@@ -185,6 +185,22 @@ impl Action {
     }
 }
 
+/// A secret API key carried from the add-model flow to the CLI harness (the one
+/// place that performs I/O), for a hosted provider. The `tui` crate never writes
+/// it to disk; the harness stores it in `auth.json` (mode `0600`). `Debug` is
+/// hand-written to REDACT the value — mirroring
+/// `codypendent_providers::credential::ResolvedCredential` — so a stray
+/// `{intent:?}` can never leak the key into a log or a snapshot. `PartialEq`/`Eq`
+/// compare the inner value (so a test can assert on the exact key it supplied).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretKey(pub String);
+
+impl std::fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretKey(<redacted>)")
+    }
+}
+
 /// A semantic command the reducer wants sent to the daemon.
 ///
 /// The TUI performs no I/O, so instead of talking to the daemon it appends an
@@ -257,4 +273,49 @@ pub enum Intent {
         document_id: DocumentId,
         mutation: DocumentMutation,
     },
+
+    /// Add a usable model from the TUI (client-only — NOT a daemon command). The
+    /// harness maps this to local `models.toml` + `auth.json` writes and never
+    /// sends an envelope, so it is intercepted in the drain loop before
+    /// `intent_to_command`. `display_id` is the `models.toml` id (the flow
+    /// defaults it to `<provider>/<model>`); `provider_id` selects the catalog
+    /// entry the harness reads `base_url` from; `model` is the provider-side model
+    /// name. `api_key` is the entered key for a hosted provider (redacted in
+    /// `Debug`), or `None` for a local/no-auth provider.
+    AddModel {
+        display_id: String,
+        provider_id: String,
+        model: String,
+        api_key: Option<SecretKey>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_key_debug_is_redacted() {
+        let k = SecretKey("sk-super-secret".to_string());
+        let dbg = format!("{k:?}");
+        assert!(
+            !dbg.contains("sk-super-secret"),
+            "key redacted in Debug: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"));
+    }
+
+    #[test]
+    fn add_model_intent_debug_redacts_the_key() {
+        let intent = Intent::AddModel {
+            display_id: "groq/llama".to_string(),
+            provider_id: "groq".to_string(),
+            model: "llama-3.1-8b".to_string(),
+            api_key: Some(SecretKey("sk-secret".to_string())),
+        };
+        assert!(
+            !format!("{intent:?}").contains("sk-secret"),
+            "the key must never leak through the intent's Debug"
+        );
+    }
 }

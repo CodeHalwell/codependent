@@ -52,6 +52,9 @@ anyhow = { workspace = true }
 # Resolves the platform config dir for the trusted-publisher key store
 # (`<config_dir>/codypendent/trusted_publishers.toml`), the `models.toml` precedent.
 directories = { workspace = true }
+# Serializes an appended `[[model]]` back to `models.toml` in the add-model flow
+# (`write_add_model`). Already a transitive dep via the config loaders.
+toml = { workspace = true }
 async-trait = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
