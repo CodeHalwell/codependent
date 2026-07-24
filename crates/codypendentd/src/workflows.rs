@@ -292,6 +292,13 @@ impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
                 // — so the run-phase signal is best-effort by design; node state, not
                 // the badge, is the source of truth for progress.
                 host.publish_run_phase(&run_id, WorkflowRunState::Running);
+                // Bracket the drive as live (paired with `finish` below): while it is
+                // open the run's cancellation entry is kept even at zero in-flight
+                // handles, so a `CancelWorkflow` landing while a tool node is parked but
+                // has not yet registered its token still sticks and wakes the park
+                // (MF-1). A run cancelled before this point already flipped to a
+                // terminal state, so `drive` short-circuits without running a node.
+                host.cancellations.begin(&run_id);
                 match host
                     .conductor
                     .drive(&host.pool, &run_id, host.node_executor.as_ref(), &observer)
