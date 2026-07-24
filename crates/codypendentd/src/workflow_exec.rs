@@ -430,17 +430,21 @@ pub(crate) fn build_workflow_host(
 /// machinery `CancelRun` uses — not `CancellationToken::never()`, which left a
 /// workflow node's agent run uninterruptible before T9.
 ///
-/// **Sticky (best-effort).** Once a run is cancelled, a node that registers
-/// *afterwards* (a multi-attempt node re-entering `drive_agent` on retry) is
-/// *usually* born already cancelled, so a cancelled run does not drive a fresh agent
-/// run to completion. The one gap: `cancel` prunes the entry when it holds zero
-/// in-flight handles (correct for a paused/pending run — the terminal run will never
-/// register again, and it avoids a per-cancelled-run leak), so a retry landing in the
-/// sub-millisecond `deregister`→`register` gap of `run_node`'s retry loop can run once
-/// (the run still ends `Cancelled` — only wasted work, correct final state). Default
-/// retry (`attempts: 1`) has no such window. The entry is otherwise pruned when the
-/// run's drive fully drains ([`finish`](Self::finish), called by the host after every
-/// drive). Cheap to clone — an `Arc` over the shared registry.
+/// **Sticky.** Once a run is cancelled, a node that registers *afterwards* — a
+/// multi-attempt node re-entering `drive_agent` on retry, or a tool node's
+/// `park_for_approval` registering after the node reached `WaitingApproval` — is born
+/// already cancelled, so a cancelled run neither drives a fresh agent run to
+/// completion nor leaves a parked node's wait unwoken. The sticky flag is held for the
+/// whole life of a run's drive: the host brackets each drive with
+/// [`begin`](Self::begin) … [`finish`](Self::finish), and while that bracket is open
+/// the entry is kept even with zero in-flight handles. That closes the MF-1 lost-wakeup
+/// — a `cancel` landing in a tool node's park window (after `WaitingApproval`, before
+/// the park registers its token, when the registry momentarily holds no handle for the
+/// run) preserves the flag instead of discarding it, so the token the park then
+/// registers is born cancelled and its `select!` wakes at once. [`finish`](Self::finish)
+/// prunes the entry when the drive drains; a `cancel` with no live drive and no handle
+/// drops its own freshly-created entry rather than leak it. Cheap to clone — an `Arc`
+/// over the shared registry.
 #[derive(Clone, Default)]
 pub(crate) struct WorkflowRunCancellations {
     inner: Arc<Mutex<HashMap<String, RunCancelState>>>,
@@ -452,6 +456,15 @@ struct RunCancelState {
     /// Whether the run has been cancelled (sticky, so a later registration is born
     /// cancelled).
     cancelled: bool,
+    /// Whether a drive task is currently live for this run — the host brackets each
+    /// drive with [`WorkflowRunCancellations::begin`] … [`finish`](WorkflowRunCancellations::finish).
+    /// While a drive is live the entry is KEPT even with zero handles, so the sticky
+    /// `cancelled` flag survives a `cancel` that lands in a tool node's park window
+    /// (after `WaitingApproval`, before the park registers its token) and the token
+    /// that park then registers is born cancelled (MF-1). Pruning is otherwise driven
+    /// by "zero handles", which a parking-but-not-yet-registered node would spuriously
+    /// satisfy.
+    drive_active: bool,
     /// A monotonic id source so each registration is removable independently.
     next_id: u64,
     /// The live handles for this run's in-flight node agent runs.
@@ -459,6 +472,21 @@ struct RunCancelState {
 }
 
 impl WorkflowRunCancellations {
+    /// Mark a run's drive as live — the host calls this once, immediately before it
+    /// drives a run, and pairs it with [`finish`](Self::finish) when the drive drains.
+    /// While the bracket is open the run's entry is kept even with zero in-flight
+    /// handles, so a `cancel` landing while a tool node is parked but has not yet
+    /// registered its token (the MF-1 window) is not lost: the sticky flag survives
+    /// for the park's later [`register`](Self::register) to be born cancelled. Never
+    /// clears the sticky `cancelled` flag — a run cancelled before its drive began
+    /// stays cancelled (its drive then short-circuits on the durable terminal state).
+    pub(crate) fn begin(&self, workflow_run_id: &str) {
+        self.lock()
+            .entry(workflow_run_id.to_owned())
+            .or_default()
+            .drive_active = true;
+    }
+
     /// Register an in-flight node's agent run and get the token to drive it with.
     /// The token is born cancelled if the run is already cancelled (sticky). Returns
     /// the registration id to [`deregister`](Self::deregister) with once the drive
@@ -484,16 +512,29 @@ impl WorkflowRunCancellations {
         let mut map = self.lock();
         if let Some(entry) = map.get_mut(workflow_run_id) {
             entry.handles.remove(&id);
-            if entry.handles.is_empty() && !entry.cancelled {
+            // While a drive is live its [`begin`](Self::begin) … [`finish`](Self::finish)
+            // bracket owns the entry's lifetime, so leave removal to `finish`: dropping
+            // the entry here on a transient zero-handle gap (e.g. between two nodes)
+            // would discard the `drive_active`/sticky bookkeeping a later park in the
+            // SAME drive relies on — the exact MF-1 lost-wakeup. Only prune when no
+            // drive is live and the run is not cancelled (the drained, never-cancelled
+            // cleanup, now reached only outside a drive bracket).
+            if entry.handles.is_empty() && !entry.cancelled && !entry.drive_active {
                 map.remove(workflow_run_id);
             }
         }
     }
 
     /// Fire every in-flight node's token for `workflow_run_id` and mark the run
-    /// cancelled (sticky). Idempotent. When no node is in flight (a paused run
-    /// cancelled), the terminal run will never register again, so the entry is
-    /// dropped immediately rather than left to linger.
+    /// cancelled (sticky). Idempotent. The entry — carrying the sticky `cancelled`
+    /// flag — is KEPT whenever a drive is live ([`begin`](Self::begin) was called and
+    /// [`finish`](Self::finish) will prune it) OR a handle is in flight. Only when a
+    /// run has NEITHER a live drive NOR any handle (a paused/terminal run cancelled —
+    /// nothing to wake, and no `finish` will come) is the freshly-created entry
+    /// dropped rather than left to linger. This is the MF-1 fix: a live drive whose
+    /// tool node is parked at `WaitingApproval` but has not yet registered its token
+    /// holds zero handles, yet must keep the flag so that register is born cancelled —
+    /// `drive_active`, not the handle count, is what tells the two cases apart.
     pub(crate) fn cancel(&self, workflow_run_id: &str) {
         let mut map = self.lock();
         let entry = map.entry(workflow_run_id.to_owned()).or_default();
@@ -501,13 +542,15 @@ impl WorkflowRunCancellations {
         for handle in entry.handles.values() {
             handle.cancel();
         }
-        if entry.handles.is_empty() {
+        if !entry.drive_active && entry.handles.is_empty() {
             map.remove(workflow_run_id);
         }
     }
 
     /// Drop a run's entry once its drive has fully drained (the host calls this after
-    /// a drive returns), so a cancelled run's sticky entry does not linger.
+    /// a drive returns), so a cancelled run's sticky entry does not linger. Pairs with
+    /// [`begin`](Self::begin): together they bracket a live drive, over which the entry
+    /// is kept even at zero handles.
     pub(crate) fn finish(&self, workflow_run_id: &str) {
         self.lock().remove(workflow_run_id);
     }
@@ -4605,6 +4648,65 @@ steps:
         let host = WorkflowConductorHost::new(pool.clone(), Arc::new(executor))
             .with_streaming(WorkflowHub::new(), cancellations.clone());
         (host, cancellations)
+    }
+
+    /// MF-1 root cause (the flaky-cancel race), pinned deterministically at the
+    /// registry layer. A `CancelWorkflow` can land while a tool node is parking —
+    /// AFTER the node is durably [`NodeState::WaitingApproval`] (so an observer, or
+    /// this test's canceller, can see it and cancel) but BEFORE
+    /// [`AgentLoopNodeExecutor::park_for_approval`] has called
+    /// [`WorkflowRunCancellations::register`]. In that window the drive is live yet
+    /// the registry holds NO handle for the run — the exact interleaving the daemon
+    /// hits under SQLite load (the `approvals.request` write widens the gap). The
+    /// sticky `cancelled` flag MUST survive that cancel so the token the park then
+    /// registers is born cancelled and its `select!` wakes at once. If it is lost,
+    /// the park blocks on the (never-granted) approval forever, the drive wedges
+    /// holding the per-run lock, and the node is stranded `WaitingApproval` — which
+    /// is precisely the timing-dependent hang that made
+    /// `cancel_while_a_tool_node_is_parked_unblocks_the_drive_and_never_writes`
+    /// flaky. This reproduces it with no timing at all.
+    #[test]
+    fn a_cancel_before_a_parking_node_registers_still_births_a_cancelled_token() {
+        let cancellations = WorkflowRunCancellations::default();
+        let run = "run-park-race";
+
+        // The host has begun driving the run (the live-drive bracket the fix relies
+        // on), and the run's tool node has reached `WaitingApproval` — but the park
+        // has not called `register` yet, so the registry holds NO handle for the run.
+        cancellations.begin(run);
+
+        // A `CancelWorkflow` fires in exactly that window.
+        cancellations.cancel(run);
+
+        // The cancel must stick even though nothing was in flight to fire. Before the
+        // fix, `cancel` dropped the whole entry when it held zero handles, silently
+        // discarding the sticky flag it had just set — so this was false and the wake
+        // was lost.
+        assert!(
+            cancellations.is_cancelled(run),
+            "a cancel landing in the park window (a live drive, no handle registered) \
+             must still mark the run cancelled — the sticky flag must not be discarded"
+        );
+
+        // The park now registers its token and races the approval decision against
+        // it. It MUST be born cancelled — otherwise the `select!` never observes the
+        // cancel and the parked drive wedges forever holding the per-run lock, exactly
+        // the timing-dependent hang that made the full-host test below flaky.
+        let (_id, token) = cancellations.register(run);
+        assert!(
+            token.is_cancelled(),
+            "a token registered after the run was cancelled must be born cancelled — \
+             otherwise the parked drive never wakes"
+        );
+
+        // Sanity: a cancel with NO live drive and no handle must NOT leave a lingering
+        // entry (the paused/terminal-run case the zero-handle prune still guards).
+        let other = WorkflowRunCancellations::default();
+        other.cancel("idle-run");
+        assert!(
+            !other.is_cancelled("idle-run"),
+            "cancelling a run with no live drive leaves no lingering entry"
+        );
     }
 
     #[tokio::test]
