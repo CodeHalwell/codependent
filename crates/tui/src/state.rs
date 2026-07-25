@@ -12,7 +12,7 @@ use codypendent_protocol::{
     ModelId, ProposedAction, Risk, RunDisposition, RunId, RunState, ToolOutcome,
 };
 
-use crate::action::Intent;
+use crate::action::{Intent, SecretKey};
 
 /// Which pane currently has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +161,27 @@ pub enum Overlay {
     /// [`AppState::pending_provider`] (advisory/browse-only this task; wiring
     /// a staged provider into a live run is a follow-up).
     ProviderPicker { query: String, selected: usize },
+    /// Add-model flow, step 2 (text prompt): the provider-side model name, for the
+    /// catalog provider chosen in step 1 (`provider_id`). `requires_key` was read
+    /// from that provider's card so submit knows whether step 3 (the key prompt) is
+    /// needed. On submit, a key-requiring provider advances to
+    /// [`Overlay::AddModelKey`]; a local/no-auth one emits `Intent::AddModel`
+    /// directly. A blank name is rejected (the prompt stays open).
+    AddModelId {
+        provider_id: String,
+        requires_key: bool,
+        buffer: String,
+    },
+    /// Add-model flow, step 3 (masked text prompt; key-requiring providers only):
+    /// the API key for the chosen `provider_id` + `model`. `buffer` holds the key in
+    /// a REDACTING newtype so it can never leak through `Debug`; the render masks it
+    /// on screen. On submit, emits `Intent::AddModel` with the key handed to the
+    /// harness (an empty key emits `api_key: None`).
+    AddModelKey {
+        provider_id: String,
+        model: String,
+        buffer: SecretKey,
+    },
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -711,6 +732,10 @@ pub struct ProviderCard {
     pub auth: String,
     /// On-device (Ollama/LM Studio/vLLM) vs. hosted.
     pub local: bool,
+    /// Whether adding a model from this provider needs an API key (its first auth
+    /// method is `ApiKey`). Drives the add-model flow's key step — a local/no-auth/
+    /// ACP provider skips it. Set by the CLI harness from the catalog `AuthMethod`.
+    pub requires_key: bool,
 }
 
 /// The indices into `providers` whose id/name/protocol case-insensitively
@@ -950,9 +975,11 @@ impl AppState {
     #[must_use]
     pub fn input_mode(&self) -> InputMode {
         match self.overlay {
-            Overlay::NewRun(_) | Overlay::Steering(_) | Overlay::DocEdit { .. } => {
-                InputMode::Editing
-            }
+            Overlay::NewRun(_)
+            | Overlay::Steering(_)
+            | Overlay::DocEdit { .. }
+            | Overlay::AddModelId { .. }
+            | Overlay::AddModelKey { .. } => InputMode::Editing,
             Overlay::ConfirmCancel => InputMode::Confirm,
             // The palette, the model picker, and the provider picker all
             // filter on printable keys while staying arrow-navigable, so they

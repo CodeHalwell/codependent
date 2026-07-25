@@ -161,6 +161,10 @@ pub enum Action {
 
     /// Toggle the command palette (`/`): a searchable list of every command.
     OpenPalette,
+    /// Begin the add-model flow for the focused provider in the `/provider` picker
+    /// (`Tab`): opens the model-name prompt (step 2). A no-op outside the provider
+    /// picker.
+    BeginAddModel,
     /// Flip between the chat single-column and the workspace panes (`F2`).
     ToggleLayout,
 

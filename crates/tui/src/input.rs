@@ -214,6 +214,7 @@ fn map_palette_key(key: &KeyEvent) -> Action {
         KeyCode::Down => Action::SelectNext,
         KeyCode::Char('c') if ctrl(key) => Action::InputCancel,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
+        KeyCode::Tab => Action::BeginAddModel,
         _ => Action::NoOp,
     }
 }
@@ -403,6 +404,14 @@ mod tests {
         assert_eq!(
             map_event(&key(KeyCode::Esc), InputMode::Palette, W),
             Action::InputCancel
+        );
+    }
+
+    #[test]
+    fn tab_in_palette_mode_begins_add_model() {
+        assert_eq!(
+            map_event(&key(KeyCode::Tab), InputMode::Palette, W),
+            Action::BeginAddModel
         );
     }
 

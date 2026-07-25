@@ -1495,6 +1495,10 @@ fn load_provider_cards(paths: &RuntimePaths) -> Vec<ProviderCard> {
                 Some(_) => "unknown".to_string(),
             },
             local: p.local,
+            // Adding a model from this provider needs a key iff its first auth
+            // method is an API key (local/none/acp/cloud-iam/oauth skip the key
+            // step). `AuthMethod` is already imported in this function.
+            requires_key: matches!(p.auth.first(), Some(AuthMethod::ApiKey { .. })),
         })
         .collect()
 }
