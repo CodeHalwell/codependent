@@ -612,6 +612,31 @@ async fn event_loop(
         reduce(state, action);
 
         for intent in state.drain_outbox() {
+            // `AddModel` is the one client-only intent: apply it locally (models.toml
+            // + auth.json) and skip the daemon-command mapping entirely.
+            if let Intent::AddModel {
+                display_id,
+                provider_id,
+                model,
+                api_key,
+            } = &intent
+            {
+                let key = api_key.as_ref().map(|k| k.0.as_str());
+                match write_add_model(paths, display_id, provider_id, model, key) {
+                    Ok(()) => {
+                        // Re-seed the model picker so the new model shows immediately.
+                        state.models = load_model_cards(paths).await;
+                        reduce(state, Action::Notice(format!("added model {display_id}")));
+                    }
+                    Err(error) => {
+                        reduce(
+                            state,
+                            Action::Notice(format!("could not add model: {error}")),
+                        );
+                    }
+                }
+                continue;
+            }
             // The first edit on a document subscribes this client to its live sync
             // stream (a re-attach carrying the grown subscription set) and seeds its
             // replica, so the edit's own resulting sync — and every other writer's —
@@ -879,7 +904,136 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             document_id,
             mutation,
         },
+        // `AddModel` is a CLIENT-ONLY intent applied locally by the harness (see the
+        // drain loop's interception); it never becomes a daemon command, so this
+        // mapping is never reached.
+        Intent::AddModel { .. } => unreachable!(
+            "AddModel is applied locally by the harness (write_add_model), never sent to the daemon"
+        ),
     }
+}
+
+/// Apply an `Intent::AddModel` to the local config: append (or update in place) a
+/// `[[model]]` entry in `<data_dir>/models.toml`, and, when a non-blank key was
+/// entered, store it in `<data_dir>/auth.json` (mode `0600`). This is the
+/// harness's job because the `tui` crate performs no I/O and never touches the
+/// key.
+///
+/// The written entry is always `provider = "openai-compatible"` (the only wire
+/// adapter `ModelConfig`/`client_for` supports today); `base_url` is read from the
+/// catalog provider (`<data_dir>/providers.toml` layered over the built-ins). A
+/// duplicate `display_id` UPDATES its entry rather than duplicating it. Both files
+/// are written atomically (temp + rename) so a concurrent daemon read never sees a
+/// torn file.
+///
+/// Two guards, deliberate and load-bearing (not just brief follow-through):
+/// - A blank/whitespace-only `display_id` is rejected outright — nothing is
+///   written (neither file). Model ids double as the `auth.json` key, so a blank
+///   one is never a legitimate profile, just an empty prompt submitted as-is.
+/// - A blank/whitespace-only `api_key` is treated exactly like `None` — the
+///   `auth.json` write is skipped entirely. Storing `AuthStore::set(id, "")` would
+///   silently shadow a valid `api_key_env` into "no key" at resolution time
+///   (`ModelRegistry::client_for` prefers a *present* `auth.json` entry over the
+///   env var unconditionally) — a real regression a prior review flagged (SDD
+///   ledger M1) and this function must not reintroduce.
+///
+/// All-or-nothing when a key is entered (SDD ledger M3): `AuthStore::load` is
+/// fallible (a hand-corrupted `auth.json` surfaces as `Err`), so it is called
+/// BEFORE `models.toml` is written — a corrupt pre-existing `auth.json` aborts
+/// the whole add before anything is written, rather than leaving a keyless
+/// `models.toml` entry behind while the key silently fails to save. A keyless
+/// add never loads `auth.json` at all, exactly as before.
+fn write_add_model(
+    paths: &RuntimePaths,
+    display_id: &str,
+    provider_id: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<()> {
+    use codypendent_providers::Catalog;
+    use codypendent_runtime::auth::AuthStore;
+    use codypendent_runtime::models::{load_models, ModelConfig};
+
+    if display_id.trim().is_empty() {
+        bail!("model id must not be blank");
+    }
+
+    let data_dir = &paths.data_dir;
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating the data dir {}", data_dir.display()))?;
+
+    // A blank/whitespace-only key is treated exactly like `None` (see the doc
+    // comment's second guard) — filtered up front so the load-order guard right
+    // below and the final write agree on whether a key is really present.
+    let key = api_key.filter(|k| !k.trim().is_empty());
+
+    // M3 (all-or-nothing): when a key is present, load auth.json NOW, before
+    // models.toml is written. `AuthStore::load` is fallible — a hand-corrupted
+    // `auth.json` surfaces as `Err` right here, aborting the whole add before
+    // anything is written, rather than leaving a keyless `models.toml` entry
+    // behind while the key silently fails to save. A keyless add loads no
+    // auth.json at all, exactly as before.
+    let mut auth = key
+        .is_some()
+        .then(|| {
+            AuthStore::load(data_dir)
+                .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))
+        })
+        .transpose()?;
+
+    // Resolve the catalog base_url for the chosen provider (built-ins layered with
+    // any user providers.toml; a load failure falls back to the built-ins).
+    let catalog = Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
+        .unwrap_or_else(|_| Catalog::builtin());
+    let base_url = catalog
+        .get(provider_id)
+        .and_then(|p| p.base_url.clone())
+        .unwrap_or_default();
+
+    // Read the existing models.toml (absent ⇒ start empty) through the real
+    // loader, drop any entry sharing the new display id (update-in-place), then
+    // append the new one — every other existing entry survives untouched.
+    let models_path = data_dir.join("models.toml");
+    let mut configs = if models_path.exists() {
+        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?
+    } else {
+        Vec::new()
+    };
+    configs.retain(|c| c.id.0 != display_id);
+    configs.push(ModelConfig {
+        id: ModelId(display_id.to_string()),
+        provider: "openai-compatible".to_string(),
+        base_url,
+        model: model.to_string(),
+        api_key_env: String::new(),
+    });
+
+    // Serialize back to `[[model]]` tables and write atomically.
+    #[derive(serde::Serialize)]
+    struct ModelsToml {
+        #[serde(rename = "model")]
+        model: Vec<ModelConfig>,
+    }
+    let rendered = toml::to_string_pretty(&ModelsToml { model: configs })
+        .context("serializing models.toml")?;
+    let models_tmp = data_dir.join("models.toml.tmp");
+    std::fs::write(&models_tmp, rendered.as_bytes())
+        .with_context(|| format!("writing {}", models_tmp.display()))?;
+    std::fs::rename(&models_tmp, &models_path)
+        .with_context(|| format!("replacing {}", models_path.display()))?;
+
+    // Store the key (hosted providers only) in auth.json at 0600 — loaded
+    // above, BEFORE models.toml was written, so a corrupt pre-existing
+    // auth.json already aborted the whole operation before this point (M3).
+    if let Some(key) = key {
+        let auth = auth
+            .as_mut()
+            .expect("loaded above because `key` is Some (M3 ordering)");
+        auth.set(display_id, key);
+        auth.save(data_dir)
+            .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+    }
+    Ok(())
 }
 
 /// The document a doc-editing intent operates on, when it is one the harness must
@@ -1368,8 +1522,26 @@ fn load_provider_cards(paths: &RuntimePaths) -> Vec<ProviderCard> {
                 Some(_) => "unknown".to_string(),
             },
             local: p.local,
+            // Adding a model from this provider needs a key iff its first auth
+            // method is an API key (local/none/acp/cloud-iam/oauth skip the key
+            // step). Extracted to `provider_requires_key` so this derivation has
+            // an isolated unit test against the real `AuthMethod` enum, rather
+            // than only being exercised indirectly through this I/O function.
+            requires_key: provider_requires_key(p),
         })
         .collect()
+}
+
+/// Whether adding a model from `p` needs an API key: its first configured auth
+/// method is `AuthMethod::ApiKey` (a local/no-auth/ACP/cloud-iam/OAuth provider,
+/// or one with no auth methods at all, skips the key step). A tiny pure
+/// expression — no I/O — extracted out of [`load_provider_cards`] so this
+/// bool derivation is directly unit-testable against the real
+/// `codypendent_providers::AuthMethod` enum, independent of that function's
+/// file I/O.
+fn provider_requires_key(p: &codypendent_providers::Provider) -> bool {
+    use codypendent_providers::AuthMethod;
+    matches!(p.auth.first(), Some(AuthMethod::ApiKey { .. }))
 }
 
 /// The provider picker's wire-protocol label — the same kebab-case spelling
@@ -3056,5 +3228,282 @@ steps:
             t.on_event(ev(50), now),
             GapAction::Reattach { .. }
         ));
+    }
+
+    // -- write_add_model (add-a-usable-model-from-the-TUI, Task 3) ------------
+
+    #[test]
+    fn write_add_model_appends_an_entry_that_round_trips_through_load_models() {
+        use codypendent_runtime::models::load_models;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        // "groq" is a built-in catalog provider (hosted, api-key).
+        write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            Some("sk-secret"),
+        )
+        .expect("write_add_model");
+
+        let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
+        let entry = configs
+            .iter()
+            .find(|c| c.id.0 == "groq/llama")
+            .expect("the entry is present");
+        assert_eq!(entry.provider, "openai-compatible");
+        assert_eq!(entry.model, "llama-3.1-8b");
+        assert!(
+            entry.base_url.contains("groq"),
+            "base_url comes from the catalog: {}",
+            entry.base_url
+        );
+        assert_eq!(
+            entry.api_key_env, "",
+            "the key lives in auth.json, not api_key_env"
+        );
+
+        // The key landed in auth.json.
+        let auth =
+            codypendent_runtime::auth::AuthStore::load(&paths.data_dir).expect("auth.json loads");
+        assert_eq!(auth.get("groq/llama"), Some("sk-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_add_model_stores_the_key_at_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            Some("sk-secret"),
+        )
+        .expect("write");
+        let meta = std::fs::metadata(paths.data_dir.join("auth.json")).expect("metadata");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn write_add_model_for_a_local_provider_writes_no_key() {
+        use codypendent_runtime::models::load_models;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        // "ollama" is a built-in LOCAL provider (auth none) — no key entered.
+        write_add_model(&paths, "ollama/qwen", "ollama", "qwen2.5-coder:14b", None).expect("write");
+
+        let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
+        assert!(configs.iter().any(|c| c.id.0 == "ollama/qwen"));
+        assert!(
+            !paths.data_dir.join("auth.json").exists(),
+            "a local add writes no auth.json"
+        );
+    }
+
+    /// Hard requirement: an empty (or whitespace-only) key must never reach
+    /// `AuthStore::set` — storing `set(id, "")` would silently shadow a valid
+    /// `api_key_env` into "no key" at resolution time (SDD ledger M1). A blank
+    /// key is treated exactly like `None`: no `auth.json` at all.
+    #[test]
+    fn write_add_model_treats_a_blank_key_as_no_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        write_add_model(&paths, "groq/llama", "groq", "llama-3.1-8b", Some("   ")).expect("write");
+
+        assert!(
+            !paths.data_dir.join("auth.json").exists(),
+            "a blank/whitespace-only key must never be written to auth.json"
+        );
+    }
+
+    #[test]
+    fn write_add_model_updates_a_duplicate_display_id_in_place() {
+        use codypendent_runtime::models::load_models;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        write_add_model(&paths, "groq/llama", "groq", "llama-3.1-8b", Some("k1")).expect("write 1");
+        write_add_model(&paths, "groq/llama", "groq", "llama-3.3-70b", Some("k2"))
+            .expect("write 2");
+
+        let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
+        let matching: Vec<_> = configs.iter().filter(|c| c.id.0 == "groq/llama").collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "a duplicate display id updates in place, never dupes"
+        );
+        assert_eq!(
+            matching[0].model, "llama-3.3-70b",
+            "the entry took the new model"
+        );
+        assert_eq!(
+            codypendent_runtime::auth::AuthStore::load(&paths.data_dir)
+                .expect("auth.json loads")
+                .get("groq/llama"),
+            Some("k2"),
+            "the key updated too"
+        );
+    }
+
+    /// Hard requirement: appending a new model must not clobber an existing
+    /// `[[model]]` entry already in `models.toml` — the write goes through the
+    /// real loader (parse → dedupe-by-id → serialize), not a blind text append.
+    #[test]
+    fn write_add_model_preserves_an_existing_entry_when_adding_another() {
+        use codypendent_runtime::models::load_models;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        write_add_model(&paths, "groq/llama", "groq", "llama-3.1-8b", Some("k1"))
+            .expect("write first model");
+        write_add_model(&paths, "ollama/qwen", "ollama", "qwen2.5-coder:14b", None)
+            .expect("write second model");
+
+        let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
+        assert_eq!(configs.len(), 2, "both entries survive: {configs:?}");
+        assert!(configs.iter().any(|c| c.id.0 == "groq/llama"));
+        assert!(configs.iter().any(|c| c.id.0 == "ollama/qwen"));
+        // The first model's own key is untouched by the second (keyless) add.
+        assert_eq!(
+            codypendent_runtime::auth::AuthStore::load(&paths.data_dir)
+                .expect("auth.json loads")
+                .get("groq/llama"),
+            Some("k1")
+        );
+    }
+
+    /// Hard requirement: a blank/whitespace-only display id is rejected with a
+    /// user-visible error and writes nothing — neither `models.toml` nor
+    /// `auth.json` is created.
+    #[test]
+    fn write_add_model_rejects_a_blank_display_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        let error = write_add_model(&paths, "   ", "groq", "llama-3.1-8b", Some("sk-secret"))
+            .expect_err("a blank display id must be rejected");
+        assert!(
+            !error.to_string().is_empty(),
+            "the error must carry a user-visible message"
+        );
+        assert!(
+            !paths.data_dir.join("models.toml").exists(),
+            "a rejected add writes no models.toml"
+        );
+        assert!(
+            !paths.data_dir.join("auth.json").exists(),
+            "a rejected add writes no auth.json"
+        );
+    }
+
+    /// Hard requirement (M3, all-or-nothing): when a non-blank key is entered,
+    /// a pre-existing but CORRUPT `auth.json` must abort the whole add before
+    /// anything is written — never leaving a keyless `models.toml` entry
+    /// behind. This is why `write_add_model` loads `auth.json` (fallible)
+    /// BEFORE writing `models.toml` — see its doc comment.
+    #[test]
+    fn write_add_model_is_all_or_nothing_when_auth_json_is_corrupt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        std::fs::create_dir_all(&paths.data_dir).expect("create data dir");
+        std::fs::write(paths.data_dir.join("auth.json"), b"{ not json")
+            .expect("seed corrupt auth.json");
+
+        let error = write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            Some("sk-secret"),
+        )
+        .expect_err("a corrupt pre-existing auth.json must abort the whole add");
+        assert!(
+            !error.to_string().is_empty(),
+            "the error must carry a user-visible message"
+        );
+        assert!(
+            !paths.data_dir.join("models.toml").exists(),
+            "a corrupt auth.json must abort BEFORE models.toml is written (all-or-nothing)"
+        );
+    }
+
+    // -- provider_requires_key (Task 8 add-model key step derivation) --------
+
+    /// A minimal `Provider` for exercising `provider_requires_key` directly —
+    /// every field but `auth` is irrelevant to that derivation.
+    fn provider_with_auth(
+        auth: Vec<codypendent_providers::AuthMethod>,
+    ) -> codypendent_providers::Provider {
+        codypendent_providers::Provider {
+            id: "test-provider".to_string(),
+            name: "Test Provider".to_string(),
+            protocol: codypendent_providers::Protocol::OpenAiChat,
+            base_url: None,
+            auth,
+            extra_headers: Default::default(),
+            query_params: Default::default(),
+            local: false,
+        }
+    }
+
+    #[test]
+    fn provider_requires_key_is_true_when_first_auth_is_api_key() {
+        use codypendent_providers::AuthMethod;
+        let p = provider_with_auth(vec![AuthMethod::ApiKey {
+            env: vec!["GROQ_API_KEY".to_string()],
+            header: "Authorization".to_string(),
+            prefix: "Bearer ".to_string(),
+        }]);
+        assert!(provider_requires_key(&p));
+    }
+
+    #[test]
+    fn provider_requires_key_is_false_when_first_auth_is_none() {
+        use codypendent_providers::AuthMethod;
+        let p = provider_with_auth(vec![AuthMethod::None]);
+        assert!(!provider_requires_key(&p));
+    }
+
+    #[test]
+    fn provider_requires_key_is_false_for_acp_cloud_iam_and_oauth() {
+        use codypendent_providers::AuthMethod;
+
+        let acp = provider_with_auth(vec![AuthMethod::Acp {
+            command: "gemini".to_string(),
+            args: vec!["--acp".to_string()],
+            env: Default::default(),
+        }]);
+        assert!(!provider_requires_key(&acp));
+
+        let cloud_iam = provider_with_auth(vec![AuthMethod::CloudIam {
+            variant: "aws_sigv4".to_string(),
+            env: Default::default(),
+            scopes: vec![],
+        }]);
+        assert!(!provider_requires_key(&cloud_iam));
+
+        let oauth = provider_with_auth(vec![AuthMethod::OAuth {
+            authorize_url: "https://example.com/authorize".to_string(),
+            token_url: "https://example.com/token".to_string(),
+            client_id: "client".to_string(),
+            scopes: vec![],
+            pkce: true,
+        }]);
+        assert!(!provider_requires_key(&oauth));
+    }
+
+    #[test]
+    fn provider_requires_key_is_false_for_an_empty_auth_list() {
+        let p = provider_with_auth(vec![]);
+        assert!(!provider_requires_key(&p));
     }
 }

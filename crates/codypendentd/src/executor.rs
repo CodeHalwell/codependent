@@ -948,7 +948,15 @@ pub(crate) fn load_model_registry(
         return Err("no model configured (models.toml is empty)".to_string());
     }
     let ids: Vec<_> = configs.iter().map(|c| c.id.clone()).collect();
-    let registry = ModelRegistry::new(configs);
+    // Additive: also load `<data_dir>/auth.json` so a TUI-added model's stored key
+    // resolves at client build (precedence: auth.json → api_key_env → none). An
+    // absent file yields an empty store (`AuthStore::load`'s `Ok(default)` path),
+    // leaving every model resolving as before; a present-but-corrupt file is a
+    // real failure and is propagated here exactly like an invalid `models.toml`
+    // above, rather than silently masked as "no keys saved".
+    let auth = codypendent_runtime::auth::AuthStore::load(&paths.data_dir)
+        .map_err(|e| format!("invalid auth.json: {e}"))?;
+    let registry = ModelRegistry::new(configs).with_auth(auth);
     // Phase-1 policy: every mode tries every configured model, in file order,
     // until one connects. (The Phase-7 utility router replaces this.)
     let policy = ModelPolicy::new().with_default_candidates(ids);
@@ -1333,6 +1341,47 @@ mod tests {
         assert!(
             !context_manifest_present(&pool, cont_session).await,
             "a continuation must NOT emit the === CONTEXT manifest"
+        );
+    }
+
+    // NOT `#[cfg(feature = "provider-openai")]`: `codypendentd` pulls
+    // `codypendent-runtime` with default features (provider-openai on), uses
+    // `client_for`/`from_registry` unconditionally (executor.rs:454), and defines
+    // no `provider-openai` feature of its own — so gating here would make the test
+    // dead code.
+    #[tokio::test]
+    async fn load_model_registry_resolves_a_key_from_auth_json() {
+        use codypendent_runtime::auth::AuthStore;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+
+        // A hosted model whose api_key_env is deliberately unset: env alone fails.
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            r#"
+[[model]]
+id = "groq/llama"
+provider = "openai-compatible"
+base_url = "https://api.groq.com/openai/v1"
+model = "llama-3.1-8b"
+api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
+"#,
+        )
+        .expect("write models.toml");
+
+        // auth.json carries the key, so the model must build.
+        let mut auth = AuthStore::default();
+        auth.set("groq/llama", "sk-authjson");
+        auth.save(&paths.data_dir).expect("save auth.json");
+
+        let (registry, _policy) = load_model_registry(&paths).expect("load registry");
+        assert!(
+            registry
+                .client_for(&ModelId("groq/llama".to_string()))
+                .await
+                .is_ok(),
+            "load_model_registry must attach auth.json so the key resolves"
         );
     }
 

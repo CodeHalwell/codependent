@@ -990,6 +990,18 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 buffer,
             );
         }
+        Overlay::AddModelId { buffer, .. } => {
+            render_prompt(frame, area, theme, "Model name (provider-side id)", buffer);
+        }
+        Overlay::AddModelKey { buffer, .. } => {
+            render_masked_prompt(
+                frame,
+                area,
+                theme,
+                "API key (stored locally, mode 0600)",
+                &buffer.0,
+            );
+        }
         Overlay::None => {
             if state.show_approval_modal() {
                 render_approval_modal(frame, area, state, theme);
@@ -2580,6 +2592,41 @@ fn render_prompt(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, buff
         Line::from(vec![
             Span::styled("› ", Style::default().fg(theme.focus.active)),
             Span::styled(buffer.to_owned(), Style::default().fg(theme.text.primary)),
+            Span::styled("█", Style::default().fg(theme.focus.active)),
+        ]),
+        Line::styled(
+            "Enter to submit · Esc to cancel",
+            Style::default().fg(theme.text.muted),
+        ),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
+
+/// Like [`render_prompt`] but renders the buffer MASKED (one `•` per character),
+/// so a secret (an API key) is never shown on screen. The buffer is itself a
+/// redacting newtype, so it also cannot leak through `Debug`.
+fn render_masked_prompt(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, buffer: &str) {
+    let rect = centered_rect(70, 20, area);
+    frame.render_widget(Clear, rect);
+    let masked: String = "•".repeat(buffer.chars().count());
+    let lines = vec![
+        Line::styled(title, Style::default().fg(theme.text.heading)),
+        Line::from(vec![
+            Span::styled("› ", Style::default().fg(theme.focus.active)),
+            Span::styled(masked, Style::default().fg(theme.text.primary)),
             Span::styled("█", Style::default().fg(theme.focus.active)),
         ]),
         Line::styled(
@@ -4297,6 +4344,7 @@ mod tests {
                 protocol: "openai-chat".to_owned(),
                 auth: "api-key: GROQ_API_KEY".to_owned(),
                 local: false,
+                requires_key: true,
             },
             ProviderCard {
                 id: "ollama".to_owned(),
@@ -4304,6 +4352,7 @@ mod tests {
                 protocol: "openai-chat".to_owned(),
                 auth: "none".to_owned(),
                 local: true,
+                requires_key: false,
             },
         ];
         // A previous pick already staged "groq" — that row must render
@@ -4353,6 +4402,26 @@ mod tests {
         assert!(
             text.contains("local \u{2713}"),
             "local badge missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn masked_key_prompt_hides_the_typed_key() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::AddModelKey {
+            provider_id: "groq".to_owned(),
+            model: "llama-3.1-8b".to_owned(),
+            buffer: crate::action::SecretKey("sk-secret".to_owned()),
+        };
+        let text = render_to_string(&state, 80, 24);
+        assert!(text.contains("API key"), "the key prompt title:\n{text}");
+        assert!(
+            text.contains('•'),
+            "the key is masked with bullets:\n{text}"
+        );
+        assert!(
+            !text.contains("sk-secret"),
+            "the raw key must never render:\n{text}"
         );
     }
 

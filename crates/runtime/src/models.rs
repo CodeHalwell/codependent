@@ -32,6 +32,8 @@ use std::time::Duration;
 use codypendent_protocol::{AgentMode, ModelId};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::AuthStore;
+
 #[cfg(feature = "provider-openai")]
 use agent_framework_openai::OpenAIChatCompletionClient;
 
@@ -185,18 +187,36 @@ pub enum ModelsError {
 // Registry
 // ---------------------------------------------------------------------------
 
-/// The set of configured model profiles, keyed by [`ModelId`].
+/// The set of configured model profiles, keyed by [`ModelId`], plus the
+/// resolved [`AuthStore`] (`auth.json`) so [`ModelRegistry::client_for`] can
+/// prefer a stored key over the model's `api_key_env`. The store's own redacting
+/// `Debug` keeps the derived `Debug` here from leaking a key.
 #[derive(Debug, Clone, Default)]
 pub struct ModelRegistry {
     configs: HashMap<ModelId, ModelConfig>,
+    auth: AuthStore,
 }
 
 impl ModelRegistry {
     /// Build a registry from already-parsed configs. Later entries with a
-    /// duplicate `id` overwrite earlier ones.
+    /// duplicate `id` overwrite earlier ones. The auth store starts empty (no
+    /// `auth.json` keys), so every model resolves exactly as before until one is
+    /// attached with [`with_auth`](Self::with_auth).
     pub fn new(configs: impl IntoIterator<Item = ModelConfig>) -> Self {
         let configs = configs.into_iter().map(|c| (c.id.clone(), c)).collect();
-        Self { configs }
+        Self {
+            configs,
+            auth: AuthStore::default(),
+        }
+    }
+
+    /// Attach the resolved [`AuthStore`] (`auth.json`) so `client_for` prefers a
+    /// stored key over the model's `api_key_env`. Additive: the default empty
+    /// store leaves every model resolving exactly as before.
+    #[must_use]
+    pub fn with_auth(mut self, auth: AuthStore) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// Parse `models.toml` at `path` and build a registry from it.
@@ -246,11 +266,14 @@ impl ModelRegistry {
     /// [`Protocol`] and resolving credentials through the async
     /// `CredentialProvider` seam (`codypendent_providers::credential_for`).
     ///
-    /// Reads the API key from its env var right here, at call time — it is
-    /// moved straight into the client and is never stored on the registry,
-    /// logged, or otherwise retained by this function (Chapter 11,
-    /// "Secrets"). A required-but-unset variable produces
-    /// [`ModelsError::MissingApiKeyEnv`] naming the variable.
+    /// Resolves the API key right here, at call time, in precedence order:
+    /// (1) `auth.json[model_id]`, when present and non-empty; (2) the
+    /// model's `api_key_env` environment variable; (3) no key at all (local
+    /// endpoints with an empty `api_key_env`). Whichever wins is moved
+    /// straight into the client and is never stored on the registry, logged,
+    /// or otherwise retained by this function (Chapter 11, "Secrets"). A
+    /// required-but-unset variable produces [`ModelsError::MissingApiKeyEnv`]
+    /// naming the variable.
     ///
     /// Today only [`Protocol::OpenAiChat`] is wired: a legacy `models.toml`
     /// entry (`provider = "openai-compatible"`) maps onto it via
@@ -271,26 +294,36 @@ impl ModelRegistry {
         let (protocol, auth) = config_to_protocol_auth(cfg)?;
         match protocol {
             Protocol::OpenAiChat => {
-                let api_key = match credential_for(&auth).resolve().await {
-                    Ok(ResolvedCredential::ApiKey { value, .. }) => value,
-                    Ok(ResolvedCredential::None) => String::new(),
-                    Err(CredentialError::MissingEnv { var }) => {
-                        return Err(ModelsError::MissingApiKeyEnv {
-                            model: id.clone(),
-                            var,
-                        });
-                    }
-                    // `CredentialError` is `#[non_exhaustive]`: this also
-                    // catches `NotWired` (unreachable today — the legacy
-                    // bridge above only ever produces `ApiKey`/`None` auth,
-                    // both wired) plus any future variant.
-                    Err(other) => {
-                        return Err(ModelsError::ProtocolNotWired {
-                            model: id.clone(),
-                            protocol: other.to_string(),
-                        });
-                    }
-                };
+                // Key resolution precedence (additive): (a) an `auth.json` key for
+                // this model id wins → (b) the model's `api_key_env` (today's
+                // path) → (c) none. A model with no `auth.json` entry behaves
+                // exactly as before. The stored key is moved straight into the
+                // client and is never logged or retained by this function.
+                let api_key =
+                    if let Some(key) = self.auth.get(id.0.as_str()).filter(|k| !k.is_empty()) {
+                        key.to_string()
+                    } else {
+                        match credential_for(&auth).resolve().await {
+                            Ok(ResolvedCredential::ApiKey { value, .. }) => value,
+                            Ok(ResolvedCredential::None) => String::new(),
+                            Err(CredentialError::MissingEnv { var }) => {
+                                return Err(ModelsError::MissingApiKeyEnv {
+                                    model: id.clone(),
+                                    var,
+                                });
+                            }
+                            // `CredentialError` is `#[non_exhaustive]`: this also
+                            // catches `NotWired` (unreachable today — the legacy
+                            // bridge above only ever produces `ApiKey`/`None` auth,
+                            // both wired) plus any future variant.
+                            Err(other) => {
+                                return Err(ModelsError::ProtocolNotWired {
+                                    model: id.clone(),
+                                    protocol: other.to_string(),
+                                });
+                            }
+                        }
+                    };
                 let client = OpenAIChatCompletionClient::new(api_key, cfg.model.clone())
                     .with_base_url(cfg.base_url.clone());
                 Ok(Arc::new(client))
@@ -616,6 +649,116 @@ api_key_env = ""
             registry.client_for(&id).await.is_ok(),
             "empty api_key_env is not an error"
         );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn auth_json_key_resolves_even_when_the_env_var_is_unset() {
+        use crate::auth::AuthStore;
+        // A unique, never-set var: env alone cannot satisfy this model.
+        let var = "CODYPENDENT_TEST_MODELS_AUTHJSON_UNSET_5b2e";
+        assert!(std::env::var(var).is_err(), "precondition: {var} unset");
+
+        let id = model_id("groq/llama");
+        let cfg = ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.groq.com/openai/v1".to_string(),
+            model: "llama-3.1-8b".to_string(),
+            api_key_env: var.to_string(),
+        };
+
+        // Without an auth.json entry the env var is required and missing → error.
+        let registry = ModelRegistry::new([cfg.clone()]);
+        assert!(
+            matches!(
+                registry.client_for(&id).await,
+                Err(ModelsError::MissingApiKeyEnv { .. })
+            ),
+            "with no auth.json entry the env path is unchanged (missing → error)"
+        );
+
+        // With an auth.json entry the key resolves from it — env never consulted.
+        let mut auth = AuthStore::default();
+        auth.set("groq/llama", "sk-from-authjson");
+        let registry = ModelRegistry::new([cfg]).with_auth(auth);
+        assert!(
+            registry.client_for(&id).await.is_ok(),
+            "an auth.json key must satisfy a model whose api_key_env is unset"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn local_model_needs_no_key_with_an_empty_auth_store() {
+        use crate::auth::AuthStore;
+        let id = model_id("ollama/qwen");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen2.5-coder:14b".to_string(),
+            api_key_env: String::new(),
+        }])
+        .with_auth(AuthStore::default());
+        assert!(
+            registry.client_for(&id).await.is_ok(),
+            "a local model (empty api_key_env, empty auth.json) needs no key"
+        );
+    }
+
+    /// M1 (defense-in-depth): a hand-edited `auth.json` entry whose value is
+    /// the EMPTY string must be treated as ABSENT, never as a present ""
+    /// key — otherwise it would silently shadow a perfectly valid
+    /// `api_key_env` into "no key". Proven two ways: (1) with the env var
+    /// actually unset, an empty auth.json entry must still report
+    /// `MissingApiKeyEnv` — exactly as if there were no auth.json entry at
+    /// all (this is the discriminating half: without the `.filter(|k|
+    /// !k.is_empty())` guard, the empty "" entry would be taken as a real
+    /// key and this would wrongly resolve `Ok`); (2) with the SAME empty
+    /// entry but the env var now set, resolution still succeeds — the
+    /// empty entry never blocks a valid env var either.
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn empty_auth_json_entry_is_ignored_not_treated_as_a_present_key() {
+        use crate::auth::AuthStore;
+        // A deliberately unique var name (mirrors
+        // `codypendent_providers::credential::api_key_resolves_the_first_set_env_var`,
+        // which uses the same set/remove-around-the-assertion pattern).
+        let var = "CODYPENDENT_TEST_MODELS_RS_EMPTY_AUTH_FILTER_2f9d";
+        assert!(std::env::var(var).is_err(), "precondition: {var} unset");
+
+        let id = model_id("groq/empty-auth-entry");
+        let cfg = ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.groq.com/openai/v1".to_string(),
+            model: "llama-3.1-8b".to_string(),
+            api_key_env: var.to_string(),
+        };
+
+        let mut auth = AuthStore::default();
+        auth.set(id.0.as_str(), ""); // present, but empty
+        let registry = ModelRegistry::new([cfg]).with_auth(auth);
+
+        // (1) Env still unset: the empty entry must NOT count as a key, so this
+        // must fail exactly like "no auth.json entry at all" — never silently
+        // succeed with an empty key.
+        assert!(
+            matches!(
+                registry.client_for(&id).await,
+                Err(ModelsError::MissingApiKeyEnv { .. })
+            ),
+            "an empty auth.json entry must be ignored, falling through to the (missing) env var"
+        );
+
+        // (2) Now set the env var: the same empty entry must not shadow it.
+        std::env::set_var(var, "sk-from-env-2f9d");
+        assert!(
+            registry.client_for(&id).await.is_ok(),
+            "a set env var must still resolve when the auth.json entry for this id is empty"
+        );
+        std::env::remove_var(var);
     }
 
     #[cfg(feature = "provider-openai")]

@@ -36,7 +36,7 @@ pub mod terminal;
 pub mod theme;
 pub mod theme_pack;
 
-pub use action::{Action, Intent};
+pub use action::{Action, Intent, SecretKey};
 pub use input::{map_event, pane_at, KeyBinding, KEY_BINDINGS};
 pub use reduce::reduce;
 pub use render::render;
