@@ -37,6 +37,11 @@ codypendent-eval = { workspace = true }
 # does (WAL + busy_timeout make the concurrent open safe).
 codypendent-daemon = { workspace = true }
 codypendent-runtime = { workspace = true }
+# The daemon run-loop as a library (`run_daemon`/`init_tracing`), so `codypendent
+# __daemon` runs the SAME daemon in-process — no separate `codypendentd` on disk
+# to go stale. Acyclic: `codypendentd` never depends on `cli`, and every crate it
+# pulls in is already a `cli` dependency, so this adds no new external crate.
+codypendent-codypendentd = { workspace = true }
 # The measured `ModelProfile` the bench produces and persists (its types are
 # named in `models_bench`); a leaf crate, no cycle.
 codypendent-routing = { workspace = true }

@@ -66,6 +66,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum TopCommand {
+    /// Run the daemon in-process. `codypendent __daemon` *is* the daemon — the
+    /// hidden self-spawn target `ensure_daemon` launches as `current_exe
+    /// __daemon`, so an updated `codypendent` always runs a matching daemon.
+    /// Hidden from `--help`; behaves exactly like the standalone `codypendentd`.
+    #[command(name = "__daemon", hide = true)]
+    InternalDaemon,
     /// Manage the codypendentd daemon.
     Daemon {
         #[command(subcommand)]
@@ -549,6 +555,18 @@ enum EventsFormat {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // `codypendent __daemon` *is* the daemon (the hidden self-spawn target of
+    // `ensure_daemon`). Dispatch it before any TUI/theme setup so it behaves
+    // exactly like the standalone `codypendentd` binary: init the daemon's
+    // tracing, resolve paths, run the loop to shutdown.
+    if matches!(cli.command, Some(TopCommand::InternalDaemon)) {
+        codypendent_codypendentd::init_tracing();
+        let paths = RuntimePaths::resolve()?;
+        paths.ensure_directories()?;
+        return codypendent_codypendentd::run_daemon(paths).await;
+    }
+
     let paths = RuntimePaths::resolve()?;
     // `--theme` wins over `CODYPENDENT_THEME`; an empty value from either
     // source falls through to the other (see `theme_select::resolve_theme_override`
@@ -560,6 +578,9 @@ async fn main() -> anyhow::Result<()> {
         return tui::run(&paths, std::env::current_dir()?, theme_override).await;
     };
     match command {
+        // Dispatched before the match (see the early return in `main`); a
+        // parsed `InternalDaemon` never reaches here.
+        TopCommand::InternalDaemon => unreachable!("__daemon is dispatched before the match"),
         TopCommand::Daemon { command } => match command {
             DaemonCommand::Start => commands::start(&paths).await,
             DaemonCommand::Stop => commands::stop(&paths).await,
@@ -711,5 +732,28 @@ async fn main() -> anyhow::Result<()> {
             let (binary, name) = ide.binary_and_name();
             commands::open(&paths, session_id, binary, name, repo).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn daemon_subcommand_parses_to_internal_daemon() {
+        // `codypendent __daemon` is the hidden self-spawn target; it must parse.
+        let cli = Cli::try_parse_from(["codypendent", "__daemon"]).expect("__daemon must parse");
+        assert!(matches!(cli.command, Some(TopCommand::InternalDaemon)));
+    }
+
+    #[test]
+    fn internal_daemon_is_hidden_from_help() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+        assert!(
+            !help.contains("__daemon"),
+            "the __daemon subcommand must be hidden from --help, got:\n{help}"
+        );
     }
 }
