@@ -11,6 +11,10 @@ license.workspace = true
 name = "codypendentd"
 path = "src/main.rs"
 
+[lib]
+name = "codypendent_codypendentd"
+path = "src/lib.rs"
+
 [dependencies]
 codypendent-daemon = { workspace = true }
 codypendent-runtime = { workspace = true }

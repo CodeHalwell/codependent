@@ -32,16 +32,17 @@ pub(crate) enum EnsureOutcome {
     Started { pid: u32 },
 }
 
-/// Spawn `codypendentd` detached if nothing answers Ping yet, then wait for
-/// the socket to come up (5 second budget). No I/O beyond the daemon's own
-/// log file — callers decide how (or whether) to report the outcome.
+/// Spawn the daemon (`codypendent __daemon`, this binary itself) detached if
+/// nothing answers Ping yet, then wait for the socket to come up (5 second
+/// budget). No I/O beyond the daemon's own log file — callers decide how (or
+/// whether) to report the outcome.
 pub(crate) async fn ensure_daemon(paths: &RuntimePaths) -> anyhow::Result<EnsureOutcome> {
     if client::ping(&paths.socket_path).await {
         return Ok(EnsureOutcome::AlreadyRunning);
     }
     paths.ensure_directories()?;
 
-    let daemon_binary = resolve_daemon_binary();
+    let invocation = resolve_daemon_binary();
     let log_path = paths.log_dir.join("daemon.log");
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -49,7 +50,7 @@ pub(crate) async fn ensure_daemon(paths: &RuntimePaths) -> anyhow::Result<Ensure
         .open(&log_path)?;
     let log_for_stderr = log.try_clone()?;
 
-    let mut command = std::process::Command::new(&daemon_binary);
+    let mut command = daemon_command(&invocation);
     command
         .stdin(std::process::Stdio::null())
         .stdout(log)
@@ -62,7 +63,7 @@ pub(crate) async fn ensure_daemon(paths: &RuntimePaths) -> anyhow::Result<Ensure
     }
     let child = command
         .spawn()
-        .with_context(|| format!("failed to spawn {}", daemon_binary.display()))?;
+        .with_context(|| format!("failed to spawn {}", invocation.program.display()))?;
 
     for _ in 0..50 {
         if client::ping(&paths.socket_path).await {
@@ -76,8 +77,8 @@ pub(crate) async fn ensure_daemon(paths: &RuntimePaths) -> anyhow::Result<Ensure
     )
 }
 
-/// `codypendent daemon start`: spawn `codypendentd` detached, then wait for
-/// the socket to answer Ping (5 second budget).
+/// `codypendent daemon start`: spawn the daemon (`codypendent __daemon`, this
+/// binary) detached, then wait for the socket to answer Ping (5 second budget).
 pub async fn start(paths: &RuntimePaths) -> anyhow::Result<()> {
     match ensure_daemon(paths).await? {
         EnsureOutcome::AlreadyRunning => println!("daemon already running"),
@@ -143,18 +144,49 @@ pub async fn status(paths: &RuntimePaths, json: bool) -> anyhow::Result<bool> {
     }
 }
 
-/// Prefer a `codypendentd` sitting next to this executable (the layout that
-/// `cargo build` and installers both produce); fall back to PATH lookup.
-fn resolve_daemon_binary() -> PathBuf {
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(dir) = current.parent() {
-            let candidate = dir.join("codypendentd");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
+/// How to launch the daemon: the program to run plus the leading args. The
+/// primary form runs THIS binary (`codypendent`) with the hidden `__daemon`
+/// subcommand, so an updated `codypendent` always spawns a matching daemon —
+/// there is no separate `codypendentd` on disk to go stale (the version-skew
+/// bug this design eliminates).
+struct DaemonInvocation {
+    program: PathBuf,
+    args: Vec<String>,
+}
+
+/// Resolve how to launch the daemon. Primary: run this executable itself via
+/// `codypendent __daemon`. Fallback (only when `current_exe` is unavailable — a
+/// rare failure): a `codypendentd` on PATH, launched with no extra args, keeping
+/// the pre-single-binary path working.
+fn resolve_daemon_binary() -> DaemonInvocation {
+    resolve_daemon_invocation(std::env::current_exe())
+}
+
+/// The pure core of [`resolve_daemon_binary`], taking the `current_exe` result
+/// so both the self-spawn and the fallback are unit-testable without depending
+/// on the test binary's own path.
+fn resolve_daemon_invocation(current_exe: std::io::Result<PathBuf>) -> DaemonInvocation {
+    match current_exe {
+        // Run the daemon from THIS binary: `codypendent __daemon`.
+        Ok(program) => DaemonInvocation {
+            program,
+            args: vec!["__daemon".to_string()],
+        },
+        // `current_exe` unavailable: fall back to a `codypendentd` on PATH.
+        Err(_) => DaemonInvocation {
+            program: PathBuf::from("codypendentd"),
+            args: Vec::new(),
+        },
     }
-    PathBuf::from("codypendentd")
+}
+
+/// Build the (unspawned) command that launches the daemon per `invocation`.
+/// Split from [`ensure_daemon`] so a test can assert the resolved program +
+/// argv (`current_exe __daemon`) without spawning a real daemon.
+fn daemon_command(invocation: &DaemonInvocation) -> std::process::Command {
+    let mut command = std::process::Command::new(&invocation.program);
+    command.args(&invocation.args);
+    command
 }
 
 // --- STEP 1.13: headless JSONL client ---------------------------------------
@@ -2315,5 +2347,63 @@ sandbox_profile = "network-client"
         .unwrap();
         let err = plugin_diff(&a, &b).unwrap_err().to_string();
         assert!(err.contains("different plugins"));
+    }
+}
+
+#[cfg(test)]
+mod daemon_spawn_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_self_with_hidden_daemon_subcommand() {
+        let inv = resolve_daemon_invocation(Ok(PathBuf::from("/opt/bin/codypendent")));
+        assert_eq!(inv.program, PathBuf::from("/opt/bin/codypendent"));
+        assert_eq!(inv.args, vec!["__daemon".to_string()]);
+    }
+
+    #[test]
+    fn falls_back_to_path_codypendentd_when_current_exe_unavailable() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "no current_exe");
+        let inv = resolve_daemon_invocation(Err(err));
+        assert_eq!(inv.program, PathBuf::from("codypendentd"));
+        assert!(inv.args.is_empty());
+    }
+
+    #[test]
+    fn resolve_daemon_binary_uses_current_exe() {
+        // In the test process `current_exe` is available, so the primary
+        // self-spawn form is chosen: program == this binary, args == __daemon.
+        let inv = resolve_daemon_binary();
+        assert_eq!(inv.program, std::env::current_exe().unwrap());
+        assert_eq!(inv.args, vec!["__daemon".to_string()]);
+    }
+
+    #[test]
+    fn daemon_command_argv_is_program_then_daemon() {
+        let inv = DaemonInvocation {
+            program: PathBuf::from("/opt/bin/codypendent"),
+            args: vec!["__daemon".to_string()],
+        };
+        let command = daemon_command(&inv);
+        assert_eq!(
+            command.get_program(),
+            std::ffi::OsStr::new("/opt/bin/codypendent")
+        );
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, vec![std::ffi::OsStr::new("__daemon")]);
+    }
+
+    #[test]
+    fn daemon_command_argv_for_the_fallback_has_no_args() {
+        // The `codypendentd` fallback (used when `current_exe` is unavailable)
+        // is the standalone daemon binary, which does NOT parse `__daemon` — so
+        // `daemon_command` must build it with an empty argv.
+        let inv = DaemonInvocation {
+            program: PathBuf::from("codypendentd"),
+            args: vec![],
+        };
+        let command = daemon_command(&inv);
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("codypendentd"));
+        assert_eq!(command.get_args().count(), 0);
     }
 }

@@ -36,6 +36,7 @@ license = "MIT"
 # Internal crates
 codypendent-protocol = { path = "crates/protocol" }
 codypendent-daemon = { path = "crates/daemon" }
+codypendent-codypendentd = { path = "crates/codypendentd" }
 codypendent-tui = { path = "crates/tui" }
 codypendent-runtime = { path = "crates/runtime" }
 codypendent-knowledge = { path = "crates/knowledge" }

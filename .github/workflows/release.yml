@@ -70,8 +70,13 @@ jobs:
         run: |
           dist="codypendent-${{ matrix.target }}"
           mkdir -p "$dist"
+          # The primary artifact is the single self-contained `codypendent`
+          # binary (it runs the daemon from itself via `codypendent __daemon`).
+          # It MUST be present.
           cp "target/${{ matrix.target }}/release/codypendent" "$dist/"
-          cp "target/${{ matrix.target }}/release/codypendentd" "$dist/"
+          # `codypendentd` stays as an OPTIONAL standalone daemon for advanced
+          # use; ship it if this build produced it, but never fail if absent.
+          cp "target/${{ matrix.target }}/release/codypendentd" "$dist/" 2>/dev/null || true
           cp README.md ROADMAP.md "$dist/" 2>/dev/null || true
           tar -czf "$dist.tar.gz" "$dist"
           echo "artifact=$dist.tar.gz" >> "$GITHUB_OUTPUT"
