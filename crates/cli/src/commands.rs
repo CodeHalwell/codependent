@@ -77,8 +77,8 @@ pub(crate) async fn ensure_daemon(paths: &RuntimePaths) -> anyhow::Result<Ensure
     )
 }
 
-/// `codypendent daemon start`: spawn `codypendentd` detached, then wait for
-/// the socket to answer Ping (5 second budget).
+/// `codypendent daemon start`: spawn the daemon (`codypendent __daemon`, this
+/// binary) detached, then wait for the socket to answer Ping (5 second budget).
 pub async fn start(paths: &RuntimePaths) -> anyhow::Result<()> {
     match ensure_daemon(paths).await? {
         EnsureOutcome::AlreadyRunning => println!("daemon already running"),
@@ -2391,5 +2391,19 @@ mod daemon_spawn_tests {
         );
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args, vec![std::ffi::OsStr::new("__daemon")]);
+    }
+
+    #[test]
+    fn daemon_command_argv_for_the_fallback_has_no_args() {
+        // The `codypendentd` fallback (used when `current_exe` is unavailable)
+        // is the standalone daemon binary, which does NOT parse `__daemon` — so
+        // `daemon_command` must build it with an empty argv.
+        let inv = DaemonInvocation {
+            program: PathBuf::from("codypendentd"),
+            args: vec![],
+        };
+        let command = daemon_command(&inv);
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("codypendentd"));
+        assert_eq!(command.get_args().count(), 0);
     }
 }
