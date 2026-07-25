@@ -936,6 +936,13 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
 ///   (`ModelRegistry::client_for` prefers a *present* `auth.json` entry over the
 ///   env var unconditionally) — a real regression a prior review flagged (SDD
 ///   ledger M1) and this function must not reintroduce.
+///
+/// All-or-nothing when a key is entered (SDD ledger M3): `AuthStore::load` is
+/// fallible (a hand-corrupted `auth.json` surfaces as `Err`), so it is called
+/// BEFORE `models.toml` is written — a corrupt pre-existing `auth.json` aborts
+/// the whole add before anything is written, rather than leaving a keyless
+/// `models.toml` entry behind while the key silently fails to save. A keyless
+/// add never loads `auth.json` at all, exactly as before.
 fn write_add_model(
     paths: &RuntimePaths,
     display_id: &str,
@@ -954,6 +961,25 @@ fn write_add_model(
     let data_dir = &paths.data_dir;
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating the data dir {}", data_dir.display()))?;
+
+    // A blank/whitespace-only key is treated exactly like `None` (see the doc
+    // comment's second guard) — filtered up front so the load-order guard right
+    // below and the final write agree on whether a key is really present.
+    let key = api_key.filter(|k| !k.trim().is_empty());
+
+    // M3 (all-or-nothing): when a key is present, load auth.json NOW, before
+    // models.toml is written. `AuthStore::load` is fallible — a hand-corrupted
+    // `auth.json` surfaces as `Err` right here, aborting the whole add before
+    // anything is written, rather than leaving a keyless `models.toml` entry
+    // behind while the key silently fails to save. A keyless add loads no
+    // auth.json at all, exactly as before.
+    let mut auth = key
+        .is_some()
+        .then(|| {
+            AuthStore::load(data_dir)
+                .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))
+        })
+        .transpose()?;
 
     // Resolve the catalog base_url for the chosen provider (built-ins layered with
     // any user providers.toml; a load failure falls back to the built-ins).
@@ -996,12 +1022,13 @@ fn write_add_model(
     std::fs::rename(&models_tmp, &models_path)
         .with_context(|| format!("replacing {}", models_path.display()))?;
 
-    // Store the key (hosted providers only, and only when actually non-blank) in
-    // auth.json at 0600. A missing auth.json loads as an empty store (never an
-    // error); a corrupt one surfaces here rather than being silently discarded.
-    if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
-        let mut auth = AuthStore::load(data_dir)
-            .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
+    // Store the key (hosted providers only) in auth.json at 0600 — loaded
+    // above, BEFORE models.toml was written, so a corrupt pre-existing
+    // auth.json already aborted the whole operation before this point (M3).
+    if let Some(key) = key {
+        let auth = auth
+            .as_mut()
+            .expect("loaded above because `key` is Some (M3 ordering)");
         auth.set(display_id, key);
         auth.save(data_dir)
             .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
@@ -1497,10 +1524,24 @@ fn load_provider_cards(paths: &RuntimePaths) -> Vec<ProviderCard> {
             local: p.local,
             // Adding a model from this provider needs a key iff its first auth
             // method is an API key (local/none/acp/cloud-iam/oauth skip the key
-            // step). `AuthMethod` is already imported in this function.
-            requires_key: matches!(p.auth.first(), Some(AuthMethod::ApiKey { .. })),
+            // step). Extracted to `provider_requires_key` so this derivation has
+            // an isolated unit test against the real `AuthMethod` enum, rather
+            // than only being exercised indirectly through this I/O function.
+            requires_key: provider_requires_key(p),
         })
         .collect()
+}
+
+/// Whether adding a model from `p` needs an API key: its first configured auth
+/// method is `AuthMethod::ApiKey` (a local/no-auth/ACP/cloud-iam/OAuth provider,
+/// or one with no auth methods at all, skips the key step). A tiny pure
+/// expression — no I/O — extracted out of [`load_provider_cards`] so this
+/// bool derivation is directly unit-testable against the real
+/// `codypendent_providers::AuthMethod` enum, independent of that function's
+/// file I/O.
+fn provider_requires_key(p: &codypendent_providers::Provider) -> bool {
+    use codypendent_providers::AuthMethod;
+    matches!(p.auth.first(), Some(AuthMethod::ApiKey { .. }))
 }
 
 /// The provider picker's wire-protocol label — the same kebab-case spelling
@@ -3361,5 +3402,108 @@ steps:
             !paths.data_dir.join("auth.json").exists(),
             "a rejected add writes no auth.json"
         );
+    }
+
+    /// Hard requirement (M3, all-or-nothing): when a non-blank key is entered,
+    /// a pre-existing but CORRUPT `auth.json` must abort the whole add before
+    /// anything is written — never leaving a keyless `models.toml` entry
+    /// behind. This is why `write_add_model` loads `auth.json` (fallible)
+    /// BEFORE writing `models.toml` — see its doc comment.
+    #[test]
+    fn write_add_model_is_all_or_nothing_when_auth_json_is_corrupt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        std::fs::create_dir_all(&paths.data_dir).expect("create data dir");
+        std::fs::write(paths.data_dir.join("auth.json"), b"{ not json")
+            .expect("seed corrupt auth.json");
+
+        let error = write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            Some("sk-secret"),
+        )
+        .expect_err("a corrupt pre-existing auth.json must abort the whole add");
+        assert!(
+            !error.to_string().is_empty(),
+            "the error must carry a user-visible message"
+        );
+        assert!(
+            !paths.data_dir.join("models.toml").exists(),
+            "a corrupt auth.json must abort BEFORE models.toml is written (all-or-nothing)"
+        );
+    }
+
+    // -- provider_requires_key (Task 8 add-model key step derivation) --------
+
+    /// A minimal `Provider` for exercising `provider_requires_key` directly —
+    /// every field but `auth` is irrelevant to that derivation.
+    fn provider_with_auth(
+        auth: Vec<codypendent_providers::AuthMethod>,
+    ) -> codypendent_providers::Provider {
+        codypendent_providers::Provider {
+            id: "test-provider".to_string(),
+            name: "Test Provider".to_string(),
+            protocol: codypendent_providers::Protocol::OpenAiChat,
+            base_url: None,
+            auth,
+            extra_headers: Default::default(),
+            query_params: Default::default(),
+            local: false,
+        }
+    }
+
+    #[test]
+    fn provider_requires_key_is_true_when_first_auth_is_api_key() {
+        use codypendent_providers::AuthMethod;
+        let p = provider_with_auth(vec![AuthMethod::ApiKey {
+            env: vec!["GROQ_API_KEY".to_string()],
+            header: "Authorization".to_string(),
+            prefix: "Bearer ".to_string(),
+        }]);
+        assert!(provider_requires_key(&p));
+    }
+
+    #[test]
+    fn provider_requires_key_is_false_when_first_auth_is_none() {
+        use codypendent_providers::AuthMethod;
+        let p = provider_with_auth(vec![AuthMethod::None]);
+        assert!(!provider_requires_key(&p));
+    }
+
+    #[test]
+    fn provider_requires_key_is_false_for_acp_cloud_iam_and_oauth() {
+        use codypendent_providers::AuthMethod;
+
+        let acp = provider_with_auth(vec![AuthMethod::Acp {
+            command: "gemini".to_string(),
+            args: vec!["--acp".to_string()],
+            env: Default::default(),
+        }]);
+        assert!(!provider_requires_key(&acp));
+
+        let cloud_iam = provider_with_auth(vec![AuthMethod::CloudIam {
+            variant: "aws_sigv4".to_string(),
+            env: Default::default(),
+            scopes: vec![],
+        }]);
+        assert!(!provider_requires_key(&cloud_iam));
+
+        let oauth = provider_with_auth(vec![AuthMethod::OAuth {
+            authorize_url: "https://example.com/authorize".to_string(),
+            token_url: "https://example.com/token".to_string(),
+            client_id: "client".to_string(),
+            scopes: vec![],
+            pkce: true,
+        }]);
+        assert!(!provider_requires_key(&oauth));
+    }
+
+    #[test]
+    fn provider_requires_key_is_false_for_an_empty_auth_list() {
+        let p = provider_with_auth(vec![]);
+        assert!(!provider_requires_key(&p));
     }
 }
