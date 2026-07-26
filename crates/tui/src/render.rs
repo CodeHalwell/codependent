@@ -22,9 +22,9 @@ use codypendent_protocol::{
 
 use crate::reduce::capability_label;
 use crate::state::{
-    filter_models, filter_providers, AppState, DocFocus, DocLeaseState, LayoutMode, ModelCard,
-    ModelLocationLabel, Overlay, PatchSummary, ProviderCard, RunActivity, RunView,
-    StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
+    filter_model_names, filter_models, filter_providers, AppState, DocFocus, DocLeaseState,
+    LayoutMode, ModelCard, ModelLocationLabel, Overlay, PatchSummary, ProviderCard, RunActivity,
+    RunView, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -1002,6 +1002,32 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 &buffer.0,
             );
         }
+        Overlay::AddModelProviderKey {
+            provider_id,
+            buffer,
+        } => {
+            render_masked_prompt(
+                frame,
+                area,
+                theme,
+                &format!(
+                    "API key for {provider_id} (used to list its models; stored locally 0600)"
+                ),
+                &buffer.0,
+            );
+        }
+        Overlay::AddModelQuerying { provider_id, .. } => {
+            render_querying(frame, area, theme, provider_id);
+        }
+        Overlay::AddModelPick {
+            provider_id,
+            models,
+            query,
+            selected,
+            ..
+        } => {
+            render_add_model_pick(frame, area, theme, provider_id, models, query, *selected);
+        }
         Overlay::None => {
             if state.show_approval_modal() {
                 render_approval_modal(frame, area, state, theme);
@@ -1370,12 +1396,9 @@ fn context_label(context_tokens: Option<u64>) -> String {
 
 /// The provider-catalog picker (Task 8): the same filter-line + list/detail
 /// shape as [`render_model_picker`], over [`AppState::providers`] instead of
-/// `models`. Selecting a row stages it on [`AppState::pending_provider`] —
-/// browse/stage only this task; wiring a staged provider into a live run is a
-/// follow-up. There is no "serving run" to compare against (unlike the model
-/// picker's current-run marker), so the current/staged marker instead reflects
-/// [`AppState::pending_provider`] — the provider already staged from a
-/// previous pick. Colors are Theme tokens only (RULE 7).
+/// `models`. `Enter` (or `Tab`) begins the add-model flow for the focused
+/// provider (model-discovery) — the picker no longer stages a provider for
+/// later; it acts immediately. Colors are Theme tokens only (RULE 7).
 fn render_provider_picker(
     frame: &mut Frame,
     area: Rect,
@@ -1426,11 +1449,7 @@ fn render_provider_picker(
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(rows[1]);
 
-    // The provider already staged for the next run, if any — marks the
-    // staged row/detail.
-    let staged = state.pending_provider.as_deref();
-
-    // Left: the filtered provider list (id, staged marker, name + badges).
+    // Left: the filtered provider list (id, name + badges).
     let matches = filter_providers(&state.providers, query);
     let mut items: Vec<ListItem> = Vec::new();
     if state.providers.is_empty() {
@@ -1447,16 +1466,12 @@ fn render_provider_picker(
     for (row, &idx) in matches.iter().enumerate() {
         let card = &state.providers[idx];
         let is_selected = row == selected;
-        let is_staged = staged == Some(card.id.as_str());
         let head = Line::from(vec![
             Span::styled(
                 if is_selected { "› " } else { "  " },
                 Style::default().fg(theme.focus.active),
             ),
-            Span::styled(
-                if is_staged { "● " } else { "  " },
-                Style::default().fg(theme.status.success),
-            ),
+            Span::styled("  ", Style::default().fg(theme.focus.active)),
             Span::styled(
                 truncate(&card.id, 26),
                 Style::default().fg(theme.text.primary),
@@ -1497,23 +1512,12 @@ fn render_provider_picker(
         .style(Style::default().bg(theme.surface.overlay));
     let mut lines: Vec<Line> = Vec::new();
     if let Some(card) = state.focused_provider() {
-        let is_staged = staged == Some(card.id.as_str());
-        lines.push(Line::from(vec![
-            Span::styled(
-                card.id.clone(),
-                Style::default()
-                    .fg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            if is_staged {
-                Span::styled(
-                    "  ● staged".to_owned(),
-                    Style::default().fg(theme.status.success),
-                )
-            } else {
-                Span::raw("")
-            },
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            card.id.clone(),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        )]));
         let field = |k: &str, v: String, color: Color| -> Line {
             Line::from(vec![
                 Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
@@ -1534,7 +1538,7 @@ fn render_provider_picker(
         ));
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "  Enter stages this provider for your next run",
+            "  Enter or Tab — browse this provider's models to add one",
             Style::default().fg(theme.text.muted),
         ));
     } else {
@@ -1545,7 +1549,7 @@ fn render_provider_picker(
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "  ↑/↓ select · Enter stage · Esc close",
+        "  ↑/↓ select · Enter/Tab add model · Esc close",
         Style::default().fg(theme.text.muted),
     ));
     frame.render_widget(
@@ -2647,6 +2651,127 @@ fn render_masked_prompt(frame: &mut Frame, area: Rect, theme: &Theme, title: &st
             .block(block)
             .wrap(Wrap { trim: false }),
         rect,
+    );
+}
+
+/// The transient "Fetching models from <provider>…" box shown while the harness
+/// GETs the provider's `/models` list (model-discovery). Non-interactive except
+/// `Esc`, which cancels the wait. Colors are Theme tokens only (RULE 7). The key
+/// is NOT in scope here (the overlay's `api_key` field is dropped via `..`).
+fn render_querying(frame: &mut Frame, area: Rect, theme: &Theme, provider_id: &str) {
+    // No blank spacer line between the title and the hint (unlike
+    // `render_prompt`'s 3-line shape): at this box's height (`centered_rect(70,
+    // 20, _)`), a typical terminal's interior only fits 2 rows, and a third line
+    // would silently fall off the bottom (ratatui's `Paragraph` clips rather than
+    // scrolling without an explicit offset).
+    let lines = vec![
+        Line::styled(
+            format!("Fetching models from {provider_id}…"),
+            Style::default().fg(theme.text.heading),
+        ),
+        Line::styled("Esc to cancel", Style::default().fg(theme.text.muted)),
+    ];
+    let rect = centered_rect(70, 20, area);
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
+
+/// The add-model pick-list (model-discovery): a filter line over the provider's
+/// fetched model ids, the same shape as [`render_model_picker`] but over plain
+/// `String` names (there is no `ModelCard` detail to show). Colors are Theme
+/// tokens only (RULE 7). The key is NOT in scope here.
+fn render_add_model_pick(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    provider_id: &str,
+    models: &[String],
+    query: &str,
+    selected: usize,
+) {
+    let rect = centered_rect(84, 84, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Add a model from {provider_id} ({}) ", models.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    let filter = Line::from(vec![
+        Span::styled("› ", Style::default().fg(theme.focus.active)),
+        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
+        Span::styled("▏", Style::default().fg(theme.focus.active)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(filter).style(Style::default().bg(theme.surface.overlay)),
+        rows[0],
+    );
+
+    let matches = filter_model_names(models, query);
+    let mut items: Vec<ListItem> = Vec::new();
+    if models.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no models returned",
+            Style::default().fg(theme.text.muted),
+        )));
+    } else if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching model",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate() {
+        let is_selected = row == selected;
+        let head = Line::from(vec![
+            Span::styled(
+                if is_selected { "› " } else { "  " },
+                Style::default().fg(theme.focus.active),
+            ),
+            Span::styled(
+                truncate(&models[idx], 40),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]);
+        let item = ListItem::new(vec![head]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        rows[1],
     );
 }
 
@@ -4332,7 +4457,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_picker_snapshot_shows_rows_staged_marker_and_badges() {
+    fn provider_picker_snapshot_shows_rows_and_badges() {
         // `ProviderCard` is already in scope via the module's own `use
         // crate::state::{..., ProviderCard, ...}` (unlike `GraphEdgeCard`
         // below, which needs its own local import).
@@ -4345,6 +4470,7 @@ mod tests {
                 auth: "api-key: GROQ_API_KEY".to_owned(),
                 local: false,
                 requires_key: true,
+                can_list_models: true,
             },
             ProviderCard {
                 id: "ollama".to_owned(),
@@ -4353,20 +4479,14 @@ mod tests {
                 auth: "none".to_owned(),
                 local: true,
                 requires_key: false,
+                can_list_models: true,
             },
         ];
-        // A previous pick already staged "groq" — that row must render
-        // marked staged.
-        state.pending_provider = Some("groq".to_owned());
         reduce(&mut state, Action::OpenPalette);
         for c in "provider".chars() {
             reduce(&mut state, Action::InputChar(c));
         }
         reduce(&mut state, Action::InputSubmit);
-        // Focus the SECOND row (ollama) — deliberately NOT the staged one
-        // (groq) — so the staged-marker assertions below can only be
-        // satisfied by the list rows themselves, never by the
-        // (ollama-focused) detail panel.
         reduce(&mut state, Action::SelectNext);
         assert!(matches!(state.overlay, Overlay::ProviderPicker { .. }));
 
@@ -4379,19 +4499,6 @@ mod tests {
             text.contains("Ollama (local)"),
             "second row's name missing:\n{text}"
         );
-
-        // Row-scoped, mirroring the model picker's own current-marker check:
-        // only the staged provider's list row shows the leading marker.
-        assert!(
-            text.contains("● groq"),
-            "the list's staged marker is missing from groq's row:\n{text}"
-        );
-        assert!(
-            !text.contains("● ollama"),
-            "the list must not mark the non-staged provider's row staged:\n{text}"
-        );
-
-        // Protocol + auth + local/hosted badges.
         assert!(text.contains("openai-chat"), "protocol missing:\n{text}");
         assert!(
             text.contains("api-key: GROQ_API_KEY"),
@@ -4402,6 +4509,41 @@ mod tests {
         assert!(
             text.contains("local \u{2713}"),
             "local badge missing:\n{text}"
+        );
+        // Staging is gone: no staged marker should render.
+        assert!(
+            !text.contains("● staged"),
+            "the dead staged marker must not render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn provider_picker_hint_says_add_model_not_stage() {
+        let mut state = running_build_state();
+        state.providers = vec![ProviderCard {
+            id: "groq".to_owned(),
+            name: "Groq".to_owned(),
+            protocol: "openai-chat".to_owned(),
+            auth: "api-key: GROQ_API_KEY".to_owned(),
+            local: false,
+            requires_key: true,
+            can_list_models: true,
+        }];
+        reduce(&mut state, Action::OpenPalette);
+        for c in "provider".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputSubmit);
+        assert!(matches!(state.overlay, Overlay::ProviderPicker { .. }));
+
+        let text = render_to_string(&state, 120, 40);
+        assert!(
+            text.contains("add model") || text.contains("browse this provider's models"),
+            "the hint must describe adding a model, not staging:\n{text}"
+        );
+        assert!(
+            !text.contains("stage"),
+            "the dead 'stage' copy must be gone:\n{text}"
         );
     }
 
@@ -4422,6 +4564,72 @@ mod tests {
         assert!(
             !text.contains("sk-secret"),
             "the raw key must never render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn add_model_provider_key_prompt_masks_the_key() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::AddModelProviderKey {
+            provider_id: "groq".to_owned(),
+            buffer: crate::action::SecretKey("sk-secret".to_owned()),
+        };
+        let text = render_to_string(&state, 100, 24);
+        assert!(
+            text.contains("API key for groq"),
+            "the key prompt title:\n{text}"
+        );
+        assert!(
+            text.contains('•'),
+            "the key is masked with bullets:\n{text}"
+        );
+        assert!(
+            !text.contains("sk-secret"),
+            "the raw key must never render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn add_model_querying_box_names_the_provider() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: Some(crate::action::SecretKey("sk-secret".to_owned())),
+        };
+        let text = render_to_string(&state, 80, 24);
+        assert!(
+            text.contains("Fetching models from groq"),
+            "the querying box names the provider:\n{text}"
+        );
+        assert!(text.contains("Esc to cancel"), "the cancel hint:\n{text}");
+        assert!(
+            !text.contains("sk-secret"),
+            "the key must never render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn add_model_pick_lists_and_filters_names() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::AddModelPick {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+            models: vec!["llama-3.1-8b".to_owned(), "gpt-oss-20b".to_owned()],
+            query: "llama".to_owned(),
+            selected: 0,
+        };
+        let text = render_to_string(&state, 100, 30);
+        assert!(
+            text.contains("Add a model from groq"),
+            "the pick-list title:\n{text}"
+        );
+        assert!(
+            text.contains("llama-3.1-8b"),
+            "the matching model lists:\n{text}"
+        );
+        assert!(
+            !text.contains("gpt-oss-20b"),
+            "a non-matching model is filtered out:\n{text}"
         );
     }
 

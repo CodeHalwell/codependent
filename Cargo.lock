@@ -656,6 +656,7 @@ dependencies = [
  "crossterm",
  "directories",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",

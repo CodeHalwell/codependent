@@ -157,19 +157,22 @@ pub enum Overlay {
     /// from the command palette's `/provider` entry. `query` filters by
     /// id/name/protocol substring; `selected` indexes the filtered results
     /// (reset to 0 whenever the query changes) — the same shape as
-    /// [`Overlay::ModelPicker`]. `Enter` stages the focused row on
-    /// [`AppState::pending_provider`] (advisory/browse-only this task; wiring
-    /// a staged provider into a live run is a follow-up).
+    /// [`Overlay::ModelPicker`]. `Enter` (or `Tab`) begins the add-model flow
+    /// for the focused provider (model-discovery).
     ProviderPicker { query: String, selected: usize },
-    /// Add-model flow, step 2 (text prompt): the provider-side model name, for the
-    /// catalog provider chosen in step 1 (`provider_id`). `requires_key` was read
-    /// from that provider's card so submit knows whether step 3 (the key prompt) is
-    /// needed. On submit, a key-requiring provider advances to
-    /// [`Overlay::AddModelKey`]; a local/no-auth one emits `Intent::AddModel`
-    /// directly. A blank name is rejected (the prompt stays open).
+    /// Add-model flow, free-text fallback (step 2): the provider-side model name,
+    /// for the catalog provider chosen in step 1 (`provider_id`). `requires_key`
+    /// was read from that provider's card. `api_key`:
+    ///   `None`    = no key captured yet → today's rule (`requires_key` ? advance
+    ///               to [`Overlay::AddModelKey`] : emit `Intent::AddModel` with `None`).
+    ///   `Some(k)` = key already captured (a can-list provider's failed query fell
+    ///               back here, possibly blank) → emit `AddModel` directly with `k`
+    ///               (blank normalized to `None`), no re-prompt.
+    /// A blank name is rejected (the prompt stays open).
     AddModelId {
         provider_id: String,
         requires_key: bool,
+        api_key: Option<SecretKey>,
         buffer: String,
     },
     /// Add-model flow, step 3 (masked text prompt; key-requiring providers only):
@@ -181,6 +184,34 @@ pub enum Overlay {
         provider_id: String,
         model: String,
         buffer: SecretKey,
+    },
+    /// Add-model flow, key-first masked prompt (hosted, can-list only), shown
+    /// BEFORE the query. `buffer` is the redacting [`SecretKey`] newtype (masked
+    /// in render). On submit: emit `Intent::QueryProviderModels { provider_id,
+    /// api_key }` and open [`Overlay::AddModelQuerying`].
+    AddModelProviderKey {
+        provider_id: String,
+        buffer: SecretKey,
+    },
+    /// Add-model flow, transient "Fetching models from <provider>…" state while
+    /// the harness GETs. Holds `api_key` across the round trip so the fed-back
+    /// `Action` need not carry it. Non-interactive except `Esc` (cancels; a late
+    /// result is ignored via the `provider_id`/overlay match guard).
+    AddModelQuerying {
+        provider_id: String,
+        api_key: Option<SecretKey>,
+    },
+    /// Add-model flow, the model pick-list — fuzzy-filterable like the
+    /// model/provider pickers. `Enter` on a row → `Intent::AddModel { display_id:
+    /// "<provider>/<picked>", provider_id, model: <picked>, api_key }`; `Esc`
+    /// closes. `query` filters `models` by substring; `selected` indexes the
+    /// filtered results (reset to 0 when the query changes).
+    AddModelPick {
+        provider_id: String,
+        api_key: Option<SecretKey>,
+        models: Vec<String>,
+        query: String,
+        selected: usize,
     },
 }
 
@@ -715,6 +746,22 @@ pub(crate) fn filter_models(models: &[ModelCard], query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// The indices into `models` whose name case-insensitively contains `query` —
+/// the add-model pick-list's substring filter, in list order. Mirrors
+/// [`filter_models`] adapted to plain `String` model names (the provider's
+/// `/models` ids are bare strings, not [`ModelCard`]s). An empty query matches
+/// every name.
+#[must_use]
+pub(crate) fn filter_model_names(models: &[String], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    models
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| needle.is_empty() || name.to_lowercase().contains(&needle))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 /// One provider-catalog row for the `/provider` picker projection (Task 8).
 /// The TUI performs no I/O; the CLI harness seeds this from
 /// `codypendent_providers::Catalog` (the built-in ~40-provider catalog,
@@ -736,6 +783,12 @@ pub struct ProviderCard {
     /// method is `ApiKey`). Drives the add-model flow's key step — a local/no-auth/
     /// ACP provider skips it. Set by the CLI harness from the catalog `AuthMethod`.
     pub requires_key: bool,
+    /// Whether this provider can serve an OpenAI-compatible `/models` list:
+    /// protocol is `OpenAiChat`, a `base_url` is set, and the first auth method
+    /// is `ApiKey` or `None` (or absent). Set by the harness
+    /// (`provider_can_list_models`), mirroring `requires_key`. Drives the
+    /// Enter/Tab branch: `true` → live pick-list; `false` → today's free-text flow.
+    pub can_list_models: bool,
 }
 
 /// The indices into `providers` whose id/name/protocol case-insensitively
@@ -868,11 +921,6 @@ pub struct AppState {
     /// picker's live filtered selection by the reducer, mirroring
     /// `selected_model`.
     pub selected_provider: usize,
-    /// The provider staged from the picker (`Enter` on a row). Advisory/
-    /// browse-only this task — nothing yet reads it to change which provider
-    /// serves a run; wiring a staged provider into a live run (including the
-    /// auth state machine) is a follow-up.
-    pub pending_provider: Option<String>,
     /// The focused pane. Vestigial in the conversation-centred shell (the
     /// transcript is the single main surface); retained for catch-up/mouse code.
     pub focus: Pane,
@@ -956,7 +1004,6 @@ impl AppState {
             pending_model: None,
             providers: Vec::new(),
             selected_provider: 0,
-            pending_provider: None,
             focus: Pane::Sessions,
             composer: String::new(),
             layout: LayoutMode::Chat,
@@ -979,24 +1026,29 @@ impl AppState {
             | Overlay::Steering(_)
             | Overlay::DocEdit { .. }
             | Overlay::AddModelId { .. }
-            | Overlay::AddModelKey { .. } => InputMode::Editing,
+            | Overlay::AddModelKey { .. }
+            | Overlay::AddModelProviderKey { .. } => InputMode::Editing,
             Overlay::ConfirmCancel => InputMode::Confirm,
-            // The palette, the model picker, and the provider picker all
-            // filter on printable keys while staying arrow-navigable, so they
-            // share this input mode (see [`crate::input::map_palette_key`]).
+            // The palette, the model picker, the provider picker, and the
+            // add-model pick-list all filter on printable keys while staying
+            // arrow-navigable, so they share this input mode (see
+            // [`crate::input::map_palette_key`]).
             Overlay::Palette { .. }
             | Overlay::ModelPicker { .. }
-            | Overlay::ProviderPicker { .. } => InputMode::Palette,
+            | Overlay::ProviderPicker { .. }
+            | Overlay::AddModelPick { .. } => InputMode::Palette,
             // The Skills / Memory / Docs / Edges / Workflow / Help browsers are
             // navigable with the arrow/command key table, so they stay in `Normal`
-            // mode.
+            // mode. The add-model querying box is likewise non-interactive except
+            // `Esc` (dismiss), so it shares this mode too.
             Overlay::Help
             | Overlay::Skills
             | Overlay::Memory { .. }
             | Overlay::Docs
             | Overlay::Edges
             | Overlay::Workflow
-            | Overlay::Blackboard => InputMode::Normal,
+            | Overlay::Blackboard
+            | Overlay::AddModelQuerying { .. } => InputMode::Normal,
             // The base conversation view: an unresolved approval owns the screen
             // (decision keys only); otherwise the composer captures typed text.
             Overlay::None => {
@@ -1190,6 +1242,94 @@ impl AppState {
             run.transcript.remove(0);
             run.transcript_selected = run.transcript_selected.saturating_sub(1);
             run.scroll = run.scroll.saturating_sub(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`filter_model_names`] mirrors [`filter_models`]/[`filter_providers`]'s
+    /// substring-match shape, adapted to bare `String` model ids (the
+    /// add-model pick-list's fetched names have no [`ModelCard`] wrapper).
+    #[test]
+    fn filter_model_names_matches_case_insensitive_substrings() {
+        let models = vec!["llama-3.1-8b".to_owned(), "gpt-oss-20b".to_owned()];
+        assert_eq!(
+            filter_model_names(&models, ""),
+            vec![0, 1],
+            "an empty query matches every name"
+        );
+        assert_eq!(
+            filter_model_names(&models, "LLAMA"),
+            vec![0],
+            "the match is case-insensitive"
+        );
+        assert_eq!(
+            filter_model_names(&models, "oss"),
+            vec![1],
+            "a mid-string substring matches"
+        );
+        assert!(
+            filter_model_names(&models, "zzz-no-such-model").is_empty(),
+            "no match returns an empty list"
+        );
+    }
+
+    /// Secret hygiene (model discovery): every new overlay that carries a
+    /// [`SecretKey`] — directly or via `AddModelId`'s new `api_key` field — must
+    /// redact it through `Overlay`'s derived `Debug`, exactly like the
+    /// pre-existing `AddModelKey` overlay. `Overlay` derives `Debug` structurally,
+    /// so this holds as long as every such field's own type is `SecretKey` (never
+    /// a raw `String`); asserted directly here rather than only inferred from the
+    /// render tests (which check the SCREEN, not `{:?}`).
+    #[test]
+    fn new_overlays_debug_redacts_the_key() {
+        let cases = [
+            format!(
+                "{:?}",
+                Overlay::AddModelProviderKey {
+                    provider_id: "groq".to_owned(),
+                    buffer: SecretKey("sk-secret".to_owned()),
+                }
+            ),
+            format!(
+                "{:?}",
+                Overlay::AddModelQuerying {
+                    provider_id: "groq".to_owned(),
+                    api_key: Some(SecretKey("sk-secret".to_owned())),
+                }
+            ),
+            format!(
+                "{:?}",
+                Overlay::AddModelPick {
+                    provider_id: "groq".to_owned(),
+                    api_key: Some(SecretKey("sk-secret".to_owned())),
+                    models: vec!["llama-3.1-8b".to_owned()],
+                    query: String::new(),
+                    selected: 0,
+                }
+            ),
+            format!(
+                "{:?}",
+                Overlay::AddModelId {
+                    provider_id: "groq".to_owned(),
+                    requires_key: true,
+                    api_key: Some(SecretKey("sk-secret".to_owned())),
+                    buffer: String::new(),
+                }
+            ),
+        ];
+        for dbg in cases {
+            assert!(
+                !dbg.contains("sk-secret"),
+                "the key must never leak through Debug: {dbg}"
+            );
+            assert!(
+                dbg.contains("<redacted>"),
+                "expected a redaction marker: {dbg}"
+            );
         }
     }
 }

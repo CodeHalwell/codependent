@@ -14,9 +14,9 @@ use codypendent_protocol::{
 
 use crate::action::{Action, Intent, SecretKey};
 use crate::state::{
-    filter_models, filter_providers, AppState, DocBlockView, DocEdit, DocFocus, DocLeaseState,
-    DocSuggestionView, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView,
-    ToolCard, ToolStatus, TranscriptEntry,
+    filter_model_names, filter_models, filter_providers, AppState, DocBlockView, DocEdit, DocFocus,
+    DocLeaseState, DocSuggestionView, Overlay, Pane, PatchSummary, PendingApproval, RunActivity,
+    RunView, ToolCard, ToolStatus, TranscriptEntry,
 };
 
 /// Fold a single [`Action`] into the state. Pure: the only side effect is
@@ -190,6 +190,16 @@ pub fn reduce(state: &mut AppState, action: Action) {
             cost,
             error,
         } => apply_workflow_node_update(state, &node_id, node_state, cost, error),
+
+        // --- model discovery: the harness's fetched-list return path ---
+        Action::ProviderModelsLoaded {
+            provider_id,
+            models,
+        } => on_provider_models_loaded(state, provider_id, models),
+        Action::ProviderModelsFailed {
+            provider_id,
+            reason,
+        } => on_provider_models_failed(state, provider_id, reason),
 
         Action::NoOp => {}
     }
@@ -676,6 +686,19 @@ fn nav(state: &mut AppState, delta: i32) {
             state.selected_provider = indices.get(*selected).copied().unwrap_or(0);
             return;
         }
+        // The add-model pick-list (model-discovery): the same shape as the
+        // model/provider pickers, over the overlay's own `models` field rather
+        // than an `AppState` list.
+        Overlay::AddModelPick {
+            ref query,
+            ref mut selected,
+            ref models,
+            ..
+        } => {
+            let indices = filter_model_names(models, query);
+            step(selected, indices.len(), delta);
+            return;
+        }
         _ => {}
     }
     // Base view: a pending approval owns the arrows (move between stacked
@@ -959,6 +982,16 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
         Overlay::AddModelId { buffer, .. } => edit(buffer),
         // The key buffer is a redacting newtype; edit its inner String.
         Overlay::AddModelKey { buffer, .. } => edit(&mut buffer.0),
+        // The key-first prompt masks a redacting newtype, like `AddModelKey`.
+        Overlay::AddModelProviderKey { buffer, .. } => edit(&mut buffer.0),
+        // The pick-list filters like the model picker: editing the query resets
+        // the selection to the top of the new filtered set.
+        Overlay::AddModelPick {
+            query, selected, ..
+        } => {
+            edit(query);
+            *selected = 0;
+        }
         // Editing the palette query changes the filtered set, so the selection
         // returns to the top rather than pointing past the new results.
         Overlay::Palette { query, selected } => {
@@ -1107,22 +1140,20 @@ fn submit_prompt(state: &mut AppState) {
                 }
             }
         }
-        // Enter stages the focused provider on `pending_provider` and emits a
-        // status notice (Task 8) — browse/stage only this task; wiring a
-        // staged provider into a live run is a follow-up. Re-derives the
-        // filtered list from the overlay's own `query`/`selected` rather than
-        // trusting `selected_provider`, for the same zero-match reason as the
-        // model-picker arm above. `mem::take` already closed the picker (left
-        // the overlay `None`).
+        // Enter begins the add-model flow for the focused provider — the same
+        // branch `Tab` takes (model-discovery). The old `pending_provider`
+        // staging + "applies to your next run" notice are removed: nothing ever
+        // consumed the staged value. Re-derives the filtered selection from the
+        // overlay's own `query`/`selected` (the zero-match guard the model picker
+        // uses); `mem::take` already closed the picker, so `enter_add_model_flow`
+        // sets the next overlay directly.
         Overlay::ProviderPicker { query, selected } => {
             if let Some(&idx) = filter_providers(&state.providers, &query).get(selected) {
                 if let Some(card) = state.providers.get(idx) {
-                    let id = card.id.clone();
-                    state.pending_provider = Some(id.clone());
-                    state.notice = Some((
-                        format!("provider staged: {id} — applies to your next run"),
-                        state.tick + 25,
-                    ));
+                    let provider_id = card.id.clone();
+                    let requires_key = card.requires_key;
+                    let can_list_models = card.can_list_models;
+                    enter_add_model_flow(state, provider_id, requires_key, can_list_models);
                 }
             }
         }
@@ -1170,12 +1201,14 @@ fn submit_prompt(state: &mut AppState) {
                 run.follow = true;
             }
         }
-        // Add-model flow step 2: a hosted provider advances to the masked key
-        // prompt; a local one emits `Intent::AddModel` now. A blank name reopens
-        // the prompt. `mem::take` left the overlay `None`.
+        // Add-model free-text fallback: a captured key emits directly; otherwise
+        // today's rule (hosted → masked key prompt; local → emit now). A blank
+        // name reopens the prompt, carrying any captured key. `mem::take` left
+        // the overlay `None`.
         Overlay::AddModelId {
             provider_id,
             requires_key,
+            api_key,
             buffer,
         } => {
             let model = buffer.trim().to_owned();
@@ -1184,8 +1217,27 @@ fn submit_prompt(state: &mut AppState) {
                 state.overlay = Overlay::AddModelId {
                     provider_id,
                     requires_key,
+                    api_key,
                     buffer: String::new(),
                 };
+            } else if let Some(key) = api_key {
+                // A key was already captured (a can-list provider's failed query
+                // fell back here). Emit directly — never re-prompt. A blank inner
+                // key normalizes to `None`.
+                let display_id = format!("{provider_id}/{model}");
+                let inner = key.0.trim().to_owned();
+                let api_key = if inner.is_empty() {
+                    None
+                } else {
+                    Some(SecretKey(inner))
+                };
+                state.notice = Some((format!("adding model {display_id}"), state.tick + 25));
+                state.outbox.push(Intent::AddModel {
+                    display_id,
+                    provider_id,
+                    model,
+                    api_key,
+                });
             } else if requires_key {
                 state.overlay = Overlay::AddModelKey {
                     provider_id,
@@ -1225,18 +1277,99 @@ fn submit_prompt(state: &mut AppState) {
                 api_key,
             });
         }
+        // Key-first prompt (can-list hosted): emit the query with the entered key
+        // (blank → no key) and open the transient "Fetching…" state, keeping the
+        // key in the overlay for the round trip.
+        Overlay::AddModelProviderKey {
+            provider_id,
+            buffer,
+        } => {
+            let key = buffer.0.trim().to_owned();
+            let api_key = if key.is_empty() {
+                None
+            } else {
+                Some(SecretKey(key))
+            };
+            state.outbox.push(Intent::QueryProviderModels {
+                provider_id: provider_id.clone(),
+                api_key: api_key.clone(),
+            });
+            state.overlay = Overlay::AddModelQuerying {
+                provider_id,
+                api_key,
+            };
+        }
+        // The pick-list: resolve the filtered selection (same zero-match guard as
+        // the model picker) and emit `AddModel` for the chosen name, moving the
+        // stashed key into the intent.
+        Overlay::AddModelPick {
+            provider_id,
+            api_key,
+            models,
+            query,
+            selected,
+        } => {
+            if let Some(&idx) = filter_model_names(&models, &query).get(selected) {
+                if let Some(model) = models.get(idx) {
+                    let model = model.clone();
+                    let display_id = format!("{provider_id}/{model}");
+                    state.notice = Some((format!("adding model {display_id}"), state.tick + 25));
+                    state.outbox.push(Intent::AddModel {
+                        display_id,
+                        provider_id,
+                        model,
+                        api_key,
+                    });
+                }
+            }
+        }
         // Nothing to submit; restore the (non-text) overlay we took.
         other => state.overlay = other,
     }
 }
 
-/// Begin the add-model flow (`Tab` in the `/provider` picker): open the model-name
-/// prompt for the focused catalog provider, carrying its `requires_key` so the flow
-/// knows whether a key step follows. A no-op outside the provider picker, or when
-/// the filtered selection matches no provider (the same zero-match guard the
-/// Enter-stage arm uses).
+/// The shared add-model entry, called by both `Tab` (`begin_add_model`) and
+/// `Enter` (the `ProviderPicker` submit arm). Branches on the focused provider's
+/// gates (model-discovery):
+/// - can-list + hosted → key-first masked prompt (the key is needed before the
+///   model name exists), which on submit queries `<base_url>/models`.
+/// - can-list + local/no-auth → query immediately (no key).
+/// - cannot-list → today's free-text `AddModelId` flow, unchanged.
+fn enter_add_model_flow(
+    state: &mut AppState,
+    provider_id: String,
+    requires_key: bool,
+    can_list_models: bool,
+) {
+    state.overlay = if can_list_models && requires_key {
+        Overlay::AddModelProviderKey {
+            provider_id,
+            buffer: SecretKey(String::new()),
+        }
+    } else if can_list_models {
+        state.outbox.push(Intent::QueryProviderModels {
+            provider_id: provider_id.clone(),
+            api_key: None,
+        });
+        Overlay::AddModelQuerying {
+            provider_id,
+            api_key: None,
+        }
+    } else {
+        Overlay::AddModelId {
+            provider_id,
+            requires_key,
+            api_key: None,
+            buffer: String::new(),
+        }
+    };
+}
+
+/// Begin the add-model flow (`Tab` in the `/provider` picker) for the focused
+/// catalog provider. A no-op outside the provider picker, or when the filtered
+/// selection matches no provider (the same zero-match guard the Enter arm uses).
 fn begin_add_model(state: &mut AppState) {
-    let (provider_id, requires_key) = {
+    let (provider_id, requires_key, can_list_models) = {
         let Overlay::ProviderPicker { query, selected } = &state.overlay else {
             return;
         };
@@ -1244,15 +1377,81 @@ fn begin_add_model(state: &mut AppState) {
             return;
         };
         match state.providers.get(idx) {
-            Some(card) => (card.id.clone(), card.requires_key),
+            Some(card) => (card.id.clone(), card.requires_key, card.can_list_models),
             None => return,
         }
     };
-    state.overlay = Overlay::AddModelId {
-        provider_id,
-        requires_key,
-        buffer: String::new(),
-    };
+    enter_add_model_flow(state, provider_id, requires_key, can_list_models);
+}
+
+/// Fold a fetched provider model list into the in-flight query overlay
+/// (model-discovery). Moves the stashed `api_key` from `AddModelQuerying` into
+/// the pick-list so the round-trip `Action` never carries the key. If the
+/// overlay is no longer the matching `AddModelQuerying` (the user dismissed or
+/// opened something else, or this is a stale result for another provider), the
+/// result is ignored — the race guard.
+fn on_provider_models_loaded(state: &mut AppState, provider_id: String, models: Vec<String>) {
+    let matched = matches!(
+        &state.overlay,
+        Overlay::AddModelQuerying { provider_id: pid, .. } if *pid == provider_id
+    );
+    if !matched {
+        return;
+    }
+    if let Overlay::AddModelQuerying {
+        provider_id: pid,
+        api_key,
+    } = std::mem::replace(&mut state.overlay, Overlay::None)
+    {
+        state.overlay = Overlay::AddModelPick {
+            provider_id: pid,
+            api_key,
+            models,
+            query: String::new(),
+            selected: 0,
+        };
+    }
+}
+
+/// Fold a failed model-list query into the free-text fallback (model-discovery):
+/// move the stashed `api_key` from `AddModelQuerying` into `AddModelId` so a
+/// hosted provider is never asked for its key twice, and surface a key-free
+/// notice. Ignored (race guard) if the overlay no longer matches.
+///
+/// `requires_key` is derived from the provider's own catalog card, not from
+/// whether this particular query happened to carry a key: a hosted provider
+/// queried with a blank key still requires one on the free-text fallback, so
+/// the flow re-prompts for it instead of silently adding a keyless model that
+/// can only fail later at run time.
+fn on_provider_models_failed(state: &mut AppState, provider_id: String, reason: String) {
+    let matched = matches!(
+        &state.overlay,
+        Overlay::AddModelQuerying { provider_id: pid, .. } if *pid == provider_id
+    );
+    if !matched {
+        return;
+    }
+    if let Overlay::AddModelQuerying {
+        provider_id: pid,
+        api_key,
+    } = std::mem::replace(&mut state.overlay, Overlay::None)
+    {
+        let requires_key = state
+            .providers
+            .iter()
+            .find(|c| c.id == provider_id)
+            .map_or(api_key.is_some(), |c| c.requires_key);
+        state.notice = Some((
+            format!("couldn't fetch models ({reason}); type the model name"),
+            state.tick + 25,
+        ));
+        state.overlay = Overlay::AddModelId {
+            provider_id: pid,
+            requires_key,
+            api_key,
+            buffer: String::new(),
+        };
+    }
 }
 
 /// Run a command chosen from the palette. Each maps onto the same effect its
@@ -3591,6 +3790,10 @@ mod tests {
             auth: auth.to_owned(),
             local,
             requires_key: auth.starts_with("api-key"),
+            // Mirrors the harness gate closely enough for reducer tests: an
+            // OpenAI-compatible provider with an api-key/none auth badge lists.
+            can_list_models: protocol == "openai-chat"
+                && (auth.starts_with("api-key") || auth == "none"),
         }
     }
 
@@ -3697,7 +3900,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_picker_enter_stages_the_focused_provider_and_emits_a_notice() {
+    fn provider_picker_enter_begins_the_flow_for_the_focused_provider() {
         let mut s = AppState::new();
         s.providers = vec![
             provider_card(
@@ -3710,28 +3913,33 @@ mod tests {
             provider_card("ollama", "Ollama (local)", "openai-chat", "none", true),
         ];
         open_provider_picker(&mut s);
-        reduce(&mut s, Action::SelectNext); // focus "ollama"
-        reduce(&mut s, Action::InputSubmit); // stage it
+        reduce(&mut s, Action::SelectNext); // focus "ollama" (can-list local)
+        reduce(&mut s, Action::InputSubmit); // Enter begins the flow
 
-        assert_eq!(s.overlay, Overlay::None, "the picker closes on select");
-        assert_eq!(s.pending_provider.as_deref(), Some("ollama"));
-        let notice = s.notice.as_ref().expect("a visible notice").0.clone();
-        assert!(
-            notice.contains("ollama"),
-            "the notice names the staged provider: {notice}"
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelQuerying {
+                provider_id: "ollama".to_owned(),
+                api_key: None,
+            },
+            "the picker gives way to the add-model flow, not a staged marker"
         );
-        assert!(
-            notice.contains("next run"),
-            "the notice explains staging is advisory: {notice}"
+        assert_eq!(
+            s.outbox,
+            vec![Intent::QueryProviderModels {
+                provider_id: "ollama".to_owned(),
+                api_key: None,
+            }]
         );
     }
 
     #[test]
-    fn provider_picker_enter_with_zero_matches_stages_nothing() {
+    fn provider_picker_enter_with_zero_matches_begins_nothing() {
         // Regression (mirrors the model-picker's own regression test):
         // `selected_provider`'s `.unwrap_or(0)` fallback (see `nav` and
         // `edit_prompt`) points at the full list's row 0 whenever the live
-        // query matches nothing — Enter must NOT silently stage that row.
+        // query matches nothing — Enter must NOT silently begin the flow for
+        // that row.
         let mut s = AppState::new();
         s.providers = vec![
             provider_card(
@@ -3754,23 +3962,15 @@ mod tests {
 
         reduce(&mut s, Action::InputSubmit);
 
-        assert_eq!(
-            s.overlay,
-            Overlay::None,
-            "the picker still closes (mirrors the palette's no-match submit)"
-        );
+        assert_eq!(s.overlay, Overlay::None, "the picker still closes");
         assert!(
-            s.pending_provider.is_none(),
-            "a zero-match submit must not silently stage providers[0]"
-        );
-        assert!(
-            s.notice.is_none(),
-            "a zero-match submit must not emit a staging notice"
+            s.outbox.is_empty(),
+            "a zero-match submit must begin no flow"
         );
     }
 
     #[test]
-    fn provider_picker_escape_closes_without_staging() {
+    fn provider_picker_escape_closes_the_picker() {
         let mut s = AppState::new();
         s.providers = vec![provider_card(
             "groq",
@@ -3782,7 +3982,7 @@ mod tests {
         open_provider_picker(&mut s);
         reduce(&mut s, Action::InputCancel);
         assert_eq!(s.overlay, Overlay::None);
-        assert!(s.pending_provider.is_none(), "Esc must not stage anything");
+        assert!(s.outbox.is_empty(), "Esc begins no flow");
     }
 
     // --- Task 4: the add-model flow (pick provider -> name -> masked key -> emit) ---
@@ -3804,36 +4004,42 @@ mod tests {
         reduce(&mut s, Action::BeginAddModel);
         assert_eq!(
             s.overlay,
-            Overlay::AddModelId {
+            Overlay::AddModelProviderKey {
                 provider_id: "groq".to_owned(),
-                requires_key: true,
-                buffer: String::new(),
+                buffer: SecretKey(String::new()),
             }
         );
         assert_eq!(s.input_mode(), crate::state::InputMode::Editing);
     }
 
     #[test]
-    fn add_model_hosted_flow_prompts_for_a_key_then_emits_the_intent() {
+    fn add_model_cannot_list_hosted_flow_prompts_name_then_key_then_emits() {
         let mut s = AppState::new();
         s.providers = vec![provider_card(
-            "groq",
-            "Groq",
-            "openai-chat",
-            "api-key: GROQ_API_KEY",
+            "anthropic",
+            "Anthropic",
+            "anthropic",
+            "api-key: ANTHROPIC_API_KEY",
             false,
         )];
         open_provider_picker(&mut s);
-        reduce(&mut s, Action::BeginAddModel);
-        for c in "llama-3.1-8b".chars() {
+        reduce(&mut s, Action::BeginAddModel); // cannot-list → free-text name prompt
+        assert!(matches!(
+            s.overlay,
+            Overlay::AddModelId {
+                requires_key: true,
+                ..
+            }
+        ));
+        for c in "claude-haiku-4.5".chars() {
             reduce(&mut s, Action::InputChar(c));
         }
-        reduce(&mut s, Action::InputSubmit); // step 2 → step 3 (masked key)
+        reduce(&mut s, Action::InputSubmit); // name → masked key
         assert_eq!(
             s.overlay,
             Overlay::AddModelKey {
-                provider_id: "groq".to_owned(),
-                model: "llama-3.1-8b".to_owned(),
+                provider_id: "anthropic".to_owned(),
+                model: "claude-haiku-4.5".to_owned(),
                 buffer: SecretKey(String::new()),
             }
         );
@@ -3842,31 +4048,31 @@ mod tests {
         for c in "sk-secret".chars() {
             reduce(&mut s, Action::InputChar(c));
         }
-        reduce(&mut s, Action::InputSubmit); // step 3 → emit
+        reduce(&mut s, Action::InputSubmit); // key → emit
         assert_eq!(s.overlay, Overlay::None);
         assert_eq!(
             s.outbox,
             vec![Intent::AddModel {
-                display_id: "groq/llama-3.1-8b".to_owned(),
-                provider_id: "groq".to_owned(),
-                model: "llama-3.1-8b".to_owned(),
+                display_id: "anthropic/claude-haiku-4.5".to_owned(),
+                provider_id: "anthropic".to_owned(),
+                model: "claude-haiku-4.5".to_owned(),
                 api_key: Some(SecretKey("sk-secret".to_owned())),
             }]
         );
     }
 
     #[test]
-    fn add_model_local_provider_skips_the_key_step_and_emits_no_key() {
+    fn add_model_cannot_list_keyless_flow_skips_the_key_step() {
         let mut s = AppState::new();
         s.providers = vec![provider_card(
-            "ollama",
-            "Ollama (local)",
-            "openai-chat",
-            "none",
-            true,
+            "claude-code",
+            "Claude Code (ACP)",
+            "acp",
+            "acp: npx",
+            false,
         )];
         open_provider_picker(&mut s);
-        reduce(&mut s, Action::BeginAddModel);
+        reduce(&mut s, Action::BeginAddModel); // cannot-list, no key → name prompt
         assert!(matches!(
             s.overlay,
             Overlay::AddModelId {
@@ -3874,7 +4080,7 @@ mod tests {
                 ..
             }
         ));
-        for c in "qwen2.5-coder".chars() {
+        for c in "some-model".chars() {
             reduce(&mut s, Action::InputChar(c));
         }
         reduce(&mut s, Action::InputSubmit); // no key step → emit directly
@@ -3882,9 +4088,9 @@ mod tests {
         assert_eq!(
             s.outbox,
             vec![Intent::AddModel {
-                display_id: "ollama/qwen2.5-coder".to_owned(),
-                provider_id: "ollama".to_owned(),
-                model: "qwen2.5-coder".to_owned(),
+                display_id: "claude-code/some-model".to_owned(),
+                provider_id: "claude-code".to_owned(),
+                model: "some-model".to_owned(),
                 api_key: None,
             }]
         );
@@ -3894,10 +4100,10 @@ mod tests {
     fn add_model_rejects_a_blank_model_name() {
         let mut s = AppState::new();
         s.providers = vec![provider_card(
-            "groq",
-            "Groq",
-            "openai-chat",
-            "api-key: GROQ_API_KEY",
+            "anthropic",
+            "Anthropic",
+            "anthropic",
+            "api-key: ANTHROPIC_API_KEY",
             false,
         )];
         open_provider_picker(&mut s);
@@ -3915,10 +4121,10 @@ mod tests {
     fn add_model_escape_abandons_the_flow_without_emitting() {
         let mut s = AppState::new();
         s.providers = vec![provider_card(
-            "groq",
-            "Groq",
-            "openai-chat",
-            "api-key: GROQ_API_KEY",
+            "anthropic",
+            "Anthropic",
+            "anthropic",
+            "api-key: ANTHROPIC_API_KEY",
             false,
         )];
         open_provider_picker(&mut s);
@@ -3929,6 +4135,439 @@ mod tests {
         reduce(&mut s, Action::InputCancel); // Esc on the model-name prompt
         assert_eq!(s.overlay, Overlay::None);
         assert!(s.outbox.is_empty());
+    }
+
+    // --- model discovery: Enter/Tab begin the add-model flow ---
+
+    #[test]
+    fn provider_picker_enter_can_list_hosted_opens_the_key_prompt() {
+        let mut s = AppState::new();
+        // groq: openai-chat + api-key → can_list + requires_key.
+        s.providers = vec![provider_card(
+            "groq",
+            "Groq",
+            "openai-chat",
+            "api-key: GROQ_API_KEY",
+            false,
+        )];
+        open_provider_picker(&mut s); // focuses groq
+        reduce(&mut s, Action::InputSubmit); // Enter begins the flow
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelProviderKey {
+                provider_id: "groq".to_owned(),
+                buffer: SecretKey(String::new()),
+            }
+        );
+        assert!(s.outbox.is_empty(), "no query until the key is entered");
+    }
+
+    #[test]
+    fn provider_picker_enter_can_list_local_queries_immediately() {
+        let mut s = AppState::new();
+        // ollama: openai-chat + none → can_list, no key.
+        s.providers = vec![provider_card(
+            "ollama",
+            "Ollama (local)",
+            "openai-chat",
+            "none",
+            true,
+        )];
+        open_provider_picker(&mut s);
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::QueryProviderModels {
+                provider_id: "ollama".to_owned(),
+                api_key: None,
+            }]
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelQuerying {
+                provider_id: "ollama".to_owned(),
+                api_key: None,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_picker_enter_cannot_list_opens_the_free_text_prompt() {
+        let mut s = AppState::new();
+        // anthropic: native protocol → cannot list, but needs a key.
+        s.providers = vec![provider_card(
+            "anthropic",
+            "Anthropic",
+            "anthropic",
+            "api-key: ANTHROPIC_API_KEY",
+            false,
+        )];
+        open_provider_picker(&mut s);
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelId {
+                provider_id: "anthropic".to_owned(),
+                requires_key: true,
+                api_key: None,
+                buffer: String::new(),
+            }
+        );
+        assert!(s.outbox.is_empty(), "the free-text path emits nothing yet");
+    }
+
+    #[test]
+    fn provider_picker_tab_and_enter_take_the_same_branch() {
+        let providers = vec![provider_card(
+            "groq",
+            "Groq",
+            "openai-chat",
+            "api-key: GROQ_API_KEY",
+            false,
+        )];
+
+        let mut via_enter = AppState::new();
+        via_enter.providers = providers.clone();
+        open_provider_picker(&mut via_enter);
+        reduce(&mut via_enter, Action::InputSubmit);
+
+        let mut via_tab = AppState::new();
+        via_tab.providers = providers;
+        open_provider_picker(&mut via_tab);
+        reduce(&mut via_tab, Action::BeginAddModel);
+
+        assert_eq!(via_enter.overlay, via_tab.overlay);
+        assert!(matches!(
+            via_enter.overlay,
+            Overlay::AddModelProviderKey { .. }
+        ));
+    }
+
+    // --- model discovery: Action handlers (isolated, no Enter/Tab flow) ---
+
+    #[test]
+    fn provider_models_loaded_opens_the_pick_list_carrying_the_key() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: Some(SecretKey("sk-secret".to_owned())),
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsLoaded {
+                provider_id: "groq".to_owned(),
+                models: vec!["llama-3.1-8b".to_owned(), "llama-3.3-70b".to_owned()],
+            },
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelPick {
+                provider_id: "groq".to_owned(),
+                api_key: Some(SecretKey("sk-secret".to_owned())),
+                models: vec!["llama-3.1-8b".to_owned(), "llama-3.3-70b".to_owned()],
+                query: String::new(),
+                selected: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_models_loaded_for_a_mismatched_provider_is_ignored() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsLoaded {
+                provider_id: "ollama".to_owned(),
+                models: vec!["qwen".to_owned()],
+            },
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelQuerying {
+                provider_id: "groq".to_owned(),
+                api_key: None,
+            },
+            "a stale result for another provider must not replace the overlay"
+        );
+    }
+
+    #[test]
+    fn provider_models_failed_falls_back_to_free_text_carrying_the_key() {
+        let mut s = AppState::new();
+        // Hosted + listable, and it already has a real key on the failed query —
+        // the card's own `requires_key: true` must agree with `api_key.is_some()`.
+        s.providers = vec![provider_card(
+            "groq",
+            "Groq",
+            "openai-chat",
+            "api-key: GROQ_API_KEY",
+            false,
+        )];
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: Some(SecretKey("sk-secret".to_owned())),
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsFailed {
+                provider_id: "groq".to_owned(),
+                reason: "HTTP 401".to_owned(),
+            },
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelId {
+                provider_id: "groq".to_owned(),
+                requires_key: true,
+                api_key: Some(SecretKey("sk-secret".to_owned())),
+                buffer: String::new(),
+            }
+        );
+        let notice = s.notice.as_ref().expect("a fallback notice").0.clone();
+        assert!(
+            notice.contains("HTTP 401"),
+            "the notice explains why: {notice}"
+        );
+    }
+
+    #[test]
+    fn provider_models_failed_for_a_hosted_provider_blank_key_still_requires_key() {
+        // Regression for the add-model bug: a hosted+listable provider (e.g.
+        // groq) queried with a BLANK key (`api_key: None`) fails (401), and the
+        // free-text fallback must still know this provider needs a key — derived
+        // from the provider's own catalog card, not from whether a key was typed
+        // on this particular query. Getting this wrong lets a keyless, unrunnable
+        // hosted model be added with no way back to the key prompt.
+        let mut s = AppState::new();
+        s.providers = vec![provider_card(
+            "groq",
+            "Groq",
+            "openai-chat",
+            "api-key: GROQ_API_KEY",
+            false,
+        )];
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsFailed {
+                provider_id: "groq".to_owned(),
+                reason: "HTTP 401".to_owned(),
+            },
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelId {
+                provider_id: "groq".to_owned(),
+                requires_key: true,
+                api_key: None,
+                buffer: String::new(),
+            },
+            "a hosted provider must still require a key on fallback even though \
+             this particular query carried none"
+        );
+    }
+
+    #[test]
+    fn provider_models_failed_for_a_local_provider_falls_back_with_no_key() {
+        let mut s = AppState::new();
+        // Local + listable + no-auth — the card's `requires_key: false` must
+        // still hold on fallback.
+        s.providers = vec![provider_card(
+            "ollama",
+            "Ollama (local)",
+            "openai-chat",
+            "none",
+            true,
+        )];
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "ollama".to_owned(),
+            api_key: None,
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsFailed {
+                provider_id: "ollama".to_owned(),
+                reason: "could not connect to the provider".to_owned(),
+            },
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelId {
+                provider_id: "ollama".to_owned(),
+                requires_key: false,
+                api_key: None,
+                buffer: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn provider_models_failed_for_a_mismatched_provider_is_ignored() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsFailed {
+                provider_id: "ollama".to_owned(),
+                reason: "x".to_owned(),
+            },
+        );
+        assert!(matches!(s.overlay, Overlay::AddModelQuerying { .. }));
+    }
+
+    // --- model discovery: new overlay submit arms (isolated) ---
+
+    #[test]
+    fn add_model_provider_key_submit_queries_with_the_key() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelProviderKey {
+            provider_id: "groq".to_owned(),
+            buffer: SecretKey("sk-secret".to_owned()),
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::QueryProviderModels {
+                provider_id: "groq".to_owned(),
+                api_key: Some(SecretKey("sk-secret".to_owned())),
+            }]
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelQuerying {
+                provider_id: "groq".to_owned(),
+                api_key: Some(SecretKey("sk-secret".to_owned())),
+            }
+        );
+    }
+
+    #[test]
+    fn add_model_provider_key_blank_queries_with_no_key() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelProviderKey {
+            provider_id: "groq".to_owned(),
+            buffer: SecretKey(String::new()),
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::QueryProviderModels {
+                provider_id: "groq".to_owned(),
+                api_key: None,
+            }]
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelQuerying {
+                provider_id: "groq".to_owned(),
+                api_key: None,
+            }
+        );
+    }
+
+    #[test]
+    fn add_model_pick_submit_emits_add_model_with_the_key() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelPick {
+            provider_id: "groq".to_owned(),
+            api_key: Some(SecretKey("sk-secret".to_owned())),
+            models: vec!["llama-3.1-8b".to_owned(), "llama-3.3-70b".to_owned()],
+            query: String::new(),
+            selected: 1,
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::None);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::AddModel {
+                display_id: "groq/llama-3.3-70b".to_owned(),
+                provider_id: "groq".to_owned(),
+                model: "llama-3.3-70b".to_owned(),
+                api_key: Some(SecretKey("sk-secret".to_owned())),
+            }]
+        );
+    }
+
+    #[test]
+    fn add_model_pick_zero_match_emits_nothing() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelPick {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+            models: vec!["llama-3.1-8b".to_owned()],
+            query: "zzz-nope".to_owned(),
+            selected: 0,
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::None, "the picker still closes");
+        assert!(s.outbox.is_empty(), "a zero-match submit adds nothing");
+    }
+
+    #[test]
+    fn add_model_pick_filters_and_navigates() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelPick {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+            models: vec!["llama-3.1-8b".to_owned(), "gpt-oss-20b".to_owned()],
+            query: String::new(),
+            selected: 1,
+        };
+        // Typing resets the selection to the top of the new filtered set.
+        for c in "gpt".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        match &s.overlay {
+            Overlay::AddModelPick {
+                query, selected, ..
+            } => {
+                assert_eq!(query, "gpt");
+                assert_eq!(*selected, 0);
+            }
+            other => panic!("expected the pick-list, got {other:?}"),
+        }
+        // Down clamps at the single filtered row.
+        reduce(&mut s, Action::SelectNext);
+        match &s.overlay {
+            Overlay::AddModelPick { selected, .. } => assert_eq!(*selected, 0),
+            other => panic!("expected the pick-list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_model_id_with_a_captured_key_emits_directly_without_re_prompting() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelId {
+            provider_id: "groq".to_owned(),
+            requires_key: true,
+            api_key: Some(SecretKey("sk-secret".to_owned())),
+            buffer: "llama-3.1-8b".to_owned(),
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.overlay,
+            Overlay::None,
+            "no AddModelKey step — key already held"
+        );
+        assert_eq!(
+            s.outbox,
+            vec![Intent::AddModel {
+                display_id: "groq/llama-3.1-8b".to_owned(),
+                provider_id: "groq".to_owned(),
+                model: "llama-3.1-8b".to_owned(),
+                api_key: Some(SecretKey("sk-secret".to_owned())),
+            }]
+        );
     }
 
     #[test]
