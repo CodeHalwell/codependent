@@ -3591,6 +3591,10 @@ mod tests {
             auth: auth.to_owned(),
             local,
             requires_key: auth.starts_with("api-key"),
+            // Mirrors the harness gate closely enough for reducer tests: an
+            // OpenAI-compatible provider with an api-key/none auth badge lists.
+            can_list_models: protocol == "openai-chat"
+                && (auth.starts_with("api-key") || auth == "none"),
         }
     }
 

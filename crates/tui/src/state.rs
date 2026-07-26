@@ -736,6 +736,12 @@ pub struct ProviderCard {
     /// method is `ApiKey`). Drives the add-model flow's key step — a local/no-auth/
     /// ACP provider skips it. Set by the CLI harness from the catalog `AuthMethod`.
     pub requires_key: bool,
+    /// Whether this provider can serve an OpenAI-compatible `/models` list:
+    /// protocol is `OpenAiChat`, a `base_url` is set, and the first auth method
+    /// is `ApiKey` or `None` (or absent). Set by the harness
+    /// (`provider_can_list_models`), mirroring `requires_key`. Drives the
+    /// Enter/Tab branch: `true` → live pick-list; `false` → today's free-text flow.
+    pub can_list_models: bool,
 }
 
 /// The indices into `providers` whose id/name/protocol case-insensitively

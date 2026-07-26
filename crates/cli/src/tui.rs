@@ -1529,6 +1529,11 @@ fn load_provider_cards(paths: &RuntimePaths) -> Vec<ProviderCard> {
             // an isolated unit test against the real `AuthMethod` enum, rather
             // than only being exercised indirectly through this I/O function.
             requires_key: provider_requires_key(p),
+            // Whether the add-model flow can offer a live `/models` pick-list for
+            // this provider (OpenAiChat + base_url + ApiKey/None), vs. the
+            // free-text fallback. Extracted to `provider_can_list_models`, unit
+            // tested against the real enums.
+            can_list_models: provider_can_list_models(p),
         })
         .collect()
 }
@@ -1543,6 +1548,23 @@ fn load_provider_cards(paths: &RuntimePaths) -> Vec<ProviderCard> {
 fn provider_requires_key(p: &codypendent_providers::Provider) -> bool {
     use codypendent_providers::AuthMethod;
     matches!(p.auth.first(), Some(AuthMethod::ApiKey { .. }))
+}
+
+/// Whether adding a model from `p` can use a live `/models` list: the protocol
+/// is OpenAI-compatible (`OpenAiChat`), a non-blank `base_url` is set, and the
+/// first auth method is `ApiKey` or `None` (or there is none at all). Native
+/// (Anthropic/Gemini), ACP, cloud-IAM, and OAuth providers — and any without a
+/// `base_url` — cannot list here and take the free-text path. A tiny pure
+/// expression (no I/O), extracted out of `load_provider_cards` so it is directly
+/// unit-testable against the real `codypendent_providers` enums.
+fn provider_can_list_models(p: &codypendent_providers::Provider) -> bool {
+    use codypendent_providers::{AuthMethod, Protocol};
+    matches!(p.protocol, Protocol::OpenAiChat)
+        && p.base_url.as_deref().is_some_and(|u| !u.trim().is_empty())
+        && matches!(
+            p.auth.first(),
+            Some(AuthMethod::ApiKey { .. } | AuthMethod::None) | None
+        )
 }
 
 /// The provider picker's wire-protocol label — the same kebab-case spelling
@@ -3527,5 +3549,134 @@ steps:
     fn provider_requires_key_is_false_for_an_empty_auth_list() {
         let p = provider_with_auth(vec![]);
         assert!(!provider_requires_key(&p));
+    }
+
+    // -- provider_can_list_models (model-discovery gate) ----------------------
+
+    /// A `Provider` with an explicit protocol + base_url, for exercising
+    /// `provider_can_list_models` (which reads all three of protocol, base_url,
+    /// and the first auth method).
+    fn provider_listable(
+        protocol: codypendent_providers::Protocol,
+        base_url: Option<&str>,
+        auth: Vec<codypendent_providers::AuthMethod>,
+    ) -> codypendent_providers::Provider {
+        codypendent_providers::Provider {
+            id: "test-provider".to_string(),
+            name: "Test Provider".to_string(),
+            protocol,
+            base_url: base_url.map(str::to_string),
+            auth,
+            extra_headers: Default::default(),
+            query_params: Default::default(),
+            local: false,
+        }
+    }
+
+    #[test]
+    fn can_list_models_true_for_openai_chat_with_base_url_and_api_key() {
+        use codypendent_providers::{AuthMethod, Protocol};
+        let p = provider_listable(
+            Protocol::OpenAiChat,
+            Some("https://api.groq.com/openai/v1"),
+            vec![AuthMethod::ApiKey {
+                env: vec!["GROQ_API_KEY".to_string()],
+                header: "Authorization".to_string(),
+                prefix: "Bearer ".to_string(),
+            }],
+        );
+        assert!(provider_can_list_models(&p));
+    }
+
+    #[test]
+    fn can_list_models_true_for_openai_chat_with_base_url_and_no_auth() {
+        use codypendent_providers::{AuthMethod, Protocol};
+        let p = provider_listable(
+            Protocol::OpenAiChat,
+            Some("http://localhost:11434/v1"),
+            vec![AuthMethod::None],
+        );
+        assert!(provider_can_list_models(&p));
+    }
+
+    #[test]
+    fn can_list_models_true_for_openai_chat_with_base_url_and_empty_auth() {
+        use codypendent_providers::Protocol;
+        let p = provider_listable(
+            Protocol::OpenAiChat,
+            Some("http://localhost:1234/v1"),
+            vec![],
+        );
+        assert!(provider_can_list_models(&p));
+    }
+
+    #[test]
+    fn can_list_models_false_without_a_base_url() {
+        use codypendent_providers::{AuthMethod, Protocol};
+        let p = provider_listable(
+            Protocol::OpenAiChat,
+            None,
+            vec![AuthMethod::ApiKey {
+                env: vec!["OPENAI_API_KEY".to_string()],
+                header: "Authorization".to_string(),
+                prefix: "Bearer ".to_string(),
+            }],
+        );
+        assert!(!provider_can_list_models(&p));
+    }
+
+    #[test]
+    fn can_list_models_false_for_a_blank_base_url() {
+        use codypendent_providers::{AuthMethod, Protocol};
+        let p = provider_listable(Protocol::OpenAiChat, Some("   "), vec![AuthMethod::None]);
+        assert!(!provider_can_list_models(&p));
+    }
+
+    #[test]
+    fn can_list_models_false_for_non_openai_chat_protocols() {
+        use codypendent_providers::{AuthMethod, Protocol};
+        for protocol in [Protocol::Anthropic, Protocol::GeminiNative, Protocol::Acp] {
+            let p = provider_listable(
+                protocol,
+                Some("https://api.anthropic.com"),
+                vec![AuthMethod::ApiKey {
+                    env: vec!["ANTHROPIC_API_KEY".to_string()],
+                    header: "x-api-key".to_string(),
+                    prefix: "".to_string(),
+                }],
+            );
+            assert!(
+                !provider_can_list_models(&p),
+                "protocol {protocol:?} must not list"
+            );
+        }
+    }
+
+    #[test]
+    fn can_list_models_false_for_cloud_iam_and_oauth() {
+        use codypendent_providers::{AuthMethod, Protocol};
+        let cloud_iam = provider_listable(
+            Protocol::OpenAiChat,
+            Some("https://bedrock.example/v1"),
+            vec![AuthMethod::CloudIam {
+                variant: "aws_sigv4".to_string(),
+                env: Default::default(),
+                scopes: vec![],
+            }],
+        );
+        assert!(!provider_can_list_models(&cloud_iam));
+
+        let oauth = provider_listable(
+            Protocol::OpenAiChat,
+            Some("https://oauth.example/v1"),
+            vec![AuthMethod::OAuth {
+                authorize_url: "https://example.com/authorize".to_string(),
+                token_url: "https://example.com/token".to_string(),
+                client_id: "client".to_string(),
+                scopes: vec![],
+                pkce: true,
+            }],
+        );
+        assert!(!provider_can_list_models(&oauth));
     }
 }

@@ -4345,6 +4345,7 @@ mod tests {
                 auth: "api-key: GROQ_API_KEY".to_owned(),
                 local: false,
                 requires_key: true,
+                can_list_models: true,
             },
             ProviderCard {
                 id: "ollama".to_owned(),
@@ -4353,6 +4354,7 @@ mod tests {
                 auth: "none".to_owned(),
                 local: true,
                 requires_key: false,
+                can_list_models: true,
             },
         ];
         // A previous pick already staged "groq" — that row must render
