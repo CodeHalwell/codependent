@@ -53,6 +53,10 @@ tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The workspace HTTP stack (rustls, no system OpenSSL), reused for the add-model
+# flow's background `<base_url>/models` GET (model-discovery). The CLI does not
+# depend on it directly yet; the same crate the GitHub client uses.
+reqwest = { workspace = true }
 anyhow = { workspace = true }
 # Resolves the platform config dir for the trusted-publisher key store
 # (`<config_dir>/codypendent/trusted_publishers.toml`), the `models.toml` precedent.

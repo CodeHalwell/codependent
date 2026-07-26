@@ -193,6 +193,10 @@ pub async fn run(
     // event or heartbeat is missed during setup.
     let (out_tx, out_rx) = mpsc::channel::<Envelope>(256);
     let (event_tx, mut event_rx) = mpsc::channel::<ReaderSignal>(256);
+    // A second sender clone for the model-discovery query tasks, which feed
+    // `ReaderSignal::ProviderModels` back into the same loop (the reader task
+    // owns the first clone).
+    let query_tx = event_tx.clone();
     let reader = tokio::spawn(read_loop(read_half, event_tx, out_tx.clone(), client_id));
     let writer = tokio::spawn(write_loop(write_half, out_rx));
 
@@ -221,6 +225,7 @@ pub async fn run(
         &mut state,
         &mut width,
         &mut event_rx,
+        query_tx,
         &mut input_rx,
         &mut ticker,
         &out_tx,
@@ -461,6 +466,7 @@ async fn event_loop(
     state: &mut AppState,
     width: &mut u16,
     event_rx: &mut mpsc::Receiver<ReaderSignal>,
+    query_tx: mpsc::Sender<ReaderSignal>,
     input_rx: &mut mpsc::Receiver<CrosstermEvent>,
     ticker: &mut tokio::time::Interval,
     out_tx: &mpsc::Sender<Envelope>,
@@ -543,6 +549,10 @@ async fn event_loop(
                     lease_id,
                 },
                 Some(ReaderSignal::DocumentLeaseBlocked) => Action::DocumentLeaseBlocked,
+                Some(ReaderSignal::ProviderModels { provider_id, result }) => match result {
+                    Ok(models) => Action::ProviderModelsLoaded { provider_id, models },
+                    Err(reason) => Action::ProviderModelsFailed { provider_id, reason },
+                },
                 Some(ReaderSignal::Catchup(catchup)) => {
                     // Fold the gap replay (the daemon already windowed it to
                     // `(last_seen, through]`, and a too-large gap arrives as a
@@ -637,6 +647,54 @@ async fn event_loop(
                 }
                 continue;
             }
+            // `QueryProviderModels` is the other client-only intent (model
+            // discovery): resolve the catalog provider's base_url + first
+            // api-key header/prefix, then spawn the `<base_url>/models` GET off
+            // the UI thread and feed the result back as
+            // `ReaderSignal::ProviderModels`. Never a daemon command. The spawned
+            // task owns the key for the request and drops it — it is never sent
+            // back.
+            if let Intent::QueryProviderModels {
+                provider_id,
+                api_key,
+            } = &intent
+            {
+                use codypendent_providers::{AuthMethod, Catalog};
+                let catalog =
+                    Catalog::load_with_user_overrides(&paths.data_dir.join("providers.toml"))
+                        .unwrap_or_else(|_| Catalog::builtin());
+                let (base_url, header, prefix) = match catalog.get(provider_id) {
+                    Some(provider) => {
+                        let base = provider.base_url.clone().unwrap_or_default();
+                        let (header, prefix) = match provider.auth.first() {
+                            Some(AuthMethod::ApiKey { header, prefix, .. }) => {
+                                (header.clone(), prefix.clone())
+                            }
+                            _ => ("Authorization".to_string(), "Bearer ".to_string()),
+                        };
+                        (base, header, prefix)
+                    }
+                    None => (
+                        String::new(),
+                        "Authorization".to_string(),
+                        "Bearer ".to_string(),
+                    ),
+                };
+                let provider_id = provider_id.clone();
+                let key = api_key.as_ref().map(|k| k.0.clone());
+                let tx = query_tx.clone();
+                tokio::spawn(async move {
+                    let result =
+                        query_provider_models(&base_url, &header, &prefix, key.as_deref()).await;
+                    let _ = tx
+                        .send(ReaderSignal::ProviderModels {
+                            provider_id,
+                            result,
+                        })
+                        .await;
+                });
+                continue;
+            }
             // The first edit on a document subscribes this client to its live sync
             // stream (a re-attach carrying the grown subscription set) and seeds its
             // replica, so the edit's own resulting sync — and every other writer's —
@@ -712,6 +770,14 @@ enum ReaderSignal {
     /// The daemon refused an edit lease: the block range is held by another writer
     /// (`document.range-leased`) — surfaced as the presence-lite "blocked" signal.
     DocumentLeaseBlocked,
+    /// A provider's fetched model list (model-discovery): the result of the
+    /// spawned `<base_url>/models` GET, keyed by `provider_id`. Mapped by the
+    /// loop's `select!` to `Action::ProviderModelsLoaded` (Ok) /
+    /// `ProviderModelsFailed` (Err). Carries NO key.
+    ProviderModels {
+        provider_id: String,
+        result: Result<Vec<String>, String>,
+    },
     /// The daemon closed the connection.
     Closed,
 }
@@ -1038,6 +1104,98 @@ fn write_add_model(
             .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     }
     Ok(())
+}
+
+/// The provider's OpenAI-compatible model-list URL: `<base_url>/models`. The
+/// catalog `base_url` already carries its version segment (`…/v1`, `…/v4`, …),
+/// so the list route is its sibling `/models` — never `/v1/models` (which would
+/// double the version). A trailing slash is trimmed so the join is exact.
+fn models_url(base_url: &str) -> String {
+    format!("{}/models", base_url.trim_end_matches('/'))
+}
+
+/// Parse an OpenAI/Ollama `/models` response body (`{ "object": "list", "data":
+/// [ { "id": "…" }, … ] }`) into the model ids: trim each, skip blank/missing,
+/// dedup preserving order. An empty result is an `Err` so the reducer's failure
+/// arm routes to the free-text fallback uniformly. A pure function over the body
+/// string — the network GET is in `query_provider_models` — so it is directly
+/// unit-testable. The error strings are generic and never carry a key.
+fn parse_models_response(body: &str) -> Result<Vec<String>, String> {
+    #[derive(serde::Deserialize)]
+    struct ModelsResponse {
+        #[serde(default)]
+        data: Vec<ModelEntry>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ModelEntry {
+        #[serde(default)]
+        id: String,
+    }
+    let parsed: ModelsResponse = serde_json::from_str(body)
+        .map_err(|_| "the provider returned an unexpected response".to_string())?;
+    let mut ids: Vec<String> = Vec::new();
+    for entry in parsed.data {
+        let id = entry.id.trim().to_string();
+        if id.is_empty() || ids.contains(&id) {
+            continue;
+        }
+        ids.push(id);
+    }
+    if ids.is_empty() {
+        return Err("provider returned no models".to_string());
+    }
+    Ok(ids)
+}
+
+/// GET `<base_url>/models` for the add-model flow (model-discovery), applying the
+/// provider's auth header only when a non-blank `api_key` is present (a keyless
+/// OpenAI-compatible endpoint sends none). Bounded at 10s so a hung endpoint
+/// can't wedge the query task. Non-2xx → `Err` with the STATUS ONLY (never the
+/// key); the body is parsed defensively. Every returned `reason` is key-free and
+/// URL-free (send errors map to fixed strings; the auth value is marked
+/// sensitive so reqwest cannot echo it in any error). This is the only I/O in
+/// the model-discovery feature; it runs on a spawned task off the UI thread.
+async fn query_provider_models(
+    base_url: &str,
+    header: &str,
+    prefix: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let url = models_url(base_url);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| "could not build the HTTP client".to_string())?;
+    let mut request = client.get(&url);
+    if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
+        // Mark the auth value sensitive so reqwest redacts it from any error /
+        // debug (mirrors the GitHub client). The key never appears in a reason.
+        match reqwest::header::HeaderValue::from_str(&format!("{prefix}{key}")) {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                request = request.header(header, value);
+            }
+            Err(_) => return Err("the API key is not a valid header value".to_string()),
+        }
+    }
+    let response = request.send().await.map_err(|error| {
+        if error.is_timeout() {
+            "request timed out".to_string()
+        } else if error.is_connect() {
+            "could not connect to the provider".to_string()
+        } else {
+            "the model-list request failed".to_string()
+        }
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status.as_u16()));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|_| "could not read the response body".to_string())?;
+    parse_models_response(&body)
 }
 
 /// The document a doc-editing intent operates on, when it is one the harness must
@@ -3681,5 +3839,73 @@ steps:
             }],
         );
         assert!(!provider_can_list_models(&oauth));
+    }
+
+    // -- models_url + parse_models_response (model-discovery, pure) -----------
+
+    #[test]
+    fn models_url_appends_models_without_doubling_the_version() {
+        // The base_url already carries its version segment; the list route is its
+        // sibling `/models`, never `/v1/models`.
+        assert_eq!(
+            models_url("https://api.groq.com/openai/v1"),
+            "https://api.groq.com/openai/v1/models"
+        );
+        assert_eq!(
+            models_url("http://localhost:11434/v1"),
+            "http://localhost:11434/v1/models"
+        );
+        // A non-`/v1` base (z.ai) must not be forced to `/v1`.
+        assert_eq!(
+            models_url("https://api.z.ai/api/paas/v4"),
+            "https://api.z.ai/api/paas/v4/models"
+        );
+        // A trailing slash is trimmed so the join is exact.
+        assert_eq!(
+            models_url("http://localhost:1234/v1/"),
+            "http://localhost:1234/v1/models"
+        );
+    }
+
+    #[test]
+    fn parse_models_response_extracts_ids_from_the_openai_shape() {
+        let body = r#"{"object":"list","data":[{"id":"llama-3.1-8b"},{"id":"llama-3.3-70b"}]}"#;
+        assert_eq!(
+            parse_models_response(body).expect("parse"),
+            vec!["llama-3.1-8b".to_string(), "llama-3.3-70b".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_models_response_skips_blank_and_dedups_preserving_order() {
+        let body = r#"{"data":[{"id":"a"},{"id":"  "},{"id":""},{"id":"a"},{"id":"b"}]}"#;
+        assert_eq!(
+            parse_models_response(body).expect("parse"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_models_response_errors_on_an_empty_list() {
+        let body = r#"{"object":"list","data":[]}"#;
+        let err = parse_models_response(body).expect_err("empty list must be an error");
+        assert!(err.contains("no models"), "reason: {err}");
+    }
+
+    #[test]
+    fn parse_models_response_errors_when_the_data_key_is_absent() {
+        // `data` is `#[serde(default)]`, so a body missing the key entirely is
+        // still valid JSON (unlike a malformed body) — it must fall through to
+        // the same "no models" error as an explicit empty list, not panic or
+        // silently succeed with an empty `Vec`.
+        let body = r#"{"object":"list"}"#;
+        let err = parse_models_response(body).expect_err("missing data key must be an error");
+        assert!(err.contains("no models"), "reason: {err}");
+    }
+
+    #[test]
+    fn parse_models_response_errors_on_a_malformed_body() {
+        assert!(parse_models_response("not json at all").is_err());
+        assert!(parse_models_response("").is_err());
     }
 }
