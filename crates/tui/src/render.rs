@@ -1538,7 +1538,7 @@ fn render_provider_picker(
         ));
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "  Enter stages this provider for your next run",
+            "  Enter or Tab — browse this provider's models to add one",
             Style::default().fg(theme.text.muted),
         ));
     } else {
@@ -1549,7 +1549,7 @@ fn render_provider_picker(
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "  ↑/↓ select · Enter stage · Esc close",
+        "  ↑/↓ select · Enter/Tab add model · Esc close",
         Style::default().fg(theme.text.muted),
     ));
     frame.render_widget(
@@ -4514,6 +4514,36 @@ mod tests {
         assert!(
             !text.contains("● staged"),
             "the dead staged marker must not render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn provider_picker_hint_says_add_model_not_stage() {
+        let mut state = running_build_state();
+        state.providers = vec![ProviderCard {
+            id: "groq".to_owned(),
+            name: "Groq".to_owned(),
+            protocol: "openai-chat".to_owned(),
+            auth: "api-key: GROQ_API_KEY".to_owned(),
+            local: false,
+            requires_key: true,
+            can_list_models: true,
+        }];
+        reduce(&mut state, Action::OpenPalette);
+        for c in "provider".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputSubmit);
+        assert!(matches!(state.overlay, Overlay::ProviderPicker { .. }));
+
+        let text = render_to_string(&state, 120, 40);
+        assert!(
+            text.contains("add model") || text.contains("browse this provider's models"),
+            "the hint must describe adding a model, not staging:\n{text}"
+        );
+        assert!(
+            !text.contains("stage"),
+            "the dead 'stage' copy must be gone:\n{text}"
         );
     }
 
