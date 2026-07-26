@@ -905,11 +905,14 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             document_id,
             mutation,
         },
-        // `AddModel` is a CLIENT-ONLY intent applied locally by the harness (see the
-        // drain loop's interception); it never becomes a daemon command, so this
-        // mapping is never reached.
+        // `AddModel` and `QueryProviderModels` are CLIENT-ONLY intents applied
+        // locally by the harness (see the drain loop's interceptions); neither
+        // becomes a daemon command, so these mappings are never reached.
         Intent::AddModel { .. } => unreachable!(
             "AddModel is applied locally by the harness (write_add_model), never sent to the daemon"
+        ),
+        Intent::QueryProviderModels { .. } => unreachable!(
+            "QueryProviderModels is applied locally by the harness (background GET), never sent to the daemon"
         ),
     }
 }

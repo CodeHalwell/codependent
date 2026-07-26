@@ -22,9 +22,9 @@ use codypendent_protocol::{
 
 use crate::reduce::capability_label;
 use crate::state::{
-    filter_models, filter_providers, AppState, DocFocus, DocLeaseState, LayoutMode, ModelCard,
-    ModelLocationLabel, Overlay, PatchSummary, ProviderCard, RunActivity, RunView,
-    StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
+    filter_model_names, filter_models, filter_providers, AppState, DocFocus, DocLeaseState,
+    LayoutMode, ModelCard, ModelLocationLabel, Overlay, PatchSummary, ProviderCard, RunActivity,
+    RunView, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -1001,6 +1001,32 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 "API key (stored locally, mode 0600)",
                 &buffer.0,
             );
+        }
+        Overlay::AddModelProviderKey {
+            provider_id,
+            buffer,
+        } => {
+            render_masked_prompt(
+                frame,
+                area,
+                theme,
+                &format!(
+                    "API key for {provider_id} (used to list its models; stored locally 0600)"
+                ),
+                &buffer.0,
+            );
+        }
+        Overlay::AddModelQuerying { provider_id, .. } => {
+            render_querying(frame, area, theme, provider_id);
+        }
+        Overlay::AddModelPick {
+            provider_id,
+            models,
+            query,
+            selected,
+            ..
+        } => {
+            render_add_model_pick(frame, area, theme, provider_id, models, query, *selected);
         }
         Overlay::None => {
             if state.show_approval_modal() {
@@ -2647,6 +2673,127 @@ fn render_masked_prompt(frame: &mut Frame, area: Rect, theme: &Theme, title: &st
             .block(block)
             .wrap(Wrap { trim: false }),
         rect,
+    );
+}
+
+/// The transient "Fetching models from <provider>…" box shown while the harness
+/// GETs the provider's `/models` list (model-discovery). Non-interactive except
+/// `Esc`, which cancels the wait. Colors are Theme tokens only (RULE 7). The key
+/// is NOT in scope here (the overlay's `api_key` field is dropped via `..`).
+fn render_querying(frame: &mut Frame, area: Rect, theme: &Theme, provider_id: &str) {
+    // No blank spacer line between the title and the hint (unlike
+    // `render_prompt`'s 3-line shape): at this box's height (`centered_rect(70,
+    // 20, _)`), a typical terminal's interior only fits 2 rows, and a third line
+    // would silently fall off the bottom (ratatui's `Paragraph` clips rather than
+    // scrolling without an explicit offset).
+    let lines = vec![
+        Line::styled(
+            format!("Fetching models from {provider_id}…"),
+            Style::default().fg(theme.text.heading),
+        ),
+        Line::styled("Esc to cancel", Style::default().fg(theme.text.muted)),
+    ];
+    let rect = centered_rect(70, 20, area);
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
+
+/// The add-model pick-list (model-discovery): a filter line over the provider's
+/// fetched model ids, the same shape as [`render_model_picker`] but over plain
+/// `String` names (there is no `ModelCard` detail to show). Colors are Theme
+/// tokens only (RULE 7). The key is NOT in scope here.
+fn render_add_model_pick(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    provider_id: &str,
+    models: &[String],
+    query: &str,
+    selected: usize,
+) {
+    let rect = centered_rect(84, 84, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Add a model from {provider_id} ({}) ", models.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    let filter = Line::from(vec![
+        Span::styled("› ", Style::default().fg(theme.focus.active)),
+        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
+        Span::styled("▏", Style::default().fg(theme.focus.active)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(filter).style(Style::default().bg(theme.surface.overlay)),
+        rows[0],
+    );
+
+    let matches = filter_model_names(models, query);
+    let mut items: Vec<ListItem> = Vec::new();
+    if models.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no models returned",
+            Style::default().fg(theme.text.muted),
+        )));
+    } else if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching model",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate() {
+        let is_selected = row == selected;
+        let head = Line::from(vec![
+            Span::styled(
+                if is_selected { "› " } else { "  " },
+                Style::default().fg(theme.focus.active),
+            ),
+            Span::styled(
+                truncate(&models[idx], 40),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]);
+        let item = ListItem::new(vec![head]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        rows[1],
     );
 }
 
@@ -4424,6 +4571,72 @@ mod tests {
         assert!(
             !text.contains("sk-secret"),
             "the raw key must never render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn add_model_provider_key_prompt_masks_the_key() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::AddModelProviderKey {
+            provider_id: "groq".to_owned(),
+            buffer: crate::action::SecretKey("sk-secret".to_owned()),
+        };
+        let text = render_to_string(&state, 100, 24);
+        assert!(
+            text.contains("API key for groq"),
+            "the key prompt title:\n{text}"
+        );
+        assert!(
+            text.contains('•'),
+            "the key is masked with bullets:\n{text}"
+        );
+        assert!(
+            !text.contains("sk-secret"),
+            "the raw key must never render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn add_model_querying_box_names_the_provider() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: Some(crate::action::SecretKey("sk-secret".to_owned())),
+        };
+        let text = render_to_string(&state, 80, 24);
+        assert!(
+            text.contains("Fetching models from groq"),
+            "the querying box names the provider:\n{text}"
+        );
+        assert!(text.contains("Esc to cancel"), "the cancel hint:\n{text}");
+        assert!(
+            !text.contains("sk-secret"),
+            "the key must never render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn add_model_pick_lists_and_filters_names() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::AddModelPick {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+            models: vec!["llama-3.1-8b".to_owned(), "gpt-oss-20b".to_owned()],
+            query: "llama".to_owned(),
+            selected: 0,
+        };
+        let text = render_to_string(&state, 100, 30);
+        assert!(
+            text.contains("Add a model from groq"),
+            "the pick-list title:\n{text}"
+        );
+        assert!(
+            text.contains("llama-3.1-8b"),
+            "the matching model lists:\n{text}"
+        );
+        assert!(
+            !text.contains("gpt-oss-20b"),
+            "a non-matching model is filtered out:\n{text}"
         );
     }
 

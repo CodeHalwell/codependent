@@ -159,6 +159,20 @@ pub enum Action {
         error: String,
     },
 
+    /// A provider's model list, fetched by the harness (client-only add-model
+    /// flow). Folds into the in-flight `Overlay::AddModelQuerying` (matched by
+    /// `provider_id`) → `Overlay::AddModelPick`. Carries NO key — the key stays
+    /// in the reducer's `AddModelQuerying` overlay across the round trip.
+    ProviderModelsLoaded {
+        provider_id: String,
+        models: Vec<String>,
+    },
+    /// The model-list query failed (unreachable / non-200 / unparseable / auth
+    /// rejected / empty). `reason` is a human, key-free message. Folds the
+    /// in-flight query into the free-text `Overlay::AddModelId` fallback (carrying
+    /// any already-entered key).
+    ProviderModelsFailed { provider_id: String, reason: String },
+
     /// Toggle the command palette (`/`): a searchable list of every command.
     OpenPalette,
     /// Begin the add-model flow for the focused provider in the `/provider` picker
@@ -299,6 +313,18 @@ pub enum Intent {
         model: String,
         api_key: Option<SecretKey>,
     },
+
+    /// Query a provider's OpenAI-compatible model list (client-only — NOT a
+    /// daemon command). The harness GETs `<base_url>/models` with the provider's
+    /// auth header and feeds the result back as `Action::ProviderModelsLoaded` /
+    /// `ProviderModelsFailed`. `api_key` is the key the user entered for a hosted
+    /// provider (redacted in `Debug`), or `None` for a local/no-auth provider.
+    /// Intercepted in the harness drain loop, mirroring `AddModel`; never mapped
+    /// to a `CommandBody`.
+    QueryProviderModels {
+        provider_id: String,
+        api_key: Option<SecretKey>,
+    },
 }
 
 #[cfg(test)]
@@ -322,6 +348,18 @@ mod tests {
             display_id: "groq/llama".to_string(),
             provider_id: "groq".to_string(),
             model: "llama-3.1-8b".to_string(),
+            api_key: Some(SecretKey("sk-secret".to_string())),
+        };
+        assert!(
+            !format!("{intent:?}").contains("sk-secret"),
+            "the key must never leak through the intent's Debug"
+        );
+    }
+
+    #[test]
+    fn query_provider_models_intent_debug_redacts_the_key() {
+        let intent = Intent::QueryProviderModels {
+            provider_id: "groq".to_string(),
             api_key: Some(SecretKey("sk-secret".to_string())),
         };
         assert!(
