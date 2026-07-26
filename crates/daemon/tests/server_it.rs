@@ -341,6 +341,7 @@ async fn create_attach_and_two_clients_observe_one_event() {
                     session_id,
                     text: "focus on the parser".to_string(),
                     mode: AgentMode::Build,
+                    model: None,
                 },
                 "input-1",
             )),
@@ -483,6 +484,7 @@ async fn a_follow_up_launches_a_new_run_after_a_prior_run() {
             session_id,
             text: "the follow up".to_string(),
             mode: AgentMode::Build,
+            model: None,
         },
         "input",
     )
@@ -589,6 +591,7 @@ async fn a_continuation_inherits_the_session_repository_and_pinned_model() {
             session_id,
             text: "the follow up".to_string(),
             mode: AgentMode::Build,
+            model: None,
         },
         "cont-input",
     )

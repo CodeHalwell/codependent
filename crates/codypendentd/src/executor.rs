@@ -1232,6 +1232,11 @@ async fn queued_run_overrides(
         Ok(codypendent_protocol::CommandBody::StartRun {
             repository, model, ..
         }) => (repository.map(std::path::PathBuf::from), model),
+        // A continuation launched by a `SubmitUserInput` records its OWN
+        // mid-conversation model pin on the command body — recover it so a
+        // crash-relaunched re-pinned run resolves that model, not an unpinned
+        // default. It carries no repository (that stays the session's).
+        Ok(codypendent_protocol::CommandBody::SubmitUserInput { model, .. }) => (None, model),
         _ => (None, None),
     }
 }

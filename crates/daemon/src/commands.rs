@@ -159,6 +159,11 @@ impl CommandProcessor {
                 session_id,
                 text,
                 mode,
+                // `model` (a mid-conversation pin) is persisted verbatim on the
+                // command body — exactly like `StartRun.model` — and recovered by
+                // `session_run_provenance` / `queued_run_overrides`, not written by
+                // the projection path. The ledger row is the same either way.
+                ..
             } => {
                 self.apply_submit_input(pool, &ctx, &command, session_id, text, mode)
                     .await
@@ -1426,17 +1431,25 @@ pub(crate) struct SessionRunProvenance {
     pub model: Option<ModelId>,
 }
 
-/// Recover a session's [`SessionRunProvenance`] from its originating `StartRun`
-/// command. Only a `StartRun` carries a repository/model, so this scans the
-/// session's applied `StartRun` commands newest-first and returns the most
-/// recent one's `repository`/`model` (a session that re-pinned thus inherits its
-/// latest pin; the repository is stable across a session either way). A session
-/// with no applied `StartRun` yields the default (both `None`), so the caller
-/// falls back exactly as an older client's continuation did.
+/// Recover a session's [`SessionRunProvenance`] from its applied command ledger.
+///
+/// **Model** (the pin): the most recent command that carried one — a `StartRun`
+/// *or* a mid-conversation `SubmitUserInput` re-pin — wins, scanning newest-first.
+/// So a session re-pinned mid-conversation inherits its LATEST pin (the switch
+/// sticks for the next follow-up), while a follow-up that carried none never
+/// clobbers the session's current model. A `SubmitUserInput` with no pin
+/// (`model: None`) is transparent to this scan.
+///
+/// **Repository** (stable across a session): only a `StartRun` carries one, so
+/// this takes the most recent `StartRun`'s `repository` — unchanged from before
+/// this function also considered continuations for the model.
+///
+/// A session with no applied `StartRun`/pin yields the default (both `None`), so
+/// the caller falls back exactly as an older client's continuation did.
 ///
 /// The `body LIKE` clause only *bounds* the rows scanned — the command body is
-/// compact JSON, internally tagged `"type":"StartRun"` — while the
-/// deserialize-and-match below is the authoritative extractor.
+/// compact JSON, internally tagged `"type":"StartRun"` / `"type":"SubmitUserInput"`
+/// — while the deserialize-and-match below is the authoritative extractor.
 pub(crate) async fn session_run_provenance(
     pool: &SqlitePool,
     session_id: SessionId,
@@ -1444,21 +1457,49 @@ pub(crate) async fn session_run_provenance(
     let bodies: Vec<(String,)> = sqlx::query_as(
         "SELECT body FROM commands \
          WHERE session_id = ? AND status = 'applied' \
-           AND body LIKE '%\"type\":\"StartRun\"%' \
+           AND (body LIKE '%\"type\":\"StartRun\"%' \
+                OR body LIKE '%\"type\":\"SubmitUserInput\"%') \
          ORDER BY received_at DESC",
     )
     .bind(session_id.to_string())
     .fetch_all(pool)
     .await?;
+    let mut provenance = SessionRunProvenance::default();
+    let mut model_found = false;
+    let mut repository_found = false;
     for (body,) in bodies {
-        if let Ok(CommandBody::StartRun {
-            repository, model, ..
-        }) = serde_json::from_str::<CommandBody>(&body)
-        {
-            return Ok(SessionRunProvenance { repository, model });
+        match serde_json::from_str::<CommandBody>(&body) {
+            // A `StartRun` is authoritative for the repository, and (like any
+            // pinned command) supplies the model when no newer pin was found.
+            Ok(CommandBody::StartRun {
+                repository, model, ..
+            }) => {
+                if !model_found {
+                    provenance.model = model;
+                    model_found = true;
+                }
+                if !repository_found {
+                    provenance.repository = repository;
+                    repository_found = true;
+                }
+            }
+            // A mid-conversation re-pin carries no repository. It only overrides
+            // the model, and only when it actually pinned one — a `None`
+            // follow-up (matched by the catch-all below) is transparent and must
+            // NOT clobber the session's model.
+            Ok(CommandBody::SubmitUserInput {
+                model: Some(model), ..
+            }) if !model_found => {
+                provenance.model = Some(model);
+                model_found = true;
+            }
+            _ => {}
+        }
+        if model_found && repository_found {
+            break;
         }
     }
-    Ok(SessionRunProvenance::default())
+    Ok(provenance)
 }
 
 async fn approval_session(
@@ -1713,6 +1754,7 @@ mod tests {
                         session_id: session,
                         text: "focus on the parser".to_string(),
                         mode: AgentMode::Build,
+                        model: None,
                     },
                     "input",
                 ),
@@ -1781,6 +1823,7 @@ mod tests {
                         session_id: session,
                         text: "keep going".to_string(),
                         mode: AgentMode::Build,
+                        model: None,
                     },
                     "prov-input",
                 ),
@@ -1800,6 +1843,179 @@ mod tests {
             provenance.model,
             Some(ModelId("pinned-model-x".to_string())),
             "the continuation must inherit the session's pinned model"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_run_provenance_follows_a_mid_conversation_repin() {
+        // The instant, same-session model switch: a `SubmitUserInput` that
+        // carries a pin RE-pins the session, so the next follow-up inherits the
+        // LATEST pick (the switch sticks), a further re-pin updates it again, and
+        // an unpinned follow-up never clobbers the current model. The repository
+        // stays the session's originating one throughout.
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "repin-create").await;
+
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "diagnose".to_string(),
+                        mode: AgentMode::Build,
+                        repository: Some("/work/some-checkout".to_string()),
+                        model: Some(ModelId("model-x".to_string())),
+                    },
+                    "repin-start",
+                ),
+            )
+            .await
+            .expect("start run");
+
+        // First re-pick mid-conversation: switch to model-y.
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::SubmitUserInput {
+                        session_id: session,
+                        text: "switch to Y".to_string(),
+                        mode: AgentMode::Build,
+                        model: Some(ModelId("model-y".to_string())),
+                    },
+                    "repin-y",
+                ),
+            )
+            .await
+            .expect("submit input Y");
+
+        let after_y = session_run_provenance(&pool, session)
+            .await
+            .expect("recover provenance");
+        assert_eq!(
+            after_y.model,
+            Some(ModelId("model-y".to_string())),
+            "a mid-conversation re-pin must stick for the next follow-up"
+        );
+        assert_eq!(
+            after_y.repository.as_deref(),
+            Some("/work/some-checkout"),
+            "the repository stays the session's originating one"
+        );
+
+        // Second re-pick: switch again to model-z; the latest pick wins.
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::SubmitUserInput {
+                        session_id: session,
+                        text: "now Z".to_string(),
+                        mode: AgentMode::Build,
+                        model: Some(ModelId("model-z".to_string())),
+                    },
+                    "repin-z",
+                ),
+            )
+            .await
+            .expect("submit input Z");
+
+        let after_z = session_run_provenance(&pool, session)
+            .await
+            .expect("recover provenance");
+        assert_eq!(
+            after_z.model,
+            Some(ModelId("model-z".to_string())),
+            "a second re-pin must update the session's current model"
+        );
+
+        // An unpinned follow-up must NOT clobber the current pin (inherits Z).
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::SubmitUserInput {
+                        session_id: session,
+                        text: "keep going".to_string(),
+                        mode: AgentMode::Build,
+                        model: None,
+                    },
+                    "repin-none",
+                ),
+            )
+            .await
+            .expect("submit input none");
+
+        let after_none = session_run_provenance(&pool, session)
+            .await
+            .expect("recover provenance");
+        assert_eq!(
+            after_none.model,
+            Some(ModelId("model-z".to_string())),
+            "an unpinned follow-up inherits the session's current model, never clobbers it"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_run_provenance_repin_switches_a_session_started_unpinned() {
+        // The user-reported bug, at the daemon level: a session STARTED on the
+        // default (unpinned) model, then the operator re-picks a model
+        // mid-conversation. The re-pick must take effect for the next follow-up
+        // instead of the session forever using the model it started with.
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "unpinned-create").await;
+
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "diagnose".to_string(),
+                        mode: AgentMode::Build,
+                        repository: None,
+                        model: None,
+                    },
+                    "unpinned-start",
+                ),
+            )
+            .await
+            .expect("start run");
+
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::SubmitUserInput {
+                        session_id: session,
+                        text: "use the big model".to_string(),
+                        mode: AgentMode::Build,
+                        model: Some(ModelId("just-picked".to_string())),
+                    },
+                    "unpinned-repin",
+                ),
+            )
+            .await
+            .expect("submit input");
+
+        let provenance = session_run_provenance(&pool, session)
+            .await
+            .expect("recover provenance");
+        assert_eq!(
+            provenance.model,
+            Some(ModelId("just-picked".to_string())),
+            "re-picking a model mid-conversation must switch the session, not be dropped"
         );
     }
 
@@ -2174,6 +2390,7 @@ mod tests {
                         session_id: session,
                         text: "keep going".to_string(),
                         mode: AgentMode::Build,
+                        model: None,
                     },
                     "input",
                 ),

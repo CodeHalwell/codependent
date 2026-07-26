@@ -360,7 +360,7 @@ export type CommandBody =
       subscriptions: Subscription[];
       requested_role: ClientRole;
     }
-  | { type: "SubmitUserInput"; session_id: Uuid; text: string; mode: AgentMode }
+  | { type: "SubmitUserInput"; session_id: Uuid; text: string; mode: AgentMode; model?: string }
   | { type: "StartRun"; session_id: Uuid; objective: string; mode: AgentMode; repository?: string; model?: string }
   | {
       type: "ResolveApproval";

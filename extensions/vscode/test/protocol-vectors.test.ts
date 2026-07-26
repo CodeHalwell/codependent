@@ -618,6 +618,7 @@ function reconstructCommandBody(r: Record<string, unknown>): CommandBody {
         session_id: str(r, "session_id"),
         text: str(r, "text"),
         mode: reconstructAgentMode(rec(r, "mode")),
+        model: optStr(r, "model"),
       };
     case "StartRun":
       return {

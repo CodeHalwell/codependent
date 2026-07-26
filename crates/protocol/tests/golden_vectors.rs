@@ -266,6 +266,7 @@ fn command_vectors() -> Vec<Vector> {
                 session_id: session_id(),
                 text: "try again".to_string(),
                 mode: AgentMode::Build,
+                model: Some(ModelId("claude-sonnet-5".to_string())),
             },
         ),
         vec_of(

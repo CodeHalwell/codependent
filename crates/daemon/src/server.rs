@@ -1535,6 +1535,7 @@ async fn handle_request(
                                         session_id,
                                         text,
                                         mode,
+                                        model,
                                     } => {
                                         let provenance = crate::commands::session_run_provenance(
                                             &state.pool,
@@ -1550,7 +1551,14 @@ async fn handle_request(
                                             repository: resolve_run_repository(
                                                 provenance.repository.as_deref(),
                                             ),
-                                            model: provenance.model,
+                                            // A mid-conversation re-pin runs on
+                                            // exactly the model the operator just
+                                            // picked (instant switch, same
+                                            // session); with none carried, the
+                                            // continuation INHERITS the session's
+                                            // current model from provenance (I-2)
+                                            // — unchanged behavior.
+                                            model: model.clone().or(provenance.model),
                                             prior: Vec::new(),
                                         });
                                     }

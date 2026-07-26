@@ -48,6 +48,20 @@ pub enum CommandBody {
         session_id: SessionId,
         text: String,
         mode: AgentMode,
+        /// The model to **pin** this continuation to (mid-conversation model
+        /// switch). When the operator re-picks a model in the `/model` picker,
+        /// the very next follow-up in the SAME session carries it here so the
+        /// switch is instant — no restart, no new session. `Some(id)` runs this
+        /// continuation on exactly that model AND makes it the session's current
+        /// pin (a later follow-up that carries none inherits it via
+        /// [`session_run_provenance`](crate) recovery). `None` is unchanged
+        /// behavior: the continuation inherits the session's existing model from
+        /// its originating `StartRun`. Mirrors
+        /// [`StartRun.model`](CommandBody::StartRun::model): `#[serde(default)]`
+        /// keeps an older client (which sends none) working — the daemon then
+        /// resolves the model exactly as before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelId>,
     },
     StartRun {
         session_id: SessionId,
@@ -444,6 +458,47 @@ mod tests {
     }
 
     #[test]
+    fn submit_user_input_pins_a_model_when_present_and_omits_it_when_absent() {
+        // A mid-conversation model switch (the re-pick the TUI sends on the very
+        // next follow-up) mirrors `StartRun`'s pin: present on the wire when set
+        // and reparsed exactly, absent (skipped) when None so an older client —
+        // and any continuation that lets the daemon inherit the session's model —
+        // keeps working unchanged.
+        let pinned = CommandBody::SubmitUserInput {
+            session_id: SessionId::new(),
+            text: "switch to the big model".to_string(),
+            mode: AgentMode::Build,
+            model: Some(ModelId("claude-sonnet-5".to_string())),
+        };
+        let json = serde_json::to_string(&pinned).expect("serialize");
+        assert!(
+            json.contains("claude-sonnet-5"),
+            "a re-pinned model is on the wire: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
+            pinned
+        );
+
+        let unpinned = CommandBody::SubmitUserInput {
+            session_id: SessionId::new(),
+            text: "keep going".to_string(),
+            mode: AgentMode::Build,
+            model: None,
+        };
+        let json = serde_json::to_string(&unpinned).expect("serialize");
+        assert!(
+            !json.contains("model"),
+            "an absent pinned model is skipped on the wire: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
+            unpinned,
+            "a payload without the key defaults to None (an older client's shape)"
+        );
+    }
+
+    #[test]
     fn every_command_body_round_trips() {
         round_trip(CommandBody::CreateSession {
             workspace: WorkspaceId::new(),
@@ -459,6 +514,15 @@ mod tests {
             session_id: SessionId::new(),
             text: "try again".to_string(),
             mode: AgentMode::Build,
+            model: Some(ModelId("claude-sonnet-5".to_string())),
+        });
+        // Also round-trip the unpinned continuation (no mid-conversation switch):
+        // the field is absent on the wire and reparses to None.
+        round_trip(CommandBody::SubmitUserInput {
+            session_id: SessionId::new(),
+            text: "try again".to_string(),
+            mode: AgentMode::Build,
+            model: None,
         });
         round_trip(CommandBody::StartRun {
             session_id: SessionId::new(),
