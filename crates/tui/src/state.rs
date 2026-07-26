@@ -157,9 +157,8 @@ pub enum Overlay {
     /// from the command palette's `/provider` entry. `query` filters by
     /// id/name/protocol substring; `selected` indexes the filtered results
     /// (reset to 0 whenever the query changes) — the same shape as
-    /// [`Overlay::ModelPicker`]. `Enter` stages the focused row on
-    /// [`AppState::pending_provider`] (advisory/browse-only this task; wiring
-    /// a staged provider into a live run is a follow-up).
+    /// [`Overlay::ModelPicker`]. `Enter` (or `Tab`) begins the add-model flow
+    /// for the focused provider (model-discovery).
     ProviderPicker { query: String, selected: usize },
     /// Add-model flow, free-text fallback (step 2): the provider-side model name,
     /// for the catalog provider chosen in step 1 (`provider_id`). `requires_key`
@@ -922,11 +921,6 @@ pub struct AppState {
     /// picker's live filtered selection by the reducer, mirroring
     /// `selected_model`.
     pub selected_provider: usize,
-    /// The provider staged from the picker (`Enter` on a row). Advisory/
-    /// browse-only this task — nothing yet reads it to change which provider
-    /// serves a run; wiring a staged provider into a live run (including the
-    /// auth state machine) is a follow-up.
-    pub pending_provider: Option<String>,
     /// The focused pane. Vestigial in the conversation-centred shell (the
     /// transcript is the single main surface); retained for catch-up/mouse code.
     pub focus: Pane,
@@ -1010,7 +1004,6 @@ impl AppState {
             pending_model: None,
             providers: Vec::new(),
             selected_provider: 0,
-            pending_provider: None,
             focus: Pane::Sessions,
             composer: String::new(),
             layout: LayoutMode::Chat,

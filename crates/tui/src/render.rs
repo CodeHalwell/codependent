@@ -1396,12 +1396,9 @@ fn context_label(context_tokens: Option<u64>) -> String {
 
 /// The provider-catalog picker (Task 8): the same filter-line + list/detail
 /// shape as [`render_model_picker`], over [`AppState::providers`] instead of
-/// `models`. Selecting a row stages it on [`AppState::pending_provider`] —
-/// browse/stage only this task; wiring a staged provider into a live run is a
-/// follow-up. There is no "serving run" to compare against (unlike the model
-/// picker's current-run marker), so the current/staged marker instead reflects
-/// [`AppState::pending_provider`] — the provider already staged from a
-/// previous pick. Colors are Theme tokens only (RULE 7).
+/// `models`. `Enter` (or `Tab`) begins the add-model flow for the focused
+/// provider (model-discovery) — the picker no longer stages a provider for
+/// later; it acts immediately. Colors are Theme tokens only (RULE 7).
 fn render_provider_picker(
     frame: &mut Frame,
     area: Rect,
@@ -1452,11 +1449,7 @@ fn render_provider_picker(
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(rows[1]);
 
-    // The provider already staged for the next run, if any — marks the
-    // staged row/detail.
-    let staged = state.pending_provider.as_deref();
-
-    // Left: the filtered provider list (id, staged marker, name + badges).
+    // Left: the filtered provider list (id, name + badges).
     let matches = filter_providers(&state.providers, query);
     let mut items: Vec<ListItem> = Vec::new();
     if state.providers.is_empty() {
@@ -1473,16 +1466,12 @@ fn render_provider_picker(
     for (row, &idx) in matches.iter().enumerate() {
         let card = &state.providers[idx];
         let is_selected = row == selected;
-        let is_staged = staged == Some(card.id.as_str());
         let head = Line::from(vec![
             Span::styled(
                 if is_selected { "› " } else { "  " },
                 Style::default().fg(theme.focus.active),
             ),
-            Span::styled(
-                if is_staged { "● " } else { "  " },
-                Style::default().fg(theme.status.success),
-            ),
+            Span::styled("  ", Style::default().fg(theme.focus.active)),
             Span::styled(
                 truncate(&card.id, 26),
                 Style::default().fg(theme.text.primary),
@@ -1523,23 +1512,12 @@ fn render_provider_picker(
         .style(Style::default().bg(theme.surface.overlay));
     let mut lines: Vec<Line> = Vec::new();
     if let Some(card) = state.focused_provider() {
-        let is_staged = staged == Some(card.id.as_str());
-        lines.push(Line::from(vec![
-            Span::styled(
-                card.id.clone(),
-                Style::default()
-                    .fg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            if is_staged {
-                Span::styled(
-                    "  ● staged".to_owned(),
-                    Style::default().fg(theme.status.success),
-                )
-            } else {
-                Span::raw("")
-            },
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            card.id.clone(),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        )]));
         let field = |k: &str, v: String, color: Color| -> Line {
             Line::from(vec![
                 Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
@@ -4479,7 +4457,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_picker_snapshot_shows_rows_staged_marker_and_badges() {
+    fn provider_picker_snapshot_shows_rows_and_badges() {
         // `ProviderCard` is already in scope via the module's own `use
         // crate::state::{..., ProviderCard, ...}` (unlike `GraphEdgeCard`
         // below, which needs its own local import).
@@ -4504,18 +4482,11 @@ mod tests {
                 can_list_models: true,
             },
         ];
-        // A previous pick already staged "groq" — that row must render
-        // marked staged.
-        state.pending_provider = Some("groq".to_owned());
         reduce(&mut state, Action::OpenPalette);
         for c in "provider".chars() {
             reduce(&mut state, Action::InputChar(c));
         }
         reduce(&mut state, Action::InputSubmit);
-        // Focus the SECOND row (ollama) — deliberately NOT the staged one
-        // (groq) — so the staged-marker assertions below can only be
-        // satisfied by the list rows themselves, never by the
-        // (ollama-focused) detail panel.
         reduce(&mut state, Action::SelectNext);
         assert!(matches!(state.overlay, Overlay::ProviderPicker { .. }));
 
@@ -4528,19 +4499,6 @@ mod tests {
             text.contains("Ollama (local)"),
             "second row's name missing:\n{text}"
         );
-
-        // Row-scoped, mirroring the model picker's own current-marker check:
-        // only the staged provider's list row shows the leading marker.
-        assert!(
-            text.contains("● groq"),
-            "the list's staged marker is missing from groq's row:\n{text}"
-        );
-        assert!(
-            !text.contains("● ollama"),
-            "the list must not mark the non-staged provider's row staged:\n{text}"
-        );
-
-        // Protocol + auth + local/hosted badges.
         assert!(text.contains("openai-chat"), "protocol missing:\n{text}");
         assert!(
             text.contains("api-key: GROQ_API_KEY"),
@@ -4551,6 +4509,11 @@ mod tests {
         assert!(
             text.contains("local \u{2713}"),
             "local badge missing:\n{text}"
+        );
+        // Staging is gone: no staged marker should render.
+        assert!(
+            !text.contains("● staged"),
+            "the dead staged marker must not render:\n{text}"
         );
     }
 
