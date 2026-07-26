@@ -1417,6 +1417,12 @@ fn on_provider_models_loaded(state: &mut AppState, provider_id: String, models: 
 /// move the stashed `api_key` from `AddModelQuerying` into `AddModelId` so a
 /// hosted provider is never asked for its key twice, and surface a key-free
 /// notice. Ignored (race guard) if the overlay no longer matches.
+///
+/// `requires_key` is derived from the provider's own catalog card, not from
+/// whether this particular query happened to carry a key: a hosted provider
+/// queried with a blank key still requires one on the free-text fallback, so
+/// the flow re-prompts for it instead of silently adding a keyless model that
+/// can only fail later at run time.
 fn on_provider_models_failed(state: &mut AppState, provider_id: String, reason: String) {
     let matched = matches!(
         &state.overlay,
@@ -1430,7 +1436,11 @@ fn on_provider_models_failed(state: &mut AppState, provider_id: String, reason: 
         api_key,
     } = std::mem::replace(&mut state.overlay, Overlay::None)
     {
-        let requires_key = api_key.is_some();
+        let requires_key = state
+            .providers
+            .iter()
+            .find(|c| c.id == provider_id)
+            .map_or(api_key.is_some(), |c| c.requires_key);
         state.notice = Some((
             format!("couldn't fetch models ({reason}); type the model name"),
             state.tick + 25,
@@ -4288,6 +4298,15 @@ mod tests {
     #[test]
     fn provider_models_failed_falls_back_to_free_text_carrying_the_key() {
         let mut s = AppState::new();
+        // Hosted + listable, and it already has a real key on the failed query —
+        // the card's own `requires_key: true` must agree with `api_key.is_some()`.
+        s.providers = vec![provider_card(
+            "groq",
+            "Groq",
+            "openai-chat",
+            "api-key: GROQ_API_KEY",
+            false,
+        )];
         s.overlay = Overlay::AddModelQuerying {
             provider_id: "groq".to_owned(),
             api_key: Some(SecretKey("sk-secret".to_owned())),
@@ -4316,8 +4335,57 @@ mod tests {
     }
 
     #[test]
+    fn provider_models_failed_for_a_hosted_provider_blank_key_still_requires_key() {
+        // Regression for the add-model bug: a hosted+listable provider (e.g.
+        // groq) queried with a BLANK key (`api_key: None`) fails (401), and the
+        // free-text fallback must still know this provider needs a key — derived
+        // from the provider's own catalog card, not from whether a key was typed
+        // on this particular query. Getting this wrong lets a keyless, unrunnable
+        // hosted model be added with no way back to the key prompt.
+        let mut s = AppState::new();
+        s.providers = vec![provider_card(
+            "groq",
+            "Groq",
+            "openai-chat",
+            "api-key: GROQ_API_KEY",
+            false,
+        )];
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsFailed {
+                provider_id: "groq".to_owned(),
+                reason: "HTTP 401".to_owned(),
+            },
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelId {
+                provider_id: "groq".to_owned(),
+                requires_key: true,
+                api_key: None,
+                buffer: String::new(),
+            },
+            "a hosted provider must still require a key on fallback even though \
+             this particular query carried none"
+        );
+    }
+
+    #[test]
     fn provider_models_failed_for_a_local_provider_falls_back_with_no_key() {
         let mut s = AppState::new();
+        // Local + listable + no-auth — the card's `requires_key: false` must
+        // still hold on fallback.
+        s.providers = vec![provider_card(
+            "ollama",
+            "Ollama (local)",
+            "openai-chat",
+            "none",
+            true,
+        )];
         s.overlay = Overlay::AddModelQuerying {
             provider_id: "ollama".to_owned(),
             api_key: None,
