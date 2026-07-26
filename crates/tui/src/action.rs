@@ -232,14 +232,21 @@ pub enum Intent {
     /// `mode` field; the session id is supplied by the harness the same way
     /// `StartRun`'s is (see `intent_to_command`).
     ///
-    /// Unlike [`Intent::StartRun`] this carries no `model` (nor repository):
-    /// the daemon is the source of truth for a continuation's provenance and
-    /// INHERITS both the session's pinned model (I-2) and repository (I-1) from
-    /// its originating `StartRun` command server-side — adding either here would
-    /// be a protocol wire change, and the client is not authoritative for them.
+    /// Carries the current pinned `model` so a mid-conversation model switch is
+    /// instant: when the operator re-picks a model in the `/model` picker, the
+    /// very next follow-up in the SAME session runs on it, no restart and no new
+    /// session. `Some(id)` pins this continuation (and becomes the session's
+    /// current model server-side); `None` lets the daemon INHERIT the session's
+    /// existing model (I-2) from its provenance, exactly as before. Repository
+    /// (I-1) is still never carried here: it is stable across a session and the
+    /// client is not authoritative for it.
     SubmitUserInput {
         text: String,
         mode: codypendent_protocol::AgentMode,
+        /// The model the operator pinned via the `/model` picker, carried so a
+        /// re-pick applies to this very follow-up (mid-conversation model
+        /// switch). `None` inherits the session's current model server-side.
+        model: Option<codypendent_protocol::ModelId>,
     },
     /// Resolve a pending approval.
     ResolveApproval {

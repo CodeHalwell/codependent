@@ -151,6 +151,18 @@ pub struct ReconcileReport {
 /// raw `sqlx`/`git` failures are wrapped, never surfaced verbatim to callers.
 #[derive(Debug, thiserror::Error)]
 pub enum WorktreeError {
+    /// `path` is not a Git repository (and none of its parent directories are
+    /// either). Checked up front with `git rev-parse --is-inside-work-tree`
+    /// before any operation that assumes Git is there — every writing run needs
+    /// an isolated worktree (STEP 1.8), so there is no path forward without one
+    /// either way, but this lets the user see actionable guidance instead of the
+    /// raw `git` stderr a downstream `rev-parse HEAD` would otherwise surface.
+    #[error(
+        "{path} is not a git repository. Codypendent isolates each Build run in a git \
+         worktree, so it needs one — open Codypendent inside a git repository, or run \
+         `git init` in this folder first."
+    )]
+    NotAGitRepository { path: PathBuf },
     /// The computed worktree path would sit inside the repository working tree.
     /// Worktrees must live outside it (STEP 1.8 requirement 1).
     #[error("worktree path {worktree} would be nested inside repository {repository}")]
@@ -226,6 +238,21 @@ impl WorktreeManager {
         run_id: RunId,
     ) -> Result<WorkspaceLease, WorktreeError> {
         let repo = tokio::fs::canonicalize(repository).await?;
+
+        // Fail fast with actionable guidance when `repo` is not a Git repository
+        // at all (nor any parent directory), rather than letting the
+        // `rev-parse HEAD` below leak raw `git` stderr ("fatal: not a git
+        // repository (or any of the parent directories): .git") into the run's
+        // error line. Every writing run needs an isolated worktree, so a
+        // non-git directory cannot proceed either way — this only changes what
+        // the user sees.
+        if run_git(&repo, &["rev-parse", "--is-inside-work-tree"])
+            .await
+            .is_err()
+        {
+            return Err(WorktreeError::NotAGitRepository { path: repo });
+        }
+
         let short = short_run_id(run_id);
         let branch = format!("codypendent/run-{short}");
         let worktree_path = self.worktree_path_for(&repo, &short)?;
@@ -932,6 +959,47 @@ mod tests {
             "worktree must live outside the repository tree"
         );
         assert!(!lease.base_commit.is_empty());
+    }
+
+    #[tokio::test]
+    async fn allocate_against_non_git_directory_fails_with_actionable_guidance() {
+        // The usability bug this guards: launching a Build run from a directory
+        // that is not a Git repository must fail with a CLEAR, ACTIONABLE
+        // message naming the path and pointing at `git init` — never the raw
+        // `git rev-parse HEAD` stderr ("fatal: not a git repository...").
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let run_id = seed_run(&pool).await;
+
+        // A plain directory, deliberately NOT `git init`-ed.
+        let not_a_repo = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+
+        let mgr = WorktreeManager::new();
+        let err = mgr
+            .allocate(&pool, &not_a_repo, run_id)
+            .await
+            .expect_err("a non-git directory must not allocate a worktree");
+
+        assert!(
+            matches!(err, WorktreeError::NotAGitRepository { .. }),
+            "expected NotAGitRepository, got {err:?}"
+        );
+
+        let message = err.to_string();
+        let canonical = std::fs::canonicalize(&not_a_repo).unwrap();
+        assert!(
+            message.contains(&canonical.display().to_string()),
+            "message must name the path, got: {message}"
+        );
+        assert!(
+            message.contains("git init"),
+            "message must guide the user to `git init`, got: {message}"
+        );
+        assert!(
+            !message.contains("rev-parse"),
+            "message must not leak the raw git command, got: {message}"
+        );
     }
 
     #[tokio::test]

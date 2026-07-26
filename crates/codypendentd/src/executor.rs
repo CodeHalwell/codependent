@@ -33,7 +33,7 @@ use codypendent_daemon::executor::{PriorTurn, RunExecutor, RunLaunch};
 use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT};
 use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::workflow_stream::{WorkflowHub, WorkflowReader};
-use codypendent_daemon::worktrees::WorktreeManager;
+use codypendent_daemon::worktrees::{WorktreeError, WorktreeManager};
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::github::{GitHubApi, RepoId};
 use codypendent_knowledge::{assemble_context, extract_candidates, Curation, MemoryStore, Scope};
@@ -1102,7 +1102,18 @@ pub(crate) async fn bind_run_worktree(
                 lease: Some(lease.id),
             })
         }
-        Err(error) => Err(format!("could not allocate an isolated worktree: {error}")),
+        Err(error) => {
+            // `NotAGitRepository` is already a complete, actionable message on
+            // its own (names the path, says what to do); prefixing it with
+            // "could not allocate an isolated worktree:" would just repeat
+            // "worktree"/"isolated" and read worse. Every other allocation
+            // failure keeps that explanatory prefix.
+            let message = match &error {
+                WorktreeError::NotAGitRepository { .. } => error.to_string(),
+                _ => format!("could not allocate an isolated worktree: {error}"),
+            };
+            Err(message)
+        }
     }
 }
 
@@ -1221,6 +1232,11 @@ async fn queued_run_overrides(
         Ok(codypendent_protocol::CommandBody::StartRun {
             repository, model, ..
         }) => (repository.map(std::path::PathBuf::from), model),
+        // A continuation launched by a `SubmitUserInput` records its OWN
+        // mid-conversation model pin on the command body — recover it so a
+        // crash-relaunched re-pinned run resolves that model, not an unpinned
+        // default. It carries no repository (that stays the session's).
+        Ok(codypendent_protocol::CommandBody::SubmitUserInput { model, .. }) => (None, model),
         _ => (None, None),
     }
 }
@@ -1579,6 +1595,53 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
             .await
             .unwrap();
         assert_eq!(state, "released");
+    }
+
+    #[tokio::test]
+    async fn build_run_against_non_git_directory_fails_with_actionable_message() {
+        // The usability bug this guards: launching a Build run from a directory
+        // that is not a Git repository used to die with the raw
+        // `git rev-parse HEAD` stderr. `bind_run_worktree` must instead fail the
+        // run with a message that names the path and tells the user what to do —
+        // and must NOT leak `rev-parse` or git's raw "fatal: not a git
+        // repository" text.
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, _artifacts) = test_pool(tmp.path()).await;
+        let not_a_repo = tmp.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+        let run_id = seed_run(&pool).await;
+        let manager = WorktreeManager::new();
+
+        // `.err()` rather than `expect_err` — `WorktreeBinding` (the `Ok` side)
+        // does not derive `Debug`, which `expect_err` requires.
+        let error = bind_run_worktree(
+            &pool,
+            &manager,
+            run_id,
+            run_writes_to_worktree(AgentMode::Build),
+            &not_a_repo,
+        )
+        .await
+        .err()
+        .expect("a non-git directory must fail the run rather than allocate");
+
+        let canonical = std::fs::canonicalize(&not_a_repo).unwrap();
+        assert!(
+            error.contains(&canonical.display().to_string()),
+            "error must name the path, got: {error}"
+        );
+        assert!(
+            error.contains("git init"),
+            "error must guide the user to `git init`, got: {error}"
+        );
+        assert!(
+            !error.contains("rev-parse"),
+            "error must not leak the raw git command, got: {error}"
+        );
+        assert!(
+            !error.contains("fatal: not a git repository"),
+            "error must not leak raw git stderr, got: {error}"
+        );
     }
 
     #[tokio::test]

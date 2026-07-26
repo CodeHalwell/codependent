@@ -341,6 +341,7 @@ async fn create_attach_and_two_clients_observe_one_event() {
                     session_id,
                     text: "focus on the parser".to_string(),
                     mode: AgentMode::Build,
+                    model: None,
                 },
                 "input-1",
             )),
@@ -483,6 +484,7 @@ async fn a_follow_up_launches_a_new_run_after_a_prior_run() {
             session_id,
             text: "the follow up".to_string(),
             mode: AgentMode::Build,
+            model: None,
         },
         "input",
     )
@@ -589,6 +591,7 @@ async fn a_continuation_inherits_the_session_repository_and_pinned_model() {
             session_id,
             text: "the follow up".to_string(),
             mode: AgentMode::Build,
+            model: None,
         },
         "cont-input",
     )
@@ -619,6 +622,129 @@ async fn a_continuation_inherits_the_session_repository_and_pinned_model() {
         model,
         Some(pinned),
         "the continuation inherits the session's pinned model, not None"
+    );
+
+    shutdown(s, task).await;
+}
+
+#[tokio::test]
+async fn a_mid_conversation_repin_applies_instantly() {
+    // Companion to `a_continuation_inherits_the_session_repository_and_pinned_model`
+    // above, which covers the `model: None` (inherit) case. This covers the
+    // complementary `model: Some(_)` (re-pin) case: a follow-up `SubmitUserInput`
+    // that carries its OWN model must launch its run on THAT model — not the
+    // session's original pin. `handle_request` builds this via
+    // `model.clone().or(provenance.model)` (the current command's model wins,
+    // falling back to provenance only when `None`).
+    //
+    // NOTE on this test's discriminating power: reversing the combinator to
+    // `provenance.model.or(model.clone())` does NOT turn this test red. By the
+    // time `handle_request` reaches this arm, `CommandProcessor::apply` has
+    // already committed the current `SubmitUserInput` row as `status =
+    // 'applied'`; `session_run_provenance`'s newest-first scan (it now matches
+    // `SubmitUserInput` rows, not just `StartRun`, since the same fix) then
+    // finds THAT row first and self-referentially resolves `provenance.model`
+    // to this turn's own pinned model — so `provenance.model` and
+    // `model.clone()` already agree whenever the latter is `Some(_)`, and
+    // `Option::or`'s argument order only ever matters when both sides are
+    // `Some` and differ. This was verified empirically (flipping the
+    // combinator, and separately dropping `model.clone()` fallback entirely,
+    // both left this test green). The test is still kept: it pins down the
+    // observable, user-facing contract (a re-pin takes effect THIS turn) that
+    // was untested before, even though it cannot isolate this one combinator's
+    // argument order from `session_run_provenance`'s self-referential recovery.
+    let pinned_y = ModelId("pinned-model-y".to_string());
+    let repin_x = ModelId("repin-model-x".to_string());
+    assert_ne!(
+        pinned_y, repin_x,
+        "the originating pin and the mid-conversation repin must differ"
+    );
+
+    let capture = Arc::new(CapturingExecutor::default());
+    let launches = capture.launches.clone();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server_with_executor(&tmp, capture).await;
+
+    let client = ClientId::new();
+    let mut s = connect(&paths).await;
+    handshake(&mut s, client).await;
+
+    let created = send_recv(
+        &mut s,
+        &Envelope::request(
+            client,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "conversation".to_string(),
+                },
+                "repin-create",
+            )),
+        ),
+    )
+    .await;
+    let session_id = created.session_id.expect("session id in CommandAccepted");
+    attach(
+        &mut s,
+        client,
+        session_id,
+        Some(0),
+        ClientRole::Controller,
+        vec![Subscription::SessionSummary],
+        "repin-attach",
+    )
+    .await;
+
+    // The originating run: pinned to Y.
+    let first_run = command_created_run(
+        &mut s,
+        client,
+        CommandBody::StartRun {
+            session_id,
+            objective: "first objective".to_string(),
+            mode: AgentMode::Build,
+            repository: None,
+            model: Some(pinned_y),
+        },
+        "repin-start",
+    )
+    .await
+    .expect("StartRun creates a run");
+
+    // The follow-up re-pins to X mid-conversation — through the SAME real
+    // request path (`handle_request` / `CommandProcessor::apply`) the adjacent
+    // inherit-case test uses.
+    let second_run = command_created_run(
+        &mut s,
+        client,
+        CommandBody::SubmitUserInput {
+            session_id,
+            text: "switch to X".to_string(),
+            mode: AgentMode::Build,
+            model: Some(repin_x.clone()),
+        },
+        "repin-input",
+    )
+    .await
+    .expect("SubmitUserInput launches a run");
+    assert_ne!(second_run, first_run, "the follow-up starts a distinct run");
+
+    // `spawn_run` is called synchronously while applying the command, before its
+    // `CommandAccepted` is written, so the continuation's launch is already
+    // captured here.
+    let model = {
+        let captured = launches.lock().expect("launches lock");
+        let continuation = captured
+            .iter()
+            .find(|launch| launch.run_id == second_run)
+            .expect("the continuation launch was captured");
+        continuation.model.clone()
+    };
+    assert_eq!(
+        model,
+        Some(repin_x),
+        "a mid-conversation re-pin must take effect on THIS turn, not one turn later"
     );
 
     shutdown(s, task).await;

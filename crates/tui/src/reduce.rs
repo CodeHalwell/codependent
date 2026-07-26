@@ -1147,6 +1147,11 @@ fn submit_prompt(state: &mut AppState) {
                     state.outbox.push(Intent::SubmitUserInput {
                         text,
                         mode: state.default_mode,
+                        // Carry the current pin so a mid-conversation model
+                        // switch is instant: a re-pick applies to THIS very
+                        // follow-up, not just a fresh run. `None` (never pinned)
+                        // inherits the session's model server-side, unchanged.
+                        model: state.pending_model.clone(),
                     });
                 } else {
                     // No run yet this session: nothing to continue — start one.
@@ -3240,10 +3245,60 @@ mod tests {
                 intents.as_slice(),
                 [Intent::SubmitUserInput {
                     text,
-                    mode: AgentMode::Build
+                    mode: AgentMode::Build,
+                    // No model was ever pinned in this session, so the follow-up
+                    // inherits the session's model server-side (carries None).
+                    model: None,
                 }] if text == "follow up"
             ),
             "expected a SubmitUserInput intent, got {intents:?}"
+        );
+    }
+
+    #[test]
+    fn follow_up_carries_the_pinned_model_for_an_instant_switch() {
+        // The mid-conversation model switch: with a run already terminal, a
+        // model pinned via the `/model` picker must ride on the very next
+        // follow-up (`SubmitUserInput.model`), so the switch is instant and
+        // applies in the SAME session rather than being silently dropped.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "fix the bug".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("done".to_owned()),
+                },
+                chronicle: artifact(),
+            }),
+        );
+        assert!(!s.selected_run_is_active(), "the run is terminal");
+
+        // The operator re-picks a model mid-conversation.
+        s.pending_model = Some(codypendent_protocol::ModelId("pinned-model-x".to_owned()));
+
+        for c in "use the big model now".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+
+        let intents = s.drain_outbox();
+        assert!(
+            matches!(
+                intents.as_slice(),
+                [Intent::SubmitUserInput { model: Some(m), .. }]
+                    if m.0 == "pinned-model-x"
+            ),
+            "the follow-up must carry the current pin, got {intents:?}"
         );
     }
 

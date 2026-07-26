@@ -857,18 +857,19 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             model,
         },
         // Task 5 (continuous-session plan): a follow-up once the selected run
-        // is terminal. No `repository`/`model` on this wire shape (unlike
-        // `StartRun`) — and it is NOT a protocol wire change to add them. The
-        // daemon instead RECOVERS the session's provenance from its originating
-        // `StartRun` command and threads the SAME repository (I-1) and pinned
-        // model (I-2) into the continuation launch (see
-        // `commands::session_run_provenance`), so a follow-up runs against the
-        // session's real checkout and stays pinned — not the daemon's frozen
-        // `current_dir()` with the model dropped.
-        Intent::SubmitUserInput { text, mode } => CommandBody::SubmitUserInput {
+        // is terminal. Carries the operator's current `model` pin so a
+        // mid-conversation switch is instant (the re-pick applies to this very
+        // follow-up); `None` lets the daemon INHERIT the session's model (I-2)
+        // from its provenance, unchanged. Repository (I-1) is still not on this
+        // wire shape: the daemon RECOVERS it from the session's originating
+        // `StartRun` (see `commands::session_run_provenance`), so a follow-up
+        // runs against the session's real checkout, not the daemon's frozen
+        // `current_dir()`.
+        Intent::SubmitUserInput { text, mode, model } => CommandBody::SubmitUserInput {
             session_id,
             text,
             mode,
+            model,
         },
         Intent::ResolveApproval {
             approval_id,
@@ -2417,13 +2418,15 @@ mod tests {
         // Task 5 (continuous-session plan): a follow-up after a terminal run
         // maps to `SubmitUserInput`, not `StartRun` — the daemon seeds it from
         // the session's prior turns instead of starting cold. Mirrors
-        // `StartRun`'s `session_id` binding above; unlike `StartRun`, it
-        // carries no `repository`/`model` (the wire shape has neither).
+        // `StartRun`'s `session_id` binding above; the operator's current model
+        // pin threads through so a mid-conversation switch reaches the wire
+        // (repository is still not on this shape).
         assert_eq!(
             intent_to_command(
                 Intent::SubmitUserInput {
                     text: "also add tests".into(),
                     mode: AgentMode::Build,
+                    model: Some(codypendent_protocol::ModelId("pinned-model-x".into())),
                 },
                 session_id,
                 repository,
@@ -2432,6 +2435,25 @@ mod tests {
                 session_id,
                 text: "also add tests".into(),
                 mode: AgentMode::Build,
+                model: Some(codypendent_protocol::ModelId("pinned-model-x".into())),
+            }
+        );
+        // And an unpinned follow-up carries no model on the wire (inherit).
+        assert_eq!(
+            intent_to_command(
+                Intent::SubmitUserInput {
+                    text: "keep going".into(),
+                    mode: AgentMode::Build,
+                    model: None,
+                },
+                session_id,
+                repository,
+            ),
+            CommandBody::SubmitUserInput {
+                session_id,
+                text: "keep going".into(),
+                mode: AgentMode::Build,
+                model: None,
             }
         );
 
