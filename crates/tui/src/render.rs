@@ -20,12 +20,13 @@ use codypendent_protocol::{
     AgentMode, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition, RunState,
 };
 
+use crate::action::Action;
 use crate::input::footer_hints;
 use crate::reduce::capability_label;
 use crate::state::{
     filter_model_names, filter_models, filter_providers, AppState, DocFocus, DocLeaseState,
-    LayoutMode, ModelCard, ModelLocationLabel, Overlay, PatchSummary, ProviderCard, RunActivity,
-    RunView, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
+    LayoutMode, ModelCard, ModelLocationLabel, Overlay, Pane, PatchSummary, ProviderCard,
+    RunActivity, RunView, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -80,6 +81,11 @@ fn render_workspace(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
             Constraint::Percentage(26),
         ])
         .split(area);
+    // Register the whole-pane click-to-focus rects FIRST so each pane's own
+    // finer row hits (registered by the renderers below) win over them.
+    state.register_hit(cols[0], Action::FocusPane(Pane::Sessions));
+    state.register_hit(cols[1], Action::FocusPane(Pane::Transcript));
+    state.register_hit(cols[2], Action::FocusPane(Pane::Approvals));
     render_runs_pane(frame, cols[0], state, theme);
     render_conversation(frame, cols[1], state, theme);
     render_context_pane(frame, cols[2], state, theme);
@@ -118,7 +124,24 @@ fn render_runs_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
             item
         });
     }
+    let inner = block.inner(area);
     frame.render_widget(List::new(items).block(block), area);
+    let base = inner.y + if state.runs.is_empty() { 1 } else { 0 };
+    for (idx, _) in state.runs.iter().enumerate() {
+        let y = base + idx as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
+            Action::SelectRun(idx),
+        );
+    }
 }
 
 /// The context pane (workspace layout): pending approvals over the selected run's
@@ -373,9 +396,17 @@ fn for_each_row<'a>(
                 other => {
                     scratch.clear();
                     entry_lines(other, theme, false, false, &mut scratch);
-                    let _ = (run_idx, selected_run, idx); // hit tagging wired in Task 8
-                    for line in scratch.drain(..) {
-                        visit(Row::built(line));
+                    let hit = if run_idx == selected_run {
+                        fold_hit_entry(other, idx)
+                    } else {
+                        None
+                    };
+                    for (j, line) in scratch.drain(..).enumerate() {
+                        let mut row = Row::built(line);
+                        if j == 0 {
+                            row.hit_entry = hit;
+                        }
+                        visit(row);
                         produced = true;
                     }
                 }
@@ -390,6 +421,22 @@ fn for_each_row<'a>(
         if let Some(status) = activity_status_line(&run.activity, theme) {
             visit(Row::built(status));
         }
+    }
+}
+
+/// The entry index if this entry renders a clickable fold HEAD (its first line):
+/// a backstage summary, a folded (multi-line) note, or a failed-run summary.
+fn fold_hit_entry(entry: &TranscriptEntry, idx: usize) -> Option<usize> {
+    match entry {
+        TranscriptEntry::Backstage { .. } => Some(idx),
+        TranscriptEntry::Note { text, .. } if text.lines().count() > NOTE_INLINE_LINE_THRESHOLD => {
+            Some(idx)
+        }
+        TranscriptEntry::Completed {
+            disposition: RunDisposition::Failed { .. },
+            ..
+        } => Some(idx),
+        _ => None,
     }
 }
 
@@ -501,7 +548,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     // reintroduce the overflow the old implicit coupling merely avoided.
     offset = offset.min(u16::MAX.saturating_sub(inner.height));
 
-    let (mut lines, r0, _hits) = build_transcript_window(
+    let (mut lines, r0, hits) = build_transcript_window(
         &state.runs,
         theme,
         inner_width,
@@ -519,6 +566,25 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         padded.resize(top_pad as usize, Line::raw(""));
         padded.append(&mut lines);
         lines = padded;
+    }
+
+    // Register only the VISIBLE fold-head hits `build_transcript_window` found
+    // (bounded by the viewport, never the whole history — virtualization
+    // preserved). One of `top_pad`/`r0` is always 0 (see their derivation
+    // above), so this formula exactly places a single-row fold head.
+    for (line_index, entry) in &hits {
+        let screen_y = inner.y as i32 + top_pad as i32 + *line_index as i32 - r0 as i32;
+        if screen_y >= inner.y as i32 && screen_y < (inner.y + inner.height) as i32 {
+            state.register_hit(
+                Rect {
+                    x: inner.x,
+                    y: screen_y as u16,
+                    width: inner.width,
+                    height: 1,
+                },
+                Action::ActivateRow(*entry),
+            );
+        }
     }
 
     let paragraph = Paragraph::new(lines)
@@ -588,6 +654,12 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             .wrap(Wrap { trim: false }),
         area,
     );
+    // Belt-and-braces: the full-screen scrim (`render_overlays`) already
+    // returns to typing on an outside click; this covers the composer
+    // specifically in case it ever renders above the scrim.
+    if !matches!(state.overlay, Overlay::None) {
+        state.register_hit(area, Action::Dismiss);
+    }
 }
 
 fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
@@ -1141,7 +1213,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
 /// The persistent, derived shortcut strip: `·`-separated chips built from
 /// `input::footer_hints()`, so it never drifts from the real key bindings. Chips
 /// drop right-to-left on narrow terminals.
-fn render_shortcuts_bar(frame: &mut Frame, area: Rect, _state: &AppState, theme: &Theme) {
+fn render_shortcuts_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let bg = Style::default().bg(theme.surface.overlay);
     let mut spans: Vec<Span> = vec![Span::raw(" ")];
     let mut used = 1usize;
@@ -1156,6 +1228,7 @@ fn render_shortcuts_bar(frame: &mut Frame, area: Rect, _state: &AppState, theme:
             spans.push(Span::styled(" · ", Style::default().fg(theme.text.muted)));
             used += 3;
         }
+        let chip_start = used as u16 + area.x;
         // Split "glyph rest" so the key glyph reads as the accent.
         let (glyph, rest) = hint.label.split_once(' ').unwrap_or((hint.label, ""));
         spans.push(Span::styled(
@@ -1169,11 +1242,30 @@ fn render_shortcuts_bar(frame: &mut Frame, area: Rect, _state: &AppState, theme:
             ));
         }
         used += chip;
+        let chip_end = used as u16 + area.x;
+        state.register_hit(
+            Rect {
+                x: chip_start,
+                y: area.y,
+                width: chip_end.saturating_sub(chip_start),
+                height: 1,
+            },
+            hint.action.clone(),
+        );
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
 }
 
 fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    // The modal scrim: registered FIRST (bottom of the overlay z-order) so it
+    // sits beneath every overlay's own rows, registered by the arms below —
+    // `hit_test` resolves to the topmost (last-registered) rect, so a click
+    // inside the overlay still resolves to its row, not the scrim. The
+    // approval modal (the `Overlay::None` + pending-approval branch) gets no
+    // scrim — it is a decision the operator must make explicitly.
+    if !matches!(state.overlay, Overlay::None) {
+        state.register_hit(area, Action::Dismiss);
+    }
     match &state.overlay {
         Overlay::Help => render_help(frame, area, theme),
         Overlay::NewRun(buffer) => {
@@ -1198,7 +1290,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::Workflow => render_workflow(frame, area, state, theme),
         Overlay::Blackboard => render_blackboard(frame, area, state, theme),
         Overlay::Palette { query, selected } => {
-            render_palette(frame, area, theme, query, *selected);
+            render_palette(frame, area, state, theme, query, *selected);
         }
         Overlay::ModelPicker { query, selected } => {
             render_model_picker(frame, area, state, theme, query, *selected);
@@ -1254,7 +1346,16 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             selected,
             ..
         } => {
-            render_add_model_pick(frame, area, theme, provider_id, models, query, *selected);
+            render_add_model_pick(
+                frame,
+                area,
+                state,
+                theme,
+                provider_id,
+                models,
+                query,
+                *selected,
+            );
         }
         Overlay::None => {
             if state.show_approval_modal() {
@@ -1512,6 +1613,24 @@ fn render_model_picker(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         cols[0],
     );
+    // Each row is a fixed 3 lines tall (head/provider/badges) — register a
+    // rect of that height per filtered row so a click maps to the right index.
+    let list_area = cols[0];
+    for (row, _) in matches.iter().enumerate() {
+        let y = list_area.y + (row as u16) * 3;
+        if y >= list_area.y + list_area.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: 3,
+            },
+            Action::ActivateRow(row),
+        );
+    }
 
     // Right: the detail panel for the focused model.
     let detail_block = Block::default()
@@ -1732,6 +1851,24 @@ fn render_provider_picker(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         cols[0],
     );
+    // Each row is a fixed 4 lines tall (head/name/badges/auth) — register a
+    // rect of that height per filtered row so a click maps to the right index.
+    let list_area = cols[0];
+    for (row, _) in matches.iter().enumerate() {
+        let y = list_area.y + (row as u16) * 4;
+        if y >= list_area.y + list_area.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: 4,
+            },
+            Action::ActivateRow(row),
+        );
+    }
 
     // Right: the detail panel for the focused provider.
     let detail_block = Block::default()
@@ -2590,7 +2727,14 @@ fn textwrap_summary(summary: &str) -> Vec<String> {
 /// The command palette: a filter line over a searchable list of every command,
 /// so the growing feature set is reachable without a permanent pane or a
 /// single-key binding each. Colors are Theme tokens only (RULE 7).
-fn render_palette(frame: &mut Frame, area: Rect, theme: &Theme, query: &str, selected: usize) {
+fn render_palette(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    query: &str,
+    selected: usize,
+) {
     let rect = centered_rect(72, 70, area);
     frame.render_widget(Clear, rect);
 
@@ -2700,6 +2844,32 @@ fn render_palette(frame: &mut Frame, area: Rect, theme: &Theme, query: &str, sel
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         rows[1],
     );
+
+    // Register each selectable row's rect for clicks, re-walking `matches` in
+    // the same order `items` was built so a (non-clickable) group label row
+    // shifts the screen offset exactly as it did above.
+    let list_area = rows[1];
+    let mut y = list_area.y;
+    let mut last_group: Option<&str> = None;
+    for (fi, entry) in matches.iter().enumerate() {
+        if show_groups && last_group != Some(entry.group) {
+            y = y.saturating_add(1); // the (non-clickable) group label row
+            last_group = Some(entry.group);
+        }
+        if y >= list_area.y + list_area.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: 1,
+            },
+            Action::ActivateRow(fi),
+        );
+        y = y.saturating_add(1);
+    }
 }
 
 /// Color an edge's confidence by tier (Chapter 07): a syntax-inferred call
@@ -2949,9 +3119,11 @@ fn render_querying(frame: &mut Frame, area: Rect, theme: &Theme, provider_id: &s
 /// fetched model ids, the same shape as [`render_model_picker`] but over plain
 /// `String` names (there is no `ModelCard` detail to show). Colors are Theme
 /// tokens only (RULE 7). The key is NOT in scope here.
+#[allow(clippy::too_many_arguments)] // mirrors the model/provider picker signatures + `state` (Task 8)
 fn render_add_model_pick(
     frame: &mut Frame,
     area: Rect,
+    state: &AppState,
     theme: &Theme,
     provider_id: &str,
     models: &[String],
@@ -3029,6 +3201,23 @@ fn render_add_model_pick(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         rows[1],
     );
+    // Each row is a single line — register a 1-row rect per filtered row.
+    let list_area = rows[1];
+    for (row, _) in matches.iter().enumerate() {
+        let y = list_area.y + row as u16;
+        if y >= list_area.y + list_area.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: 1,
+            },
+            Action::ActivateRow(row),
+        );
+    }
 }
 
 fn render_confirm(frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -5468,6 +5657,48 @@ mod tests {
             tail_lines.len() <= height as usize + 4,
             "tail-of-history build stays O(viewport), not O(history): {}",
             tail_lines.len()
+        );
+    }
+
+    // --- Task 8: register clickable surfaces + parity ---
+
+    #[test]
+    fn clicking_a_palette_row_registers_activate_row() {
+        let mut state = running_build_state();
+        reduce(&mut state, Action::OpenPalette);
+        let _ = render_to_string(&state, 120, 40); // populates the hit map
+        let map = state.hit_map.borrow();
+        assert!(
+            map.iter().any(|(_, a)| matches!(a, Action::ActivateRow(_))),
+            "a palette row registered ActivateRow"
+        );
+        // A full-screen scrim closes the overlay on an outside click (registered first).
+        assert!(
+            map.iter().any(|(_, a)| matches!(a, Action::Dismiss)),
+            "modal scrim"
+        );
+    }
+
+    #[test]
+    fn clicking_a_run_entry_registers_select_run() {
+        let mut state = running_build_state();
+        reduce(&mut state, Action::ToggleLayout); // workspace shows the runs pane
+        let _ = render_to_string(&state, 120, 30);
+        let map = state.hit_map.borrow();
+        assert!(
+            map.iter().any(|(_, a)| matches!(a, Action::SelectRun(0))),
+            "run row → SelectRun"
+        );
+    }
+
+    #[test]
+    fn clicking_a_footer_chip_registers_its_action() {
+        let state = running_build_state();
+        let _ = render_to_string(&state, 120, 30);
+        let map = state.hit_map.borrow();
+        assert!(
+            map.iter().any(|(_, a)| matches!(a, Action::OpenPalette)),
+            "footer chip → its Action"
         );
     }
 }

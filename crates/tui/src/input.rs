@@ -98,6 +98,16 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         description: "detach (the run keeps going)",
         mouse: None,
     },
+    KeyBinding {
+        keys: "↑↓ + Enter",
+        description: "activate a list row / transcript fold (same as clicking it)",
+        mouse: Some("click a row"),
+    },
+    KeyBinding {
+        keys: "Tab",
+        description: "focus a pane (same as clicking it)",
+        mouse: Some("click a pane"),
+    },
 ];
 
 /// One footer chip: a compact display label paired with the real `KEY_BINDINGS`
@@ -715,7 +725,8 @@ mod tests {
         );
 
         // A left click with nothing registered under it (an empty hit-test map)
-        // falls back to inert — Task 8 registers the actual clickable surfaces.
+        // falls back to inert — the actual clickable surfaces (palette/pickers/
+        // runs/footer/panes/folds) are registered by the renderer (Task 8).
         let click = map_event(
             &wheel(MouseEventKind::Down(MouseButton::Left), 1),
             InputMode::Normal,
@@ -723,6 +734,39 @@ mod tests {
             &[],
         );
         assert_eq!(click, Action::NoOp);
+
+        // (3) A left click resolves to the topmost registered rect's Action, and
+        // each such Action is keyboard-reachable.
+        use ratatui::layout::Rect;
+        let map = vec![(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 1,
+            },
+            Action::ActivateRow(0),
+        )];
+        let click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            map_event(&click, InputMode::Palette, W, &map),
+            Action::ActivateRow(0)
+        );
+        // ActivateRow ≡ SelectNext×k then InputSubmit; SelectRun ≡ Prev/NextRun;
+        // FocusPane ≡ Tab (CyclePane); Dismiss ≡ Esc — all in the keyboard table.
+        assert_eq!(
+            map_event(&key(KeyCode::Enter), InputMode::Palette, W, &[]),
+            Action::InputSubmit
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Tab), InputMode::Normal, W, &[]),
+            Action::CyclePane
+        );
     }
 
     /// Drift guard: every footer chip must derive from a real `KEY_BINDINGS`
