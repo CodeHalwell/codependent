@@ -6754,19 +6754,25 @@ steps:
             "agents.worker",
             "role = \"worker\"\n\n[budget]\nmaximum_tool_calls = 5\n",
         );
-        // Four reads → 4 of 5 == 80% → a warning, still within budget.
-        let read = || ModelStep::CallTool {
+        // Four reads → 4 of 5 == 80% → a warning, still within budget. Each
+        // call carries a distinct (ignored) `call` marker so the four are
+        // not CONSECUTIVE identical calls — the loop-fix Task 2
+        // repeated-identical-tool-call guard would otherwise short-circuit
+        // the 3rd/4th (same tool + args), executing fewer than four
+        // `ToolCompleted`s and undershooting this test's 80% mark. The
+        // marker changes only the args digest, not what is read.
+        let read = |call: u32| ModelStep::CallTool {
             tool: "workspace.read_file".to_string(),
-            args: json!({ "path": "README.md" }),
+            args: json!({ "path": "README.md", "call": call }),
         };
         let executor = executor_with(
             &pool,
             &paths,
             factory(vec![
-                read(),
-                read(),
-                read(),
-                read(),
+                read(0),
+                read(1),
+                read(2),
+                read(3),
                 ModelStep::Finish {
                     summary: "read four".to_string(),
                 },

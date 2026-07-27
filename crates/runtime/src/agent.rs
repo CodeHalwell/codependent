@@ -91,6 +91,20 @@ const MAX_WALL_CLOCK_SECS: u64 = 30 * 60;
 /// does not specify one (further clamped down by the command scope).
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 30;
 
+/// Defense-in-depth backstop (loop-fix Task 2): the number of CONSECUTIVE,
+/// IDENTICAL tool calls (same tool + same args digest, back to back with no
+/// different call in between) the loop tolerates before it stops executing
+/// the tool and steers the model instead. Task 1 fixed the root cause of a
+/// re-reading loop — the transcript now records the model's own `ToolCall`
+/// turn, so a replayed transcript lets even a so-so model notice "I already
+/// asked for this" — but a genuinely weak model can still ignore that and
+/// re-issue the identical call forever. `3` tolerates a legitimate "call it,
+/// get a transient/no-op result, retry once" pattern (two executions) while
+/// still catching a real loop well short of the much larger `MAX_STEPS`
+/// budget: the evidence run repeated `workspace.read_file` with the identical
+/// `args_digest` three times in a row before this guard existed.
+const MAX_CONSECUTIVE_IDENTICAL_CALLS: u32 = 3;
+
 // ---------------------------------------------------------------------------
 // Transcript, steps, and the ModelDriver trait
 // ---------------------------------------------------------------------------
@@ -925,6 +939,13 @@ impl FrameworkAgentRuntime {
         let mut usage: Option<ModelUsage> = None;
         let run_started = Instant::now();
         let mut wall_clock_warned = false;
+        // Repeated-identical-call guard state (loop-fix Task 2): the identity
+        // (tool, args_digest) of the most recently ISSUED call and how many
+        // times in a row it has now been issued — reset (to a fresh count of
+        // 1) whenever a call with a DIFFERENT identity arrives, so only
+        // back-to-back repeats accumulate. Per-run (reset for every
+        // `execute_run`), never persisted.
+        let mut repeated_call: Option<(String, String, u32)> = None;
 
         // --- Inspect/Plan/Modify/Test: the model-driven inner loop ---
         let terminal = loop {
@@ -1089,6 +1110,48 @@ impl FrameworkAgentRuntime {
                         tool: tool.clone(),
                         args: args.clone(),
                     });
+
+                    // Repeated-identical-call guard (defense-in-depth,
+                    // loop-fix Task 2): update the consecutive-identity
+                    // counter for THIS call before deciding whether to run
+                    // it. A call whose (tool, args_digest) matches the
+                    // immediately preceding one extends the streak; any
+                    // other call — a different tool, different args, or the
+                    // first call of the run — resets it to 1.
+                    let args_digest = hash_json(&args);
+                    let consecutive = match repeated_call.take() {
+                        Some((last_tool, last_digest, count))
+                            if last_tool == tool && last_digest == args_digest =>
+                        {
+                            count + 1
+                        }
+                        _ => 1,
+                    };
+                    repeated_call = Some((tool.clone(), args_digest, consecutive));
+
+                    if consecutive >= MAX_CONSECUTIVE_IDENTICAL_CALLS {
+                        // Short-circuit: do NOT run the tool again — its
+                        // result is already in the transcript above (the
+                        // ToolCall was just recorded honestly, but the
+                        // execution and its result are replaced by a
+                        // DISTINCT, truthful steer rather than a fabricated
+                        // tool result). This is the backstop that bounds a
+                        // weak model that keeps re-issuing the identical
+                        // call despite Task 1's transcript fidelity.
+                        let steer = format!(
+                            "You have already called `{tool}` with these exact arguments \
+                             {consecutive} times in a row; its result is in the transcript \
+                             above. Do not repeat this call — use the result you already \
+                             have and proceed with the task."
+                        );
+                        transcript.push(TurnItem::Steering(steer));
+                        // Safe point: same boundary a completed tool call
+                        // would drain at.
+                        self.drain_steering(&mut run, &run_actor, &mut transcript)
+                            .await?;
+                        continue;
+                    }
+
                     match self
                         .run_tool(&run, &run_actor, &tool, args, &mut actions, &cancel)
                         .await?

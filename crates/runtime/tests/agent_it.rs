@@ -1498,6 +1498,223 @@ async fn read_file_observation_carries_a_path_header() {
     );
 }
 
+// --- loop-fix Task 2: repeated-identical-tool-call guard --------------------
+//
+// Task 1 (above) fixed the ROOT CAUSE of a re-reading loop by giving the
+// model a transcript that records its own `ToolCall` turns, so a replay lets
+// it notice "I already asked for this". This guard is the DEFENSE-IN-DEPTH
+// backstop for a model that still ignores that and re-issues the identical
+// call: past a threshold of CONSECUTIVE identical `(tool, args)` calls, the
+// loop stops executing the tool and steers the model instead. The threshold
+// mirrors `MAX_CONSECUTIVE_IDENTICAL_CALLS` in `crates/runtime/src/agent.rs`
+// (currently 3) — kept in sync manually since the const is private to that
+// module.
+
+/// Drive `steps` (typically some `CallTool`s followed by a `Finish`) through
+/// a fresh Build-mode run in a temp repo seeded with `files`
+/// (relative-path -> contents), auto-approving any `ToolProposed` so the loop
+/// never blocks. Returns every transcript item the model was shown — the
+/// `CapturingDriver` overwrites `seen` on each `next_step` call, and its last
+/// call (right before `Finish`) sees the whole conversation so far.
+async fn drive_steps(
+    steps: Vec<ModelStep>,
+    files: &[(&str, &str)],
+) -> Vec<codypendent_runtime::agent::TurnItem> {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    for (name, contents) in files {
+        std::fs::write(repo.join(name), contents).unwrap();
+    }
+
+    let pool = open_database(&dir.path().join("db.sqlite")).await.unwrap();
+    let store = ArtifactStore::new(dir.path().join("artifacts"));
+    let broker = ApprovalBroker::new();
+    let hub = SubscriptionHub::new();
+    let session = SessionId::new();
+    let run = RunId::new();
+    ledger::create_session(&pool, session, "guard-it")
+        .await
+        .unwrap();
+    seed_started_run!(pool, session, run, "guard", AgentMode::Build);
+
+    let runtime = build_runtime!(pool, store, broker, hub);
+    let mut rx = hub.subscribe(session);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let driver = CapturingDriver {
+        steps: std::sync::Mutex::new(steps.into()),
+        seen: seen.clone(),
+    };
+
+    let ctx = RunContext::new(session, run, "guard", AgentMode::Build, repo.clone(), repo);
+    let handle = tokio::spawn(async move {
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+    });
+
+    loop {
+        let event = rx.recv().await.expect("event");
+        let done = matches!(event.body, EventBody::RunCompleted { .. });
+        if let EventBody::ToolProposed { approval_id, .. } = &event.body {
+            broker
+                .resolve(
+                    &pool,
+                    *approval_id,
+                    ApprovalDecision::Approve,
+                    ApprovalScope::Once,
+                    "tester".to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        if done {
+            break;
+        }
+    }
+    handle.await.unwrap().unwrap();
+
+    let seen = seen.lock().unwrap().clone();
+    seen
+}
+
+#[tokio::test]
+async fn repeated_identical_tool_call_short_circuits_after_threshold() {
+    // The model issues the SAME `workspace.read_file` call five times in a
+    // row (identical tool + args, back to back — the exact shape of the real
+    // failing run this guard was written for). The first two run for real;
+    // the third, fourth, and fifth are short-circuited: the tool's
+    // underlying execution runs at most (threshold - 1) == 2 times, and each
+    // short-circuited step gets a DISTINCT "already called" steer instead of
+    // a repeated/fabricated tool result.
+    use codypendent_runtime::agent::TurnItem;
+
+    let call = ModelStep::CallTool {
+        tool: "workspace.read_file".to_string(),
+        args: json!({ "path": "target.txt" }),
+    };
+    let steps = vec![
+        call.clone(),
+        call.clone(),
+        call.clone(),
+        call.clone(),
+        call,
+        ModelStep::Finish {
+            summary: "done".to_string(),
+        },
+    ];
+    let seen = drive_steps(steps, &[("target.txt", "hello\n")]).await;
+
+    let call_count = seen
+        .iter()
+        .filter(
+            |item| matches!(item, TurnItem::ToolCall { tool, .. } if tool == "workspace.read_file"),
+        )
+        .count();
+    assert_eq!(
+        call_count, 5,
+        "the transcript must honestly record every call the model asked for, \
+         even the short-circuited ones; got:\n{seen:?}"
+    );
+
+    let result_count = seen
+        .iter()
+        .filter(|item| matches!(item, TurnItem::ToolResult { tool, .. } if tool == "workspace.read_file"))
+        .count();
+    assert_eq!(
+        result_count, 2,
+        "the tool must actually execute at most (threshold - 1) == 2 times; \
+         the rest must be short-circuited; got:\n{seen:?}"
+    );
+
+    let steer_count = seen
+        .iter()
+        .filter(|item| matches!(item, TurnItem::Steering(text) if text.contains("already called")))
+        .count();
+    assert_eq!(
+        steer_count, 3,
+        "each short-circuited call must inject a distinct 'already called' \
+         steer, not a repeated tool result; got:\n{seen:?}"
+    );
+    let steer_text = seen
+        .iter()
+        .find_map(|item| match item {
+            TurnItem::Steering(text) if text.contains("already called") => Some(text.clone()),
+            _ => None,
+        })
+        .expect("at least one 'already called' steer");
+    assert!(
+        steer_text.contains("workspace.read_file"),
+        "the steer must name the repeated tool; got: {steer_text}"
+    );
+    assert!(
+        steer_text.contains("Do not repeat this call"),
+        "the steer must tell the model to stop repeating and use the prior \
+         result; got: {steer_text}"
+    );
+}
+
+#[tokio::test]
+async fn different_call_in_between_resets_the_consecutive_counter() {
+    // Control: two identical calls, then a DIFFERENT call, then the first
+    // identity twice more. No identity ever reaches the threshold
+    // consecutively (the intervening different call resets the streak each
+    // time), so every call must execute for real — the guard must never
+    // fire on legitimately-spaced repeats.
+    use codypendent_runtime::agent::TurnItem;
+
+    let call_a = ModelStep::CallTool {
+        tool: "workspace.read_file".to_string(),
+        args: json!({ "path": "a.txt" }),
+    };
+    let call_b = ModelStep::CallTool {
+        tool: "workspace.read_file".to_string(),
+        args: json!({ "path": "b.txt" }),
+    };
+    let steps = vec![
+        call_a.clone(),
+        call_a.clone(),
+        call_b,
+        call_a.clone(),
+        call_a,
+        ModelStep::Finish {
+            summary: "done".to_string(),
+        },
+    ];
+    let seen = drive_steps(steps, &[("a.txt", "A\n"), ("b.txt", "B\n")]).await;
+
+    let a_results = seen
+        .iter()
+        .filter(|item| {
+            matches!(item, TurnItem::ToolResult { tool, output } if tool == "workspace.read_file" && output.contains("a.txt"))
+        })
+        .count();
+    let b_results = seen
+        .iter()
+        .filter(|item| {
+            matches!(item, TurnItem::ToolResult { tool, output } if tool == "workspace.read_file" && output.contains("b.txt"))
+        })
+        .count();
+    assert_eq!(
+        a_results, 4,
+        "all four `a.txt` reads must execute for real (no premature \
+         short-circuit); got:\n{seen:?}"
+    );
+    assert_eq!(
+        b_results, 1,
+        "the intervening `b.txt` read must execute for real; got:\n{seen:?}"
+    );
+
+    let premature_steer = seen
+        .iter()
+        .any(|item| matches!(item, TurnItem::Steering(text) if text.contains("already called")));
+    assert!(
+        !premature_steer,
+        "a different call in between must reset the consecutive counter — \
+         the guard must not fire; got:\n{seen:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Read-your-writes on an isolated worktree (T5 fix pass).
 //
