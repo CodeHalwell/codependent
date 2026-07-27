@@ -566,6 +566,7 @@ async fn extract_candidates_yields_provenance_bearing_candidates() {
                 run_id: run,
                 tool: "shell.run".to_string(),
                 args_digest: "digest-1".to_string(),
+                label: Some("cargo test".to_string()),
             },
         ),
         event(
@@ -583,6 +584,7 @@ async fn extract_candidates_yields_provenance_bearing_candidates() {
                 run_id: run,
                 tool: "shell.run".to_string(),
                 args_digest: "digest-1".to_string(),
+                label: Some("cargo test".to_string()),
             },
         ),
         event(

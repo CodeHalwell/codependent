@@ -106,6 +106,18 @@ pub enum EventBody {
         tool: String,
         /// Digest of the tool arguments (not the arguments themselves).
         args_digest: String,
+        /// A short, human-readable display label for the call — e.g. the file
+        /// path a `workspace.read_file` targets, or the command a `shell.run`
+        /// executes — so a client can render `workspace.read_file ·
+        /// services/main.py` instead of the bare tool name. Derived by the
+        /// emitter (`codypendent_runtime::tools::tool_label`) from the same
+        /// arguments `args_digest` hashes, BEFORE they are discarded: bounded,
+        /// single-line, and never the full arguments or file contents.
+        /// `#[serde(default)]` keeps old ledger bytes and an older daemon's
+        /// events (neither carries this field) deserializing to `None` —
+        /// additive and back-compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
     ToolCompleted {
         run_id: RunId,
@@ -234,6 +246,13 @@ mod tests {
             run_id,
             tool: "shell.run".to_string(),
             args_digest: "abc123".to_string(),
+            label: Some("cargo test".to_string()),
+        });
+        round_trip(EventBody::ToolStarted {
+            run_id,
+            tool: "shell.run".to_string(),
+            args_digest: "abc123".to_string(),
+            label: None,
         });
         round_trip(EventBody::ToolCompleted {
             run_id,
@@ -298,6 +317,55 @@ mod tests {
         });
         let json = serde_json::to_string(&event).expect("serialize");
         assert!(!json.contains("artifact"));
+    }
+
+    #[test]
+    fn tool_started_omits_absent_label() {
+        let event = event_with(EventBody::ToolStarted {
+            run_id: RunId::new(),
+            tool: "shell.run".to_string(),
+            args_digest: "abc123".to_string(),
+            label: None,
+        });
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(!json.contains("label"));
+    }
+
+    #[test]
+    fn tool_started_carries_a_present_label() {
+        let run_id = RunId::new();
+        let event = event_with(EventBody::ToolStarted {
+            run_id,
+            tool: "workspace.read_file".to_string(),
+            args_digest: "abc123".to_string(),
+            label: Some("services/main.py".to_string()),
+        });
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(json.contains("services/main.py"));
+        let parsed: SessionEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            parsed.body,
+            EventBody::ToolStarted {
+                run_id,
+                tool: "workspace.read_file".to_string(),
+                args_digest: "abc123".to_string(),
+                label: Some("services/main.py".to_string()),
+            }
+        );
+    }
+
+    /// A `label`-less payload — exactly what an old daemon or an old ledger
+    /// entry looks like — must still deserialize, with `label` defaulting to
+    /// `None` (the `#[serde(default)]` contract that keeps this an additive,
+    /// back-compatible wire change).
+    #[test]
+    fn tool_started_without_label_field_deserializes_to_none() {
+        let json = r#"{"sequence":1,"occurred_at":"2026-01-01T00:00:00Z","actor":{"type":"System"},"body":{"type":"ToolStarted","run_id":"30000000-0000-0000-0000-000000000001","tool":"shell.run","args_digest":"abc123"}}"#;
+        let parsed: SessionEvent = serde_json::from_str(json).expect("old payload must parse");
+        match parsed.body {
+            EventBody::ToolStarted { label, .. } => assert_eq!(label, None),
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
     }
 
     #[test]

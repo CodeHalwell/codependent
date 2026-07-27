@@ -804,6 +804,7 @@ fn events_vectors() -> Vec<Vector> {
                 run_id: run_id(),
                 tool: "shell.run".to_string(),
                 args_digest: "abc123".to_string(),
+                label: Some("cargo test --all-features".to_string()),
             }),
         ),
         vec_of(

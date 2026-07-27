@@ -69,8 +69,8 @@ use crate::models::ModelRegistry;
 use crate::tools::{
     new_pull_request, parse_blackboard_post, parse_blackboard_query, parse_create_check_run,
     parse_create_draft_pull_request, parse_get_pull_request, parse_list_check_runs,
-    parse_update_pull_request, render_check_runs, render_pull_request, ApplyPatch, ApplyPatchInput,
-    ArtifactSink, BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput,
+    parse_update_pull_request, render_check_runs, render_pull_request, tool_label, ApplyPatch,
+    ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput,
     BlackboardQueryTool, CommandRequest, CreateCheckRunInput, CreateCheckRunSummary,
     CreateDraftPullRequest, CreateDraftPullRequestInput, EnvironmentBinding, GetPullRequest,
     GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns, ListCheckRunsInput, ReadFile,
@@ -1331,6 +1331,13 @@ impl FrameworkAgentRuntime {
                 run_id: run.run_id,
                 tool: tool.to_string(),
                 args_digest: hash_json(&args),
+                // Derived from the same `args` the digest above hashes, while
+                // they are still in scope — a short, bounded display string
+                // (never the full arguments), so a client can show e.g.
+                // `workspace.read_file · services/main.py` (see
+                // `crate::tools::tool_label`'s doc comment for the safety
+                // contract).
+                label: tool_label(tool, &args),
             },
         )
         .await?;

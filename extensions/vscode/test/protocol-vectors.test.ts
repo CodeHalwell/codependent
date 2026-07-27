@@ -490,6 +490,7 @@ function reconstructEventBody(r: Record<string, unknown>): EventBody {
         run_id: str(r, "run_id"),
         tool: str(r, "tool"),
         args_digest: str(r, "args_digest"),
+        label: optStr(r, "label"),
       };
     case "ToolCompleted": {
       const artifactRaw = optRec(r, "artifact");

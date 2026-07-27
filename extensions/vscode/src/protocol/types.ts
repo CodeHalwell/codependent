@@ -259,7 +259,7 @@ export type EventBody =
   | { type: "RunStateChanged"; run_id: Uuid; state: RunState }
   | { type: "ModelStreamDelta"; run_id: Uuid; text: string }
   | { type: "ToolProposed"; run_id: Uuid; approval_id: Uuid; action: ProposedAction }
-  | { type: "ToolStarted"; run_id: Uuid; tool: string; args_digest: string }
+  | { type: "ToolStarted"; run_id: Uuid; tool: string; args_digest: string; label?: string }
   | {
       type: "ToolCompleted";
       run_id: Uuid;

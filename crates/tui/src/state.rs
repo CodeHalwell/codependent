@@ -240,6 +240,14 @@ pub struct ToolCard {
     pub action: Option<ProposedAction>,
     /// Digest of the tool arguments (never the arguments themselves).
     pub args_digest: Option<String>,
+    /// A short, human-readable display label for the call, e.g. the file
+    /// path a `workspace.read_file` targets — set from [`ToolStarted`]'s
+    /// `label` field when present, `None` otherwise (an older daemon, or a
+    /// tool `tool_label` does not recognize). A bounded display string, never
+    /// the full arguments.
+    ///
+    /// [`ToolStarted`]: codypendent_protocol::EventBody::ToolStarted
+    pub label: Option<String>,
     /// Terminal outcome, once completed.
     pub outcome: Option<ToolOutcome>,
     /// Bulk output reference, if the tool produced one.
