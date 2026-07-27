@@ -1313,6 +1313,7 @@ impl codypendent_runtime::agent::ModelDriver for CapturingDriver {
     async fn next_step(
         &self,
         transcript: &[codypendent_runtime::agent::TurnItem],
+        _offered_tools: &[&str],
         sink: &mut dyn codypendent_runtime::agent::DeltaSink,
     ) -> anyhow::Result<StepOutcome> {
         *self.seen.lock().unwrap() = transcript.to_vec();

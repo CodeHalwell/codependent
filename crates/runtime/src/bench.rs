@@ -31,6 +31,27 @@ use codypendent_routing::{
 };
 
 use crate::agent::{ModelDriver, ModelStep, NullDeltaSink, TurnItem};
+use crate::tools::{ApplyPatch, GitDiff, ReadFile, Search, Shell};
+
+/// The tools offered to a bare driver-under-test: there is no [`RunContext`]
+/// here (the bench measures a [`ModelDriver`] directly, outside any run), so
+/// this stands in for the unconditional baseline
+/// [`FrameworkAgentRuntime::offered_tool_names`] returns for a run with no
+/// GitHub/workflow context — never `blackboard.*`/`github.*` (FIX 1: advertise/
+/// execute mismatch). [`tool_call_probe`](DriverBenchTarget::tool_call_probe)'s
+/// prompt names `workspace.read_file` explicitly, so this keeps the probe
+/// meaningful against a live model without resurrecting the fixed
+/// over-advertisement bug for a driver that carries no run context at all.
+///
+/// [`RunContext`]: crate::agent::RunContext
+/// [`FrameworkAgentRuntime::offered_tool_names`]: crate::agent::FrameworkAgentRuntime::offered_tool_names
+const BENCH_OFFERED_TOOLS: &[&str] = &[
+    Shell::NAME,
+    ReadFile::NAME,
+    Search::NAME,
+    GitDiff::NAME,
+    ApplyPatch::NAME,
+];
 
 /// One timed generation: how many tokens were produced, how long until the first
 /// token appeared, and the total wall time.
@@ -300,6 +321,7 @@ impl<'a> DriverBenchTarget<'a> {
         self.driver
             .next_step(
                 &[TurnItem::Objective(prompt.to_string())],
+                BENCH_OFFERED_TOOLS,
                 &mut NullDeltaSink,
             )
             .await

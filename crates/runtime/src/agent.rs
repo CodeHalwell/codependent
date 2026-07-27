@@ -310,14 +310,21 @@ pub trait ModelDriver: Send + Sync {
     fn model_id(&self) -> ModelId;
 
     /// Given the conversation so far, produce the next step and the MEASURED
-    /// usage for the request that produced it (see [`StepOutcome`]). A driver
-    /// that cannot measure usage returns `usage: None` — never a fabricated zero.
-    /// As it produces natural-language text, it pushes each chunk through
-    /// `sink` (see [`DeltaSink`]); today's drivers push once per request, but
-    /// this is the seam a later token-by-token stream plugs into.
+    /// usage for the request that produced it (see [`StepOutcome`]). `offered_tools`
+    /// is the exact tool-name set [`FrameworkAgentRuntime::offered_tool_names`]
+    /// computed for this run (FIX 1: advertise/execute mismatch) — a driver that
+    /// advertises tools to a live provider MUST restrict itself to this set,
+    /// since the loop's `prepare` dispatch gate refuses any call outside it; a
+    /// driver with no provider-facing advertisement (e.g. a scripted test
+    /// driver) may ignore it. A driver that cannot measure usage
+    /// returns `usage: None` — never a fabricated zero. As it produces
+    /// natural-language text, it pushes each chunk through `sink` (see
+    /// [`DeltaSink`]); today's drivers push once per request, but this is the
+    /// seam a later token-by-token stream plugs into.
     async fn next_step(
         &self,
         transcript: &[TurnItem],
+        offered_tools: &[&str],
         sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome>;
 }
@@ -371,6 +378,7 @@ impl ModelDriver for ScriptedDriver {
     async fn next_step(
         &self,
         _transcript: &[TurnItem],
+        _offered_tools: &[&str],
         sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome> {
         let step = {
@@ -927,11 +935,19 @@ impl FrameworkAgentRuntime {
             let (tx, mut rx) = mpsc::unbounded_channel::<String>();
             let mut sink = ChannelSink { tx };
             let step_result = {
-                // `step_fut` borrows `&transcript` and `&mut sink`; scoping it
-                // here releases both borrows before the `match step` arms below
-                // mutate `transcript`. The `#[async_trait]` future is boxed and
-                // `Unpin`, so `&mut step_fut` polls without `tokio::pin!`.
-                let mut step_fut = driver.next_step(&transcript, &mut sink);
+                // `step_fut` borrows `&transcript`, `&offered_tools`, and
+                // `&mut sink`; scoping it here releases those borrows before
+                // the `match step` arms below mutate `transcript`. The
+                // `#[async_trait]` future is boxed and `Unpin`, so `&mut
+                // step_fut` polls without `tokio::pin!`.
+                //
+                // `offered_tools` is the SAME set `prepare` will accept for
+                // this run (FIX 1: advertise/execute mismatch) — recomputed
+                // each step so a live provider driver is never advertised (and
+                // so cannot be tempted to call) a tool dispatch would refuse
+                // as "unknown".
+                let offered_tools = self.offered_tool_names(&run);
+                let mut step_fut = driver.next_step(&transcript, &offered_tools, &mut sink);
                 loop {
                     tokio::select! {
                         // Poll the step future first: its completion is what ends
@@ -2233,8 +2249,11 @@ impl FrameworkModelDriver {
         Ok(Self::new(client, model_id))
     }
 
-    /// The Phase 1 tools advertised to the model as declaration-only function
-    /// tools (the loop executes them; the framework never does).
+    /// The full tool SCHEMA catalog — every tool's name, description, and JSON
+    /// schema, declaration-only (the loop executes them; the framework never
+    /// does). Membership for a given run is decided downstream, NOT here: see
+    /// [`advertised_tools`](Self::advertised_tools), the FIX 1 projection
+    /// `next_step` actually sends as `options.tools`.
     fn tool_definitions() -> Vec<agent_framework_core::tools::ToolDefinition> {
         use agent_framework_core::tools::{ApprovalMode, ToolDefinition, ToolKind};
         let decl = |name: &str, description: &str, parameters: Value| ToolDefinition {
@@ -2351,9 +2370,11 @@ impl FrameworkModelDriver {
                 }),
             ),
             // The blackboard tools are only dispatchable inside a workflow agent
-            // node (the loop gates them on the run's workflow binding); advertised
-            // here like the github.* tools, which are likewise offered statically
-            // and gated at dispatch.
+            // node (the loop gates them on the run's workflow binding). They are
+            // declared here in the static schema catalog alongside the github.*
+            // tools, but `next_step` advertises to the model only the
+            // `offered_tool_names` projection (`advertised_tools`, FIX 1) — so a
+            // non-workflow run's model is never even shown these entries.
             decl(
                 BlackboardPostTool::NAME,
                 "Post a typed artifact (finding, decision, hypothesis, …) to the workflow \
@@ -2384,6 +2405,28 @@ impl FrameworkModelDriver {
                 }),
             ),
         ]
+    }
+
+    /// Project [`tool_definitions`](Self::tool_definitions) — the static schema
+    /// catalog — down to exactly `offered_tools` (FIX 1: advertise/execute
+    /// mismatch). Before this projection existed the catalog was advertised
+    /// whole and unconditionally, so a non-workflow run's model could be
+    /// offered `blackboard.*` (workflow-only) or `github.*` (no client
+    /// configured) and then refused by `prepare`'s dispatch gate as "unknown
+    /// tool" — a wasted, confusing call. Filtering here on the SAME names
+    /// [`FrameworkAgentRuntime::offered_tool_names`] computed for the run makes
+    /// the advertised set byte-for-byte what dispatch will accept; a name
+    /// absent from `offered_tools` is fail-safe omitted even if
+    /// `tool_definitions` and `offered_tool_names` ever drift. Pulled out of
+    /// `next_step` so the projection itself is unit-testable without a live
+    /// `ChatClient`.
+    fn advertised_tools(
+        offered_tools: &[&str],
+    ) -> Vec<agent_framework_core::tools::ToolDefinition> {
+        Self::tool_definitions()
+            .into_iter()
+            .filter(|def| offered_tools.contains(&def.name.as_str()))
+            .collect()
     }
 
     fn to_messages(transcript: &[TurnItem]) -> Vec<agent_framework_core::types::Message> {
@@ -2420,6 +2463,7 @@ impl ModelDriver for FrameworkModelDriver {
     async fn next_step(
         &self,
         transcript: &[TurnItem],
+        offered_tools: &[&str],
         sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome> {
         use agent_framework_core::client::ChatClient;
@@ -2427,7 +2471,7 @@ impl ModelDriver for FrameworkModelDriver {
         use futures::StreamExt;
 
         let mut options = ChatOptions::new();
-        options.tools = Self::tool_definitions();
+        options.tools = Self::advertised_tools(offered_tools);
 
         let mut stream = self
             .client
@@ -2638,13 +2682,16 @@ mod tests {
                 summary: "done".to_string(),
             },
         ]);
-        let first = driver.next_step(&[], &mut NullDeltaSink).await.unwrap();
+        let first = driver
+            .next_step(&[], &[], &mut NullDeltaSink)
+            .await
+            .unwrap();
         assert_eq!(first.step, ModelStep::Say("hi".to_string()));
         // A plain scripted driver reports NO usage (unmeasured, as today).
         assert_eq!(first.usage, None);
         assert!(matches!(
             driver
-                .next_step(&[], &mut NullDeltaSink)
+                .next_step(&[], &[], &mut NullDeltaSink)
                 .await
                 .unwrap()
                 .step,
@@ -2653,7 +2700,7 @@ mod tests {
         // Draining past the end keeps yielding Finish, never hangs.
         assert!(matches!(
             driver
-                .next_step(&[], &mut NullDeltaSink)
+                .next_step(&[], &[], &mut NullDeltaSink)
                 .await
                 .unwrap()
                 .step,
@@ -2670,7 +2717,7 @@ mod tests {
         }]);
         assert_eq!(
             plain
-                .next_step(&[], &mut NullDeltaSink)
+                .next_step(&[], &[], &mut NullDeltaSink)
                 .await
                 .unwrap()
                 .usage,
@@ -2693,7 +2740,7 @@ mod tests {
         .with_usage(usage);
         assert_eq!(
             measured
-                .next_step(&[], &mut NullDeltaSink)
+                .next_step(&[], &[], &mut NullDeltaSink)
                 .await
                 .unwrap()
                 .usage,
@@ -2701,7 +2748,7 @@ mod tests {
         );
         assert_eq!(
             measured
-                .next_step(&[], &mut NullDeltaSink)
+                .next_step(&[], &[], &mut NullDeltaSink)
                 .await
                 .unwrap()
                 .usage,
@@ -2802,6 +2849,107 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 0);
         assert_eq!(usage.completion_tokens, 9);
         assert_eq!(usage.cost_micros, None);
+    }
+
+    /// A no-op blackboard channel for the FIX 1 advertised-tools tests below:
+    /// enough to make the tools *available* (the runtime only checks
+    /// `is_some()` to decide whether to offer them) without a real board.
+    /// Mirrors `tests/agent_it.rs`'s `FakeBlackboardChannel`.
+    #[cfg(feature = "provider-openai")]
+    struct NoopBlackboardChannel;
+
+    #[cfg(feature = "provider-openai")]
+    #[async_trait]
+    impl BlackboardChannel for NoopBlackboardChannel {
+        async fn post(
+            &self,
+            _workflow_run_id: &str,
+            _post: BlackboardPost,
+        ) -> Result<codypendent_protocol::BlackboardItemView, BlackboardChannelError> {
+            Err(BlackboardChannelError::Backend("noop channel".to_string()))
+        }
+        async fn query(
+            &self,
+            _workflow_run_id: &str,
+            _kind: Option<String>,
+            _include_superseded: bool,
+        ) -> Result<Vec<codypendent_protocol::BlackboardItemView>, BlackboardChannelError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// FIX 1 (advertise/execute mismatch): a plain single-agent run's model must
+    /// never be ADVERTISED a tool `prepare`'s dispatch gate will refuse.
+    /// `FrameworkModelDriver::advertised_tools` is the exact projection
+    /// `next_step` assigns to `options.tools`; feeding it a solo run's own
+    /// `offered_tool_names` must exclude both `blackboard.*` (workflow-only) and
+    /// `github.*` (no client configured on `test_runtime()`), while still
+    /// including the unconditional baseline tools.
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn advertised_tools_excludes_workflow_and_github_tools_for_a_solo_run() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let solo = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+
+        let offered = runtime.offered_tool_names(&solo);
+        let advertised = FrameworkModelDriver::advertised_tools(&offered);
+        let names: Vec<&str> = advertised.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            !names.contains(&BlackboardPostTool::NAME)
+                && !names.contains(&BlackboardQueryTool::NAME),
+            "a solo run must not be advertised the blackboard tools: {names:?}"
+        );
+        assert!(
+            !names.contains(&GetPullRequest::NAME),
+            "a solo run with no GitHub client must not be advertised github.* tools: {names:?}"
+        );
+        assert!(
+            names.contains(&Shell::NAME) && names.contains(&ReadFile::NAME),
+            "the unconditional baseline tools are still advertised: {names:?}"
+        );
+    }
+
+    /// The other half of FIX 1: a real workflow agent node (a wired blackboard
+    /// channel AND a `WorkflowContext`) sees NO behavior change — it is still
+    /// advertised `blackboard.*`, exactly as `offered_tool_names` already
+    /// promised before this fix.
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn advertised_tools_includes_blackboard_tools_for_a_workflow_run() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime.with_blackboard(Arc::new(NoopBlackboardChannel));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let node = RunContext::new(
+            session_id,
+            RunId::new(),
+            "node",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        )
+        .with_workflow(WorkflowContext {
+            workflow_run_id: "wfrun-1".to_string(),
+            node_id: "inspect".to_string(),
+            agent_role: "investigator".to_string(),
+        });
+
+        let offered = runtime.offered_tool_names(&node);
+        let advertised = FrameworkModelDriver::advertised_tools(&offered);
+        let names: Vec<&str> = advertised.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            names.contains(&BlackboardPostTool::NAME) && names.contains(&BlackboardQueryTool::NAME),
+            "a workflow node must still be advertised the blackboard tools: {names:?}"
+        );
     }
 
     #[test]
@@ -2996,6 +3144,7 @@ mod tests {
         async fn next_step(
             &self,
             transcript: &[TurnItem],
+            _offered_tools: &[&str],
             _sink: &mut dyn DeltaSink,
         ) -> anyhow::Result<StepOutcome> {
             let mut slot = self.seen.lock().expect("capturing driver mutex");
@@ -3083,6 +3232,7 @@ mod tests {
         async fn next_step(
             &self,
             _transcript: &[TurnItem],
+            _offered_tools: &[&str],
             sink: &mut dyn DeltaSink,
         ) -> anyhow::Result<StepOutcome> {
             for chunk in &self.chunks {
@@ -3152,6 +3302,7 @@ mod tests {
         async fn next_step(
             &self,
             _transcript: &[TurnItem],
+            _offered_tools: &[&str],
             sink: &mut dyn DeltaSink,
         ) -> anyhow::Result<StepOutcome> {
             for chunk in &self.chunks {
