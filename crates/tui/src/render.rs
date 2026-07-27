@@ -258,6 +258,9 @@ struct Row<'a> {
     /// The transcript-entry index this row is a click target for (fold heads in
     /// the selected run). `None` unless tagged (Task 8).
     hit_entry: Option<usize>,
+    /// A full-width background for this row (the `You` container). Cosmetic —
+    /// `columns()`/`rows()` ignore it; applied only to visible rows at build.
+    bg: Option<Color>,
 }
 
 enum RowKind<'a> {
@@ -279,6 +282,7 @@ impl<'a> Row<'a> {
         Row {
             kind: RowKind::Built(line),
             hit_entry: None,
+            bg: None,
         }
     }
     fn model(prefix: &'static str, text: &'a str, caret: bool, style: Style) -> Self {
@@ -290,12 +294,14 @@ impl<'a> Row<'a> {
                 style,
             },
             hit_entry: None,
+            bg: None,
         }
     }
     fn rich(rl: &'a crate::markdown::RichLine) -> Self {
         Row {
             kind: RowKind::Rich(rl),
             hit_entry: None,
+            bg: None,
         }
     }
     /// Display width, allocation-free (`Span::raw` borrows; `.width()` is unicode width).
@@ -476,10 +482,14 @@ fn for_each_row<'a>(
                     } else {
                         None
                     };
+                    let is_user = matches!(other, TranscriptEntry::User { .. });
                     for (j, line) in scratch.drain(..).enumerate() {
                         let mut row = Row::built(line);
                         if j == 0 {
                             row.hit_entry = hit;
+                        }
+                        if is_user {
+                            row.bg = Some(theme.surface.user);
                         }
                         visit(row);
                         produced = true;
@@ -550,8 +560,26 @@ fn build_transcript_window<'a>(
                 first_seen = true;
             }
             let hit = row.hit_entry;
+            let bg = row.bg;
             let index = out.len();
-            out.push(row.into_line(theme));
+            let mut line = row.into_line(theme);
+            if let Some(c) = bg {
+                if c == theme.surface.panel {
+                    // No distinct raised surface (ansi16/monochrome): a leading accent bar.
+                    line.spans.insert(
+                        0,
+                        Span::styled("▎", Style::default().fg(theme.focus.active)),
+                    );
+                } else {
+                    line.style = line.style.bg(c);
+                    let pad = (inner_width as usize).saturating_sub(line.width());
+                    if pad > 0 {
+                        line.spans
+                            .push(Span::styled(" ".repeat(pad), Style::default().bg(c)));
+                    }
+                }
+            }
+            out.push(line);
             if let Some(entry) = hit {
                 hits.push((index, entry));
             }
@@ -5647,6 +5675,85 @@ mod tests {
         );
     }
 
+    // --- Task 8: user-message container (Row.bg) ---
+
+    fn user_turn_state() -> AppState {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        // RunStarted pushes the objective as a `User` transcript entry.
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "my question".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        s
+    }
+
+    #[test]
+    fn user_rows_carry_the_container_bg_and_fill_width() {
+        let s = user_turn_state();
+        let theme = Theme::dark();
+        let inner_width = 40u16;
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, inner_width, 0, 40, 0);
+        let user_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|sp| sp.content.contains("my question")))
+            .expect("user body line present");
+        assert_eq!(
+            user_line.style.bg,
+            Some(theme.surface.user),
+            "no container bg"
+        );
+        assert_eq!(
+            user_line.width(),
+            inner_width as usize,
+            "not padded to full width"
+        );
+    }
+
+    #[test]
+    fn ansi16_user_row_uses_an_accent_bar_not_a_bg() {
+        let s = user_turn_state();
+        let theme = Theme::ansi16(); // surface.user == surface.panel here
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 40, 0, 40, 0);
+        let user_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|sp| sp.content.contains("my question")))
+            .expect("user body line present");
+        assert_eq!(user_line.spans[0].content, "▎", "no accent bar");
+        assert_eq!(user_line.spans[0].style.fg, Some(theme.focus.active));
+        assert_ne!(
+            user_line.style.bg,
+            Some(theme.surface.user),
+            "should not bg-fill on ansi16"
+        );
+    }
+
+    #[test]
+    fn user_container_does_not_break_virtualization() {
+        let mut s = user_turn_state();
+        // Add a long agent reply so the window must virtualize.
+        let run_id = s.runs[0].run_id;
+        let mut big = String::new();
+        for i in 0..3000 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta { run_id, text: big }),
+        );
+        let theme = Theme::dark();
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 100, 20, 0);
+        assert!(
+            lines.len() <= 24,
+            "build still O(viewport): {}",
+            lines.len()
+        );
+    }
+
     #[test]
     fn theme_change_re_renders_without_re_parsing() {
         use crate::markdown::PARSE_CALLS;
@@ -5854,7 +5961,9 @@ mod tests {
             top_lines.len()
         );
         assert!(
-            top_lines.iter().any(|l| l.to_string() == "You"),
+            // Task 8: the `You` row now carries the container bg, padded to
+            // `inner_width` — trim the trailing fill before the exact match.
+            top_lines.iter().any(|l| l.to_string().trim_end() == "You"),
             "the user role header is one of the virtualized top rows"
         );
         assert!(
