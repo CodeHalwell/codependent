@@ -60,6 +60,27 @@ use synoptic::{from_extension, TokOpt};
 #[cfg(test)]
 pub static PARSE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only: serializes the tests that reset then assert on `PARSE_CALLS`
+/// (`render::theme_change_re_renders_without_re_parsing`,
+/// `reduce::finalize_is_idempotent`) against EACH OTHER. `PARSE_CALLS` is one
+/// process-wide counter and `cargo test` runs test functions in parallel by
+/// default, so without this, two such tests running concurrently could
+/// interleave their reset/read and flake. `parse()` itself does NOT take this
+/// lock (only increments the atomic), so a test holding it across its own
+/// finalize step cannot deadlock against itself; each PARSE_CALLS-dependent
+/// test takes this lock at its start, before it resets the counter.
+#[cfg(test)]
+pub static PARSE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`PARSE_LOCK`], recovering from a poisoned lock (a prior panic
+/// while holding it) rather than cascading that failure into the other
+/// PARSE_CALLS-dependent test — the guarded data is a unit `()`, so a panic
+/// leaves nothing inconsistent behind.
+#[cfg(test)]
+pub fn lock_parse_calls() -> std::sync::MutexGuard<'static, ()> {
+    PARSE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Parse a finalized message's raw text into semantic `RichLine`s. Theme- and
 /// width-independent; called exactly once per message on finalize (never per
 /// frame). `pulldown-cmark` is total — malformed input degrades to best-effort

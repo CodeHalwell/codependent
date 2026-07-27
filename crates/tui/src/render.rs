@@ -5758,6 +5758,14 @@ mod tests {
     fn theme_change_re_renders_without_re_parsing() {
         use crate::markdown::PARSE_CALLS;
         use std::sync::atomic::Ordering;
+        // Serialize against the other PARSE_CALLS-dependent test
+        // (`reduce::finalize_is_idempotent`): PARSE_CALLS is one process-wide
+        // counter and `cargo test` runs tests in parallel by default, so two
+        // such tests racing could otherwise interleave their reset/read and
+        // flake this assertion. Held for the whole test (see
+        // `markdown::lock_parse_calls` doc comment for why this cannot
+        // deadlock against this test's own finalize step below).
+        let _serialize_parse_calls = crate::markdown::lock_parse_calls();
         let s = finalized_model_state("# H");
         PARSE_CALLS.store(0, Ordering::Relaxed);
         let (dark, _r, _h) = build_transcript_window(&s.runs, &Theme::dark(), 78, 0, 40, 0);
@@ -6029,6 +6037,105 @@ mod tests {
         assert!(
             map.iter().any(|(_, a)| matches!(a, Action::OpenPalette)),
             "footer chip → its Action"
+        );
+    }
+
+    // --- Task 9: hygiene — final end-to-end integration ---
+
+    /// End-to-end: a finalized assistant message with headings, emphasis,
+    /// inline code, a list, a fenced code block, and a block quote renders
+    /// through the real `parse` -> cache -> `RowKind::Rich` path — the whole
+    /// pipeline this feature built, not a single stage in isolation. While
+    /// still streaming the raw markdown is visible (plain path); once
+    /// finalized the markup is consumed and the styled prose remains.
+    #[test]
+    fn full_markdown_message_snaps_to_rich_end_to_end() {
+        let md = "# Report\n\nSome **bold** and `code`.\n\n- one\n- two\n\n\
+                  ```rust\nfn main() { let x = 1; }\n```\n\n> a quote";
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "please report".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: md.to_owned(),
+            }),
+        );
+        // While streaming: raw markdown is visible (plain path).
+        assert!(render_to_string(&s, 80, 30).contains("# Report"));
+        // Finalize.
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+        let out = render_to_string(&s, 80, 30);
+        // The literal "# " heading marker is gone (rendered as a styled heading).
+        assert!(out.contains("Report"));
+        assert!(
+            !out.contains("# Report"),
+            "heading markup should be consumed:\n{out}"
+        );
+        // The user's own turn and the agent reply both rendered.
+        assert!(out.contains("please report"));
+    }
+
+    /// Same end-to-end path, but with a large finalized rich message — the
+    /// crash-path invariant (§Global Constraints: virtualization preserved)
+    /// re-checked one more time against the full pipeline, not just the
+    /// synthetic list built in `rich_message_build_materializes_only_the_viewport`.
+    #[test]
+    fn full_pipeline_stays_virtualization_bounded_when_finalized() {
+        // Headings/bold/inline code up top, then a long plain list — 3000
+        // short items keeps the whole message comfortably under
+        // `RICH_MARKDOWN_MAX_BYTES` (64 KiB) so it actually finalizes into
+        // the rich cache (a message over that cap stays on the plain path
+        // by design), while still being long enough to force virtualization.
+        let mut md = "# Huge Report\n\nSome **bold** and `inline` code up top.\n\n".to_owned();
+        for i in 0..3000 {
+            md.push_str(&format!("- item {i}\n"));
+        }
+        let s = finalized_model_state(&md);
+        assert!(
+            s.runs[0].transcript.iter().any(|e| matches!(
+                e,
+                TranscriptEntry::Model {
+                    rendered: Some(_),
+                    ..
+                }
+            )),
+            "message did not finalize into the rich cache"
+        );
+
+        let theme = Theme::dark();
+        let (inner_width, height) = (78u16, 20u16);
+        let total = transcript_rows(&s.runs, &theme, inner_width);
+        assert!(
+            total >= 3000,
+            "measure sees the whole rich history: {total}"
+        );
+        let (lines, _r, _h) = build_transcript_window(
+            &s.runs,
+            &theme,
+            inner_width,
+            total.saturating_sub(height),
+            height,
+            0,
+        );
+        assert!(
+            lines.len() <= height as usize + 4,
+            "full pipeline must still materialize O(viewport), not O(history): {}",
+            lines.len()
         );
     }
 }

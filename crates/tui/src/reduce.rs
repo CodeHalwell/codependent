@@ -4906,6 +4906,14 @@ mod tests {
     fn finalize_is_idempotent() {
         use crate::markdown::PARSE_CALLS;
         use std::sync::atomic::Ordering;
+        // Serialize against the other PARSE_CALLS-dependent test
+        // (`render::theme_change_re_renders_without_re_parsing`): PARSE_CALLS
+        // is one process-wide counter and `cargo test` runs tests in parallel
+        // by default, so two such tests racing could otherwise interleave
+        // their reset/read and flake this assertion. Held for the whole test
+        // (see `markdown::lock_parse_calls` doc comment for why this cannot
+        // deadlock against this test's own finalize steps below).
+        let _serialize_parse_calls = crate::markdown::lock_parse_calls();
         let mut s = AppState::new();
         let run_id = RunId::new();
         reduce(
