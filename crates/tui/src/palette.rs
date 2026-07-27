@@ -68,59 +68,47 @@ pub struct PaletteEntry {
     /// single-key binding (e.g. the model picker: MP1 deliberately gives it
     /// none, leaving `m` free).
     pub key: &'static str,
+    /// The command's group, for the palette's dim group-label rows. Groups
+    /// are rendered only while the query is empty (filtering can straddle
+    /// groups, so the labels would mislead); see [`crate::render`].
+    pub group: &'static str,
 }
 
-/// Every command the palette offers, ordered by likely usage (not alphabetically)
-/// so the common actions surface first when the query is empty.
+/// Every command the palette offers, grouped into contiguous sections (`Run` →
+/// `Models` → `Browse` → `Session`) so the palette can render a dim group label
+/// whenever the group changes. [`filtered`] preserves this table order, so the
+/// selectable index math is unaffected by the grouping.
 pub const COMMANDS: &[PaletteEntry] = &[
+    // --- Run: acting on the selected run. ---
     PaletteEntry {
         command: PaletteCommand::NewRun,
         title: "New run",
         description: "start a new run in this session",
         key: "n",
+        group: "Run",
     },
     PaletteEntry {
         command: PaletteCommand::Steer,
         title: "Steer run",
         description: "queue a message for the next safe point",
         key: "s",
+        group: "Run",
     },
     PaletteEntry {
         command: PaletteCommand::PauseResume,
         title: "Pause / resume run",
         description: "pause the selected run, or resume it",
         key: "p",
+        group: "Run",
     },
     PaletteEntry {
         command: PaletteCommand::Cancel,
         title: "Cancel run",
         description: "cancel the selected run (asks to confirm)",
         key: "c",
+        group: "Run",
     },
-    PaletteEntry {
-        command: PaletteCommand::Docs,
-        title: "Docs Studio",
-        description: "browse documents (tree / editor / review rails)",
-        key: "D",
-    },
-    PaletteEntry {
-        command: PaletteCommand::Edges,
-        title: "Code-graph edges",
-        description: "inspect graph edges (relation, evidence, revision)",
-        key: "G",
-    },
-    PaletteEntry {
-        command: PaletteCommand::Workflow,
-        title: "Workflow graph",
-        description: "view workflow nodes (state, agent, worktree, approval)",
-        key: "W",
-    },
-    PaletteEntry {
-        command: PaletteCommand::Blackboard,
-        title: "Blackboard",
-        description: "view workflow artifacts (findings, decisions, evidence)",
-        key: "B",
-    },
+    // --- Models: choosing what runs the next turn. ---
     PaletteEntry {
         command: PaletteCommand::Model,
         title: "Model picker",
@@ -128,6 +116,7 @@ pub const COMMANDS: &[PaletteEntry] = &[
         // Palette-only this task: no single-key equivalent (see the field's
         // doc comment).
         key: "—",
+        group: "Models",
     },
     PaletteEntry {
         command: PaletteCommand::Provider,
@@ -136,36 +125,72 @@ pub const COMMANDS: &[PaletteEntry] = &[
         // Palette-only (Task 8): no single-key equivalent, mirroring the
         // model picker's own row.
         key: "—",
+        group: "Models",
+    },
+    // --- Browse: read-only studios and inspectors. ---
+    PaletteEntry {
+        command: PaletteCommand::Docs,
+        title: "Docs Studio",
+        description: "browse documents (tree / editor / review rails)",
+        key: "D",
+        group: "Browse",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Edges,
+        title: "Code-graph edges",
+        description: "inspect graph edges (relation, evidence, revision)",
+        key: "G",
+        group: "Browse",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Workflow,
+        title: "Workflow graph",
+        description: "view workflow nodes (state, agent, worktree, approval)",
+        key: "W",
+        group: "Browse",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Blackboard,
+        title: "Blackboard",
+        description: "view workflow artifacts (findings, decisions, evidence)",
+        key: "B",
+        group: "Browse",
     },
     PaletteEntry {
         command: PaletteCommand::Skills,
         title: "Skill Studio",
         description: "browse skills and their permissions verbatim",
         key: "S",
+        group: "Browse",
     },
     PaletteEntry {
         command: PaletteCommand::Memory,
         title: "Memory",
         description: "browse curated memories and their provenance",
         key: "M",
+        group: "Browse",
     },
+    // --- Session: client-level and housekeeping commands. ---
     PaletteEntry {
         command: PaletteCommand::ToggleLayout,
         title: "Toggle layout",
         description: "switch between chat and workspace panes",
         key: "F2",
+        group: "Session",
     },
     PaletteEntry {
         command: PaletteCommand::Help,
         title: "Help",
         description: "toggle the key-binding help overlay",
         key: "?",
+        group: "Session",
     },
     PaletteEntry {
         command: PaletteCommand::Detach,
         title: "Detach",
         description: "leave the TUI; the run keeps going",
         key: "q",
+        group: "Session",
     },
     PaletteEntry {
         command: PaletteCommand::NewConversation,
@@ -174,6 +199,7 @@ pub const COMMANDS: &[PaletteEntry] = &[
             "start a fresh, unseeded conversation — detaches now; the next launch begins it",
         // Palette-only: a deliberate, rare action gets no single-key slot.
         key: "—",
+        group: "Session",
     },
 ];
 

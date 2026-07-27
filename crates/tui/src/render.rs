@@ -2596,7 +2596,7 @@ fn render_palette(frame: &mut Frame, area: Rect, theme: &Theme, query: &str, sel
         Paragraph::new(vec![
             filter,
             Line::styled(
-                "  ↑/↓ select · Enter run · Esc close",
+                "  ↑/↓ select · Enter run · Esc close · click a row",
                 Style::default().fg(theme.text.muted),
             ),
         ])
@@ -2604,8 +2604,18 @@ fn render_palette(frame: &mut Frame, area: Rect, theme: &Theme, query: &str, sel
         rows[0],
     );
 
-    // The filtered command list.
+    // The filtered command list: name / description / shortcut columns,
+    // grouped into contiguous sections (a dim label row per group) when the
+    // query is empty — filtering flattens the groups away since matches can
+    // straddle them.
     let matches = crate::palette::filtered(query);
+    let inner_w = rows[1].width as usize;
+    let title_w = 20usize;
+    let key_w = 4usize;
+    // marker(2) + title + space + description(fill) + key
+    let desc_w = inner_w.saturating_sub(2 + title_w + 1 + key_w).max(1);
+    let show_groups = query.trim().is_empty();
+
     let mut items: Vec<ListItem> = Vec::new();
     if matches.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -2613,23 +2623,41 @@ fn render_palette(frame: &mut Frame, area: Rect, theme: &Theme, query: &str, sel
             Style::default().fg(theme.text.muted),
         )));
     }
+    let mut last_group: Option<&str> = None;
     for (idx, entry) in matches.iter().enumerate() {
+        if show_groups && last_group != Some(entry.group) {
+            items.push(ListItem::new(Line::styled(
+                format!("  {}", entry.group),
+                Style::default().fg(theme.text.muted),
+            )));
+            last_group = Some(entry.group);
+        }
         let is_selected = idx == selected;
         let marker = if is_selected { "› " } else { "  " };
+        // Unbound commands (`key == "—"`) show nothing in the shortcut
+        // column — never a fake `[—]` marker (the honesty invariant: an
+        // absent binding reads as absent, not as a placeholder value).
+        let key = if entry.key == "—" {
+            " ".repeat(key_w)
+        } else {
+            format!("{:>width$}", entry.key, width = key_w)
+        };
         let head = Line::from(vec![
             Span::styled(marker, Style::default().fg(theme.focus.active)),
             Span::styled(
-                format!("{:<20}", entry.title),
+                format!("{:<width$}", entry.title, width = title_w),
                 Style::default().fg(theme.text.primary),
             ),
+            Span::raw(" "),
             Span::styled(
-                entry.description.to_owned(),
+                format!(
+                    "{:<width$}",
+                    truncate(entry.description, desc_w),
+                    width = desc_w
+                ),
                 Style::default().fg(theme.text.muted),
             ),
-            Span::styled(
-                format!("  [{}]", entry.key),
-                Style::default().fg(theme.status.info),
-            ),
+            Span::styled(key, Style::default().fg(theme.status.info)),
         ]);
         let item = ListItem::new(head);
         items.push(if is_selected {
@@ -4622,6 +4650,36 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_aligns_columns_groups_and_drops_the_dash() {
+        let mut state = running_build_state();
+        reduce(&mut state, Action::OpenPalette);
+        let all = render_to_string(&state, 120, 40);
+        assert!(all.contains("Command palette"), "title:\n{all}");
+        assert!(all.contains("New run"), "command:\n{all}");
+        assert!(all.contains("Model picker"), "command:\n{all}");
+        // Group labels appear on the empty query.
+        assert!(
+            all.contains("Run") && all.contains("Models"),
+            "group labels:\n{all}"
+        );
+        // The confusing unbound-key marker is gone.
+        assert!(!all.contains("[—]"), "no [—] marker:\n{all}");
+        // The header hint invites clicking.
+        assert!(all.contains("click a row"), "click hint:\n{all}");
+
+        // Filtering hides the group labels.
+        for c in "docs".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        let filtered = render_to_string(&state, 120, 40);
+        assert!(filtered.contains("Docs Studio"), "match:\n{filtered}");
+        assert!(
+            !filtered.contains("New run"),
+            "non-match filtered:\n{filtered}"
+        );
+    }
+
+    #[test]
     fn command_palette_snapshot_lists_and_filters_commands() {
         let mut state = running_build_state();
         reduce(&mut state, Action::OpenPalette);
@@ -4630,7 +4688,7 @@ mod tests {
         // Unfiltered, it lists commands with their key hints.
         assert!(all.contains("New run"), "command missing:\n{all}");
         assert!(all.contains("Docs Studio"), "command missing:\n{all}");
-        assert!(all.contains("[n]"), "key hint missing:\n{all}");
+        assert!(!all.contains("[—]"), "no dash marker:\n{all}");
 
         // Typing filters the list down.
         for c in "docs".chars() {
