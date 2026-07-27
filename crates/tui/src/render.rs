@@ -20,43 +20,51 @@ use codypendent_protocol::{
     AgentMode, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition, RunState,
 };
 
+use crate::action::Action;
+use crate::input::footer_hints;
 use crate::reduce::capability_label;
 use crate::state::{
     filter_model_names, filter_models, filter_providers, AppState, DocFocus, DocLeaseState,
-    LayoutMode, ModelCard, ModelLocationLabel, Overlay, PatchSummary, ProviderCard, RunActivity,
-    RunView, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
+    LayoutMode, ModelCard, ModelLocationLabel, Overlay, Pane, PatchSummary, ProviderCard,
+    RunActivity, RunView, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 
 /// Draw the whole UI for the current frame.
 pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let area = frame.area();
+    // Rebuilt fresh every frame (mirrors `transcript_max_scroll`): a stale hit
+    // from a previous layout must never survive to resolve this frame's clicks.
+    state.hit_map.borrow_mut().clear();
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.surface.background)),
         area,
     );
 
     // A conversation-centred shell: the transcript is the workspace, a
-    // persistent composer sits beneath it, and a one-row status footer spans the
-    // bottom. Every other surface (runs, approvals, docs, skills, memory, edges)
-    // is a centered overlay or the approval modal — minimal permanent chrome.
+    // persistent composer sits beneath it, a one-row status footer follows, and
+    // a one-row derived shortcuts strip spans the very bottom. Every other
+    // surface (runs, approvals, docs, skills, memory, edges) is a centered
+    // overlay or the approval modal — minimal permanent chrome.
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),                  // conversation transcript
             Constraint::Length(COMPOSER_HEIGHT), // persistent composer
             Constraint::Length(1),               // status footer
+            Constraint::Length(1),               // shortcuts footer (derived)
         ])
         .split(area);
 
-    // The region above the composer depends on the layout; the composer and
-    // status footer are identical in both.
+    // The region above the composer depends on the layout; the composer, status
+    // footer, and shortcuts footer are identical in both.
     match state.layout {
         LayoutMode::Chat => render_conversation(frame, rows[0], state, theme),
         LayoutMode::Workspace => render_workspace(frame, rows[0], state, theme),
     }
     render_composer(frame, rows[1], state, theme);
     render_status_line(frame, rows[2], state, theme);
+    render_shortcuts_bar(frame, rows[3], state, theme);
 
     render_overlays(frame, area, state, theme);
 }
@@ -73,6 +81,11 @@ fn render_workspace(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
             Constraint::Percentage(26),
         ])
         .split(area);
+    // Register the whole-pane click-to-focus rects FIRST so each pane's own
+    // finer row hits (registered by the renderers below) win over them.
+    state.register_hit(cols[0], Action::FocusPane(Pane::Sessions));
+    state.register_hit(cols[1], Action::FocusPane(Pane::Transcript));
+    state.register_hit(cols[2], Action::FocusPane(Pane::Approvals));
     render_runs_pane(frame, cols[0], state, theme);
     render_conversation(frame, cols[1], state, theme);
     render_context_pane(frame, cols[2], state, theme);
@@ -111,7 +124,24 @@ fn render_runs_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
             item
         });
     }
+    let inner = block.inner(area);
     frame.render_widget(List::new(items).block(block), area);
+    let base = inner.y + if state.runs.is_empty() { 1 } else { 0 };
+    for (idx, _) in state.runs.iter().enumerate() {
+        let y = base + idx as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
+            Action::SelectRun(idx),
+        );
+    }
 }
 
 /// The context pane (workspace layout): pending approvals over the selected run's
@@ -210,11 +240,256 @@ fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &
 /// The composer's height in rows (a bordered box holding one input line).
 const COMPOSER_HEIGHT: u16 = 3;
 
+/// Wrapped-row height of a line `columns` display-columns wide in an
+/// `inner_width` viewport: ceil(columns/inner_width), min 1.
+fn line_rows(columns: usize, inner_width: usize) -> u16 {
+    let iw = inner_width.max(1);
+    let rows = if columns == 0 {
+        1
+    } else {
+        columns.div_ceil(iw)
+    };
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// One transcript row before placement (see module-level virtualization note).
+struct Row<'a> {
+    kind: RowKind<'a>,
+    /// The transcript-entry index this row is a click target for (fold heads in
+    /// the selected run). `None` unless tagged (Task 8).
+    hit_entry: Option<usize>,
+}
+
+enum RowKind<'a> {
+    /// An already-styled line (structural rows + every non-`Model` entry).
+    Built(Line<'a>),
+    /// A streamed model-text source line, borrowed so measuring allocates nothing.
+    Model {
+        prefix: &'static str,
+        text: &'a str,
+        caret: bool,
+        style: Style,
+    },
+}
+
+impl<'a> Row<'a> {
+    fn built(line: Line<'a>) -> Self {
+        Row {
+            kind: RowKind::Built(line),
+            hit_entry: None,
+        }
+    }
+    fn model(prefix: &'static str, text: &'a str, caret: bool, style: Style) -> Self {
+        Row {
+            kind: RowKind::Model {
+                prefix,
+                text,
+                caret,
+                style,
+            },
+            hit_entry: None,
+        }
+    }
+    /// Display width, allocation-free (`Span::raw` borrows; `.width()` is unicode width).
+    fn columns(&self) -> usize {
+        match &self.kind {
+            RowKind::Built(line) => line.width(),
+            RowKind::Model {
+                prefix,
+                text,
+                caret,
+                ..
+            } => Span::raw(*prefix).width() + Span::raw(*text).width() + usize::from(*caret),
+        }
+    }
+    fn rows(&self, inner_width: u16) -> u16 {
+        line_rows(self.columns(), inner_width as usize)
+    }
+    fn into_line(self, theme: &Theme) -> Line<'a> {
+        match self.kind {
+            RowKind::Built(line) => line,
+            RowKind::Model {
+                prefix,
+                text,
+                caret,
+                style,
+            } => {
+                if caret {
+                    Line::from(vec![
+                        Span::styled(format!("{prefix}{text}"), style),
+                        Span::styled("▋", Style::default().fg(theme.text.muted)),
+                    ])
+                } else {
+                    Line::styled(format!("{prefix}{text}"), style)
+                }
+            }
+        }
+    }
+}
+
+/// Walk the whole session transcript in scroll order, emitting one `Row` per
+/// logical line. Mirrors the old `conversation_lines` walk exactly; the `Model`
+/// entry is emitted as borrowed `Row::Model` rows (measured cheaply, built only
+/// when visible), every other entry reuses the existing `entry_lines` builders.
+fn for_each_row<'a>(
+    runs: &'a [RunView],
+    theme: &Theme,
+    selected_run: usize,
+    mut visit: impl FnMut(Row<'a>),
+) {
+    let mut awaiting_header = false;
+    let mut seen_user_turn = false;
+    let last_run_idx = runs.len().checked_sub(1);
+    let mut scratch: Vec<Line> = Vec::new();
+    for (run_idx, run) in runs.iter().enumerate() {
+        let is_last_run = Some(run_idx) == last_run_idx;
+        let last_entry_idx = run.transcript.len().checked_sub(1);
+        let mut produced = false;
+        for (idx, entry) in run.transcript.iter().enumerate() {
+            let streaming_tail = is_last_run
+                && last_entry_idx == Some(idx)
+                && run.activity == RunActivity::Streaming;
+            let is_agent_cell = matches!(
+                entry,
+                TranscriptEntry::Model { .. }
+                    | TranscriptEntry::Tool(_)
+                    | TranscriptEntry::Patch(_)
+            );
+            if matches!(entry, TranscriptEntry::User { .. }) {
+                if seen_user_turn {
+                    visit(Row::built(Line::raw("")));
+                    produced = true;
+                }
+                seen_user_turn = true;
+                awaiting_header = true;
+            } else if is_agent_cell && awaiting_header {
+                let mut spans = vec![Span::styled(
+                    "⏺ codypendent",
+                    Style::default()
+                        .fg(theme.agent.tool)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                if let Some(model) = &run.model {
+                    spans.push(Span::styled(
+                        format!(" · {model}"),
+                        Style::default().fg(theme.text.muted),
+                    ));
+                }
+                visit(Row::built(Line::from(spans)));
+                produced = true;
+                awaiting_header = false;
+            }
+            match entry {
+                TranscriptEntry::Model { text } => {
+                    let mut rows: Vec<&str> = text.lines().collect();
+                    if rows.is_empty() {
+                        rows.push("");
+                    }
+                    let last = rows.len() - 1;
+                    let style = Style::default().fg(theme.agent.model_text);
+                    for (i, l) in rows.into_iter().enumerate() {
+                        let prefix = if i == 0 { "▌ " } else { "  " };
+                        visit(Row::model(prefix, l, streaming_tail && i == last, style));
+                        produced = true;
+                    }
+                }
+                other => {
+                    scratch.clear();
+                    entry_lines(other, theme, false, false, &mut scratch);
+                    let hit = if run_idx == selected_run {
+                        fold_hit_entry(other, idx)
+                    } else {
+                        None
+                    };
+                    for (j, line) in scratch.drain(..).enumerate() {
+                        let mut row = Row::built(line);
+                        if j == 0 {
+                            row.hit_entry = hit;
+                        }
+                        visit(row);
+                        produced = true;
+                    }
+                }
+            }
+        }
+        if !produced {
+            visit(Row::built(Line::styled(
+                "(waiting for the agent…)",
+                Style::default().fg(theme.text.muted),
+            )));
+        }
+        if let Some(status) = activity_status_line(&run.activity, theme) {
+            visit(Row::built(status));
+        }
+    }
+}
+
+/// The entry index if this entry renders a clickable fold HEAD (its first line):
+/// a backstage summary, a folded (multi-line) note, or a failed-run summary.
+fn fold_hit_entry(entry: &TranscriptEntry, idx: usize) -> Option<usize> {
+    match entry {
+        TranscriptEntry::Backstage { .. } => Some(idx),
+        TranscriptEntry::Note { text, .. } if text.lines().count() > NOTE_INLINE_LINE_THRESHOLD => {
+            Some(idx)
+        }
+        TranscriptEntry::Completed {
+            disposition: RunDisposition::Failed { .. },
+            ..
+        } => Some(idx),
+        _ => None,
+    }
+}
+
+/// Total wrapped-row height of the whole transcript (the measure pass).
+fn transcript_rows(runs: &[RunView], theme: &Theme, inner_width: u16) -> u16 {
+    let mut total: u16 = 0;
+    for_each_row(runs, theme, usize::MAX, |row| {
+        total = total.saturating_add(row.rows(inner_width));
+    });
+    total
+}
+
+/// Build only the rows whose wrapped range intersects `[first_row, first_row+height)`.
+fn build_transcript_window<'a>(
+    runs: &'a [RunView],
+    theme: &Theme,
+    inner_width: u16,
+    first_row: u16,
+    height: u16,
+    selected_run: usize,
+) -> (Vec<Line<'a>>, u16, Vec<(usize, usize)>) {
+    let last_row = first_row.saturating_add(height);
+    let mut out: Vec<Line> = Vec::with_capacity(height as usize + 2);
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    let mut cursor: u16 = 0;
+    let mut scroll: u16 = 0;
+    let mut first_seen = false;
+    for_each_row(runs, theme, selected_run, |row| {
+        let h = row.rows(inner_width);
+        let row_start = cursor;
+        let row_end = cursor.saturating_add(h);
+        cursor = row_end;
+        if row_end > first_row && row_start < last_row {
+            if !first_seen {
+                scroll = first_row.saturating_sub(row_start);
+                first_seen = true;
+            }
+            let hit = row.hit_entry;
+            let index = out.len();
+            out.push(row.into_line(theme));
+            if let Some(entry) = hit {
+                hits.push((index, entry));
+            }
+        }
+    });
+    (out, scroll, hits)
+}
+
 /// The conversation: every run in the session, in order, as one continuous
 /// scroll (Task 5, continuous-session plan) — the primary surface, full
 /// width. Before this task, the pane showed only the *selected* run, so a
 /// follow-up's new run made the previous turn disappear the instant it
-/// started; `conversation_lines` now walks all of `state.runs`. The title
+/// started; [`for_each_row`] now walks all of `state.runs`. The title
 /// names the session + the newest turn (and a turn count once the session has
 /// more than one), plus the header chrome (Task 4, codex chat shell) naming
 /// what's serving it: `model · mode[ · cost]`.
@@ -253,29 +528,69 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         return;
     }
 
-    let lines = conversation_lines(&state.runs, theme);
-
-    // Auto-scroll: measure the wrapped height, cache the bottom offset (so the
-    // reducer's paging can leave/enter follow mode precisely), and pin the view to
-    // the tail while following; otherwise honor the manual offset. The selected
-    // run's follow/scroll fields govern the WHOLE scroll — `AppState::ensure_run`
-    // keeps `selected_run` on the newest run by default, so "follow" still means
-    // "stick to the conversation's live tail."
-    let max_scroll = max_scroll_offset(&lines, inner.width, inner.height);
+    let inner_width = inner.width;
+    // Measure the whole transcript cheaply, cache the bottom offset (so the
+    // reducer's paging leaves/enters follow mode precisely), then BUILD only the
+    // visible window — per-frame allocation is bounded by the viewport, not the
+    // transcript length (the crash fix).
+    let content_rows = transcript_rows(&state.runs, theme, inner_width);
+    let max_scroll = content_rows.saturating_sub(inner.height);
     state.transcript_max_scroll.set(max_scroll);
     let (follow, scroll) = state
         .selected_run()
         .map_or((true, 0), |run| (run.follow, run.scroll));
-    let offset = if follow {
+    let mut offset = if follow {
         max_scroll
     } else {
         scroll.min(max_scroll)
     };
+    // Guard the u16 handed to `Paragraph::scroll` — the rewrite must not
+    // reintroduce the overflow the old implicit coupling merely avoided.
+    offset = offset.min(u16::MAX.saturating_sub(inner.height));
+
+    let (mut lines, r0, hits) = build_transcript_window(
+        &state.runs,
+        theme,
+        inner_width,
+        offset,
+        inner.height,
+        state.selected_run,
+    );
+
+    // Bottom-anchor: when the transcript is shorter than the viewport, pool the
+    // quiet space at the TOP so content sits flush above the composer. `top_pad`
+    // is 0 whenever content overflows, so the follow/scroll path is untouched.
+    let top_pad = inner.height.saturating_sub(content_rows);
+    if top_pad > 0 {
+        let mut padded = Vec::with_capacity(top_pad as usize + lines.len());
+        padded.resize(top_pad as usize, Line::raw(""));
+        padded.append(&mut lines);
+        lines = padded;
+    }
+
+    // Register only the VISIBLE fold-head hits `build_transcript_window` found
+    // (bounded by the viewport, never the whole history — virtualization
+    // preserved). One of `top_pad`/`r0` is always 0 (see their derivation
+    // above), so this formula exactly places a single-row fold head.
+    for (line_index, entry) in &hits {
+        let screen_y = inner.y as i32 + top_pad as i32 + *line_index as i32 - r0 as i32;
+        if screen_y >= inner.y as i32 && screen_y < (inner.y + inner.height) as i32 {
+            state.register_hit(
+                Rect {
+                    x: inner.x,
+                    y: screen_y as u16,
+                    width: inner.width,
+                    height: 1,
+                },
+                Action::ActivateRow(*entry),
+            );
+        }
+    }
 
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((offset, 0));
+        .scroll((r0, 0));
     frame.render_widget(paragraph, area);
 }
 
@@ -296,27 +611,6 @@ fn header_chrome(run: &RunView, status: &StatusProjection) -> String {
         parts.push(format_cost(Some(cost)));
     }
     format!(" · {}", parts.join(" · "))
-}
-
-/// The largest useful scroll offset: total wrapped rows minus the viewport
-/// height (0 when everything fits). Wrapped rows are estimated as
-/// `ceil(line_width / inner_width)` per line — close enough for scrolling; the
-/// exact word-wrap boundary differs by at most a row.
-fn max_scroll_offset(lines: &[Line], width: u16, height: u16) -> u16 {
-    let inner_width = width.max(1) as usize;
-    let total: usize = lines
-        .iter()
-        .map(|line| {
-            let w = line.width();
-            if w == 0 {
-                1
-            } else {
-                w.div_ceil(inner_width)
-            }
-        })
-        .sum();
-    let total = u16::try_from(total).unwrap_or(u16::MAX);
-    total.saturating_sub(height)
 }
 
 /// The persistent composer: an always-present input line. Empty, it shows a
@@ -360,6 +654,12 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             .wrap(Wrap { trim: false }),
         area,
     );
+    // Belt-and-braces: the full-screen scrim (`render_overlays`) already
+    // returns to typing on an outside click; this covers the composer
+    // specifically in case it ever renders above the scrim.
+    if !matches!(state.overlay, Overlay::None) {
+        state.register_hit(area, Action::Dismiss);
+    }
 }
 
 fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
@@ -373,93 +673,6 @@ fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
         ))
         .border_style(Style::default().fg(theme.border_color(focused)))
         .style(theme.panel_style())
-}
-
-/// The whole session's transcript, in run order, as one continuous scroll
-/// (Task 5, continuous-session plan): every run's entries walk through
-/// exactly the per-turn rendering a single run used to get alone, so a
-/// follow-up's new run is appended after the prior one instead of replacing
-/// it. `awaiting_header` and `seen_user_turn` (see their notes below) thread
-/// continuously across a run boundary — a new run's opening `User` entry is
-/// just the conversation's next turn — so the assistant header and the
-/// between-turns blank line both land exactly where they would if the whole
-/// session had always been one run's transcript.
-fn conversation_lines<'a>(runs: &'a [RunView], theme: &Theme) -> Vec<Line<'a>> {
-    let mut lines: Vec<Line> = Vec::new();
-    // Assistant-turn header (codex chat shell Task 3): a `⏺ codypendent`
-    // line announces the first agent cell (Model/Tool/Patch) of each turn,
-    // so the transcript reads as "you asked → codypendent answered" rather
-    // than an undifferentiated stream. `awaiting_header` tracks whether the
-    // next agent cell is still the first one since the most recent `User`
-    // entry; every other cell kind (Steering, Budget, Note, Backstage,
-    // Completed, Unsupported) leaves it untouched, so a run that ends before
-    // producing any agent cell never emits a lone header with nothing under
-    // it.
-    let mut awaiting_header = false;
-    // Turn spacing (Task 4, codex chat shell): a blank line before every
-    // `User` turn after the first, so consecutive turns breathe instead of
-    // reading as one undifferentiated scroll. The opening turn needs no
-    // leading gap.
-    let mut seen_user_turn = false;
-    // The last run's index: only the conversation's newest run can still be
-    // live, so the streaming caret (below) never lands on an earlier,
-    // necessarily-terminal run.
-    let last_run_idx = runs.len().checked_sub(1);
-    for (run_idx, run) in runs.iter().enumerate() {
-        let is_last_run = Some(run_idx) == last_run_idx;
-        let last_entry_idx = run.transcript.len().checked_sub(1);
-        let before = lines.len();
-        for (idx, entry) in run.transcript.iter().enumerate() {
-            // Task 4: the streaming caret belongs on the newest entry of the
-            // newest run only, and only while that run is actively streaming
-            // into it — never mid-transcript, never on an earlier run, and
-            // never once the run has moved on to Idle/Thinking/RunningTool (a
-            // tool call, a thinking pause, or completion all drop it).
-            let streaming_tail = is_last_run
-                && last_entry_idx == Some(idx)
-                && run.activity == RunActivity::Streaming;
-            let is_agent_cell = matches!(
-                entry,
-                TranscriptEntry::Model { .. }
-                    | TranscriptEntry::Tool(_)
-                    | TranscriptEntry::Patch(_)
-            );
-            if matches!(entry, TranscriptEntry::User { .. }) {
-                if seen_user_turn {
-                    lines.push(Line::raw(""));
-                }
-                seen_user_turn = true;
-                awaiting_header = true;
-            } else if is_agent_cell && awaiting_header {
-                lines.push(Line::styled(
-                    "⏺ codypendent",
-                    Style::default().fg(theme.focus.active),
-                ));
-                awaiting_header = false;
-            }
-            // `selected = false`: the conversation shows no per-entry
-            // selection highlight (there is no in-transcript cursor in the
-            // composer-driven shell — `render_conversation` never focuses it).
-            entry_lines(entry, theme, false, streaming_tail, &mut lines);
-        }
-        // A run with no transcript entries yet (shouldn't happen in practice —
-        // `RunStarted`'s fold pushes the objective as the very first entry —
-        // but kept for the same defend-in-depth reason the single-run
-        // renderer always had it) still occupies its place in the scroll.
-        if lines.len() == before {
-            lines.push(Line::styled(
-                "(waiting for the agent…)",
-                Style::default().fg(theme.text.muted),
-            ));
-        }
-        // The live "working" status row (Task 3): appended right after this
-        // run's own entries — from this run's own activity — so it reads as
-        // that run's newest line. Idle (every terminal run) renders nothing.
-        if let Some(status) = activity_status_line(&run.activity, theme) {
-            lines.push(status);
-        }
-    }
-    lines
 }
 
 /// The dim status row a run's derived [`RunActivity`] renders as, so a run
@@ -493,7 +706,23 @@ fn entry_lines<'a>(
 
     match entry {
         TranscriptEntry::User { text } => {
-            out.push(head(format!("› {text}"), theme.focus.active));
+            out.push(Line::styled(
+                "You",
+                Style::default()
+                    .fg(theme.focus.active)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            let mut wrote_body = false;
+            for line in text.lines() {
+                out.push(Line::styled(
+                    format!("  {line}"),
+                    Style::default().fg(theme.text.primary),
+                ));
+                wrote_body = true;
+            }
+            if !wrote_body {
+                out.push(Line::styled("  ", Style::default().fg(theme.text.primary)));
+            }
         }
         TranscriptEntry::Model { text } => {
             model_entry_lines(text, theme, selected, streaming_tail, out);
@@ -518,13 +747,33 @@ fn entry_lines<'a>(
                 theme.status.warning,
             ));
         }
-        TranscriptEntry::Completed { disposition } => match disposition {
+        TranscriptEntry::Completed {
+            disposition,
+            expanded,
+        } => match disposition {
             // Success: the streamed model prose already ended the turn —
             // render nothing here, so the reply is never echoed a second
             // (or, with the old status line plus this one, third) time.
             RunDisposition::Completed { .. } => {}
+            // A failed run's `reason` is often a nested driver/service error
+            // chain (e.g. "model driver error: model stream failed: service
+            // error: request failed: builder error") — raw, that reads as
+            // noise. Collapsed (default), only `summarize_error`'s one-line,
+            // human summary shows; expanding (Task 3, mirrors the Backstage
+            // fold) reveals the full raw chain underneath, so no detail is
+            // ever lost, just folded.
             RunDisposition::Failed { reason } => {
-                out.push(head(format!("✗ {reason}"), theme.status.error));
+                let marker = if *expanded { "▾" } else { "▸" };
+                out.push(head(
+                    format!("{marker} ✗ {}", summarize_error(reason)),
+                    theme.status.error,
+                ));
+                if *expanded {
+                    out.push(Line::styled(
+                        format!("    {reason}"),
+                        Style::default().fg(theme.text.muted),
+                    ));
+                }
             }
             RunDisposition::Cancelled { reason } => {
                 let text = reason
@@ -562,6 +811,34 @@ fn entry_lines<'a>(
     }
 }
 
+/// Map a nested error chain (`": "`-joined segments) to a concise summary. Pure
+/// heuristic: recognized outermost segments map to a friendly category; anything
+/// else degrades to the outermost segment verbatim. The full raw chain is one
+/// expand away, so no detail is lost.
+fn summarize_error(raw: &str) -> String {
+    let outer = raw.split(": ").next().unwrap_or("").trim();
+    // Recognized categories, checked against any segment of the chain.
+    for segment in raw.split(": ") {
+        match segment.trim() {
+            "model driver error" | "model stream failed" => {
+                return "model error — the provider request failed".to_owned();
+            }
+            _ => {}
+        }
+    }
+    for segment in raw.split(": ") {
+        match segment.trim() {
+            "service error" | "request failed" => return "provider request failed".to_owned(),
+            _ => {}
+        }
+    }
+    if outer.is_empty() {
+        "run failed".to_owned()
+    } else {
+        outer.to_owned()
+    }
+}
+
 /// Renders one coalesced model-text entry. While `streaming_tail` is set —
 /// this is the run's newest transcript entry and the run's derived activity
 /// is [`RunActivity::Streaming`] — a muted `▋` caret is appended directly
@@ -572,7 +849,7 @@ fn entry_lines<'a>(
 /// call starting, a thinking pause, or the run completing).
 ///
 /// Folding the caret into the same `Line` that both the transcript
-/// `Paragraph` and [`max_scroll_offset`]'s measurement read (see
+/// `Paragraph` and [`transcript_rows`]'s measurement read (see
 /// `render_conversation`) means the measured bottom already accounts for it —
 /// "follow latest" pins to the caret's row with no separate adjustment.
 fn model_entry_lines<'a>(
@@ -862,16 +1139,6 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             .run_state
             .map_or(theme.text.muted, |s| run_state_color(s, theme)),
     ));
-    if full {
-        ambient.push(field(
-            "model",
-            status
-                .model
-                .as_ref()
-                .map_or("—".to_owned(), ToString::to_string),
-            theme.text.secondary,
-        ));
-    }
     if mid {
         ambient.push(field(
             "ctx",
@@ -926,10 +1193,8 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         ]
     } else if scrolled_up {
         vec![key("PgDn"), word(" ↧ latest")]
-    } else if !state.composer.is_empty() {
-        vec![key("⏎"), word(" send  "), key("Esc"), word(" clear")]
     } else {
-        vec![key("/"), word(" cmds  "), key("F2"), word(" layout")]
+        Vec::new()
     };
     // Right-align the hint by padding between it and the ambient fields. This
     // renders every frame, so measure widths from the spans directly rather than
@@ -945,7 +1210,62 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
 }
 
+/// The persistent, derived shortcut strip: `·`-separated chips built from
+/// `input::footer_hints()`, so it never drifts from the real key bindings. Chips
+/// drop right-to-left on narrow terminals.
+fn render_shortcuts_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let bg = Style::default().bg(theme.surface.overlay);
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    let mut used = 1usize;
+    let width = area.width as usize;
+    for (i, hint) in footer_hints().iter().enumerate() {
+        let sep = if i > 0 { 3 } else { 0 }; // " · "
+        let chip = Span::raw(hint.label).width(); // DISPLAY width (labels have ⏎/↑↓)
+        if used + sep + chip + 1 > width {
+            break; // drop the rest on a narrow terminal
+        }
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(theme.text.muted)));
+            used += 3;
+        }
+        let chip_start = used as u16 + area.x;
+        // Split "glyph rest" so the key glyph reads as the accent.
+        let (glyph, rest) = hint.label.split_once(' ').unwrap_or((hint.label, ""));
+        spans.push(Span::styled(
+            glyph.to_owned(),
+            Style::default().fg(theme.focus.active),
+        ));
+        if !rest.is_empty() {
+            spans.push(Span::styled(
+                format!(" {rest}"),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        used += chip;
+        let chip_end = used as u16 + area.x;
+        state.register_hit(
+            Rect {
+                x: chip_start,
+                y: area.y,
+                width: chip_end.saturating_sub(chip_start),
+                height: 1,
+            },
+            hint.action.clone(),
+        );
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
+}
+
 fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    // The modal scrim: registered FIRST (bottom of the overlay z-order) so it
+    // sits beneath every overlay's own rows, registered by the arms below —
+    // `hit_test` resolves to the topmost (last-registered) rect, so a click
+    // inside the overlay still resolves to its row, not the scrim. The
+    // approval modal (the `Overlay::None` + pending-approval branch) gets no
+    // scrim — it is a decision the operator must make explicitly.
+    if !matches!(state.overlay, Overlay::None) {
+        state.register_hit(area, Action::Dismiss);
+    }
     match &state.overlay {
         Overlay::Help => render_help(frame, area, theme),
         Overlay::NewRun(buffer) => {
@@ -970,7 +1290,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::Workflow => render_workflow(frame, area, state, theme),
         Overlay::Blackboard => render_blackboard(frame, area, state, theme),
         Overlay::Palette { query, selected } => {
-            render_palette(frame, area, theme, query, *selected);
+            render_palette(frame, area, state, theme, query, *selected);
         }
         Overlay::ModelPicker { query, selected } => {
             render_model_picker(frame, area, state, theme, query, *selected);
@@ -1026,7 +1346,16 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             selected,
             ..
         } => {
-            render_add_model_pick(frame, area, theme, provider_id, models, query, *selected);
+            render_add_model_pick(
+                frame,
+                area,
+                state,
+                theme,
+                provider_id,
+                models,
+                query,
+                *selected,
+            );
         }
         Overlay::None => {
             if state.show_approval_modal() {
@@ -1284,6 +1613,24 @@ fn render_model_picker(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         cols[0],
     );
+    // Each row is a fixed 3 lines tall (head/provider/badges) — register a
+    // rect of that height per filtered row so a click maps to the right index.
+    let list_area = cols[0];
+    for (row, _) in matches.iter().enumerate() {
+        let y = list_area.y + (row as u16) * 3;
+        if y >= list_area.y + list_area.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: 3,
+            },
+            Action::ActivateRow(row),
+        );
+    }
 
     // Right: the detail panel for the focused model.
     let detail_block = Block::default()
@@ -1504,6 +1851,24 @@ fn render_provider_picker(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         cols[0],
     );
+    // Each row is a fixed 4 lines tall (head/name/badges/auth) — register a
+    // rect of that height per filtered row so a click maps to the right index.
+    let list_area = cols[0];
+    for (row, _) in matches.iter().enumerate() {
+        let y = list_area.y + (row as u16) * 4;
+        if y >= list_area.y + list_area.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: 4,
+            },
+            Action::ActivateRow(row),
+        );
+    }
 
     // Right: the detail panel for the focused provider.
     let detail_block = Block::default()
@@ -2362,7 +2727,14 @@ fn textwrap_summary(summary: &str) -> Vec<String> {
 /// The command palette: a filter line over a searchable list of every command,
 /// so the growing feature set is reachable without a permanent pane or a
 /// single-key binding each. Colors are Theme tokens only (RULE 7).
-fn render_palette(frame: &mut Frame, area: Rect, theme: &Theme, query: &str, selected: usize) {
+fn render_palette(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    query: &str,
+    selected: usize,
+) {
     let rect = centered_rect(72, 70, area);
     frame.render_widget(Clear, rect);
 
@@ -2398,7 +2770,7 @@ fn render_palette(frame: &mut Frame, area: Rect, theme: &Theme, query: &str, sel
         Paragraph::new(vec![
             filter,
             Line::styled(
-                "  ↑/↓ select · Enter run · Esc close",
+                "  ↑/↓ select · Enter run · Esc close · click a row",
                 Style::default().fg(theme.text.muted),
             ),
         ])
@@ -2406,8 +2778,18 @@ fn render_palette(frame: &mut Frame, area: Rect, theme: &Theme, query: &str, sel
         rows[0],
     );
 
-    // The filtered command list.
+    // The filtered command list: name / description / shortcut columns,
+    // grouped into contiguous sections (a dim label row per group) when the
+    // query is empty — filtering flattens the groups away since matches can
+    // straddle them.
     let matches = crate::palette::filtered(query);
+    let inner_w = rows[1].width as usize;
+    let title_w = 20usize;
+    let key_w = 4usize;
+    // marker(2) + title + space + description(fill) + key
+    let desc_w = inner_w.saturating_sub(2 + title_w + 1 + key_w).max(1);
+    let show_groups = query.trim().is_empty();
+
     let mut items: Vec<ListItem> = Vec::new();
     if matches.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -2415,23 +2797,41 @@ fn render_palette(frame: &mut Frame, area: Rect, theme: &Theme, query: &str, sel
             Style::default().fg(theme.text.muted),
         )));
     }
+    let mut last_group: Option<&str> = None;
     for (idx, entry) in matches.iter().enumerate() {
+        if show_groups && last_group != Some(entry.group) {
+            items.push(ListItem::new(Line::styled(
+                format!("  {}", entry.group),
+                Style::default().fg(theme.text.muted),
+            )));
+            last_group = Some(entry.group);
+        }
         let is_selected = idx == selected;
         let marker = if is_selected { "› " } else { "  " };
+        // Unbound commands (`key == "—"`) show nothing in the shortcut
+        // column — never a fake `[—]` marker (the honesty invariant: an
+        // absent binding reads as absent, not as a placeholder value).
+        let key = if entry.key == "—" {
+            " ".repeat(key_w)
+        } else {
+            format!("{:>width$}", entry.key, width = key_w)
+        };
         let head = Line::from(vec![
             Span::styled(marker, Style::default().fg(theme.focus.active)),
             Span::styled(
-                format!("{:<20}", entry.title),
+                format!("{:<width$}", entry.title, width = title_w),
                 Style::default().fg(theme.text.primary),
             ),
+            Span::raw(" "),
             Span::styled(
-                entry.description.to_owned(),
+                format!(
+                    "{:<width$}",
+                    truncate(entry.description, desc_w),
+                    width = desc_w
+                ),
                 Style::default().fg(theme.text.muted),
             ),
-            Span::styled(
-                format!("  [{}]", entry.key),
-                Style::default().fg(theme.status.info),
-            ),
+            Span::styled(key, Style::default().fg(theme.status.info)),
         ]);
         let item = ListItem::new(head);
         items.push(if is_selected {
@@ -2444,6 +2844,32 @@ fn render_palette(frame: &mut Frame, area: Rect, theme: &Theme, query: &str, sel
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         rows[1],
     );
+
+    // Register each selectable row's rect for clicks, re-walking `matches` in
+    // the same order `items` was built so a (non-clickable) group label row
+    // shifts the screen offset exactly as it did above.
+    let list_area = rows[1];
+    let mut y = list_area.y;
+    let mut last_group: Option<&str> = None;
+    for (fi, entry) in matches.iter().enumerate() {
+        if show_groups && last_group != Some(entry.group) {
+            y = y.saturating_add(1); // the (non-clickable) group label row
+            last_group = Some(entry.group);
+        }
+        if y >= list_area.y + list_area.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: 1,
+            },
+            Action::ActivateRow(fi),
+        );
+        y = y.saturating_add(1);
+    }
 }
 
 /// Color an edge's confidence by tier (Chapter 07): a syntax-inferred call
@@ -2693,9 +3119,11 @@ fn render_querying(frame: &mut Frame, area: Rect, theme: &Theme, provider_id: &s
 /// fetched model ids, the same shape as [`render_model_picker`] but over plain
 /// `String` names (there is no `ModelCard` detail to show). Colors are Theme
 /// tokens only (RULE 7). The key is NOT in scope here.
+#[allow(clippy::too_many_arguments)] // mirrors the model/provider picker signatures + `state` (Task 8)
 fn render_add_model_pick(
     frame: &mut Frame,
     area: Rect,
+    state: &AppState,
     theme: &Theme,
     provider_id: &str,
     models: &[String],
@@ -2773,6 +3201,23 @@ fn render_add_model_pick(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         rows[1],
     );
+    // Each row is a single line — register a 1-row rect per filtered row.
+    let list_area = rows[1];
+    for (row, _) in matches.iter().enumerate() {
+        let y = list_area.y + row as u16;
+        if y >= list_area.y + list_area.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: 1,
+            },
+            Action::ActivateRow(row),
+        );
+    }
 }
 
 fn render_confirm(frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -3603,6 +4048,88 @@ mod tests {
         );
     }
 
+    /// Task 3: a nested error chain collapses to one concise, friendly line;
+    /// an unrecognized outermost segment degrades to itself verbatim (never a
+    /// crash, never a fabrication) and an empty reason still says something.
+    #[test]
+    fn summarize_error_maps_known_chains_and_degrades_unknown() {
+        assert_eq!(
+            summarize_error(
+                "model driver error: model stream failed: service error: request failed: builder error"
+            ),
+            "model error — the provider request failed"
+        );
+        assert_eq!(
+            summarize_error("service error: request failed"),
+            "provider request failed"
+        );
+        // Unknown outermost segment degrades to that segment verbatim (never a crash).
+        assert_eq!(
+            summarize_error("no model configured"),
+            "no model configured"
+        );
+        assert_eq!(summarize_error(""), "run failed");
+    }
+
+    /// Task 3: a failed run's nested error chain renders collapsed to the
+    /// concise summary by default (raw chain hidden), and expanding the
+    /// selected `Completed` entry reveals the full raw chain underneath —
+    /// nothing lost, just folded.
+    #[test]
+    fn a_failed_run_collapses_the_chain_and_expands_to_the_raw() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "hi".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Failed {
+                    reason: "model driver error: model stream failed: service error: request failed: builder error".to_owned(),
+                },
+                chronicle: filler_chronicle(),
+            }),
+        );
+
+        // Width 100 (rather than a tighter 80/90) keeps the raw, unwrapped
+        // chain on one row — at 88 inner columns the 89-column indented raw
+        // line wraps its last word onto its own row, which would split the
+        // "builder error" substring across a line break and make this a test
+        // artifact rather than a signal about the real feature.
+        let collapsed = render_to_string(&s, 100, 20);
+        assert!(
+            collapsed.contains("✗ model error — the provider request failed"),
+            "summary:\n{collapsed}"
+        );
+        assert!(
+            !collapsed.contains("builder error"),
+            "raw chain hidden while collapsed:\n{collapsed}"
+        );
+
+        // Select the Completed entry and expand it.
+        s.focus = Pane::Transcript;
+        let last = s.runs[0].transcript.len() - 1;
+        s.runs[0].transcript_selected = last;
+        reduce(&mut s, Action::Expand);
+
+        let expanded = render_to_string(&s, 100, 20);
+        assert!(
+            expanded.contains("✗ model error — the provider request failed"),
+            "summary kept:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("builder error"),
+            "raw chain revealed on expand:\n{expanded}"
+        );
+    }
+
     /// The assistant header announces only the first agent cell of a turn —
     /// a tool call followed by more model text in the same turn must not
     /// repeat it, and a `Tool` cell (not just `Model`) triggers it.
@@ -3722,22 +4249,25 @@ mod tests {
         });
         let out = render_to_string(&s, 80, 20);
         let rows: Vec<&str> = out.lines().collect();
-        // Search for the turn marker itself (not just the bare word), so a
-        // match can't land on the pane title — which also shows the
-        // objective ("alpha") and would otherwise be mistaken for the
-        // transcript row.
-        let alpha_row = rows
+        // Search for the turn body/header themselves (not just the bare
+        // word), so a match can't land on the pane title — which also shows
+        // the objective ("alpha") and would otherwise be mistaken for the
+        // transcript row. Rows carry the pane's left/right border glyph, so
+        // strip it before comparing the header line exactly.
+        let alpha_body = rows
             .iter()
-            .position(|r| r.contains("› alpha"))
-            .expect("first turn rendered");
-        let beta_row = rows
+            .position(|r| r.contains("  alpha"))
+            .expect("first turn body");
+        let beta_header = rows
             .iter()
-            .position(|r| r.contains("› beta"))
-            .expect("second turn rendered");
+            .skip(alpha_body)
+            .position(|r| r.trim_matches('│').trim() == "You")
+            .map(|p| p + alpha_body)
+            .expect("second turn header");
         assert_eq!(
-            beta_row,
-            alpha_row + 2,
-            "exactly one blank row separates the turns:\n{out}"
+            beta_header,
+            alpha_body + 2,
+            "one blank row separates the turns:\n{out}"
         );
     }
 
@@ -3797,11 +4327,11 @@ mod tests {
 
         let out = render_to_string(&s, 100, 30);
         assert!(
-            out.contains("› alpha") && out.contains("alpha reply"),
+            out.contains("  alpha") && out.contains("alpha reply"),
             "the first (completed) run's turn must still be visible:\n{out}"
         );
         assert!(
-            out.contains("› beta") && out.contains("beta reply"),
+            out.contains("  beta") && out.contains("beta reply"),
             "the second (live) run's turn must also be visible:\n{out}"
         );
         assert_eq!(
@@ -4118,22 +4648,6 @@ mod tests {
     }
 
     #[test]
-    fn a_user_turn_renders_with_a_caret_marker() {
-        let mut s = AppState::new();
-        let run_id = RunId::new();
-        reduce(
-            &mut s,
-            system_ev(EventBody::RunStarted {
-                run_id,
-                objective: "add a test".to_owned(),
-                mode: AgentMode::Build,
-            }),
-        );
-        let out = render_to_string(&s, 80, 12);
-        assert!(out.contains("› add a test") || out.contains("> add a test"));
-    }
-
-    #[test]
     fn composer_shows_a_typed_draft() {
         let mut state = running_build_state();
         for c in "add a boundary check".chars() {
@@ -4172,25 +4686,76 @@ mod tests {
     }
 
     #[test]
+    fn the_shortcuts_footer_renders_derived_chips() {
+        let state = running_build_state();
+        let out = render_to_string(&state, 100, 30);
+        // The persistent footer strip (its own row, below the status line).
+        assert!(out.contains("send"), "send chip:\n{out}");
+        assert!(out.contains("commands"), "commands chip:\n{out}");
+        assert!(out.contains("layout"), "layout chip:\n{out}");
+        assert!(out.contains("help"), "help chip:\n{out}");
+    }
+
+    #[test]
+    fn shortcuts_footer_row_does_not_clip_composer_or_status_line() {
+        // The root layout gains a 4th row for the shortcuts footer (Task 5) by
+        // shrinking the `Min(3)` transcript region — the fixed-height composer
+        // and status rows keep their full height, unclipped, with the footer as
+        // the new bottom-most row.
+        let state = running_build_state();
+        let height = 30u16;
+        let text = render_to_string(&state, 100, height);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            height as usize,
+            "expected exactly {height} rendered rows:\n{text}"
+        );
+
+        // Bottom-most row: the new shortcuts footer.
+        let footer_row = lines[lines.len() - 1];
+        assert!(
+            footer_row.contains("send") || footer_row.contains("commands"),
+            "bottom row should be the shortcuts footer:\n{footer_row:?}"
+        );
+
+        // Directly above it: the unchanged status line, still showing its fields.
+        let status_row = lines[lines.len() - 2];
+        assert!(
+            status_row.contains("mode"),
+            "status line should sit directly above the footer, unclipped:\n{status_row:?}"
+        );
+
+        // The `COMPOSER_HEIGHT` rows above that are the persistent composer —
+        // still fully present, not swallowed by the new footer row.
+        let composer_start = lines.len() - 2 - COMPOSER_HEIGHT as usize;
+        let composer_end = lines.len() - 2;
+        let composer_rows = lines[composer_start..composer_end].join("\n");
+        assert!(
+            composer_rows.contains('›'),
+            "composer should keep its full height, unclipped:\n{composer_rows}"
+        );
+    }
+
+    #[test]
     fn contextual_footer_switches_hint_by_context() {
         // Idle: full ambient fields + a command hint.
         let mut state = running_build_state();
         let idle = render_to_string(&state, 120, 30);
         assert!(idle.contains("mode"), "ambient fields:\n{idle}");
-        assert!(idle.contains("model"), "model field at full width:\n{idle}");
         assert!(
-            idle.contains("cmds") || idle.contains("F2"),
-            "command hint:\n{idle}"
+            idle.contains("commands") || idle.contains("F2"),
+            "footer command chips:\n{idle}"
         );
 
-        // Drafting: the hint invites sending.
+        // Drafting still shows the ambient state; the send affordance is in the footer.
         for c in "hello".chars() {
             reduce(&mut state, Action::InputChar(c));
         }
         let drafting = render_to_string(&state, 120, 30);
         assert!(
             drafting.contains("send"),
-            "send hint while drafting:\n{drafting}"
+            "send chip in the footer:\n{drafting}"
         );
     }
 
@@ -4203,6 +4768,29 @@ mod tests {
         assert!(
             !narrow.contains("model"),
             "model dropped when narrow:\n{narrow}"
+        );
+    }
+
+    #[test]
+    fn the_status_line_drops_the_model_but_keeps_honest_placeholders() {
+        let state = running_build_state();
+        let out = render_to_string(&state, 120, 30);
+        // The model is deduped out of the status line's ambient fields — but still
+        // shown in the header chrome + the assistant turn header.
+        let status_row = out.lines().rev().nth(1).unwrap_or(""); // status line is 2nd from bottom
+        assert!(
+            !status_row.contains("model"),
+            "no `model` field on the status line:\n{status_row}"
+        );
+        assert!(
+            out.contains("gpt-5.1-codex"),
+            "model still shown in chrome/turn header:\n{out}"
+        );
+        // Honesty: unmeasured cost/wt still render `—` (running_build_state measures
+        // neither), never a fabricated number.
+        assert!(
+            status_row.contains("—"),
+            "unmeasured fields stay em-dash:\n{status_row}"
         );
     }
 
@@ -4355,6 +4943,36 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_aligns_columns_groups_and_drops_the_dash() {
+        let mut state = running_build_state();
+        reduce(&mut state, Action::OpenPalette);
+        let all = render_to_string(&state, 120, 40);
+        assert!(all.contains("Command palette"), "title:\n{all}");
+        assert!(all.contains("New run"), "command:\n{all}");
+        assert!(all.contains("Model picker"), "command:\n{all}");
+        // Group labels appear on the empty query.
+        assert!(
+            all.contains("Run") && all.contains("Models"),
+            "group labels:\n{all}"
+        );
+        // The confusing unbound-key marker is gone.
+        assert!(!all.contains("[—]"), "no [—] marker:\n{all}");
+        // The header hint invites clicking.
+        assert!(all.contains("click a row"), "click hint:\n{all}");
+
+        // Filtering hides the group labels.
+        for c in "docs".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        let filtered = render_to_string(&state, 120, 40);
+        assert!(filtered.contains("Docs Studio"), "match:\n{filtered}");
+        assert!(
+            !filtered.contains("New run"),
+            "non-match filtered:\n{filtered}"
+        );
+    }
+
+    #[test]
     fn command_palette_snapshot_lists_and_filters_commands() {
         let mut state = running_build_state();
         reduce(&mut state, Action::OpenPalette);
@@ -4363,7 +4981,7 @@ mod tests {
         // Unfiltered, it lists commands with their key hints.
         assert!(all.contains("New run"), "command missing:\n{all}");
         assert!(all.contains("Docs Studio"), "command missing:\n{all}");
-        assert!(all.contains("[n]"), "key hint missing:\n{all}");
+        assert!(!all.contains("[—]"), "no dash marker:\n{all}");
 
         // Typing filters the list down.
         for c in "docs".chars() {
@@ -4769,6 +5387,318 @@ mod tests {
         assert!(
             text.contains("off-by-one"),
             "payload summary missing:\n{text}"
+        );
+    }
+
+    // --- Task 1: transcript virtualization + bottom-anchor + scroll clamp ---
+
+    #[test]
+    fn a_short_transcript_is_anchored_to_the_bottom() {
+        // One brief turn in a tall viewport: quiet space pools at the TOP, content
+        // sits flush above the composer.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "tiny".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "one short reply".to_owned(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 24);
+        let rows: Vec<&str> = out.lines().collect();
+        // The transcript pane is rows[1..] under the 1-row border; its first content
+        // row (row index 1) is blank (top padding), and the reply is in the lower
+        // rows just above the composer. Each row is the pane's full width, so the
+        // pane's own left/right border glyph brackets the content; strip it before
+        // checking for blank padding.
+        assert!(
+            rows[2].trim_matches('│').trim().is_empty(),
+            "quiet space at the top:\n{out}"
+        );
+        let reply_row = rows
+            .iter()
+            .position(|r| r.contains("one short reply"))
+            .expect("reply rendered");
+        assert!(
+            reply_row > 12,
+            "content anchored toward the bottom (row {reply_row}):\n{out}"
+        );
+    }
+
+    #[test]
+    fn build_transcript_window_materializes_only_the_viewport() {
+        // A pathological single Model entry of thousands of source lines. The build
+        // pass must materialize O(viewport) lines, not O(history).
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "huge".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let mut big = String::new();
+        for i in 0..5000 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta { run_id, text: big }),
+        );
+
+        let theme = Theme::dark();
+        let inner_width = 78;
+        let height = 20;
+        let total = transcript_rows(&s.runs, &theme, inner_width);
+        assert!(total >= 5000, "measure sees the whole history: {total}");
+        let (lines, _r0, _hits) = build_transcript_window(
+            &s.runs,
+            &theme,
+            inner_width,
+            total.saturating_sub(height),
+            height,
+            0,
+        );
+        assert!(
+            lines.len() <= height as usize + 4,
+            "the build materializes O(viewport) lines, not O(history): {}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn a_tall_transcript_still_tails_the_latest_row() {
+        // Overflow path unchanged: following pins to the tail.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "scrolling".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let mut big = String::new();
+        for i in 0..200 {
+            big.push_str(&format!("body line {i}\n"));
+        }
+        big.push_str("THE FINAL LINE");
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta { run_id, text: big }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(
+            out.contains("THE FINAL LINE"),
+            "the tail is visible while following:\n{out}"
+        );
+        assert!(
+            !out.contains("body line 0"),
+            "the head has scrolled off:\n{out}"
+        );
+    }
+
+    // --- Task 2: turn / role renderer ---
+
+    #[test]
+    fn a_user_turn_renders_a_role_header_and_indented_body() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "add a test".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let out = render_to_string(&s, 80, 14);
+        assert!(out.contains("You"), "user role header:\n{out}");
+        assert!(
+            out.contains("  add a test"),
+            "indented body (two-space gutter):\n{out}"
+        );
+        assert!(
+            !out.contains("› add a test"),
+            "the old caret user line is gone:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_assistant_header_names_the_model_when_known() {
+        let s = running_build_state(); // serves "gpt-5.1-codex"
+        let out = render_to_string(&s, 110, 30);
+        assert!(
+            out.contains("⏺ codypendent · gpt-5.1-codex"),
+            "model in the turn header:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_assistant_header_omits_the_model_when_unknown() {
+        // A run with a tool cell but no agent-authored (model-bearing) event.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "hi".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc".to_owned(),
+            }),
+        );
+        let out = render_to_string(&s, 90, 20);
+        assert!(out.contains("⏺ codypendent"), "bare header:\n{out}");
+        assert!(
+            !out.contains("codypendent ·"),
+            "no ` · <model>` when unknown (honesty):\n{out}"
+        );
+    }
+
+    /// Virtualization guard (Task 1's invariant, re-checked against Task 2's
+    /// header/gap rows): a pathological single Model entry of thousands of
+    /// source lines, under a known-model run (so a `You` header/body Row and a
+    /// model-named assistant header Row both ride the same `for_each_row`
+    /// walk as the huge Model entry). The build pass must still materialize
+    /// O(viewport) lines at either end of the history — the new header
+    /// styling must not reintroduce whole-transcript materialization.
+    #[test]
+    fn virtualization_still_holds_with_role_headers_and_turn_gaps() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "huge".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let mut big = String::new();
+        for i in 0..5000 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        reduce(
+            &mut s,
+            Action::daemon_event(SessionEvent {
+                sequence: 2,
+                occurred_at: Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::Agent {
+                    agent_id: codypendent_protocol::AgentId::new(),
+                    run_id,
+                    model: ModelId("gpt-5.1-codex".to_owned()),
+                },
+                body: EventBody::ModelStreamDelta { run_id, text: big },
+            }),
+        );
+
+        let theme = Theme::dark();
+        let inner_width = 78;
+        let height = 20;
+        let total = transcript_rows(&s.runs, &theme, inner_width);
+        assert!(
+            total >= 5000,
+            "measure still sees the whole history: {total}"
+        );
+
+        // The viewport at the very TOP: the `You` header and the model-named
+        // assistant header are among the first virtualized rows.
+        let (top_lines, _r0, _hits) =
+            build_transcript_window(&s.runs, &theme, inner_width, 0, height, 0);
+        assert!(
+            top_lines.len() <= height as usize + 4,
+            "top-of-history build stays O(viewport), not O(history): {}",
+            top_lines.len()
+        );
+        assert!(
+            top_lines.iter().any(|l| l.to_string() == "You"),
+            "the user role header is one of the virtualized top rows"
+        );
+        assert!(
+            top_lines
+                .iter()
+                .any(|l| l.to_string().contains("codypendent · gpt-5.1-codex")),
+            "the model-named assistant header is one of the virtualized top rows"
+        );
+
+        // The viewport at the TAIL of the same pathological history: still
+        // O(viewport), not O(history) — Task 2 must not undo Task 1's fix.
+        let (tail_lines, _r0, _hits) = build_transcript_window(
+            &s.runs,
+            &theme,
+            inner_width,
+            total.saturating_sub(height),
+            height,
+            0,
+        );
+        assert!(
+            tail_lines.len() <= height as usize + 4,
+            "tail-of-history build stays O(viewport), not O(history): {}",
+            tail_lines.len()
+        );
+    }
+
+    // --- Task 8: register clickable surfaces + parity ---
+
+    #[test]
+    fn clicking_a_palette_row_registers_activate_row() {
+        let mut state = running_build_state();
+        reduce(&mut state, Action::OpenPalette);
+        let _ = render_to_string(&state, 120, 40); // populates the hit map
+        let map = state.hit_map.borrow();
+        assert!(
+            map.iter().any(|(_, a)| matches!(a, Action::ActivateRow(_))),
+            "a palette row registered ActivateRow"
+        );
+        // A full-screen scrim closes the overlay on an outside click (registered first).
+        assert!(
+            map.iter().any(|(_, a)| matches!(a, Action::Dismiss)),
+            "modal scrim"
+        );
+    }
+
+    #[test]
+    fn clicking_a_run_entry_registers_select_run() {
+        let mut state = running_build_state();
+        reduce(&mut state, Action::ToggleLayout); // workspace shows the runs pane
+        let _ = render_to_string(&state, 120, 30);
+        let map = state.hit_map.borrow();
+        assert!(
+            map.iter().any(|(_, a)| matches!(a, Action::SelectRun(0))),
+            "run row → SelectRun"
+        );
+    }
+
+    #[test]
+    fn clicking_a_footer_chip_registers_its_action() {
+        let state = running_build_state();
+        let _ = render_to_string(&state, 120, 30);
+        let map = state.hit_map.borrow();
+        assert!(
+            map.iter().any(|(_, a)| matches!(a, Action::OpenPalette)),
+            "footer chip → its Action"
         );
     }
 }

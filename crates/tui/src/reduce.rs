@@ -60,6 +60,12 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::FocusPane(pane) => state.focus = pane,
+        Action::ActivateRow(n) => activate_row(state, n),
+        Action::SelectRun(n) => {
+            let mut idx = n;
+            clamp(&mut idx, state.runs.len());
+            state.selected_run = idx;
+        }
         Action::SelectPrev => nav(state, -1),
         Action::SelectNext => nav(state, 1),
         Action::ScrollPageUp => scroll_page(state, true),
@@ -524,6 +530,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     run,
                     TranscriptEntry::Completed {
                         disposition: disposition.clone(),
+                        expanded: false,
                     },
                 );
                 run.disposition = Some(disposition);
@@ -769,6 +776,7 @@ fn expand_selected(state: &mut AppState) {
                 TranscriptEntry::Patch(patch) => patch.expanded = !patch.expanded,
                 TranscriptEntry::Note { expanded, .. } => *expanded = !*expanded,
                 TranscriptEntry::Backstage { expanded, .. } => *expanded = !*expanded,
+                TranscriptEntry::Completed { expanded, .. } => *expanded = !*expanded,
                 _ => {}
             }
         }
@@ -1062,6 +1070,65 @@ fn input_cancel(state: &mut AppState) {
 /// Switch the conversation to another run (`Ctrl-↑/↓`), clamping at the ends.
 fn cycle_run(state: &mut AppState, delta: i32) {
     step(&mut state.selected_run, state.runs.len(), delta);
+}
+
+/// Set the open list overlay's `selected` to `n`, mirroring `nav`'s picker
+/// resolution (keeps `selected_model`/`selected_provider` pointed at the same
+/// filtered card). A no-op for a non-list overlay.
+fn set_overlay_selected(state: &mut AppState, n: usize) {
+    match state.overlay {
+        Overlay::Palette {
+            ref mut selected, ..
+        }
+        | Overlay::AddModelPick {
+            ref mut selected, ..
+        } => {
+            *selected = n;
+        }
+        Overlay::ModelPicker {
+            ref query,
+            ref mut selected,
+        } => {
+            *selected = n;
+            let indices = filter_models(&state.models, query);
+            state.selected_model = indices.get(n).copied().unwrap_or(0);
+        }
+        Overlay::ProviderPicker {
+            ref query,
+            ref mut selected,
+        } => {
+            *selected = n;
+            let indices = filter_providers(&state.providers, query);
+            state.selected_provider = indices.get(n).copied().unwrap_or(0);
+        }
+        _ => {}
+    }
+}
+
+/// A click on row N: activate the open list overlay's row N (same effect as
+/// selecting it + `Enter`), or — with no overlay — toggle the transcript fold
+/// line at entry N of the selected run (same effect as `Enter` on that entry).
+fn activate_row(state: &mut AppState, n: usize) {
+    match state.overlay {
+        Overlay::Palette { .. }
+        | Overlay::ModelPicker { .. }
+        | Overlay::ProviderPicker { .. }
+        | Overlay::AddModelPick { .. } => {
+            set_overlay_selected(state, n);
+            submit_prompt(state);
+        }
+        Overlay::None => {
+            state.focus = Pane::Transcript;
+            let idx = state.selected_run;
+            if let Some(run) = state.runs.get_mut(idx) {
+                if n < run.transcript.len() {
+                    run.transcript_selected = n;
+                }
+            }
+            expand_selected(state);
+        }
+        _ => {}
+    }
 }
 
 fn submit_prompt(state: &mut AppState) {
@@ -1981,6 +2048,52 @@ mod tests {
 
         reduce(&mut s, Action::Expand);
         let TranscriptEntry::Backstage { expanded, .. } = &s.runs[0].transcript[idx] else {
+            unreachable!()
+        };
+        assert!(!*expanded, "Expand toggles it back off");
+    }
+
+    #[test]
+    fn expand_toggles_a_selected_completed_entry() {
+        // Task 3: the same Action::Expand that toggles a selected Backstage
+        // entry also toggles a failed run's `Completed` entry, revealing the
+        // full raw error chain beneath the concise summary (render.rs).
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Failed {
+                    reason: "boom".to_owned(),
+                },
+                chronicle: artifact(),
+            }),
+        );
+        let idx = s.runs[0]
+            .transcript
+            .iter()
+            .position(|e| matches!(e, TranscriptEntry::Completed { .. }))
+            .expect("a Completed entry was folded in");
+
+        s.focus = Pane::Transcript;
+        s.runs[0].transcript_selected = idx;
+        reduce(&mut s, Action::Expand);
+        let TranscriptEntry::Completed { expanded, .. } = &s.runs[0].transcript[idx] else {
+            unreachable!()
+        };
+        assert!(*expanded, "Expand opens the selected Completed entry");
+
+        reduce(&mut s, Action::Expand);
+        let TranscriptEntry::Completed { expanded, .. } = &s.runs[0].transcript[idx] else {
             unreachable!()
         };
         assert!(!*expanded, "Expand toggles it back off");
@@ -4604,5 +4717,100 @@ mod tests {
             unreachable!()
         };
         assert!(p.expanded);
+    }
+
+    #[test]
+    fn select_run_sets_the_selected_run_clamped() {
+        let mut s = AppState::new();
+        for obj in ["a", "b", "c"] {
+            reduce(
+                &mut s,
+                system_ev(EventBody::RunStarted {
+                    run_id: RunId::new(),
+                    objective: obj.to_owned(),
+                    mode: AgentMode::Build,
+                }),
+            );
+        }
+        reduce(&mut s, Action::SelectRun(1));
+        assert_eq!(s.selected_run, 1);
+        reduce(&mut s, Action::SelectRun(99)); // clamps to last
+        assert_eq!(s.selected_run, 2);
+    }
+
+    #[test]
+    fn activate_row_with_no_overlay_selects_and_toggles_the_transcript_fold() {
+        // A click on a transcript row (no overlay open) is "select it + Enter":
+        // it focuses the transcript, moves the selection to entry N, and toggles
+        // its fold — mirroring `a_short_note_folds_the_same_way_as_a_long_one`.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::NoteAppended {
+                text: "the test command is cargo test".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+        // transcript[0] is the User turn RunStarted pushes for the objective;
+        // the note folds in right after it, starting collapsed.
+        s.focus = Pane::Sessions; // not on the transcript yet — the click must focus it
+        reduce(&mut s, Action::ActivateRow(1));
+        assert_eq!(s.focus, Pane::Transcript, "a click focuses the transcript");
+        assert_eq!(
+            s.runs[0].transcript_selected, 1,
+            "the click selects entry N"
+        );
+        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[1] else {
+            unreachable!("NoteAppended must fold into a Note entry")
+        };
+        assert!(
+            *expanded,
+            "ActivateRow toggles the fold, exactly like Enter"
+        );
+
+        reduce(&mut s, Action::ActivateRow(1));
+        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[1] else {
+            unreachable!()
+        };
+        assert!(!*expanded, "a second click toggles it back off");
+    }
+
+    #[test]
+    fn activate_row_in_an_overlay_selects_and_runs_that_row() {
+        // A click on overlay row N is "select it + Enter": it must move the
+        // overlay's own `selected` to N (not just activate whatever was already
+        // selected) and then run it — mirroring
+        // `palette_submit_runs_the_highlighted_command`.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(&mut s, Action::OpenPalette);
+        for c in "run".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        // "run" filters (in table order) to [New run, Steer run, Pause/resume
+        // run, Cancel run, Model picker, Detach]; row 1 is "Steer run".
+        reduce(&mut s, Action::ActivateRow(1));
+        assert_eq!(
+            s.overlay,
+            Overlay::Steering(String::new()),
+            "row 1 of the filtered list ('Steer run') ran, not row 0"
+        );
     }
 }

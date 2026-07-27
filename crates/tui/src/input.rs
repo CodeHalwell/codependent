@@ -10,6 +10,7 @@
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::layout::Rect;
 
 use codypendent_protocol::ApprovalScope;
 
@@ -97,19 +98,91 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         description: "detach (the run keeps going)",
         mouse: None,
     },
+    KeyBinding {
+        keys: "↑↓ + Enter",
+        description: "activate a list row / transcript fold (same as clicking it)",
+        mouse: Some("click a row"),
+    },
+    KeyBinding {
+        keys: "Tab",
+        description: "focus a pane (same as clicking it)",
+        mouse: Some("click a pane"),
+    },
 ];
+
+/// One footer chip: a compact display label paired with the real `KEY_BINDINGS`
+/// entry it derives from (so it can never drift) and the `Action` a click fires.
+#[derive(Debug, Clone)]
+pub struct FooterHint {
+    pub binding: &'static KeyBinding,
+    pub label: &'static str,
+    pub action: Action,
+}
+
+/// The curated, ordered footer strip. Each entry references a real binding by
+/// index (the drift-guard test asserts each is present in `KEY_BINDINGS`).
+static FOOTER_HINTS: &[FooterHint] = &[
+    FooterHint {
+        binding: &KEY_BINDINGS[1],
+        label: "⏎ send",
+        action: Action::InputSubmit,
+    },
+    FooterHint {
+        binding: &KEY_BINDINGS[2],
+        label: "/ commands",
+        action: Action::OpenPalette,
+    },
+    FooterHint {
+        binding: &KEY_BINDINGS[3],
+        label: "↑↓ scroll",
+        action: Action::ScrollPageDown,
+    },
+    FooterHint {
+        binding: &KEY_BINDINGS[5],
+        label: "F2 layout",
+        action: Action::ToggleLayout,
+    },
+    FooterHint {
+        binding: &KEY_BINDINGS[9],
+        label: "? help",
+        action: Action::Help,
+    },
+    FooterHint {
+        binding: &KEY_BINDINGS[12],
+        label: "q detach",
+        action: Action::Detach,
+    },
+];
+
+/// The persistent, derived shortcut strip (curated subset of `KEY_BINDINGS`).
+#[must_use]
+pub fn footer_hints() -> &'static [FooterHint] {
+    FOOTER_HINTS
+}
+
+/// Resolve a left click at `(col,row)` to the topmost registered rect's Action.
+/// Iterates in reverse so the last-registered (top-of-z-order) rect wins.
+#[must_use]
+pub fn hit_test(hit_map: &[(Rect, Action)], col: u16, row: u16) -> Option<Action> {
+    hit_map
+        .iter()
+        .rev()
+        .find(|(r, _)| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
+        .map(|(_, action)| action.clone())
+}
 
 /// Translate a terminal event into a semantic [`Action`].
 ///
 /// `mode` decides whether printable keys are text or navigation; `width` is the
 /// current terminal width (unused by the single-column shell, kept for the mouse
-/// signature). The mapping is total — anything unrecognized maps to
+/// signature); `hit_map` is the render-time geometry cache ([`hit_test`]) a left
+/// click resolves against. The mapping is total — anything unrecognized maps to
 /// [`Action::NoOp`].
 #[must_use]
-pub fn map_event(event: &Event, mode: InputMode, width: u16) -> Action {
+pub fn map_event(event: &Event, mode: InputMode, width: u16, hit_map: &[(Rect, Action)]) -> Action {
     match event {
         Event::Key(key) => map_key(key, mode),
-        Event::Mouse(mouse) => map_mouse(mouse, mode, width),
+        Event::Mouse(mouse) => map_mouse(mouse, mode, width, hit_map),
         // Bracketed paste lands in whichever text buffer is capturing: the
         // composer, a prompt, or the palette filter.
         Event::Paste(text)
@@ -267,23 +340,35 @@ fn map_confirm_key(key: &KeyEvent) -> Action {
     }
 }
 
-fn map_mouse(mouse: &MouseEvent, mode: InputMode, _width: u16) -> Action {
+fn map_mouse(
+    mouse: &MouseEvent,
+    mode: InputMode,
+    _width: u16,
+    hit_map: &[(Rect, Action)],
+) -> Action {
     match mode {
         // A text prompt / confirm captures nothing from the mouse.
         InputMode::Editing | InputMode::Confirm => Action::NoOp,
-        // The conversation scrolls its transcript on the wheel.
+        // The conversation scrolls its transcript on the wheel; a left click
+        // resolves through the hit-test map (a registered fold line, footer chip,
+        // etc.), falling back to inert when nothing is registered there.
         InputMode::Composer => match mouse.kind {
             MouseEventKind::ScrollUp => Action::ScrollPageUp,
             MouseEventKind::ScrollDown => Action::ScrollPageDown,
+            MouseEventKind::Down(MouseButton::Left) => {
+                hit_test(hit_map, mouse.column, mouse.row).unwrap_or(Action::NoOp)
+            }
             _ => Action::NoOp,
         },
         // List surfaces — browsers, the palette, stacked approvals — move their
-        // selection on the wheel. A left click is inert (there are no panes to
-        // focus in the single-column shell).
+        // selection on the wheel. A left click resolves through the same
+        // hit-test map (a registered row), falling back to inert otherwise.
         InputMode::Normal | InputMode::Palette | InputMode::Approval => match mouse.kind {
             MouseEventKind::ScrollUp => Action::SelectPrev,
             MouseEventKind::ScrollDown => Action::SelectNext,
-            MouseEventKind::Down(MouseButton::Left) => Action::NoOp,
+            MouseEventKind::Down(MouseButton::Left) => {
+                hit_test(hit_map, mouse.column, mouse.row).unwrap_or(Action::NoOp)
+            }
             _ => Action::NoOp,
         },
     }
@@ -330,53 +415,80 @@ mod tests {
     #[test]
     fn normal_command_keys_map() {
         assert_eq!(
-            map_event(&key(KeyCode::Tab), InputMode::Normal, W),
+            map_event(&key(KeyCode::Tab), InputMode::Normal, W, &[]),
             Action::CyclePane
         );
-        assert_eq!(map_event(&ch('n'), InputMode::Normal, W), Action::NewRun);
-        assert_eq!(map_event(&ch('p'), InputMode::Normal, W), Action::Pause);
-        assert_eq!(map_event(&ch('c'), InputMode::Normal, W), Action::Cancel);
-        assert_eq!(map_event(&ch('s'), InputMode::Normal, W), Action::Steer);
-        assert_eq!(map_event(&ch('q'), InputMode::Normal, W), Action::Detach);
-        assert_eq!(map_event(&ch('?'), InputMode::Normal, W), Action::Help);
         assert_eq!(
-            map_event(&key(KeyCode::Enter), InputMode::Normal, W),
+            map_event(&ch('n'), InputMode::Normal, W, &[]),
+            Action::NewRun
+        );
+        assert_eq!(
+            map_event(&ch('p'), InputMode::Normal, W, &[]),
+            Action::Pause
+        );
+        assert_eq!(
+            map_event(&ch('c'), InputMode::Normal, W, &[]),
+            Action::Cancel
+        );
+        assert_eq!(
+            map_event(&ch('s'), InputMode::Normal, W, &[]),
+            Action::Steer
+        );
+        assert_eq!(
+            map_event(&ch('q'), InputMode::Normal, W, &[]),
+            Action::Detach
+        );
+        assert_eq!(map_event(&ch('?'), InputMode::Normal, W, &[]), Action::Help);
+        assert_eq!(
+            map_event(&key(KeyCode::Enter), InputMode::Normal, W, &[]),
             Action::Expand
         );
         assert_eq!(
-            map_event(&ch('a'), InputMode::Normal, W),
+            map_event(&ch('a'), InputMode::Normal, W, &[]),
             Action::Approve(ApprovalScope::Once)
         );
         assert_eq!(
-            map_event(&ch('A'), InputMode::Normal, W),
+            map_event(&ch('A'), InputMode::Normal, W, &[]),
             Action::Approve(ApprovalScope::Run)
         );
-        assert_eq!(map_event(&ch('r'), InputMode::Normal, W), Action::Reject);
         assert_eq!(
-            map_event(&ch('S'), InputMode::Normal, W),
+            map_event(&ch('r'), InputMode::Normal, W, &[]),
+            Action::Reject
+        );
+        assert_eq!(
+            map_event(&ch('S'), InputMode::Normal, W, &[]),
             Action::OpenSkills
         );
         assert_eq!(
-            map_event(&ch('M'), InputMode::Normal, W),
+            map_event(&ch('M'), InputMode::Normal, W, &[]),
             Action::OpenMemory
         );
         assert_eq!(
-            map_event(&ch('o'), InputMode::Normal, W),
+            map_event(&ch('o'), InputMode::Normal, W, &[]),
             Action::OpenSource
         );
-        assert_eq!(map_event(&ch('e'), InputMode::Normal, W), Action::EditDoc);
-        assert_eq!(map_event(&ch('D'), InputMode::Normal, W), Action::OpenDocs);
-        assert_eq!(map_event(&ch('G'), InputMode::Normal, W), Action::OpenEdges);
         assert_eq!(
-            map_event(&ch('W'), InputMode::Normal, W),
+            map_event(&ch('e'), InputMode::Normal, W, &[]),
+            Action::EditDoc
+        );
+        assert_eq!(
+            map_event(&ch('D'), InputMode::Normal, W, &[]),
+            Action::OpenDocs
+        );
+        assert_eq!(
+            map_event(&ch('G'), InputMode::Normal, W, &[]),
+            Action::OpenEdges
+        );
+        assert_eq!(
+            map_event(&ch('W'), InputMode::Normal, W, &[]),
             Action::OpenWorkflow
         );
         assert_eq!(
-            map_event(&ch('B'), InputMode::Normal, W),
+            map_event(&ch('B'), InputMode::Normal, W, &[]),
             Action::OpenBlackboard
         );
         assert_eq!(
-            map_event(&ch('/'), InputMode::Normal, W),
+            map_event(&ch('/'), InputMode::Normal, W, &[]),
             Action::OpenPalette
         );
     }
@@ -385,24 +497,24 @@ mod tests {
     fn palette_mode_filters_but_stays_navigable() {
         // Printable keys become the filter query...
         assert_eq!(
-            map_event(&ch('d'), InputMode::Palette, W),
+            map_event(&ch('d'), InputMode::Palette, W, &[]),
             Action::InputChar('d')
         );
         // ...while arrows still move the selection and Enter runs it.
         assert_eq!(
-            map_event(&key(KeyCode::Up), InputMode::Palette, W),
+            map_event(&key(KeyCode::Up), InputMode::Palette, W, &[]),
             Action::SelectPrev
         );
         assert_eq!(
-            map_event(&key(KeyCode::Down), InputMode::Palette, W),
+            map_event(&key(KeyCode::Down), InputMode::Palette, W, &[]),
             Action::SelectNext
         );
         assert_eq!(
-            map_event(&key(KeyCode::Enter), InputMode::Palette, W),
+            map_event(&key(KeyCode::Enter), InputMode::Palette, W, &[]),
             Action::InputSubmit
         );
         assert_eq!(
-            map_event(&key(KeyCode::Esc), InputMode::Palette, W),
+            map_event(&key(KeyCode::Esc), InputMode::Palette, W, &[]),
             Action::InputCancel
         );
     }
@@ -410,7 +522,7 @@ mod tests {
     #[test]
     fn tab_in_palette_mode_begins_add_model() {
         assert_eq!(
-            map_event(&key(KeyCode::Tab), InputMode::Palette, W),
+            map_event(&key(KeyCode::Tab), InputMode::Palette, W, &[]),
             Action::BeginAddModel
         );
     }
@@ -419,23 +531,28 @@ mod tests {
     fn editing_mode_routes_text_not_commands() {
         // In a prompt, 'n' is text, not "new run".
         assert_eq!(
-            map_event(&ch('n'), InputMode::Editing, W),
+            map_event(&ch('n'), InputMode::Editing, W, &[]),
             Action::InputChar('n')
         );
         assert_eq!(
-            map_event(&key(KeyCode::Enter), InputMode::Editing, W),
+            map_event(&key(KeyCode::Enter), InputMode::Editing, W, &[]),
             Action::InputSubmit
         );
         assert_eq!(
-            map_event(&key(KeyCode::Esc), InputMode::Editing, W),
+            map_event(&key(KeyCode::Esc), InputMode::Editing, W, &[]),
             Action::InputCancel
         );
         assert_eq!(
-            map_event(&key(KeyCode::Backspace), InputMode::Editing, W),
+            map_event(&key(KeyCode::Backspace), InputMode::Editing, W, &[]),
             Action::InputBackspace
         );
         assert_eq!(
-            map_event(&Event::Paste("hello".to_owned()), InputMode::Editing, W),
+            map_event(
+                &Event::Paste("hello".to_owned()),
+                InputMode::Editing,
+                W,
+                &[]
+            ),
             Action::InputPaste("hello".to_owned())
         );
     }
@@ -443,16 +560,19 @@ mod tests {
     #[test]
     fn confirm_mode_yes_no() {
         assert_eq!(
-            map_event(&ch('y'), InputMode::Confirm, W),
+            map_event(&ch('y'), InputMode::Confirm, W, &[]),
             Action::ConfirmCancel
         );
         assert_eq!(
-            map_event(&key(KeyCode::Enter), InputMode::Confirm, W),
+            map_event(&key(KeyCode::Enter), InputMode::Confirm, W, &[]),
             Action::ConfirmCancel
         );
-        assert_eq!(map_event(&ch('n'), InputMode::Confirm, W), Action::Dismiss);
         assert_eq!(
-            map_event(&key(KeyCode::Esc), InputMode::Confirm, W),
+            map_event(&ch('n'), InputMode::Confirm, W, &[]),
+            Action::Dismiss
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Esc), InputMode::Confirm, W, &[]),
             Action::Dismiss
         );
     }
@@ -462,7 +582,7 @@ mod tests {
         let mut ev = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         ev.kind = KeyEventKind::Release;
         assert_eq!(
-            map_event(&Event::Key(ev), InputMode::Normal, W),
+            map_event(&Event::Key(ev), InputMode::Normal, W, &[]),
             Action::NoOp
         );
     }
@@ -483,41 +603,41 @@ mod tests {
         // Printable keys are text — including `/`, which the reducer (not the
         // mapper) turns into a palette-open only on an empty composer.
         assert_eq!(
-            map_event(&ch('h'), InputMode::Composer, W),
+            map_event(&ch('h'), InputMode::Composer, W, &[]),
             Action::InputChar('h')
         );
         assert_eq!(
-            map_event(&ch('/'), InputMode::Composer, W),
+            map_event(&ch('/'), InputMode::Composer, W, &[]),
             Action::InputChar('/')
         );
         assert_eq!(
-            map_event(&key(KeyCode::Enter), InputMode::Composer, W),
+            map_event(&key(KeyCode::Enter), InputMode::Composer, W, &[]),
             Action::InputSubmit
         );
         assert_eq!(
-            map_event(&key(KeyCode::Esc), InputMode::Composer, W),
+            map_event(&key(KeyCode::Esc), InputMode::Composer, W, &[]),
             Action::InputCancel
         );
         assert_eq!(
-            map_event(&key(KeyCode::PageUp), InputMode::Composer, W),
+            map_event(&key(KeyCode::PageUp), InputMode::Composer, W, &[]),
             Action::ScrollPageUp
         );
         // Ctrl-C detaches rather than typing a 'c'; Ctrl-↑/↓ switch runs.
         assert_eq!(
-            map_event(&ctrl(KeyCode::Char('c')), InputMode::Composer, W),
+            map_event(&ctrl(KeyCode::Char('c')), InputMode::Composer, W, &[]),
             Action::Detach
         );
         assert_eq!(
-            map_event(&ctrl(KeyCode::Up), InputMode::Composer, W),
+            map_event(&ctrl(KeyCode::Up), InputMode::Composer, W, &[]),
             Action::PrevRun
         );
         assert_eq!(
-            map_event(&ctrl(KeyCode::Down), InputMode::Composer, W),
+            map_event(&ctrl(KeyCode::Down), InputMode::Composer, W, &[]),
             Action::NextRun
         );
         // F2 flips the layout from the base view.
         assert_eq!(
-            map_event(&key(KeyCode::F(2)), InputMode::Composer, W),
+            map_event(&key(KeyCode::F(2)), InputMode::Composer, W, &[]),
             Action::ToggleLayout
         );
     }
@@ -525,18 +645,24 @@ mod tests {
     #[test]
     fn approval_mode_only_decision_keys() {
         assert_eq!(
-            map_event(&ch('a'), InputMode::Approval, W),
+            map_event(&ch('a'), InputMode::Approval, W, &[]),
             Action::Approve(ApprovalScope::Once)
         );
         assert_eq!(
-            map_event(&ch('A'), InputMode::Approval, W),
+            map_event(&ch('A'), InputMode::Approval, W, &[]),
             Action::Approve(ApprovalScope::Run)
         );
-        assert_eq!(map_event(&ch('r'), InputMode::Approval, W), Action::Reject);
-        // Typing past an approval is swallowed, not sent to a composer.
-        assert_eq!(map_event(&ch('x'), InputMode::Approval, W), Action::NoOp);
         assert_eq!(
-            map_event(&key(KeyCode::Up), InputMode::Approval, W),
+            map_event(&ch('r'), InputMode::Approval, W, &[]),
+            Action::Reject
+        );
+        // Typing past an approval is swallowed, not sent to a composer.
+        assert_eq!(
+            map_event(&ch('x'), InputMode::Approval, W, &[]),
+            Action::NoOp
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Up), InputMode::Approval, W, &[]),
             Action::SelectPrev
         );
     }
@@ -558,34 +684,157 @@ mod tests {
 
         // (2) Live mapping. In a list surface the wheel moves the selection,
         // reachable from the arrows.
-        let wheel_up = map_event(&wheel(MouseEventKind::ScrollUp, 10), InputMode::Normal, W);
+        let wheel_up = map_event(
+            &wheel(MouseEventKind::ScrollUp, 10),
+            InputMode::Normal,
+            W,
+            &[],
+        );
         assert_eq!(wheel_up, Action::SelectPrev);
-        assert_eq!(wheel_up, map_event(&key(KeyCode::Up), InputMode::Normal, W));
+        assert_eq!(
+            wheel_up,
+            map_event(&key(KeyCode::Up), InputMode::Normal, W, &[])
+        );
 
-        let wheel_down = map_event(&wheel(MouseEventKind::ScrollDown, 10), InputMode::Normal, W);
+        let wheel_down = map_event(
+            &wheel(MouseEventKind::ScrollDown, 10),
+            InputMode::Normal,
+            W,
+            &[],
+        );
         assert_eq!(wheel_down, Action::SelectNext);
         assert_eq!(
             wheel_down,
-            map_event(&key(KeyCode::Down), InputMode::Normal, W)
+            map_event(&key(KeyCode::Down), InputMode::Normal, W, &[])
         );
 
         // In the conversation the wheel scrolls the transcript, reachable from
         // PgUp / PgDn.
         assert_eq!(
-            map_event(&wheel(MouseEventKind::ScrollUp, 10), InputMode::Composer, W),
+            map_event(
+                &wheel(MouseEventKind::ScrollUp, 10),
+                InputMode::Composer,
+                W,
+                &[]
+            ),
             Action::ScrollPageUp
         );
         assert_eq!(
-            map_event(&key(KeyCode::PageUp), InputMode::Composer, W),
+            map_event(&key(KeyCode::PageUp), InputMode::Composer, W, &[]),
             Action::ScrollPageUp
         );
 
-        // A left click is inert in the single-column shell (no panes to focus).
+        // A left click with nothing registered under it (an empty hit-test map)
+        // falls back to inert — the actual clickable surfaces (palette/pickers/
+        // runs/footer/panes/folds) are registered by the renderer (Task 8).
         let click = map_event(
             &wheel(MouseEventKind::Down(MouseButton::Left), 1),
             InputMode::Normal,
             W,
+            &[],
         );
         assert_eq!(click, Action::NoOp);
+
+        // (3) A left click resolves to the topmost registered rect's Action, and
+        // each such Action is keyboard-reachable.
+        use ratatui::layout::Rect;
+        let map = vec![(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 1,
+            },
+            Action::ActivateRow(0),
+        )];
+        let click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            map_event(&click, InputMode::Palette, W, &map),
+            Action::ActivateRow(0)
+        );
+        // ActivateRow ≡ SelectNext×k then InputSubmit; SelectRun ≡ Prev/NextRun;
+        // FocusPane ≡ Tab (CyclePane); Dismiss ≡ Esc — all in the keyboard table.
+        assert_eq!(
+            map_event(&key(KeyCode::Enter), InputMode::Palette, W, &[]),
+            Action::InputSubmit
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Tab), InputMode::Normal, W, &[]),
+            Action::CyclePane
+        );
+    }
+
+    /// Drift guard: every footer chip must derive from a real `KEY_BINDINGS`
+    /// entry (Task 5) — the footer strip can never silently diverge from the
+    /// actual bindings table.
+    #[test]
+    fn footer_hints_are_all_backed_by_real_bindings() {
+        for hint in footer_hints() {
+            assert!(
+                KEY_BINDINGS.iter().any(|b| b.keys == hint.binding.keys),
+                "footer hint {:?} must derive from a real KEY_BINDINGS entry",
+                hint.label
+            );
+            assert!(!hint.label.is_empty());
+        }
+    }
+
+    #[test]
+    fn hit_test_returns_the_topmost_registered_action() {
+        let base = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        let overlay = Rect {
+            x: 2,
+            y: 2,
+            width: 6,
+            height: 3,
+        };
+        let map = vec![
+            (base, Action::FocusPane(Pane::Transcript)),
+            (overlay, Action::ActivateRow(1)), // later-registered = topmost
+        ];
+        // Inside the overlay: the topmost wins.
+        assert_eq!(hit_test(&map, 3, 3), Some(Action::ActivateRow(1)));
+        // Over the base only: the base wins.
+        assert_eq!(
+            hit_test(&map, 15, 8),
+            Some(Action::FocusPane(Pane::Transcript))
+        );
+        // Outside everything: None.
+        assert_eq!(hit_test(&map, 40, 40), None);
+    }
+
+    #[test]
+    fn a_left_click_over_a_registered_rect_resolves_to_its_action() {
+        let map = vec![(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 2,
+            },
+            Action::SelectRun(2),
+        )];
+        let click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            map_event(&click, InputMode::Composer, W, &map),
+            Action::SelectRun(2)
+        );
+        // No registered rect under the click → NoOp.
+        assert_eq!(map_event(&click, InputMode::Composer, W, &[]), Action::NoOp);
     }
 }
