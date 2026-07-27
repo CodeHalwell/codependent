@@ -258,6 +258,9 @@ struct Row<'a> {
     /// The transcript-entry index this row is a click target for (fold heads in
     /// the selected run). `None` unless tagged (Task 8).
     hit_entry: Option<usize>,
+    /// A full-width background for this row (the `You` container). Cosmetic —
+    /// `columns()`/`rows()` ignore it; applied only to visible rows at build.
+    bg: Option<Color>,
 }
 
 enum RowKind<'a> {
@@ -270,6 +273,8 @@ enum RowKind<'a> {
         caret: bool,
         style: Style,
     },
+    /// A cached, finalized rich line — borrowed so MEASURE allocates nothing.
+    Rich(&'a crate::markdown::RichLine),
 }
 
 impl<'a> Row<'a> {
@@ -277,6 +282,7 @@ impl<'a> Row<'a> {
         Row {
             kind: RowKind::Built(line),
             hit_entry: None,
+            bg: None,
         }
     }
     fn model(prefix: &'static str, text: &'a str, caret: bool, style: Style) -> Self {
@@ -288,6 +294,14 @@ impl<'a> Row<'a> {
                 style,
             },
             hit_entry: None,
+            bg: None,
+        }
+    }
+    fn rich(rl: &'a crate::markdown::RichLine) -> Self {
+        Row {
+            kind: RowKind::Rich(rl),
+            hit_entry: None,
+            bg: None,
         }
     }
     /// Display width, allocation-free (`Span::raw` borrows; `.width()` is unicode width).
@@ -300,6 +314,11 @@ impl<'a> Row<'a> {
                 caret,
                 ..
             } => Span::raw(*prefix).width() + Span::raw(*text).width() + usize::from(*caret),
+            RowKind::Rich(rl) => rl
+                .spans
+                .iter()
+                .map(|s| Span::raw(s.text.as_str()).width())
+                .sum(),
         }
     }
     fn rows(&self, inner_width: u16) -> u16 {
@@ -323,7 +342,59 @@ impl<'a> Row<'a> {
                     Line::styled(format!("{prefix}{text}"), style)
                 }
             }
+            RowKind::Rich(rl) => Line::from(
+                rl.spans
+                    .iter()
+                    .map(|s| Span::styled(s.text.clone(), style_for(s.role, theme)))
+                    .collect::<Vec<_>>(),
+            ),
         }
+    }
+}
+
+use crate::markdown::{SpanRole, SyntaxRole};
+
+/// Map a semantic `SpanRole` to a concrete `Style` from the live theme. Every
+/// colour is a theme token — correct in all seven depths; a theme change simply
+/// yields new colours on the next frame (no cache invalidation). Exhaustive over
+/// `SpanRole`/`SyntaxRole`: a new variant is a compile error here, never a silent
+/// unstyled span.
+fn style_for(role: SpanRole, theme: &Theme) -> Style {
+    let base = Style::default();
+    match role {
+        SpanRole::Gutter => base.fg(theme.text.muted),
+        SpanRole::Body => base.fg(theme.agent.model_text),
+        SpanRole::Heading(1..=2) => base
+            .fg(theme.text.heading)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        SpanRole::Heading(_) => base.fg(theme.text.heading).add_modifier(Modifier::BOLD),
+        SpanRole::Strong => base.fg(theme.text.primary).add_modifier(Modifier::BOLD),
+        SpanRole::Emphasis => base
+            .fg(theme.agent.model_text)
+            .add_modifier(Modifier::ITALIC),
+        SpanRole::StrongEmphasis => base
+            .fg(theme.text.primary)
+            .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        SpanRole::InlineCode => base.fg(theme.syntax.string),
+        SpanRole::Link => base
+            .fg(theme.focus.active)
+            .add_modifier(Modifier::UNDERLINED),
+        SpanRole::ListMarker => base.fg(theme.agent.tool),
+        SpanRole::BlockQuote => base.fg(theme.text.secondary).add_modifier(Modifier::ITALIC),
+        SpanRole::Rule => base.fg(theme.text.muted),
+        SpanRole::TableHeader => base.fg(theme.text.heading).add_modifier(Modifier::BOLD),
+        SpanRole::TableCell => base.fg(theme.agent.model_text),
+        SpanRole::TableRule => base.fg(theme.surface.border),
+        SpanRole::CodePlain => base.fg(theme.text.primary),
+        SpanRole::CodeToken(SyntaxRole::Keyword) => base.fg(theme.syntax.keyword),
+        SpanRole::CodeToken(SyntaxRole::Literal) => base.fg(theme.syntax.literal),
+        SpanRole::CodeToken(SyntaxRole::StringLit) => base.fg(theme.syntax.string),
+        SpanRole::CodeToken(SyntaxRole::Comment) => base.fg(theme.syntax.comment),
+        SpanRole::CodeToken(SyntaxRole::Type) => base.fg(theme.syntax.r#type),
+        SpanRole::CodeToken(SyntaxRole::Function) => base.fg(theme.syntax.function),
+        SpanRole::CodeToken(SyntaxRole::Operator) => base.fg(theme.syntax.operator),
+        SpanRole::CodeToken(SyntaxRole::Constant) => base.fg(theme.syntax.constant),
+        SpanRole::CodeToken(SyntaxRole::Punctuation) => base.fg(theme.syntax.punctuation),
     }
 }
 
@@ -380,19 +451,29 @@ fn for_each_row<'a>(
                 awaiting_header = false;
             }
             match entry {
-                TranscriptEntry::Model { text } => {
-                    let mut rows: Vec<&str> = text.lines().collect();
-                    if rows.is_empty() {
-                        rows.push("");
+                TranscriptEntry::Model { text, rendered } => match rendered {
+                    // RICH: finalized and not the live tail → borrow cached lines.
+                    Some(lines) if !streaming_tail => {
+                        for rl in lines {
+                            visit(Row::rich(rl));
+                            produced = true;
+                        }
                     }
-                    let last = rows.len() - 1;
-                    let style = Style::default().fg(theme.agent.model_text);
-                    for (i, l) in rows.into_iter().enumerate() {
-                        let prefix = if i == 0 { "▌ " } else { "  " };
-                        visit(Row::model(prefix, l, streaming_tail && i == last, style));
-                        produced = true;
+                    // PLAIN: streaming tail, or not yet finalized (belt-and-braces).
+                    _ => {
+                        let mut rows: Vec<&str> = text.lines().collect();
+                        if rows.is_empty() {
+                            rows.push("");
+                        }
+                        let last = rows.len() - 1;
+                        let style = Style::default().fg(theme.agent.model_text);
+                        for (i, l) in rows.into_iter().enumerate() {
+                            let prefix = if i == 0 { "▌ " } else { "  " };
+                            visit(Row::model(prefix, l, streaming_tail && i == last, style));
+                            produced = true;
+                        }
                     }
-                }
+                },
                 other => {
                     scratch.clear();
                     entry_lines(other, theme, false, false, &mut scratch);
@@ -401,10 +482,14 @@ fn for_each_row<'a>(
                     } else {
                         None
                     };
+                    let is_user = matches!(other, TranscriptEntry::User { .. });
                     for (j, line) in scratch.drain(..).enumerate() {
                         let mut row = Row::built(line);
                         if j == 0 {
                             row.hit_entry = hit;
+                        }
+                        if is_user {
+                            row.bg = Some(theme.surface.user);
                         }
                         visit(row);
                         produced = true;
@@ -475,8 +560,26 @@ fn build_transcript_window<'a>(
                 first_seen = true;
             }
             let hit = row.hit_entry;
+            let bg = row.bg;
             let index = out.len();
-            out.push(row.into_line(theme));
+            let mut line = row.into_line(theme);
+            if let Some(c) = bg {
+                if c == theme.surface.panel {
+                    // No distinct raised surface (ansi16/monochrome): a leading accent bar.
+                    line.spans.insert(
+                        0,
+                        Span::styled("▎", Style::default().fg(theme.focus.active)),
+                    );
+                } else {
+                    line.style = line.style.bg(c);
+                    let pad = (inner_width as usize).saturating_sub(line.width());
+                    if pad > 0 {
+                        line.spans
+                            .push(Span::styled(" ".repeat(pad), Style::default().bg(c)));
+                    }
+                }
+            }
+            out.push(line);
             if let Some(entry) = hit {
                 hits.push((index, entry));
             }
@@ -724,7 +827,7 @@ fn entry_lines<'a>(
                 out.push(Line::styled("  ", Style::default().fg(theme.text.primary)));
             }
         }
-        TranscriptEntry::Model { text } => {
+        TranscriptEntry::Model { text, .. } => {
             model_entry_lines(text, theme, selected, streaming_tail, out);
         }
         TranscriptEntry::Tool(card) => tool_card_lines(card, theme, selected, out),
@@ -5611,6 +5714,239 @@ mod tests {
         );
     }
 
+    // --- Task 7: RowKind::Rich + style_for (finalized rich rows) ---
+
+    /// Drive a run to a finalized rich Model; return the mutated state.
+    fn finalized_model_state(markdown: &str) -> AppState {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "go".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: markdown.to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+        s
+    }
+
+    #[test]
+    fn finalized_model_renders_styled_heading() {
+        let s = finalized_model_state("# Heading");
+        let theme = Theme::dark();
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 0, 40, 0);
+        // A heading span is bold and coloured text.heading.
+        let styled = lines.iter().flat_map(|l| l.spans.iter()).any(|sp| {
+            sp.style.fg == Some(theme.text.heading)
+                && sp.style.add_modifier.contains(Modifier::BOLD)
+        });
+        assert!(styled, "the finalized heading is not styled from the theme");
+    }
+
+    #[test]
+    fn keyword_span_maps_to_syntax_keyword() {
+        let s = finalized_model_state("```rust\nfn a() {}\n```");
+        let theme = Theme::dark();
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 0, 40, 0);
+        let has_kw = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|sp| sp.style.fg == Some(theme.syntax.keyword));
+        assert!(has_kw, "no span coloured syntax.keyword");
+    }
+
+    #[test]
+    fn rich_message_build_materializes_only_the_viewport() {
+        // A large FINALIZED rich message — the crash-path invariant with rich rows.
+        let mut big = String::new();
+        for i in 0..4000 {
+            big.push_str(&format!("- item {i}\n"));
+        }
+        let s = finalized_model_state(&big);
+        // It really is finalized (rendered Some), so the rich path is exercised.
+        assert!(s.runs[0].transcript.iter().any(|e| matches!(
+            e,
+            TranscriptEntry::Model {
+                rendered: Some(_),
+                ..
+            }
+        )));
+
+        let theme = Theme::dark();
+        let (inner_width, height) = (78u16, 20u16);
+        let total = transcript_rows(&s.runs, &theme, inner_width);
+        assert!(
+            total >= 4000,
+            "measure sees the whole rich history: {total}"
+        );
+        let (lines, _r, _h) = build_transcript_window(
+            &s.runs,
+            &theme,
+            inner_width,
+            total.saturating_sub(height),
+            height,
+            0,
+        );
+        assert!(
+            lines.len() <= height as usize + 4,
+            "build materializes O(viewport), not O(history): {}",
+            lines.len()
+        );
+    }
+
+    // --- Task 8: user-message container (Row.bg) ---
+
+    fn user_turn_state() -> AppState {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        // RunStarted pushes the objective as a `User` transcript entry.
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "my question".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        s
+    }
+
+    #[test]
+    fn user_rows_carry_the_container_bg_and_fill_width() {
+        let s = user_turn_state();
+        let theme = Theme::dark();
+        let inner_width = 40u16;
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, inner_width, 0, 40, 0);
+        let user_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|sp| sp.content.contains("my question")))
+            .expect("user body line present");
+        assert_eq!(
+            user_line.style.bg,
+            Some(theme.surface.user),
+            "no container bg"
+        );
+        assert_eq!(
+            user_line.width(),
+            inner_width as usize,
+            "not padded to full width"
+        );
+    }
+
+    #[test]
+    fn ansi16_user_row_uses_an_accent_bar_not_a_bg() {
+        let s = user_turn_state();
+        let theme = Theme::ansi16(); // surface.user == surface.panel here
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 40, 0, 40, 0);
+        let user_line = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|sp| sp.content.contains("my question")))
+            .expect("user body line present");
+        assert_eq!(user_line.spans[0].content, "▎", "no accent bar");
+        assert_eq!(user_line.spans[0].style.fg, Some(theme.focus.active));
+        assert_ne!(
+            user_line.style.bg,
+            Some(theme.surface.user),
+            "should not bg-fill on ansi16"
+        );
+    }
+
+    #[test]
+    fn user_container_does_not_break_virtualization() {
+        let mut s = user_turn_state();
+        // Add a long agent reply so the window must virtualize.
+        let run_id = s.runs[0].run_id;
+        let mut big = String::new();
+        for i in 0..3000 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta { run_id, text: big }),
+        );
+        let theme = Theme::dark();
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 100, 20, 0);
+        assert!(
+            lines.len() <= 24,
+            "build still O(viewport): {}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn theme_change_re_renders_without_re_parsing() {
+        use crate::markdown::PARSE_CALLS;
+        use std::sync::atomic::Ordering;
+        // Serialize against the other PARSE_CALLS-dependent test
+        // (`reduce::finalize_is_idempotent`): PARSE_CALLS is one process-wide
+        // counter and `cargo test` runs tests in parallel by default, so two
+        // such tests racing could otherwise interleave their reset/read and
+        // flake this assertion. Held for the whole test (see
+        // `markdown::lock_parse_calls` doc comment for why this cannot
+        // deadlock against this test's own finalize step below).
+        let _serialize_parse_calls = crate::markdown::lock_parse_calls();
+        let s = finalized_model_state("# H");
+        PARSE_CALLS.store(0, Ordering::Relaxed);
+        let (dark, _r, _h) = build_transcript_window(&s.runs, &Theme::dark(), 78, 0, 40, 0);
+        let (light, _r, _h) = build_transcript_window(&s.runs, &Theme::light(), 78, 0, 40, 0);
+        assert_eq!(
+            PARSE_CALLS.load(Ordering::Relaxed),
+            0,
+            "build re-parsed — cache not used"
+        );
+        let dfg = dark
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find_map(|s| s.style.fg);
+        let lfg = light
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find_map(|s| s.style.fg);
+        assert_ne!(dfg, lfg, "theme change produced no colour change");
+    }
+
+    #[test]
+    fn streaming_model_still_renders_plain() {
+        // No RunStateChanged: the tail is still Streaming ⇒ plain path (rendered None).
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "go".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "# still going".to_owned(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(
+            out.contains("# still going"),
+            "streaming text should render as-is (plain):\n{out}"
+        );
+    }
+
     #[test]
     fn a_tall_transcript_still_tails_the_latest_row() {
         // Overflow path unchanged: following pins to the tail.
@@ -5768,7 +6104,9 @@ mod tests {
             top_lines.len()
         );
         assert!(
-            top_lines.iter().any(|l| l.to_string() == "You"),
+            // Task 8: the `You` row now carries the container bg, padded to
+            // `inner_width` — trim the trailing fill before the exact match.
+            top_lines.iter().any(|l| l.to_string().trim_end() == "You"),
             "the user role header is one of the virtualized top rows"
         );
         assert!(
@@ -5834,6 +6172,105 @@ mod tests {
         assert!(
             map.iter().any(|(_, a)| matches!(a, Action::OpenPalette)),
             "footer chip → its Action"
+        );
+    }
+
+    // --- Task 9: hygiene — final end-to-end integration ---
+
+    /// End-to-end: a finalized assistant message with headings, emphasis,
+    /// inline code, a list, a fenced code block, and a block quote renders
+    /// through the real `parse` -> cache -> `RowKind::Rich` path — the whole
+    /// pipeline this feature built, not a single stage in isolation. While
+    /// still streaming the raw markdown is visible (plain path); once
+    /// finalized the markup is consumed and the styled prose remains.
+    #[test]
+    fn full_markdown_message_snaps_to_rich_end_to_end() {
+        let md = "# Report\n\nSome **bold** and `code`.\n\n- one\n- two\n\n\
+                  ```rust\nfn main() { let x = 1; }\n```\n\n> a quote";
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "please report".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: md.to_owned(),
+            }),
+        );
+        // While streaming: raw markdown is visible (plain path).
+        assert!(render_to_string(&s, 80, 30).contains("# Report"));
+        // Finalize.
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+        let out = render_to_string(&s, 80, 30);
+        // The literal "# " heading marker is gone (rendered as a styled heading).
+        assert!(out.contains("Report"));
+        assert!(
+            !out.contains("# Report"),
+            "heading markup should be consumed:\n{out}"
+        );
+        // The user's own turn and the agent reply both rendered.
+        assert!(out.contains("please report"));
+    }
+
+    /// Same end-to-end path, but with a large finalized rich message — the
+    /// crash-path invariant (§Global Constraints: virtualization preserved)
+    /// re-checked one more time against the full pipeline, not just the
+    /// synthetic list built in `rich_message_build_materializes_only_the_viewport`.
+    #[test]
+    fn full_pipeline_stays_virtualization_bounded_when_finalized() {
+        // Headings/bold/inline code up top, then a long plain list — 3000
+        // short items keeps the whole message comfortably under
+        // `RICH_MARKDOWN_MAX_BYTES` (64 KiB) so it actually finalizes into
+        // the rich cache (a message over that cap stays on the plain path
+        // by design), while still being long enough to force virtualization.
+        let mut md = "# Huge Report\n\nSome **bold** and `inline` code up top.\n\n".to_owned();
+        for i in 0..3000 {
+            md.push_str(&format!("- item {i}\n"));
+        }
+        let s = finalized_model_state(&md);
+        assert!(
+            s.runs[0].transcript.iter().any(|e| matches!(
+                e,
+                TranscriptEntry::Model {
+                    rendered: Some(_),
+                    ..
+                }
+            )),
+            "message did not finalize into the rich cache"
+        );
+
+        let theme = Theme::dark();
+        let (inner_width, height) = (78u16, 20u16);
+        let total = transcript_rows(&s.runs, &theme, inner_width);
+        assert!(
+            total >= 3000,
+            "measure sees the whole rich history: {total}"
+        );
+        let (lines, _r, _h) = build_transcript_window(
+            &s.runs,
+            &theme,
+            inner_width,
+            total.saturating_sub(height),
+            height,
+            0,
+        );
+        assert!(
+            lines.len() <= height as usize + 4,
+            "full pipeline must still materialize O(viewport), not O(history): {}",
+            lines.len()
         );
     }
 }

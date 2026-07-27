@@ -19,6 +19,11 @@ serde_json = { workspace = true }
 # an execution capability (README: theme plugins get no execution permissions).
 toml = { workspace = true }
 thiserror = { workspace = true }
+# Rich TUI output formatting (Phase 6): the markdown parser behind the
+# finalize-time `markdown::parse` cache (client-only; see markdown.rs).
+pulldown-cmark = { workspace = true }
+# Per-language fenced-code syntax highlighting (client-only; see markdown.rs).
+synoptic = { workspace = true }
 
 [lints]
 workspace = true

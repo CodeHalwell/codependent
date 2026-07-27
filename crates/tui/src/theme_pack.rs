@@ -147,6 +147,7 @@ fn set_token(theme: &mut Theme, token: &str, color: Color) -> Option<()> {
         "surface.panel" => theme.surface.panel = color,
         "surface.border" => theme.surface.border = color,
         "surface.overlay" => theme.surface.overlay = color,
+        "surface.user" => theme.surface.user = color,
         "text.primary" => theme.text.primary = color,
         "text.secondary" => theme.text.secondary = color,
         "text.muted" => theme.text.muted = color,
@@ -161,6 +162,11 @@ fn set_token(theme: &mut Theme, token: &str, color: Color) -> Option<()> {
         "syntax.literal" => theme.syntax.literal = color,
         "syntax.string" => theme.syntax.string = color,
         "syntax.comment" => theme.syntax.comment = color,
+        "syntax.type" => theme.syntax.r#type = color,
+        "syntax.function" => theme.syntax.function = color,
+        "syntax.operator" => theme.syntax.operator = color,
+        "syntax.constant" => theme.syntax.constant = color,
+        "syntax.punctuation" => theme.syntax.punctuation = color,
         "diff.added" => theme.diff.added = color,
         "diff.removed" => theme.diff.removed = color,
         "diff.context" => theme.diff.context = color,
@@ -227,6 +233,21 @@ filesystem_read = ["/etc/passwd"]
             err,
             ThemePackError::ExecutionPermissionsForbidden(_)
         ));
+    }
+
+    #[test]
+    fn pack_can_override_new_syntax_and_user_tokens() {
+        let toml = r##"
+schema_version = 1
+id = "expanded"
+base = "dark"
+[tokens]
+"syntax.type" = "#00ffcc"
+"surface.user" = "236"
+"##;
+        let theme = load_theme_pack(toml).expect("loads");
+        assert_eq!(theme.syntax.r#type, Color::Rgb(0x00, 0xff, 0xcc));
+        assert_eq!(theme.surface.user, Color::Indexed(236));
     }
 
     #[test]

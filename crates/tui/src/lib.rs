@@ -28,6 +28,7 @@
 
 pub mod action;
 pub mod input;
+pub mod markdown;
 pub mod palette;
 pub mod reduce;
 pub mod render;
@@ -38,6 +39,7 @@ pub mod theme_pack;
 
 pub use action::{Action, Intent, SecretKey};
 pub use input::{map_event, pane_at, KeyBinding, KEY_BINDINGS};
+pub use markdown::{RichLine, RichSpan, SpanRole, SyntaxRole};
 pub use reduce::reduce;
 pub use render::render;
 pub use state::{
