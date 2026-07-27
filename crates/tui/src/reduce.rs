@@ -19,11 +19,44 @@ use crate::state::{
     RunView, ToolCard, ToolStatus, TranscriptEntry,
 };
 
+/// Above this size a message stays on the fast plain path (its single parse
+/// would be too costly). 64 KiB — a quarter of `MAX_MODEL_ENTRY_BYTES`.
+const RICH_MARKDOWN_MAX_BYTES: usize = 64 * 1024;
+
+/// Parse every finalized (non-streaming-tail) `Model` entry into its rich cache
+/// exactly once. Runs at the tail of every folded `DaemonEvent`, so it catches
+/// all stream-ending transitions without enumerating them. Idempotent (skips any
+/// entry already `Some`); bounded (O(total Model entries) cheap `is_none` checks).
+pub(crate) fn finalize_streamed_models(state: &mut AppState) {
+    let last_run = state.runs.len().checked_sub(1);
+    for (idx, run) in state.runs.iter_mut().enumerate() {
+        // The live streaming tail (only possible in the last run) is skipped.
+        let tail = if Some(idx) == last_run && run.activity == RunActivity::Streaming {
+            run.transcript.len().checked_sub(1)
+        } else {
+            None
+        };
+        for (i, entry) in run.transcript.iter_mut().enumerate() {
+            if Some(i) == tail {
+                continue;
+            }
+            if let TranscriptEntry::Model { text, rendered } = entry {
+                if rendered.is_none() && text.len() <= RICH_MARKDOWN_MAX_BYTES {
+                    *rendered = Some(crate::markdown::parse(text));
+                }
+            }
+        }
+    }
+}
+
 /// Fold a single [`Action`] into the state. Pure: the only side effect is
 /// mutating `state` (including appending intents to its outbox).
 pub fn reduce(state: &mut AppState, action: Action) {
     match action {
-        Action::DaemonEvent(event) => apply_event(state, *event),
+        Action::DaemonEvent(event) => {
+            apply_event(state, *event);
+            finalize_streamed_models(state);
+        }
         Action::CatchupSnapshot {
             title,
             closed,
@@ -4811,6 +4844,105 @@ mod tests {
             s.overlay,
             Overlay::Steering(String::new()),
             "row 1 of the filtered list ('Steer run') ran, not row 0"
+        );
+    }
+
+    #[test]
+    fn finalize_leaves_streaming_tail_plain_then_snaps_on_stop() {
+        use crate::state::TranscriptEntry;
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "go".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "# Title\n**bold**".to_owned(),
+            }),
+        );
+        // Still streaming ⇒ the tail Model stays plain (rendered None).
+        let model = s.runs[0]
+            .transcript
+            .iter()
+            .rev()
+            .find(|e| matches!(e, TranscriptEntry::Model { .. }))
+            .unwrap();
+        assert!(matches!(
+            model,
+            TranscriptEntry::Model { rendered: None, .. }
+        ));
+
+        // Stream ends (activity leaves Streaming) ⇒ finalize parses it once.
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+        let model = s.runs[0]
+            .transcript
+            .iter()
+            .rev()
+            .find(|e| matches!(e, TranscriptEntry::Model { .. }))
+            .unwrap();
+        match model {
+            TranscriptEntry::Model {
+                rendered: Some(lines),
+                ..
+            } => assert!(!lines.is_empty()),
+            other => panic!("expected finalized Model, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_is_idempotent() {
+        use crate::markdown::PARSE_CALLS;
+        use std::sync::atomic::Ordering;
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "go".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "hello".to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+        PARSE_CALLS.store(0, Ordering::Relaxed);
+        // Further events run the sweep again; the finalized entry is not re-parsed.
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+        assert_eq!(
+            PARSE_CALLS.load(Ordering::Relaxed),
+            0,
+            "already-cached entry re-parsed"
         );
     }
 }
