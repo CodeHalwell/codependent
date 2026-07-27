@@ -37,7 +37,7 @@ use codypendent_protocol::{
 };
 
 use crate::memory::CandidateMemory;
-use crate::types::{EvidenceRef, MemoryClass, Revision, Scope};
+use crate::types::{EvidenceRef, MemoryClass, RetentionPolicy, Revision, Scope};
 
 /// The default confidence stamped on an observed candidate (below a model- or
 /// user-asserted fact; the curator and later learning can adjust).
@@ -51,6 +51,25 @@ const SHELL_TOOL: &str = "shell.run";
 
 /// Markers that flag a note as an explicit memory proposal.
 const PROPOSE_MARKERS: [&str; 2] = ["memory.propose:", "memory:"];
+
+/// The maximum number of characters kept from a completed run's summary when
+/// building the breadcrumb statement (M0: a bounded crumb, not the whole
+/// reply).
+const SUMMARY_BREADCRUMB_MAX: usize = 200;
+
+/// Retention, in days, for a completed-run breadcrumb candidate.
+const BREADCRUMB_TTL_DAYS: u32 = 30;
+
+/// Truncate `s` to at most `max` **characters** (never splitting a multibyte
+/// char), appending `…` only when truncation actually occurred.
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut truncated: String = s.chars().take(max).collect();
+    truncated.push('…');
+    truncated
+}
 
 /// The canonical orderable revision for a ledger sequence. Delegates to
 /// [`Revision::sequence`] so the `seq:` + fixed-width-zero-padded format (which
@@ -195,19 +214,27 @@ fn run_outcome_candidates(events: &[SessionEvent], scope: &Scope) -> Vec<Candida
         else {
             continue;
         };
-        let (class, statement) = match disposition {
-            RunDisposition::Completed { summary } => (
-                MemoryClass::Episodic,
-                format!(
-                    "Run {run_id} completed: {}",
-                    summary
-                        .clone()
-                        .unwrap_or_else(|| "(no summary)".to_string())
-                ),
-            ),
+        let (class, statement, retention) = match disposition {
+            RunDisposition::Completed { summary } => {
+                let first = summary
+                    .as_deref()
+                    .and_then(|s| s.lines().map(str::trim).find(|l| !l.is_empty()))
+                    .unwrap_or("(no summary)");
+                (
+                    MemoryClass::Episodic,
+                    format!(
+                        "Run {run_id} completed: {}",
+                        cap_chars(first, SUMMARY_BREADCRUMB_MAX)
+                    ),
+                    Some(RetentionPolicy {
+                        ttl_days: Some(BREADCRUMB_TTL_DAYS),
+                    }),
+                )
+            }
             RunDisposition::Failed { reason } => (
                 MemoryClass::Failure,
                 format!("Run {run_id} failed: {reason}"),
+                None,
             ),
             RunDisposition::Cancelled { reason } => (
                 MemoryClass::Episodic,
@@ -218,6 +245,7 @@ fn run_outcome_candidates(events: &[SessionEvent], scope: &Scope) -> Vec<Candida
                         .map(|r| format!(": {r}"))
                         .unwrap_or_default()
                 ),
+                None,
             ),
             _ => continue,
         };
@@ -236,7 +264,7 @@ fn run_outcome_candidates(events: &[SessionEvent], scope: &Scope) -> Vec<Candida
             // Inherit the chronicle's classification so a sensitive run does not
             // become a less-restricted memory.
             sensitivity: chronicle.sensitivity,
-            retention: None,
+            retention,
         });
     }
     candidates
@@ -284,4 +312,205 @@ fn explicit_proposal_candidates(
         });
     }
     candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codypendent_protocol::{Actor, ArtifactId, ArtifactRef, RunId};
+
+    fn artifact() -> ArtifactRef {
+        ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "application/json".to_string(),
+            byte_length: 42,
+            sha256: "0".repeat(64),
+            sensitivity: DataClassification::Internal,
+        }
+    }
+
+    fn event(sequence: u64, body: EventBody) -> SessionEvent {
+        SessionEvent {
+            sequence,
+            occurred_at: chrono::Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body,
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // cap_chars
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn cap_chars_leaves_short_strings_untouched() {
+        assert_eq!(cap_chars("hello", 200), "hello");
+        assert_eq!(cap_chars("", 200), "");
+        // Exactly at the limit: still no ellipsis.
+        assert_eq!(cap_chars("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn cap_chars_truncates_and_appends_ellipsis_only_when_cut() {
+        let capped = cap_chars("abcdefghij", 5);
+        assert_eq!(capped, "abcde…");
+    }
+
+    #[test]
+    fn cap_chars_is_char_boundary_safe_on_multibyte_input() {
+        // Each "é" is a single char but multiple bytes in UTF-8; a byte-index
+        // truncation would panic or split the char. Chars 0..=2 are "a", "é",
+        // "b" — capping at 2 chars must keep exactly "aé" plus the ellipsis.
+        let s = "aébcdéfg";
+        let capped = cap_chars(s, 2);
+        assert_eq!(capped, "aé…");
+    }
+
+    // ----------------------------------------------------------------
+    // run_outcome_candidates — Completed arm
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn completed_run_yields_bounded_breadcrumb_not_whole_reply() {
+        let session = SessionId::new();
+        let run = RunId::new();
+        let long_first_line = "a".repeat(250);
+        let long_tail = "x".repeat(500);
+        let summary = format!("{long_first_line}\n{long_tail}");
+
+        let events = vec![event(
+            1,
+            EventBody::RunCompleted {
+                run_id: run,
+                disposition: RunDisposition::Completed {
+                    summary: Some(summary),
+                },
+                chronicle: artifact(),
+            },
+        )];
+
+        let candidates = run_outcome_candidates(&events, &Scope::Session(session));
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+
+        assert_eq!(candidate.class, MemoryClass::Episodic);
+        let prefix = format!("Run {run} completed: ");
+        assert!(
+            candidate.statement.starts_with(&prefix),
+            "got {:?}",
+            candidate.statement
+        );
+        let max_len = prefix.len() + SUMMARY_BREADCRUMB_MAX + '…'.len_utf8();
+        assert!(
+            candidate.statement.len() <= max_len,
+            "statement of length {} exceeds bound {max_len}: {:?}",
+            candidate.statement.len(),
+            candidate.statement
+        );
+        // Only the first line survived — none of the 500-char tail leaked in.
+        assert!(!candidate.statement.contains('x'));
+        assert!(
+            candidate.statement.ends_with('…'),
+            "got {:?}",
+            candidate.statement
+        );
+        assert_eq!(
+            candidate.retention,
+            Some(RetentionPolicy {
+                ttl_days: Some(BREADCRUMB_TTL_DAYS)
+            })
+        );
+    }
+
+    #[test]
+    fn completed_run_none_summary_uses_placeholder() {
+        let session = SessionId::new();
+        let run = RunId::new();
+
+        let events = vec![event(
+            1,
+            EventBody::RunCompleted {
+                run_id: run,
+                disposition: RunDisposition::Completed { summary: None },
+                chronicle: artifact(),
+            },
+        )];
+
+        let candidates = run_outcome_candidates(&events, &Scope::Session(session));
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+
+        assert_eq!(
+            candidate.statement,
+            format!("Run {run} completed: (no summary)")
+        );
+        assert_eq!(
+            candidate.retention,
+            Some(RetentionPolicy {
+                ttl_days: Some(BREADCRUMB_TTL_DAYS)
+            })
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // run_outcome_candidates — Failed / Cancelled arms unchanged
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn failed_run_statement_and_retention_unchanged() {
+        let session = SessionId::new();
+        let run = RunId::new();
+
+        let events = vec![event(
+            1,
+            EventBody::RunCompleted {
+                run_id: run,
+                disposition: RunDisposition::Failed {
+                    reason: "clippy denied 3 lints".to_string(),
+                },
+                chronicle: artifact(),
+            },
+        )];
+
+        let candidates = run_outcome_candidates(&events, &Scope::Session(session));
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+
+        assert_eq!(candidate.class, MemoryClass::Failure);
+        assert_eq!(
+            candidate.statement,
+            format!("Run {run} failed: clippy denied 3 lints")
+        );
+        assert_eq!(candidate.retention, None);
+    }
+
+    #[test]
+    fn cancelled_run_statement_and_retention_unchanged() {
+        let session = SessionId::new();
+        let run = RunId::new();
+
+        let events = vec![event(
+            1,
+            EventBody::RunCompleted {
+                run_id: run,
+                disposition: RunDisposition::Cancelled {
+                    reason: Some("user aborted".to_string()),
+                },
+                chronicle: artifact(),
+            },
+        )];
+
+        let candidates = run_outcome_candidates(&events, &Scope::Session(session));
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+
+        assert_eq!(candidate.class, MemoryClass::Episodic);
+        assert_eq!(
+            candidate.statement,
+            format!("Run {run} cancelled: user aborted")
+        );
+        assert_eq!(candidate.retention, None);
+    }
 }
