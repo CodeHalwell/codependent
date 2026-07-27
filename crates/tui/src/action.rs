@@ -40,6 +40,13 @@ pub enum Action {
     CyclePane,
     /// Move keyboard focus to a specific pane (mouse click).
     FocusPane(Pane),
+    /// Activate row N of the active list surface (mouse click): the open overlay
+    /// list, or — with no overlay — the transcript fold line at entry N of the
+    /// selected run. Folds to the same effect the keyboard's selection + `Enter`
+    /// produces. Client-only (no `Intent`, no wire).
+    ActivateRow(usize),
+    /// Select run N in the runs pane (mouse click). Client-only.
+    SelectRun(usize),
     /// Select the previous item / scroll up in the focused pane (`Up`/`k`/wheel-up).
     SelectPrev,
     /// Select the next item / scroll down in the focused pane (`Down`/`j`/wheel-down).

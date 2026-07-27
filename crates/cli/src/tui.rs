@@ -588,7 +588,7 @@ async fn event_loop(
                 // Track width for mouse-column → pane mapping; the draw below
                 // re-reads the real size, so a resize just needs a redraw.
                 Some(CrosstermEvent::Resize(w, _)) => { *width = w; Action::NoOp }
-                Some(event) => map_event(&event, state.input_mode(), *width),
+                Some(event) => map_event(&event, state.input_mode(), *width, &state.hit_map.borrow()),
                 None => return Ok(()), // input bridge ended
             },
             _ = ticker.tick() => {

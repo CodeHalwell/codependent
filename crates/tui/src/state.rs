@@ -5,14 +5,16 @@
 //! derived deterministically from the ordered [`SessionEvent`] stream plus local
 //! navigation, so replaying the same events yields the same state.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+
+use ratatui::layout::Rect;
 
 use codypendent_protocol::{
     AgentMode, ApprovalId, ArtifactRef, BudgetDimension, ChangeSetId, DocumentId, DocumentMutation,
     ModelId, ProposedAction, Risk, RunDisposition, RunId, RunState, ToolOutcome,
 };
 
-use crate::action::{Intent, SecretKey};
+use crate::action::{Action, Intent, SecretKey};
 
 /// Which pane currently has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -943,6 +945,14 @@ pub struct AppState {
     /// layout metric — never domain state — which is why it is a [`Cell`] the
     /// draw-only renderer may update through a shared reference.
     pub transcript_max_scroll: Cell<u16>,
+    /// A render→input geometry cache (mirrors `transcript_max_scroll`): every
+    /// interactive widget registers its `Rect` + the `Action` a click fires here
+    /// during render; the input layer resolves a left click to the topmost hit.
+    /// A one-frame-fresh layout metric, cleared at the start of every render —
+    /// never domain state. `RefCell` (not `Cell`) because the payload is a
+    /// non-`Copy` `Vec`. Default/clone/eq are harmless: it defaults empty and is
+    /// only populated during render, so reducer-only tests keep comparing equal.
+    pub hit_map: RefCell<Vec<(Rect, Action)>>,
     /// The top-most overlay / modal.
     pub overlay: Overlay,
     /// The mode used for the next new run (the new-run prompt inherits it).
@@ -1013,6 +1023,7 @@ impl AppState {
             composer: String::new(),
             layout: LayoutMode::Chat,
             transcript_max_scroll: Cell::new(0),
+            hit_map: RefCell::new(Vec::new()),
             overlay: Overlay::None,
             default_mode: AgentMode::Build,
             should_detach: false,
@@ -1180,6 +1191,12 @@ impl AppState {
     /// connection task calls this after each reduce to dispatch commands.
     pub fn drain_outbox(&mut self) -> Vec<Intent> {
         std::mem::take(&mut self.outbox)
+    }
+
+    /// Register an interactive rect → the Action a left click on it fires. Called
+    /// by the renderer (interior mutability; the reducer never touches it).
+    pub fn register_hit(&self, rect: Rect, action: Action) {
+        self.hit_map.borrow_mut().push((rect, action));
     }
 
     // --- internal helpers used by the reducer ---

@@ -32,6 +32,9 @@ use crate::theme::Theme;
 /// Draw the whole UI for the current frame.
 pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let area = frame.area();
+    // Rebuilt fresh every frame (mirrors `transcript_max_scroll`): a stale hit
+    // from a previous layout must never survive to resolve this frame's clicks.
+    state.hit_map.borrow_mut().clear();
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.surface.background)),
         area,
