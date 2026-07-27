@@ -1214,11 +1214,26 @@ impl FrameworkAgentRuntime {
         let decision = self.policy.evaluate(&prepared.action, &self.eval_ctx(run));
         match decision.decision {
             Decision::Deny => {
-                let reason = decision
-                    .reasons
-                    .first()
+                let first_reason = decision.reasons.first();
+                let reason = first_reason
                     .map(|r| r.message.clone())
                     .unwrap_or_else(|| "denied by policy".to_string());
+                let mut text = format!("policy denied: {reason}");
+                // FIX 3 (agent & tool fixes spec): a shell command denied solely
+                // because its program is not on the allow-list gets an actionable
+                // hint appended — otherwise the model tends to retry the same
+                // denied command instead of switching strategy (the evidence: a
+                // Python-repo review looped on file reads after `ls`/`find` were
+                // denied). The reason CODE stays the stable machine contract;
+                // only this human/model-facing text gains the hint, and only for
+                // this one reason code — any other denial (e.g. a write refused
+                // by mode) is unaffected.
+                if first_reason.map(|r| r.code.as_str()) == Some("policy.program-not-allowlisted") {
+                    text.push_str(
+                        " — to inspect the repository use the `workspace.read_file` and \
+                         `workspace.search` tools instead of a shell command.",
+                    );
+                }
                 // (c) on Deny: emit a denial completion and DO NOT execute.
                 self.emit(
                     run.session_id,
@@ -1227,14 +1242,14 @@ impl FrameworkAgentRuntime {
                         run_id: run.run_id,
                         tool: tool.to_string(),
                         outcome: ToolOutcome::Failed {
-                            message: format!("policy denied: {reason}"),
+                            message: text.clone(),
                         },
                         artifact: None,
                     },
                 )
                 .await?;
                 actions.push(action_digest(tool, "denied", None));
-                return Ok(ToolFlow::Observation(format!("policy denied: {reason}")));
+                return Ok(ToolFlow::Observation(text));
             }
             Decision::RequireApproval => {
                 // (c) park the run in WaitingForApproval until an approver
@@ -2949,6 +2964,61 @@ mod tests {
         assert!(
             names.contains(&BlackboardPostTool::NAME) && names.contains(&BlackboardQueryTool::NAME),
             "a workflow node must still be advertised the blackboard tools: {names:?}"
+        );
+    }
+
+    /// FIX 3 (agent & tool fixes spec): a `shell.run` denial for a program that
+    /// is not on the allow-list — an interpreter like `python`, which FIX 2
+    /// deliberately never adds — must still be denied, but the model-facing text
+    /// now names the structured tools to use instead, so the model changes
+    /// strategy rather than retrying the same denied command in a loop.
+    #[tokio::test]
+    async fn shell_denial_for_unlisted_program_points_at_workspace_tools() {
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::CallTool {
+                tool: "shell.run".to_string(),
+                args: json!({"program": "python", "args": ["--version"]}),
+            },
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ]);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "explore a python repo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("the run completes even though the tool call is denied");
+
+        let mut denial = None;
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::ToolCompleted {
+                tool,
+                outcome: ToolOutcome::Failed { message },
+                ..
+            } = event.body
+            {
+                if tool == "shell.run" {
+                    denial = Some(message);
+                }
+            }
+        }
+        let message = denial.expect("shell.run was completed as a policy denial");
+        assert!(
+            message.contains("is not in the shell allow-list"),
+            "the factual denial must be preserved: {message}"
+        );
+        assert!(
+            message.contains("workspace.read_file") && message.contains("workspace.search"),
+            "the denial must point the model at the structured exploration tools: {message}"
         );
     }
 

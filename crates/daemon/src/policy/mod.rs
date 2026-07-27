@@ -704,6 +704,51 @@ mod tests {
         assert_eq!(denied.decision, Decision::Deny);
     }
 
+    /// FIX 2 (agent & tool fixes spec, §2a + Reconciliation R2): widening the
+    /// default allow-list moves a curated command from Deny to
+    /// **RequireApproval**, never to auto-run — `eval_command` requires approval
+    /// for every allow-listed program. `find` (excluded — `-delete`/`-exec`) and
+    /// an interpreter (`python`, never added) must still deny outright.
+    #[test]
+    fn newly_curated_command_requires_approval_while_find_and_interpreters_stay_denied() {
+        let engine = PolicyEngine::with_defaults();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+
+        let ls = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "ls".to_string(),
+                args: Vec::new(),
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(
+            ls.decision,
+            Decision::RequireApproval,
+            "a newly curated command still requires approval, never auto-runs"
+        );
+
+        for program in ["find", "python"] {
+            let denied = engine.evaluate(
+                &ProposedAction::ExecuteCommand {
+                    program: program.to_string(),
+                    args: Vec::new(),
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+                &ctx(&repo, &repo),
+            );
+            assert_eq!(
+                denied.decision,
+                Decision::Deny,
+                "`{program}` must stay denied"
+            );
+            assert_eq!(denied.reasons[0].code, "policy.program-not-allowlisted");
+        }
+    }
+
     #[test]
     fn network_denied_by_default_and_git_requires_approval() {
         let engine = PolicyEngine::with_defaults();
