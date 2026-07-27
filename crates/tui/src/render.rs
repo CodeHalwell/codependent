@@ -210,11 +210,223 @@ fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &
 /// The composer's height in rows (a bordered box holding one input line).
 const COMPOSER_HEIGHT: u16 = 3;
 
+/// Wrapped-row height of a line `columns` display-columns wide in an
+/// `inner_width` viewport: ceil(columns/inner_width), min 1.
+fn line_rows(columns: usize, inner_width: usize) -> u16 {
+    let iw = inner_width.max(1);
+    let rows = if columns == 0 {
+        1
+    } else {
+        columns.div_ceil(iw)
+    };
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// One transcript row before placement (see module-level virtualization note).
+struct Row<'a> {
+    kind: RowKind<'a>,
+    /// The transcript-entry index this row is a click target for (fold heads in
+    /// the selected run). `None` unless tagged (Task 8).
+    hit_entry: Option<usize>,
+}
+
+enum RowKind<'a> {
+    /// An already-styled line (structural rows + every non-`Model` entry).
+    Built(Line<'a>),
+    /// A streamed model-text source line, borrowed so measuring allocates nothing.
+    Model {
+        prefix: &'static str,
+        text: &'a str,
+        caret: bool,
+        style: Style,
+    },
+}
+
+impl<'a> Row<'a> {
+    fn built(line: Line<'a>) -> Self {
+        Row {
+            kind: RowKind::Built(line),
+            hit_entry: None,
+        }
+    }
+    fn model(prefix: &'static str, text: &'a str, caret: bool, style: Style) -> Self {
+        Row {
+            kind: RowKind::Model {
+                prefix,
+                text,
+                caret,
+                style,
+            },
+            hit_entry: None,
+        }
+    }
+    /// Display width, allocation-free (`Span::raw` borrows; `.width()` is unicode width).
+    fn columns(&self) -> usize {
+        match &self.kind {
+            RowKind::Built(line) => line.width(),
+            RowKind::Model {
+                prefix,
+                text,
+                caret,
+                ..
+            } => Span::raw(*prefix).width() + Span::raw(*text).width() + usize::from(*caret),
+        }
+    }
+    fn rows(&self, inner_width: u16) -> u16 {
+        line_rows(self.columns(), inner_width as usize)
+    }
+    fn into_line(self, theme: &Theme) -> Line<'a> {
+        match self.kind {
+            RowKind::Built(line) => line,
+            RowKind::Model {
+                prefix,
+                text,
+                caret,
+                style,
+            } => {
+                if caret {
+                    Line::from(vec![
+                        Span::styled(format!("{prefix}{text}"), style),
+                        Span::styled("▋", Style::default().fg(theme.text.muted)),
+                    ])
+                } else {
+                    Line::styled(format!("{prefix}{text}"), style)
+                }
+            }
+        }
+    }
+}
+
+/// Walk the whole session transcript in scroll order, emitting one `Row` per
+/// logical line. Mirrors the old `conversation_lines` walk exactly; the `Model`
+/// entry is emitted as borrowed `Row::Model` rows (measured cheaply, built only
+/// when visible), every other entry reuses the existing `entry_lines` builders.
+fn for_each_row<'a>(
+    runs: &'a [RunView],
+    theme: &Theme,
+    selected_run: usize,
+    mut visit: impl FnMut(Row<'a>),
+) {
+    let mut awaiting_header = false;
+    let mut seen_user_turn = false;
+    let last_run_idx = runs.len().checked_sub(1);
+    let mut scratch: Vec<Line> = Vec::new();
+    for (run_idx, run) in runs.iter().enumerate() {
+        let is_last_run = Some(run_idx) == last_run_idx;
+        let last_entry_idx = run.transcript.len().checked_sub(1);
+        let mut produced = false;
+        for (idx, entry) in run.transcript.iter().enumerate() {
+            let streaming_tail = is_last_run
+                && last_entry_idx == Some(idx)
+                && run.activity == RunActivity::Streaming;
+            let is_agent_cell = matches!(
+                entry,
+                TranscriptEntry::Model { .. }
+                    | TranscriptEntry::Tool(_)
+                    | TranscriptEntry::Patch(_)
+            );
+            if matches!(entry, TranscriptEntry::User { .. }) {
+                if seen_user_turn {
+                    visit(Row::built(Line::raw("")));
+                    produced = true;
+                }
+                seen_user_turn = true;
+                awaiting_header = true;
+            } else if is_agent_cell && awaiting_header {
+                visit(Row::built(Line::styled(
+                    "⏺ codypendent",
+                    Style::default().fg(theme.focus.active),
+                )));
+                produced = true;
+                awaiting_header = false;
+            }
+            match entry {
+                TranscriptEntry::Model { text } => {
+                    let mut rows: Vec<&str> = text.lines().collect();
+                    if rows.is_empty() {
+                        rows.push("");
+                    }
+                    let last = rows.len() - 1;
+                    let style = Style::default().fg(theme.agent.model_text);
+                    for (i, l) in rows.into_iter().enumerate() {
+                        let prefix = if i == 0 { "▌ " } else { "  " };
+                        visit(Row::model(prefix, l, streaming_tail && i == last, style));
+                        produced = true;
+                    }
+                }
+                other => {
+                    scratch.clear();
+                    entry_lines(other, theme, false, false, &mut scratch);
+                    let _ = (run_idx, selected_run, idx); // hit tagging wired in Task 8
+                    for line in scratch.drain(..) {
+                        visit(Row::built(line));
+                        produced = true;
+                    }
+                }
+            }
+        }
+        if !produced {
+            visit(Row::built(Line::styled(
+                "(waiting for the agent…)",
+                Style::default().fg(theme.text.muted),
+            )));
+        }
+        if let Some(status) = activity_status_line(&run.activity, theme) {
+            visit(Row::built(status));
+        }
+    }
+}
+
+/// Total wrapped-row height of the whole transcript (the measure pass).
+fn transcript_rows(runs: &[RunView], theme: &Theme, inner_width: u16) -> u16 {
+    let mut total: u16 = 0;
+    for_each_row(runs, theme, usize::MAX, |row| {
+        total = total.saturating_add(row.rows(inner_width));
+    });
+    total
+}
+
+/// Build only the rows whose wrapped range intersects `[first_row, first_row+height)`.
+fn build_transcript_window<'a>(
+    runs: &'a [RunView],
+    theme: &Theme,
+    inner_width: u16,
+    first_row: u16,
+    height: u16,
+    selected_run: usize,
+) -> (Vec<Line<'a>>, u16, Vec<(usize, usize)>) {
+    let last_row = first_row.saturating_add(height);
+    let mut out: Vec<Line> = Vec::with_capacity(height as usize + 2);
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    let mut cursor: u16 = 0;
+    let mut scroll: u16 = 0;
+    let mut first_seen = false;
+    for_each_row(runs, theme, selected_run, |row| {
+        let h = row.rows(inner_width);
+        let row_start = cursor;
+        let row_end = cursor.saturating_add(h);
+        cursor = row_end;
+        if row_end > first_row && row_start < last_row {
+            if !first_seen {
+                scroll = first_row.saturating_sub(row_start);
+                first_seen = true;
+            }
+            let hit = row.hit_entry;
+            let index = out.len();
+            out.push(row.into_line(theme));
+            if let Some(entry) = hit {
+                hits.push((index, entry));
+            }
+        }
+    });
+    (out, scroll, hits)
+}
+
 /// The conversation: every run in the session, in order, as one continuous
 /// scroll (Task 5, continuous-session plan) — the primary surface, full
 /// width. Before this task, the pane showed only the *selected* run, so a
 /// follow-up's new run made the previous turn disappear the instant it
-/// started; `conversation_lines` now walks all of `state.runs`. The title
+/// started; [`for_each_row`] now walks all of `state.runs`. The title
 /// names the session + the newest turn (and a turn count once the session has
 /// more than one), plus the header chrome (Task 4, codex chat shell) naming
 /// what's serving it: `model · mode[ · cost]`.
@@ -253,29 +465,50 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         return;
     }
 
-    let lines = conversation_lines(&state.runs, theme);
-
-    // Auto-scroll: measure the wrapped height, cache the bottom offset (so the
-    // reducer's paging can leave/enter follow mode precisely), and pin the view to
-    // the tail while following; otherwise honor the manual offset. The selected
-    // run's follow/scroll fields govern the WHOLE scroll — `AppState::ensure_run`
-    // keeps `selected_run` on the newest run by default, so "follow" still means
-    // "stick to the conversation's live tail."
-    let max_scroll = max_scroll_offset(&lines, inner.width, inner.height);
+    let inner_width = inner.width;
+    // Measure the whole transcript cheaply, cache the bottom offset (so the
+    // reducer's paging leaves/enters follow mode precisely), then BUILD only the
+    // visible window — per-frame allocation is bounded by the viewport, not the
+    // transcript length (the crash fix).
+    let content_rows = transcript_rows(&state.runs, theme, inner_width);
+    let max_scroll = content_rows.saturating_sub(inner.height);
     state.transcript_max_scroll.set(max_scroll);
     let (follow, scroll) = state
         .selected_run()
         .map_or((true, 0), |run| (run.follow, run.scroll));
-    let offset = if follow {
+    let mut offset = if follow {
         max_scroll
     } else {
         scroll.min(max_scroll)
     };
+    // Guard the u16 handed to `Paragraph::scroll` — the rewrite must not
+    // reintroduce the overflow the old implicit coupling merely avoided.
+    offset = offset.min(u16::MAX.saturating_sub(inner.height));
+
+    let (mut lines, r0, _hits) = build_transcript_window(
+        &state.runs,
+        theme,
+        inner_width,
+        offset,
+        inner.height,
+        state.selected_run,
+    );
+
+    // Bottom-anchor: when the transcript is shorter than the viewport, pool the
+    // quiet space at the TOP so content sits flush above the composer. `top_pad`
+    // is 0 whenever content overflows, so the follow/scroll path is untouched.
+    let top_pad = inner.height.saturating_sub(content_rows);
+    if top_pad > 0 {
+        let mut padded = Vec::with_capacity(top_pad as usize + lines.len());
+        padded.resize(top_pad as usize, Line::raw(""));
+        padded.append(&mut lines);
+        lines = padded;
+    }
 
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((offset, 0));
+        .scroll((r0, 0));
     frame.render_widget(paragraph, area);
 }
 
@@ -296,27 +529,6 @@ fn header_chrome(run: &RunView, status: &StatusProjection) -> String {
         parts.push(format_cost(Some(cost)));
     }
     format!(" · {}", parts.join(" · "))
-}
-
-/// The largest useful scroll offset: total wrapped rows minus the viewport
-/// height (0 when everything fits). Wrapped rows are estimated as
-/// `ceil(line_width / inner_width)` per line — close enough for scrolling; the
-/// exact word-wrap boundary differs by at most a row.
-fn max_scroll_offset(lines: &[Line], width: u16, height: u16) -> u16 {
-    let inner_width = width.max(1) as usize;
-    let total: usize = lines
-        .iter()
-        .map(|line| {
-            let w = line.width();
-            if w == 0 {
-                1
-            } else {
-                w.div_ceil(inner_width)
-            }
-        })
-        .sum();
-    let total = u16::try_from(total).unwrap_or(u16::MAX);
-    total.saturating_sub(height)
 }
 
 /// The persistent composer: an always-present input line. Empty, it shows a
@@ -373,93 +585,6 @@ fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
         ))
         .border_style(Style::default().fg(theme.border_color(focused)))
         .style(theme.panel_style())
-}
-
-/// The whole session's transcript, in run order, as one continuous scroll
-/// (Task 5, continuous-session plan): every run's entries walk through
-/// exactly the per-turn rendering a single run used to get alone, so a
-/// follow-up's new run is appended after the prior one instead of replacing
-/// it. `awaiting_header` and `seen_user_turn` (see their notes below) thread
-/// continuously across a run boundary — a new run's opening `User` entry is
-/// just the conversation's next turn — so the assistant header and the
-/// between-turns blank line both land exactly where they would if the whole
-/// session had always been one run's transcript.
-fn conversation_lines<'a>(runs: &'a [RunView], theme: &Theme) -> Vec<Line<'a>> {
-    let mut lines: Vec<Line> = Vec::new();
-    // Assistant-turn header (codex chat shell Task 3): a `⏺ codypendent`
-    // line announces the first agent cell (Model/Tool/Patch) of each turn,
-    // so the transcript reads as "you asked → codypendent answered" rather
-    // than an undifferentiated stream. `awaiting_header` tracks whether the
-    // next agent cell is still the first one since the most recent `User`
-    // entry; every other cell kind (Steering, Budget, Note, Backstage,
-    // Completed, Unsupported) leaves it untouched, so a run that ends before
-    // producing any agent cell never emits a lone header with nothing under
-    // it.
-    let mut awaiting_header = false;
-    // Turn spacing (Task 4, codex chat shell): a blank line before every
-    // `User` turn after the first, so consecutive turns breathe instead of
-    // reading as one undifferentiated scroll. The opening turn needs no
-    // leading gap.
-    let mut seen_user_turn = false;
-    // The last run's index: only the conversation's newest run can still be
-    // live, so the streaming caret (below) never lands on an earlier,
-    // necessarily-terminal run.
-    let last_run_idx = runs.len().checked_sub(1);
-    for (run_idx, run) in runs.iter().enumerate() {
-        let is_last_run = Some(run_idx) == last_run_idx;
-        let last_entry_idx = run.transcript.len().checked_sub(1);
-        let before = lines.len();
-        for (idx, entry) in run.transcript.iter().enumerate() {
-            // Task 4: the streaming caret belongs on the newest entry of the
-            // newest run only, and only while that run is actively streaming
-            // into it — never mid-transcript, never on an earlier run, and
-            // never once the run has moved on to Idle/Thinking/RunningTool (a
-            // tool call, a thinking pause, or completion all drop it).
-            let streaming_tail = is_last_run
-                && last_entry_idx == Some(idx)
-                && run.activity == RunActivity::Streaming;
-            let is_agent_cell = matches!(
-                entry,
-                TranscriptEntry::Model { .. }
-                    | TranscriptEntry::Tool(_)
-                    | TranscriptEntry::Patch(_)
-            );
-            if matches!(entry, TranscriptEntry::User { .. }) {
-                if seen_user_turn {
-                    lines.push(Line::raw(""));
-                }
-                seen_user_turn = true;
-                awaiting_header = true;
-            } else if is_agent_cell && awaiting_header {
-                lines.push(Line::styled(
-                    "⏺ codypendent",
-                    Style::default().fg(theme.focus.active),
-                ));
-                awaiting_header = false;
-            }
-            // `selected = false`: the conversation shows no per-entry
-            // selection highlight (there is no in-transcript cursor in the
-            // composer-driven shell — `render_conversation` never focuses it).
-            entry_lines(entry, theme, false, streaming_tail, &mut lines);
-        }
-        // A run with no transcript entries yet (shouldn't happen in practice —
-        // `RunStarted`'s fold pushes the objective as the very first entry —
-        // but kept for the same defend-in-depth reason the single-run
-        // renderer always had it) still occupies its place in the scroll.
-        if lines.len() == before {
-            lines.push(Line::styled(
-                "(waiting for the agent…)",
-                Style::default().fg(theme.text.muted),
-            ));
-        }
-        // The live "working" status row (Task 3): appended right after this
-        // run's own entries — from this run's own activity — so it reads as
-        // that run's newest line. Idle (every terminal run) renders nothing.
-        if let Some(status) = activity_status_line(&run.activity, theme) {
-            lines.push(status);
-        }
-    }
-    lines
 }
 
 /// The dim status row a run's derived [`RunActivity`] renders as, so a run
@@ -572,7 +697,7 @@ fn entry_lines<'a>(
 /// call starting, a thinking pause, or the run completing).
 ///
 /// Folding the caret into the same `Line` that both the transcript
-/// `Paragraph` and [`max_scroll_offset`]'s measurement read (see
+/// `Paragraph` and [`transcript_rows`]'s measurement read (see
 /// `render_conversation`) means the measured bottom already accounts for it —
 /// "follow latest" pins to the caret's row with no separate adjustment.
 fn model_entry_lines<'a>(
@@ -4769,6 +4894,126 @@ mod tests {
         assert!(
             text.contains("off-by-one"),
             "payload summary missing:\n{text}"
+        );
+    }
+
+    // --- Task 1: transcript virtualization + bottom-anchor + scroll clamp ---
+
+    #[test]
+    fn a_short_transcript_is_anchored_to_the_bottom() {
+        // One brief turn in a tall viewport: quiet space pools at the TOP, content
+        // sits flush above the composer.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "tiny".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "one short reply".to_owned(),
+            }),
+        );
+        let out = render_to_string(&s, 80, 24);
+        let rows: Vec<&str> = out.lines().collect();
+        // The transcript pane is rows[1..] under the 1-row border; its first content
+        // row (row index 1) is blank (top padding), and the reply is in the lower
+        // rows just above the composer. Each row is the pane's full width, so the
+        // pane's own left/right border glyph brackets the content; strip it before
+        // checking for blank padding.
+        assert!(
+            rows[2].trim_matches('│').trim().is_empty(),
+            "quiet space at the top:\n{out}"
+        );
+        let reply_row = rows
+            .iter()
+            .position(|r| r.contains("one short reply"))
+            .expect("reply rendered");
+        assert!(
+            reply_row > 12,
+            "content anchored toward the bottom (row {reply_row}):\n{out}"
+        );
+    }
+
+    #[test]
+    fn build_transcript_window_materializes_only_the_viewport() {
+        // A pathological single Model entry of thousands of source lines. The build
+        // pass must materialize O(viewport) lines, not O(history).
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "huge".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let mut big = String::new();
+        for i in 0..5000 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta { run_id, text: big }),
+        );
+
+        let theme = Theme::dark();
+        let inner_width = 78;
+        let height = 20;
+        let total = transcript_rows(&s.runs, &theme, inner_width);
+        assert!(total >= 5000, "measure sees the whole history: {total}");
+        let (lines, _r0, _hits) = build_transcript_window(
+            &s.runs,
+            &theme,
+            inner_width,
+            total.saturating_sub(height),
+            height,
+            0,
+        );
+        assert!(
+            lines.len() <= height as usize + 4,
+            "the build materializes O(viewport) lines, not O(history): {}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn a_tall_transcript_still_tails_the_latest_row() {
+        // Overflow path unchanged: following pins to the tail.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "scrolling".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let mut big = String::new();
+        for i in 0..200 {
+            big.push_str(&format!("body line {i}\n"));
+        }
+        big.push_str("THE FINAL LINE");
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta { run_id, text: big }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(
+            out.contains("THE FINAL LINE"),
+            "the tail is visible while following:\n{out}"
+        );
+        assert!(
+            !out.contains("body line 0"),
+            "the head has scrolled off:\n{out}"
         );
     }
 }
