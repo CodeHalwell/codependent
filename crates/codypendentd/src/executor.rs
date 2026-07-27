@@ -690,13 +690,52 @@ impl RuntimeExecutor {
             .await;
     }
 
-    /// M3a: the extractor this run's harvest is injected with. Always
-    /// [`NoopExtractor`] for now — zero model deps, behavior unchanged from
-    /// before M3a. M3b replaces this body with the D2 selection order
-    /// (configured `memory_extraction_model` → the run's own resolved model →
-    /// `NoopExtractor`).
-    async fn build_fact_extractor(&self, _mode: AgentMode) -> Box<dyn FactExtractor> {
-        Box::new(NoopExtractor)
+    /// M3b: the extractor this run's harvest is injected with, per the D2
+    /// selection order: (1) a configured `memory_extraction_model` (from
+    /// `routing.toml`), when set AND resolvable in the model registry;
+    /// (2) else the run's own resolved model (the same `resolve_model` call
+    /// `execute` uses); (3) else [`NoopExtractor`] — no model configured at
+    /// all. Every step is fail-safe: a missing registry, an unresolvable
+    /// model, or a client-construction error all fall back to
+    /// `NoopExtractor` rather than failing the harvest (which itself never
+    /// fails a run).
+    ///
+    /// NOT gated on `#[cfg(feature = "provider-openai")]`: `codypendentd`
+    /// pulls `codypendent-runtime` with default features (provider-openai
+    /// on) and already calls its `client_for`/`from_registry` unconditionally
+    /// elsewhere (`execute`, above; `load_model_registry_resolves_a_key_from_auth_json`'s
+    /// comment), and defines no `provider-openai` feature of its own — so
+    /// gating here would make the real path dead code in every build this
+    /// crate ships.
+    async fn build_fact_extractor(&self, mode: AgentMode) -> Box<dyn FactExtractor> {
+        let (registry, policy) = match self.load_registry() {
+            Ok(rp) => rp,
+            Err(_) => return Box::new(NoopExtractor), // no model configured ⇒ Noop
+        };
+        // D2 selection: (1) configured extraction model, (2) run's resolved
+        // model, (3) Noop.
+        let configured = RoutingConfig::load(&self.paths).memory_extraction_model;
+        let model_id = match configured.filter(|id| registry.get(id).is_some()) {
+            Some(id) => id,
+            None => match resolve_model(&registry, &policy, mode).await {
+                Ok(resolved) => resolved.id,
+                Err(_) => return Box::new(NoopExtractor),
+            },
+        };
+        // D2 config visibility: warn ONCE per process that extraction makes a
+        // per-run model call, so an operator points `memory_extraction_model`
+        // at a cheap model.
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        NOTE.call_once(|| tracing::info!(
+            "memory extraction makes a best-effort per-run model call; set `memory_extraction_model` in routing.toml to a cheap/local model to keep cost off the coding model"
+        ));
+        match codypendent_runtime::LlmFactExtractor::from_registry(&registry, model_id).await {
+            Ok(extractor) => Box::new(extractor),
+            Err(error) => {
+                warn!(%error, "could not build memory extraction client; extraction disabled for this run");
+                Box::new(NoopExtractor)
+            }
+        }
     }
 
     /// The testable harvest core: loads the ledger, appends the pure
@@ -1680,6 +1719,135 @@ mod tests {
                 .any(|(class, statement)| class == "code"
                     && statement.contains("crates/x/src/a.rs:42")),
             "an empty M3a extractor must not suppress the M1 heuristic candidate, got {statements:?}"
+        );
+    }
+
+    /// M3b: a mock extractor that returns two distinct facts contributes TWO
+    /// additional curated `MemoryRecord`s, alongside the M1 heuristic
+    /// candidate from the same chronicle — the fan-in accepts every producer's
+    /// output, not just the heuristic one.
+    #[tokio::test]
+    async fn harvest_with_extractor_returning_two_facts_curates_both() {
+        use codypendent_daemon::artifacts::Provenance;
+        use codypendent_knowledge::{CandidateMemory, EvidenceRef, MemoryClass};
+        use codypendent_protocol::{ArtifactId, RunDisposition};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor =
+            RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
+
+        let session = SessionId::new();
+        let run_id = RunId::new();
+        ledger::create_session(&pool, session, "harvest-two-facts")
+            .await
+            .expect("create session");
+
+        let chronicle_bytes = serde_json::to_vec(&serde_json::json!({
+            "objective": "fix the guard",
+            "investigations": [],
+            "changes": [],
+            "actions": [],
+            "decisions": [],
+        }))
+        .expect("serialize chronicle");
+        let chronicle_ref = executor
+            .artifacts()
+            .put(
+                &pool,
+                "application/json",
+                DataClassification::Internal,
+                Provenance::system("test-chronicle-two-facts"),
+                &chronicle_bytes,
+            )
+            .await
+            .expect("store chronicle artifact");
+
+        let event = codypendent_protocol::SessionEvent {
+            sequence: 1,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("done".to_string()),
+                },
+                chronicle: chronicle_ref.clone(),
+            },
+        };
+        ledger::append_event(&pool, session, &event)
+            .await
+            .expect("append RunCompleted");
+
+        // A fabricated "chronicle artifact" evidence ref: any valid `ArtifactRef`
+        // works as provenance — `curate` only checks that provenance is non-empty.
+        let evidence_artifact = codypendent_protocol::ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "application/json".to_string(),
+            byte_length: 0,
+            sha256: "0".repeat(64),
+            sensitivity: DataClassification::Internal,
+        };
+        let build_fact = |statement: &str, class: MemoryClass| CandidateMemory {
+            class,
+            scope: None,
+            statement: statement.to_string(),
+            structured_value: None,
+            provenance: vec![EvidenceRef::Artifact {
+                artifact: evidence_artifact.clone(),
+                source_path: None,
+            }],
+            confidence: 0.7,
+            observed_at: Utc::now(),
+            valid_from: codypendent_knowledge::Revision::sequence(1),
+            sensitivity: DataClassification::Internal,
+            retention: None,
+        };
+        let mock = MockExtractor(vec![
+            build_fact("prefer sqlx over diesel", MemoryClass::Semantic),
+            build_fact(
+                "retrying without backoff floods the API",
+                MemoryClass::Failure,
+            ),
+        ]);
+
+        executor
+            .harvest_with(session, run_id, repository, &mock)
+            .await;
+
+        let statements: Vec<(String, String)> =
+            sqlx::query_as("SELECT class, statement FROM memories ORDER BY class")
+                .fetch_all(&pool)
+                .await
+                .expect("query memories");
+
+        assert!(
+            statements
+                .iter()
+                .any(|(_, s)| s == "prefer sqlx over diesel"),
+            "expected the first extractor fact to be curated, got {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|(_, s)| s == "retrying without backoff floods the API"),
+            "expected the second extractor fact to be curated, got {statements:?}"
+        );
+        // The empty chronicle contributes no M1 heuristic candidates, so the
+        // only OTHER thing landing is M0's bounded completed-run breadcrumb
+        // (`extract_candidates` over the `RunCompleted` event itself) —
+        // exactly the two extractor facts plus that one breadcrumb.
+        assert_eq!(
+            statements.len(),
+            3,
+            "the two extractor facts plus the M0 completed-run breadcrumb, got {statements:?}"
         );
     }
 

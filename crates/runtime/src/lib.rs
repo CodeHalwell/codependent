@@ -9,5 +9,13 @@ pub mod agent;
 pub mod auth;
 pub mod bench;
 pub mod blackboard;
+// The model-backed `FactExtractor` (M3b, smarter-memory): needs `futures` to
+// drain the streaming `ChatClient` response, which is only pulled in behind
+// `provider-openai` (see Cargo.toml).
+#[cfg(feature = "provider-openai")]
+pub mod extractor;
 pub mod models;
 pub mod tools;
+
+#[cfg(feature = "provider-openai")]
+pub use extractor::LlmFactExtractor;

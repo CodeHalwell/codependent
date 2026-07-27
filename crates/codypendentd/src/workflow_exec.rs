@@ -2996,6 +2996,7 @@ steps:
             enabled: true,
             policy,
             data_classification: DataClassification::Secret,
+            memory_extraction_model: None,
         };
         let factory = ConfiguredModelDriverFactory {
             paths: paths.clone(),
@@ -3069,6 +3070,7 @@ steps:
             enabled: true,
             policy,
             data_classification: DataClassification::Internal,
+            memory_extraction_model: None,
         };
         let factory = ConfiguredModelDriverFactory {
             paths: paths.clone(),
@@ -3144,6 +3146,7 @@ steps:
             enabled: true,
             policy,
             data_classification: DataClassification::Secret,
+            memory_extraction_model: None,
         };
         let factory = ConfiguredModelDriverFactory {
             paths: paths.clone(),
@@ -3211,6 +3214,7 @@ steps:
             enabled: true,
             policy,
             data_classification: DataClassification::Secret,
+            memory_extraction_model: None,
         };
         let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
             paths: paths.clone(),

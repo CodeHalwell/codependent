@@ -841,6 +841,7 @@ dependencies = [
  "chrono",
  "codypendent-daemon",
  "codypendent-integrations",
+ "codypendent-knowledge",
  "codypendent-protocol",
  "codypendent-providers",
  "codypendent-routing",

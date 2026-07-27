@@ -90,6 +90,14 @@ pub struct RoutingConfig {
     /// routing. To permit hosted models the operator must explicitly declare a
     /// lower ceiling (e.g. `Internal`) in `routing.toml`, an affirmative act.
     pub data_classification: DataClassification,
+    /// The D2 memory-extraction model override (smarter-memory M3b): when
+    /// set AND resolvable in the model registry, `build_fact_extractor` uses
+    /// this model to run the LLM fact extractor instead of the run's own
+    /// resolved model — letting an operator point extraction at a cheap/local
+    /// model so it never rides on the (possibly expensive) coding model.
+    /// Absent (the default) falls through to the run's resolved model, and
+    /// ultimately to `NoopExtractor` if neither resolves.
+    pub memory_extraction_model: Option<ModelId>,
 }
 
 impl Default for RoutingConfig {
@@ -100,6 +108,7 @@ impl Default for RoutingConfig {
             // Fail closed: undeclared data is treated as most-restrictive, so
             // enabling routing without a classification keeps work local.
             data_classification: DataClassification::Unknown,
+            memory_extraction_model: None,
         }
     }
 }
@@ -116,6 +125,9 @@ struct RoutingConfigFile {
     policy: Option<RoutingPolicy>,
     #[serde(default)]
     data_classification: Option<DataClassification>,
+    /// `memory_extraction_model = "cheap-local"` in `routing.toml` (D2, M3b).
+    #[serde(default)]
+    memory_extraction_model: Option<ModelId>,
 }
 
 impl RoutingConfig {
@@ -141,6 +153,7 @@ impl RoutingConfig {
                 data_classification: file
                     .data_classification
                     .unwrap_or(DataClassification::Unknown),
+                memory_extraction_model: file.memory_extraction_model,
             },
             Err(e) => {
                 warn!(path = %path.display(), error = %e, "invalid routing.toml; routing stays OFF");
@@ -830,6 +843,7 @@ mod tests {
             enabled: true,
             policy: policy_with(vec![], DataClassification::Confidential),
             data_classification: DataClassification::Internal,
+            memory_extraction_model: None,
         };
         let coord = RoutingCoordinator::new(pool.clone(), config);
         let (session, run) = seed_session_run(&pool).await;
@@ -937,6 +951,7 @@ mod tests {
             enabled: true,
             policy: policy_with(vec![], DataClassification::Confidential),
             data_classification: DataClassification::Internal,
+            memory_extraction_model: None,
         };
         let coord = RoutingCoordinator::new(pool, config);
 
@@ -981,6 +996,7 @@ mod tests {
             enabled: true,
             policy: policy_with(vec![], DataClassification::Internal),
             data_classification: DataClassification::Secret,
+            memory_extraction_model: None,
         };
         let coord = RoutingCoordinator::new(pool, config);
 
@@ -1019,6 +1035,7 @@ mod tests {
             enabled: true,
             policy: policy_with(vec![], DataClassification::Internal),
             data_classification: DataClassification::Secret,
+            memory_extraction_model: None,
         };
         let coord = RoutingCoordinator::new(pool, config);
         let err = coord
@@ -1087,6 +1104,7 @@ mod tests {
             enabled: true,
             policy: policy_with(vec![], DataClassification::Internal),
             data_classification: DataClassification::Secret,
+            memory_extraction_model: None,
         };
         let coord = RoutingCoordinator::new(pool, config);
         let err = coord
@@ -1123,6 +1141,7 @@ mod tests {
             enabled: true,
             policy: policy_with(vec![], DataClassification::Internal),
             data_classification: DataClassification::Secret,
+            memory_extraction_model: None,
         };
         let coord = RoutingCoordinator::new(pool, config);
         coord
@@ -1157,6 +1176,7 @@ mod tests {
             enabled: true,
             policy: policy_with(vec![], DataClassification::Confidential),
             data_classification: DataClassification::Internal,
+            memory_extraction_model: None,
         };
         let coord = RoutingCoordinator::new(pool, config);
         let err = coord
@@ -1195,6 +1215,7 @@ mod tests {
             enabled: true,
             policy: policy_with(vec![], DataClassification::Confidential),
             data_classification: DataClassification::Internal,
+            memory_extraction_model: None,
         };
         let coord = RoutingCoordinator::new(pool, config);
         coord
@@ -1238,6 +1259,7 @@ mod tests {
                 DataClassification::Confidential,
             ),
             data_classification: DataClassification::Internal,
+            memory_extraction_model: None,
         };
         let coord = RoutingCoordinator::new(pool.clone(), config);
         let (session, run) = seed_session_run(&pool).await;
@@ -1333,6 +1355,7 @@ mod tests {
             enabled: true,
             policy: policy_with(vec![], DataClassification::Confidential),
             data_classification: DataClassification::Internal,
+            memory_extraction_model: None,
         };
         let coord =
             RoutingCoordinator::new(pool.clone(), config).with_prober(Arc::new(DenyToolsProber));
@@ -1425,6 +1448,7 @@ mod tests {
             enabled: true,
             policy: policy_with(vec![], DataClassification::Internal),
             data_classification: DataClassification::Public, // permissive ceiling
+            memory_extraction_model: None,
         };
         let coord = RoutingCoordinator::new(pool, config);
 
@@ -1509,5 +1533,39 @@ failure = 0.5
         assert!(config.enabled);
         assert_eq!(config.data_classification, DataClassification::Internal);
         assert_eq!(config.policy.registry_key(), "router/coding/3");
+    }
+
+    /// D2 (smarter-memory M3b): a declared `memory_extraction_model` parses
+    /// into `Some`, so `build_fact_extractor` can prefer it over the run's
+    /// own resolved model.
+    #[test]
+    fn load_parses_a_declared_memory_extraction_model() {
+        let dir = tempdir().unwrap();
+        let paths =
+            codypendent_protocol::discovery::RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        std::fs::write(
+            paths.data_dir.join("routing.toml"),
+            r#"
+memory_extraction_model = "cheap-local"
+"#,
+        )
+        .unwrap();
+        let config = RoutingConfig::load(&paths);
+        assert_eq!(
+            config.memory_extraction_model,
+            Some(ModelId("cheap-local".to_string()))
+        );
+    }
+
+    /// The absent case: no `memory_extraction_model` key in `routing.toml`
+    /// (or no file at all) leaves it `None`, so `build_fact_extractor` falls
+    /// through to the run's own resolved model (D2 selection order step 2).
+    #[test]
+    fn load_defaults_memory_extraction_model_to_none_when_absent() {
+        let dir = tempdir().unwrap();
+        let paths =
+            codypendent_protocol::discovery::RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        assert_eq!(RoutingConfig::load(&paths).memory_extraction_model, None);
     }
 }
