@@ -1851,6 +1851,210 @@ mod tests {
         );
     }
 
+    /// M6: cross-mechanism integration. A single run's harvest fans in all
+    /// three fact producers at once — a heuristic `Code` finding pulled from
+    /// the chronicle (M1), a `memory.propose:` note as `memory.remember`
+    /// would emit it (M2), and a stubbed `FactExtractor` standing in for the
+    /// LLM path (M3) — and proves they all land in the SAME `memories` table
+    /// as distinct, one-line-statement records, retrievable via
+    /// `assemble_context` exactly like a later run would see them. A second
+    /// extractor fact that duplicates the M1 Code finding verbatim proves the
+    /// `curate` dedup gate (`> DEDUP_SIMILARITY` trigram cosine, gate c)
+    /// fires ACROSS mechanisms, not merely within one producer's own output —
+    /// it collapses into the earlier record instead of adding a second.
+    #[tokio::test]
+    async fn harvest_composes_heuristic_note_and_extractor_facts_with_dedup() {
+        use codypendent_daemon::artifacts::Provenance;
+        use codypendent_knowledge::{CandidateMemory, EvidenceRef, MemoryClass};
+        use codypendent_protocol::{ArtifactId, RunDisposition};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor =
+            RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
+
+        let session = SessionId::new();
+        let run_id = RunId::new();
+        ledger::create_session(&pool, session, "harvest-compose")
+            .await
+            .expect("create session");
+
+        // (M1) A chronicle whose one `investigations` line is a code-ref
+        // finding, so `chronicle_candidates` yields exactly one Code fact.
+        let code_ref_fragment = "crates/x/src/compose.rs:9";
+        let chronicle_bytes = serde_json::to_vec(&serde_json::json!({
+            "objective": "fix the compose guard",
+            "investigations": [format!("{code_ref_fragment} the guard is inverted")],
+            "changes": [],
+            "actions": [],
+            "decisions": [],
+        }))
+        .expect("serialize chronicle");
+        let chronicle_ref = executor
+            .artifacts()
+            .put(
+                &pool,
+                "application/json",
+                DataClassification::Internal,
+                Provenance::system("test-chronicle-compose"),
+                &chronicle_bytes,
+            )
+            .await
+            .expect("store chronicle artifact");
+
+        // (M2) The note `memory.remember`'s `execute_memory_remember` would
+        // emit for a plain (no structured value) proposal.
+        let note_event = codypendent_protocol::SessionEvent {
+            sequence: 1,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::NoteAppended {
+                text: "memory.propose: prefer sqlx over diesel".to_string(),
+                run_id: Some(run_id),
+            },
+        };
+        ledger::append_event(&pool, session, &note_event)
+            .await
+            .expect("append NoteAppended");
+
+        let completed_event = codypendent_protocol::SessionEvent {
+            sequence: 2,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("done".to_string()),
+                },
+                chronicle: chronicle_ref.clone(),
+            },
+        };
+        ledger::append_event(&pool, session, &completed_event)
+            .await
+            .expect("append RunCompleted");
+
+        // (M3) The stubbed extractor: one genuinely new fact, plus one that
+        // duplicates the M1 Code finding verbatim (same statement, same
+        // class) — the cross-mechanism dedup case.
+        let evidence_artifact = codypendent_protocol::ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "application/json".to_string(),
+            byte_length: 0,
+            sha256: "0".repeat(64),
+            sensitivity: DataClassification::Internal,
+        };
+        let build_fact = |statement: &str, class: MemoryClass| CandidateMemory {
+            class,
+            scope: None,
+            statement: statement.to_string(),
+            structured_value: None,
+            provenance: vec![EvidenceRef::Artifact {
+                artifact: evidence_artifact.clone(),
+                source_path: None,
+            }],
+            confidence: 0.7,
+            observed_at: Utc::now(),
+            valid_from: codypendent_knowledge::Revision::sequence(2),
+            sensitivity: DataClassification::Internal,
+            retention: None,
+        };
+        let llm_distinct_statement = "authentication tokens expire after 24 hours";
+        let llm_duplicate_statement = format!("{code_ref_fragment} the guard is inverted");
+        let mock = MockExtractor(vec![
+            build_fact(llm_distinct_statement, MemoryClass::Semantic),
+            build_fact(&llm_duplicate_statement, MemoryClass::Code),
+        ]);
+
+        executor
+            .harvest_with(session, run_id, repository, &mock)
+            .await;
+
+        let statements: Vec<(String, String)> =
+            sqlx::query_as("SELECT class, statement FROM memories ORDER BY class, statement")
+                .fetch_all(&pool)
+                .await
+                .expect("query memories");
+
+        // Exactly one Code record survives — the LLM's duplicate collapsed
+        // into the M1 heuristic finding rather than adding a second.
+        let code_records: Vec<_> = statements
+            .iter()
+            .filter(|(class, _)| class == "code")
+            .collect();
+        assert_eq!(
+            code_records.len(),
+            1,
+            "the LLM's duplicate Code fact must dedup against the M1 heuristic finding, got {statements:?}"
+        );
+        assert!(
+            code_records[0].1.contains(code_ref_fragment),
+            "expected the surviving Code record to be the heuristic finding, got {statements:?}"
+        );
+
+        assert!(
+            statements
+                .iter()
+                .any(|(class, s)| class == "semantic" && s == "prefer sqlx over diesel"),
+            "expected the M2 memory.propose note to be curated, got {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|(class, s)| class == "semantic" && s == llm_distinct_statement),
+            "expected the M3 extractor's distinct fact to be curated, got {statements:?}"
+        );
+
+        // Retrieval end-to-end: the DISTINCT curated facts resurface as
+        // separate one-line statements in the same repository-scoped context
+        // manifest a later run would open with (`context.rs` `=== MEMORIES
+        // ===`, capped `MAX_CONTEXT_MEMORIES`).
+        let manifest = assemble_context(
+            &pool,
+            repository,
+            "compose check",
+            &[Scope::Repository(repository)],
+        )
+        .await
+        .expect("assemble context");
+        let manifest_statements: Vec<&str> = manifest
+            .memories
+            .iter()
+            .map(|m| m.statement.as_str())
+            .collect();
+        assert!(
+            manifest_statements
+                .iter()
+                .any(|s| s.contains(code_ref_fragment)),
+            "expected the Code finding to resurface via assemble_context, got {manifest_statements:?}"
+        );
+        assert!(
+            manifest_statements.contains(&"prefer sqlx over diesel"),
+            "expected the M2 note to resurface via assemble_context, got {manifest_statements:?}"
+        );
+        assert!(
+            manifest_statements.contains(&llm_distinct_statement),
+            "expected the M3 extractor fact to resurface via assemble_context, got {manifest_statements:?}"
+        );
+
+        // Deduped + M0 breadcrumb: Code(1) + Semantic-note(1) +
+        // Semantic-llm(1) + Episodic completed-run breadcrumb(1) = 4 total
+        // curated records; the duplicate LLM fact contributed zero.
+        assert_eq!(
+            statements.len(),
+            4,
+            "expected exactly 4 curated records (dedup collapsed the 5th), got {statements:?}"
+        );
+    }
+
     // NOT `#[cfg(feature = "provider-openai")]`: `codypendentd` pulls
     // `codypendent-runtime` with default features (provider-openai on), uses
     // `client_for`/`from_registry` unconditionally (executor.rs:454), and defines

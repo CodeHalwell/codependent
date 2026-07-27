@@ -176,6 +176,14 @@ export type ProposedAction =
   | { type: "GitCommit"; repository: string }
   | { type: "GitPush"; remote: string; branch: string }
   | { type: "GitHubMutation"; repository: string; summary: string }
+  /**
+   * Record a memory proposal note (the `memory.remember` core tool,
+   * smarter-memory M2). Always policy-Allowed and never serialized into a
+   * `ToolProposed`/`ApprovalRequested` wire event (see
+   * `crates/protocol/src/run.rs`), so it never actually reaches this client —
+   * modeled here for type-level parity with the Rust enum only.
+   */
+  | { type: "RecordMemory" }
   | { type: "Unknown" };
 
 export type ToolOutcome =

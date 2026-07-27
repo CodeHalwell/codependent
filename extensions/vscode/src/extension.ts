@@ -490,6 +490,10 @@ function describeAction(action: ProposedAction): string {
       return `git push ${String(action.branch)} -> ${String(action.remote)}`;
     case "GitHubMutation":
       return String(action.summary);
+    case "RecordMemory":
+      // Never actually reaches the client (always-Allow, never on the wire —
+      // see the `ProposedAction` doc comment above); handled for completeness.
+      return "record a memory";
     default:
       return `action ${action.type}`;
   }
