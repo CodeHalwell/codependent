@@ -32,8 +32,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use chrono::{DateTime, Utc};
 use codypendent_protocol::{
-    DataClassification, EventBody, RunDisposition, RunId, SessionEvent, SessionId, ToolOutcome,
+    ArtifactRef, DataClassification, EventBody, RunDisposition, RunId, SessionEvent, SessionId,
+    ToolOutcome,
 };
 
 use crate::memory::CandidateMemory;
@@ -59,6 +61,17 @@ const SUMMARY_BREADCRUMB_MAX: usize = 200;
 
 /// Retention, in days, for a completed-run breadcrumb candidate.
 const BREADCRUMB_TTL_DAYS: u32 = 30;
+
+/// Per-class caps on heuristic chronicle extraction (M1) — a chronicle can
+/// carry an unbounded number of investigation lines / changes / actions; these
+/// keep a single run from flooding the curator with hundreds of candidates.
+const MAX_CHRONICLE_FINDINGS: usize = 8;
+const MAX_CHRONICLE_CHANGES: usize = 8;
+const MAX_CHRONICLE_FAILURES: usize = 8;
+
+/// Case-insensitive prefixes that mark an `investigations` line as a decision
+/// rather than a plain finding.
+const DECISION_MARKERS: [&str; 4] = ["decided", "chose", "will use", "because"];
 
 /// Truncate `s` to at most `max` **characters** (never splitting a multibyte
 /// char), appending `…` only when truncation actually occurred.
@@ -314,6 +327,133 @@ fn explicit_proposal_candidates(
     candidates
 }
 
+/// The first `<path>.<ext>:<line>` token in `line` (e.g. `src/a.rs:42`), or
+/// `None`. Regex-free (`crates/knowledge` forbids the `regex` dep): scan
+/// whitespace-split tokens for one that has a `:` followed by ASCII digits,
+/// with a `.<ext>` before the `:`.
+fn code_ref(line: &str) -> Option<&str> {
+    line.split_whitespace().find(|tok| {
+        let Some((path, line_no)) = tok.rsplit_once(':') else {
+            return false;
+        };
+        !line_no.is_empty()
+            && line_no.bytes().all(|b| b.is_ascii_digit())
+            && path.rsplit_once('.').is_some_and(|(_, ext)| {
+                !ext.is_empty() && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+            })
+    })
+}
+
+/// Discrete heuristic facts from a parsed run chronicle (M1). Pure: data in →
+/// candidates out; a missing or misshaped field simply yields no candidates
+/// from that field — never a panic. Every candidate cites the chronicle
+/// artifact itself (`EvidenceRef::Artifact`), so provenance is always present
+/// without needing a session id.
+///
+/// Field reality (`crates/runtime/src/agent.rs build_chronicle`):
+/// `investigations` is an array of plain strings (findings/decisions),
+/// `changes` entries are `{changeset_id, artifact, byte_length}`, and
+/// `actions` entries are `{tool, outcome, artifact}`. `decisions` is always
+/// `[]` in practice, so decision-shaped facts are pulled out of
+/// `investigations` lines instead (lines starting with a marker in
+/// [`DECISION_MARKERS`]).
+#[must_use]
+pub fn chronicle_candidates(
+    chronicle: &serde_json::Value,
+    scope: &Scope,
+    chronicle_ref: &ArtifactRef,
+    run_id: RunId,
+    observed_at: DateTime<Utc>,
+    valid_from: Revision,
+    sensitivity: DataClassification,
+) -> Vec<CandidateMemory> {
+    let build = |class: MemoryClass, raw: &str, valid_from: Revision| CandidateMemory {
+        class,
+        scope: Some(scope.clone()),
+        statement: cap_chars(raw, SUMMARY_BREADCRUMB_MAX),
+        structured_value: None,
+        provenance: vec![EvidenceRef::Artifact {
+            artifact: chronicle_ref.clone(),
+            source_path: None,
+        }],
+        confidence: OBSERVED_CONFIDENCE,
+        observed_at,
+        valid_from,
+        sensitivity,
+        retention: None,
+    };
+
+    let mut candidates = Vec::new();
+
+    // `investigations`: plain-string findings/decisions.
+    if let Some(lines) = chronicle.get("investigations").and_then(|v| v.as_array()) {
+        for line in lines
+            .iter()
+            .filter_map(|v| v.as_str())
+            .take(MAX_CHRONICLE_FINDINGS)
+        {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(reference) = code_ref(trimmed) {
+                candidates.push(build(
+                    MemoryClass::Code,
+                    &format!("{reference} — {trimmed}"),
+                    valid_from.clone(),
+                ));
+                continue;
+            }
+            let lower = trimmed.to_lowercase();
+            let is_decision = DECISION_MARKERS.iter().any(|m| lower.starts_with(m));
+            let word_count = trimmed.split_whitespace().count();
+            if is_decision || word_count >= 4 {
+                candidates.push(build(MemoryClass::Semantic, trimmed, valid_from.clone()));
+            }
+        }
+    }
+
+    // `changes`: applied changesets.
+    if let Some(entries) = chronicle.get("changes").and_then(|v| v.as_array()) {
+        for entry in entries.iter().take(MAX_CHRONICLE_CHANGES) {
+            let Some(changeset_id) = entry.get("changeset_id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let bytes_clause = entry
+                .get("byte_length")
+                .and_then(|v| v.as_u64())
+                .map(|n| format!(" ({n} bytes)"))
+                .unwrap_or_default();
+            candidates.push(build(
+                MemoryClass::Episodic,
+                &format!("Applied changeset {changeset_id}{bytes_clause} in run {run_id}"),
+                valid_from.clone(),
+            ));
+        }
+    }
+
+    // `actions`: failed/denied/rejected tool invocations.
+    if let Some(entries) = chronicle.get("actions").and_then(|v| v.as_array()) {
+        for entry in entries.iter().take(MAX_CHRONICLE_FAILURES) {
+            let (Some(tool), Some(outcome)) = (
+                entry.get("tool").and_then(|v| v.as_str()),
+                entry.get("outcome").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            if matches!(outcome, "failed" | "denied" | "rejected") {
+                candidates.push(build(
+                    MemoryClass::Failure,
+                    &format!("{tool} {outcome} in run {run_id}"),
+                    valid_from.clone(),
+                ));
+            }
+        }
+    }
+
+    candidates
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,5 +652,244 @@ mod tests {
             format!("Run {run} cancelled: user aborted")
         );
         assert_eq!(candidate.retention, None);
+    }
+
+    // ----------------------------------------------------------------
+    // chronicle_candidates
+    // ----------------------------------------------------------------
+
+    fn chronicle_args() -> (
+        Scope,
+        ArtifactRef,
+        RunId,
+        chrono::DateTime<chrono::Utc>,
+        Revision,
+    ) {
+        (
+            Scope::Repository(codypendent_protocol::RepositoryId::new()),
+            artifact(),
+            RunId::new(),
+            chrono::Utc::now(),
+            Revision::sequence(1),
+        )
+    }
+
+    #[test]
+    fn chronicle_code_ref_finding_yields_code_candidate() {
+        let (scope, chronicle_ref, run_id, observed_at, valid_from) = chronicle_args();
+        let chronicle = serde_json::json!({
+            "investigations": ["crates/x/src/a.rs:42 the guard is inverted"],
+        });
+
+        let candidates = chronicle_candidates(
+            &chronicle,
+            &scope,
+            &chronicle_ref,
+            run_id,
+            observed_at,
+            valid_from,
+            DataClassification::Internal,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.class, MemoryClass::Code);
+        assert!(
+            candidate.statement.contains("crates/x/src/a.rs:42"),
+            "got {:?}",
+            candidate.statement
+        );
+        assert_eq!(
+            candidate.provenance,
+            vec![EvidenceRef::Artifact {
+                artifact: chronicle_ref,
+                source_path: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn chronicle_prose_finding_yields_semantic_candidate() {
+        let (scope, chronicle_ref, run_id, observed_at, valid_from) = chronicle_args();
+        let chronicle = serde_json::json!({
+            "investigations": ["the retry loop never terminates on timeout"],
+        });
+
+        let candidates = chronicle_candidates(
+            &chronicle,
+            &scope,
+            &chronicle_ref,
+            run_id,
+            observed_at,
+            valid_from,
+            DataClassification::Internal,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].class, MemoryClass::Semantic);
+    }
+
+    #[test]
+    fn chronicle_decision_marker_finding_yields_semantic_candidate() {
+        let (scope, chronicle_ref, run_id, observed_at, valid_from) = chronicle_args();
+        let chronicle = serde_json::json!({
+            "investigations": ["decided to use sqlx over diesel"],
+        });
+
+        let candidates = chronicle_candidates(
+            &chronicle,
+            &scope,
+            &chronicle_ref,
+            run_id,
+            observed_at,
+            valid_from,
+            DataClassification::Internal,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].class, MemoryClass::Semantic);
+    }
+
+    #[test]
+    fn chronicle_change_entry_yields_episodic_candidate_mentioning_run() {
+        let (scope, chronicle_ref, run_id, observed_at, valid_from) = chronicle_args();
+        let chronicle = serde_json::json!({
+            "changes": [{"changeset_id": "cs-1", "artifact": "diff.patch", "byte_length": 128}],
+        });
+
+        let candidates = chronicle_candidates(
+            &chronicle,
+            &scope,
+            &chronicle_ref,
+            run_id,
+            observed_at,
+            valid_from,
+            DataClassification::Internal,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.class, MemoryClass::Episodic);
+        assert!(candidate.statement.contains("cs-1"));
+        assert!(candidate.statement.contains(&run_id.to_string()));
+    }
+
+    #[test]
+    fn chronicle_failed_action_yields_failure_candidate_succeeded_yields_none() {
+        let (scope, chronicle_ref, run_id, observed_at, valid_from) = chronicle_args();
+        let chronicle = serde_json::json!({
+            "actions": [
+                {"tool": "shell.run", "outcome": "failed", "artifact": null},
+                {"tool": "shell.run", "outcome": "succeeded", "artifact": null},
+            ],
+        });
+
+        let candidates = chronicle_candidates(
+            &chronicle,
+            &scope,
+            &chronicle_ref,
+            run_id,
+            observed_at,
+            valid_from,
+            DataClassification::Internal,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.class, MemoryClass::Failure);
+        assert_eq!(
+            candidate.statement,
+            format!("shell.run failed in run {run_id}")
+        );
+    }
+
+    #[test]
+    fn chronicle_missing_or_misshaped_fields_yield_no_candidates() {
+        let (scope, chronicle_ref, run_id, observed_at, valid_from) = chronicle_args();
+
+        // Completely empty chronicle.
+        let empty = serde_json::json!({});
+        assert!(chronicle_candidates(
+            &empty,
+            &scope,
+            &chronicle_ref,
+            run_id,
+            observed_at,
+            valid_from.clone(),
+            DataClassification::Internal,
+        )
+        .is_empty());
+
+        // `investigations` is a string, not an array; `changes`/`actions` entries
+        // missing their expected keys.
+        let malformed = serde_json::json!({
+            "investigations": "not an array",
+            "changes": [{"artifact": "x"}],
+            "actions": [{"tool": "shell.run"}, {"outcome": "failed"}],
+        });
+        assert!(chronicle_candidates(
+            &malformed,
+            &scope,
+            &chronicle_ref,
+            run_id,
+            observed_at,
+            valid_from,
+            DataClassification::Internal,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn chronicle_per_class_caps_are_enforced() {
+        let (scope, chronicle_ref, run_id, observed_at, valid_from) = chronicle_args();
+        let findings: Vec<String> = (0..20)
+            .map(|i| format!("finding number {i} is a prose sentence worth keeping"))
+            .collect();
+        let changes: Vec<serde_json::Value> = (0..20)
+            .map(|i| serde_json::json!({"changeset_id": format!("cs-{i}"), "byte_length": 1}))
+            .collect();
+        let actions: Vec<serde_json::Value> = (0..20)
+            .map(|i| serde_json::json!({"tool": format!("tool-{i}"), "outcome": "failed"}))
+            .collect();
+        let chronicle = serde_json::json!({
+            "investigations": findings,
+            "changes": changes,
+            "actions": actions,
+        });
+
+        let candidates = chronicle_candidates(
+            &chronicle,
+            &scope,
+            &chronicle_ref,
+            run_id,
+            observed_at,
+            valid_from,
+            DataClassification::Internal,
+        );
+
+        let count = |class: MemoryClass| candidates.iter().filter(|c| c.class == class).count();
+        assert_eq!(count(MemoryClass::Semantic), MAX_CHRONICLE_FINDINGS);
+        assert_eq!(count(MemoryClass::Episodic), MAX_CHRONICLE_CHANGES);
+        assert_eq!(count(MemoryClass::Failure), MAX_CHRONICLE_FAILURES);
+    }
+
+    #[test]
+    fn chronicle_statements_are_length_bounded() {
+        let (scope, chronicle_ref, run_id, observed_at, valid_from) = chronicle_args();
+        let long_line = format!("a prose finding that goes on {}", "x".repeat(500));
+        let chronicle = serde_json::json!({ "investigations": [long_line] });
+
+        let candidates = chronicle_candidates(
+            &chronicle,
+            &scope,
+            &chronicle_ref,
+            run_id,
+            observed_at,
+            valid_from,
+            DataClassification::Internal,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].statement.chars().count() <= SUMMARY_BREADCRUMB_MAX + 1);
     }
 }

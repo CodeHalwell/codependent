@@ -68,7 +68,7 @@ pub use memory::{
     detect_secret, provenance_cards, CandidateMemory, Curation, ForgetAudit, MemoryError,
     MemoryStore, ProvenanceCard,
 };
-pub use observer::extract_candidates;
+pub use observer::{chronicle_candidates, extract_candidates};
 
 pub use context::{assemble_context, ContextCard, ContextError, ContextManifest, ContextMemory};
 

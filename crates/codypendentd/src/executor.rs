@@ -36,10 +36,14 @@ use codypendent_daemon::workflow_stream::{WorkflowHub, WorkflowReader};
 use codypendent_daemon::worktrees::{WorktreeError, WorktreeManager};
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::github::{GitHubApi, RepoId};
-use codypendent_knowledge::{assemble_context, extract_candidates, Curation, MemoryStore, Scope};
+use codypendent_knowledge::{
+    assemble_context, chronicle_candidates, extract_candidates, Curation, MemoryStore, Revision,
+    Scope,
+};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    Actor, AgentMode, DataClassification, EventBody, ModelId, RepositoryId, RunId, SessionId,
+    Actor, AgentMode, ArtifactRef, DataClassification, EventBody, ModelId, RepositoryId, RunId,
+    SessionId,
 };
 use codypendent_runtime::agent::{
     cancellation, mode_overlay, ApprovalRequest, CancellationHandle, CancellationToken,
@@ -657,6 +661,16 @@ impl RuntimeExecutor {
         }
     }
 
+    /// Read + JSON-parse the bytes behind a chronicle [`ArtifactRef`]
+    /// (best-effort; the caller warns and skips on any error).
+    async fn load_chronicle(&self, chronicle: &ArtifactRef) -> anyhow::Result<serde_json::Value> {
+        use tokio::io::AsyncReadExt;
+        let mut file = self.artifacts().open(&self.pool, chronicle.id).await?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).await?;
+        Ok(serde_json::from_slice(&buf)?)
+    }
+
     /// After a run reaches a terminal state, harvest curated memories from its own
     /// event trace and note each durable one, so "a run produces a curated memory
     /// whose provenance opens to its source" holds for every run.
@@ -688,6 +702,33 @@ impl RuntimeExecutor {
         // session-scoped memory would never be seen again.
         let repository_scope = Scope::Repository(repository);
         let mut candidates = extract_candidates(&events, Scope::Session(session_id));
+
+        // Heuristic chronicle facts (M1). Locate the RunCompleted event, load its
+        // chronicle artifact, parse it, and append discrete candidates. Every
+        // step is best-effort: a miss/parse failure is warned and skipped, never
+        // fatal to an otherwise-finished run.
+        if let Some((chronicle_ref, seq, at)) = events.iter().rev().find_map(|e| match &e.body {
+            EventBody::RunCompleted { chronicle, .. } => {
+                Some((chronicle.clone(), e.sequence, e.occurred_at))
+            }
+            _ => None,
+        }) {
+            match self.load_chronicle(&chronicle_ref).await {
+                Ok(chronicle) => candidates.extend(chronicle_candidates(
+                    &chronicle,
+                    &Scope::Session(session_id),
+                    &chronicle_ref,
+                    run_id,
+                    at,
+                    Revision::sequence(seq),
+                    chronicle_ref.sensitivity,
+                )),
+                Err(error) => {
+                    warn!(%session_id, %run_id, %error, "could not load run chronicle for memory harvest");
+                }
+            }
+        }
+
         for candidate in &mut candidates {
             candidate.scope = Some(repository_scope.clone());
         }
@@ -1357,6 +1398,100 @@ mod tests {
         assert!(
             !context_manifest_present(&pool, cont_session).await,
             "a continuation must NOT emit the === CONTEXT manifest"
+        );
+    }
+
+    /// M1: `harvest_memories` loads + parses the `RunCompleted` chronicle
+    /// artifact and folds `chronicle_candidates` in alongside the existing
+    /// event-derived candidates, so a code-ref finding, a decision, an applied
+    /// changeset, and a failed action all land as curated `MemoryRecord`s.
+    #[tokio::test]
+    async fn harvest_memories_appends_chronicle_candidates() {
+        use codypendent_daemon::artifacts::Provenance;
+        use codypendent_protocol::{ArtifactId, RunDisposition};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor =
+            RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
+
+        let session = SessionId::new();
+        let run_id = RunId::new();
+        ledger::create_session(&pool, session, "harvest")
+            .await
+            .expect("create session");
+
+        let chronicle_bytes = serde_json::to_vec(&serde_json::json!({
+            "objective": "fix the guard",
+            "investigations": ["crates/x/src/a.rs:42 the guard is inverted"],
+            "changes": [{"changeset_id": "cs-1", "artifact": ArtifactId::new().to_string(), "byte_length": 128}],
+            "actions": [{"tool": "shell.run", "outcome": "failed", "artifact": null}],
+            "decisions": [],
+        }))
+        .expect("serialize chronicle");
+        let chronicle_ref = executor
+            .artifacts()
+            .put(
+                &pool,
+                "application/json",
+                DataClassification::Internal,
+                Provenance::system("test-chronicle"),
+                &chronicle_bytes,
+            )
+            .await
+            .expect("store chronicle artifact");
+
+        let event = codypendent_protocol::SessionEvent {
+            sequence: 1,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("done".to_string()),
+                },
+                chronicle: chronicle_ref,
+            },
+        };
+        ledger::append_event(&pool, session, &event)
+            .await
+            .expect("append RunCompleted");
+
+        executor.harvest_memories(session, run_id, repository).await;
+
+        let statements: Vec<(String, String)> =
+            sqlx::query_as("SELECT class, statement FROM memories ORDER BY class")
+                .fetch_all(&pool)
+                .await
+                .expect("query memories");
+
+        assert!(
+            statements
+                .iter()
+                .any(|(class, statement)| class == "code"
+                    && statement.contains("crates/x/src/a.rs:42")),
+            "expected a Code memory from the code-ref finding, got {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|(class, statement)| class == "episodic" && statement.contains("cs-1")),
+            "expected an Episodic memory from the changeset, got {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|(class, statement)| class == "failure"
+                    && statement.contains("shell.run")
+                    && statement.contains("failed")),
+            "expected a Failure memory from the failed action, got {statements:?}"
         );
     }
 
