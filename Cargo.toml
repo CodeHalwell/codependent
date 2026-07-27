@@ -128,6 +128,11 @@ notify = "7"
 # authoritative for document drafts; Git stores reviewed Markdown snapshots.
 loro = "1.13"
 
+# Rich TUI output formatting (client-only, Phase 6). pulldown-cmark: the
+# CommonMark + GFM-tables parser behind rustdoc/mdBook (MIT). default-features
+# off drops its getopts CLI path; the pull-parser (Parser/Event/Tag) is core.
+pulldown-cmark = { version = "0.13", default-features = false }
+
 # CLI and paths
 clap = { version = "4", features = ["derive"] }
 directories = "6"
