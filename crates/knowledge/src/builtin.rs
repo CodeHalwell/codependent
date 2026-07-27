@@ -172,6 +172,23 @@ pub fn builtin_tools() -> Vec<RegistryItem> {
             ],
             Vec::new(),
         ),
+        // The smarter-memory M2 core tool: an agent's only way to save a fact in its
+        // own words. Its only effect is a `NoteAppended` on the run's own ledger — not
+        // the filesystem, a command, the network, or a secret — so it requests no
+        // capability (risk `Safe`), and it is CORE: offered to every run, unlike the
+        // blackboard tools above (workflow-only).
+        tool(
+            "memory.remember",
+            "Save a durable fact, decision, or learning to long-term memory in your own words \
+             — one discrete fact per call, not a run summary.",
+            &[
+                "remember this fact",
+                "save a decision to memory",
+                "note a learning for future runs",
+            ],
+            &["memory", "remember", "fact", "decision", "learning"],
+            Vec::new(),
+        ),
     ]
 }
 

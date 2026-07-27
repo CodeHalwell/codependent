@@ -303,7 +303,20 @@ fn explicit_proposal_candidates(
         let Some(marker) = PROPOSE_MARKERS.into_iter().find(|m| lower.starts_with(m)) else {
             continue;
         };
-        let statement = trimmed[marker.len()..].trim();
+        let rest = &trimmed[marker.len()..];
+        // M2: an optional structured value tail, delimited by the first ASCII
+        // Record Separator (`\u{1e}`). No separator ⇒ exactly today's behavior
+        // (backward compatible with existing `memory:` / `memory.propose:`
+        // notes): the whole remainder is the statement, no structured value. A
+        // present separator whose tail fails to parse as JSON also falls back
+        // to the whole remainder as the statement, never a panic.
+        let (statement, structured_value) = match rest.split_once('\u{1e}') {
+            Some((stmt, tail)) => match serde_json::from_str::<serde_json::Value>(tail.trim()) {
+                Ok(value) => (stmt.trim(), Some(value)),
+                Err(_) => (rest.trim(), None),
+            },
+            None => (rest.trim(), None),
+        };
         if statement.is_empty() {
             continue;
         }
@@ -311,7 +324,7 @@ fn explicit_proposal_candidates(
             class: MemoryClass::Semantic,
             scope: Some(scope.clone()),
             statement: statement.to_string(),
-            structured_value: None,
+            structured_value,
             provenance: vec![EvidenceRef::EventRange {
                 session_id: session,
                 from_sequence: event.sequence,
@@ -891,5 +904,87 @@ mod tests {
 
         assert_eq!(candidates.len(), 1);
         assert!(candidates[0].statement.chars().count() <= SUMMARY_BREADCRUMB_MAX + 1);
+    }
+
+    // ----------------------------------------------------------------
+    // explicit_proposal_candidates — M2 `\u{1e}` structured-value tail
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn explicit_proposal_plain_note_unchanged() {
+        let session = SessionId::new();
+        let events = vec![event(
+            1,
+            EventBody::NoteAppended {
+                text: "memory.propose: use ripgrep".to_string(),
+                run_id: None,
+            },
+        )];
+
+        let candidates =
+            explicit_proposal_candidates(&events, &Scope::Session(session), Some(session));
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.class, MemoryClass::Semantic);
+        assert_eq!(candidate.statement, "use ripgrep");
+        assert_eq!(candidate.structured_value, None);
+    }
+
+    #[test]
+    fn explicit_proposal_value_tail_populates_structured_value() {
+        let session = SessionId::new();
+        let events = vec![event(
+            1,
+            EventBody::NoteAppended {
+                text: "memory.propose: db is postgres\u{1e}{\"engine\":\"postgres\"}".to_string(),
+                run_id: None,
+            },
+        )];
+
+        let candidates =
+            explicit_proposal_candidates(&events, &Scope::Session(session), Some(session));
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.statement, "db is postgres");
+        assert_eq!(
+            candidate.structured_value,
+            Some(serde_json::json!({"engine": "postgres"}))
+        );
+    }
+
+    #[test]
+    fn explicit_proposal_bad_json_tail_falls_back_to_statement() {
+        let session = SessionId::new();
+        let events = vec![event(
+            1,
+            EventBody::NoteAppended {
+                text: "memory.propose: x\u{1e}not json".to_string(),
+                run_id: None,
+            },
+        )];
+
+        let candidates =
+            explicit_proposal_candidates(&events, &Scope::Session(session), Some(session));
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.structured_value, None);
+        assert_eq!(candidate.statement, "x\u{1e}not json");
+    }
+
+    #[test]
+    fn explicit_proposal_legacy_marker_still_works() {
+        let session = SessionId::new();
+        let events = vec![event(
+            1,
+            EventBody::NoteAppended {
+                text: "memory: prefer sqlx over diesel".to_string(),
+                run_id: None,
+            },
+        )];
+
+        let candidates =
+            explicit_proposal_candidates(&events, &Scope::Session(session), Some(session));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].statement, "prefer sqlx over diesel");
     }
 }

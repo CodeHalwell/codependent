@@ -69,12 +69,13 @@ use crate::models::ModelRegistry;
 use crate::tools::{
     new_pull_request, parse_blackboard_post, parse_blackboard_query, parse_create_check_run,
     parse_create_draft_pull_request, parse_get_pull_request, parse_list_check_runs,
-    parse_update_pull_request, render_check_runs, render_pull_request, tool_label, ApplyPatch,
-    ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput,
-    BlackboardQueryTool, CommandRequest, CreateCheckRunInput, CreateCheckRunSummary,
-    CreateDraftPullRequest, CreateDraftPullRequestInput, EnvironmentBinding, GetPullRequest,
-    GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns, ListCheckRunsInput, ReadFile,
-    ReadFileInput, Search, SearchInput, Shell, UpdatePullRequestInput, UpdatePullRequestTool,
+    parse_memory_remember, parse_update_pull_request, render_check_runs, render_pull_request,
+    tool_label, ApplyPatch, ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
+    BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CreateCheckRunInput,
+    CreateCheckRunSummary, CreateDraftPullRequest, CreateDraftPullRequestInput, EnvironmentBinding,
+    GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns, ListCheckRunsInput,
+    MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput, Search, SearchInput, Shell,
+    UpdatePullRequestInput, UpdatePullRequestTool,
 };
 
 /// Safety valve: the maximum number of `next_step` calls a single run makes
@@ -808,6 +809,9 @@ impl FrameworkAgentRuntime {
             Search::NAME,
             GitDiff::NAME,
             ApplyPatch::NAME,
+            // CORE (smarter-memory M2): always offered, never workflow/github-gated —
+            // saving a fact for future runs is useful regardless of run kind.
+            MemoryRemember::NAME,
         ];
         if self.github.is_some() && run.github_repo.is_some() {
             names.extend_from_slice(&[
@@ -1341,7 +1345,8 @@ impl FrameworkAgentRuntime {
             },
         )
         .await?;
-        let (observation, artifact, outcome) = self.execute_prepared(prepared, run).await;
+        let (observation, artifact, outcome) =
+            self.execute_prepared(prepared, run, run_actor).await;
         // (e/f) emit completion referencing any spilled artifact.
         self.emit(
             run.session_id,
@@ -1493,6 +1498,15 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::BlackboardQuery(input),
                 })
             }
+            // CORE (smarter-memory M2): unconditional — no run gate, unlike the
+            // blackboard arms above.
+            MemoryRemember::NAME => {
+                let input = parse_memory_remember(args)?;
+                Ok(Prepared {
+                    action: MemoryRemember::proposed_action(),
+                    tool: PreparedTool::MemoryRemember(input),
+                })
+            }
             other => Err(format!("unknown tool `{other}`")),
         }
     }
@@ -1536,6 +1550,7 @@ impl FrameworkAgentRuntime {
         &self,
         prepared: Prepared,
         run: &RunContext,
+        run_actor: &Actor,
     ) -> (String, Option<ArtifactRef>, ToolOutcome) {
         let read_scope = self.read_scope(run);
         let write_scope = self.write_scope(run);
@@ -1716,6 +1731,46 @@ impl FrameworkAgentRuntime {
             },
             PreparedTool::BlackboardPost(input) => self.execute_blackboard_post(input, run).await,
             PreparedTool::BlackboardQuery(input) => self.execute_blackboard_query(input, run).await,
+            PreparedTool::MemoryRemember(input) => {
+                self.execute_memory_remember(input, run, run_actor).await
+            }
+        }
+    }
+
+    /// Record the model's memory proposal as a `NoteAppended` on the run's
+    /// ledger (smarter-memory M2). Harvest's `explicit_proposal_candidates`
+    /// later turns it into a `Semantic` candidate — no new harvest wiring is
+    /// needed here. The entire side effect of this tool is the note.
+    async fn execute_memory_remember(
+        &self,
+        input: MemoryRememberInput,
+        run: &RunContext,
+        run_actor: &Actor,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let text = MemoryRemember::note_text(&input);
+        match self
+            .emit(
+                run.session_id,
+                run_actor.clone(),
+                EventBody::NoteAppended {
+                    text,
+                    run_id: Some(run.run_id),
+                },
+            )
+            .await
+        {
+            Ok(_) => (
+                format!("noted for memory: {}", input.statement),
+                None,
+                ToolOutcome::Succeeded,
+            ),
+            Err(error) => (
+                format!("could not record memory: {error}"),
+                None,
+                ToolOutcome::Failed {
+                    message: "memory.emit-failed".to_string(),
+                },
+            ),
         }
     }
 
@@ -1907,6 +1962,7 @@ enum PreparedTool {
     },
     BlackboardPost(BlackboardPostInput),
     BlackboardQuery(BlackboardQueryInput),
+    MemoryRemember(MemoryRememberInput),
 }
 
 // ---------------------------------------------------------------------------
@@ -2329,6 +2385,19 @@ impl FrameworkModelDriver {
                     "type": "object",
                     "properties": {"patch": {"type": "string"}},
                     "required": ["patch"]
+                }),
+            ),
+            // CORE (smarter-memory M2): declared alongside the unconditional
+            // baseline tools — offered to every run, not gated on github/workflow.
+            decl(
+                MemoryRemember::NAME,
+                "Save a durable fact, decision, or learning to long-term memory in your own \
+                 words. Use for a discrete fact worth recalling in future runs — not a summary \
+                 of what you just did. One fact per call.",
+                json!({
+                    "type": "object",
+                    "properties": {"statement": {"type": "string"}, "value": {}},
+                    "required": ["statement"]
                 }),
             ),
             decl(
@@ -2972,6 +3041,83 @@ mod tests {
             names.contains(&BlackboardPostTool::NAME) && names.contains(&BlackboardQueryTool::NAME),
             "a workflow node must still be advertised the blackboard tools: {names:?}"
         );
+    }
+
+    /// The Task-3 (smarter-memory M2) "catalog +1" assertion: a plain, non-workflow,
+    /// no-github solo run is STILL advertised `memory.remember` — it is a CORE tool,
+    /// never gated the way `blackboard.*`/`github.*` are. No snapshot/golden file
+    /// pins the catalog; this unit test is the only pin (see the module docs on
+    /// `advertised_tools`).
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn advertised_tools_includes_memory_remember_for_a_solo_run() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let solo = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+
+        let offered = runtime.offered_tool_names(&solo);
+        let advertised = FrameworkModelDriver::advertised_tools(&offered);
+        let names: Vec<&str> = advertised.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            names.contains(&MemoryRemember::NAME),
+            "a solo run must be advertised the CORE memory.remember tool: {names:?}"
+        );
+    }
+
+    /// `prepare`/`execute_prepared` round-trip for `memory.remember` (smarter-memory
+    /// M2): the policy engine `Allow`s the `RecordMemory` action, and execution emits
+    /// a `NoteAppended` whose text starts with the `memory.propose:` marker the
+    /// observer's `explicit_proposal_candidates` already watches for.
+    #[tokio::test]
+    async fn memory_remember_prepares_allowed_and_executes_a_note() {
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(MemoryRemember::NAME, &json!({"statement": "x"}), &run)
+            .await
+            .expect("prepares");
+        let decision = runtime
+            .policy
+            .evaluate(&prepared.action, &runtime.eval_ctx(&run));
+        assert_eq!(decision.decision, Decision::Allow);
+
+        let (observation, artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(artifact.is_none());
+        assert!(observation.contains('x'));
+
+        let note = (0..events.len())
+            .find_map(|_| events.try_recv().ok())
+            .expect("a note event was published");
+        match note.body {
+            EventBody::NoteAppended { text, .. } => {
+                assert!(text.starts_with("memory.propose: x"), "got {text:?}");
+            }
+            other => panic!("expected NoteAppended, got {other:?}"),
+        }
     }
 
     /// FIX 3 (agent & tool fixes spec): a `shell.run` denial for a program that
