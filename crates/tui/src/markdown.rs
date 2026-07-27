@@ -52,6 +52,7 @@ pub enum SyntaxRole {
 }
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use synoptic::{from_extension, TokOpt};
 
 /// Test-only instrumentation: counts `parse` invocations so a later test (the
 /// finalize-cache / theme-change-no-reparse test) can assert a theme change
@@ -325,13 +326,10 @@ impl Builder {
         }
     }
 
-    /// Fenced code → plain lines for now (Task 3 overrides this with `highlight`).
-    fn emit_code(&mut self, _lang: &str, code: &str) {
-        for line in code.lines() {
-            self.push_line(vec![RichSpan {
-                text: line.to_string(),
-                role: SpanRole::CodePlain,
-            }]);
+    /// Fenced code → per-language highlighted lines, re-wrapped with the gutter.
+    fn emit_code(&mut self, lang: &str, code: &str) {
+        for rl in highlight(lang, code) {
+            self.push_line(rl.spans);
         }
     }
 
@@ -355,6 +353,101 @@ fn heading_num(level: HeadingLevel) -> u8 {
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
     }
+}
+
+/// Tab width synoptic uses when normalizing multi-line token state.
+const HIGHLIGHT_TAB_WIDTH: usize = 4;
+
+/// Highlight a fenced code block into gutter-less `RichLine`s (one per source
+/// line). Maps synoptic's per-language token kinds onto the expanded
+/// `theme.syntax.*` palette; an unknown/empty language → every span `CodePlain`
+/// (still themed, still safe). Never panics.
+pub fn highlight(lang: &str, src: &str) -> Vec<RichLine> {
+    let lines: Vec<String> = src.lines().map(str::to_string).collect();
+    let ext = language_extension(lang);
+    if let Some(mut h) = from_extension(&ext, HIGHLIGHT_TAB_WIDTH) {
+        h.run(&lines);
+        lines
+            .iter()
+            .enumerate()
+            .map(|(y, raw)| {
+                let spans = h
+                    .line(y, raw)
+                    .into_iter()
+                    .map(|tok| match tok {
+                        TokOpt::Some(text, kind) => match map_kind(&kind) {
+                            Some(role) => RichSpan {
+                                text,
+                                role: SpanRole::CodeToken(role),
+                            },
+                            None => RichSpan {
+                                text,
+                                role: SpanRole::CodePlain,
+                            },
+                        },
+                        TokOpt::None(text) => RichSpan {
+                            text,
+                            role: SpanRole::CodePlain,
+                        },
+                    })
+                    .collect();
+                RichLine { spans }
+            })
+            .collect()
+    } else {
+        lines
+            .into_iter()
+            .map(|raw| RichLine {
+                spans: vec![RichSpan {
+                    text: raw,
+                    role: SpanRole::CodePlain,
+                }],
+            })
+            .collect()
+    }
+}
+
+/// Map a fence's language tag to the file extension synoptic keys on. Common
+/// word-forms are aliased; anything else is passed through (synoptic returns
+/// `None` for an unknown extension → the all-plain path above).
+fn language_extension(lang: &str) -> String {
+    match lang.trim().to_ascii_lowercase().as_str() {
+        "rust" | "rs" => "rs",
+        "python" | "py" => "py",
+        "javascript" | "js" | "node" => "js",
+        "typescript" | "ts" => "ts",
+        "json" => "json",
+        "bash" | "sh" | "shell" | "zsh" => "sh",
+        "go" | "golang" => "go",
+        "toml" => "toml",
+        "yaml" | "yml" => "yml",
+        "sql" => "sql",
+        "c" => "c",
+        "cpp" | "c++" | "cxx" | "cc" | "hpp" => "cpp",
+        "java" => "java",
+        "html" => "html",
+        "css" => "css",
+        "markdown" | "md" => "md",
+        other => other,
+    }
+    .to_string()
+}
+
+/// synoptic kind name → our `SyntaxRole`. `None` ⇒ render the token as `CodePlain`
+/// (safe default for a kind this map does not recognize).
+fn map_kind(kind: &str) -> Option<SyntaxRole> {
+    Some(match kind {
+        "keyword" => SyntaxRole::Keyword,
+        "comment" => SyntaxRole::Comment,
+        "string" | "character" => SyntaxRole::StringLit,
+        "digit" | "number" | "float" => SyntaxRole::Literal,
+        "boolean" | "reference" | "constant" => SyntaxRole::Constant,
+        "type" | "struct" | "class" | "namespace" | "enum" => SyntaxRole::Type,
+        "function" | "macros" | "macro" => SyntaxRole::Function,
+        "operator" | "symbol" => SyntaxRole::Operator,
+        "punctuation" => SyntaxRole::Punctuation,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -465,5 +558,52 @@ mod tests {
     fn soft_break_splits_paragraph_into_lines() {
         let lines = parse("a\nb");
         assert_eq!(lines.len(), 2);
+    }
+
+    fn code_roles(lines: &[RichLine]) -> Vec<SpanRole> {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.role))
+            .collect()
+    }
+
+    #[test]
+    fn rust_fence_highlights_keyword_and_comment() {
+        let out = highlight("rust", "fn main() {\n    let x = 5; // note\n}");
+        assert_eq!(out.len(), 3, "one RichLine per source line");
+        let roles = code_roles(&out);
+        assert!(
+            roles.contains(&SpanRole::CodeToken(SyntaxRole::Keyword)),
+            "fn/let are keywords"
+        );
+        assert!(
+            roles.contains(&SpanRole::CodeToken(SyntaxRole::Comment)),
+            "// note is a comment"
+        );
+    }
+
+    #[test]
+    fn python_fence_highlights_string() {
+        let out = highlight("python", "x = \"hello\"");
+        let roles = code_roles(&out);
+        assert!(roles.contains(&SpanRole::CodeToken(SyntaxRole::StringLit)));
+    }
+
+    #[test]
+    fn unknown_language_is_all_plain() {
+        let out = highlight("no-such-lang-xyz", "some text 123");
+        assert!(out[0].spans.iter().all(|s| s.role == SpanRole::CodePlain));
+    }
+
+    #[test]
+    fn fenced_code_in_parse_is_now_highlighted() {
+        let lines = parse("```rust\nfn a() {}\n```");
+        // parse re-wraps highlight's lines with the gutter, then a CodeToken(Keyword) shows.
+        let roles: Vec<SpanRole> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.role))
+            .collect();
+        assert!(roles.contains(&SpanRole::CodeToken(SyntaxRole::Keyword)));
+        assert_eq!(lines[0].spans[0].role, SpanRole::Gutter);
     }
 }

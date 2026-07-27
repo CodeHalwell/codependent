@@ -133,6 +133,11 @@ loro = "1.13"
 # off drops its getopts CLI path; the pull-parser (Parser/Event/Tag) is core.
 pulldown-cmark = { version = "0.13", default-features = false }
 
+# synoptic: pure-Rust, asset-free, per-language syntax highlighter (MIT). Its
+# heavy deps (regex 1.x, unicode-width) are already in the tree; it emits token
+# kinds we colour ourselves onto the semantic theme.syntax.* palette.
+synoptic = "2.2"
+
 # CLI and paths
 clap = { version = "4", features = ["derive"] }
 directories = "6"
