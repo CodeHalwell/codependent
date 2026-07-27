@@ -37,8 +37,8 @@ use codypendent_daemon::worktrees::{WorktreeError, WorktreeManager};
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::github::{GitHubApi, RepoId};
 use codypendent_knowledge::{
-    assemble_context, chronicle_candidates, extract_candidates, Curation, MemoryStore, Revision,
-    Scope,
+    assemble_context, chronicle_candidates, extract_candidates, Curation, ExtractionInput,
+    FactExtractor, MemoryStore, NoopExtractor, Revision, Scope,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
@@ -675,16 +675,49 @@ impl RuntimeExecutor {
     /// event trace and note each durable one, so "a run produces a curated memory
     /// whose provenance opens to its source" holds for every run.
     ///
-    /// Runs **after** `execute` returns (the loop is no longer appending), so the
-    /// note appends never race the agent loop. The curator redacts secrets before
-    /// anything is stored, so a `remembered:` note can never carry secret text.
-    /// Every failure is warned and swallowed — a harvesting error must not turn a
-    /// finished run into a failed one.
+    /// Public entry: resolves the [`FactExtractor`] for this run's mode (M3a
+    /// always resolves [`NoopExtractor`]; M3b's `build_fact_extractor` adds the
+    /// D2 selection order) and delegates to the testable core, [`Self::harvest_with`].
     async fn harvest_memories(
         &self,
         session_id: SessionId,
         run_id: RunId,
         repository: RepositoryId,
+        mode: AgentMode,
+    ) {
+        let extractor = self.build_fact_extractor(mode).await;
+        self.harvest_with(session_id, run_id, repository, extractor.as_ref())
+            .await;
+    }
+
+    /// M3a: the extractor this run's harvest is injected with. Always
+    /// [`NoopExtractor`] for now — zero model deps, behavior unchanged from
+    /// before M3a. M3b replaces this body with the D2 selection order
+    /// (configured `memory_extraction_model` → the run's own resolved model →
+    /// `NoopExtractor`).
+    async fn build_fact_extractor(&self, _mode: AgentMode) -> Box<dyn FactExtractor> {
+        Box::new(NoopExtractor)
+    }
+
+    /// The testable harvest core: loads the ledger, appends the pure
+    /// heuristic/agent-tool candidates, calls the injected `extractor`
+    /// best-effort, re-anchors every candidate to REPOSITORY scope, and
+    /// curates each through [`MemoryStore::curate`].
+    ///
+    /// Runs **after** `execute` returns (the loop is no longer appending), so the
+    /// note appends never race the agent loop. The curator redacts secrets before
+    /// anything is stored, so a `remembered:` note can never carry secret text.
+    /// Every failure is warned and swallowed — a harvesting error must not turn a
+    /// finished run into a failed one. `extractor.extract` itself can never fail
+    /// (it returns `Vec`, never `Result`), so its contribution is best-effort by
+    /// construction: an unreachable/slow/misconfigured model degrades to
+    /// "contributes nothing," never to a failed run.
+    async fn harvest_with(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        repository: RepositoryId,
+        extractor: &dyn FactExtractor,
     ) {
         let events = match ledger::load_events(&self.pool, session_id).await {
             Ok(events) => events,
@@ -701,7 +734,8 @@ impl RuntimeExecutor {
         // (which `emit_context` queries at System + this repository); a
         // session-scoped memory would never be seen again.
         let repository_scope = Scope::Repository(repository);
-        let mut candidates = extract_candidates(&events, Scope::Session(session_id));
+        let session_scope = Scope::Session(session_id);
+        let mut candidates = extract_candidates(&events, session_scope.clone());
 
         // Heuristic chronicle facts (M1). Locate the RunCompleted event, load its
         // chronicle artifact, parse it, and append discrete candidates. Every
@@ -714,15 +748,36 @@ impl RuntimeExecutor {
             _ => None,
         }) {
             match self.load_chronicle(&chronicle_ref).await {
-                Ok(chronicle) => candidates.extend(chronicle_candidates(
-                    &chronicle,
-                    &Scope::Session(session_id),
-                    &chronicle_ref,
-                    run_id,
-                    at,
-                    Revision::sequence(seq),
-                    chronicle_ref.sensitivity,
-                )),
+                Ok(chronicle) => {
+                    let valid_from = Revision::sequence(seq);
+                    candidates.extend(chronicle_candidates(
+                        &chronicle,
+                        &session_scope,
+                        &chronicle_ref,
+                        run_id,
+                        at,
+                        valid_from.clone(),
+                        chronicle_ref.sensitivity,
+                    ));
+
+                    // M3a: the LLM-extractor seam (no model call yet — the
+                    // injected extractor is best-effort NoopExtractor by
+                    // default; M3b swaps in the real model-backed one).
+                    let objective = chronicle["objective"].as_str().unwrap_or("");
+                    let transcript_excerpt = run_transcript_excerpt(&events, run_id);
+                    let input = ExtractionInput {
+                        objective,
+                        chronicle: &chronicle,
+                        transcript_excerpt: &transcript_excerpt,
+                        scope: &session_scope,
+                        chronicle_ref: &chronicle_ref,
+                        run_id,
+                        observed_at: at,
+                        valid_from,
+                        sensitivity: chronicle_ref.sensitivity,
+                    };
+                    candidates.extend(extractor.extract(input).await);
+                }
                 Err(error) => {
                     warn!(%session_id, %run_id, %error, "could not load run chronicle for memory harvest");
                 }
@@ -755,6 +810,36 @@ impl RuntimeExecutor {
     }
 }
 
+/// A cheap join of this run's note/tool-observation texts from the session
+/// ledger, un-capped (M3a): the extractor implementation is responsible for
+/// bounding its own input, per [`ExtractionInput::transcript_excerpt`]'s
+/// contract.
+fn run_transcript_excerpt(events: &[codypendent_protocol::SessionEvent], run_id: RunId) -> String {
+    use codypendent_protocol::ToolOutcome;
+
+    events
+        .iter()
+        .filter_map(|event| match &event.body {
+            EventBody::NoteAppended {
+                text,
+                run_id: note_run,
+            } if *note_run == Some(run_id) => Some(text.clone()),
+            EventBody::ToolCompleted {
+                run_id: tool_run,
+                tool,
+                outcome,
+                ..
+            } if *tool_run == run_id => Some(match outcome {
+                ToolOutcome::Succeeded => format!("{tool}: succeeded"),
+                ToolOutcome::Failed { message } => format!("{tool}: failed - {message}"),
+                _ => format!("{tool}: unknown outcome"),
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 impl RunExecutor for RuntimeExecutor {
     fn spawn_run(&self, launch: RunLaunch) {
         let executor = self.clone();
@@ -763,6 +848,10 @@ impl RunExecutor for RuntimeExecutor {
             let session_id = launch.session_id;
             let run_id = launch.run_id;
             let objective = launch.objective.clone();
+            // `AgentMode` is `Copy` — carried out alongside the identity above so
+            // `harvest_memories` can resolve the M3a/M3b fact extractor for this
+            // run's mode (D2) after `launch` is moved into the worker below.
+            let mode = launch.mode;
             // This run's OWN repository identity, derived from its repository root
             // (issue #6 item 1) — NOT the daemon's startup directory — so a shared
             // daemon attributes its context map and curated memories correctly.
@@ -864,7 +953,7 @@ impl RunExecutor for RuntimeExecutor {
             // event trace and note each durable one — emitted AFTER the loop, so
             // these appends never race it either.
             executor
-                .harvest_memories(session_id, run_id, repository)
+                .harvest_memories(session_id, run_id, repository, mode)
                 .await;
         });
     }
@@ -1464,7 +1553,9 @@ mod tests {
             .await
             .expect("append RunCompleted");
 
-        executor.harvest_memories(session, run_id, repository).await;
+        executor
+            .harvest_memories(session, run_id, repository, AgentMode::Build)
+            .await;
 
         let statements: Vec<(String, String)> =
             sqlx::query_as("SELECT class, statement FROM memories ORDER BY class")
@@ -1492,6 +1583,103 @@ mod tests {
                     && statement.contains("shell.run")
                     && statement.contains("failed")),
             "expected a Failure memory from the failed action, got {statements:?}"
+        );
+    }
+
+    /// M3a: a `FactExtractor` that always returns an empty `Vec`, mirroring
+    /// what `NoopExtractor` does but defined locally so the test asserts
+    /// against the TRAIT boundary (`&dyn FactExtractor`), not the concrete
+    /// `codypendent_knowledge` type.
+    struct MockExtractor(Vec<codypendent_knowledge::CandidateMemory>);
+
+    #[async_trait::async_trait]
+    impl FactExtractor for MockExtractor {
+        async fn extract(
+            &self,
+            _input: ExtractionInput<'_>,
+        ) -> Vec<codypendent_knowledge::CandidateMemory> {
+            self.0.clone()
+        }
+    }
+
+    /// M3a fallback: `harvest_with` injected with an extractor that
+    /// contributes nothing still curates the M1 heuristic candidates — an
+    /// empty M3 contribution must never suppress the other mechanisms.
+    #[tokio::test]
+    async fn harvest_with_empty_extractor_still_curates_heuristic_candidates() {
+        use codypendent_daemon::artifacts::Provenance;
+        use codypendent_protocol::RunDisposition;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor =
+            RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
+
+        let session = SessionId::new();
+        let run_id = RunId::new();
+        ledger::create_session(&pool, session, "harvest-fallback")
+            .await
+            .expect("create session");
+
+        let chronicle_bytes = serde_json::to_vec(&serde_json::json!({
+            "objective": "fix the guard",
+            "investigations": ["crates/x/src/a.rs:42 the guard is inverted"],
+            "changes": [],
+            "actions": [],
+            "decisions": [],
+        }))
+        .expect("serialize chronicle");
+        let chronicle_ref = executor
+            .artifacts()
+            .put(
+                &pool,
+                "application/json",
+                DataClassification::Internal,
+                Provenance::system("test-chronicle-fallback"),
+                &chronicle_bytes,
+            )
+            .await
+            .expect("store chronicle artifact");
+
+        let event = codypendent_protocol::SessionEvent {
+            sequence: 1,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("done".to_string()),
+                },
+                chronicle: chronicle_ref,
+            },
+        };
+        ledger::append_event(&pool, session, &event)
+            .await
+            .expect("append RunCompleted");
+
+        executor
+            .harvest_with(session, run_id, repository, &MockExtractor(vec![]))
+            .await;
+
+        let statements: Vec<(String, String)> =
+            sqlx::query_as("SELECT class, statement FROM memories ORDER BY class")
+                .fetch_all(&pool)
+                .await
+                .expect("query memories");
+
+        assert!(
+            statements
+                .iter()
+                .any(|(class, statement)| class == "code"
+                    && statement.contains("crates/x/src/a.rs:42")),
+            "an empty M3a extractor must not suppress the M1 heuristic candidate, got {statements:?}"
         );
     }
 
