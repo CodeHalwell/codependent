@@ -2515,6 +2515,7 @@ mod tests {
         async fn next_step(
             &self,
             _transcript: &[codypendent_runtime::agent::TurnItem],
+            _offered_tools: &[&str],
             sink: &mut dyn DeltaSink,
         ) -> anyhow::Result<StepOutcome> {
             let step = if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {

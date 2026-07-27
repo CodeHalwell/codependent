@@ -26,6 +26,7 @@
 //! input into the async loop.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -86,6 +87,119 @@ fn default_subscriptions() -> Vec<Subscription> {
     vec![Subscription::SessionSummary, Subscription::AgentActivity]
 }
 
+// ---------------------------------------------------------------------------
+// Crash logger (crash investigation follow-up).
+//
+// A prior TUI crash left the terminal in raw mode — proof `TerminalGuard`'s
+// `Drop` never ran, so it was either an abort/OS-kill, or a panic whose
+// message was lost the instant the alternate screen was torn down alongside
+// it. We could not tell which. `install_crash_hook` closes that gap for the
+// NEXT occurrence: it installs a `std::panic::set_hook` that appends the
+// panic message, its source location, and a force-captured backtrace to
+// `<data_dir>/logs/tui-crash.log` — a plain file, independent of the
+// terminal — before chaining to the previous (default) hook.
+//
+// Diagnostic contract for whoever reads the log after a future crash:
+//   - A non-empty file (a new entry since the crash) ⇒ the hook ran ⇒ it was
+//     a PANIC, and its message/location/backtrace are right there.
+//   - The file stays empty ⇒ the hook never ran ⇒ the process was
+//     aborted/OS-killed (e.g. out-of-memory) — that points at memory, not a
+//     panic, and a panic-message hunt would be a waste of time.
+// ---------------------------------------------------------------------------
+
+/// The crash log's filename under `<data_dir>/logs/` (alongside `daemon.log`).
+const CRASH_LOG_FILE_NAME: &str = "tui-crash.log";
+
+/// Format one crash-log entry from an already-extracted message, an optional
+/// source location, and a backtrace string. Pure (no I/O) and so trivially
+/// unit-testable: the panic hook itself (`install_crash_hook`) cannot easily
+/// be driven from a test without actually panicking the test process, but all
+/// of its formatting decisions live here, in a plain function a test CAN call
+/// directly with synthetic inputs.
+fn format_crash_entry(message: &str, location: Option<&str>, backtrace: &str) -> String {
+    let location = location.unwrap_or("<unknown location>");
+    format!(
+        "---- codypendent-tui crash {} ----\n\
+         message: {message}\n\
+         location: {location}\n\
+         backtrace:\n{backtrace}\n",
+        humantime_now(),
+    )
+}
+
+/// A dependency-free `now` stamp for the crash entry header. Not meant to be
+/// parsed — only to let a human tell two entries in the same file apart — so
+/// this deliberately avoids pulling in a time-formatting crate (no new
+/// dependency) in favor of the `SystemTime` Unix-epoch offset `std` already
+/// gives us.
+fn humantime_now() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(since_epoch) => format!("at unix-epoch-seconds {}", since_epoch.as_secs()),
+        Err(_) => "at an unknown time".to_string(),
+    }
+}
+
+/// Append `entry` to the crash log at `path`, creating its parent directory
+/// (e.g. `<data_dir>/logs/`) and the file itself if either is missing, in
+/// append mode so an earlier crash's entry is never overwritten. Returns the
+/// I/O error to the caller rather than swallowing it here — the panic-hook
+/// closure (`install_crash_hook`) is the one place that must never propagate
+/// a failure (a panic while handling a panic aborts the process outright), so
+/// swallowing happens there, not in this otherwise-ordinary, testable writer.
+fn write_crash_entry(path: &Path, entry: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(entry.as_bytes())
+}
+
+/// The panic hook's own body, split out from the `Box::new(move |info| ...)`
+/// closure in `install_crash_hook` so it reads linearly: extract the message
+/// (a panic payload is either a `&str` literal or a formatted `String`) and
+/// the source location from `info`, format the entry, and write it —
+/// best-effort. Any failure (a missing data dir the caller couldn't create, a
+/// full disk, permissions) is swallowed: this runs INSIDE the panic hook, and
+/// a panic here would abort the process instead of letting the original
+/// panic's unwind (and the previous hook's default reporting) continue.
+fn append_crash_log(path: &Path, info: &std::panic::PanicHookInfo<'_>, backtrace: &str) {
+    let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = info.payload().downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    };
+    let location = info.location().map(|location| location.to_string());
+    let entry = format_crash_entry(&message, location.as_deref(), backtrace);
+    let _ = write_crash_entry(path, &entry);
+}
+
+/// Install the crash-logging panic hook. Called once, as the very first thing
+/// [`run`] does — before ANY other client setup, and so well before
+/// [`TerminalGuard::enter`] — so it is active for a panic anywhere in the
+/// client's lifetime and, critically, fires before the guard's `Drop` blanks
+/// the alternate screen back to the caller's cooked terminal (the teardown
+/// that made the original crash's panic message unrecoverable).
+///
+/// The previous hook (Rust's default, unless something upstream already
+/// replaced it) is captured via [`std::panic::take_hook`] and chained after
+/// the crash-log write, so normal panic reporting (and any other behavior the
+/// previous hook carried) is entirely unchanged — this only ever ADDS the
+/// file write in front of it.
+fn install_crash_hook(paths: &RuntimePaths) {
+    let crash_log_path = paths.log_dir.join(CRASH_LOG_FILE_NAME);
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        append_crash_log(&crash_log_path, info, &backtrace.to_string());
+        previous_hook(info);
+    }));
+}
+
 /// `codypendent` with no subcommand: open the interactive TUI for `repo`.
 ///
 /// Auto-starts the daemon, resolves (or creates) `repo`'s session, attaches with
@@ -103,6 +217,13 @@ pub async fn run(
     repo: PathBuf,
     theme_override: Option<String>,
 ) -> anyhow::Result<()> {
+    // Crash logger, installed FIRST — before repo validation, the daemon
+    // connection, and (much later) `TerminalGuard::enter` — so a panic
+    // anywhere in this function's lifetime is diagnosable, and so it fires
+    // before the guard's `Drop` tears down the alternate screen (see the
+    // module docs above `install_crash_hook` for the full motivation).
+    install_crash_hook(paths);
+
     let repo = repo
         .canonicalize()
         .with_context(|| format!("{}: not a valid, accessible directory", repo.display()))?;
@@ -2923,6 +3044,65 @@ mod tests {
                 .sessions
                 .contains_key("/repo/one"),
             "the forgotten repository must not resume its old session"
+        );
+    }
+
+    /// Crash-logger tests (crash investigation follow-up). `format_crash_entry`
+    /// is pure (no I/O), so a test can assert its shape with a synthetic
+    /// message/location/backtrace without ever touching a real
+    /// `PanicHookInfo` — deliberately, since fabricating one outside an actual
+    /// panic is not practical, and this fn is what the panic hook's formatting
+    /// reduces to (see `append_crash_log`).
+    #[test]
+    fn format_crash_entry_includes_message_and_location() {
+        let entry = format_crash_entry(
+            "index out of bounds: the len is 3 but the index is 5",
+            Some("crates/tui/src/render.rs:42:9"),
+            "0: codypendent_cli::tui::install_crash_hook\n1: <backtrace omitted>",
+        );
+        assert!(!entry.is_empty());
+        assert!(entry.contains("index out of bounds: the len is 3 but the index is 5"));
+        assert!(entry.contains("crates/tui/src/render.rs:42:9"));
+        assert!(entry.contains("<backtrace omitted>"));
+    }
+
+    #[test]
+    fn format_crash_entry_falls_back_when_location_is_absent() {
+        let entry = format_crash_entry("boom", None, "<no backtrace captured>");
+        assert!(!entry.is_empty());
+        assert!(entry.contains("boom"));
+    }
+
+    #[test]
+    fn write_crash_entry_creates_the_log_and_appends_a_nonempty_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The parent `logs/` dir does not exist yet — `write_crash_entry` must
+        // create it (mirroring `<data_dir>/logs/tui-crash.log`), never fail
+        // just because nothing has been logged there before.
+        let path = tmp.path().join("logs").join("tui-crash.log");
+        assert!(!path.exists());
+
+        let entry = format_crash_entry("boom", Some("src/main.rs:1:1"), "<bt>");
+        write_crash_entry(&path, &entry).expect("write_crash_entry must create the dir + file");
+
+        let contents = std::fs::read_to_string(&path).expect("the crash log must now exist");
+        assert!(!contents.is_empty());
+        assert!(contents.contains("boom"));
+        assert!(contents.contains("src/main.rs:1:1"));
+    }
+
+    #[test]
+    fn write_crash_entry_appends_rather_than_overwrites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("logs").join("tui-crash.log");
+
+        write_crash_entry(&path, "first entry\n").unwrap();
+        write_crash_entry(&path, "second entry\n").unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("first entry") && contents.contains("second entry"),
+            "a second crash must not erase the first crash's entry, got:\n{contents}"
         );
     }
 

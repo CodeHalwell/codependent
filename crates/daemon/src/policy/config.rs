@@ -98,10 +98,32 @@ impl MergedPolicy {
                 "$HOME/.config".to_string(),
             ],
             shell_allowed_programs: vec![
+                // Original Rust baseline.
                 "cargo".to_string(),
                 "git".to_string(),
                 "rg".to_string(),
                 "rustfmt".to_string(),
+                // Curated, language-agnostic, read-only exploration set (agent &
+                // tool fixes spec, FIX 2a): without these, basic exploration of a
+                // non-Rust repository denied `ls`/`find` outright and the agent
+                // fell back to repeated file reads. `find` is deliberately
+                // excluded (`-delete`/`-exec`/`-execdir`/`-ok` can remove files or
+                // run arbitrary programs, bypassing this allow-list), as is every
+                // interpreter/code-execution multiplexer. Allow-listing a program
+                // here does not auto-run it — every allow-listed command still
+                // requires approval (see `eval_command`).
+                "ls".to_string(),
+                "cat".to_string(),
+                "head".to_string(),
+                "tail".to_string(),
+                "wc".to_string(),
+                "grep".to_string(),
+                "tree".to_string(),
+                "pwd".to_string(),
+                "file".to_string(),
+                "which".to_string(),
+                "sort".to_string(),
+                "uniq".to_string(),
             ],
             shell_interpreter_requires_approval: true,
             shell_maximum_seconds: 900,
@@ -484,6 +506,40 @@ mod tests {
         let raw = RawPolicy::parse("[shell]\nallowed_programs = [\"cargo\", \"npm\"]").unwrap();
         merged.apply_overlay(&raw);
         assert_eq!(merged.shell_allowed_programs, vec!["cargo".to_string()]);
+    }
+
+    /// FIX 2 (agent & tool fixes spec, §2a): the built-in default was Rust-only
+    /// (`cargo`/`git`/`rg`/`rustfmt`), so basic exploration in a non-Rust repo
+    /// (evidence: a Python repo review) denied `ls`/`find` outright. The default
+    /// now also carries a curated, language-agnostic, read-only exploration set —
+    /// while keeping the original four and excluding `find` (`-delete`/`-exec`
+    /// can write/exec, bypassing the allow-list) and every interpreter/multiplexer.
+    #[test]
+    fn builtin_default_shell_allow_list_includes_curated_read_only_set() {
+        let defaults = MergedPolicy::builtin_defaults();
+        let expected = [
+            // Original Rust baseline — unchanged.
+            "cargo", "git", "rg", "rustfmt",
+            // Curated read-only exploration set (FIX 2a).
+            "ls", "cat", "head", "tail", "wc", "grep", "tree", "pwd", "file", "which", "sort",
+            "uniq",
+        ];
+        for program in expected {
+            assert!(
+                defaults.shell_allowed_programs.iter().any(|p| p == program),
+                "expected `{program}` in the default shell allow-list, got {:?}",
+                defaults.shell_allowed_programs
+            );
+        }
+        assert_eq!(
+            defaults.shell_allowed_programs.len(),
+            expected.len(),
+            "no extra programs beyond the curated set: {:?}",
+            defaults.shell_allowed_programs
+        );
+        // `find` is deliberately excluded: `-delete`/`-exec`/`-execdir`/`-ok` can
+        // remove files or run arbitrary programs, bypassing the allow-list.
+        assert!(!defaults.shell_allowed_programs.iter().any(|p| p == "find"));
     }
 
     #[test]

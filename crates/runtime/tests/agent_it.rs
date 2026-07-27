@@ -722,6 +722,13 @@ index 0000000..1111111 100644
         message.contains("policy denied"),
         "expected a policy denial, got: {message}"
     );
+    // FIX 3 (agent & tool fixes spec) is SCOPED to the `shell.run`
+    // not-allow-listed denial (`policy.program-not-allowlisted`): a write refused
+    // by mode is a different reason code and must not carry the shell hint.
+    assert!(
+        !message.contains("workspace.read_file"),
+        "a write-denied-by-mode message must not carry the shell allow-list hint: {message}"
+    );
     // No approval was ever proposed for a policy-denied action.
     assert!(!events
         .iter()
@@ -1313,6 +1320,7 @@ impl codypendent_runtime::agent::ModelDriver for CapturingDriver {
     async fn next_step(
         &self,
         transcript: &[codypendent_runtime::agent::TurnItem],
+        _offered_tools: &[&str],
         sink: &mut dyn codypendent_runtime::agent::DeltaSink,
     ) -> anyhow::Result<StepOutcome> {
         *self.seen.lock().unwrap() = transcript.to_vec();
