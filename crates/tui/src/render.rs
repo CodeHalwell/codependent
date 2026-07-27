@@ -333,10 +333,19 @@ fn for_each_row<'a>(
                 seen_user_turn = true;
                 awaiting_header = true;
             } else if is_agent_cell && awaiting_header {
-                visit(Row::built(Line::styled(
+                let mut spans = vec![Span::styled(
                     "⏺ codypendent",
-                    Style::default().fg(theme.focus.active),
-                )));
+                    Style::default()
+                        .fg(theme.agent.tool)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                if let Some(model) = &run.model {
+                    spans.push(Span::styled(
+                        format!(" · {model}"),
+                        Style::default().fg(theme.text.muted),
+                    ));
+                }
+                visit(Row::built(Line::from(spans)));
                 produced = true;
                 awaiting_header = false;
             }
@@ -618,7 +627,23 @@ fn entry_lines<'a>(
 
     match entry {
         TranscriptEntry::User { text } => {
-            out.push(head(format!("› {text}"), theme.focus.active));
+            out.push(Line::styled(
+                "You",
+                Style::default()
+                    .fg(theme.focus.active)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            let mut wrote_body = false;
+            for line in text.lines() {
+                out.push(Line::styled(
+                    format!("  {line}"),
+                    Style::default().fg(theme.text.primary),
+                ));
+                wrote_body = true;
+            }
+            if !wrote_body {
+                out.push(Line::styled("  ", Style::default().fg(theme.text.primary)));
+            }
         }
         TranscriptEntry::Model { text } => {
             model_entry_lines(text, theme, selected, streaming_tail, out);
@@ -3847,22 +3872,25 @@ mod tests {
         });
         let out = render_to_string(&s, 80, 20);
         let rows: Vec<&str> = out.lines().collect();
-        // Search for the turn marker itself (not just the bare word), so a
-        // match can't land on the pane title — which also shows the
-        // objective ("alpha") and would otherwise be mistaken for the
-        // transcript row.
-        let alpha_row = rows
+        // Search for the turn body/header themselves (not just the bare
+        // word), so a match can't land on the pane title — which also shows
+        // the objective ("alpha") and would otherwise be mistaken for the
+        // transcript row. Rows carry the pane's left/right border glyph, so
+        // strip it before comparing the header line exactly.
+        let alpha_body = rows
             .iter()
-            .position(|r| r.contains("› alpha"))
-            .expect("first turn rendered");
-        let beta_row = rows
+            .position(|r| r.contains("  alpha"))
+            .expect("first turn body");
+        let beta_header = rows
             .iter()
-            .position(|r| r.contains("› beta"))
-            .expect("second turn rendered");
+            .skip(alpha_body)
+            .position(|r| r.trim_matches('│').trim() == "You")
+            .map(|p| p + alpha_body)
+            .expect("second turn header");
         assert_eq!(
-            beta_row,
-            alpha_row + 2,
-            "exactly one blank row separates the turns:\n{out}"
+            beta_header,
+            alpha_body + 2,
+            "one blank row separates the turns:\n{out}"
         );
     }
 
@@ -3922,11 +3950,11 @@ mod tests {
 
         let out = render_to_string(&s, 100, 30);
         assert!(
-            out.contains("› alpha") && out.contains("alpha reply"),
+            out.contains("  alpha") && out.contains("alpha reply"),
             "the first (completed) run's turn must still be visible:\n{out}"
         );
         assert!(
-            out.contains("› beta") && out.contains("beta reply"),
+            out.contains("  beta") && out.contains("beta reply"),
             "the second (live) run's turn must also be visible:\n{out}"
         );
         assert_eq!(
@@ -4240,22 +4268,6 @@ mod tests {
         assert!(text.contains("steer the run"), "steer placeholder:\n{text}");
         // The status footer is still present.
         assert!(text.contains("mode"), "status footer:\n{text}");
-    }
-
-    #[test]
-    fn a_user_turn_renders_with_a_caret_marker() {
-        let mut s = AppState::new();
-        let run_id = RunId::new();
-        reduce(
-            &mut s,
-            system_ev(EventBody::RunStarted {
-                run_id,
-                objective: "add a test".to_owned(),
-                mode: AgentMode::Build,
-            }),
-        );
-        let out = render_to_string(&s, 80, 12);
-        assert!(out.contains("› add a test") || out.contains("> add a test"));
     }
 
     #[test]
@@ -5014,6 +5026,156 @@ mod tests {
         assert!(
             !out.contains("body line 0"),
             "the head has scrolled off:\n{out}"
+        );
+    }
+
+    // --- Task 2: turn / role renderer ---
+
+    #[test]
+    fn a_user_turn_renders_a_role_header_and_indented_body() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "add a test".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let out = render_to_string(&s, 80, 14);
+        assert!(out.contains("You"), "user role header:\n{out}");
+        assert!(
+            out.contains("  add a test"),
+            "indented body (two-space gutter):\n{out}"
+        );
+        assert!(
+            !out.contains("› add a test"),
+            "the old caret user line is gone:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_assistant_header_names_the_model_when_known() {
+        let s = running_build_state(); // serves "gpt-5.1-codex"
+        let out = render_to_string(&s, 110, 30);
+        assert!(
+            out.contains("⏺ codypendent · gpt-5.1-codex"),
+            "model in the turn header:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_assistant_header_omits_the_model_when_unknown() {
+        // A run with a tool cell but no agent-authored (model-bearing) event.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "hi".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc".to_owned(),
+            }),
+        );
+        let out = render_to_string(&s, 90, 20);
+        assert!(out.contains("⏺ codypendent"), "bare header:\n{out}");
+        assert!(
+            !out.contains("codypendent ·"),
+            "no ` · <model>` when unknown (honesty):\n{out}"
+        );
+    }
+
+    /// Virtualization guard (Task 1's invariant, re-checked against Task 2's
+    /// header/gap rows): a pathological single Model entry of thousands of
+    /// source lines, under a known-model run (so a `You` header/body Row and a
+    /// model-named assistant header Row both ride the same `for_each_row`
+    /// walk as the huge Model entry). The build pass must still materialize
+    /// O(viewport) lines at either end of the history — the new header
+    /// styling must not reintroduce whole-transcript materialization.
+    #[test]
+    fn virtualization_still_holds_with_role_headers_and_turn_gaps() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "huge".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let mut big = String::new();
+        for i in 0..5000 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        reduce(
+            &mut s,
+            Action::daemon_event(SessionEvent {
+                sequence: 2,
+                occurred_at: Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::Agent {
+                    agent_id: codypendent_protocol::AgentId::new(),
+                    run_id,
+                    model: ModelId("gpt-5.1-codex".to_owned()),
+                },
+                body: EventBody::ModelStreamDelta { run_id, text: big },
+            }),
+        );
+
+        let theme = Theme::dark();
+        let inner_width = 78;
+        let height = 20;
+        let total = transcript_rows(&s.runs, &theme, inner_width);
+        assert!(
+            total >= 5000,
+            "measure still sees the whole history: {total}"
+        );
+
+        // The viewport at the very TOP: the `You` header and the model-named
+        // assistant header are among the first virtualized rows.
+        let (top_lines, _r0, _hits) =
+            build_transcript_window(&s.runs, &theme, inner_width, 0, height, 0);
+        assert!(
+            top_lines.len() <= height as usize + 4,
+            "top-of-history build stays O(viewport), not O(history): {}",
+            top_lines.len()
+        );
+        assert!(
+            top_lines.iter().any(|l| l.to_string() == "You"),
+            "the user role header is one of the virtualized top rows"
+        );
+        assert!(
+            top_lines
+                .iter()
+                .any(|l| l.to_string().contains("codypendent · gpt-5.1-codex")),
+            "the model-named assistant header is one of the virtualized top rows"
+        );
+
+        // The viewport at the TAIL of the same pathological history: still
+        // O(viewport), not O(history) — Task 2 must not undo Task 1's fix.
+        let (tail_lines, _r0, _hits) = build_transcript_window(
+            &s.runs,
+            &theme,
+            inner_width,
+            total.saturating_sub(height),
+            height,
+            0,
+        );
+        assert!(
+            tail_lines.len() <= height as usize + 4,
+            "tail-of-history build stays O(viewport), not O(history): {}",
+            tail_lines.len()
         );
     }
 }
