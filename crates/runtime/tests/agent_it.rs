@@ -1444,6 +1444,60 @@ async fn read_without_dirty_buffer_is_unlabeled() {
     assert!(text.contains("plain filesystem read"));
 }
 
+// --- loop-fix Task 1: transcript-fidelity FIXes 1 & 2 -----------------------
+
+#[tokio::test]
+async fn read_file_tool_call_is_recorded_immediately_before_its_result() {
+    // FIX 1 (transcript fidelity): before this fix, only the `ToolResult` was
+    // ever recorded — a replayed transcript had no memory of what the model
+    // had asked for, only what came back. The model's request must now
+    // appear as its own transcript item, paired immediately before its
+    // result (asked -> result), so a replay can tell "I already asked for
+    // this" instead of re-issuing the same call.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    let file = repo.join("src.rs");
+    std::fs::write(&file, b"hello\n").unwrap();
+
+    let seen = read_with_ide_context(&file, &repo, Vec::new()).await;
+    use codypendent_runtime::agent::TurnItem;
+    let call_index = seen
+        .iter()
+        .position(
+            |item| matches!(item, TurnItem::ToolCall { tool, .. } if tool == "workspace.read_file"),
+        )
+        .expect("a ToolCall item must be recorded for the model's request");
+    match seen.get(call_index + 1) {
+        Some(TurnItem::ToolResult { tool, .. }) if tool == "workspace.read_file" => {}
+        other => panic!(
+            "expected the ToolCall to be immediately followed by its ToolResult, got {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn read_file_observation_carries_a_path_header() {
+    // FIX 2 (transcript fidelity): the read_file observation must be tied to
+    // the file it read, so a REPLAYED `[tool result: workspace.read_file]`
+    // isn't anonymous line-numbered text with no filename attached.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    let file = repo.join("annotated.rs");
+    std::fs::write(&file, b"fn main() {}\n").unwrap();
+
+    let seen = read_with_ide_context(&file, &repo, Vec::new()).await;
+    let text = read_result_text(&seen);
+    let expected_path = file.display().to_string();
+    assert!(
+        text.contains(&expected_path),
+        "the read_file observation must name the file it read; got:\n{text}"
+    );
+    assert!(
+        text.contains("lines 1-"),
+        "the read_file observation must carry the line range; got:\n{text}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Read-your-writes on an isolated worktree (T5 fix pass).
 //

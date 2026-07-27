@@ -102,6 +102,20 @@ pub enum TurnItem {
     Objective(String),
     /// Model-authored natural-language text.
     Assistant(String),
+    /// The model's request to call a tool, recorded BEFORE the tool runs
+    /// (transcript-fidelity FIX 1, loop-fix Task 1). Previously only the
+    /// resulting [`TurnItem::ToolResult`] was recorded, so a replayed
+    /// transcript could never tell which tool/args produced a given
+    /// observation — a driver reading the replay back had no way to notice
+    /// "I already asked for this" and could loop, re-issuing the same call.
+    /// Pushed immediately before its paired `ToolResult`, so the two always
+    /// appear adjacent (asked → result).
+    ToolCall {
+        /// The tool the model asked to call.
+        tool: String,
+        /// The tool arguments, exactly as the model supplied them.
+        args: Value,
+    },
     /// The observation fed back after a tool call (already compacted).
     ToolResult {
         /// The tool that produced the observation.
@@ -213,13 +227,25 @@ pub struct StepOutcome {
     pub step: ModelStep,
     /// The provider-reported usage for this request, or `None` if unmeasured.
     pub usage: Option<ModelUsage>,
+    /// Assistant TEXT that accompanied this step's tool call, when the step is
+    /// a [`ModelStep::CallTool`] (transcript-fidelity FIX 3, loop-fix Task 1).
+    /// A response can carry both natural-language text AND a function call in
+    /// the same turn; before this field existed that text was silently
+    /// dropped when the turn became a `CallTool` step (only `Finish` ever
+    /// surfaced `response.text()`). Always `None` for `Say`/`Finish` steps —
+    /// their text already rides the step itself.
+    pub preface: Option<String>,
 }
 
 impl StepOutcome {
-    /// A step paired with its (optional, measured) usage.
+    /// A step paired with its (optional, measured) usage, with no preface text.
     #[must_use]
     pub fn new(step: ModelStep, usage: Option<ModelUsage>) -> Self {
-        Self { step, usage }
+        Self {
+            step,
+            usage,
+            preface: None,
+        }
     }
 
     /// A step whose request reported NO usage — the honest default for a driver
@@ -227,7 +253,20 @@ impl StepOutcome {
     /// `Some(ModelUsage::default())` measured zero.
     #[must_use]
     pub fn unmeasured(step: ModelStep) -> Self {
-        Self { step, usage: None }
+        Self {
+            step,
+            usage: None,
+            preface: None,
+        }
+    }
+
+    /// Attach the assistant text (if any) that accompanied a `CallTool` step
+    /// (FIX 3) — builder-style so existing `new`/`unmeasured` call sites are
+    /// unaffected unless they opt in.
+    #[must_use]
+    pub fn with_preface(mut self, preface: Option<String>) -> Self {
+        self.preface = preface;
+        self
     }
 }
 
@@ -992,6 +1031,7 @@ impl FrameworkAgentRuntime {
             let StepOutcome {
                 step,
                 usage: step_usage,
+                preface,
             } = match step_result {
                 Ok(outcome) => outcome,
                 Err(e) => break Terminal::Failed(format!("model driver error: {e}")),
@@ -1034,6 +1074,21 @@ impl FrameworkAgentRuntime {
                 }
                 ModelStep::Finish { summary } => break Terminal::Completed(summary),
                 ModelStep::CallTool { tool, args } => {
+                    // FIX 3 (transcript fidelity): a response that both spoke
+                    // and called a tool must not have its text silently
+                    // dropped — record it as the model's stated intent,
+                    // BEFORE the paired `ToolCall`/`ToolResult` below.
+                    if let Some(text) = preface {
+                        transcript.push(TurnItem::Assistant(text));
+                    }
+                    // FIX 1 (transcript fidelity): record the call itself,
+                    // before running it, so a replayed transcript pairs
+                    // "asked" with "result" instead of showing only the
+                    // result with no memory of what was requested.
+                    transcript.push(TurnItem::ToolCall {
+                        tool: tool.clone(),
+                        args: args.clone(),
+                    });
                     match self
                         .run_tool(&run, &run_actor, &tool, args, &mut actions, &cancel)
                         .await?
@@ -1579,10 +1634,25 @@ impl FrameworkAgentRuntime {
                     // quiet; a read whose disk bytes diverge from an unsaved editor
                     // buffer is flagged so the model and the trace know the content
                     // may be stale relative to the editor.
-                    let observation = match self.read_provenance(&excerpt.path, run).await {
+                    let body = match self.read_provenance(&excerpt.path, run).await {
                         SourceProvenance::Filesystem => excerpt.content,
                         other => format!("[source: {}]\n{}", other.label(), excerpt.content),
                     };
+                    // FIX 2 (transcript fidelity, loop-fix Task 1): prefix the
+                    // path + line range so a REPLAYED `[tool result:
+                    // workspace.read_file]` can be tied to the file it read.
+                    // Without this header the bare line-numbered excerpt was
+                    // anonymous in the replayed transcript — a driver reading
+                    // back a prior read of the same path could not tell it was
+                    // the same file it had already seen, and re-read it.
+                    let header = format!(
+                        "{} (lines {}-{} of {})\n",
+                        excerpt.path.display(),
+                        excerpt.start_line,
+                        excerpt.end_line,
+                        excerpt.total_lines
+                    );
+                    let observation = format!("{header}{body}");
                     (observation, None, ToolOutcome::Succeeded)
                 }
                 Err(e) => (
@@ -2461,6 +2531,14 @@ impl FrameworkModelDriver {
             let message = match item {
                 TurnItem::Objective(text) => Message::user(text.clone()),
                 TurnItem::Assistant(text) => Message::assistant(text.clone()),
+                // Rendered as an ASSISTANT turn — it's the model's own prior
+                // request, replayed back to it (FIX 1). Kept immediately before
+                // its `ToolResult` below so the asked→result pairing survives
+                // the replay, which is exactly what lets the model notice "I
+                // already asked for this" instead of re-issuing the same call.
+                TurnItem::ToolCall { tool, args } => {
+                    Message::assistant(format!("[calling {tool}: {}]", compact_args(args)))
+                }
                 // NOT `Role::tool()`: an orphan tool message (no preceding
                 // assistant `tool_calls` with a matching id) is rejected with a
                 // 400 by strict OpenAI-wire servers. See the type-level docs.
@@ -2472,6 +2550,28 @@ impl FrameworkModelDriver {
             messages.push(message);
         }
         messages
+    }
+}
+
+/// Bound on the rendered length of a replayed `[calling …]` tool-call marker's
+/// arguments (FIX 1, loop-fix Task 1): a huge argument blob (e.g. a full patch
+/// body) must not be dumped a second time into the transcript — the marker is
+/// a short pointer to what was asked, not a duplicate payload.
+#[cfg(feature = "provider-openai")]
+const MAX_ARGS_PREVIEW_CHARS: usize = 200;
+
+/// Render tool-call arguments compactly and boundedly for the `[calling …]`
+/// transcript marker: the value collapses to single-line JSON, then anything
+/// longer than [`MAX_ARGS_PREVIEW_CHARS`] is truncated with an explicit
+/// ellipsis + original-length marker rather than shown whole.
+#[cfg(feature = "provider-openai")]
+fn compact_args(args: &Value) -> String {
+    let rendered = args.to_string();
+    if rendered.chars().count() > MAX_ARGS_PREVIEW_CHARS {
+        let truncated: String = rendered.chars().take(MAX_ARGS_PREVIEW_CHARS).collect();
+        format!("{truncated}… ({} bytes total)", rendered.len())
+    } else {
+        rendered
     }
 }
 
@@ -2519,11 +2619,14 @@ impl ModelDriver for FrameworkModelDriver {
 
         // Text was already streamed to `sink` live above, so the assembler runs
         // with a no-op `on_text`. `updates_to_step` (unit-tested) is the single
-        // place that folds the updates into `(ModelStep, usage)` — coalescing
-        // text, merging tool-call fragments, and assembling provider usage —
-        // exactly as the former non-streaming `get_response` mapping did.
-        let (step, usage) = updates_to_step(updates, |_| {});
-        Ok(StepOutcome::new(step, usage))
+        // place that folds the updates into `(ModelStep, usage, preface)` —
+        // coalescing text, merging tool-call fragments, and assembling
+        // provider usage — exactly as the former non-streaming `get_response`
+        // mapping did. `preface` is FIX 3's surfaced assistant text when the
+        // step is a `CallTool` (`None` for `Say`/`Finish`, whose text already
+        // rides the step).
+        let (step, usage, preface) = updates_to_step(updates, |_| {});
+        Ok(StepOutcome::new(step, usage).with_preface(preface))
     }
 }
 
@@ -2540,16 +2643,21 @@ fn update_text_delta(update: &agent_framework_core::types::ChatResponseUpdate) -
 
 /// Map a fully-assembled framework
 /// [`ChatResponse`](agent_framework_core::types::ChatResponse) to the loop's
-/// `(ModelStep, usage)`: a function call becomes [`ModelStep::CallTool`], any
-/// other completed turn becomes [`ModelStep::Finish`] carrying its text. Usage is
-/// MEASURED tokens with an UNMEASURED cost (priced downstream), or `None` when
-/// the provider reported none — never a fabricated zero. This is the identical
-/// mapping the non-streaming `get_response` path used, now applied to the
-/// stream-assembled response.
+/// `(ModelStep, usage, preface)`: a function call becomes
+/// [`ModelStep::CallTool`], any other completed turn becomes
+/// [`ModelStep::Finish`] carrying its text. Usage is MEASURED tokens with an
+/// UNMEASURED cost (priced downstream), or `None` when the provider reported
+/// none — never a fabricated zero. `preface` is FIX 3 (transcript-fidelity,
+/// loop-fix Task 1): a turn can carry BOTH text and a function call, and that
+/// text used to be silently dropped when the turn became a `CallTool` step
+/// (only the `Finish` arm ever read `response.text()`). It is now surfaced as
+/// `Some(text)` alongside the `CallTool` step so the loop can record the
+/// model's stated intent instead of losing it; `None` for a `Finish` step,
+/// whose text already rides the step itself.
 #[cfg(feature = "provider-openai")]
 fn chat_response_to_step(
     response: &agent_framework_core::types::ChatResponse,
-) -> (ModelStep, Option<ModelUsage>) {
+) -> (ModelStep, Option<ModelUsage>, Option<String>) {
     let usage = measured_usage(response.usage_details.as_ref());
 
     // A function call in the assembled turn becomes a tool call.
@@ -2559,12 +2667,17 @@ fn chat_response_to_step(
                 .parse_arguments()
                 .map(|map| serde_json::to_value(map).unwrap_or(Value::Null))
                 .unwrap_or(Value::Null);
+            // FIX 3: the SAME message can carry text alongside the function
+            // call — surface it rather than dropping it on the floor.
+            let text = message.text();
+            let preface = (!text.is_empty()).then_some(text);
             return (
                 ModelStep::CallTool {
                     tool: call.name.clone(),
                     args,
                 },
                 usage,
+                preface,
             );
         }
     }
@@ -2580,16 +2693,18 @@ fn chat_response_to_step(
             },
         },
         usage,
+        None,
     )
 }
 
-/// Fold a batch of streaming updates into `(ModelStep, usage)`, invoking
-/// `on_text` with each text delta in arrival order. Pure and synchronous — the
-/// testable mirror of [`FrameworkModelDriver::next_step`]'s live loop: it
-/// extracts each delta with [`update_text_delta`], absorbs every update into a
-/// [`ChatResponse`](agent_framework_core::types::ChatResponse) via the
-/// framework's own coalescer (text coalesces, tool-call fragments merge, usage
-/// accumulates), then maps the assembled response with [`chat_response_to_step`].
+/// Fold a batch of streaming updates into `(ModelStep, usage, preface)`,
+/// invoking `on_text` with each text delta in arrival order. Pure and
+/// synchronous — the testable mirror of [`FrameworkModelDriver::next_step`]'s
+/// live loop: it extracts each delta with [`update_text_delta`], absorbs every
+/// update into a [`ChatResponse`](agent_framework_core::types::ChatResponse)
+/// via the framework's own coalescer (text coalesces, tool-call fragments
+/// merge, usage accumulates), then maps the assembled response with
+/// [`chat_response_to_step`] (whose `preface` this passes through unchanged).
 /// The driver emits live to its sink as updates arrive and calls this with a
 /// no-op `on_text` purely to assemble; the unit test calls it with a collecting
 /// closure to pin the ordered-chunk / coalesced-text / assembled-usage contract.
@@ -2597,7 +2712,7 @@ fn chat_response_to_step(
 fn updates_to_step(
     updates: Vec<agent_framework_core::types::ChatResponseUpdate>,
     mut on_text: impl FnMut(&str),
-) -> (ModelStep, Option<ModelUsage>) {
+) -> (ModelStep, Option<ModelUsage>, Option<String>) {
     use agent_framework_core::types::ChatResponse;
 
     let mut assembled = ChatResponse::default();
@@ -2830,6 +2945,67 @@ mod tests {
         let replay = &messages[3];
         assert_eq!(replay.role, Role::user());
         assert!(replay.text().contains("[tool result: shell.run]"));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn to_messages_pairs_a_tool_call_with_its_result() {
+        // FIX 1 (transcript fidelity, loop-fix Task 1): a `ToolCall` renders
+        // as its own ASSISTANT turn — the model's own prior request, replayed
+        // back to it — immediately followed by the matching `ToolResult`, so
+        // the asked->result pairing survives the replay.
+        use agent_framework_core::types::Role;
+        let transcript = vec![
+            TurnItem::Objective("read the config".to_string()),
+            TurnItem::ToolCall {
+                tool: "workspace.read_file".to_string(),
+                args: json!({"path": "config.toml"}),
+            },
+            TurnItem::ToolResult {
+                tool: "workspace.read_file".to_string(),
+                output: "config.toml (lines 1-3 of 3)\n     1\t[x]\n".to_string(),
+            },
+        ];
+        let messages = FrameworkModelDriver::to_messages(&transcript);
+        assert_eq!(messages.len(), 4, "system + three transcript items");
+
+        let call = &messages[2];
+        assert_eq!(
+            call.role,
+            Role::assistant(),
+            "the replayed call is the model's own prior turn, not a user turn"
+        );
+        assert!(
+            call.text().contains("workspace.read_file"),
+            "the call marker must name the tool: {}",
+            call.text()
+        );
+        assert!(
+            call.text().contains("config.toml"),
+            "the call marker must show the (compacted) args: {}",
+            call.text()
+        );
+
+        let result = &messages[3];
+        assert_eq!(result.role, Role::user());
+        assert!(result.text().contains("[tool result: workspace.read_file]"));
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn compact_args_truncates_a_huge_args_blob() {
+        // FIX 1: a pathologically large argument value (e.g. a full patch
+        // body) must not be dumped a second time into the transcript.
+        let huge = "x".repeat(MAX_ARGS_PREVIEW_CHARS * 3);
+        let rendered = compact_args(&json!({"patch": huge}));
+        assert!(
+            rendered.len() < huge.len(),
+            "a huge args blob must be truncated, not reproduced whole"
+        );
+        assert!(
+            rendered.contains("bytes total"),
+            "a truncated marker must say so: {rendered}"
+        );
     }
 
     #[cfg(feature = "provider-openai")]
@@ -3456,7 +3632,7 @@ mod tests {
         // provider usage (measured tokens, unmeasured cost).
         let updates = vec![text_update("Hel"), text_update("lo"), usage_update(3, 2)];
         let mut chunks = Vec::new();
-        let (step, usage) = updates_to_step(updates, |c| chunks.push(c.to_string()));
+        let (step, usage, preface) = updates_to_step(updates, |c| chunks.push(c.to_string()));
 
         assert_eq!(chunks, vec!["Hel".to_string(), "lo".to_string()]);
         match step {
@@ -3471,6 +3647,9 @@ mod tests {
                 cost_micros: None,
             })
         );
+        // A `Finish` step's text rides the step itself; `preface` is only
+        // populated for a `CallTool` step (FIX 3), so it's None here.
+        assert_eq!(preface, None);
     }
 
     #[cfg(feature = "provider-openai")]
@@ -3480,10 +3659,83 @@ mod tests {
         // unmeasured, never charged a fabricated zero.
         let updates = vec![text_update("hi")];
         let mut chunks = Vec::new();
-        let (step, usage) = updates_to_step(updates, |c| chunks.push(c.to_string()));
+        let (step, usage, preface) = updates_to_step(updates, |c| chunks.push(c.to_string()));
 
         assert_eq!(chunks, vec!["hi".to_string()]);
         assert!(matches!(step, ModelStep::Finish { .. }));
         assert_eq!(usage, None);
+        assert_eq!(preface, None);
+    }
+
+    // -- FIX 3 (transcript fidelity, loop-fix Task 1): assistant text
+    // accompanying a tool call must not be dropped ---------------------------
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn chat_response_to_step_surfaces_text_that_accompanies_a_tool_call() {
+        // Before FIX 3, a turn carrying BOTH text and a function call lost the
+        // text entirely: `chat_response_to_step` returned only `CallTool`, so
+        // the model's stated intent ("I'll check the config file") never
+        // reached the transcript. It must now come back as `preface`.
+        use agent_framework_core::types::{
+            ChatResponse, Content, FunctionArguments, FunctionCallContent, Message,
+        };
+
+        let message = Message {
+            contents: vec![
+                Content::text("I'll check the config file first."),
+                Content::FunctionCall(FunctionCallContent {
+                    call_id: "call-1".to_string(),
+                    name: "workspace.read_file".to_string(),
+                    arguments: Some(FunctionArguments::Raw(
+                        json!({"path": "config.toml"}).to_string(),
+                    )),
+                }),
+            ],
+            ..Message::assistant("")
+        };
+        let response = ChatResponse {
+            messages: vec![message],
+            ..ChatResponse::default()
+        };
+
+        let (step, _usage, preface) = chat_response_to_step(&response);
+        assert!(
+            matches!(&step, ModelStep::CallTool { tool, .. } if tool == "workspace.read_file"),
+            "expected a CallTool step, got {step:?}"
+        );
+        assert_eq!(
+            preface.as_deref(),
+            Some("I'll check the config file first."),
+            "the assistant's stated intent must not be dropped"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn chat_response_to_step_has_no_preface_for_a_tool_call_with_no_text() {
+        // The common case (a bare tool call, no accompanying text) must not
+        // manufacture a preface out of nothing.
+        use agent_framework_core::types::{
+            ChatResponse, Content, FunctionArguments, FunctionCallContent, Message,
+        };
+
+        let message = Message {
+            contents: vec![Content::FunctionCall(FunctionCallContent {
+                call_id: "call-1".to_string(),
+                name: "workspace.read_file".to_string(),
+                arguments: Some(FunctionArguments::Raw(
+                    json!({"path": "config.toml"}).to_string(),
+                )),
+            })],
+            ..Message::assistant("")
+        };
+        let response = ChatResponse {
+            messages: vec![message],
+            ..ChatResponse::default()
+        };
+
+        let (_step, _usage, preface) = chat_response_to_step(&response);
+        assert_eq!(preface, None);
     }
 }
