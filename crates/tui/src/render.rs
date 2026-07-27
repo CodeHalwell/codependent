@@ -910,10 +910,34 @@ fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &
     } else {
         Style::default().fg(theme.agent.tool)
     };
-    out.push(Line::from(vec![
-        Span::styled(format!("{marker} ⏺ {name} "), head_style),
-        Span::styled(outcome_mark, Style::default().fg(outcome_color)),
-    ]));
+    // The label (e.g. `services/main.py` for `workspace.read_file`, `cargo
+    // test` for `shell.run`) renders as `{tool} · {label}` before the outcome
+    // mark, dim/muted so the tool name stays the visual anchor — exactly the
+    // `⏺ codypendent · <model>` convention the turn header already uses.
+    // `tool_card_lines` has no column-width parameter to fit against (unlike
+    // `desc_w`-style callers elsewhere in this file), so — matching every
+    // other fixed-width `truncate` call in this module (run objectives,
+    // skill/memory names, ...) — the label gets its own fixed cap, well under
+    // a typical card's width even alongside a long tool name. The daemon side
+    // (`codypendent_runtime::tools::tool_label`) already bounds the label to
+    // 80 chars; this is a second, independent, render-layer clamp so a card
+    // never overflows regardless of what produced the event. When there is no
+    // label (an older daemon, or a tool `tool_label` does not recognize) the
+    // head renders exactly as it did before this field existed: `{tool}
+    // {status}`, one line either way.
+    const LABEL_RENDER_MAX_CHARS: usize = 48;
+    let mut head = vec![Span::styled(format!("{marker} ⏺ {name} "), head_style)];
+    if let Some(label) = card.label.as_deref().filter(|l| !l.is_empty()) {
+        head.push(Span::styled(
+            format!("· {} ", truncate(label, LABEL_RENDER_MAX_CHARS)),
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    head.push(Span::styled(
+        outcome_mark,
+        Style::default().fg(outcome_color),
+    ));
+    out.push(Line::from(head));
 
     if card.expanded {
         if let Some(action) = &card.action {
@@ -3600,6 +3624,7 @@ mod tests {
                 run_id,
                 tool: "shell.run".to_owned(),
                 args_digest: "abc123".to_owned(),
+                label: None,
             }),
         );
         reduce(
@@ -3719,6 +3744,7 @@ mod tests {
                 run_id,
                 tool: "shell.run".to_owned(),
                 args_digest: "d".to_owned(),
+                label: None,
             }),
         );
         reduce(
@@ -3738,6 +3764,112 @@ mod tests {
             !out.contains("[failed]"),
             "old bracket style must be gone:\n{out}"
         );
+    }
+
+    /// A `ToolStarted.label` (e.g. the file `workspace.read_file` targets)
+    /// renders after the tool name as `{tool} · {label}`, ahead of the
+    /// outcome mark — so the card reads e.g. `workspace.read_file ·
+    /// services/main.py ✓` and the user can see WHICH file, not just that a
+    /// read happened.
+    #[test]
+    fn a_tool_card_with_a_label_shows_tool_dot_label() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "workspace.read_file".to_owned(),
+                args_digest: "abc".to_owned(),
+                label: Some("services/main.py".to_owned()),
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        assert!(
+            out.contains("workspace.read_file · services/main.py"),
+            "tool · label missing:\n{out}"
+        );
+    }
+
+    /// Without a label (an older daemon, or a tool `tool_label` does not
+    /// recognize) the head renders exactly as it always did — no bare `·`
+    /// with nothing after it.
+    #[test]
+    fn a_tool_card_without_a_label_renders_unchanged() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc".to_owned(),
+                label: None,
+            }),
+        );
+        let out = render_to_string(&s, 80, 20);
+        // Exactly the pre-existing collapsed head: tool name then the status
+        // word, no `·` injected between them (the header/footer chrome uses
+        // `·` for unrelated separators elsewhere in this same screen, so the
+        // check is scoped to the tool card's own line rather than the whole
+        // render).
+        assert!(
+            out.contains("⏺ shell.run running"),
+            "unchanged tool-card head missing:\n{out}"
+        );
+        assert!(
+            !out.contains("shell.run ·"),
+            "no dot separator after the tool name without a label:\n{out}"
+        );
+    }
+
+    /// A label longer than the render-layer cap is truncated with a trailing
+    /// `…` so a pathological (or simply long) label can never blow out the
+    /// one-line card, independent of whatever bound the daemon side applied.
+    #[test]
+    fn an_overlong_label_is_truncated_in_the_render_layer() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        let long_label = "a/".repeat(60) + "file.rs";
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "workspace.read_file".to_owned(),
+                args_digest: "abc".to_owned(),
+                label: Some(long_label.clone()),
+            }),
+        );
+        let out = render_to_string(&s, 120, 20);
+        assert!(
+            !out.contains(&long_label),
+            "label must be truncated:\n{out}"
+        );
+        assert!(out.contains('…'), "truncation ellipsis missing:\n{out}");
     }
 
     /// Task 5: a patch card's collapsed head is `❖ patch {short id}` plus a
@@ -3828,6 +3960,7 @@ mod tests {
                 run_id,
                 tool: "shell.run".to_owned(),
                 args_digest: "abc".to_owned(),
+                label: None,
             }),
         );
         let out = render_to_string(&s, 80, 20);
@@ -4151,6 +4284,7 @@ mod tests {
                 run_id,
                 tool: "shell.run".to_owned(),
                 args_digest: "abc123".to_owned(),
+                label: None,
             }),
         );
         reduce(
@@ -5565,6 +5699,7 @@ mod tests {
                 run_id,
                 tool: "shell.run".to_owned(),
                 args_digest: "abc".to_owned(),
+                label: None,
             }),
         );
         let out = render_to_string(&s, 90, 20);

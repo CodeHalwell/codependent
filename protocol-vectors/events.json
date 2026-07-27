@@ -377,6 +377,7 @@
     },
     "body": {
       "args_digest": "abc123",
+      "label": "cargo test --all-features",
       "run_id": "30000000-0000-0000-0000-000000000001",
       "tool": "shell.run",
       "type": "ToolStarted"

@@ -104,12 +104,20 @@ fn model_stream_delta(chunk: &ContentChunk, run_id: RunId) -> Vec<EventBody> {
 /// stays empty: the agent built these arguments, not Codypendent's own tool
 /// executor, so there is no digest comparable to the native path's
 /// `hash_json` (`crates/runtime/src/agent.rs`) to record here — never
-/// fabricate one.
+/// fabricate one. `label` stays `None` for the same reason: the native path's
+/// `crate::tools::tool_label` (in `codypendent-runtime`) derives it from
+/// Codypendent's own typed tool arguments, which have no equivalent here — the
+/// external agent's `ToolCall` does carry a `locations`/`raw_input` that could
+/// plausibly seed a label, but `tool_call.title` (already `tool` above) is
+/// already the human-readable summary ACP gives us, so inventing a second,
+/// differently-derived label for this one client is left out of scope rather
+/// than guessed at.
 fn tool_started(tool_call: &ToolCall, run_id: RunId) -> Vec<EventBody> {
     vec![EventBody::ToolStarted {
         run_id,
         tool: tool_call.title.clone(),
         args_digest: String::new(),
+        label: None,
     }]
 }
 
@@ -679,6 +687,7 @@ mod mapping_tests {
                 run_id,
                 tool: "read_file".to_string(),
                 args_digest: String::new(),
+                label: None,
             }]
         );
     }

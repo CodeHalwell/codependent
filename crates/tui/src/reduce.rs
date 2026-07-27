@@ -358,6 +358,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         status: ToolStatus::Proposed,
                         action: Some(action),
                         args_digest: None,
+                        label: None,
                         outcome: None,
                         artifact: None,
                         approval_id: Some(approval_id),
@@ -378,6 +379,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             run_id,
             tool,
             args_digest,
+            label,
         } => {
             if let Some(run) = state.run_mut(run_id) {
                 // Cloned before `tool` moves into the card below: the tool
@@ -388,6 +390,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     Some(card) => {
                         card.tool = tool;
                         card.args_digest = Some(args_digest);
+                        card.label = label;
                         card.status = ToolStatus::Running;
                     }
                     None => AppState::push_entry(
@@ -397,6 +400,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             status: ToolStatus::Running,
                             action: None,
                             args_digest: Some(args_digest),
+                            label,
                             outcome: None,
                             artifact: None,
                             approval_id: None,
@@ -430,6 +434,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             status: ToolStatus::Completed,
                             action: None,
                             args_digest: None,
+                            label: None,
                             outcome: Some(outcome),
                             artifact,
                             approval_id: None,
@@ -1744,6 +1749,7 @@ mod tests {
                     run_id,
                     tool: format!("tool.{i}"),
                     args_digest: format!("d{i}"),
+                    label: None,
                 },
             )
         });
@@ -2319,6 +2325,7 @@ mod tests {
                 run_id,
                 tool: "shell.run".to_owned(),
                 args_digest: "abc".to_owned(),
+                label: Some("cargo test".to_owned()),
             }),
         );
         reduce(
@@ -2341,6 +2348,10 @@ mod tests {
             unreachable!()
         };
         assert_eq!(card.tool, "shell.run");
+        // `ToolStarted.label` (STARTED, not PROPOSED or COMPLETED — neither
+        // carries a label) lands on the already-Proposed card unchanged
+        // through completion.
+        assert_eq!(card.label, Some("cargo test".to_owned()));
         assert_eq!(card.status, ToolStatus::Completed);
         assert_eq!(card.outcome, Some(ToolOutcome::Succeeded));
         assert!(card.artifact.is_some());
@@ -2458,6 +2469,7 @@ mod tests {
                 run_id,
                 tool: "shell.run".to_owned(),
                 args_digest: "abc".to_owned(),
+                label: None,
             }),
         );
         assert_eq!(

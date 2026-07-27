@@ -30,6 +30,7 @@
 mod blackboard;
 mod git;
 mod github;
+mod label;
 mod read_file;
 mod repository;
 mod salient;
@@ -57,6 +58,7 @@ pub use github::{
     CreateDraftPullRequestInput, GetPullRequest, GetPullRequestInput, ListCheckRuns,
     ListCheckRunsInput, UpdatePullRequestInput, UpdatePullRequestTool,
 };
+pub use label::tool_label;
 pub use read_file::{FileExcerpt, ReadFile, ReadFileInput};
 pub use repository::{RepositoryTest, RepositoryTestOutcome};
 pub use salient::{SalientStream, SalientView};
