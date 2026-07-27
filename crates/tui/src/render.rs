@@ -668,13 +668,33 @@ fn entry_lines<'a>(
                 theme.status.warning,
             ));
         }
-        TranscriptEntry::Completed { disposition } => match disposition {
+        TranscriptEntry::Completed {
+            disposition,
+            expanded,
+        } => match disposition {
             // Success: the streamed model prose already ended the turn —
             // render nothing here, so the reply is never echoed a second
             // (or, with the old status line plus this one, third) time.
             RunDisposition::Completed { .. } => {}
+            // A failed run's `reason` is often a nested driver/service error
+            // chain (e.g. "model driver error: model stream failed: service
+            // error: request failed: builder error") — raw, that reads as
+            // noise. Collapsed (default), only `summarize_error`'s one-line,
+            // human summary shows; expanding (Task 3, mirrors the Backstage
+            // fold) reveals the full raw chain underneath, so no detail is
+            // ever lost, just folded.
             RunDisposition::Failed { reason } => {
-                out.push(head(format!("✗ {reason}"), theme.status.error));
+                let marker = if *expanded { "▾" } else { "▸" };
+                out.push(head(
+                    format!("{marker} ✗ {}", summarize_error(reason)),
+                    theme.status.error,
+                ));
+                if *expanded {
+                    out.push(Line::styled(
+                        format!("    {reason}"),
+                        Style::default().fg(theme.text.muted),
+                    ));
+                }
             }
             RunDisposition::Cancelled { reason } => {
                 let text = reason
@@ -709,6 +729,34 @@ fn entry_lines<'a>(
         TranscriptEntry::Unsupported { label } => {
             out.push(head(format!("? {label}"), theme.text.muted));
         }
+    }
+}
+
+/// Map a nested error chain (`": "`-joined segments) to a concise summary. Pure
+/// heuristic: recognized outermost segments map to a friendly category; anything
+/// else degrades to the outermost segment verbatim. The full raw chain is one
+/// expand away, so no detail is lost.
+fn summarize_error(raw: &str) -> String {
+    let outer = raw.split(": ").next().unwrap_or("").trim();
+    // Recognized categories, checked against any segment of the chain.
+    for segment in raw.split(": ") {
+        match segment.trim() {
+            "model driver error" | "model stream failed" => {
+                return "model error — the provider request failed".to_owned();
+            }
+            _ => {}
+        }
+    }
+    for segment in raw.split(": ") {
+        match segment.trim() {
+            "service error" | "request failed" => return "provider request failed".to_owned(),
+            _ => {}
+        }
+    }
+    if outer.is_empty() {
+        "run failed".to_owned()
+    } else {
+        outer.to_owned()
     }
 }
 
@@ -3750,6 +3798,88 @@ mod tests {
         assert!(
             !out.contains("run cancelled:"),
             "terse form, not the old verbose echo:\n{out}"
+        );
+    }
+
+    /// Task 3: a nested error chain collapses to one concise, friendly line;
+    /// an unrecognized outermost segment degrades to itself verbatim (never a
+    /// crash, never a fabrication) and an empty reason still says something.
+    #[test]
+    fn summarize_error_maps_known_chains_and_degrades_unknown() {
+        assert_eq!(
+            summarize_error(
+                "model driver error: model stream failed: service error: request failed: builder error"
+            ),
+            "model error — the provider request failed"
+        );
+        assert_eq!(
+            summarize_error("service error: request failed"),
+            "provider request failed"
+        );
+        // Unknown outermost segment degrades to that segment verbatim (never a crash).
+        assert_eq!(
+            summarize_error("no model configured"),
+            "no model configured"
+        );
+        assert_eq!(summarize_error(""), "run failed");
+    }
+
+    /// Task 3: a failed run's nested error chain renders collapsed to the
+    /// concise summary by default (raw chain hidden), and expanding the
+    /// selected `Completed` entry reveals the full raw chain underneath —
+    /// nothing lost, just folded.
+    #[test]
+    fn a_failed_run_collapses_the_chain_and_expands_to_the_raw() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "hi".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Failed {
+                    reason: "model driver error: model stream failed: service error: request failed: builder error".to_owned(),
+                },
+                chronicle: filler_chronicle(),
+            }),
+        );
+
+        // Width 100 (rather than a tighter 80/90) keeps the raw, unwrapped
+        // chain on one row — at 88 inner columns the 89-column indented raw
+        // line wraps its last word onto its own row, which would split the
+        // "builder error" substring across a line break and make this a test
+        // artifact rather than a signal about the real feature.
+        let collapsed = render_to_string(&s, 100, 20);
+        assert!(
+            collapsed.contains("✗ model error — the provider request failed"),
+            "summary:\n{collapsed}"
+        );
+        assert!(
+            !collapsed.contains("builder error"),
+            "raw chain hidden while collapsed:\n{collapsed}"
+        );
+
+        // Select the Completed entry and expand it.
+        s.focus = Pane::Transcript;
+        let last = s.runs[0].transcript.len() - 1;
+        s.runs[0].transcript_selected = last;
+        reduce(&mut s, Action::Expand);
+
+        let expanded = render_to_string(&s, 100, 20);
+        assert!(
+            expanded.contains("✗ model error — the provider request failed"),
+            "summary kept:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("builder error"),
+            "raw chain revealed on expand:\n{expanded}"
         );
     }
 

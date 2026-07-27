@@ -277,8 +277,13 @@ pub enum TranscriptEntry {
         used: u64,
         limit: u64,
     },
-    /// The run's terminal marker.
-    Completed { disposition: RunDisposition },
+    /// The run's terminal marker. `expanded` (client-only view state, mirroring
+    /// the other fold flags) reveals the full raw failure chain beneath the
+    /// concise summary; `disposition` is the only wire data.
+    Completed {
+        disposition: RunDisposition,
+        expanded: bool,
+    },
     /// A note appended to the session. Long/multiline notes fold by default,
     /// mirroring [`ToolCard`]/[`PatchSummary`]; `expanded` is client-only view
     /// state — it is never part of the `NoteAppended` wire event.

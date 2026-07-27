@@ -524,6 +524,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     run,
                     TranscriptEntry::Completed {
                         disposition: disposition.clone(),
+                        expanded: false,
                     },
                 );
                 run.disposition = Some(disposition);
@@ -769,6 +770,7 @@ fn expand_selected(state: &mut AppState) {
                 TranscriptEntry::Patch(patch) => patch.expanded = !patch.expanded,
                 TranscriptEntry::Note { expanded, .. } => *expanded = !*expanded,
                 TranscriptEntry::Backstage { expanded, .. } => *expanded = !*expanded,
+                TranscriptEntry::Completed { expanded, .. } => *expanded = !*expanded,
                 _ => {}
             }
         }
@@ -1981,6 +1983,52 @@ mod tests {
 
         reduce(&mut s, Action::Expand);
         let TranscriptEntry::Backstage { expanded, .. } = &s.runs[0].transcript[idx] else {
+            unreachable!()
+        };
+        assert!(!*expanded, "Expand toggles it back off");
+    }
+
+    #[test]
+    fn expand_toggles_a_selected_completed_entry() {
+        // Task 3: the same Action::Expand that toggles a selected Backstage
+        // entry also toggles a failed run's `Completed` entry, revealing the
+        // full raw error chain beneath the concise summary (render.rs).
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Failed {
+                    reason: "boom".to_owned(),
+                },
+                chronicle: artifact(),
+            }),
+        );
+        let idx = s.runs[0]
+            .transcript
+            .iter()
+            .position(|e| matches!(e, TranscriptEntry::Completed { .. }))
+            .expect("a Completed entry was folded in");
+
+        s.focus = Pane::Transcript;
+        s.runs[0].transcript_selected = idx;
+        reduce(&mut s, Action::Expand);
+        let TranscriptEntry::Completed { expanded, .. } = &s.runs[0].transcript[idx] else {
+            unreachable!()
+        };
+        assert!(*expanded, "Expand opens the selected Completed entry");
+
+        reduce(&mut s, Action::Expand);
+        let TranscriptEntry::Completed { expanded, .. } = &s.runs[0].transcript[idx] else {
             unreachable!()
         };
         assert!(!*expanded, "Expand toggles it back off");
