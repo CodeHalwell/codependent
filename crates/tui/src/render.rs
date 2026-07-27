@@ -380,7 +380,7 @@ fn for_each_row<'a>(
                 awaiting_header = false;
             }
             match entry {
-                TranscriptEntry::Model { text } => {
+                TranscriptEntry::Model { text, .. } => {
                     let mut rows: Vec<&str> = text.lines().collect();
                     if rows.is_empty() {
                         rows.push("");
@@ -724,7 +724,7 @@ fn entry_lines<'a>(
                 out.push(Line::styled("  ", Style::default().fg(theme.text.primary)));
             }
         }
-        TranscriptEntry::Model { text } => {
+        TranscriptEntry::Model { text, .. } => {
             model_entry_lines(text, theme, selected, streaming_tail, out);
         }
         TranscriptEntry::Tool(card) => tool_card_lines(card, theme, selected, out),

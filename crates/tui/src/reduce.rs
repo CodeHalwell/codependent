@@ -2155,7 +2155,7 @@ mod tests {
         // turn RunStarted pushes for the objective.
         assert_eq!(s.runs[0].transcript.len(), 2);
         match &s.runs[0].transcript[1] {
-            TranscriptEntry::Model { text } => assert_eq!(text, "Hello, world"),
+            TranscriptEntry::Model { text, .. } => assert_eq!(text, "Hello, world"),
             other => panic!("expected coalesced Model entry, got {other:?}"),
         }
         // The serving model was learned from the agent actor.

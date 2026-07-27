@@ -265,8 +265,12 @@ pub struct PatchSummary {
 pub enum TranscriptEntry {
     /// The user's own message — the run objective, or a steering follow-up.
     User { text: String },
-    /// Coalesced streamed model prose.
-    Model { text: String },
+    /// Coalesced streamed model prose. `rendered` is the parse-once rich cache:
+    /// `None` while streaming (render plain); `Some` once finalized (render rich).
+    Model {
+        text: String,
+        rendered: Option<Vec<crate::markdown::RichLine>>,
+    },
     /// A tool card (boxed: it is by far the largest variant).
     Tool(Box<ToolCard>),
     /// A proposed patch / change set.
@@ -1236,13 +1240,20 @@ impl AppState {
 
     /// Append model text, coalescing into a trailing `Model` entry.
     pub(crate) fn append_model_text(run: &mut RunView, text: &str) {
-        if let Some(TranscriptEntry::Model { text: existing }) = run.transcript.last_mut() {
+        if let Some(TranscriptEntry::Model {
+            text: existing,
+            rendered,
+        }) = run.transcript.last_mut()
+        {
             // Bound one coalesced model entry: an hours-long stream must not grow
             // a single String without limit (the full text is in the ledger; the
             // transcript is a view). Past the cap, start a fresh entry so the
             // entry-count cap in `push_entry` takes over.
             if existing.len() + text.len() <= MAX_MODEL_ENTRY_BYTES {
                 existing.push_str(text);
+                // The only entry that receives appends is the never-finalized
+                // streaming tail; keep its cache empty so it renders plain.
+                *rendered = None;
                 return;
             }
         }
@@ -1250,6 +1261,7 @@ impl AppState {
             run,
             TranscriptEntry::Model {
                 text: text.to_owned(),
+                rendered: None,
             },
         );
     }
