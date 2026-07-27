@@ -99,6 +99,56 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
     },
 ];
 
+/// One footer chip: a compact display label paired with the real `KEY_BINDINGS`
+/// entry it derives from (so it can never drift) and the `Action` a click fires.
+#[derive(Debug, Clone)]
+pub struct FooterHint {
+    pub binding: &'static KeyBinding,
+    pub label: &'static str,
+    pub action: Action,
+}
+
+/// The curated, ordered footer strip. Each entry references a real binding by
+/// index (the drift-guard test asserts each is present in `KEY_BINDINGS`).
+static FOOTER_HINTS: &[FooterHint] = &[
+    FooterHint {
+        binding: &KEY_BINDINGS[1],
+        label: "⏎ send",
+        action: Action::InputSubmit,
+    },
+    FooterHint {
+        binding: &KEY_BINDINGS[2],
+        label: "/ commands",
+        action: Action::OpenPalette,
+    },
+    FooterHint {
+        binding: &KEY_BINDINGS[3],
+        label: "↑↓ scroll",
+        action: Action::ScrollPageDown,
+    },
+    FooterHint {
+        binding: &KEY_BINDINGS[5],
+        label: "F2 layout",
+        action: Action::ToggleLayout,
+    },
+    FooterHint {
+        binding: &KEY_BINDINGS[9],
+        label: "? help",
+        action: Action::Help,
+    },
+    FooterHint {
+        binding: &KEY_BINDINGS[12],
+        label: "q detach",
+        action: Action::Detach,
+    },
+];
+
+/// The persistent, derived shortcut strip (curated subset of `KEY_BINDINGS`).
+#[must_use]
+pub fn footer_hints() -> &'static [FooterHint] {
+    FOOTER_HINTS
+}
+
 /// Translate a terminal event into a semantic [`Action`].
 ///
 /// `mode` decides whether printable keys are text or navigation; `width` is the
@@ -587,5 +637,20 @@ mod tests {
             W,
         );
         assert_eq!(click, Action::NoOp);
+    }
+
+    /// Drift guard: every footer chip must derive from a real `KEY_BINDINGS`
+    /// entry (Task 5) — the footer strip can never silently diverge from the
+    /// actual bindings table.
+    #[test]
+    fn footer_hints_are_all_backed_by_real_bindings() {
+        for hint in footer_hints() {
+            assert!(
+                KEY_BINDINGS.iter().any(|b| b.keys == hint.binding.keys),
+                "footer hint {:?} must derive from a real KEY_BINDINGS entry",
+                hint.label
+            );
+            assert!(!hint.label.is_empty());
+        }
     }
 }

@@ -20,6 +20,7 @@ use codypendent_protocol::{
     AgentMode, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition, RunState,
 };
 
+use crate::input::footer_hints;
 use crate::reduce::capability_label;
 use crate::state::{
     filter_model_names, filter_models, filter_providers, AppState, DocFocus, DocLeaseState,
@@ -37,26 +38,29 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     );
 
     // A conversation-centred shell: the transcript is the workspace, a
-    // persistent composer sits beneath it, and a one-row status footer spans the
-    // bottom. Every other surface (runs, approvals, docs, skills, memory, edges)
-    // is a centered overlay or the approval modal — minimal permanent chrome.
+    // persistent composer sits beneath it, a one-row status footer follows, and
+    // a one-row derived shortcuts strip spans the very bottom. Every other
+    // surface (runs, approvals, docs, skills, memory, edges) is a centered
+    // overlay or the approval modal — minimal permanent chrome.
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),                  // conversation transcript
             Constraint::Length(COMPOSER_HEIGHT), // persistent composer
             Constraint::Length(1),               // status footer
+            Constraint::Length(1),               // shortcuts footer (derived)
         ])
         .split(area);
 
-    // The region above the composer depends on the layout; the composer and
-    // status footer are identical in both.
+    // The region above the composer depends on the layout; the composer, status
+    // footer, and shortcuts footer are identical in both.
     match state.layout {
         LayoutMode::Chat => render_conversation(frame, rows[0], state, theme),
         LayoutMode::Workspace => render_workspace(frame, rows[0], state, theme),
     }
     render_composer(frame, rows[1], state, theme);
     render_status_line(frame, rows[2], state, theme);
+    render_shortcuts_bar(frame, rows[3], state, theme);
 
     render_overlays(frame, area, state, theme);
 }
@@ -1140,6 +1144,41 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     spans.extend(hint);
     spans.push(Span::raw(" "));
 
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
+}
+
+/// The persistent, derived shortcut strip: `·`-separated chips built from
+/// `input::footer_hints()`, so it never drifts from the real key bindings. Chips
+/// drop right-to-left on narrow terminals.
+fn render_shortcuts_bar(frame: &mut Frame, area: Rect, _state: &AppState, theme: &Theme) {
+    let bg = Style::default().bg(theme.surface.overlay);
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    let mut used = 1usize;
+    let width = area.width as usize;
+    for (i, hint) in footer_hints().iter().enumerate() {
+        let sep = if i > 0 { 3 } else { 0 }; // " · "
+        let chip = Span::raw(hint.label).width(); // DISPLAY width (labels have ⏎/↑↓)
+        if used + sep + chip + 1 > width {
+            break; // drop the rest on a narrow terminal
+        }
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(theme.text.muted)));
+            used += 3;
+        }
+        // Split "glyph rest" so the key glyph reads as the accent.
+        let (glyph, rest) = hint.label.split_once(' ').unwrap_or((hint.label, ""));
+        spans.push(Span::styled(
+            glyph.to_owned(),
+            Style::default().fg(theme.focus.active),
+        ));
+        if !rest.is_empty() {
+            spans.push(Span::styled(
+                format!(" {rest}"),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        used += chip;
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
 }
 
@@ -4464,6 +4503,58 @@ mod tests {
         reduce(&mut state, Action::ToggleLayout);
         let chat = render_to_string(&state, 120, 30);
         assert!(!chat.contains("Runs ("), "should be single-column:\n{chat}");
+    }
+
+    #[test]
+    fn the_shortcuts_footer_renders_derived_chips() {
+        let state = running_build_state();
+        let out = render_to_string(&state, 100, 30);
+        // The persistent footer strip (its own row, below the status line).
+        assert!(out.contains("send"), "send chip:\n{out}");
+        assert!(out.contains("commands"), "commands chip:\n{out}");
+        assert!(out.contains("layout"), "layout chip:\n{out}");
+        assert!(out.contains("help"), "help chip:\n{out}");
+    }
+
+    #[test]
+    fn shortcuts_footer_row_does_not_clip_composer_or_status_line() {
+        // The root layout gains a 4th row for the shortcuts footer (Task 5) by
+        // shrinking the `Min(3)` transcript region — the fixed-height composer
+        // and status rows keep their full height, unclipped, with the footer as
+        // the new bottom-most row.
+        let state = running_build_state();
+        let height = 30u16;
+        let text = render_to_string(&state, 100, height);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            height as usize,
+            "expected exactly {height} rendered rows:\n{text}"
+        );
+
+        // Bottom-most row: the new shortcuts footer.
+        let footer_row = lines[lines.len() - 1];
+        assert!(
+            footer_row.contains("send") || footer_row.contains("commands"),
+            "bottom row should be the shortcuts footer:\n{footer_row:?}"
+        );
+
+        // Directly above it: the unchanged status line, still showing its fields.
+        let status_row = lines[lines.len() - 2];
+        assert!(
+            status_row.contains("mode"),
+            "status line should sit directly above the footer, unclipped:\n{status_row:?}"
+        );
+
+        // The `COMPOSER_HEIGHT` rows above that are the persistent composer —
+        // still fully present, not swallowed by the new footer row.
+        let composer_start = lines.len() - 2 - COMPOSER_HEIGHT as usize;
+        let composer_end = lines.len() - 2;
+        let composer_rows = lines[composer_start..composer_end].join("\n");
+        assert!(
+            composer_rows.contains('›'),
+            "composer should keep its full height, unclipped:\n{composer_rows}"
+        );
     }
 
     #[test]
