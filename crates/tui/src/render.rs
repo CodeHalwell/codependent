@@ -1064,16 +1064,6 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             .run_state
             .map_or(theme.text.muted, |s| run_state_color(s, theme)),
     ));
-    if full {
-        ambient.push(field(
-            "model",
-            status
-                .model
-                .as_ref()
-                .map_or("—".to_owned(), ToString::to_string),
-            theme.text.secondary,
-        ));
-    }
     if mid {
         ambient.push(field(
             "ctx",
@@ -1128,10 +1118,8 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         ]
     } else if scrolled_up {
         vec![key("PgDn"), word(" ↧ latest")]
-    } else if !state.composer.is_empty() {
-        vec![key("⏎"), word(" send  "), key("Esc"), word(" clear")]
     } else {
-        vec![key("/"), word(" cmds  "), key("F2"), word(" layout")]
+        Vec::new()
     };
     // Right-align the hint by padding between it and the ambient fields. This
     // renders every frame, so measure widths from the spans directly rather than
@@ -4563,20 +4551,19 @@ mod tests {
         let mut state = running_build_state();
         let idle = render_to_string(&state, 120, 30);
         assert!(idle.contains("mode"), "ambient fields:\n{idle}");
-        assert!(idle.contains("model"), "model field at full width:\n{idle}");
         assert!(
-            idle.contains("cmds") || idle.contains("F2"),
-            "command hint:\n{idle}"
+            idle.contains("commands") || idle.contains("F2"),
+            "footer command chips:\n{idle}"
         );
 
-        // Drafting: the hint invites sending.
+        // Drafting still shows the ambient state; the send affordance is in the footer.
         for c in "hello".chars() {
             reduce(&mut state, Action::InputChar(c));
         }
         let drafting = render_to_string(&state, 120, 30);
         assert!(
             drafting.contains("send"),
-            "send hint while drafting:\n{drafting}"
+            "send chip in the footer:\n{drafting}"
         );
     }
 
@@ -4589,6 +4576,29 @@ mod tests {
         assert!(
             !narrow.contains("model"),
             "model dropped when narrow:\n{narrow}"
+        );
+    }
+
+    #[test]
+    fn the_status_line_drops_the_model_but_keeps_honest_placeholders() {
+        let state = running_build_state();
+        let out = render_to_string(&state, 120, 30);
+        // The model is deduped out of the status line's ambient fields — but still
+        // shown in the header chrome + the assistant turn header.
+        let status_row = out.lines().rev().nth(1).unwrap_or(""); // status line is 2nd from bottom
+        assert!(
+            !status_row.contains("model"),
+            "no `model` field on the status line:\n{status_row}"
+        );
+        assert!(
+            out.contains("gpt-5.1-codex"),
+            "model still shown in chrome/turn header:\n{out}"
+        );
+        // Honesty: unmeasured cost/wt still render `—` (running_build_state measures
+        // neither), never a fabricated number.
+        assert!(
+            status_row.contains("—"),
+            "unmeasured fields stay em-dash:\n{status_row}"
         );
     }
 
