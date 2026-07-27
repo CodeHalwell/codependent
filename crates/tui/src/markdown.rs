@@ -79,6 +79,9 @@ pub fn parse(text: &str) -> Vec<RichLine> {
 /// Width of a thematic break's rule (cosmetic; the Paragraph does not stretch it).
 const RULE_WIDTH: usize = 24;
 
+/// Cap a table's total content width so a pathological table cannot blow the pane.
+const MAX_TABLE_WIDTH: usize = 100;
+
 #[derive(Default)]
 struct Builder {
     lines: Vec<RichLine>,
@@ -95,15 +98,14 @@ struct Builder {
     // Fenced code: `Some(lang)` while inside a fence; `code` accumulates its body.
     code_lang: Option<String>,
     code: String,
-    // Table state (populated by Task 5; the Table arms are stubs until then).
+    // Table state, collected across the Table/TableHead/TableRow/TableCell
+    // events and laid out into aligned rows by `layout_table` at `TagEnd::Table`.
     table: Option<TableState>,
 }
 
 #[derive(Default)]
 struct TableState {
-    // Collected here (Task 2); read by Task 5's `layout_table` for column
-    // alignment. Unread until that lands, so the field is dead code for now.
-    #[allow(dead_code)]
+    // Collected here (Task 2); read by `layout_table` for column alignment.
     aligns: Vec<Alignment>,
     rows: Vec<Vec<Vec<RichSpan>>>, // rows[r][col] = cell spans
     row: Vec<Vec<RichSpan>>,
@@ -333,9 +335,13 @@ impl Builder {
         }
     }
 
-    /// Table layout — stub until Task 5.
+    /// Table layout: lay the collected `TableState` out into aligned rows and
+    /// splice each into the output via `push_line` (gutter-prefixed).
     fn emit_table(&mut self) {
-        self.table = None;
+        let Some(t) = self.table.take() else { return };
+        for line in layout_table(&t) {
+            self.push_line(line);
+        }
     }
 
     fn finish(mut self) -> Vec<RichLine> {
@@ -353,6 +359,91 @@ fn heading_num(level: HeadingLevel) -> u8 {
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
     }
+}
+
+/// Lay a collected table out into gutter-less `RichLine` bodies: a header row, a
+/// "─┼─" rule row, then one row per body line. Column widths are the max cell
+/// display width, capped so the total stays within `MAX_TABLE_WIDTH`; overlong
+/// cells are truncated with a trailing "…".
+fn layout_table(t: &TableState) -> Vec<Vec<RichSpan>> {
+    let n_cols = t.rows.iter().map(Vec::len).max().unwrap_or(0);
+    if n_cols == 0 {
+        return Vec::new();
+    }
+    let cell_text =
+        |cell: &[RichSpan]| -> String { cell.iter().map(|s| s.text.as_str()).collect() };
+    let cell_width = |cell: &[RichSpan]| -> usize { cell_text(cell).chars().count() };
+
+    // Column widths, capped so n_cols columns + " │ " joins fit MAX_TABLE_WIDTH.
+    let cap = (MAX_TABLE_WIDTH / n_cols).max(3);
+    let mut widths = vec![0usize; n_cols];
+    for row in &t.rows {
+        for (c, cell) in row.iter().enumerate() {
+            widths[c] = widths[c].max(cell_width(cell).min(cap));
+        }
+    }
+
+    let pad_cell = |cell: &[RichSpan], w: usize, align: Alignment, role: SpanRole| -> RichSpan {
+        let mut text = cell_text(cell);
+        let len = text.chars().count();
+        if len > w {
+            text = text.chars().take(w.saturating_sub(1)).collect::<String>() + "…";
+        } else {
+            let fill = w - len;
+            match align {
+                Alignment::Right => text = " ".repeat(fill) + &text,
+                Alignment::Center => {
+                    let l = fill / 2;
+                    text = " ".repeat(l) + &text + &" ".repeat(fill - l);
+                }
+                _ => text = text + &" ".repeat(fill), // None/Left
+            }
+        }
+        RichSpan { text, role }
+    };
+
+    let align_of = |c: usize| -> Alignment { t.aligns.get(c).copied().unwrap_or(Alignment::None) };
+    let empty: Vec<RichSpan> = Vec::new();
+    let mut out: Vec<Vec<RichSpan>> = Vec::with_capacity(t.rows.len() + 1);
+
+    for (r, row) in t.rows.iter().enumerate() {
+        let is_header = r < t.head_rows;
+        let role = if is_header {
+            SpanRole::TableHeader
+        } else {
+            SpanRole::TableCell
+        };
+        let mut spans: Vec<RichSpan> = Vec::with_capacity(n_cols * 2);
+        for (c, &w) in widths.iter().enumerate() {
+            if c > 0 {
+                spans.push(RichSpan {
+                    text: " │ ".to_string(),
+                    role: SpanRole::TableRule,
+                });
+            }
+            let cell = row.get(c).unwrap_or(&empty);
+            spans.push(pad_cell(cell, w, align_of(c), role));
+        }
+        out.push(spans);
+        // Emit the "─┼─" rule directly after the header block.
+        if is_header && r + 1 == t.head_rows {
+            let mut rule: Vec<RichSpan> = Vec::with_capacity(n_cols * 2);
+            for (c, &w) in widths.iter().enumerate() {
+                if c > 0 {
+                    rule.push(RichSpan {
+                        text: "─┼─".to_string(),
+                        role: SpanRole::TableRule,
+                    });
+                }
+                rule.push(RichSpan {
+                    text: "─".repeat(w),
+                    role: SpanRole::TableRule,
+                });
+            }
+            out.push(rule);
+        }
+    }
+    out
 }
 
 /// Tab width synoptic uses when normalizing multi-line token state.
@@ -605,5 +696,27 @@ mod tests {
             .collect();
         assert!(roles.contains(&SpanRole::CodeToken(SyntaxRole::Keyword)));
         assert_eq!(lines[0].spans[0].role, SpanRole::Gutter);
+    }
+
+    #[test]
+    fn table_renders_aligned_header_rule_and_rows() {
+        let md = "| a | bb |\n| :- | -: |\n| 1 | 2 |\n| 33 | 4 |";
+        let lines = parse(md);
+        // header + rule + 2 body rows (each a RichLine).
+        assert!(lines.len() >= 4, "got {} lines", lines.len());
+        // A header cell carries the TableHeader role.
+        assert!(lines[0]
+            .spans
+            .iter()
+            .any(|s| s.role == SpanRole::TableHeader));
+        // The second line is a rule row (─ separators) with TableRule spans.
+        assert!(lines[1].spans.iter().any(|s| s.role == SpanRole::TableRule));
+        assert!(lines[1].spans.iter().any(|s| s.text.contains('─')));
+        // Column widths are equal across the header and body rows (aligned).
+        let widths = |l: &RichLine| -> usize {
+            l.spans.iter().skip(1).map(|s| s.text.chars().count()).sum()
+        };
+        assert_eq!(widths(&lines[0]), widths(&lines[2]), "columns not aligned");
+        assert!(lines[2].spans.iter().any(|s| s.role == SpanRole::TableCell));
     }
 }
