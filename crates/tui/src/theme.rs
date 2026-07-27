@@ -21,6 +21,10 @@ pub struct SurfaceTokens {
     pub border: Color,
     /// The background of an overlay / modal.
     pub overlay: Color,
+    /// The background of the user's own message container (the `You` turn). A
+    /// subtly-raised surface distinct from `panel`; == `panel` on depths with no
+    /// distinct subtle surface (ansi16/monochrome), which fall back to an accent bar.
+    pub user: Color,
 }
 
 /// Foreground text roles.
@@ -56,6 +60,16 @@ pub struct SyntaxTokens {
     pub literal: Color,
     pub string: Color,
     pub comment: Color,
+    /// Type / struct / class / namespace names.
+    pub r#type: Color,
+    /// Function / method / macro names.
+    pub function: Color,
+    /// Operators (`+`, `=>`, `::`).
+    pub operator: Color,
+    /// Named constants / booleans / references.
+    pub constant: Color,
+    /// Brackets and separators.
+    pub punctuation: Color,
 }
 
 /// Diff / patch roles.
@@ -118,6 +132,7 @@ impl Theme {
                 panel: Color::Rgb(0x1a, 0x1d, 0x23),
                 border: Color::Rgb(0x33, 0x38, 0x42),
                 overlay: Color::Rgb(0x22, 0x26, 0x2e),
+                user: Color::Rgb(0x20, 0x24, 0x2c),
             },
             text: TextTokens {
                 primary: Color::Rgb(0xe6, 0xe9, 0xef),
@@ -138,6 +153,11 @@ impl Theme {
                 literal: Color::Rgb(0xe6, 0xb4, 0x50),
                 string: Color::Rgb(0x9c, 0xd6, 0x7a),
                 comment: Color::Rgb(0x6b, 0x74, 0x84),
+                r#type: Color::Rgb(0x5c, 0xc2, 0xc0),
+                function: Color::Rgb(0x6c, 0xb0, 0xf0),
+                operator: Color::Rgb(0xc3, 0xca, 0xd6),
+                constant: Color::Rgb(0xe8, 0x8a, 0x6a),
+                punctuation: Color::Rgb(0x9a, 0xa2, 0xb1),
             },
             diff: DiffTokens {
                 added: Color::Rgb(0x5d, 0xd6, 0x9a),
@@ -171,6 +191,7 @@ impl Theme {
                 panel: Color::Rgb(0xff, 0xff, 0xff),
                 border: Color::Rgb(0xd0, 0xd7, 0xde),
                 overlay: Color::Rgb(0xf0, 0xf2, 0xf5),
+                user: Color::Rgb(0xea, 0xec, 0xf1),
             },
             text: TextTokens {
                 primary: Color::Rgb(0x1f, 0x23, 0x28),
@@ -191,6 +212,11 @@ impl Theme {
                 literal: Color::Rgb(0x9a, 0x6b, 0x00),
                 string: Color::Rgb(0x1a, 0x7f, 0x4b),
                 comment: Color::Rgb(0x8a, 0x92, 0xa1),
+                r#type: Color::Rgb(0x0a, 0x7a, 0x78),
+                function: Color::Rgb(0x08, 0x4a, 0xc0),
+                operator: Color::Rgb(0x4a, 0x52, 0x5e),
+                constant: Color::Rgb(0xb0, 0x4a, 0x00),
+                punctuation: Color::Rgb(0x6b, 0x73, 0x82),
             },
             diff: DiffTokens {
                 added: Color::Rgb(0x1a, 0x7f, 0x4b),
@@ -225,6 +251,7 @@ impl Theme {
                 panel: Color::Rgb(0x00, 0x00, 0x00),
                 border: Color::Rgb(0xff, 0xff, 0xff),
                 overlay: Color::Rgb(0x0a, 0x0a, 0x0a),
+                user: Color::Rgb(0x1a, 0x1a, 0x1a),
             },
             text: TextTokens {
                 primary: Color::Rgb(0xff, 0xff, 0xff),
@@ -245,6 +272,11 @@ impl Theme {
                 literal: Color::Rgb(0xff, 0xd7, 0x00),
                 string: Color::Rgb(0x00, 0xff, 0x5f),
                 comment: Color::Rgb(0xc0, 0xc0, 0xc0),
+                r#type: Color::Rgb(0x00, 0xff, 0xd7),
+                function: Color::Rgb(0x00, 0xd7, 0xff),
+                operator: Color::Rgb(0xff, 0xff, 0xff),
+                constant: Color::Rgb(0xff, 0xa5, 0x00),
+                punctuation: Color::Rgb(0xe0, 0xe0, 0xe0),
             },
             diff: DiffTokens {
                 added: Color::Rgb(0x00, 0xff, 0x5f),
@@ -282,6 +314,7 @@ impl Theme {
                 panel: Color::Rgb(0x1b, 0x1e, 0x24),
                 border: Color::Rgb(0x3a, 0x40, 0x4a),
                 overlay: Color::Rgb(0x23, 0x27, 0x2f),
+                user: Color::Rgb(0x23, 0x27, 0x2f),
             },
             text: TextTokens {
                 primary: Color::Rgb(0xed, 0xf0, 0xf5),
@@ -302,6 +335,11 @@ impl Theme {
                 literal: Color::Rgb(0xe6, 0x9f, 0x00),
                 string: Color::Rgb(0x00, 0x9e, 0x73),
                 comment: Color::Rgb(0x86, 0x8e, 0x9d),
+                r#type: Color::Rgb(0x56, 0xb4, 0xe9),
+                function: Color::Rgb(0x00, 0x72, 0xb2),
+                operator: Color::Rgb(0xbc, 0xc2, 0xce),
+                constant: Color::Rgb(0xd5, 0x5e, 0x00),
+                punctuation: Color::Rgb(0x94, 0x9c, 0xac),
             },
             diff: DiffTokens {
                 added: Color::Rgb(0x00, 0x9e, 0x73), // bluish green (not pure green)
@@ -335,6 +373,7 @@ impl Theme {
                 panel: Color::Indexed(235),
                 border: Color::Indexed(240),
                 overlay: Color::Indexed(237),
+                user: Color::Indexed(236),
             },
             text: TextTokens {
                 primary: Color::Indexed(253),
@@ -355,6 +394,11 @@ impl Theme {
                 literal: Color::Indexed(179),
                 string: Color::Indexed(114),
                 comment: Color::Indexed(242),
+                r#type: Color::Indexed(80),
+                function: Color::Indexed(75),
+                operator: Color::Indexed(249),
+                constant: Color::Indexed(173),
+                punctuation: Color::Indexed(245),
             },
             diff: DiffTokens {
                 added: Color::Indexed(78),
@@ -389,6 +433,7 @@ impl Theme {
                 panel: Color::Black,
                 border: Color::DarkGray,
                 overlay: Color::Black,
+                user: Color::Black,
             },
             text: TextTokens {
                 primary: Color::White,
@@ -409,6 +454,11 @@ impl Theme {
                 literal: Color::LightYellow,
                 string: Color::LightGreen,
                 comment: Color::DarkGray,
+                r#type: Color::LightCyan,
+                function: Color::LightBlue,
+                operator: Color::Gray,
+                constant: Color::Yellow,
+                punctuation: Color::Gray,
             },
             diff: DiffTokens {
                 added: Color::LightGreen,
@@ -443,6 +493,7 @@ impl Theme {
                 panel: Color::Black,
                 border: Color::Gray,
                 overlay: Color::Black,
+                user: Color::Black,
             },
             text: TextTokens {
                 primary: Color::White,
@@ -463,6 +514,11 @@ impl Theme {
                 literal: Color::Gray,
                 string: Color::Gray,
                 comment: Color::DarkGray,
+                r#type: Color::Gray,
+                function: Color::Gray,
+                operator: Color::DarkGray,
+                constant: Color::Gray,
+                punctuation: Color::DarkGray,
             },
             diff: DiffTokens {
                 added: Color::White,
@@ -720,6 +776,69 @@ mod tests {
         assert_eq!(t.diff.removed, Color::Rgb(0xd5, 0x5e, 0x00));
     }
 
+    /// Every depth must resolve every syntax slot to a colour visible on its panel,
+    /// and light must differ from dark — the expanded palette is real everywhere.
+    #[test]
+    fn every_depth_resolves_every_syntax_slot() {
+        for v in [
+            ThemeVariant::Dark,
+            ThemeVariant::Light,
+            ThemeVariant::HighContrast,
+            ThemeVariant::ColorBlindSafe,
+            ThemeVariant::Ansi256,
+            ThemeVariant::Ansi16,
+            ThemeVariant::Monochrome,
+        ] {
+            let t = Theme::variant(v);
+            for c in [
+                t.syntax.keyword,
+                t.syntax.literal,
+                t.syntax.string,
+                t.syntax.comment,
+                t.syntax.r#type,
+                t.syntax.function,
+                t.syntax.operator,
+                t.syntax.constant,
+                t.syntax.punctuation,
+            ] {
+                assert_ne!(
+                    c, t.surface.panel,
+                    "{v:?}: a syntax slot is invisible on the panel"
+                );
+            }
+        }
+        // A sensible light/dark distinction on the new slots.
+        assert_ne!(Theme::dark().syntax.r#type, Theme::light().syntax.r#type);
+        assert_ne!(
+            Theme::dark().syntax.function,
+            Theme::light().syntax.function
+        );
+    }
+
+    /// The user container surface: distinct on the five raised-surface depths;
+    /// deliberately == panel on ansi16/monochrome (the accent-bar fallback).
+    #[test]
+    fn surface_user_is_distinct_where_a_raised_surface_exists() {
+        for v in [
+            ThemeVariant::Dark,
+            ThemeVariant::Light,
+            ThemeVariant::HighContrast,
+            ThemeVariant::ColorBlindSafe,
+            ThemeVariant::Ansi256,
+        ] {
+            let t = Theme::variant(v);
+            assert_ne!(
+                t.surface.user, t.surface.panel,
+                "{v:?}: user surface not distinct"
+            );
+        }
+        assert_eq!(Theme::ansi16().surface.user, Theme::ansi16().surface.panel);
+        assert_eq!(
+            Theme::monochrome().surface.user,
+            Theme::monochrome().surface.panel
+        );
+    }
+
     /// The monochrome variant must use only grayscale (white/gray/black) — no
     /// chromatic color at all.
     #[test]
@@ -734,6 +853,12 @@ mod tests {
             t.diff.added,
             t.diff.removed,
             t.syntax.keyword,
+            t.syntax.r#type,
+            t.syntax.function,
+            t.syntax.operator,
+            t.syntax.constant,
+            t.syntax.punctuation,
+            t.surface.user,
             t.agent.tool,
             t.focus.active,
         ] {
