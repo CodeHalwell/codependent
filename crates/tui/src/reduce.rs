@@ -2429,6 +2429,40 @@ mod tests {
     }
 
     #[test]
+    fn budget_warning_tokens_brings_the_dead_context_footer_alive() {
+        // Context-window protection (BT5): the plain (non-workflow) loop's
+        // new `BudgetWarning{Tokens}` emitter (BT3) must drive the exact same
+        // `context_percent` projection the workflow budget engine already
+        // did — proving this reducer arm (`reduce.rs:535-546`) needs zero
+        // change to bring the footer alive for normal chat.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // Honesty: before any `BudgetWarning{Tokens}` event lands, the
+        // footer's source field must stay unknown — never a fabricated
+        // percent.
+        assert_eq!(s.runs[0].context_percent, None);
+
+        reduce(
+            &mut s,
+            system_ev(EventBody::BudgetWarning {
+                run_id,
+                dimension: BudgetDimension::Tokens,
+                used: 8_192,
+                limit: 32_768,
+            }),
+        );
+        assert_eq!(s.runs[0].context_percent, Some(25));
+    }
+
+    #[test]
     fn run_completed_sets_terminal_state_and_disposition() {
         let mut s = AppState::new();
         let run_id = RunId::new();

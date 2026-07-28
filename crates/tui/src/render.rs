@@ -5032,6 +5032,64 @@ mod tests {
     }
 
     #[test]
+    fn context_footer_comes_alive_on_budget_warning_and_reads_dash_without_it() {
+        // BT5 ("the dead footer comes alive"): a plain (non-workflow) run
+        // that never emits `BudgetWarning{Tokens}` must render `ctx —`
+        // (honesty — no fabricated percent); once that event lands, the
+        // exact same footer field must show the live `ctx N%` gauge. This
+        // exercises the reducer arm (`reduce.rs:535-546`) and the render
+        // fallback (`render.rs:1270-1276`) with no production change.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::SessionCreated {
+                title: "fix-tests".to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "diagnose the failing test".to_owned(),
+                mode: codypendent_protocol::AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Running,
+            }),
+        );
+
+        let before = render_to_string(&s, 110, 30);
+        assert!(
+            before.contains("ctx —"),
+            "no BudgetWarning{{Tokens}} yet -> dash:\n{before}"
+        );
+        assert!(
+            !before.contains("ctx 25%"),
+            "must never fabricate a percent:\n{before}"
+        );
+
+        reduce(
+            &mut s,
+            system_ev(EventBody::BudgetWarning {
+                run_id,
+                dimension: BudgetDimension::Tokens,
+                used: 8_192,
+                limit: 32_768,
+            }),
+        );
+        let after = render_to_string(&s, 110, 30);
+        assert!(
+            after.contains("ctx 25%"),
+            "footer comes alive on BudgetWarning{{Tokens}}:\n{after}"
+        );
+    }
+
+    #[test]
     fn skill_studio_snapshot_shows_permissions_verbatim() {
         let mut state = running_build_state();
         state.skills = vec![SkillCard {
