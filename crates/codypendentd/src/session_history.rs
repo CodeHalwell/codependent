@@ -161,6 +161,12 @@ fn verbatim_turns(events: &[SessionEvent], run_id: RunId) -> Vec<TurnItem> {
                 turns.push(TurnItem::ToolResult {
                     tool: tool.clone(),
                     output: tool_result_summary(outcome, artifact.as_ref()),
+                    // Carry the artifact ref through the projection
+                    // (continuation-content plan, Task 2) so a later
+                    // hydration step (Task 3) can read its bytes. `output`
+                    // stays the `tool_result_summary` fallback here — this
+                    // projection remains pure/synchronous and does no I/O.
+                    artifact: artifact.clone(),
                 });
             }
             EventBody::SteeringApplied { run_id: r } if *r == run_id => {
@@ -504,14 +510,92 @@ mod tests {
 
         assert!(ts.iter().any(|t| matches!(
             t,
-            TurnItem::ToolResult { tool, output }
+            TurnItem::ToolResult { tool, output, .. }
             if tool == "shell.run" && output.contains("42") && output.contains("application/json")
         )));
         assert!(ts.iter().any(|t| matches!(
             t,
-            TurnItem::ToolResult { tool, output }
+            TurnItem::ToolResult { tool, output, .. }
             if tool == "workspace.read_file" && output == "failed: not found"
         )));
+    }
+
+    /// Continuation-content plan, Task 2: `verbatim_turns` must carry the
+    /// `ToolCompleted` event's artifact ref THROUGH the projection on its
+    /// paired `TurnItem::ToolResult`, so a later hydration step (Task 3) has
+    /// something to read bytes from. `output` stays the `tool_result_summary`
+    /// fallback string here — hydration is not this task's job, and the
+    /// projection must stay pure/synchronous.
+    #[test]
+    fn tool_completed_with_an_artifact_carries_the_ref_onto_tool_result() {
+        let run_id = RunId::new();
+        // `artifact_ref()` mints a fresh random `ArtifactId` per call, so the
+        // event and the expected value must share one instance rather than
+        // two separately-minted, non-equal refs.
+        let expected_artifact = artifact_ref();
+        let events = vec![
+            event(1, run_started(run_id, "objective")),
+            event(
+                2,
+                EventBody::ToolCompleted {
+                    run_id,
+                    tool: "workspace.read_file".to_string(),
+                    outcome: ToolOutcome::Succeeded,
+                    artifact: Some(expected_artifact.clone()),
+                },
+            ),
+            event(
+                3,
+                EventBody::ToolCompleted {
+                    run_id,
+                    tool: "shell.run".to_string(),
+                    outcome: ToolOutcome::Succeeded,
+                    artifact: None,
+                },
+            ),
+        ];
+
+        let ts = session_transcript(&events, 1);
+
+        let with_artifact = ts
+            .iter()
+            .find(
+                |t| matches!(t, TurnItem::ToolResult { tool, .. } if tool == "workspace.read_file"),
+            )
+            .expect("workspace.read_file ToolResult");
+        match with_artifact {
+            TurnItem::ToolResult {
+                output, artifact, ..
+            } => {
+                assert_eq!(
+                    artifact.as_ref(),
+                    Some(&expected_artifact),
+                    "the event's artifact ref must be carried onto the TurnItem"
+                );
+                assert!(
+                    output.contains("42") && output.contains("application/json"),
+                    "output stays the tool_result_summary fallback — Task 3 hydrates it"
+                );
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+
+        let without_artifact = ts
+            .iter()
+            .find(|t| matches!(t, TurnItem::ToolResult { tool, .. } if tool == "shell.run"))
+            .expect("shell.run ToolResult");
+        match without_artifact {
+            TurnItem::ToolResult {
+                output, artifact, ..
+            } => {
+                assert!(
+                    artifact.is_none(),
+                    "no artifact on the event means None here"
+                );
+                assert_eq!(output, "succeeded", "the no-artifact fallback string");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 
     #[test]

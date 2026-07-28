@@ -1396,7 +1396,7 @@ fn read_result_text(items: &[codypendent_runtime::agent::TurnItem]) -> String {
     items
         .iter()
         .filter_map(|item| match item {
-            codypendent_runtime::agent::TurnItem::ToolResult { tool, output }
+            codypendent_runtime::agent::TurnItem::ToolResult { tool, output, .. }
                 if tool == "workspace.read_file" =>
             {
                 Some(output.clone())
@@ -1686,13 +1686,13 @@ async fn different_call_in_between_resets_the_consecutive_counter() {
     let a_results = seen
         .iter()
         .filter(|item| {
-            matches!(item, TurnItem::ToolResult { tool, output } if tool == "workspace.read_file" && output.contains("a.txt"))
+            matches!(item, TurnItem::ToolResult { tool, output, .. } if tool == "workspace.read_file" && output.contains("a.txt"))
         })
         .count();
     let b_results = seen
         .iter()
         .filter(|item| {
-            matches!(item, TurnItem::ToolResult { tool, output } if tool == "workspace.read_file" && output.contains("b.txt"))
+            matches!(item, TurnItem::ToolResult { tool, output, .. } if tool == "workspace.read_file" && output.contains("b.txt"))
         })
         .count();
     assert_eq!(
@@ -1731,7 +1731,7 @@ fn tool_result_text(items: &[codypendent_runtime::agent::TurnItem], tool_name: &
     items
         .iter()
         .filter_map(|item| match item {
-            codypendent_runtime::agent::TurnItem::ToolResult { tool, output }
+            codypendent_runtime::agent::TurnItem::ToolResult { tool, output, .. }
                 if tool == tool_name =>
             {
                 Some(output.clone())
