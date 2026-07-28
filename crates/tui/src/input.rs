@@ -108,6 +108,19 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         description: "focus a pane (same as clicking it)",
         mouse: Some("click a pane"),
     },
+    // Appended (not inserted): FOOTER_HINTS above references entries by
+    // fixed index, so new bindings go at the end to keep those indices
+    // stable.
+    KeyBinding {
+        keys: "↑ / ↓ (composer)",
+        description: "recall the previous / next composer message",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "Alt-Enter",
+        description: "insert a line break instead of sending",
+        mouse: None,
+    },
 ];
 
 /// One footer chip: a compact display label paired with the real `KEY_BINDINGS`
@@ -219,6 +232,10 @@ fn ctrl(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+fn alt(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::ALT)
+}
+
 fn map_normal_key(key: &KeyEvent) -> Action {
     // Ctrl-C detaches gracefully rather than being read as the `c` command.
     if ctrl(key) && key.code == KeyCode::Char('c') {
@@ -265,6 +282,8 @@ fn map_normal_char(c: char) -> Action {
 
 fn map_editing_key(key: &KeyEvent) -> Action {
     match key.code {
+        // Alt+Enter inserts a manual line break; plain Enter still submits.
+        KeyCode::Enter if alt(key) => Action::InputNewline,
         KeyCode::Enter => Action::InputSubmit,
         KeyCode::Esc => Action::InputCancel,
         KeyCode::Backspace => Action::InputBackspace,
@@ -298,13 +317,19 @@ fn map_palette_key(key: &KeyEvent) -> Action {
 /// Ctrl-C detaches; Esc clears the draft.
 fn map_composer_key(key: &KeyEvent) -> Action {
     match key.code {
+        // Alt+Enter inserts a manual line break; plain Enter still submits.
+        KeyCode::Enter if alt(key) => Action::InputNewline,
         KeyCode::Enter => Action::InputSubmit,
         KeyCode::Esc => Action::InputCancel,
         KeyCode::Backspace => Action::InputBackspace,
         KeyCode::PageUp => Action::ScrollPageUp,
         KeyCode::PageDown => Action::ScrollPageDown,
+        // Ctrl-↑/↓ switch runs; plain ↑/↓ (otherwise unbound in the composer)
+        // recall composer history, shell-style.
         KeyCode::Up if ctrl(key) => Action::PrevRun,
         KeyCode::Down if ctrl(key) => Action::NextRun,
+        KeyCode::Up => Action::HistoryPrev,
+        KeyCode::Down => Action::HistoryNext,
         KeyCode::F(2) => Action::ToggleLayout,
         KeyCode::Char('c') if ctrl(key) => Action::Detach,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
@@ -639,6 +664,59 @@ mod tests {
         assert_eq!(
             map_event(&key(KeyCode::F(2)), InputMode::Composer, W, &[]),
             Action::ToggleLayout
+        );
+    }
+
+    #[test]
+    fn alt_enter_inserts_a_newline_instead_of_submitting() {
+        let alt_enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(
+            map_event(&alt_enter, InputMode::Composer, W, &[]),
+            Action::InputNewline
+        );
+        assert_eq!(
+            map_event(&alt_enter, InputMode::Editing, W, &[]),
+            Action::InputNewline
+        );
+        // Plain Enter still submits in both modes.
+        assert_eq!(
+            map_event(&key(KeyCode::Enter), InputMode::Composer, W, &[]),
+            Action::InputSubmit
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Enter), InputMode::Editing, W, &[]),
+            Action::InputSubmit
+        );
+    }
+
+    #[test]
+    fn plain_up_down_recall_composer_history_but_ctrl_still_switches_runs() {
+        // Plain ↑/↓ in the composer: history recall (previously unbound).
+        assert_eq!(
+            map_event(&key(KeyCode::Up), InputMode::Composer, W, &[]),
+            Action::HistoryPrev
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Down), InputMode::Composer, W, &[]),
+            Action::HistoryNext
+        );
+        // Ctrl-↑/↓ is unaffected: still run-switching, not history.
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Up), InputMode::Composer, W, &[]),
+            Action::PrevRun
+        );
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Down), InputMode::Composer, W, &[]),
+            Action::NextRun
+        );
+        // PgUp/PgDn scroll is unaffected.
+        assert_eq!(
+            map_event(&key(KeyCode::PageUp), InputMode::Composer, W, &[]),
+            Action::ScrollPageUp
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::PageDown), InputMode::Composer, W, &[]),
+            Action::ScrollPageDown
         );
     }
 

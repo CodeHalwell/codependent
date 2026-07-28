@@ -1,8 +1,12 @@
 //! The tool layer (STEP 1.7).
 //!
-//! Four tools the agent loop drives: [`ReadFile`] (`workspace.read_file`),
-//! [`Search`] (`workspace.search`), [`Shell`] (`shell.run`), and the Git pair
-//! [`GitDiff`]/[`ApplyPatch`] (`git.diff` / `git.apply_patch`). Each declares
+//! Six tools the agent loop drives: [`ReadFile`] (`workspace.read_file`),
+//! [`Search`] (`workspace.search`), [`Shell`] (`shell.run`), the Git pair
+//! [`GitDiff`]/[`ApplyPatch`] (`git.diff` / `git.apply_patch`), [`WriteFile`]
+//! (`workspace.write_file`), and [`EditFile`] (`workspace.edit_file`) — the
+//! structured-argument alternatives to `git.apply_patch` for a new file or a
+//! small full rewrite, or a targeted search/replace edit, respectively (a weak
+//! model is poor at reproducing an exact unified diff). Each declares
 //! the capability class it needs, exposes a [`ProposedAction`] builder so the
 //! STEP 1.10 middleware can run it through the policy engine, and an async
 //! `execute` that takes a typed input plus exactly the execution context it
@@ -28,6 +32,7 @@
 //! [`ArtifactStore`]: codypendent_daemon::artifacts::ArtifactStore
 
 mod blackboard;
+mod edit_file;
 mod git;
 mod github;
 mod label;
@@ -37,6 +42,7 @@ mod repository;
 mod salient;
 mod search;
 mod shell;
+mod write_file;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -49,6 +55,7 @@ pub use blackboard::{
     parse_blackboard_post, parse_blackboard_query, BlackboardPostInput, BlackboardPostTool,
     BlackboardQueryInput, BlackboardQueryTool,
 };
+pub use edit_file::{parse_edit_file, EditFile, EditFileInput, EditFileOutcome, FileEdit};
 pub use git::{
     ApplyPatch, ApplyPatchInput, ApplyPatchOutcome, GitDiff, GitDiffInput, GitDiffOutcome,
 };
@@ -66,6 +73,7 @@ pub use repository::{RepositoryTest, RepositoryTestOutcome};
 pub use salient::{SalientStream, SalientView};
 pub use search::{Search, SearchInput, SearchMatch, SearchResults};
 pub use shell::{CommandRequest, EnvironmentBinding, Shell, ShellOutcome};
+pub use write_file::{parse_write_file, WriteFile, WriteFileInput, WriteFileOutcome};
 
 /// A capability class a tool requires. The concrete
 /// [`Capability`](codypendent_daemon::policy::Capability) (which carries a
@@ -122,6 +130,54 @@ pub enum ToolError {
     /// `git apply --check` rejected the patch; nothing was applied.
     #[error("patch does not apply: {0}")]
     PatchDoesNotApply(String),
+    /// A write tool's target exists but is not a regular file — a symlink or a
+    /// directory. Write tools refuse to write through or over either: a
+    /// symlink at the leaf could redirect the write outside the granted scope
+    /// (the leaf-swap guard), and a directory cannot be truncated and
+    /// overwritten as file content.
+    #[error("not a regular file (symlink or directory): {0}")]
+    NotRegularFile(PathBuf),
+    /// `workspace.edit_file`: an edit's `search` text was not found in the
+    /// current buffer (after any earlier edits in the same call have been
+    /// applied). Nothing is written — the whole call fails atomically.
+    #[error("edit {index}: search text not found in {path}", path = path.display())]
+    SearchNotFound {
+        /// The file being edited.
+        path: PathBuf,
+        /// 1-based index of the failing edit, so the model knows which pair to fix.
+        index: usize,
+    },
+    /// `workspace.edit_file`: an edit's `search` text matched more than once
+    /// in the current buffer, so the target occurrence is ambiguous. Nothing
+    /// is written — the whole call fails atomically.
+    #[error(
+        "edit {index}: search text is ambiguous ({count} matches) — include more surrounding context so it is unique",
+        )]
+    SearchAmbiguous {
+        /// The file being edited.
+        path: PathBuf,
+        /// 1-based index of the failing edit.
+        index: usize,
+        /// The number of non-overlapping matches found.
+        count: usize,
+    },
+    /// `workspace.edit_file`: an edit's `search` text was empty — trivially
+    /// ambiguous, rejected before any matching is attempted.
+    #[error("edit {index}: search text must not be empty")]
+    EmptySearch {
+        /// 1-based index of the offending edit.
+        index: usize,
+    },
+    /// `workspace.edit_file`: the target file exceeds the byte-bounded edit
+    /// limit; refused rather than silently truncated. Use `git.apply_patch`
+    /// for very large files.
+    #[error("file exceeds the {cap}-byte edit limit; use git.apply_patch for very large files")]
+    FileTooLarge {
+        /// The file that was too large to load.
+        path: PathBuf,
+        /// The byte ceiling that was exceeded.
+        cap: u64,
+    },
     /// A daemon-issued helper process (ripgrep, git) exceeded its wall-clock
     /// bound and was killed. Distinct from a `shell.run` timeout, which is a
     /// successful [`ShellOutcome`] with `timed_out` set: these helpers have no
@@ -155,6 +211,11 @@ impl ToolError {
             ToolError::ProgramNotFound(_) => "tool.program-not-found",
             ToolError::InvalidRange { .. } => "tool.invalid-range",
             ToolError::PatchDoesNotApply(_) => "tool.patch-does-not-apply",
+            ToolError::NotRegularFile(_) => "tool.not-regular-file",
+            ToolError::SearchNotFound { .. } => "tool.search-not-found",
+            ToolError::SearchAmbiguous { .. } => "tool.search-ambiguous",
+            ToolError::EmptySearch { .. } => "tool.empty-search",
+            ToolError::FileTooLarge { .. } => "tool.file-too-large",
             ToolError::TimedOut { .. } => "tool.timed-out",
             ToolError::Io(_) => "tool.io-error",
             ToolError::Other(_) => "tool.error",

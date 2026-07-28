@@ -68,14 +68,16 @@ use crate::blackboard::{BlackboardChannel, BlackboardChannelError, BlackboardPos
 use crate::models::ModelRegistry;
 use crate::tools::{
     new_pull_request, parse_blackboard_post, parse_blackboard_query, parse_create_check_run,
-    parse_create_draft_pull_request, parse_get_pull_request, parse_list_check_runs,
-    parse_memory_remember, parse_update_pull_request, render_check_runs, render_pull_request,
-    tool_label, ApplyPatch, ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
-    BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CreateCheckRunInput,
-    CreateCheckRunSummary, CreateDraftPullRequest, CreateDraftPullRequestInput, EnvironmentBinding,
-    GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns, ListCheckRunsInput,
-    MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput, RepositoryTest, Search,
-    SearchInput, Shell, UpdatePullRequestInput, UpdatePullRequestTool,
+    parse_create_draft_pull_request, parse_edit_file as parse_edit_file_args,
+    parse_get_pull_request, parse_list_check_runs, parse_memory_remember,
+    parse_update_pull_request, parse_write_file as parse_write_file_args, render_check_runs,
+    render_pull_request, tool_label, ApplyPatch, ApplyPatchInput, ArtifactSink,
+    BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput, BlackboardQueryTool,
+    CommandRequest, CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
+    CreateDraftPullRequestInput, EditFile, EditFileInput, EnvironmentBinding, GetPullRequest,
+    GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns, ListCheckRunsInput, MemoryRemember,
+    MemoryRememberInput, ReadFile, ReadFileInput, RepositoryTest, Search, SearchInput, Shell,
+    UpdatePullRequestInput, UpdatePullRequestTool, WriteFile, WriteFileInput,
 };
 
 /// Safety valve: the maximum number of `next_step` calls a single run makes
@@ -137,9 +139,132 @@ pub enum TurnItem {
         tool: String,
         /// The compacted, model-facing output.
         output: String,
+        /// The bulk-output artifact recorded for this tool call, when one was
+        /// persisted (continuation-content plan, Task 2). Projection metadata
+        /// only — carried through so a later hydration step (Task 3) can read
+        /// the artifact's bytes and replace `output`; this field itself is
+        /// never rendered into a model message (see `to_messages`). `None`
+        /// for a tool call that produced no artifact, or at any construction
+        /// site that has no artifact to offer (compaction, synthetic/legacy
+        /// prior turns). Additive and serde-default so it never breaks
+        /// deserialization of a `TurnItem` persisted before this field
+        /// existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<ArtifactRef>,
     },
     /// User steering text injected at a safe point.
     Steering(String),
+}
+
+/// Cheap, dependency-free heuristic for [`estimate_context_tokens`]: roughly
+/// 4 characters per token, the widely-used rule of thumb for English/code
+/// under a BPE tokenizer. Deliberately NOT a real tokenizer dependency
+/// (context-window protection spec, `docs/superpowers/specs/
+/// 2026-07-28-context-window-design.md`, component C3): the estimate only
+/// drives a footer percentage and an advisory warning — never billing, never
+/// a hard truncation — so a ±20% error is immaterial, and a real BPE
+/// tokenizer would in any case be precise for the wrong vocabulary (Ollama
+/// models are not GPT-BPE).
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Small fixed per-turn overhead [`estimate_context_tokens`] adds on top of
+/// the character estimate for every [`TurnItem`], approximating the
+/// role/delimiter tokens a real tokenizer spends on message framing that a
+/// raw character count of the payload alone would miss (e.g. the role tag
+/// wrapping each message in `to_messages`). Kept deliberately on the
+/// conservative side: undercounting would let the footer understate how
+/// full the window is, which is the one failure mode this estimator must
+/// avoid (per-item overhead never shrinks with a longer transcript).
+const PER_ITEM_TOKEN_OVERHEAD: usize = 4;
+
+/// The rendered character length of one [`TurnItem`], approximating what
+/// `FrameworkModelDriver::to_messages` (this module, behind `provider-openai`)
+/// actually sends to the model for that turn: the framing text plus the
+/// payload. Counted with
+/// `.chars().count()` rather than byte length, so a unicode-heavy transcript
+/// is not over-counted relative to plain ASCII. Pure, unit-testable in
+/// isolation, and used only by [`estimate_context_tokens`].
+///
+/// Mirrors `to_messages`' per-variant framing:
+/// - `Objective` / `Assistant` / `Steering`: sent verbatim as the message
+///   text, so their length IS the payload length.
+/// - `ToolCall { tool, args }`: sent as `"[calling {tool}: {args}]"`, so the
+///   estimate includes the tool name and the rendered JSON args (uncapped —
+///   `to_messages` truncates a huge args blob for the *replayed* marker via
+///   `compact_args`, but estimating the untruncated length is the safer,
+///   conservative direction: it can only overcount, never hide an
+///   approaching overflow).
+/// - `ToolResult { tool, output }`: sent as `"[tool result: {tool}]\n
+///   {output}"`, so the estimate includes the tool name and the full output.
+pub fn turn_item_text_len(turn: &TurnItem) -> usize {
+    match turn {
+        TurnItem::Objective(text) | TurnItem::Assistant(text) | TurnItem::Steering(text) => {
+            text.chars().count()
+        }
+        TurnItem::ToolCall { tool, args } => {
+            "[calling : ]".chars().count() + tool.chars().count() + args.to_string().chars().count()
+        }
+        TurnItem::ToolResult { tool, output, .. } => {
+            "[tool result: ]\n".chars().count() + tool.chars().count() + output.chars().count()
+        }
+    }
+}
+
+/// Cheap, pure, dependency-free context-size estimate for a transcript, in
+/// tokens (context-window protection spec, component C3). Sums
+/// [`turn_item_text_len`] over every turn — approximating the text
+/// `to_messages` actually sends — divides by [`CHARS_PER_TOKEN`], and adds a
+/// [`PER_ITEM_TOKEN_OVERHEAD`] per turn for framing tokens a raw character
+/// count misses. Deliberately an ESTIMATE: the loop (a later task) compares
+/// it against a known context window to drive a footer percentage and an
+/// advisory warning — it is never used to bill or to hard-truncate the
+/// transcript. `std`-only, no tokenizer dependency, and does not allocate a
+/// rendered copy of the transcript — it sums lengths turn by turn.
+pub fn estimate_context_tokens(transcript: &[TurnItem]) -> usize {
+    transcript
+        .iter()
+        .map(|item| turn_item_text_len(item) / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD)
+        .sum()
+}
+
+/// Decide whether the plain loop should emit a `BudgetWarning{Tokens}` event
+/// for this step (context-window protection, component C4), and build it when
+/// it should. Called ONLY when a window is known (`limit` came from
+/// `driver.context_window()` returning `Some`) — the "unknown window ⇒ no
+/// emit" honesty rule (C5) is enforced by the CALLER never invoking this
+/// helper at all when the window is `None`, not by anything in here.
+///
+/// Dedup: computes the integer percentage `used*100/limit` (clamped to
+/// `0..=100`, `limit.max(1)` guarding a nonsensical zero limit exactly as the
+/// TUI reducer already does at `reduce.rs:544`) and compares it against
+/// `last_emitted_pct`, the percentage most recently emitted THIS run. Returns
+/// `None` (suppress) when the percentage hasn't changed, so a run whose usage
+/// isn't moving costs nothing beyond the division — bounding the emitted
+/// events to at most 101 per run (one per integer percentage point, 0..=100),
+/// never one per step.
+///
+/// Pure and `EventBody`-agnostic about `run_id`/`session_id` plumbing beyond
+/// the one field the event needs, so it is unit-testable without a driver, a
+/// sink, or a running loop.
+fn token_budget_event(
+    run_id: RunId,
+    used: u64,
+    limit: u64,
+    last_emitted_pct: Option<u16>,
+) -> Option<(EventBody, u16)> {
+    let pct = (used.saturating_mul(100) / limit.max(1)).min(100) as u16;
+    if Some(pct) == last_emitted_pct {
+        return None;
+    }
+    Some((
+        EventBody::BudgetWarning {
+            run_id,
+            dimension: BudgetDimension::Tokens,
+            used,
+            limit,
+        },
+        pct,
+    ))
 }
 
 /// The next thing the model wants to do, as decided by a [`ModelDriver`].
@@ -381,6 +506,16 @@ pub trait ModelDriver: Send + Sync {
         offered_tools: &[&str],
         sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome>;
+
+    /// The model's context window in tokens, if known — the honest source for
+    /// both the `num_ctx` request hint and the context-usage percentage
+    /// denominator (context-window protection). Defaults to `None`
+    /// ("unknown"), so every driver that doesn't override it (scripted/test
+    /// drivers included) never fabricates a window. [`FrameworkModelDriver`]
+    /// overrides this with the resolved model's configured `context_tokens`.
+    fn context_window(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A driver backed by a fixed queue of pre-set steps — the deterministic engine
@@ -394,6 +529,12 @@ pub struct ScriptedDriver {
     /// code — its requests contribute no cost. [`with_usage`](Self::with_usage)
     /// scripts a measured usage so a test can exercise the cost path.
     usage: Option<ModelUsage>,
+    /// The window [`ModelDriver::context_window`] reports. `None` (the
+    /// default via [`Self::new`]) preserves this driver's existing honest
+    /// "unknown window" behavior; [`with_context_window`](Self::with_context_window)
+    /// scripts a known window so a test can exercise the plain loop's
+    /// `BudgetWarning{Tokens}` emission (context-window protection, T3).
+    context_window: Option<u64>,
 }
 
 impl ScriptedDriver {
@@ -404,6 +545,7 @@ impl ScriptedDriver {
             steps: Mutex::new(steps.into_iter().collect()),
             model_id: ModelId("scripted".to_string()),
             usage: None,
+            context_window: None,
         }
     }
 
@@ -421,12 +563,25 @@ impl ScriptedDriver {
         self.usage = Some(usage);
         self
     }
+
+    /// Script a known context window (`ModelDriver::context_window` then
+    /// returns `Some(window)`), so a test can exercise the plain loop's
+    /// `BudgetWarning{Tokens}` emission. Without this the driver reports
+    /// `None` (unknown window — no emission, the honesty default).
+    pub fn with_context_window(mut self, window: u64) -> Self {
+        self.context_window = Some(window);
+        self
+    }
 }
 
 #[async_trait]
 impl ModelDriver for ScriptedDriver {
     fn model_id(&self) -> ModelId {
         self.model_id.clone()
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        self.context_window
     }
 
     async fn next_step(
@@ -862,6 +1017,12 @@ impl FrameworkAgentRuntime {
             Search::NAME,
             GitDiff::NAME,
             ApplyPatch::NAME,
+            // CORE (write-tools WT5): structured-argument alternatives to
+            // `git.apply_patch` — always offered, never workflow/github-gated, so a
+            // weak model that struggles with exact-context diffs still has a
+            // reliable way to create/overwrite a file or make a targeted edit.
+            WriteFile::NAME,
+            EditFile::NAME,
             // CORE (smarter-memory M2): always offered, never workflow/github-gated —
             // saving a fact for future runs is useful regardless of run kind.
             MemoryRemember::NAME,
@@ -948,6 +1109,16 @@ impl FrameworkAgentRuntime {
         let mut usage: Option<ModelUsage> = None;
         let run_started = Instant::now();
         let mut wall_clock_warned = false;
+        // Context-window protection (T3): the integer percentage
+        // (`used*100/limit`) most recently emitted as a `BudgetWarning{Tokens}`
+        // THIS run, or `None` before the first emission. Local to this run
+        // (never persisted), it is the dedup gate `token_budget_event` checks
+        // against so a step whose percentage hasn't moved doesn't re-emit.
+        let mut last_token_pct: Option<u16> = None;
+        // Resolved once: the model's context window, or `None` when unknown.
+        // `None` here means C5's honesty rule applies for the WHOLE run — the
+        // loop below never emits a `Tokens` event, so the TUI footer stays `—`.
+        let context_window = driver.context_window();
         // Repeated-identical-call guard state (loop-fix Task 2): the identity
         // (tool, args_digest) of the most recently ISSUED call and how many
         // times in a row it has now been issued — reset (to a fresh count of
@@ -991,6 +1162,26 @@ impl FrameworkAgentRuntime {
                     },
                 )
                 .await?;
+            }
+
+            // Context-window protection (T3): estimate live usage against the
+            // known window and emit the SAME `BudgetWarning{Tokens}` event the
+            // workflow budget engine emits, at the identical per-step safe
+            // point as the wall-clock warning above. Honesty (C5): when the
+            // window is unknown (`context_window == None`), this whole block
+            // is skipped — NOT ONE `Tokens` event is ever emitted for this
+            // run, so `RunView.context_percent` stays `None` and the footer
+            // keeps showing `—`. Dedup: `token_budget_event` suppresses the
+            // emit when the integer percentage hasn't changed since
+            // `last_token_pct`, bounding this to at most 101 events/run.
+            if let Some(limit) = context_window {
+                let used = estimate_context_tokens(&transcript) as u64;
+                if let Some((body, pct)) =
+                    token_budget_event(run.run_id, used, limit, last_token_pct)
+                {
+                    last_token_pct = Some(pct);
+                    self.emit(run.session_id, run_actor.clone(), body).await?;
+                }
             }
 
             let started = Instant::now();
@@ -1169,6 +1360,12 @@ impl FrameworkAgentRuntime {
                             transcript.push(TurnItem::ToolResult {
                                 tool,
                                 output: observation,
+                                // The live run loop's own transcript push has
+                                // no artifact ref threaded to it yet — only
+                                // the session_history continuation projection
+                                // (Task 2) populates this field, from the
+                                // persisted `ToolCompleted` event.
+                                artifact: None,
                             });
                             // Safe point: a completed tool call is a steering
                             // boundary.
@@ -1578,6 +1775,54 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::ApplyPatch(input),
                 })
             }
+            // Write-tools WT5: the structured-argument alternatives to
+            // `git.apply_patch`. Both reuse the SAME `WritePatch` action (see the
+            // design spec's "Verified: how apply_patch is actually gated") — the
+            // policy engine routes `WritePatch` to `eval_write`, which auto-`Allow`s
+            // a write inside the run's disposable worktree (denied in read-only
+            // modes), reviewed as an end-of-run change-set rather than a per-call
+            // approval prompt. The spilled artifact is the audit record of what was
+            // (about to be) written; `execute_prepared` performs the REAL write via
+            // `WriteFile`/`EditFile`'s own `execute`, never `git apply`.
+            WriteFile::NAME => {
+                let input = parse_write_file(args, &run.worktree)?;
+                let stored = self
+                    .sink
+                    .store(
+                        "text/plain",
+                        Provenance::tool_output(WriteFile::NAME, run.run_id),
+                        input.content.as_bytes(),
+                    )
+                    .await
+                    .map_err(|e| format!("could not stage write artifact: {e}"))?;
+                Ok(Prepared {
+                    action: ProposedAction::WritePatch { patch: stored.id },
+                    tool: PreparedTool::WriteFile(input),
+                })
+            }
+            EditFile::NAME => {
+                let input = parse_edit_file(args, &run.worktree)?;
+                let edits_json: Vec<Value> = input
+                    .edits
+                    .iter()
+                    .map(|e| json!({"search": e.search, "replace": e.replace}))
+                    .collect();
+                let payload = serde_json::to_vec(&edits_json)
+                    .map_err(|e| format!("could not serialize edits: {e}"))?;
+                let stored = self
+                    .sink
+                    .store(
+                        "application/json",
+                        Provenance::tool_output(EditFile::NAME, run.run_id),
+                        &payload,
+                    )
+                    .await
+                    .map_err(|e| format!("could not stage edit artifact: {e}"))?;
+                Ok(Prepared {
+                    action: ProposedAction::WritePatch { patch: stored.id },
+                    tool: PreparedTool::EditFile(input),
+                })
+            }
             GetPullRequest::NAME => {
                 let repo = self.github_target(run)?;
                 let input = parse_get_pull_request(args)?;
@@ -1802,7 +2047,36 @@ impl FrameworkAgentRuntime {
                         excerpt.total_lines
                     );
                     let observation = format!("{header}{body}");
-                    (observation, None, ToolOutcome::Succeeded)
+                    // Persist the FULL observation (header + excerpt) as an
+                    // artifact, mirroring shell.rs's `spill` for stdout — this
+                    // is the read_file half of continuation-content
+                    // persistence (Task 1): without it, `ToolCompleted`
+                    // carries `artifact: None` and a later CONTINUATION run
+                    // has nothing to rehydrate, so the model re-reads every
+                    // file it already read. Best-effort: a storage failure
+                    // must not turn a successful read into a failure, so an
+                    // `Err` here only degrades to `None` (logged), never
+                    // changes the outcome or the observation text.
+                    let artifact = match self
+                        .sink
+                        .store(
+                            "text/plain",
+                            Provenance::tool_output(ReadFile::NAME, run.run_id),
+                            observation.as_bytes(),
+                        )
+                        .await
+                    {
+                        Ok(reference) => Some(reference),
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                path = %excerpt.path.display(),
+                                "failed to persist workspace.read_file observation as an artifact; continuing without it"
+                            );
+                            None
+                        }
+                    };
+                    (observation, artifact, ToolOutcome::Succeeded)
                 }
                 Err(e) => (
                     format!("workspace.read_file error: {e}"),
@@ -1861,6 +2135,32 @@ impl FrameworkAgentRuntime {
                     ),
                 }
             }
+            // Write-tools WT5: the REAL write happens here, via each tool's own
+            // `execute`, under the SAME `write_scope` `apply_patch` runs under —
+            // never routed through `git apply`. The observation is the tool's own
+            // honest outcome string (created/overwrote/applied N edits).
+            PreparedTool::WriteFile(input) => {
+                match WriteFile::execute(&input, &write_scope).await {
+                    Ok(outcome) => (outcome.observation(), None, ToolOutcome::Succeeded),
+                    Err(e) => (
+                        format!("workspace.write_file error: {e}"),
+                        None,
+                        ToolOutcome::Failed {
+                            message: e.code().to_string(),
+                        },
+                    ),
+                }
+            }
+            PreparedTool::EditFile(input) => match EditFile::execute(&input, &write_scope).await {
+                Ok(outcome) => (outcome.observation(), None, ToolOutcome::Succeeded),
+                Err(e) => (
+                    format!("workspace.edit_file error: {e}"),
+                    None,
+                    ToolOutcome::Failed {
+                        message: e.code().to_string(),
+                    },
+                ),
+            },
             PreparedTool::GitHubGetPr { repo, input } => match self.github.as_ref() {
                 None => github_unconfigured(),
                 Some(client) => match client.get_pull_request(&repo, input.number).await {
@@ -2149,6 +2449,8 @@ enum PreparedTool {
     Search(SearchInput),
     GitDiff(GitDiffInput),
     ApplyPatch(ApplyPatchInput),
+    WriteFile(WriteFileInput),
+    EditFile(EditFileInput),
     GitHubGetPr {
         repo: RepoId,
         input: GetPullRequestInput,
@@ -2357,6 +2659,37 @@ fn parse_read_file(args: &Value, worktree: &Path) -> Result<ReadFileInput, Strin
     Ok(ReadFileInput { path, range })
 }
 
+/// Root a raw, model-supplied path at `worktree` exactly as [`parse_read_file`]
+/// does: a relative path resolves against the run's worktree (so a file the
+/// agent just wrote reads back, and vice versa); an absolute path is taken as
+/// given (the write scope still confines it).
+fn root_at_worktree(path: PathBuf, worktree: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        worktree.join(path)
+    }
+}
+
+/// Parse `workspace.write_file` arguments, rooting the raw `path` at `worktree`
+/// (write-tools WT5). Field validation itself is delegated to the tool crate's
+/// own [`crate::tools::parse_write_file`] (imported here as
+/// `parse_write_file_args`) — this wrapper only adds the worktree-rooting
+/// `prepare` needs, mirroring [`parse_read_file`]/`parse_apply_patch`.
+fn parse_write_file(args: &Value, worktree: &Path) -> Result<WriteFileInput, String> {
+    let mut input = parse_write_file_args(args)?;
+    input.path = root_at_worktree(input.path, worktree);
+    Ok(input)
+}
+
+/// Parse `workspace.edit_file` arguments, rooting the raw `path` at `worktree`
+/// (write-tools WT5). Mirrors [`parse_write_file`] above.
+fn parse_edit_file(args: &Value, worktree: &Path) -> Result<EditFileInput, String> {
+    let mut input = parse_edit_file_args(args)?;
+    input.path = root_at_worktree(input.path, worktree);
+    Ok(input)
+}
+
 fn parse_search(args: &Value) -> Result<SearchInput, String> {
     let pattern = args
         .get("pattern")
@@ -2515,25 +2848,45 @@ fn build_chronicle(
 pub struct FrameworkModelDriver {
     client: std::sync::Arc<dyn agent_framework_core::client::ChatClient>,
     model_id: ModelId,
+    /// The resolved model's context window in tokens, if known — sourced
+    /// from `ModelConfig.context_tokens` by [`Self::from_registry`]. `None`
+    /// (the default via [`Self::new`]) means "unknown": [`Self::context_window`]
+    /// honestly returns `None`, never a fabricated default.
+    context_tokens: Option<u64>,
 }
 
 #[cfg(feature = "provider-openai")]
 impl FrameworkModelDriver {
-    /// Wrap a constructed client and record the model id it serves.
+    /// Wrap a constructed client and record the model id it serves. The
+    /// context window starts `None` (unknown) — callers that have a resolved
+    /// `ModelConfig` should prefer [`Self::from_registry`], which populates
+    /// it; direct callers of `new` (e.g. tests) get the honest default.
     pub fn new(
         client: std::sync::Arc<dyn agent_framework_core::client::ChatClient>,
         model_id: ModelId,
     ) -> Self {
-        Self { client, model_id }
+        Self {
+            client,
+            model_id,
+            context_tokens: None,
+        }
     }
 
-    /// Build a driver from the registry by resolving `model_id` to a client.
+    /// Build a driver from the registry by resolving `model_id` to a client,
+    /// also capturing the resolved [`ModelConfig::context_tokens`] so
+    /// [`Self::context_window`] can answer honestly (`Some` when configured,
+    /// `None` when unset).
     pub async fn from_registry(models: &ModelRegistry, model_id: ModelId) -> anyhow::Result<Self> {
+        let context_tokens = models.get(&model_id).and_then(|cfg| cfg.context_tokens);
         let client = models
             .client_for(&model_id)
             .await
             .map_err(|e| anyhow::anyhow!("could not build client for {model_id}: {e}"))?;
-        Ok(Self::new(client, model_id))
+        Ok(Self {
+            client,
+            model_id,
+            context_tokens,
+        })
     }
 
     /// The full tool SCHEMA catalog — every tool's name, description, and JSON
@@ -2594,6 +2947,50 @@ impl FrameworkModelDriver {
                     "type": "object",
                     "properties": {"patch": {"type": "string"}},
                     "required": ["patch"]
+                }),
+            ),
+            // CORE (write-tools WT5): declared alongside the unconditional
+            // baseline tools — offered to every run, not gated on github/workflow.
+            // Structured-argument alternatives to `git.apply_patch` for a weak
+            // model that struggles to reproduce an exact-context diff.
+            decl(
+                WriteFile::NAME,
+                "Create a new file or overwrite an existing file with the full new contents. \
+                 Use for new files or small full rewrites; for a targeted change to a large \
+                 file use `workspace.edit_file`.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"]
+                }),
+            ),
+            decl(
+                EditFile::NAME,
+                "Edit an existing file with one or more exact search/replace pairs. Each \
+                 `search` must appear exactly once in the file — if a match is not unique the \
+                 edit is rejected and you should include more surrounding context. All edits \
+                 apply together or not at all.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "edits": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "search": {"type": "string"},
+                                    "replace": {"type": "string"}
+                                },
+                                "required": ["search", "replace"]
+                            }
+                        }
+                    },
+                    "required": ["path", "edits"]
                 }),
             ),
             // CORE (RT1): argument-less — the command is auto-detected (a
@@ -2762,9 +3159,14 @@ impl FrameworkModelDriver {
                 // NOT `Role::tool()`: an orphan tool message (no preceding
                 // assistant `tool_calls` with a matching id) is rejected with a
                 // 400 by strict OpenAI-wire servers. See the type-level docs.
-                TurnItem::ToolResult { tool, output } => {
-                    Message::user(format!("[tool result: {tool}]\n{output}"))
-                }
+                // `artifact` is projection metadata only (Task 2) — never
+                // rendered here; only `output` (which Task 3 hydrates from
+                // the artifact when present) reaches the model.
+                TurnItem::ToolResult {
+                    tool,
+                    output,
+                    artifact: _,
+                } => Message::user(format!("[tool result: {tool}]\n{output}")),
                 TurnItem::Steering(text) => Message::user(text.clone()),
             };
             messages.push(message);
@@ -2802,6 +3204,10 @@ impl ModelDriver for FrameworkModelDriver {
         self.model_id.clone()
     }
 
+    fn context_window(&self) -> Option<u64> {
+        self.context_tokens
+    }
+
     async fn next_step(
         &self,
         transcript: &[TurnItem],
@@ -2814,6 +3220,7 @@ impl ModelDriver for FrameworkModelDriver {
 
         let mut options = ChatOptions::new();
         options.tools = Self::advertised_tools(offered_tools);
+        apply_context_window(&mut options, self.context_tokens);
 
         let mut stream = self
             .client
@@ -2847,6 +3254,42 @@ impl ModelDriver for FrameworkModelDriver {
         // rides the step).
         let (step, usage, preface) = updates_to_step(updates, |_| {});
         Ok(StepOutcome::new(step, usage).with_preface(preface))
+    }
+}
+
+/// Forward a known context window as the Ollama `num_ctx` request hint
+/// (context-window protection, BT4): when `window` is `Some(n)`, sets
+/// `options.additional_properties["options"] = {"num_ctx": n}` — the shape the
+/// OpenAI converter forwards verbatim onto the request body
+/// (`agent-framework-openai`'s `convert.rs`), and the nested object Ollama
+/// reads generation parameters from at its OpenAI-compatible endpoint.
+///
+/// Honesty (C5): `window == None` leaves `additional_properties` untouched —
+/// no `options` key is inserted, so no `num_ctx` is ever invented for a model
+/// with an unconfigured window.
+///
+/// If `additional_properties["options"]` already holds an object (e.g. other
+/// Ollama generation parameters set elsewhere), `num_ctx` is merged into it
+/// rather than overwriting the existing keys. This is a pure, dependency-free
+/// body-field tweak: an endpoint that ignores it is unaffected, so it never
+/// changes whether a request succeeds.
+#[cfg(feature = "provider-openai")]
+fn apply_context_window(
+    options: &mut agent_framework_core::types::ChatOptions,
+    window: Option<u64>,
+) {
+    let Some(n) = window else {
+        return;
+    };
+    match options.additional_properties.get_mut("options") {
+        Some(serde_json::Value::Object(existing)) => {
+            existing.insert("num_ctx".to_string(), serde_json::json!(n));
+        }
+        _ => {
+            options
+                .additional_properties
+                .insert("options".to_string(), serde_json::json!({ "num_ctx": n }));
+        }
     }
 }
 
@@ -2977,6 +3420,175 @@ fn measured_usage(
 mod tests {
     use super::*;
     use crate::tools::ClosureSink;
+
+    // -----------------------------------------------------------------------
+    // Context-window protection (BT2): estimate_context_tokens / turn_item_text_len
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn estimate_context_tokens_of_empty_transcript_is_zero() {
+        // No turns, no framing overhead to charge — the honest floor.
+        assert_eq!(estimate_context_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn turn_item_text_len_covers_every_variant() {
+        // Plain text variants: the payload's char length, verbatim.
+        assert_eq!(
+            turn_item_text_len(&TurnItem::Objective("hello".to_string())),
+            5
+        );
+        assert_eq!(
+            turn_item_text_len(&TurnItem::Assistant("hi there".to_string())),
+            8
+        );
+        assert_eq!(
+            turn_item_text_len(&TurnItem::Steering("steer this".to_string())),
+            10
+        );
+
+        // ToolCall: must grow with both the tool name and the args, mirroring
+        // to_messages' "[calling {tool}: {args}]" framing — never just a
+        // constant regardless of payload size.
+        let small_call = TurnItem::ToolCall {
+            tool: "shell.run".to_string(),
+            args: json!({"cmd": "ls"}),
+        };
+        let big_call = TurnItem::ToolCall {
+            tool: "shell.run".to_string(),
+            args: json!({"cmd": "ls -la /a/much/longer/argument/payload/here"}),
+        };
+        assert!(turn_item_text_len(&big_call) > turn_item_text_len(&small_call));
+
+        // ToolResult: must grow with the output, mirroring to_messages'
+        // "[tool result: {tool}]\n{output}" framing.
+        let small_result = TurnItem::ToolResult {
+            tool: "shell.run".to_string(),
+            output: "ok".to_string(),
+            artifact: None,
+        };
+        let big_result = TurnItem::ToolResult {
+            tool: "shell.run".to_string(),
+            output: "x".repeat(4000),
+            artifact: None,
+        };
+        assert!(turn_item_text_len(&small_result) < turn_item_text_len(&big_result));
+        assert!(turn_item_text_len(&big_result) >= 4000);
+    }
+
+    #[test]
+    fn estimate_context_tokens_grows_with_a_longer_tool_result_output() {
+        // A transcript whose only difference is a much longer ToolResult
+        // output must yield a strictly larger estimate — the estimator must
+        // not collapse to a flat per-turn constant regardless of payload.
+        let short = vec![TurnItem::ToolResult {
+            tool: "shell.run".to_string(),
+            output: "ok".to_string(),
+            artifact: None,
+        }];
+        let long = vec![TurnItem::ToolResult {
+            tool: "shell.run".to_string(),
+            output: "x".repeat(4000),
+            artifact: None,
+        }];
+        assert!(estimate_context_tokens(&long) > estimate_context_tokens(&short));
+    }
+
+    #[test]
+    fn estimate_context_tokens_applies_per_item_overhead_for_empty_turns() {
+        // N turns with empty text still each carry PER_ITEM_TOKEN_OVERHEAD —
+        // the overhead is per-turn, not a single fixed constant regardless of
+        // transcript length.
+        let n = 5;
+        let turns: Vec<TurnItem> = (0..n).map(|_| TurnItem::Assistant(String::new())).collect();
+        assert_eq!(
+            estimate_context_tokens(&turns),
+            n * PER_ITEM_TOKEN_OVERHEAD,
+            "each empty turn should contribute exactly the per-item overhead"
+        );
+    }
+
+    #[test]
+    fn estimate_context_tokens_is_roughly_chars_over_four_for_a_long_turn() {
+        // Sanity check against the ~4-chars-per-token heuristic: a single
+        // ~4000-char turn should land near 1000 tokens (plus the small
+        // fixed per-item overhead), not wildly off in either direction.
+        let turns = vec![TurnItem::Assistant("a".repeat(4000))];
+        let estimate = estimate_context_tokens(&turns);
+        assert_eq!(estimate, 4000 / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD);
+        assert!(
+            (990..=1010).contains(&estimate),
+            "expected ~1000 tokens (+overhead) for a 4000-char turn, got {estimate}"
+        );
+    }
+
+    #[test]
+    fn estimate_context_tokens_is_monotonic_when_a_turn_is_appended() {
+        // Appending a TurnItem must never lower the estimate.
+        let mut transcript = vec![TurnItem::Objective("start".to_string())];
+        let before = estimate_context_tokens(&transcript);
+        transcript.push(TurnItem::Assistant("more text here".to_string()));
+        let after = estimate_context_tokens(&transcript);
+        assert!(after >= before);
+    }
+
+    // -----------------------------------------------------------------------
+    // Context-window protection (T3): `token_budget_event` — the pure emit
+    // decision behind the plain loop's `BudgetWarning{Tokens}` producer.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn token_budget_event_emits_on_first_call_with_the_computed_percent() {
+        // No prior emission (`last_emitted_pct == None`) always emits, since
+        // `Some(pct) != None` for any `pct`.
+        let run_id = RunId::new();
+        let (body, pct) =
+            token_budget_event(run_id, 8_192, 32_768, None).expect("first call always emits");
+        assert_eq!(pct, 25);
+        match body {
+            EventBody::BudgetWarning {
+                run_id: got_run_id,
+                dimension,
+                used,
+                limit,
+            } => {
+                assert_eq!(got_run_id, run_id);
+                assert_eq!(dimension, BudgetDimension::Tokens);
+                assert_eq!(used, 8_192);
+                assert_eq!(limit, 32_768);
+            }
+            other => panic!("expected BudgetWarning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_budget_event_suppresses_an_unchanged_percentage() {
+        // Dedup: the SAME integer percentage as `last_emitted_pct` must not
+        // re-emit, even though `used` differs slightly (both round to 25%).
+        let run_id = RunId::new();
+        let unchanged = token_budget_event(run_id, 8_200, 32_768, Some(25));
+        assert_eq!(unchanged, None, "unchanged percent must not re-emit");
+    }
+
+    #[test]
+    fn token_budget_event_emits_again_once_the_percentage_moves() {
+        // A percentage that DOES move re-emits with the new value.
+        let run_id = RunId::new();
+        let (_, pct) = token_budget_event(run_id, 16_384, 32_768, Some(25))
+            .expect("changed percent must emit");
+        assert_eq!(pct, 50);
+    }
+
+    #[test]
+    fn token_budget_event_clamps_to_100_and_guards_a_zero_limit() {
+        // `used > limit` clamps to 100%, and a nonsensical zero limit is
+        // guarded (`limit.max(1)`) rather than dividing by zero.
+        let run_id = RunId::new();
+        let (_, pct) = token_budget_event(run_id, 100_000, 32_768, None).expect("emits");
+        assert_eq!(pct, 100);
+        let (_, pct_zero_limit) = token_budget_event(run_id, 5, 0, None).expect("emits");
+        assert_eq!(pct_zero_limit, 100);
+    }
 
     #[test]
     fn run_context_prior_defaults_empty_and_with_prior_exposes_it() {
@@ -3114,6 +3726,18 @@ mod tests {
     }
 
     #[test]
+    fn scripted_driver_context_window_defaults_to_none() {
+        // Context-window protection (BT1): `ModelDriver::context_window` has a
+        // default impl returning `None`, so a driver like `ScriptedDriver` that
+        // never overrides it needs no change and stays honestly "unknown" —
+        // never a fabricated window.
+        let driver = ScriptedDriver::new(vec![ModelStep::Finish {
+            summary: "done".to_string(),
+        }]);
+        assert_eq!(driver.context_window(), None);
+    }
+
+    #[test]
     fn cancellation_token_flips_on_cancel() {
         let (handle, token) = cancellation();
         assert!(!token.is_cancelled());
@@ -3153,6 +3777,7 @@ mod tests {
             TurnItem::ToolResult {
                 tool: "shell.run".to_string(),
                 output: "exit 0".to_string(),
+                artifact: None,
             },
             TurnItem::Steering("also check CI".to_string()),
         ];
@@ -3184,6 +3809,7 @@ mod tests {
             TurnItem::ToolResult {
                 tool: "workspace.read_file".to_string(),
                 output: "config.toml (lines 1-3 of 3)\n     1\t[x]\n".to_string(),
+                artifact: None,
             },
         ];
         let messages = FrameworkModelDriver::to_messages(&transcript);
@@ -3267,6 +3893,106 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 0);
         assert_eq!(usage.completion_tokens, 9);
         assert_eq!(usage.cost_micros, None);
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn framework_driver_context_window_reflects_the_resolved_model_config() {
+        // Context-window protection (BT1): `FrameworkModelDriver::context_window`
+        // must source its answer from the resolved `ModelConfig.context_tokens`
+        // — `Some(n)` when the config sets it, `None` when it doesn't. Neither
+        // case fabricates a value.
+        let id = ModelId("local-default".to_string());
+        let known = ModelRegistry::new([crate::models::ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen2.5-coder:14b".to_string(),
+            api_key_env: String::new(),
+            context_tokens: Some(32_768),
+        }]);
+        let driver = FrameworkModelDriver::from_registry(&known, id.clone())
+            .await
+            .expect("driver builds from a registered model");
+        assert_eq!(
+            driver.context_window(),
+            Some(32_768),
+            "a configured context_tokens must surface verbatim"
+        );
+
+        let unknown = ModelRegistry::new([crate::models::ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen2.5-coder:14b".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+        }]);
+        let driver = FrameworkModelDriver::from_registry(&unknown, id)
+            .await
+            .expect("driver builds from a registered model");
+        assert_eq!(
+            driver.context_window(),
+            None,
+            "an unset context_tokens must stay honestly None, never a fabricated default"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn apply_context_window_sets_ollama_num_ctx_when_known() {
+        // Context-window protection (BT4): a known window must be forwarded as
+        // the Ollama request hint `{"options":{"num_ctx":n}}` via
+        // `ChatOptions.additional_properties`, the verified seam the OpenAI
+        // converter forwards onto the request body.
+        use agent_framework_core::types::ChatOptions;
+
+        let mut options = ChatOptions::new();
+        apply_context_window(&mut options, Some(32_768));
+
+        assert_eq!(
+            options.additional_properties.get("options"),
+            Some(&serde_json::json!({ "num_ctx": 32_768 })),
+            "a known window must set additional_properties[\"options\"] = {{num_ctx}}"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn apply_context_window_sets_nothing_when_window_is_unknown() {
+        // Honesty (C5): an unknown window must never invent a num_ctx — the
+        // request body must carry no `options` key at all.
+        use agent_framework_core::types::ChatOptions;
+
+        let mut options = ChatOptions::new();
+        apply_context_window(&mut options, None);
+
+        assert!(
+            !options.additional_properties.contains_key("options"),
+            "an unknown window must not fabricate an `options`/num_ctx key"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn apply_context_window_merges_into_existing_options_without_clobbering() {
+        // If something else has already populated additional_properties["options"]
+        // with other Ollama generation parameters, injecting num_ctx must merge
+        // into that object rather than overwrite it.
+        use agent_framework_core::types::ChatOptions;
+
+        let mut options = ChatOptions::new();
+        options.additional_properties.insert(
+            "options".to_string(),
+            serde_json::json!({ "temperature": 0.2 }),
+        );
+        apply_context_window(&mut options, Some(8_192));
+
+        assert_eq!(
+            options.additional_properties.get("options"),
+            Some(&serde_json::json!({ "temperature": 0.2, "num_ctx": 8_192 })),
+            "existing options keys must survive alongside the injected num_ctx"
+        );
     }
 
     /// A no-op blackboard channel for the FIX 1 advertised-tools tests below:
@@ -3399,6 +4125,222 @@ mod tests {
         );
     }
 
+    /// Write-tools WT5 "catalog +2" assertion: a plain, non-workflow, no-github
+    /// solo run is advertised BOTH `workspace.write_file` and
+    /// `workspace.edit_file` — they are CORE tools, unconditionally offered
+    /// exactly like `git.apply_patch`/`memory.remember`, never gated the way
+    /// `blackboard.*`/`github.*` are.
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn advertised_tools_includes_write_file_and_edit_file_for_a_solo_run() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let solo = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+
+        let offered = runtime.offered_tool_names(&solo);
+        let advertised = FrameworkModelDriver::advertised_tools(&offered);
+        let names: Vec<&str> = advertised.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            names.contains(&WriteFile::NAME),
+            "a solo run must be advertised the CORE workspace.write_file tool: {names:?}"
+        );
+        assert!(
+            names.contains(&EditFile::NAME),
+            "a solo run must be advertised the CORE workspace.edit_file tool: {names:?}"
+        );
+    }
+
+    /// `prepare`/`execute_prepared` round-trip for `workspace.write_file`
+    /// (write-tools WT5), mirroring the `memory.remember` round-trip below: the
+    /// policy engine `Allow`s the `WritePatch` action `prepare` emits (in the
+    /// worktree), and execution performs the REAL write — via `WriteFile::execute`,
+    /// never `git apply` — landing the file on disk with the honest `created`
+    /// observation.
+    #[tokio::test]
+    async fn write_file_prepares_allowed_and_writes_the_file() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(
+                WriteFile::NAME,
+                &json!({"path": "new.txt", "content": "hello"}),
+                &run,
+            )
+            .await
+            .expect("prepares");
+        let decision = runtime
+            .policy
+            .evaluate(&prepared.action, &runtime.eval_ctx(&run));
+        assert_eq!(
+            decision.decision,
+            Decision::Allow,
+            "a workspace.write_file WritePatch is auto-Allowed in the worktree, exactly \
+             like git.apply_patch"
+        );
+
+        let (observation, artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(artifact.is_none());
+        assert!(
+            observation.contains("created") && observation.contains("5 bytes"),
+            "got {observation:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("new.txt")).expect("file was written"),
+            "hello"
+        );
+    }
+
+    /// `prepare`/`execute_prepared` round-trip for `workspace.edit_file`
+    /// (write-tools WT5): a unique search/replace edit applies for real.
+    #[tokio::test]
+    async fn edit_file_prepares_allowed_and_applies_a_unique_edit() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("existing.txt"), "hello world").expect("seed file");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(
+                EditFile::NAME,
+                &json!({
+                    "path": "existing.txt",
+                    "edits": [{"search": "world", "replace": "there"}]
+                }),
+                &run,
+            )
+            .await
+            .expect("prepares");
+        let decision = runtime
+            .policy
+            .evaluate(&prepared.action, &runtime.eval_ctx(&run));
+        assert_eq!(
+            decision.decision,
+            Decision::Allow,
+            "a workspace.edit_file WritePatch is auto-Allowed in the worktree, exactly \
+             like git.apply_patch"
+        );
+
+        let (observation, artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(artifact.is_none());
+        assert!(
+            observation.contains("applied 1 edit"),
+            "got {observation:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("existing.txt")).expect("file exists"),
+            "hello there"
+        );
+    }
+
+    /// WT6 composition check: the two round-trips above each exercise
+    /// `workspace.write_file` and `workspace.edit_file` in isolation on
+    /// separate files. This drives them back-to-back on the *same* file in
+    /// one run — `write_file` creates it, then `edit_file` modifies the
+    /// content it just wrote — and additionally asserts `tool_label` derives
+    /// the expected `path`-only label for each call's raw args, the same
+    /// `args` shape `run_tool` hashes into `ToolStarted.args_digest`.
+    #[tokio::test]
+    async fn write_file_then_edit_file_compose_in_one_run() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let write_args = json!({"path": "compose.txt", "content": "hello world"});
+        assert_eq!(
+            crate::tools::tool_label(WriteFile::NAME, &write_args),
+            Some("compose.txt".to_string()),
+            "the write_file tool card must label with the path"
+        );
+        let prepared = runtime
+            .prepare(WriteFile::NAME, &write_args, &run)
+            .await
+            .expect("write_file prepares");
+        let (observation, _artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(observation.contains("created"), "got {observation:?}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("compose.txt")).expect("file was written"),
+            "hello world"
+        );
+
+        let edit_args = json!({
+            "path": "compose.txt",
+            "edits": [{"search": "world", "replace": "there"}]
+        });
+        assert_eq!(
+            crate::tools::tool_label(EditFile::NAME, &edit_args),
+            Some("compose.txt".to_string()),
+            "the edit_file tool card must label with the path, never the edits array"
+        );
+        let prepared = runtime
+            .prepare(EditFile::NAME, &edit_args, &run)
+            .await
+            .expect("edit_file prepares");
+        let (observation, _artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(
+            observation.contains("applied 1 edit"),
+            "got {observation:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("compose.txt")).expect("file exists"),
+            "hello there",
+            "edit_file must apply on top of what write_file just created, in the same run"
+        );
+    }
+
     /// `prepare`/`execute_prepared` round-trip for `memory.remember` (smarter-memory
     /// M2): the policy engine `Allow`s the `RecordMemory` action, and execution emits
     /// a `NoteAppended` whose text starts with the `memory.propose:` marker the
@@ -3445,6 +4387,147 @@ mod tests {
             }
             other => panic!("expected NoteAppended, got {other:?}"),
         }
+    }
+
+    /// Continuation-content persistence, Task 1: `read_file`'s output was
+    /// never persisted as an artifact — `PreparedTool::ReadFile` always
+    /// returned `None`, so a later CONTINUATION run had nothing to rehydrate
+    /// and the model re-read every file it had already read. This asserts the
+    /// fix: `execute_prepared` for `workspace.read_file` now returns
+    /// `Some(artifact)`, and the bytes handed to the sink are exactly the
+    /// observation (the `path (lines X-Y of Z)` header plus the excerpt) —
+    /// so reopening the artifact later reproduces exactly what the model saw.
+    #[tokio::test]
+    async fn read_file_persists_the_observation_as_an_artifact() {
+        type StoredCall = (String, Vec<u8>);
+        let stored: Arc<Mutex<Option<StoredCall>>> = Arc::new(Mutex::new(None));
+        let capture = stored.clone();
+        let sink: Box<dyn ArtifactSink> = Box::new(ClosureSink(
+            move |media_type: String, _provenance: Provenance, bytes: Vec<u8>| {
+                let capture = capture.clone();
+                async move {
+                    *capture.lock().expect("lock") = Some((media_type.clone(), bytes.clone()));
+                    Ok::<ArtifactRef, anyhow::Error>(ArtifactRef {
+                        id: ArtifactId::new(),
+                        media_type,
+                        byte_length: bytes.len() as u64,
+                        sha256: format!("{:x}", Sha256::digest(&bytes)),
+                        sensitivity: codypendent_protocol::DataClassification::Internal,
+                    })
+                }
+            },
+        ));
+        let hub = SubscriptionHub::new();
+        let session_id = SessionId::new();
+        let _events = hub.subscribe(session_id);
+        let runtime = FrameworkAgentRuntime::new(
+            ModelRegistry::new(Vec::new()),
+            PolicyEngine::with_defaults(),
+            ApprovalBroker::new(),
+            hub,
+            in_memory_journal(),
+            sink,
+        );
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("config.toml"), "[x]\ny = 1\n").expect("write fixture");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(ReadFile::NAME, &json!({"path": "config.toml"}), &run)
+            .await
+            .expect("prepares");
+        let (observation, artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+
+        let artifact = artifact
+            .expect("read_file must now persist its observation as an artifact, not return None");
+        assert_eq!(artifact.media_type, "text/plain");
+
+        let (_, stored_bytes) = stored
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("the sink must have been called");
+        assert_eq!(
+            stored_bytes,
+            observation.as_bytes(),
+            "the stored blob must be exactly the observation (header + excerpt)"
+        );
+    }
+
+    /// Companion to the test above: persistence is best-effort. If the
+    /// artifact sink itself fails (a storage error), the read must still
+    /// succeed and the observation must be unaffected — only the artifact
+    /// ref degrades to `None`. A storage hiccup must never turn a successful
+    /// `read_file` into a failure.
+    #[tokio::test]
+    async fn read_file_degrades_to_no_artifact_when_the_sink_fails() {
+        let sink: Box<dyn ArtifactSink> = Box::new(ClosureSink(
+            |_media_type: String, _provenance: Provenance, _bytes: Vec<u8>| async move {
+                Err::<ArtifactRef, anyhow::Error>(anyhow::anyhow!("disk full"))
+            },
+        ));
+        let hub = SubscriptionHub::new();
+        let session_id = SessionId::new();
+        let _events = hub.subscribe(session_id);
+        let runtime = FrameworkAgentRuntime::new(
+            ModelRegistry::new(Vec::new()),
+            PolicyEngine::with_defaults(),
+            ApprovalBroker::new(),
+            hub,
+            in_memory_journal(),
+            sink,
+        );
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("config.toml"), "[x]\n").expect("write fixture");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(ReadFile::NAME, &json!({"path": "config.toml"}), &run)
+            .await
+            .expect("prepares");
+        let (observation, artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+
+        assert!(
+            matches!(outcome, ToolOutcome::Succeeded),
+            "a sink failure must not turn a successful read into a failure"
+        );
+        assert!(
+            artifact.is_none(),
+            "a sink failure must degrade to no artifact, not propagate"
+        );
+        assert!(
+            observation.contains("[x]"),
+            "the observation must be unaffected by the sink failure: {observation}"
+        );
     }
 
     /// FIX 3 (agent & tool fixes spec): a `shell.run` denial for a program that
@@ -3819,6 +4902,29 @@ mod tests {
         deltas
     }
 
+    /// Collect every `BudgetWarning{Tokens}` currently buffered on `events` as
+    /// `(used, limit)` pairs, in publish order — the loop-level counterpart to
+    /// [`drain_deltas`], used by the context-window protection (T3) tests to
+    /// inspect the plain loop's `BudgetWarning{Tokens}` producer without
+    /// caring about the other event kinds a run also emits.
+    fn drain_token_budget_events(
+        events: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+    ) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::BudgetWarning {
+                dimension: BudgetDimension::Tokens,
+                used,
+                limit,
+                ..
+            } = event.body
+            {
+                out.push((used, limit));
+            }
+        }
+        out
+    }
+
     #[tokio::test]
     async fn a_say_step_streams_its_text_as_a_delta_through_the_sink() {
         // A scripted `Say` run emits exactly one `ModelStreamDelta` carrying
@@ -3848,6 +4954,125 @@ mod tests {
 
         let deltas = drain_deltas(&mut events);
         assert_eq!(deltas, vec!["Hello, world.".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Context-window protection (T3): the plain loop's `BudgetWarning{Tokens}`
+    // producer, exercised end to end through `execute_run`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_known_context_window_emits_budget_warning_tokens_matching_the_estimate() {
+        // With `driver.context_window() == Some(limit)`, the loop's very first
+        // pass through the safe point sees `transcript == [Objective(..)]`
+        // (before the scripted `Say`/`Finish` steps run), so the FIRST emitted
+        // `used` must equal `estimate_context_tokens` of exactly that
+        // transcript — proving the loop feeds the estimator the real,
+        // in-flight transcript rather than some placeholder.
+        let objective = "say hello";
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::Say("Hello, world.".to_string()),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ])
+        .with_context_window(32_768);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            objective,
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("scripted run completes");
+
+        let token_events = drain_token_budget_events(&mut events);
+        assert!(
+            !token_events.is_empty(),
+            "a known window must emit at least one BudgetWarning{{Tokens}}"
+        );
+        let expected_used =
+            estimate_context_tokens(&[TurnItem::Objective(objective.to_string())]) as u64;
+        assert_eq!(token_events[0], (expected_used, 32_768));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_context_window_emits_no_budget_warning_tokens() {
+        // Honesty (C5): `driver.context_window() == None` (the default,
+        // undisturbed by `with_context_window`) must suppress EVERY
+        // `BudgetWarning{Tokens}` emission for the whole run, so
+        // `RunView.context_percent` stays `None` and the footer shows `—`.
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::Say("Hello, world.".to_string()),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ]);
+        assert_eq!(driver.context_window(), None);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "say hello",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("scripted run completes");
+
+        let token_events = drain_token_budget_events(&mut events);
+        assert!(
+            token_events.is_empty(),
+            "unknown window must never emit BudgetWarning{{Tokens}}, got {token_events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_percentage_across_steps_does_not_re_emit() {
+        // Dedup: a huge window relative to a short scripted transcript keeps
+        // the integer percentage at 0 across every step, so despite the loop
+        // passing the safe point twice (once before the `Say` step, once
+        // before `Finish`), at most ONE `BudgetWarning{Tokens}` is emitted —
+        // proving the per-step emit does not spam the ledger.
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::Say("Hello, world.".to_string()),
+            ModelStep::Say("Still here.".to_string()),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ])
+        .with_context_window(100_000_000);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "say hello",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("scripted run completes");
+
+        let token_events = drain_token_budget_events(&mut events);
+        assert_eq!(
+            token_events.len(),
+            1,
+            "an unchanged percent across steps must not re-emit, got {token_events:?}"
+        );
     }
 
     /// A driver that records the transcript it is FIRST handed, then finishes —

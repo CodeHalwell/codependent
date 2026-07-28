@@ -88,10 +88,23 @@ pub enum Action {
     InputPaste(String),
     /// Delete the last character of the open prompt.
     InputBackspace,
+    /// Insert a manual line break into the open prompt (`Alt+Enter`) without
+    /// submitting — the composer/prompt buffer already renders embedded `\n`
+    /// as separate lines, growing to fit.
+    InputNewline,
     /// Submit the open prompt (`Enter`).
     InputSubmit,
     /// Abandon the open prompt (`Esc`).
     InputCancel,
+    /// Recall the previous composer submission (`Up` in the base view,
+    /// shell-style). The first press stashes the in-progress draft so it is
+    /// never lost; repeated presses walk toward older entries. Client-only
+    /// (no `Intent`, no wire) — history lives only in this client's state.
+    HistoryPrev,
+    /// Walk composer history toward newer entries (`Down` in the base view);
+    /// moving past the newest restores the stashed in-progress draft.
+    /// Client-only.
+    HistoryNext,
 
     // --- knowledge browsers (STEP 2.6) ---
     /// Toggle the Skill Studio browser (`S`).
