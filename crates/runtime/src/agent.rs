@@ -142,6 +142,77 @@ pub enum TurnItem {
     Steering(String),
 }
 
+/// Cheap, dependency-free heuristic for [`estimate_context_tokens`]: roughly
+/// 4 characters per token, the widely-used rule of thumb for English/code
+/// under a BPE tokenizer. Deliberately NOT a real tokenizer dependency
+/// (context-window protection spec, `docs/superpowers/specs/
+/// 2026-07-28-context-window-design.md`, component C3): the estimate only
+/// drives a footer percentage and an advisory warning — never billing, never
+/// a hard truncation — so a ±20% error is immaterial, and a real BPE
+/// tokenizer would in any case be precise for the wrong vocabulary (Ollama
+/// models are not GPT-BPE).
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Small fixed per-turn overhead [`estimate_context_tokens`] adds on top of
+/// the character estimate for every [`TurnItem`], approximating the
+/// role/delimiter tokens a real tokenizer spends on message framing that a
+/// raw character count of the payload alone would miss (e.g. the role tag
+/// wrapping each message in `to_messages`). Kept deliberately on the
+/// conservative side: undercounting would let the footer understate how
+/// full the window is, which is the one failure mode this estimator must
+/// avoid (per-item overhead never shrinks with a longer transcript).
+const PER_ITEM_TOKEN_OVERHEAD: usize = 4;
+
+/// The rendered character length of one [`TurnItem`], approximating what
+/// `FrameworkModelDriver::to_messages` (this module, behind `provider-openai`)
+/// actually sends to the model for that turn: the framing text plus the
+/// payload. Counted with
+/// `.chars().count()` rather than byte length, so a unicode-heavy transcript
+/// is not over-counted relative to plain ASCII. Pure, unit-testable in
+/// isolation, and used only by [`estimate_context_tokens`].
+///
+/// Mirrors `to_messages`' per-variant framing:
+/// - `Objective` / `Assistant` / `Steering`: sent verbatim as the message
+///   text, so their length IS the payload length.
+/// - `ToolCall { tool, args }`: sent as `"[calling {tool}: {args}]"`, so the
+///   estimate includes the tool name and the rendered JSON args (uncapped —
+///   `to_messages` truncates a huge args blob for the *replayed* marker via
+///   `compact_args`, but estimating the untruncated length is the safer,
+///   conservative direction: it can only overcount, never hide an
+///   approaching overflow).
+/// - `ToolResult { tool, output }`: sent as `"[tool result: {tool}]\n
+///   {output}"`, so the estimate includes the tool name and the full output.
+pub fn turn_item_text_len(turn: &TurnItem) -> usize {
+    match turn {
+        TurnItem::Objective(text) | TurnItem::Assistant(text) | TurnItem::Steering(text) => {
+            text.chars().count()
+        }
+        TurnItem::ToolCall { tool, args } => {
+            "[calling : ]".chars().count() + tool.chars().count() + args.to_string().chars().count()
+        }
+        TurnItem::ToolResult { tool, output } => {
+            "[tool result: ]\n".chars().count() + tool.chars().count() + output.chars().count()
+        }
+    }
+}
+
+/// Cheap, pure, dependency-free context-size estimate for a transcript, in
+/// tokens (context-window protection spec, component C3). Sums
+/// [`turn_item_text_len`] over every turn — approximating the text
+/// `to_messages` actually sends — divides by [`CHARS_PER_TOKEN`], and adds a
+/// [`PER_ITEM_TOKEN_OVERHEAD`] per turn for framing tokens a raw character
+/// count misses. Deliberately an ESTIMATE: the loop (a later task) compares
+/// it against a known context window to drive a footer percentage and an
+/// advisory warning — it is never used to bill or to hard-truncate the
+/// transcript. `std`-only, no tokenizer dependency, and does not allocate a
+/// rendered copy of the transcript — it sums lengths turn by turn.
+pub fn estimate_context_tokens(transcript: &[TurnItem]) -> usize {
+    transcript
+        .iter()
+        .map(|item| turn_item_text_len(item) / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD)
+        .sum()
+}
+
 /// The next thing the model wants to do, as decided by a [`ModelDriver`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelStep {
@@ -2923,6 +2994,113 @@ fn measured_usage(
 mod tests {
     use super::*;
     use crate::tools::ClosureSink;
+
+    // -----------------------------------------------------------------------
+    // Context-window protection (BT2): estimate_context_tokens / turn_item_text_len
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn estimate_context_tokens_of_empty_transcript_is_zero() {
+        // No turns, no framing overhead to charge — the honest floor.
+        assert_eq!(estimate_context_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn turn_item_text_len_covers_every_variant() {
+        // Plain text variants: the payload's char length, verbatim.
+        assert_eq!(
+            turn_item_text_len(&TurnItem::Objective("hello".to_string())),
+            5
+        );
+        assert_eq!(
+            turn_item_text_len(&TurnItem::Assistant("hi there".to_string())),
+            8
+        );
+        assert_eq!(
+            turn_item_text_len(&TurnItem::Steering("steer this".to_string())),
+            10
+        );
+
+        // ToolCall: must grow with both the tool name and the args, mirroring
+        // to_messages' "[calling {tool}: {args}]" framing — never just a
+        // constant regardless of payload size.
+        let small_call = TurnItem::ToolCall {
+            tool: "shell.run".to_string(),
+            args: json!({"cmd": "ls"}),
+        };
+        let big_call = TurnItem::ToolCall {
+            tool: "shell.run".to_string(),
+            args: json!({"cmd": "ls -la /a/much/longer/argument/payload/here"}),
+        };
+        assert!(turn_item_text_len(&big_call) > turn_item_text_len(&small_call));
+
+        // ToolResult: must grow with the output, mirroring to_messages'
+        // "[tool result: {tool}]\n{output}" framing.
+        let small_result = TurnItem::ToolResult {
+            tool: "shell.run".to_string(),
+            output: "ok".to_string(),
+        };
+        let big_result = TurnItem::ToolResult {
+            tool: "shell.run".to_string(),
+            output: "x".repeat(4000),
+        };
+        assert!(turn_item_text_len(&small_result) < turn_item_text_len(&big_result));
+        assert!(turn_item_text_len(&big_result) >= 4000);
+    }
+
+    #[test]
+    fn estimate_context_tokens_grows_with_a_longer_tool_result_output() {
+        // A transcript whose only difference is a much longer ToolResult
+        // output must yield a strictly larger estimate — the estimator must
+        // not collapse to a flat per-turn constant regardless of payload.
+        let short = vec![TurnItem::ToolResult {
+            tool: "shell.run".to_string(),
+            output: "ok".to_string(),
+        }];
+        let long = vec![TurnItem::ToolResult {
+            tool: "shell.run".to_string(),
+            output: "x".repeat(4000),
+        }];
+        assert!(estimate_context_tokens(&long) > estimate_context_tokens(&short));
+    }
+
+    #[test]
+    fn estimate_context_tokens_applies_per_item_overhead_for_empty_turns() {
+        // N turns with empty text still each carry PER_ITEM_TOKEN_OVERHEAD —
+        // the overhead is per-turn, not a single fixed constant regardless of
+        // transcript length.
+        let n = 5;
+        let turns: Vec<TurnItem> = (0..n).map(|_| TurnItem::Assistant(String::new())).collect();
+        assert_eq!(
+            estimate_context_tokens(&turns),
+            n * PER_ITEM_TOKEN_OVERHEAD,
+            "each empty turn should contribute exactly the per-item overhead"
+        );
+    }
+
+    #[test]
+    fn estimate_context_tokens_is_roughly_chars_over_four_for_a_long_turn() {
+        // Sanity check against the ~4-chars-per-token heuristic: a single
+        // ~4000-char turn should land near 1000 tokens (plus the small
+        // fixed per-item overhead), not wildly off in either direction.
+        let turns = vec![TurnItem::Assistant("a".repeat(4000))];
+        let estimate = estimate_context_tokens(&turns);
+        assert_eq!(estimate, 4000 / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD);
+        assert!(
+            (990..=1010).contains(&estimate),
+            "expected ~1000 tokens (+overhead) for a 4000-char turn, got {estimate}"
+        );
+    }
+
+    #[test]
+    fn estimate_context_tokens_is_monotonic_when_a_turn_is_appended() {
+        // Appending a TurnItem must never lower the estimate.
+        let mut transcript = vec![TurnItem::Objective("start".to_string())];
+        let before = estimate_context_tokens(&transcript);
+        transcript.push(TurnItem::Assistant("more text here".to_string()));
+        let after = estimate_context_tokens(&transcript);
+        assert!(after >= before);
+    }
 
     #[test]
     fn run_context_prior_defaults_empty_and_with_prior_exposes_it() {
