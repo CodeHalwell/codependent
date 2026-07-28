@@ -79,11 +79,50 @@ impl PathScope {
     /// path under a deny entry is [`ScopeVerdict::Denied`] even when it is also
     /// under an allowed root.
     pub fn classify(&self, path: &Path) -> ScopeVerdict {
+        self.classify_canonical(&canonicalize_lenient(path))
+    }
+
+    /// Resolve `path` to its lenient-canonical absolute form and classify that
+    /// **same** resolved path against this scope, returning both together.
+    ///
+    /// This is the no-TOCTOU seam for callers that must later act (e.g. write)
+    /// on exactly the path that was checked: [`classify`] alone recomputes the
+    /// canonical path internally and hands the caller nothing, so a caller that
+    /// re-derives the path itself (even by calling `classify` and then
+    /// re-canonicalizing) opens a check/act gap. `resolve` closes that gap by
+    /// canonicalizing once and returning the resolved [`PathBuf`] alongside its
+    /// [`ScopeVerdict`] — the caller acts on the returned path, never a
+    /// re-derived one.
+    ///
+    /// A non-existent leaf (e.g. a new file to be created) resolves via
+    /// [`canonicalize_lenient`]: the existing ancestor prefix is fully
+    /// canonicalized (collapsing `..` and symlinks), and the not-yet-created
+    /// remainder is appended — so a traversal or symlinked parent cannot escape
+    /// containment even for a path that does not yet exist.
+    ///
+    /// Note: this does not by itself guard against a symlink planted *at the
+    /// leaf* between this call and a later filesystem write — callers that
+    /// write to the returned path must additionally check
+    /// `symlink_metadata` on that same path immediately before writing.
+    ///
+    /// [`classify`]: PathScope::classify
+    pub fn resolve(&self, path: &Path) -> (PathBuf, ScopeVerdict) {
         let canonical = canonicalize_lenient(path);
-        if self.deny.iter().any(|d| is_within(&canonical, d)) {
+        let verdict = self.classify_canonical(&canonical);
+        (canonical, verdict)
+    }
+
+    /// The shared classification core: deny-wins, then root-containment, both
+    /// via component-wise [`is_within`]. Takes an already-canonicalized path so
+    /// [`classify`] and [`resolve`] never canonicalize twice.
+    ///
+    /// [`classify`]: PathScope::classify
+    /// [`resolve`]: PathScope::resolve
+    fn classify_canonical(&self, canonical: &Path) -> ScopeVerdict {
+        if self.deny.iter().any(|d| is_within(canonical, d)) {
             return ScopeVerdict::Denied;
         }
-        if self.roots.iter().any(|r| is_within(&canonical, r)) {
+        if self.roots.iter().any(|r| is_within(canonical, r)) {
             ScopeVerdict::Allowed
         } else {
             ScopeVerdict::OutsideRoots
@@ -252,5 +291,123 @@ mod tests {
         // ...but only that exact path — not the bare name or another location.
         assert!(!scope.allows_program("cargo"));
         assert!(!scope.allows_program("/tmp/cargo"));
+    }
+
+    #[test]
+    fn resolve_allows_a_new_nonexistent_leaf_under_the_root() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let scope = PathScope::new(vec![root.clone()], vec![]);
+
+        let target = root.join("new_file.txt");
+        assert!(!target.exists());
+        let (resolved, verdict) = scope.resolve(&target);
+
+        assert_eq!(verdict, ScopeVerdict::Allowed);
+        assert_eq!(resolved, target);
+    }
+
+    #[test]
+    fn resolve_allows_an_existing_file_under_the_root() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let scope = PathScope::new(vec![root.clone()], vec![]);
+
+        let target = root.join("existing.txt");
+        std::fs::write(&target, b"hello").unwrap();
+        let (resolved, verdict) = scope.resolve(&target);
+
+        assert_eq!(verdict, ScopeVerdict::Allowed);
+        assert_eq!(resolved, target);
+    }
+
+    #[test]
+    fn resolve_rejects_a_relative_escape_outside_the_root() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join("inside")).unwrap();
+        let scope = PathScope::new(vec![root.join("inside")], vec![]);
+
+        // `<root>/inside/../outside` escapes the allowed root via `..`.
+        let escape = root.join("inside/../outside");
+        let (resolved, verdict) = scope.resolve(&escape);
+
+        assert_eq!(verdict, ScopeVerdict::OutsideRoots);
+        assert_eq!(resolved, root.join("outside"));
+    }
+
+    #[test]
+    fn resolve_rejects_an_absolute_path_outside_the_root() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let scope = PathScope::new(vec![root.join("inside")], vec![]);
+
+        let outside = tempdir().unwrap();
+        let outside_root = std::fs::canonicalize(outside.path()).unwrap();
+        let (resolved, verdict) = scope.resolve(&outside_root.join("file.txt"));
+
+        assert_eq!(verdict, ScopeVerdict::OutsideRoots);
+        assert_eq!(resolved, outside_root.join("file.txt"));
+    }
+
+    #[test]
+    fn resolve_denies_a_path_under_a_denied_subpath() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join("secret")).unwrap();
+        let scope = PathScope::new(vec![root.clone()], vec![root.join("secret")]);
+
+        let (resolved, verdict) = scope.resolve(&root.join("secret/file.txt"));
+
+        assert_eq!(verdict, ScopeVerdict::Denied);
+        assert_eq!(resolved, root.join("secret/file.txt"));
+    }
+
+    #[test]
+    fn resolve_resolves_a_symlinked_parent_before_the_root_check() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.join("link");
+        symlink(&real, &link).unwrap();
+        let scope = PathScope::new(vec![real.clone()], vec![]);
+
+        // A not-yet-created file addressed through the symlinked parent still
+        // resolves to (and is classified against) the real, symlink-free path.
+        let (resolved, verdict) = scope.resolve(&link.join("new.txt"));
+
+        assert_eq!(verdict, ScopeVerdict::Allowed);
+        assert_eq!(resolved, real.join("new.txt"));
+    }
+
+    #[test]
+    fn resolve_returns_the_same_path_a_caller_checks_for_a_leaf_symlink() {
+        // Demonstrates the no-TOCTOU seam write tools rely on: `resolve` hands
+        // back the exact path a caller must then pass to `symlink_metadata`
+        // (never a re-derived path) to refuse a symlink planted at the leaf.
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let scope = PathScope::new(vec![root.clone()], vec![]);
+
+        let elsewhere = tempdir().unwrap();
+        let outside_target = elsewhere.path().join("secret.txt");
+        std::fs::write(&outside_target, b"outside").unwrap();
+        let leaf = root.join("planted_link");
+        symlink(&outside_target, &leaf).unwrap();
+
+        // `resolve` follows the symlink during canonicalization (it exists),
+        // so a leaf symlink pointing outside the root is itself classified as
+        // OutsideRoots — the scope check already catches this case.
+        let (resolved, verdict) = scope.resolve(&leaf);
+        assert_eq!(verdict, ScopeVerdict::OutsideRoots);
+
+        // The caller can additionally confirm — on the SAME resolved path,
+        // no re-derivation — whether the *original* leaf was a symlink, which
+        // is the check a write tool performs immediately before writing to
+        // guard against a symlink planted after this call returns.
+        let leaf_metadata = std::fs::symlink_metadata(&leaf).unwrap();
+        assert!(leaf_metadata.file_type().is_symlink());
+        assert_eq!(resolved, std::fs::canonicalize(&outside_target).unwrap());
     }
 }

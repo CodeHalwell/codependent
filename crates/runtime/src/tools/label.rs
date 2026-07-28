@@ -19,7 +19,7 @@
 
 use serde_json::Value;
 
-use super::{ApplyPatch, ReadFile, Search, Shell};
+use super::{ApplyPatch, EditFile, ReadFile, Search, Shell};
 
 /// Hard ceiling on a derived label's length, in `char`s. Longer values are
 /// truncated with a trailing `…`. Short enough to sit on one line next to the
@@ -40,6 +40,10 @@ const MAX_LABEL_CHARS: usize = 80;
 /// * `workspace.read_file` (and `read_file`/`workspace.write_file`/
 ///   `write_file`/`git.apply_patch`/`apply_patch` — any write-ish tool that
 ///   might carry one) → its `path` (or `file`/`filename`) argument.
+/// * `workspace.edit_file` (and `edit_file`) → its `path` argument — the
+///   file being edited, not the `edits` array of search/replace pairs (that
+///   carries file content and must never surface here, same as
+///   `git.apply_patch`'s patch body).
 /// * `shell.run` → the command it runs: the structured `program` + `args`
 ///   array Chapter 11 requires (never an unparsed shell string), joined the
 ///   way a human reads a command line — falling back to a flat `command`/
@@ -60,6 +64,10 @@ pub fn tool_label(tool: &str, args: &Value) -> Option<String> {
         "workspace.write_file" | "write_file" | ApplyPatch::NAME | "apply_patch" => {
             string_arg(args, &["path", "file", "filename"])
         }
+        // `workspace.edit_file`'s `edits` array carries the search/replace
+        // text (file content) — only `path` is safe to show, mirroring
+        // `git.apply_patch`'s patch-body exclusion above.
+        EditFile::NAME | "edit_file" => string_arg(args, &["path", "file", "filename"]),
         Shell::NAME => shell_command_label(args),
         Search::NAME | "search" => string_arg(args, &["query", "pattern"]),
         _ => None,
@@ -210,6 +218,60 @@ mod tests {
         assert_eq!(
             tool_label("search", &json!({"pattern": "TODO"})),
             Some("TODO".to_string())
+        );
+    }
+
+    #[test]
+    fn write_file_label_is_the_path() {
+        assert_eq!(
+            tool_label("workspace.write_file", &json!({"path": "services/main.py"})),
+            Some("services/main.py".to_string())
+        );
+    }
+
+    #[test]
+    fn write_file_alias_name_is_recognized() {
+        assert_eq!(
+            tool_label("write_file", &json!({"path": "new_file.rs"})),
+            Some("new_file.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn edit_file_label_is_the_path_not_the_edits() {
+        assert_eq!(
+            tool_label(
+                "workspace.edit_file",
+                &json!({
+                    "path": "services/main.py",
+                    "edits": [{"search": "old", "replace": "new"}],
+                })
+            ),
+            Some("services/main.py".to_string())
+        );
+    }
+
+    #[test]
+    fn edit_file_alias_name_is_recognized() {
+        assert_eq!(
+            tool_label(
+                "edit_file",
+                &json!({"path": "b.rs", "edits": [{"search": "x", "replace": "y"}]})
+            ),
+            Some("b.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn edit_file_never_leaks_the_edits_array() {
+        // No `path` present — only the (content-bearing) `edits` array. Must
+        // yield `None`, never fall through to stringify `edits` somehow.
+        assert_eq!(
+            tool_label(
+                "workspace.edit_file",
+                &json!({"edits": [{"search": "old", "replace": "new"}]})
+            ),
+            None
         );
     }
 
