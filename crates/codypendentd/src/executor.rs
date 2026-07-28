@@ -2836,4 +2836,225 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
             other => panic!("expected ToolResult, got {other:?}"),
         }
     }
+
+    /// Continuation-content plan, Task 4 (capstone integration test): prove
+    /// the T1 (persist) → T2 (carry the ref through the projection) → T3
+    /// (hydrate) chain COMPOSES across a real run boundary — the gap a
+    /// per-layer unit test cannot see. A PRIOR run is driven through the REAL
+    /// `FrameworkAgentRuntime::execute_run` loop (Explore mode: reading needs
+    /// no approval), so its two `workspace.read_file` calls persist genuine
+    /// artifacts through the actual T1 producer code — never hand-built
+    /// bytes — landing real `ToolCompleted` events with `artifact: Some(..)`
+    /// on the ledger, in the SAME `ArtifactStore` `reconstruct_prior` reads
+    /// from below. A NEW run in the same session then calls the real
+    /// `RuntimeExecutor::reconstruct_prior` — the exact seam a live
+    /// continuation run calls at start — and the assertion is the whole
+    /// payoff of the plan: the seed transcript's `ToolResult`s for
+    /// `workspace.read_file` must carry the real file content (the #37
+    /// path/line header plus the excerpt), never the bare `"succeeded"`
+    /// `tool_result_summary` fallback — so the model sees what it already
+    /// read instead of re-reading it.
+    #[tokio::test]
+    async fn continuation_seed_carries_prior_read_file_content_across_a_real_run() {
+        use codypendent_protocol::RunDisposition;
+        use codypendent_runtime::agent::{ModelStep, ScriptedDriver};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+
+        // The repository the prior run reads — a real checkout-shaped
+        // directory, separate from the daemon's own data dir.
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        std::fs::write(
+            repo.path().join("alpha.rs"),
+            "fn alpha() -> u32 {\n    1\n}\n",
+        )
+        .expect("write alpha.rs");
+        std::fs::write(
+            repo.path().join("beta.rs"),
+            "fn beta() -> u32 {\n    2\n}\n",
+        )
+        .expect("write beta.rs");
+
+        let repository = scan::repository_id_for(repo.path());
+        let executor =
+            RuntimeExecutor::new(pool.clone(), paths, repository, repo.path().to_path_buf());
+
+        let session = SessionId::new();
+        let prior_run = RunId::new();
+        let current_run = RunId::new();
+        ledger::create_session(&pool, session, "cross-run-hydration")
+            .await
+            .expect("create session");
+
+        // Seed the prior run's row + `RunStarted`, exactly as the `StartRun`
+        // command does before the loop runs — `execute_run` executes an
+        // ALREADY-STARTED run (mirrors `seed_started_run!` in
+        // `crates/runtime/tests/agent_it.rs`).
+        projections::insert_run(
+            &pool,
+            prior_run,
+            session,
+            "read two files",
+            AgentMode::Explore,
+            "hosted",
+            "{}",
+        )
+        .await
+        .expect("insert prior run row");
+        let prior_started = codypendent_protocol::SessionEvent {
+            sequence: ledger::next_sequence(&pool, session)
+                .await
+                .expect("sequence"),
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::RunStarted {
+                run_id: prior_run,
+                objective: "read two files".to_string(),
+                mode: AgentMode::Explore,
+            },
+        };
+        ledger::append_event(&pool, session, &prior_started)
+            .await
+            .expect("append RunStarted");
+
+        // Drive the REAL agent loop for the prior run over the SAME pool +
+        // artifact store `reconstruct_prior` reads from below — the T1
+        // producer runs for real here, not a hand-built `ToolCompleted`.
+        let broker = ApprovalBroker::new();
+        let hub = SubscriptionHub::new();
+        let journal = run_journal(&pool, &broker);
+        let sink = artifact_sink(&pool, executor.artifacts());
+        let runtime = FrameworkAgentRuntime::new(
+            ModelRegistry::new(Vec::new()),
+            PolicyEngine::with_defaults(),
+            broker,
+            hub,
+            journal,
+            sink,
+        );
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::CallTool {
+                tool: "workspace.read_file".to_string(),
+                args: serde_json::json!({"path": "alpha.rs"}),
+            },
+            ModelStep::CallTool {
+                tool: "workspace.read_file".to_string(),
+                args: serde_json::json!({"path": "beta.rs"}),
+            },
+            ModelStep::Finish {
+                summary: "read both files".to_string(),
+            },
+        ]);
+        let ctx = RunContext::new(
+            session,
+            prior_run,
+            "read two files",
+            AgentMode::Explore,
+            repo.path(),
+            repo.path(),
+        );
+        let outcome = runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("prior run executes");
+        assert!(
+            matches!(outcome.disposition, RunDisposition::Completed { .. }),
+            "the prior run must complete for its events to land on the ledger"
+        );
+
+        // Sanity: the prior run's real `ToolCompleted` events actually carry
+        // artifacts (the T1 producer ran for real) before asserting on the
+        // continuation seed built from them.
+        let prior_events = ledger::load_events(&pool, session)
+            .await
+            .expect("load prior events");
+        let artifact_count = prior_events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.body,
+                    EventBody::ToolCompleted {
+                        artifact: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            artifact_count, 2,
+            "both read_file calls must have persisted a real artifact"
+        );
+
+        // A NEW run in the same session — its own `RunStarted` is already on
+        // the ledger before it executes (the runtime seeds the current
+        // objective itself), mirroring `continuation_prior`'s doc contract.
+        let follow_up_started = codypendent_protocol::SessionEvent {
+            sequence: ledger::next_sequence(&pool, session)
+                .await
+                .expect("sequence"),
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::RunStarted {
+                run_id: current_run,
+                objective: "now check the config".to_string(),
+                mode: AgentMode::Explore,
+            },
+        };
+        ledger::append_event(&pool, session, &follow_up_started)
+            .await
+            .expect("append current run's RunStarted");
+
+        // THE ASSERTION: the real `reconstruct_prior` — the exact seam a live
+        // continuation run calls — must show the actual prior file content,
+        // never the `tool_result_summary` "succeeded" fallback.
+        let prior = executor.reconstruct_prior(session, current_run).await;
+
+        let tool_results: Vec<&TurnItem> = prior
+            .iter()
+            .filter(
+                |t| matches!(t, TurnItem::ToolResult { tool, .. } if tool == "workspace.read_file"),
+            )
+            .collect();
+        assert_eq!(
+            tool_results.len(),
+            2,
+            "both prior read_file calls must appear in the continuation seed, got: {tool_results:?}"
+        );
+
+        let outputs: Vec<&str> = tool_results
+            .iter()
+            .map(|t| match t {
+                TurnItem::ToolResult { output, .. } => output.as_str(),
+                _ => unreachable!("filtered to ToolResult above"),
+            })
+            .collect();
+
+        for output in &outputs {
+            assert_ne!(
+                *output, "succeeded",
+                "the continuation must SEE the prior read's content, not the bare succeeded fallback"
+            );
+        }
+        assert!(
+            outputs
+                .iter()
+                .any(|o| o.contains("alpha.rs") && o.contains("fn alpha")),
+            "the alpha.rs read must hydrate with its path header and content, got: {outputs:?}"
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|o| o.contains("beta.rs") && o.contains("fn beta")),
+            "the beta.rs read must hydrate with its path header and content, got: {outputs:?}"
+        );
+    }
 }
