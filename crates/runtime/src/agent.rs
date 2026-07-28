@@ -68,14 +68,16 @@ use crate::blackboard::{BlackboardChannel, BlackboardChannelError, BlackboardPos
 use crate::models::ModelRegistry;
 use crate::tools::{
     new_pull_request, parse_blackboard_post, parse_blackboard_query, parse_create_check_run,
-    parse_create_draft_pull_request, parse_get_pull_request, parse_list_check_runs,
-    parse_memory_remember, parse_update_pull_request, render_check_runs, render_pull_request,
-    tool_label, ApplyPatch, ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
-    BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CreateCheckRunInput,
-    CreateCheckRunSummary, CreateDraftPullRequest, CreateDraftPullRequestInput, EnvironmentBinding,
-    GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns, ListCheckRunsInput,
-    MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput, Search, SearchInput, Shell,
-    UpdatePullRequestInput, UpdatePullRequestTool,
+    parse_create_draft_pull_request, parse_edit_file as parse_edit_file_args,
+    parse_get_pull_request, parse_list_check_runs, parse_memory_remember,
+    parse_update_pull_request, parse_write_file as parse_write_file_args, render_check_runs,
+    render_pull_request, tool_label, ApplyPatch, ApplyPatchInput, ArtifactSink,
+    BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput, BlackboardQueryTool,
+    CommandRequest, CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
+    CreateDraftPullRequestInput, EditFile, EditFileInput, EnvironmentBinding, GetPullRequest,
+    GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns, ListCheckRunsInput, MemoryRemember,
+    MemoryRememberInput, ReadFile, ReadFileInput, Search, SearchInput, Shell,
+    UpdatePullRequestInput, UpdatePullRequestTool, WriteFile, WriteFileInput,
 };
 
 /// Safety valve: the maximum number of `next_step` calls a single run makes
@@ -862,6 +864,12 @@ impl FrameworkAgentRuntime {
             Search::NAME,
             GitDiff::NAME,
             ApplyPatch::NAME,
+            // CORE (write-tools WT5): structured-argument alternatives to
+            // `git.apply_patch` — always offered, never workflow/github-gated, so a
+            // weak model that struggles with exact-context diffs still has a
+            // reliable way to create/overwrite a file or make a targeted edit.
+            WriteFile::NAME,
+            EditFile::NAME,
             // CORE (smarter-memory M2): always offered, never workflow/github-gated —
             // saving a fact for future runs is useful regardless of run kind.
             MemoryRemember::NAME,
@@ -1545,6 +1553,54 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::ApplyPatch(input),
                 })
             }
+            // Write-tools WT5: the structured-argument alternatives to
+            // `git.apply_patch`. Both reuse the SAME `WritePatch` action (see the
+            // design spec's "Verified: how apply_patch is actually gated") — the
+            // policy engine routes `WritePatch` to `eval_write`, which auto-`Allow`s
+            // a write inside the run's disposable worktree (denied in read-only
+            // modes), reviewed as an end-of-run change-set rather than a per-call
+            // approval prompt. The spilled artifact is the audit record of what was
+            // (about to be) written; `execute_prepared` performs the REAL write via
+            // `WriteFile`/`EditFile`'s own `execute`, never `git apply`.
+            WriteFile::NAME => {
+                let input = parse_write_file(args, &run.worktree)?;
+                let stored = self
+                    .sink
+                    .store(
+                        "text/plain",
+                        Provenance::tool_output(WriteFile::NAME, run.run_id),
+                        input.content.as_bytes(),
+                    )
+                    .await
+                    .map_err(|e| format!("could not stage write artifact: {e}"))?;
+                Ok(Prepared {
+                    action: ProposedAction::WritePatch { patch: stored.id },
+                    tool: PreparedTool::WriteFile(input),
+                })
+            }
+            EditFile::NAME => {
+                let input = parse_edit_file(args, &run.worktree)?;
+                let edits_json: Vec<Value> = input
+                    .edits
+                    .iter()
+                    .map(|e| json!({"search": e.search, "replace": e.replace}))
+                    .collect();
+                let payload = serde_json::to_vec(&edits_json)
+                    .map_err(|e| format!("could not serialize edits: {e}"))?;
+                let stored = self
+                    .sink
+                    .store(
+                        "application/json",
+                        Provenance::tool_output(EditFile::NAME, run.run_id),
+                        &payload,
+                    )
+                    .await
+                    .map_err(|e| format!("could not stage edit artifact: {e}"))?;
+                Ok(Prepared {
+                    action: ProposedAction::WritePatch { patch: stored.id },
+                    tool: PreparedTool::EditFile(input),
+                })
+            }
             GetPullRequest::NAME => {
                 let repo = self.github_target(run)?;
                 let input = parse_get_pull_request(args)?;
@@ -1790,6 +1846,32 @@ impl FrameworkAgentRuntime {
                     ),
                 }
             }
+            // Write-tools WT5: the REAL write happens here, via each tool's own
+            // `execute`, under the SAME `write_scope` `apply_patch` runs under —
+            // never routed through `git apply`. The observation is the tool's own
+            // honest outcome string (created/overwrote/applied N edits).
+            PreparedTool::WriteFile(input) => {
+                match WriteFile::execute(&input, &write_scope).await {
+                    Ok(outcome) => (outcome.observation(), None, ToolOutcome::Succeeded),
+                    Err(e) => (
+                        format!("workspace.write_file error: {e}"),
+                        None,
+                        ToolOutcome::Failed {
+                            message: e.code().to_string(),
+                        },
+                    ),
+                }
+            }
+            PreparedTool::EditFile(input) => match EditFile::execute(&input, &write_scope).await {
+                Ok(outcome) => (outcome.observation(), None, ToolOutcome::Succeeded),
+                Err(e) => (
+                    format!("workspace.edit_file error: {e}"),
+                    None,
+                    ToolOutcome::Failed {
+                        message: e.code().to_string(),
+                    },
+                ),
+            },
             PreparedTool::GitHubGetPr { repo, input } => match self.github.as_ref() {
                 None => github_unconfigured(),
                 Some(client) => match client.get_pull_request(&repo, input.number).await {
@@ -2073,6 +2155,8 @@ enum PreparedTool {
     Search(SearchInput),
     GitDiff(GitDiffInput),
     ApplyPatch(ApplyPatchInput),
+    WriteFile(WriteFileInput),
+    EditFile(EditFileInput),
     GitHubGetPr {
         repo: RepoId,
         input: GetPullRequestInput,
@@ -2279,6 +2363,37 @@ fn parse_read_file(args: &Value, worktree: &Path) -> Result<ReadFileInput, Strin
         }
     });
     Ok(ReadFileInput { path, range })
+}
+
+/// Root a raw, model-supplied path at `worktree` exactly as [`parse_read_file`]
+/// does: a relative path resolves against the run's worktree (so a file the
+/// agent just wrote reads back, and vice versa); an absolute path is taken as
+/// given (the write scope still confines it).
+fn root_at_worktree(path: PathBuf, worktree: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        worktree.join(path)
+    }
+}
+
+/// Parse `workspace.write_file` arguments, rooting the raw `path` at `worktree`
+/// (write-tools WT5). Field validation itself is delegated to the tool crate's
+/// own [`crate::tools::parse_write_file`] (imported here as
+/// `parse_write_file_args`) — this wrapper only adds the worktree-rooting
+/// `prepare` needs, mirroring [`parse_read_file`]/`parse_apply_patch`.
+fn parse_write_file(args: &Value, worktree: &Path) -> Result<WriteFileInput, String> {
+    let mut input = parse_write_file_args(args)?;
+    input.path = root_at_worktree(input.path, worktree);
+    Ok(input)
+}
+
+/// Parse `workspace.edit_file` arguments, rooting the raw `path` at `worktree`
+/// (write-tools WT5). Mirrors [`parse_write_file`] above.
+fn parse_edit_file(args: &Value, worktree: &Path) -> Result<EditFileInput, String> {
+    let mut input = parse_edit_file_args(args)?;
+    input.path = root_at_worktree(input.path, worktree);
+    Ok(input)
 }
 
 fn parse_search(args: &Value) -> Result<SearchInput, String> {
@@ -2518,6 +2633,50 @@ impl FrameworkModelDriver {
                     "type": "object",
                     "properties": {"patch": {"type": "string"}},
                     "required": ["patch"]
+                }),
+            ),
+            // CORE (write-tools WT5): declared alongside the unconditional
+            // baseline tools — offered to every run, not gated on github/workflow.
+            // Structured-argument alternatives to `git.apply_patch` for a weak
+            // model that struggles to reproduce an exact-context diff.
+            decl(
+                WriteFile::NAME,
+                "Create a new file or overwrite an existing file with the full new contents. \
+                 Use for new files or small full rewrites; for a targeted change to a large \
+                 file use `workspace.edit_file`.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"]
+                }),
+            ),
+            decl(
+                EditFile::NAME,
+                "Edit an existing file with one or more exact search/replace pairs. Each \
+                 `search` must appear exactly once in the file — if a match is not unique the \
+                 edit is rejected and you should include more surrounding context. All edits \
+                 apply together or not at all.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "edits": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "search": {"type": "string"},
+                                    "replace": {"type": "string"}
+                                },
+                                "required": ["search", "replace"]
+                            }
+                        }
+                    },
+                    "required": ["path", "edits"]
                 }),
             ),
             // CORE (smarter-memory M2): declared alongside the unconditional
@@ -3308,6 +3467,151 @@ mod tests {
         assert!(
             names.contains(&MemoryRemember::NAME),
             "a solo run must be advertised the CORE memory.remember tool: {names:?}"
+        );
+    }
+
+    /// Write-tools WT5 "catalog +2" assertion: a plain, non-workflow, no-github
+    /// solo run is advertised BOTH `workspace.write_file` and
+    /// `workspace.edit_file` — they are CORE tools, unconditionally offered
+    /// exactly like `git.apply_patch`/`memory.remember`, never gated the way
+    /// `blackboard.*`/`github.*` are.
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn advertised_tools_includes_write_file_and_edit_file_for_a_solo_run() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let solo = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+
+        let offered = runtime.offered_tool_names(&solo);
+        let advertised = FrameworkModelDriver::advertised_tools(&offered);
+        let names: Vec<&str> = advertised.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            names.contains(&WriteFile::NAME),
+            "a solo run must be advertised the CORE workspace.write_file tool: {names:?}"
+        );
+        assert!(
+            names.contains(&EditFile::NAME),
+            "a solo run must be advertised the CORE workspace.edit_file tool: {names:?}"
+        );
+    }
+
+    /// `prepare`/`execute_prepared` round-trip for `workspace.write_file`
+    /// (write-tools WT5), mirroring the `memory.remember` round-trip below: the
+    /// policy engine `Allow`s the `WritePatch` action `prepare` emits (in the
+    /// worktree), and execution performs the REAL write — via `WriteFile::execute`,
+    /// never `git apply` — landing the file on disk with the honest `created`
+    /// observation.
+    #[tokio::test]
+    async fn write_file_prepares_allowed_and_writes_the_file() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(
+                WriteFile::NAME,
+                &json!({"path": "new.txt", "content": "hello"}),
+                &run,
+            )
+            .await
+            .expect("prepares");
+        let decision = runtime
+            .policy
+            .evaluate(&prepared.action, &runtime.eval_ctx(&run));
+        assert_eq!(
+            decision.decision,
+            Decision::Allow,
+            "a workspace.write_file WritePatch is auto-Allowed in the worktree, exactly \
+             like git.apply_patch"
+        );
+
+        let (observation, artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(artifact.is_none());
+        assert!(
+            observation.contains("created") && observation.contains("5 bytes"),
+            "got {observation:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("new.txt")).expect("file was written"),
+            "hello"
+        );
+    }
+
+    /// `prepare`/`execute_prepared` round-trip for `workspace.edit_file`
+    /// (write-tools WT5): a unique search/replace edit applies for real.
+    #[tokio::test]
+    async fn edit_file_prepares_allowed_and_applies_a_unique_edit() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("existing.txt"), "hello world").expect("seed file");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(
+                EditFile::NAME,
+                &json!({
+                    "path": "existing.txt",
+                    "edits": [{"search": "world", "replace": "there"}]
+                }),
+                &run,
+            )
+            .await
+            .expect("prepares");
+        let decision = runtime
+            .policy
+            .evaluate(&prepared.action, &runtime.eval_ctx(&run));
+        assert_eq!(
+            decision.decision,
+            Decision::Allow,
+            "a workspace.edit_file WritePatch is auto-Allowed in the worktree, exactly \
+             like git.apply_patch"
+        );
+
+        let (observation, artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(artifact.is_none());
+        assert!(
+            observation.contains("applied 1 edit"),
+            "got {observation:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("existing.txt")).expect("file exists"),
+            "hello there"
         );
     }
 
