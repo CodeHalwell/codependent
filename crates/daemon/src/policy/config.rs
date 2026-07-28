@@ -7,11 +7,16 @@
 //! 3. `<repo>/.codypendent/policy.toml` (the Repository layer, narrowest).
 //!
 //! Each file layer is a [`RawPolicy`] applied over the accumulating
-//! [`MergedPolicy`] by [`MergedPolicy::apply_overlay`]. The **merge invariant**
-//! (guide RULE 4) is enforced here: a narrower layer may only *restrict* a
-//! security scope, never widen it. Allowed roots and allow-lists intersect;
-//! deny lists union; approval requirements ratchet toward the more restrictive
-//! value. Preferences that carry no security weight are simply overridden.
+//! [`MergedPolicy`] by either [`MergedPolicy::apply_untrusted_overlay`] (a
+//! repo-local file — may only *restrict* a security scope, never widen it:
+//! allowed roots and allow-lists intersect; deny lists union; approval
+//! requirements ratchet toward the more restrictive value) or
+//! [`MergedPolicy::apply_trusted_overlay`] (the user's own global config —
+//! may *widen or narrow* the shell allow-list, network allow-list, and
+//! `fs_read` scope, and may relax git/network approval dispositions;
+//! `fs_write` stays narrow-only even here, since worktree confinement is the
+//! floor no file may widen). Preferences that carry no security weight are
+//! simply overridden.
 //!
 //! Every section that appears in `docs/specs/policy.toml` is modeled with
 //! `#[serde(deny_unknown_fields)]`, so an unknown key is a load *error*, not a
@@ -138,8 +143,11 @@ impl MergedPolicy {
 
     /// Apply a narrower file layer over this policy, enforcing the merge
     /// invariant. Only fields the overlay sets are touched; each is narrowed,
-    /// never widened.
-    pub fn apply_overlay(&mut self, raw: &RawPolicy) {
+    /// never widened. Used for an **untrusted** source (a repo-local
+    /// `.codypendent/policy.toml`): the file may only claw back authority the
+    /// broader layers already granted, never add a program, root, endpoint,
+    /// or relax an approval disposition.
+    pub fn apply_untrusted_overlay(&mut self, raw: &RawPolicy) {
         if let Some(schema_version) = raw.schema_version {
             self.schema_version = schema_version;
         }
@@ -197,6 +205,95 @@ impl MergedPolicy {
         // `scope`, `data`, `plugins`, and `memory` are parsed (and validated for
         // unknown keys) but not enforced in Phase 1.
     }
+
+    /// Apply a **trusted** file layer over this policy — the user's own
+    /// global config, never a repo-local file. Unlike
+    /// [`Self::apply_untrusted_overlay`], this path may *widen* the shell
+    /// allow-list, network allow-list, and `fs_read` scope, and may *relax*
+    /// git/network approval dispositions (the overlay value replaces the
+    /// accumulated one in either direction). `fs_write` is the one exception:
+    /// it stays **narrow-only** even from a trusted source, because worktree
+    /// confinement (`fs_write = $WORKTREE`) is the floor that guarantees a
+    /// run cannot write outside its isolated worktree — no config file, not
+    /// even the user's own, may widen it (Decision 2a).
+    ///
+    /// Widening the shell/network allow-lists only changes which programs or
+    /// endpoints are *considered* — it never bypasses the approval gate.
+    /// Every allow-listed program still requires a human approval at
+    /// evaluation time (`eval_command`); widening can move a program from
+    /// `Deny` to `RequireApproval`, never to auto-run.
+    ///
+    /// Not yet called by [`super::PolicyEngine::load`] — routing the trusted
+    /// global config through this path (vs. the untrusted path) is a
+    /// separate follow-up task; this method is built and unit-tested ahead
+    /// of that wiring.
+    #[allow(dead_code)]
+    pub fn apply_trusted_overlay(&mut self, raw: &RawPolicy) {
+        if let Some(schema_version) = raw.schema_version {
+            self.schema_version = schema_version;
+        }
+        if let Some(fs) = &raw.filesystem {
+            if let Some(read) = &fs.read {
+                // Widen: a trusted global may extend read scope.
+                self.fs_read = union_roots(&self.fs_read, read);
+            }
+            if let Some(write) = &fs.write {
+                // Narrow-only floor (Decision 2a): even the trusted global
+                // config cannot widen where writes may land.
+                self.fs_write = intersect_roots(&self.fs_write, write);
+            }
+            if let Some(deny) = &fs.deny {
+                // Deny accumulates regardless of trust: adding a denial only
+                // tightens, so it is always safe to union.
+                union_in_place(&mut self.fs_deny, deny);
+            }
+        }
+        if let Some(shell) = &raw.shell {
+            if let Some(programs) = &shell.allowed_programs {
+                // Widen: the trusted global may add programs (e.g. `pytest`)
+                // while keeping the built-in/broader set (union, not
+                // replace). Adding a program here only makes it eligible for
+                // `RequireApproval`, never for auto-run.
+                union_in_place(&mut self.shell_allowed_programs, programs);
+            }
+            if let Some(requires) = shell.shell_interpreter_requires_approval {
+                // Either direction: a trusted global may relax or tighten.
+                self.shell_interpreter_requires_approval = requires;
+            }
+            if let Some(seconds) = shell.maximum_seconds {
+                // Either direction: a trusted global may relax or tighten.
+                self.shell_maximum_seconds = seconds;
+            }
+        }
+        if let Some(network) = &raw.network {
+            if let Some(allow) = &network.allow {
+                // Widen: trusted global may add network endpoints.
+                union_in_place(&mut self.network_allow, allow);
+            }
+            if let Some(default) = network.default {
+                // Either direction: a trusted global may relax network
+                // default to `Allow`.
+                self.network_default = default;
+            }
+        }
+        if let Some(git) = &raw.git {
+            if let Some(commit) = git.commit {
+                // Either direction: a trusted global may relax approval.
+                self.git_commit = commit;
+            }
+            if let Some(push) = git.push {
+                self.git_push = push;
+            }
+            if let Some(force_push) = git.force_push {
+                self.git_force_push = force_push;
+            }
+            if let Some(delete_branch) = git.delete_branch {
+                self.git_delete_branch = delete_branch;
+            }
+        }
+        // `scope`, `data`, `plugins`, and `memory` are parsed (and validated for
+        // unknown keys) but not enforced in Phase 1.
+    }
 }
 
 /// Region intersection of two allowed-root lists. A root from `overlay` is kept
@@ -233,6 +330,24 @@ fn intersect_exact(base: &[String], overlay: &[String]) -> Vec<String> {
         .filter(|item| overlay.iter().any(|o| o == *item))
         .cloned()
         .collect()
+}
+
+/// Region union of two allowed-root lists — the widening dual of
+/// [`intersect_roots`]. Every `base` root is kept; an `overlay` root is
+/// appended unless it already lies within a root already in the result (so a
+/// redundant sub-root contributes nothing new). Used only by the **trusted**
+/// widen path (`apply_trusted_overlay`) for `fs_read`; `fs_write` never calls
+/// this — it stays on `intersect_roots` even for a trusted source.
+#[allow(dead_code)] // called by apply_trusted_overlay, not yet wired into `load`
+fn union_roots(base: &[String], overlay: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = base.to_vec();
+    for candidate in overlay {
+        let already_covered = out.iter().any(|existing| raw_within(candidate, existing));
+        if !already_covered {
+            out.push(candidate.clone());
+        }
+    }
+    out
 }
 
 /// Append entries of `extra` to `base` that are not already present.
@@ -485,7 +600,7 @@ mod tests {
             RawPolicy::parse("[filesystem]\ndeny = [\"$WORKTREE/secrets\", \"$WORKTREE/.git\"]")
                 .unwrap();
         let before = merged.fs_deny.len();
-        merged.apply_overlay(&raw);
+        merged.apply_untrusted_overlay(&raw);
         // New entry added once; the already-present `$WORKTREE/.git` not duped.
         assert!(merged.fs_deny.iter().any(|d| d == "$WORKTREE/secrets"));
         assert_eq!(
@@ -504,7 +619,7 @@ mod tests {
         let mut merged = MergedPolicy::builtin_defaults();
         // Overlay tries to add `npm` and keep `cargo`.
         let raw = RawPolicy::parse("[shell]\nallowed_programs = [\"cargo\", \"npm\"]").unwrap();
-        merged.apply_overlay(&raw);
+        merged.apply_untrusted_overlay(&raw);
         assert_eq!(merged.shell_allowed_programs, vec!["cargo".to_string()]);
     }
 
@@ -548,9 +663,83 @@ mod tests {
         // Overlay tries to relax commit to `allow` — must not weaken approval.
         let raw =
             RawPolicy::parse("[git]\ncommit = \"allow\"\n[network]\ndefault = \"allow\"").unwrap();
-        merged.apply_overlay(&raw);
+        merged.apply_untrusted_overlay(&raw);
         assert_eq!(merged.git_commit, ApprovalAction::Approval);
         assert_eq!(merged.network_default, NetworkDefault::Deny);
+    }
+
+    /// PF1: a **trusted** global config may WIDEN the shell allow-list — the
+    /// concrete `pytest` need. The merged set must contain both `pytest` and
+    /// the built-in baseline (union, not replace).
+    #[test]
+    fn trusted_overlay_widens_shell_allow_list() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        let raw = RawPolicy::parse("[shell]\nallowed_programs = [\"pytest\"]").unwrap();
+        merged.apply_trusted_overlay(&raw);
+        assert!(merged.shell_allowed_programs.iter().any(|p| p == "pytest"));
+        // Built-ins survive — this is a union, not a replace.
+        for builtin in ["cargo", "git", "rg", "rustfmt"] {
+            assert!(
+                merged.shell_allowed_programs.iter().any(|p| p == builtin),
+                "expected `{builtin}` to survive the trusted widen, got {:?}",
+                merged.shell_allowed_programs
+            );
+        }
+    }
+
+    /// PF1 regression guard: an **untrusted** repo-local file must still only
+    /// narrow, even post-split. A repo cannot add `pytest` to the allow-list.
+    #[test]
+    fn untrusted_overlay_still_only_narrows_shell_allow_list() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        let raw = RawPolicy::parse("[shell]\nallowed_programs = [\"cargo\", \"pytest\"]").unwrap();
+        merged.apply_untrusted_overlay(&raw);
+        assert_eq!(merged.shell_allowed_programs, vec!["cargo".to_string()]);
+        assert!(!merged.shell_allowed_programs.iter().any(|p| p == "pytest"));
+    }
+
+    /// PF1: a trusted global config may WIDEN `fs_read` (e.g. to read a
+    /// sibling vendored directory outside the repository root).
+    #[test]
+    fn trusted_overlay_widens_fs_read() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        assert_eq!(merged.fs_read, vec!["$REPOSITORY".to_string()]);
+        let raw = RawPolicy::parse("[filesystem]\nread = [\"/opt/vendored\"]").unwrap();
+        merged.apply_trusted_overlay(&raw);
+        assert!(merged.fs_read.iter().any(|r| r == "$REPOSITORY"));
+        assert!(merged.fs_read.iter().any(|r| r == "/opt/vendored"));
+    }
+
+    /// PF1 SECURITY FLOOR (Decision 2a): `fs_write` never widens, even from
+    /// the trusted global config. A trusted overlay naming `$HOME` must not
+    /// add it to the write scope — worktree confinement is the one invariant
+    /// no file, trusted or not, may relax.
+    #[test]
+    fn trusted_overlay_does_not_widen_fs_write() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        assert_eq!(merged.fs_write, vec!["$WORKTREE".to_string()]);
+        let raw = RawPolicy::parse("[filesystem]\nwrite = [\"$HOME\"]").unwrap();
+        merged.apply_trusted_overlay(&raw);
+        // `$HOME` is disjoint from `$WORKTREE`, so the narrow-only intersect
+        // drops it entirely rather than widening the write scope.
+        assert!(!merged.fs_write.iter().any(|r| r == "$HOME"));
+        assert!(merged.fs_write.is_empty() || merged.fs_write == vec!["$WORKTREE".to_string()]);
+    }
+
+    /// PF1: a trusted global config may WIDEN the network allow-list and
+    /// relax `network.default` and `git.commit` — the opposite of the
+    /// untrusted ratchet proven by `git_and_network_ratchet_toward_restriction`.
+    #[test]
+    fn trusted_overlay_widens_network_and_relaxes_git() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        let raw = RawPolicy::parse(
+            "[network]\nallow = [\"example.com\"]\ndefault = \"allow\"\n[git]\ncommit = \"allow\"",
+        )
+        .unwrap();
+        merged.apply_trusted_overlay(&raw);
+        assert!(merged.network_allow.iter().any(|n| n == "example.com"));
+        assert_eq!(merged.network_default, NetworkDefault::Allow);
+        assert_eq!(merged.git_commit, ApprovalAction::Allow);
     }
 
     #[test]

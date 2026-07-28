@@ -208,15 +208,20 @@ impl PolicyEngine {
         repo_policy: Option<&Path>,
         config_policy: Option<&Path>,
     ) -> Result<Self, PolicyLoadError> {
+        // NOTE: both layers still route through the narrow-only path here —
+        // unchanged from today's behavior. PF1 only splits `apply_overlay`
+        // into `apply_untrusted_overlay` (this call, kept verbatim) and the
+        // new widen-capable `apply_trusted_overlay`; routing `config_policy`
+        // through the trusted path is a separate task.
         let mut merged = MergedPolicy::builtin_defaults();
         if let Some(path) = config_policy {
             if let Some(raw) = config::load_layer(path)? {
-                merged.apply_overlay(&raw);
+                merged.apply_untrusted_overlay(&raw);
             }
         }
         if let Some(path) = repo_policy {
             if let Some(raw) = config::load_layer(path)? {
-                merged.apply_overlay(&raw);
+                merged.apply_untrusted_overlay(&raw);
             }
         }
         Ok(Self::from_merged(merged))
