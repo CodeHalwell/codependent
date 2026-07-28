@@ -416,6 +416,7 @@ fn for_each_row<'a>(
         let is_last_run = Some(run_idx) == last_run_idx;
         let last_entry_idx = run.transcript.len().checked_sub(1);
         let mut produced = false;
+        let mut prev_was_agent_cell = false;
         for (idx, entry) in run.transcript.iter().enumerate() {
             let streaming_tail = is_last_run
                 && last_entry_idx == Some(idx)
@@ -426,6 +427,20 @@ fn for_each_row<'a>(
                     | TranscriptEntry::Tool(_)
                     | TranscriptEntry::Patch(_)
             );
+            // One blank before the first backstage/note entry that follows an
+            // agent reply, so the dim "memory updated"/"context carried"
+            // notes don't jam straight onto the model's text. `prev_was_agent_cell`
+            // flips false again the moment we enter the notes cluster, so
+            // only the FIRST note in a run of them gets the gap.
+            let entering_notes_after_reply = prev_was_agent_cell
+                && matches!(
+                    entry,
+                    TranscriptEntry::Note { .. } | TranscriptEntry::Backstage { .. }
+                );
+            if entering_notes_after_reply {
+                visit(Row::built(Line::raw("")));
+                produced = true;
+            }
             if matches!(entry, TranscriptEntry::User { .. }) {
                 if seen_user_turn {
                     visit(Row::built(Line::raw("")));
@@ -434,6 +449,9 @@ fn for_each_row<'a>(
                 seen_user_turn = true;
                 awaiting_header = true;
             } else if is_agent_cell && awaiting_header {
+                if produced {
+                    visit(Row::built(Line::raw("")));
+                }
                 let mut spans = vec![Span::styled(
                     "⏺ codypendent",
                     Style::default()
@@ -496,6 +514,7 @@ fn for_each_row<'a>(
                     }
                 }
             }
+            prev_was_agent_cell = is_agent_cell;
         }
         if !produced {
             visit(Row::built(Line::styled(
@@ -6071,6 +6090,47 @@ mod tests {
         assert!(
             out.contains("⏺ codypendent · gpt-5.1-codex"),
             "model in the turn header:\n{out}"
+        );
+    }
+
+    /// Turn spacing (transcript "too cramped" fix): mirroring the existing
+    /// blank line before a follow-up `You` turn, a blank line now separates
+    /// the user's message from the assistant's `⏺ codypendent` header too —
+    /// so the reply doesn't jam straight onto the user's text. The header
+    /// and its own body stay glued together (no blank in between); only the
+    /// turn boundary gets the gap.
+    #[test]
+    fn a_blank_line_separates_the_user_turn_from_the_assistant_header() {
+        let s = running_build_state(); // objective → User turn, then a Model reply
+        let out = render_to_string(&s, 110, 30);
+        let rows: Vec<&str> = out.lines().collect();
+        let user_header = rows
+            .iter()
+            .position(|r| r.trim_matches('│').trim() == "You")
+            .expect("user turn header");
+        assert!(
+            !rows[user_header + 1].trim_matches('│').trim().is_empty(),
+            "the You header stays glued to its own body (no blank in between):\n{out}"
+        );
+        let assistant_header = rows
+            .iter()
+            .skip(user_header)
+            .position(|r| r.contains("⏺ codypendent"))
+            .map(|p| p + user_header)
+            .expect("assistant header");
+        assert!(
+            rows[assistant_header - 1]
+                .trim_matches('│')
+                .trim()
+                .is_empty(),
+            "one blank row separates the user turn from the assistant header:\n{out}"
+        );
+        assert!(
+            !rows[assistant_header - 2]
+                .trim_matches('│')
+                .trim()
+                .is_empty(),
+            "only one blank row, not double-spacing, before the assistant header:\n{out}"
         );
     }
 
