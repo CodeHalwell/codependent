@@ -198,28 +198,59 @@ impl PolicyEngine {
     }
 
     /// Load and merge policy from explicit file paths over the built-in
-    /// defaults: `config_policy` (User layer) then `repo_policy` (Repository
-    /// layer, narrowest). A `None` path — or a path that does not exist — is
-    /// skipped. A malformed file (including an unknown key) is an error.
+    /// defaults, applying each layer through the merge path its trust level
+    /// demands (PF4 — see the policy-files design spec, Decision 1):
+    ///
+    /// - `global_policy` (the User layer, the operator's own machine) is
+    ///   **trusted** and goes through [`MergedPolicy::apply_trusted_overlay`] —
+    ///   it may widen the shell/network allow-lists and `fs_read`, and relax
+    ///   git/network approval dispositions (never `fs_write`; see Decision 2a).
+    /// - `repo_policy` (the Repository layer, `<repo>/.codypendent/policy.toml`,
+    ///   possibly attacker-controlled) is **untrusted** and goes through
+    ///   [`MergedPolicy::apply_untrusted_overlay`] — narrow-only, applied LAST
+    ///   so it can always claw back what the global layer widened but can
+    ///   never exceed it.
+    ///
+    /// A `None` path — or a path that does not exist — is skipped (the layer
+    /// contributes nothing, exactly as if the file were absent). A malformed
+    /// file (including an unknown key) is an `Err`: never silently ignored,
+    /// and never silently defaulted — a caller must fail the run rather than
+    /// fall back to `with_defaults`, since that would be a silent widen back
+    /// to (weaker) built-ins for a layer that was meant to narrow or that the
+    /// user meant to widen deliberately.
     ///
     /// Passing explicit paths keeps the engine testable without reading real
     /// user directories.
     pub fn load(
         repo_policy: Option<&Path>,
-        config_policy: Option<&Path>,
+        global_policy: Option<&Path>,
     ) -> Result<Self, PolicyLoadError> {
         let mut merged = MergedPolicy::builtin_defaults();
-        if let Some(path) = config_policy {
+        if let Some(path) = global_policy {
             if let Some(raw) = config::load_layer(path)? {
-                merged.apply_overlay(&raw);
+                merged.apply_trusted_overlay(&raw);
             }
         }
         if let Some(path) = repo_policy {
             if let Some(raw) = config::load_layer(path)? {
-                merged.apply_overlay(&raw);
+                merged.apply_untrusted_overlay(&raw);
             }
         }
         Ok(Self::from_merged(merged))
+    }
+
+    /// Widen an ALREADY-MERGED engine's network allow-list, admitting
+    /// `endpoints` on top of whatever [`load`](Self::load) (or
+    /// [`with_defaults`](Self::with_defaults)) produced. Used to re-admit
+    /// [`GITHUB_API_ENDPOINT`] after loading policy files, so a configured
+    /// GitHub client's endpoint composes with a loaded policy exactly as
+    /// [`with_defaults_allowing_network`](Self::with_defaults_allowing_network)
+    /// composes it over the built-in defaults. Admitting an endpoint grants
+    /// nothing on its own — every GitHub write still returns
+    /// `RequireApproval` ([`eval_github_mutation`](Self::eval_github_mutation)).
+    pub fn admitting_network(mut self, endpoints: impl IntoIterator<Item = String>) -> Self {
+        self.merged.network_allow.extend(endpoints);
+        Self::from_merged(self.merged)
     }
 
     fn from_merged(merged: MergedPolicy) -> Self {
@@ -928,5 +959,173 @@ mod tests {
         let json = serde_json::to_string(&decision).unwrap();
         let parsed: PolicyDecision = serde_json::from_str(&json).unwrap();
         assert_eq!(decision, parsed);
+    }
+
+    // --- PF4: trust routing in `PolicyEngine::load` ---
+
+    /// End-to-end widen: a **trusted global** policy adding `pytest` to the
+    /// shell allow-list must actually move `pytest` from `Deny` to
+    /// `RequireApproval` once loaded through `PolicyEngine::load` — never to
+    /// auto-run (the approval gate is untouched by widening).
+    #[test]
+    fn load_trusted_global_widens_pytest_to_require_approval() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("global-policy.toml"),
+            "[shell]\nallowed_programs = [\"pytest\"]\n",
+        )
+        .unwrap();
+
+        let engine = PolicyEngine::load(None, Some(&dir.path().join("global-policy.toml")))
+            .expect("load a well-formed trusted global policy");
+        let repo = dir.path().to_path_buf();
+        let decision = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "pytest".to_string(),
+                args: Vec::new(),
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(
+            decision.decision,
+            Decision::RequireApproval,
+            "a trusted global policy must be able to widen the allow-list to pytest"
+        );
+
+        // Never auto-run: the same widened command still requires approval,
+        // not Allow.
+        assert_ne!(decision.decision, Decision::Allow);
+    }
+
+    /// The security-critical contrast: the SAME `pytest` addition through the
+    /// **untrusted repo-local** layer must NOT take effect — `pytest` stays
+    /// `Deny`d. Proves origin, not content, decides trust.
+    #[test]
+    fn load_untrusted_repo_cannot_widen_pytest() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("repo-policy.toml"),
+            "[shell]\nallowed_programs = [\"cargo\", \"pytest\"]\n",
+        )
+        .unwrap();
+
+        let engine = PolicyEngine::load(Some(&dir.path().join("repo-policy.toml")), None)
+            .expect("load a well-formed untrusted repo policy");
+        let repo = dir.path().to_path_buf();
+        let decision = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "pytest".to_string(),
+                args: Vec::new(),
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(
+            decision.decision,
+            Decision::Deny,
+            "a repo-local policy must never be able to widen the allow-list"
+        );
+        assert_eq!(decision.reasons[0].code, "policy.program-not-allowlisted");
+    }
+
+    /// A repo layer applied AFTER a widening global layer can still claw back
+    /// what the global layer granted (narrow-only, applied last) — but never
+    /// exceed it. Here the global widens to `pytest`, and the repo narrows
+    /// the allow-list to just `cargo`, so `pytest` must not survive the merge.
+    #[test]
+    fn load_repo_layer_claws_back_what_global_widened() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("global-policy.toml");
+        let repo_path = dir.path().join("repo-policy.toml");
+        std::fs::write(&global_path, "[shell]\nallowed_programs = [\"pytest\"]\n").unwrap();
+        std::fs::write(&repo_path, "[shell]\nallowed_programs = [\"cargo\"]\n").unwrap();
+
+        let engine = PolicyEngine::load(Some(&repo_path), Some(&global_path))
+            .expect("load both well-formed layers");
+        let repo = dir.path().to_path_buf();
+
+        let pytest_decision = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "pytest".to_string(),
+                args: Vec::new(),
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(
+            pytest_decision.decision,
+            Decision::Deny,
+            "the repo layer, applied last, must claw back the global's widen"
+        );
+
+        let cargo_decision = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "cargo".to_string(),
+                args: Vec::new(),
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(cargo_decision.decision, Decision::RequireApproval);
+    }
+
+    /// A malformed file in EITHER layer must fail `load` with a
+    /// `PolicyLoadError` — never a silently-defaulted engine. This is what
+    /// lets a caller (the executor) map the error to a run failure instead of
+    /// quietly falling back to weaker built-in defaults.
+    #[test]
+    fn load_malformed_global_policy_is_an_error_not_a_default() {
+        let dir = tempdir().unwrap();
+        let bad = dir.path().join("bad-global.toml");
+        std::fs::write(&bad, "[shell]\nbogus_key = true\n").unwrap();
+
+        let result = PolicyEngine::load(None, Some(&bad));
+        assert!(
+            result.is_err(),
+            "a malformed global policy must be a load error, not a defaulted engine"
+        );
+    }
+
+    /// `admitting_network` composes with a LOADED policy: the endpoint is
+    /// admitted on top of whatever the file layers already granted, and
+    /// admitting it alone still requires approval for a GitHub mutation
+    /// (grants nothing on its own).
+    #[test]
+    fn admitting_network_composes_with_a_loaded_policy() {
+        let dir = tempdir().unwrap();
+        let global_path = dir.path().join("global-policy.toml");
+        std::fs::write(&global_path, "[shell]\nallowed_programs = [\"pytest\"]\n").unwrap();
+
+        let engine = PolicyEngine::load(None, Some(&global_path))
+            .expect("load a well-formed trusted global policy")
+            .admitting_network([GITHUB_API_ENDPOINT.to_string()]);
+        let repo = dir.path().to_path_buf();
+
+        // The pytest widen from the file layer survived the post-load admit.
+        let pytest_decision = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "pytest".to_string(),
+                args: Vec::new(),
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(pytest_decision.decision, Decision::RequireApproval);
+
+        // The admitted endpoint reaches the approval gate, never Allow.
+        let github_decision = engine.evaluate(
+            &ProposedAction::GitHubMutation {
+                repository: "octocat/hello-world".to_string(),
+                summary: "create draft PR".to_string(),
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(github_decision.decision, Decision::RequireApproval);
     }
 }

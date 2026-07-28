@@ -383,6 +383,45 @@ impl RuntimeExecutor {
         load_model_registry(&self.paths)
     }
 
+    /// Build this run's [`PolicyEngine`] (PF4 — the policy-files design spec,
+    /// "Executor wiring"). Loads the two file layers over the built-in
+    /// defaults, trust-routed by origin (Decision 1):
+    ///
+    /// - the REPO-LOCAL `<repository>/.codypendent/policy.toml` is untrusted
+    ///   (the repo may be one the agent is merely reviewing) and can only
+    ///   narrow;
+    /// - the GLOBAL `self.paths.global_policy_path()` (the operator's own
+    ///   config directory) is trusted and may widen the shell/network
+    ///   allow-lists and `fs_read`, or relax git/network approval.
+    ///
+    /// `PolicyEngine::load` applies the global layer first (widen-or-narrow)
+    /// and the repo layer last (narrow-only), so the repo can always claw
+    /// back what the global layer granted but never exceed it. When a GitHub
+    /// client is configured, [`GITHUB_API_ENDPOINT`] is admitted on the
+    /// network allow-list AFTER the load, so it composes with whatever the
+    /// file layers granted rather than being lost to them — admitting the
+    /// endpoint alone grants nothing; every GitHub write still requires
+    /// approval.
+    ///
+    /// A malformed or unknown-key file in EITHER layer is mapped to a legible
+    /// error string here, and the caller (`execute`) propagates it with `?` so
+    /// the run does not start. This must NEVER fall back to
+    /// `PolicyEngine::with_defaults` on a load error — that would silently
+    /// widen the effective policy back to the (weaker) built-ins for a layer
+    /// an operator meant to narrow, or silently drop the widening they wrote
+    /// a global `pytest` line to get, reproducing the exact honesty gap this
+    /// wiring closes.
+    fn load_run_policy(&self, repository: &Path) -> Result<PolicyEngine, String> {
+        let repo_policy = repository.join(".codypendent").join("policy.toml");
+        let global_policy = self.paths.global_policy_path();
+        let mut policy = PolicyEngine::load(Some(&repo_policy), Some(&global_policy))
+            .map_err(|e| format!("policy configuration error: {e}"))?;
+        if self.github.is_some() {
+            policy = policy.admitting_network([GITHUB_API_ENDPOINT.to_string()]);
+        }
+        Ok(policy)
+    }
+
     /// The pool-erased [`RunJournal`]. Delegates to the shared [`run_journal`].
     fn journal(&self) -> RunJournal {
         run_journal(&self.pool, &self.approvals)
@@ -482,14 +521,7 @@ impl RuntimeExecutor {
             .await
             .map_err(|e| format!("could not build model client: {e}"))?;
 
-        // When a GitHub client is configured, admit the GitHub API endpoint on
-        // the network allow-list so a mutation reaches the approval gate rather
-        // than a hard network deny — every GitHub write still requires approval.
-        let policy = if self.github.is_some() {
-            PolicyEngine::with_defaults_allowing_network([GITHUB_API_ENDPOINT.to_string()])
-        } else {
-            PolicyEngine::with_defaults()
-        };
+        let policy = self.load_run_policy(&launch.repository)?;
 
         let mut runtime = FrameworkAgentRuntime::new(
             registry,
@@ -2218,6 +2250,186 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
                 .await
                 .is_ok(),
             "load_model_registry must attach auth.json so the key resolves"
+        );
+    }
+
+    // --- PF4: the executor seam wires `PolicyEngine::load` (policy-files spec) ---
+
+    /// The security-critical failure mode this wiring closes: a malformed
+    /// GLOBAL policy file must fail `load_run_policy` with a legible error —
+    /// never silently fall back to `PolicyEngine::with_defaults` (which would
+    /// be a silent widen back to weaker built-ins for a file the operator
+    /// meant to narrow, or a silent drop of the widening they wrote it for).
+    /// `execute` propagates this with `?`, so the run does not start.
+    #[tokio::test]
+    async fn load_run_policy_fails_on_malformed_global_policy_no_silent_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().join("data"));
+        paths.ensure_directories().expect("directories");
+        std::fs::create_dir_all(&paths.config_dir).expect("config dir");
+        std::fs::write(paths.global_policy_path(), "[shell]\nbogus_key = true\n")
+            .expect("write malformed global policy");
+
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("repo root");
+        let repository = scan::repository_id_for(&repo_root);
+        let executor = RuntimeExecutor::new(pool, paths, repository, repo_root.clone());
+
+        let result = executor.load_run_policy(&repo_root);
+        let err = result
+            .expect_err("a malformed global policy must fail the run, never silently default");
+        assert!(
+            err.contains("policy configuration error"),
+            "the error must be legible and name the cause, got: {err}"
+        );
+    }
+
+    /// The contrast: with NEITHER policy file present, `load_run_policy`
+    /// succeeds and behaves exactly like `PolicyEngine::with_defaults` — a
+    /// user who has written no policy files sees no change (missing is fine,
+    /// not an error).
+    #[tokio::test]
+    async fn load_run_policy_with_no_files_matches_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().join("data"));
+        paths.ensure_directories().expect("directories");
+
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("repo root");
+        let repository = scan::repository_id_for(&repo_root);
+        let executor = RuntimeExecutor::new(pool, paths, repository, repo_root.clone());
+
+        let policy = executor
+            .load_run_policy(&repo_root)
+            .expect("no files present: load_run_policy must succeed");
+        assert_eq!(
+            policy.policy_version(),
+            codypendent_daemon::policy::PolicyEngine::with_defaults().policy_version(),
+            "with no policy files the loaded engine must match with_defaults exactly"
+        );
+    }
+
+    /// End-to-end through the executor seam: a TRUSTED global policy widens
+    /// the shell allow-list to `pytest`, but the SAME addition through the
+    /// UNTRUSTED repo-local `.codypendent/policy.toml` does not take effect —
+    /// proving the executor's trust routing (global → widen, repo → narrow
+    /// only), not just the lower-level `PolicyEngine::load`.
+    #[tokio::test]
+    async fn load_run_policy_global_widens_pytest_but_repo_cannot() {
+        use codypendent_daemon::policy::{Decision, EvalContext};
+        use codypendent_protocol::ProposedAction;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().join("data"));
+        paths.ensure_directories().expect("directories");
+        std::fs::create_dir_all(&paths.config_dir).expect("config dir");
+        std::fs::write(
+            paths.global_policy_path(),
+            "[shell]\nallowed_programs = [\"pytest\"]\n",
+        )
+        .expect("write global policy");
+
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("repo root");
+        let repository = scan::repository_id_for(&repo_root);
+        let executor = RuntimeExecutor::new(pool, paths, repository, repo_root.clone());
+
+        let widened = executor
+            .load_run_policy(&repo_root)
+            .expect("well-formed global policy loads");
+        let ctx = EvalContext::new(&repo_root, &repo_root);
+        let decision = widened.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "pytest".to_string(),
+                args: Vec::new(),
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx,
+        );
+        assert_eq!(
+            decision.decision,
+            Decision::RequireApproval,
+            "the executor must route the global file through the trusted (widening) path"
+        );
+
+        // A SEPARATE executor with NO global policy at all — a repo-local file
+        // trying the same `pytest` addition on its own must not grant it: the
+        // repo layer alone (`apply_untrusted_overlay`) has no widening branch.
+        let bare_dir = tempfile::tempdir().expect("tempdir");
+        let bare_paths = RuntimePaths::from_data_dir(bare_dir.path().join("data"));
+        bare_paths.ensure_directories().expect("directories");
+        let bare_pool =
+            codypendent_daemon::db::open_database(&bare_paths.data_dir.join("codypendent.db"))
+                .await
+                .expect("open db");
+        let repo_root_2 = bare_dir.path().join("repo");
+        std::fs::create_dir_all(repo_root_2.join(".codypendent")).expect(".codypendent dir");
+        std::fs::write(
+            repo_root_2.join(".codypendent").join("policy.toml"),
+            "[shell]\nallowed_programs = [\"cargo\", \"pytest\"]\n",
+        )
+        .expect("write repo policy");
+        let repository_2 = scan::repository_id_for(&repo_root_2);
+        let bare_executor =
+            RuntimeExecutor::new(bare_pool, bare_paths, repository_2, repo_root_2.clone());
+
+        let repo_only = bare_executor
+            .load_run_policy(&repo_root_2)
+            .expect("well-formed repo policy loads");
+        let repo_ctx = EvalContext::new(&repo_root_2, &repo_root_2);
+        let repo_decision = repo_only.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "pytest".to_string(),
+                args: Vec::new(),
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &repo_ctx,
+        );
+        assert_eq!(
+            repo_decision.decision,
+            Decision::Deny,
+            "the repo-local layer alone must never be able to widen the allow-list to pytest"
+        );
+
+        // Back on the FIRST executor (whose global policy widens pytest): a
+        // repo-local file that narrows to `cargo` only must claw the widen
+        // back — the repo layer is applied LAST and narrow-only, so it can
+        // reduce authority the global layer granted but never exceed it.
+        let clawback_repo = dir.path().join("clawback-repo");
+        std::fs::create_dir_all(clawback_repo.join(".codypendent")).expect(".codypendent dir");
+        std::fs::write(
+            clawback_repo.join(".codypendent").join("policy.toml"),
+            "[shell]\nallowed_programs = [\"cargo\"]\n",
+        )
+        .expect("write narrowing repo policy");
+        let clawed_back = executor
+            .load_run_policy(&clawback_repo)
+            .expect("well-formed repo policy loads");
+        let clawback_ctx = EvalContext::new(&clawback_repo, &clawback_repo);
+        let clawback_decision = clawed_back.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "pytest".to_string(),
+                args: Vec::new(),
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &clawback_ctx,
+        );
+        assert_eq!(
+            clawback_decision.decision,
+            Decision::Deny,
+            "the repo-local layer, applied last and narrow-only, must claw back the global widen"
         );
     }
 
