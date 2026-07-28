@@ -76,7 +76,7 @@ use crate::tools::{
     CommandRequest, CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
     CreateDraftPullRequestInput, EditFile, EditFileInput, EnvironmentBinding, GetPullRequest,
     GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns, ListCheckRunsInput, MemoryRemember,
-    MemoryRememberInput, ReadFile, ReadFileInput, Search, SearchInput, Shell,
+    MemoryRememberInput, ReadFile, ReadFileInput, RepositoryTest, Search, SearchInput, Shell,
     UpdatePullRequestInput, UpdatePullRequestTool, WriteFile, WriteFileInput,
 };
 
@@ -204,7 +204,7 @@ pub fn turn_item_text_len(turn: &TurnItem) -> usize {
         TurnItem::ToolCall { tool, args } => {
             "[calling : ]".chars().count() + tool.chars().count() + args.to_string().chars().count()
         }
-        TurnItem::ToolResult { tool, output } => {
+        TurnItem::ToolResult { tool, output, .. } => {
             "[tool result: ]\n".chars().count() + tool.chars().count() + output.chars().count()
         }
     }
@@ -1026,6 +1026,11 @@ impl FrameworkAgentRuntime {
             // CORE (smarter-memory M2): always offered, never workflow/github-gated —
             // saving a fact for future runs is useful regardless of run kind.
             MemoryRemember::NAME,
+            // CORE (RT1): always offered, never workflow-gated — a plain chat
+            // session can run the repository's own tests exactly as a workflow
+            // tool node already does. The detected program still goes through
+            // the same `shell.run` allow-list + approval gate (see `prepare`).
+            RepositoryTest::NAME,
         ];
         if self.github.is_some() && run.github_repo.is_some() {
             names.extend_from_slice(&[
@@ -1700,6 +1705,34 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::Shell(request),
                 })
             }
+            // CORE (RT1): argument-less — the command is auto-detected (a
+            // `.codypendent/test-command` override, else the build manifest),
+            // never taken from the model's args. A worktree with no resolvable
+            // command surfaces a legible tool error (below) rather than a panic.
+            // The detected program is wrapped in the SAME `CommandRequest` /
+            // `ProposedAction::ExecuteCommand` shape `shell.run` emits, so it is
+            // policy-gated through the identical allow-list + approval path —
+            // no new `ProposedAction` variant.
+            RepositoryTest::NAME => {
+                let command = RepositoryTest::detect_command(&run.worktree)
+                    .await
+                    .map_err(|reason| format!("repository.test: {reason}"))?;
+                let (program, rest) = command
+                    .split_first()
+                    .ok_or_else(|| "repository.test: detected an empty command".to_string())?;
+                let request = CommandRequest {
+                    program: PathBuf::from(program),
+                    args: rest.to_vec(),
+                    cwd: run.worktree.clone(),
+                    environment: Vec::new(),
+                    timeout: std::time::Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
+                };
+                let action = Shell::proposed_action(&request);
+                Ok(Prepared {
+                    action,
+                    tool: PreparedTool::RepositoryTest(command),
+                })
+            }
             ReadFile::NAME => {
                 let input = parse_read_file(args, &run.worktree)?;
                 let action = ReadFile::proposed_action(&input);
@@ -1943,6 +1976,44 @@ impl FrameworkAgentRuntime {
                     }
                     Err(e) => (
                         format!("shell.run error: {e}"),
+                        None,
+                        ToolOutcome::Failed {
+                            message: e.code().to_string(),
+                        },
+                    ),
+                }
+            }
+            // Runs through `RepositoryTest::execute`, which itself calls
+            // `Shell::execute` under the SAME granted scopes `shell.run` uses
+            // (`write_scope` for `cwd`, `command_scope` for the allow-list) —
+            // by the time execution reaches here the policy middleware has
+            // already Allowed/approved the `ExecuteCommand` action `prepare`
+            // built for the detected program, exactly as for `shell.run`.
+            PreparedTool::RepositoryTest(command) => {
+                match RepositoryTest::execute(
+                    &command,
+                    &run.worktree,
+                    &write_scope,
+                    &command_scope,
+                    &*self.sink,
+                    run.run_id,
+                )
+                .await
+                {
+                    Ok(outcome) => {
+                        let observation = outcome.summary.clone();
+                        let artifact = outcome.output_ref.clone();
+                        let result = if outcome.success {
+                            ToolOutcome::Succeeded
+                        } else {
+                            ToolOutcome::Failed {
+                                message: outcome.summary,
+                            }
+                        };
+                        (observation, artifact, result)
+                    }
+                    Err(e) => (
+                        format!("repository.test error: {e}"),
                         None,
                         ToolOutcome::Failed {
                             message: e.code().to_string(),
@@ -2369,6 +2440,11 @@ struct Prepared {
 /// A model tool call parsed into its typed, executable input.
 enum PreparedTool {
     Shell(CommandRequest),
+    /// The `repository.test` tool's detected command (`[program, args...]`),
+    /// resolved once in `prepare` (so the SAME command that was policy-gated
+    /// via `ProposedAction::ExecuteCommand` is what actually runs — never
+    /// re-detected at execution time, which could otherwise drift).
+    RepositoryTest(Vec<String>),
     ReadFile(ReadFileInput),
     Search(SearchInput),
     GitDiff(GitDiffInput),
@@ -2917,6 +2993,18 @@ impl FrameworkModelDriver {
                     "required": ["path", "edits"]
                 }),
             ),
+            // CORE (RT1): argument-less — the command is auto-detected (a
+            // `.codypendent/test-command` override, else `cargo test` / `npm
+            // test` / `pytest` by manifest), never supplied by the model. The
+            // detected program still goes through the `shell.run` allow-list +
+            // approval gate.
+            decl(
+                RepositoryTest::NAME,
+                "Run the repository's own test suite. The command is auto-detected from the \
+                 worktree (a `.codypendent/test-command` override, else `cargo test` / `npm \
+                 test` / `pytest` by build manifest) — takes no arguments.",
+                json!({"type": "object", "properties": {}}),
+            ),
             // CORE (smarter-memory M2): declared alongside the unconditional
             // baseline tools — offered to every run, not gated on github/workflow.
             decl(
@@ -3377,10 +3465,12 @@ mod tests {
         let small_result = TurnItem::ToolResult {
             tool: "shell.run".to_string(),
             output: "ok".to_string(),
+            artifact: None,
         };
         let big_result = TurnItem::ToolResult {
             tool: "shell.run".to_string(),
             output: "x".repeat(4000),
+            artifact: None,
         };
         assert!(turn_item_text_len(&small_result) < turn_item_text_len(&big_result));
         assert!(turn_item_text_len(&big_result) >= 4000);
@@ -3394,10 +3484,12 @@ mod tests {
         let short = vec![TurnItem::ToolResult {
             tool: "shell.run".to_string(),
             output: "ok".to_string(),
+            artifact: None,
         }];
         let long = vec![TurnItem::ToolResult {
             tool: "shell.run".to_string(),
             output: "x".repeat(4000),
+            artifact: None,
         }];
         assert!(estimate_context_tokens(&long) > estimate_context_tokens(&short));
     }
@@ -4490,6 +4582,177 @@ mod tests {
         assert!(
             message.contains("workspace.read_file") && message.contains("workspace.search"),
             "the denial must point the model at the structured exploration tools: {message}"
+        );
+    }
+
+    /// RT1: `repository.test` is a CORE tool — offered to a plain, non-workflow
+    /// solo run exactly like `memory.remember` (the M2 "+1" precedent), never
+    /// gated on a workflow/github binding.
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn advertised_tools_includes_repository_test_for_a_solo_run() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let solo = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+
+        let offered = runtime.offered_tool_names(&solo);
+        let advertised = FrameworkModelDriver::advertised_tools(&offered);
+        let names: Vec<&str> = advertised.iter().map(|d| d.name.as_str()).collect();
+
+        assert!(
+            names.contains(&RepositoryTest::NAME),
+            "a solo run must be advertised the CORE repository.test tool: {names:?}"
+        );
+    }
+
+    /// RT1: `prepare` on a worktree with a `Cargo.toml` detects `cargo test` and
+    /// wraps it in the SAME `ProposedAction::ExecuteCommand` shape `shell.run`
+    /// emits — so it goes through the identical allow-list + approval gate.
+    /// `cargo` is on the built-in allow-list, but (like every allow-listed
+    /// program) still requires approval; it is never auto-run. The manifest is
+    /// deliberately minimal/invalid (no `package.name`) so `cargo test` fails
+    /// fast with a parse error instead of touching the shared `target/` — the
+    /// round trip only needs to prove the wiring runs the DETECTED command
+    /// through `Shell::execute`, not that a real test suite passes.
+    #[tokio::test]
+    async fn repository_test_prepares_and_executes_cargo_test_in_a_cargo_worktree() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\n").expect("write Cargo.toml");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "run the tests",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(RepositoryTest::NAME, &json!({}), &run)
+            .await
+            .expect("detects cargo test from the Cargo.toml manifest");
+        match &prepared.action {
+            ProposedAction::ExecuteCommand { program, args, .. } => {
+                assert_eq!(program, "cargo");
+                assert_eq!(args, &vec!["test".to_string()]);
+            }
+            other => panic!("expected an ExecuteCommand action, got {other:?}"),
+        }
+
+        let decision = runtime
+            .policy
+            .evaluate(&prepared.action, &runtime.eval_ctx(&run));
+        assert_eq!(
+            decision.decision,
+            Decision::RequireApproval,
+            "the detected `cargo` is allow-listed but, like shell.run, still requires approval"
+        );
+
+        // Simulate the approval having been granted, and run it through the
+        // SAME execution path `shell.run` uses.
+        let (observation, _artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(
+            matches!(outcome, ToolOutcome::Failed { .. }),
+            "the invalid manifest makes cargo fail fast; got {outcome:?}"
+        );
+        assert!(
+            observation.contains("cargo test"),
+            "the observation names the command that ran: {observation:?}"
+        );
+    }
+
+    /// RT1: a worktree with no `.codypendent/test-command` and no recognized
+    /// build manifest must not crash the run — `prepare` surfaces the same
+    /// legible reason `RepositoryTest::detect_command` returns.
+    #[tokio::test]
+    async fn repository_test_prepare_surfaces_a_legible_error_when_undetectable() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "run the tests",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+
+        let err = match runtime
+            .prepare(RepositoryTest::NAME, &json!({}), &run)
+            .await
+        {
+            Ok(_) => panic!("an empty worktree must not resolve a test command"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("no test command"),
+            "the reason must be legible, not a panic: {err}"
+        );
+    }
+
+    /// RT1: a detected program that is NOT on the shell allow-list (`pytest`,
+    /// the default for a `pyproject.toml` worktree) is Denied through the exact
+    /// same gate `shell.run` uses — no bypass, no special-casing.
+    #[tokio::test]
+    async fn repository_test_denies_a_non_allow_listed_detected_program() {
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::CallTool {
+                tool: RepositoryTest::NAME.to_string(),
+                args: json!({}),
+            },
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ]);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("pyproject.toml"), "[project]\n")
+            .expect("write pyproject.toml");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "run the tests in a python repo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("the run completes even though the tool call is denied");
+
+        let mut denial = None;
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::ToolCompleted {
+                tool,
+                outcome: ToolOutcome::Failed { message },
+                ..
+            } = event.body
+            {
+                if tool == RepositoryTest::NAME {
+                    denial = Some(message);
+                }
+            }
+        }
+        let message = denial.expect("repository.test was completed as a policy denial");
+        assert!(
+            message.contains("`pytest` is not in the shell allow-list"),
+            "the detected program must be denied through the SAME allow-list `shell.run` uses: \
+             {message}"
         );
     }
 
