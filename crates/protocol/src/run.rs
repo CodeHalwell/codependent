@@ -165,6 +165,12 @@ pub enum ProposedAction {
         /// The workflow run whose board is read (server-derived).
         workflow_run_id: String,
     },
+    /// Record a memory proposal note (the `memory.remember` core tool, smarter-memory
+    /// M2). Appends a `NoteAppended` to the run's own ledger — no filesystem, command,
+    /// network, or remote effect. Always policy-`Allow`ed (see the daemon policy
+    /// engine's explicit arm); never serialized into a `ToolProposed` (never gated by
+    /// approval), so it needs no golden wire vector.
+    RecordMemory,
     #[serde(other)]
     Unknown,
 }

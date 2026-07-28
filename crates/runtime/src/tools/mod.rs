@@ -31,6 +31,7 @@ mod blackboard;
 mod git;
 mod github;
 mod label;
+mod memory;
 mod read_file;
 mod repository;
 mod salient;
@@ -59,6 +60,7 @@ pub use github::{
     ListCheckRunsInput, UpdatePullRequestInput, UpdatePullRequestTool,
 };
 pub use label::tool_label;
+pub use memory::{parse_memory_remember, MemoryRemember, MemoryRememberInput};
 pub use read_file::{FileExcerpt, ReadFile, ReadFileInput};
 pub use repository::{RepositoryTest, RepositoryTestOutcome};
 pub use salient::{SalientStream, SalientView};

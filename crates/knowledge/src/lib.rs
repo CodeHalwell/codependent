@@ -18,6 +18,7 @@ pub mod codegraph;
 pub mod context;
 pub mod db;
 pub mod docs;
+pub mod extractor;
 pub mod manifest;
 pub mod memory;
 pub mod observer;
@@ -36,6 +37,8 @@ pub use types::{
 };
 
 pub use outbox::KnowledgeIndexEvent;
+
+pub use extractor::{ExtractionInput, FactExtractor, NoopExtractor};
 
 pub use builtin::{builtin_tools, register_builtins};
 pub use manifest::{
@@ -68,7 +71,7 @@ pub use memory::{
     detect_secret, provenance_cards, CandidateMemory, Curation, ForgetAudit, MemoryError,
     MemoryStore, ProvenanceCard,
 };
-pub use observer::extract_candidates;
+pub use observer::{chronicle_candidates, extract_candidates};
 
 pub use context::{assemble_context, ContextCard, ContextError, ContextManifest, ContextMemory};
 

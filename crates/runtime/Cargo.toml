@@ -20,6 +20,11 @@ codypendent-routing = { workspace = true }
 # credentials via the async CredentialProvider seam. codypendent-providers is
 # a daemon-free, network-free leaf crate (like codypendent-routing), so this
 # adds no cycle.
+# The model-backed `LlmFactExtractor` (M3b, smarter-memory) implements
+# `codypendent_knowledge::FactExtractor` and returns its `CandidateMemory`.
+# `codypendent-knowledge` depends on neither the daemon nor this crate, so
+# this is a one-way internal edge — no cycle (see its own Cargo.toml comment).
+codypendent-knowledge = { workspace = true }
 codypendent-providers = { workspace = true }
 agent-framework-core = { workspace = true }
 agent-framework-openai = { workspace = true, optional = true }

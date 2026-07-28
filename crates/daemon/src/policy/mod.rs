@@ -276,6 +276,7 @@ impl PolicyEngine {
             ProposedAction::BlackboardPost { .. } | ProposedAction::BlackboardQuery { .. } => {
                 self.eval_blackboard()
             }
+            ProposedAction::RecordMemory => self.eval_record_memory(),
             _ => self.deny(PolicyReason::new(
                 "policy.unsupported-action",
                 "the proposed action is not recognized by this policy engine",
@@ -296,6 +297,23 @@ impl PolicyEngine {
             reasons: vec![PolicyReason::new(
                 "policy.blackboard-allowed",
                 "a workflow blackboard access targets only the run's own artifact channel",
+            )],
+            capability_grant: None,
+            policy_version: self.version.clone(),
+        }
+    }
+
+    /// A `memory.remember` call (smarter-memory M2) is always permitted: its
+    /// only effect is a `NoteAppended` on the run's own ledger — not the
+    /// filesystem, a command, the network, or any remote — so it grants no
+    /// capability and never reaches the approval gate, exactly like a
+    /// blackboard access.
+    fn eval_record_memory(&self) -> PolicyDecision {
+        PolicyDecision {
+            decision: Decision::Allow,
+            reasons: vec![PolicyReason::new(
+                "policy.record-memory-allowed",
+                "a memory proposal note targets only the run's own ledger",
             )],
             capability_grant: None,
             policy_version: self.version.clone(),
@@ -862,6 +880,23 @@ mod tests {
             decision.capability_grant.unwrap().capability,
             Capability::FileWrite(_)
         ));
+    }
+
+    /// `memory.remember` (smarter-memory M2): its only effect is a note on the
+    /// run's own ledger, so it is always `Allow`ed regardless of mode/scope —
+    /// mirroring the blackboard tools' unconditional allow.
+    #[test]
+    fn record_memory_is_always_allowed() {
+        let engine = PolicyEngine::with_defaults();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let decision = engine.evaluate(
+            &ProposedAction::RecordMemory,
+            &ctx(&repo, &repo).with_mode(ModeOverlay::read_only()),
+        );
+        assert_eq!(decision.decision, Decision::Allow);
+        assert_eq!(decision.reasons[0].code, "policy.record-memory-allowed");
+        assert!(decision.capability_grant.is_none());
     }
 
     #[test]

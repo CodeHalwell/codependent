@@ -36,10 +36,14 @@ use codypendent_daemon::workflow_stream::{WorkflowHub, WorkflowReader};
 use codypendent_daemon::worktrees::{WorktreeError, WorktreeManager};
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::github::{GitHubApi, RepoId};
-use codypendent_knowledge::{assemble_context, extract_candidates, Curation, MemoryStore, Scope};
+use codypendent_knowledge::{
+    assemble_context, chronicle_candidates, extract_candidates, Curation, ExtractionInput,
+    FactExtractor, MemoryStore, NoopExtractor, Revision, Scope,
+};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    Actor, AgentMode, DataClassification, EventBody, ModelId, RepositoryId, RunId, SessionId,
+    Actor, AgentMode, ArtifactRef, DataClassification, EventBody, ModelId, RepositoryId, RunId,
+    SessionId,
 };
 use codypendent_runtime::agent::{
     cancellation, mode_overlay, ApprovalRequest, CancellationHandle, CancellationToken,
@@ -657,20 +661,102 @@ impl RuntimeExecutor {
         }
     }
 
+    /// Read + JSON-parse the bytes behind a chronicle [`ArtifactRef`]
+    /// (best-effort; the caller warns and skips on any error).
+    async fn load_chronicle(&self, chronicle: &ArtifactRef) -> anyhow::Result<serde_json::Value> {
+        use tokio::io::AsyncReadExt;
+        let mut file = self.artifacts().open(&self.pool, chronicle.id).await?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).await?;
+        Ok(serde_json::from_slice(&buf)?)
+    }
+
     /// After a run reaches a terminal state, harvest curated memories from its own
     /// event trace and note each durable one, so "a run produces a curated memory
     /// whose provenance opens to its source" holds for every run.
     ///
-    /// Runs **after** `execute` returns (the loop is no longer appending), so the
-    /// note appends never race the agent loop. The curator redacts secrets before
-    /// anything is stored, so a `remembered:` note can never carry secret text.
-    /// Every failure is warned and swallowed — a harvesting error must not turn a
-    /// finished run into a failed one.
+    /// Public entry: resolves the [`FactExtractor`] for this run's mode (M3a
+    /// always resolves [`NoopExtractor`]; M3b's `build_fact_extractor` adds the
+    /// D2 selection order) and delegates to the testable core, [`Self::harvest_with`].
     async fn harvest_memories(
         &self,
         session_id: SessionId,
         run_id: RunId,
         repository: RepositoryId,
+        mode: AgentMode,
+    ) {
+        let extractor = self.build_fact_extractor(mode).await;
+        self.harvest_with(session_id, run_id, repository, extractor.as_ref())
+            .await;
+    }
+
+    /// M3b: the extractor this run's harvest is injected with, per the D2
+    /// selection order: (1) a configured `memory_extraction_model` (from
+    /// `routing.toml`), when set AND resolvable in the model registry;
+    /// (2) else the run's own resolved model (the same `resolve_model` call
+    /// `execute` uses); (3) else [`NoopExtractor`] — no model configured at
+    /// all. Every step is fail-safe: a missing registry, an unresolvable
+    /// model, or a client-construction error all fall back to
+    /// `NoopExtractor` rather than failing the harvest (which itself never
+    /// fails a run).
+    ///
+    /// NOT gated on `#[cfg(feature = "provider-openai")]`: `codypendentd`
+    /// pulls `codypendent-runtime` with default features (provider-openai
+    /// on) and already calls its `client_for`/`from_registry` unconditionally
+    /// elsewhere (`execute`, above; `load_model_registry_resolves_a_key_from_auth_json`'s
+    /// comment), and defines no `provider-openai` feature of its own — so
+    /// gating here would make the real path dead code in every build this
+    /// crate ships.
+    async fn build_fact_extractor(&self, mode: AgentMode) -> Box<dyn FactExtractor> {
+        let (registry, policy) = match self.load_registry() {
+            Ok(rp) => rp,
+            Err(_) => return Box::new(NoopExtractor), // no model configured ⇒ Noop
+        };
+        // D2 selection: (1) configured extraction model, (2) run's resolved
+        // model, (3) Noop.
+        let configured = RoutingConfig::load(&self.paths).memory_extraction_model;
+        let model_id = match configured.filter(|id| registry.get(id).is_some()) {
+            Some(id) => id,
+            None => match resolve_model(&registry, &policy, mode).await {
+                Ok(resolved) => resolved.id,
+                Err(_) => return Box::new(NoopExtractor),
+            },
+        };
+        // D2 config visibility: warn ONCE per process that extraction makes a
+        // per-run model call, so an operator points `memory_extraction_model`
+        // at a cheap model.
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        NOTE.call_once(|| tracing::info!(
+            "memory extraction makes a best-effort per-run model call; set `memory_extraction_model` in routing.toml to a cheap/local model to keep cost off the coding model"
+        ));
+        match codypendent_runtime::LlmFactExtractor::from_registry(&registry, model_id).await {
+            Ok(extractor) => Box::new(extractor),
+            Err(error) => {
+                warn!(%error, "could not build memory extraction client; extraction disabled for this run");
+                Box::new(NoopExtractor)
+            }
+        }
+    }
+
+    /// The testable harvest core: loads the ledger, appends the pure
+    /// heuristic/agent-tool candidates, calls the injected `extractor`
+    /// best-effort, re-anchors every candidate to REPOSITORY scope, and
+    /// curates each through [`MemoryStore::curate`].
+    ///
+    /// Runs **after** `execute` returns (the loop is no longer appending), so the
+    /// note appends never race the agent loop. The curator redacts secrets before
+    /// anything is stored, so a `remembered:` note can never carry secret text.
+    /// Every failure is warned and swallowed — a harvesting error must not turn a
+    /// finished run into a failed one. `extractor.extract` itself can never fail
+    /// (it returns `Vec`, never `Result`), so its contribution is best-effort by
+    /// construction: an unreachable/slow/misconfigured model degrades to
+    /// "contributes nothing," never to a failed run.
+    async fn harvest_with(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        repository: RepositoryId,
+        extractor: &dyn FactExtractor,
     ) {
         let events = match ledger::load_events(&self.pool, session_id).await {
             Ok(events) => events,
@@ -687,7 +773,56 @@ impl RuntimeExecutor {
         // (which `emit_context` queries at System + this repository); a
         // session-scoped memory would never be seen again.
         let repository_scope = Scope::Repository(repository);
-        let mut candidates = extract_candidates(&events, Scope::Session(session_id));
+        let session_scope = Scope::Session(session_id);
+        let mut candidates = extract_candidates(&events, session_scope.clone());
+
+        // Heuristic chronicle facts (M1). Locate the RunCompleted event, load its
+        // chronicle artifact, parse it, and append discrete candidates. Every
+        // step is best-effort: a miss/parse failure is warned and skipped, never
+        // fatal to an otherwise-finished run.
+        if let Some((chronicle_ref, seq, at)) = events.iter().rev().find_map(|e| match &e.body {
+            EventBody::RunCompleted { chronicle, .. } => {
+                Some((chronicle.clone(), e.sequence, e.occurred_at))
+            }
+            _ => None,
+        }) {
+            match self.load_chronicle(&chronicle_ref).await {
+                Ok(chronicle) => {
+                    let valid_from = Revision::sequence(seq);
+                    candidates.extend(chronicle_candidates(
+                        &chronicle,
+                        &session_scope,
+                        &chronicle_ref,
+                        run_id,
+                        at,
+                        valid_from.clone(),
+                        chronicle_ref.sensitivity,
+                    ));
+
+                    // M3a: the LLM-extractor seam (no model call yet — the
+                    // injected extractor is best-effort NoopExtractor by
+                    // default; M3b swaps in the real model-backed one).
+                    let objective = chronicle["objective"].as_str().unwrap_or("");
+                    let transcript_excerpt = run_transcript_excerpt(&events, run_id);
+                    let input = ExtractionInput {
+                        objective,
+                        chronicle: &chronicle,
+                        transcript_excerpt: &transcript_excerpt,
+                        scope: &session_scope,
+                        chronicle_ref: &chronicle_ref,
+                        run_id,
+                        observed_at: at,
+                        valid_from,
+                        sensitivity: chronicle_ref.sensitivity,
+                    };
+                    candidates.extend(extractor.extract(input).await);
+                }
+                Err(error) => {
+                    warn!(%session_id, %run_id, %error, "could not load run chronicle for memory harvest");
+                }
+            }
+        }
+
         for candidate in &mut candidates {
             candidate.scope = Some(repository_scope.clone());
         }
@@ -714,6 +849,36 @@ impl RuntimeExecutor {
     }
 }
 
+/// A cheap join of this run's note/tool-observation texts from the session
+/// ledger, un-capped (M3a): the extractor implementation is responsible for
+/// bounding its own input, per [`ExtractionInput::transcript_excerpt`]'s
+/// contract.
+fn run_transcript_excerpt(events: &[codypendent_protocol::SessionEvent], run_id: RunId) -> String {
+    use codypendent_protocol::ToolOutcome;
+
+    events
+        .iter()
+        .filter_map(|event| match &event.body {
+            EventBody::NoteAppended {
+                text,
+                run_id: note_run,
+            } if *note_run == Some(run_id) => Some(text.clone()),
+            EventBody::ToolCompleted {
+                run_id: tool_run,
+                tool,
+                outcome,
+                ..
+            } if *tool_run == run_id => Some(match outcome {
+                ToolOutcome::Succeeded => format!("{tool}: succeeded"),
+                ToolOutcome::Failed { message } => format!("{tool}: failed - {message}"),
+                _ => format!("{tool}: unknown outcome"),
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 impl RunExecutor for RuntimeExecutor {
     fn spawn_run(&self, launch: RunLaunch) {
         let executor = self.clone();
@@ -722,6 +887,10 @@ impl RunExecutor for RuntimeExecutor {
             let session_id = launch.session_id;
             let run_id = launch.run_id;
             let objective = launch.objective.clone();
+            // `AgentMode` is `Copy` — carried out alongside the identity above so
+            // `harvest_memories` can resolve the M3a/M3b fact extractor for this
+            // run's mode (D2) after `launch` is moved into the worker below.
+            let mode = launch.mode;
             // This run's OWN repository identity, derived from its repository root
             // (issue #6 item 1) — NOT the daemon's startup directory — so a shared
             // daemon attributes its context map and curated memories correctly.
@@ -823,7 +992,7 @@ impl RunExecutor for RuntimeExecutor {
             // event trace and note each durable one — emitted AFTER the loop, so
             // these appends never race it either.
             executor
-                .harvest_memories(session_id, run_id, repository)
+                .harvest_memories(session_id, run_id, repository, mode)
                 .await;
         });
     }
@@ -1357,6 +1526,532 @@ mod tests {
         assert!(
             !context_manifest_present(&pool, cont_session).await,
             "a continuation must NOT emit the === CONTEXT manifest"
+        );
+    }
+
+    /// M1: `harvest_memories` loads + parses the `RunCompleted` chronicle
+    /// artifact and folds `chronicle_candidates` in alongside the existing
+    /// event-derived candidates, so a code-ref finding, a decision, an applied
+    /// changeset, and a failed action all land as curated `MemoryRecord`s.
+    #[tokio::test]
+    async fn harvest_memories_appends_chronicle_candidates() {
+        use codypendent_daemon::artifacts::Provenance;
+        use codypendent_protocol::{ArtifactId, RunDisposition};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor =
+            RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
+
+        let session = SessionId::new();
+        let run_id = RunId::new();
+        ledger::create_session(&pool, session, "harvest")
+            .await
+            .expect("create session");
+
+        let chronicle_bytes = serde_json::to_vec(&serde_json::json!({
+            "objective": "fix the guard",
+            "investigations": ["crates/x/src/a.rs:42 the guard is inverted"],
+            "changes": [{"changeset_id": "cs-1", "artifact": ArtifactId::new().to_string(), "byte_length": 128}],
+            "actions": [{"tool": "shell.run", "outcome": "failed", "artifact": null}],
+            "decisions": [],
+        }))
+        .expect("serialize chronicle");
+        let chronicle_ref = executor
+            .artifacts()
+            .put(
+                &pool,
+                "application/json",
+                DataClassification::Internal,
+                Provenance::system("test-chronicle"),
+                &chronicle_bytes,
+            )
+            .await
+            .expect("store chronicle artifact");
+
+        let event = codypendent_protocol::SessionEvent {
+            sequence: 1,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("done".to_string()),
+                },
+                chronicle: chronicle_ref,
+            },
+        };
+        ledger::append_event(&pool, session, &event)
+            .await
+            .expect("append RunCompleted");
+
+        executor
+            .harvest_memories(session, run_id, repository, AgentMode::Build)
+            .await;
+
+        let statements: Vec<(String, String)> =
+            sqlx::query_as("SELECT class, statement FROM memories ORDER BY class")
+                .fetch_all(&pool)
+                .await
+                .expect("query memories");
+
+        assert!(
+            statements
+                .iter()
+                .any(|(class, statement)| class == "code"
+                    && statement.contains("crates/x/src/a.rs:42")),
+            "expected a Code memory from the code-ref finding, got {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|(class, statement)| class == "episodic" && statement.contains("cs-1")),
+            "expected an Episodic memory from the changeset, got {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|(class, statement)| class == "failure"
+                    && statement.contains("shell.run")
+                    && statement.contains("failed")),
+            "expected a Failure memory from the failed action, got {statements:?}"
+        );
+    }
+
+    /// M3a: a `FactExtractor` that always returns an empty `Vec`, mirroring
+    /// what `NoopExtractor` does but defined locally so the test asserts
+    /// against the TRAIT boundary (`&dyn FactExtractor`), not the concrete
+    /// `codypendent_knowledge` type.
+    struct MockExtractor(Vec<codypendent_knowledge::CandidateMemory>);
+
+    #[async_trait::async_trait]
+    impl FactExtractor for MockExtractor {
+        async fn extract(
+            &self,
+            _input: ExtractionInput<'_>,
+        ) -> Vec<codypendent_knowledge::CandidateMemory> {
+            self.0.clone()
+        }
+    }
+
+    /// M3a fallback: `harvest_with` injected with an extractor that
+    /// contributes nothing still curates the M1 heuristic candidates — an
+    /// empty M3 contribution must never suppress the other mechanisms.
+    #[tokio::test]
+    async fn harvest_with_empty_extractor_still_curates_heuristic_candidates() {
+        use codypendent_daemon::artifacts::Provenance;
+        use codypendent_protocol::RunDisposition;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor =
+            RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
+
+        let session = SessionId::new();
+        let run_id = RunId::new();
+        ledger::create_session(&pool, session, "harvest-fallback")
+            .await
+            .expect("create session");
+
+        let chronicle_bytes = serde_json::to_vec(&serde_json::json!({
+            "objective": "fix the guard",
+            "investigations": ["crates/x/src/a.rs:42 the guard is inverted"],
+            "changes": [],
+            "actions": [],
+            "decisions": [],
+        }))
+        .expect("serialize chronicle");
+        let chronicle_ref = executor
+            .artifacts()
+            .put(
+                &pool,
+                "application/json",
+                DataClassification::Internal,
+                Provenance::system("test-chronicle-fallback"),
+                &chronicle_bytes,
+            )
+            .await
+            .expect("store chronicle artifact");
+
+        let event = codypendent_protocol::SessionEvent {
+            sequence: 1,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("done".to_string()),
+                },
+                chronicle: chronicle_ref,
+            },
+        };
+        ledger::append_event(&pool, session, &event)
+            .await
+            .expect("append RunCompleted");
+
+        executor
+            .harvest_with(session, run_id, repository, &MockExtractor(vec![]))
+            .await;
+
+        let statements: Vec<(String, String)> =
+            sqlx::query_as("SELECT class, statement FROM memories ORDER BY class")
+                .fetch_all(&pool)
+                .await
+                .expect("query memories");
+
+        assert!(
+            statements
+                .iter()
+                .any(|(class, statement)| class == "code"
+                    && statement.contains("crates/x/src/a.rs:42")),
+            "an empty M3a extractor must not suppress the M1 heuristic candidate, got {statements:?}"
+        );
+    }
+
+    /// M3b: a mock extractor that returns two distinct facts contributes TWO
+    /// additional curated `MemoryRecord`s, alongside the M1 heuristic
+    /// candidate from the same chronicle — the fan-in accepts every producer's
+    /// output, not just the heuristic one.
+    #[tokio::test]
+    async fn harvest_with_extractor_returning_two_facts_curates_both() {
+        use codypendent_daemon::artifacts::Provenance;
+        use codypendent_knowledge::{CandidateMemory, EvidenceRef, MemoryClass};
+        use codypendent_protocol::{ArtifactId, RunDisposition};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor =
+            RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
+
+        let session = SessionId::new();
+        let run_id = RunId::new();
+        ledger::create_session(&pool, session, "harvest-two-facts")
+            .await
+            .expect("create session");
+
+        let chronicle_bytes = serde_json::to_vec(&serde_json::json!({
+            "objective": "fix the guard",
+            "investigations": [],
+            "changes": [],
+            "actions": [],
+            "decisions": [],
+        }))
+        .expect("serialize chronicle");
+        let chronicle_ref = executor
+            .artifacts()
+            .put(
+                &pool,
+                "application/json",
+                DataClassification::Internal,
+                Provenance::system("test-chronicle-two-facts"),
+                &chronicle_bytes,
+            )
+            .await
+            .expect("store chronicle artifact");
+
+        let event = codypendent_protocol::SessionEvent {
+            sequence: 1,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("done".to_string()),
+                },
+                chronicle: chronicle_ref.clone(),
+            },
+        };
+        ledger::append_event(&pool, session, &event)
+            .await
+            .expect("append RunCompleted");
+
+        // A fabricated "chronicle artifact" evidence ref: any valid `ArtifactRef`
+        // works as provenance — `curate` only checks that provenance is non-empty.
+        let evidence_artifact = codypendent_protocol::ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "application/json".to_string(),
+            byte_length: 0,
+            sha256: "0".repeat(64),
+            sensitivity: DataClassification::Internal,
+        };
+        let build_fact = |statement: &str, class: MemoryClass| CandidateMemory {
+            class,
+            scope: None,
+            statement: statement.to_string(),
+            structured_value: None,
+            provenance: vec![EvidenceRef::Artifact {
+                artifact: evidence_artifact.clone(),
+                source_path: None,
+            }],
+            confidence: 0.7,
+            observed_at: Utc::now(),
+            valid_from: codypendent_knowledge::Revision::sequence(1),
+            sensitivity: DataClassification::Internal,
+            retention: None,
+        };
+        let mock = MockExtractor(vec![
+            build_fact("prefer sqlx over diesel", MemoryClass::Semantic),
+            build_fact(
+                "retrying without backoff floods the API",
+                MemoryClass::Failure,
+            ),
+        ]);
+
+        executor
+            .harvest_with(session, run_id, repository, &mock)
+            .await;
+
+        let statements: Vec<(String, String)> =
+            sqlx::query_as("SELECT class, statement FROM memories ORDER BY class")
+                .fetch_all(&pool)
+                .await
+                .expect("query memories");
+
+        assert!(
+            statements
+                .iter()
+                .any(|(_, s)| s == "prefer sqlx over diesel"),
+            "expected the first extractor fact to be curated, got {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|(_, s)| s == "retrying without backoff floods the API"),
+            "expected the second extractor fact to be curated, got {statements:?}"
+        );
+        // The empty chronicle contributes no M1 heuristic candidates, so the
+        // only OTHER thing landing is M0's bounded completed-run breadcrumb
+        // (`extract_candidates` over the `RunCompleted` event itself) —
+        // exactly the two extractor facts plus that one breadcrumb.
+        assert_eq!(
+            statements.len(),
+            3,
+            "the two extractor facts plus the M0 completed-run breadcrumb, got {statements:?}"
+        );
+    }
+
+    /// M6: cross-mechanism integration. A single run's harvest fans in all
+    /// three fact producers at once — a heuristic `Code` finding pulled from
+    /// the chronicle (M1), a `memory.propose:` note as `memory.remember`
+    /// would emit it (M2), and a stubbed `FactExtractor` standing in for the
+    /// LLM path (M3) — and proves they all land in the SAME `memories` table
+    /// as distinct, one-line-statement records, retrievable via
+    /// `assemble_context` exactly like a later run would see them. A second
+    /// extractor fact that duplicates the M1 Code finding verbatim proves the
+    /// `curate` dedup gate (`> DEDUP_SIMILARITY` trigram cosine, gate c)
+    /// fires ACROSS mechanisms, not merely within one producer's own output —
+    /// it collapses into the earlier record instead of adding a second.
+    #[tokio::test]
+    async fn harvest_composes_heuristic_note_and_extractor_facts_with_dedup() {
+        use codypendent_daemon::artifacts::Provenance;
+        use codypendent_knowledge::{CandidateMemory, EvidenceRef, MemoryClass};
+        use codypendent_protocol::{ArtifactId, RunDisposition};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor =
+            RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
+
+        let session = SessionId::new();
+        let run_id = RunId::new();
+        ledger::create_session(&pool, session, "harvest-compose")
+            .await
+            .expect("create session");
+
+        // (M1) A chronicle whose one `investigations` line is a code-ref
+        // finding, so `chronicle_candidates` yields exactly one Code fact.
+        let code_ref_fragment = "crates/x/src/compose.rs:9";
+        let chronicle_bytes = serde_json::to_vec(&serde_json::json!({
+            "objective": "fix the compose guard",
+            "investigations": [format!("{code_ref_fragment} the guard is inverted")],
+            "changes": [],
+            "actions": [],
+            "decisions": [],
+        }))
+        .expect("serialize chronicle");
+        let chronicle_ref = executor
+            .artifacts()
+            .put(
+                &pool,
+                "application/json",
+                DataClassification::Internal,
+                Provenance::system("test-chronicle-compose"),
+                &chronicle_bytes,
+            )
+            .await
+            .expect("store chronicle artifact");
+
+        // (M2) The note `memory.remember`'s `execute_memory_remember` would
+        // emit for a plain (no structured value) proposal.
+        let note_event = codypendent_protocol::SessionEvent {
+            sequence: 1,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::NoteAppended {
+                text: "memory.propose: prefer sqlx over diesel".to_string(),
+                run_id: Some(run_id),
+            },
+        };
+        ledger::append_event(&pool, session, &note_event)
+            .await
+            .expect("append NoteAppended");
+
+        let completed_event = codypendent_protocol::SessionEvent {
+            sequence: 2,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("done".to_string()),
+                },
+                chronicle: chronicle_ref.clone(),
+            },
+        };
+        ledger::append_event(&pool, session, &completed_event)
+            .await
+            .expect("append RunCompleted");
+
+        // (M3) The stubbed extractor: one genuinely new fact, plus one that
+        // duplicates the M1 Code finding verbatim (same statement, same
+        // class) — the cross-mechanism dedup case.
+        let evidence_artifact = codypendent_protocol::ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "application/json".to_string(),
+            byte_length: 0,
+            sha256: "0".repeat(64),
+            sensitivity: DataClassification::Internal,
+        };
+        let build_fact = |statement: &str, class: MemoryClass| CandidateMemory {
+            class,
+            scope: None,
+            statement: statement.to_string(),
+            structured_value: None,
+            provenance: vec![EvidenceRef::Artifact {
+                artifact: evidence_artifact.clone(),
+                source_path: None,
+            }],
+            confidence: 0.7,
+            observed_at: Utc::now(),
+            valid_from: codypendent_knowledge::Revision::sequence(2),
+            sensitivity: DataClassification::Internal,
+            retention: None,
+        };
+        let llm_distinct_statement = "authentication tokens expire after 24 hours";
+        let llm_duplicate_statement = format!("{code_ref_fragment} the guard is inverted");
+        let mock = MockExtractor(vec![
+            build_fact(llm_distinct_statement, MemoryClass::Semantic),
+            build_fact(&llm_duplicate_statement, MemoryClass::Code),
+        ]);
+
+        executor
+            .harvest_with(session, run_id, repository, &mock)
+            .await;
+
+        let statements: Vec<(String, String)> =
+            sqlx::query_as("SELECT class, statement FROM memories ORDER BY class, statement")
+                .fetch_all(&pool)
+                .await
+                .expect("query memories");
+
+        // Exactly one Code record survives — the LLM's duplicate collapsed
+        // into the M1 heuristic finding rather than adding a second.
+        let code_records: Vec<_> = statements
+            .iter()
+            .filter(|(class, _)| class == "code")
+            .collect();
+        assert_eq!(
+            code_records.len(),
+            1,
+            "the LLM's duplicate Code fact must dedup against the M1 heuristic finding, got {statements:?}"
+        );
+        assert!(
+            code_records[0].1.contains(code_ref_fragment),
+            "expected the surviving Code record to be the heuristic finding, got {statements:?}"
+        );
+
+        assert!(
+            statements
+                .iter()
+                .any(|(class, s)| class == "semantic" && s == "prefer sqlx over diesel"),
+            "expected the M2 memory.propose note to be curated, got {statements:?}"
+        );
+        assert!(
+            statements
+                .iter()
+                .any(|(class, s)| class == "semantic" && s == llm_distinct_statement),
+            "expected the M3 extractor's distinct fact to be curated, got {statements:?}"
+        );
+
+        // Retrieval end-to-end: the DISTINCT curated facts resurface as
+        // separate one-line statements in the same repository-scoped context
+        // manifest a later run would open with (`context.rs` `=== MEMORIES
+        // ===`, capped `MAX_CONTEXT_MEMORIES`).
+        let manifest = assemble_context(
+            &pool,
+            repository,
+            "compose check",
+            &[Scope::Repository(repository)],
+        )
+        .await
+        .expect("assemble context");
+        let manifest_statements: Vec<&str> = manifest
+            .memories
+            .iter()
+            .map(|m| m.statement.as_str())
+            .collect();
+        assert!(
+            manifest_statements
+                .iter()
+                .any(|s| s.contains(code_ref_fragment)),
+            "expected the Code finding to resurface via assemble_context, got {manifest_statements:?}"
+        );
+        assert!(
+            manifest_statements.contains(&"prefer sqlx over diesel"),
+            "expected the M2 note to resurface via assemble_context, got {manifest_statements:?}"
+        );
+        assert!(
+            manifest_statements.contains(&llm_distinct_statement),
+            "expected the M3 extractor fact to resurface via assemble_context, got {manifest_statements:?}"
+        );
+
+        // Deduped + M0 breadcrumb: Code(1) + Semantic-note(1) +
+        // Semantic-llm(1) + Episodic completed-run breadcrumb(1) = 4 total
+        // curated records; the duplicate LLM fact contributed zero.
+        assert_eq!(
+            statements.len(),
+            4,
+            "expected exactly 4 curated records (dedup collapsed the 5th), got {statements:?}"
         );
     }
 
