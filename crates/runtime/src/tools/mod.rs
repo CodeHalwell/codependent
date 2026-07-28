@@ -1,8 +1,11 @@
 //! The tool layer (STEP 1.7).
 //!
-//! Four tools the agent loop drives: [`ReadFile`] (`workspace.read_file`),
-//! [`Search`] (`workspace.search`), [`Shell`] (`shell.run`), and the Git pair
-//! [`GitDiff`]/[`ApplyPatch`] (`git.diff` / `git.apply_patch`). Each declares
+//! Five tools the agent loop drives: [`ReadFile`] (`workspace.read_file`),
+//! [`Search`] (`workspace.search`), [`Shell`] (`shell.run`), the Git pair
+//! [`GitDiff`]/[`ApplyPatch`] (`git.diff` / `git.apply_patch`), and [`WriteFile`]
+//! (`workspace.write_file`) — the structured-argument, whole-file alternative to
+//! `git.apply_patch` for a new file or a small full rewrite (a weak model is poor
+//! at reproducing an exact unified diff). Each declares
 //! the capability class it needs, exposes a [`ProposedAction`] builder so the
 //! STEP 1.10 middleware can run it through the policy engine, and an async
 //! `execute` that takes a typed input plus exactly the execution context it
@@ -37,6 +40,7 @@ mod repository;
 mod salient;
 mod search;
 mod shell;
+mod write_file;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -66,6 +70,7 @@ pub use repository::{RepositoryTest, RepositoryTestOutcome};
 pub use salient::{SalientStream, SalientView};
 pub use search::{Search, SearchInput, SearchMatch, SearchResults};
 pub use shell::{CommandRequest, EnvironmentBinding, Shell, ShellOutcome};
+pub use write_file::{parse_write_file, WriteFile, WriteFileInput, WriteFileOutcome};
 
 /// A capability class a tool requires. The concrete
 /// [`Capability`](codypendent_daemon::policy::Capability) (which carries a
@@ -122,6 +127,13 @@ pub enum ToolError {
     /// `git apply --check` rejected the patch; nothing was applied.
     #[error("patch does not apply: {0}")]
     PatchDoesNotApply(String),
+    /// A write tool's target exists but is not a regular file — a symlink or a
+    /// directory. Write tools refuse to write through or over either: a
+    /// symlink at the leaf could redirect the write outside the granted scope
+    /// (the leaf-swap guard), and a directory cannot be truncated and
+    /// overwritten as file content.
+    #[error("not a regular file (symlink or directory): {0}")]
+    NotRegularFile(PathBuf),
     /// A daemon-issued helper process (ripgrep, git) exceeded its wall-clock
     /// bound and was killed. Distinct from a `shell.run` timeout, which is a
     /// successful [`ShellOutcome`] with `timed_out` set: these helpers have no
@@ -155,6 +167,7 @@ impl ToolError {
             ToolError::ProgramNotFound(_) => "tool.program-not-found",
             ToolError::InvalidRange { .. } => "tool.invalid-range",
             ToolError::PatchDoesNotApply(_) => "tool.patch-does-not-apply",
+            ToolError::NotRegularFile(_) => "tool.not-regular-file",
             ToolError::TimedOut { .. } => "tool.timed-out",
             ToolError::Io(_) => "tool.io-error",
             ToolError::Other(_) => "tool.error",
