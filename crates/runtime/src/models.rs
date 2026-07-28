@@ -82,6 +82,15 @@ pub struct ModelConfig {
     /// endpoint with no auth).
     #[serde(default)]
     pub api_key_env: String,
+    /// The model's context window in tokens, if known. Sourced from
+    /// `models.toml` (a user-set `context_tokens` key) — there is no
+    /// auto-population from the provider catalog in v1. Used for two
+    /// things: (1) the `num_ctx` request hint, and (2) the denominator of
+    /// the context-usage percentage surfaced in the TUI footer. `None`
+    /// means "unknown" — no percentage is fabricated and no `num_ctx` is
+    /// sent; a config without this key parses unchanged (back-compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
 }
 
 /// The on-disk shape of `models.toml`: a bare array of `[[model]]` tables.
@@ -579,11 +588,59 @@ api_key_env = ""
         assert_eq!(configs[1].model, "qwen2.5-coder:14b");
         assert_eq!(configs[1].api_key_env, "");
 
+        // Neither entry sets `context_tokens` — both must default to `None`
+        // (back-compatible: an existing models.toml with no such key parses
+        // unchanged), never a fabricated window.
+        assert_eq!(configs[0].context_tokens, None);
+        assert_eq!(configs[1].context_tokens, None);
+
         // ModelRegistry::load goes through the same path and should agree.
         let registry = ModelRegistry::load(file.path()).expect("load registry");
         assert!(registry.get(&model_id("hosted-default")).is_some());
         assert!(registry.get(&model_id("local-default")).is_some());
         assert_eq!(registry.ids().count(), 2);
+    }
+
+    #[test]
+    fn context_tokens_parses_when_present_and_defaults_to_none_when_absent() {
+        // Context-window protection (BT1): `context_tokens` is additive and
+        // optional. A user who sets it under a `[[model]]` entry gets it back
+        // as `Some(n)`; a config that omits it (the existing/back-compat
+        // shape) must still parse, defaulting to `None` — never a fabricated
+        // window.
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        write!(
+            file,
+            r#"
+[[model]]
+id = "local-default"
+provider = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "qwen2.5-coder:14b"
+api_key_env = ""
+context_tokens = 32768
+
+[[model]]
+id = "hosted-default"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5.1-codex"
+api_key_env = "OPENAI_API_KEY"
+"#
+        )
+        .expect("write temp file");
+
+        let configs = load_models(file.path()).expect("parse models.toml");
+        assert_eq!(configs.len(), 2);
+        assert_eq!(
+            configs[0].context_tokens,
+            Some(32_768),
+            "an explicit context_tokens must parse verbatim"
+        );
+        assert_eq!(
+            configs[1].context_tokens, None,
+            "an entry with no context_tokens key must default to None, not a fabricated value"
+        );
     }
 
     // -- missing-env-var --------------------------------------------------
@@ -607,6 +664,7 @@ api_key_env = ""
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-5.1-codex".to_string(),
             api_key_env: var_name.to_string(),
+            context_tokens: None,
         }]);
 
         // `Arc<dyn ChatClient>` (the `Ok` type) has no `Debug` impl, so
@@ -640,6 +698,7 @@ api_key_env = ""
             base_url: "http://localhost:11434/v1".to_string(),
             model: "qwen2.5-coder:14b".to_string(),
             api_key_env: String::new(),
+            context_tokens: None,
         }]);
 
         // Builds an OpenAI-compatible client with no key (Ok is enough — the
@@ -666,6 +725,7 @@ api_key_env = ""
             base_url: "https://api.groq.com/openai/v1".to_string(),
             model: "llama-3.1-8b".to_string(),
             api_key_env: var.to_string(),
+            context_tokens: None,
         };
 
         // Without an auth.json entry the env var is required and missing → error.
@@ -699,6 +759,7 @@ api_key_env = ""
             base_url: "http://localhost:11434/v1".to_string(),
             model: "qwen2.5-coder:14b".to_string(),
             api_key_env: String::new(),
+            context_tokens: None,
         }])
         .with_auth(AuthStore::default());
         assert!(
@@ -735,6 +796,7 @@ api_key_env = ""
             base_url: "https://api.groq.com/openai/v1".to_string(),
             model: "llama-3.1-8b".to_string(),
             api_key_env: var.to_string(),
+            context_tokens: None,
         };
 
         let mut auth = AuthStore::default();
@@ -771,6 +833,7 @@ api_key_env = ""
             base_url: "https://api.anthropic.com".to_string(),
             model: "claude-sonnet-5".to_string(),
             api_key_env: String::new(),
+            context_tokens: None,
         }]);
 
         let err = registry
@@ -841,6 +904,7 @@ api_key_env = ""
                 base_url: "http://127.0.0.1:1/v1".to_string(),
                 model: "unused".to_string(),
                 api_key_env: String::new(),
+                context_tokens: None,
             },
             ModelConfig {
                 id: reachable.clone(),
@@ -848,6 +912,7 @@ api_key_env = ""
                 base_url: format!("http://{reachable_addr}/v1"),
                 model: "unused".to_string(),
                 api_key_env: String::new(),
+                context_tokens: None,
             },
         ]);
         let policy = ModelPolicy::new()
@@ -870,6 +935,7 @@ api_key_env = ""
             base_url: "http://127.0.0.1:1/v1".to_string(),
             model: "unused".to_string(),
             api_key_env: String::new(),
+            context_tokens: None,
         }]);
         let policy = ModelPolicy::new().with_candidates(AgentMode::Build, vec![closed.clone()]);
 
@@ -910,6 +976,7 @@ api_key_env = ""
             base_url: format!("http://{reachable_addr}/v1"),
             model: "unused".to_string(),
             api_key_env: String::new(),
+            context_tokens: None,
         }]);
         let ghost = model_id("not-in-registry");
         let policy =

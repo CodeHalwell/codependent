@@ -154,6 +154,117 @@ pub enum TurnItem {
     Steering(String),
 }
 
+/// Cheap, dependency-free heuristic for [`estimate_context_tokens`]: roughly
+/// 4 characters per token, the widely-used rule of thumb for English/code
+/// under a BPE tokenizer. Deliberately NOT a real tokenizer dependency
+/// (context-window protection spec, `docs/superpowers/specs/
+/// 2026-07-28-context-window-design.md`, component C3): the estimate only
+/// drives a footer percentage and an advisory warning — never billing, never
+/// a hard truncation — so a ±20% error is immaterial, and a real BPE
+/// tokenizer would in any case be precise for the wrong vocabulary (Ollama
+/// models are not GPT-BPE).
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Small fixed per-turn overhead [`estimate_context_tokens`] adds on top of
+/// the character estimate for every [`TurnItem`], approximating the
+/// role/delimiter tokens a real tokenizer spends on message framing that a
+/// raw character count of the payload alone would miss (e.g. the role tag
+/// wrapping each message in `to_messages`). Kept deliberately on the
+/// conservative side: undercounting would let the footer understate how
+/// full the window is, which is the one failure mode this estimator must
+/// avoid (per-item overhead never shrinks with a longer transcript).
+const PER_ITEM_TOKEN_OVERHEAD: usize = 4;
+
+/// The rendered character length of one [`TurnItem`], approximating what
+/// `FrameworkModelDriver::to_messages` (this module, behind `provider-openai`)
+/// actually sends to the model for that turn: the framing text plus the
+/// payload. Counted with
+/// `.chars().count()` rather than byte length, so a unicode-heavy transcript
+/// is not over-counted relative to plain ASCII. Pure, unit-testable in
+/// isolation, and used only by [`estimate_context_tokens`].
+///
+/// Mirrors `to_messages`' per-variant framing:
+/// - `Objective` / `Assistant` / `Steering`: sent verbatim as the message
+///   text, so their length IS the payload length.
+/// - `ToolCall { tool, args }`: sent as `"[calling {tool}: {args}]"`, so the
+///   estimate includes the tool name and the rendered JSON args (uncapped —
+///   `to_messages` truncates a huge args blob for the *replayed* marker via
+///   `compact_args`, but estimating the untruncated length is the safer,
+///   conservative direction: it can only overcount, never hide an
+///   approaching overflow).
+/// - `ToolResult { tool, output }`: sent as `"[tool result: {tool}]\n
+///   {output}"`, so the estimate includes the tool name and the full output.
+pub fn turn_item_text_len(turn: &TurnItem) -> usize {
+    match turn {
+        TurnItem::Objective(text) | TurnItem::Assistant(text) | TurnItem::Steering(text) => {
+            text.chars().count()
+        }
+        TurnItem::ToolCall { tool, args } => {
+            "[calling : ]".chars().count() + tool.chars().count() + args.to_string().chars().count()
+        }
+        TurnItem::ToolResult { tool, output } => {
+            "[tool result: ]\n".chars().count() + tool.chars().count() + output.chars().count()
+        }
+    }
+}
+
+/// Cheap, pure, dependency-free context-size estimate for a transcript, in
+/// tokens (context-window protection spec, component C3). Sums
+/// [`turn_item_text_len`] over every turn — approximating the text
+/// `to_messages` actually sends — divides by [`CHARS_PER_TOKEN`], and adds a
+/// [`PER_ITEM_TOKEN_OVERHEAD`] per turn for framing tokens a raw character
+/// count misses. Deliberately an ESTIMATE: the loop (a later task) compares
+/// it against a known context window to drive a footer percentage and an
+/// advisory warning — it is never used to bill or to hard-truncate the
+/// transcript. `std`-only, no tokenizer dependency, and does not allocate a
+/// rendered copy of the transcript — it sums lengths turn by turn.
+pub fn estimate_context_tokens(transcript: &[TurnItem]) -> usize {
+    transcript
+        .iter()
+        .map(|item| turn_item_text_len(item) / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD)
+        .sum()
+}
+
+/// Decide whether the plain loop should emit a `BudgetWarning{Tokens}` event
+/// for this step (context-window protection, component C4), and build it when
+/// it should. Called ONLY when a window is known (`limit` came from
+/// `driver.context_window()` returning `Some`) — the "unknown window ⇒ no
+/// emit" honesty rule (C5) is enforced by the CALLER never invoking this
+/// helper at all when the window is `None`, not by anything in here.
+///
+/// Dedup: computes the integer percentage `used*100/limit` (clamped to
+/// `0..=100`, `limit.max(1)` guarding a nonsensical zero limit exactly as the
+/// TUI reducer already does at `reduce.rs:544`) and compares it against
+/// `last_emitted_pct`, the percentage most recently emitted THIS run. Returns
+/// `None` (suppress) when the percentage hasn't changed, so a run whose usage
+/// isn't moving costs nothing beyond the division — bounding the emitted
+/// events to at most 101 per run (one per integer percentage point, 0..=100),
+/// never one per step.
+///
+/// Pure and `EventBody`-agnostic about `run_id`/`session_id` plumbing beyond
+/// the one field the event needs, so it is unit-testable without a driver, a
+/// sink, or a running loop.
+fn token_budget_event(
+    run_id: RunId,
+    used: u64,
+    limit: u64,
+    last_emitted_pct: Option<u16>,
+) -> Option<(EventBody, u16)> {
+    let pct = (used.saturating_mul(100) / limit.max(1)).min(100) as u16;
+    if Some(pct) == last_emitted_pct {
+        return None;
+    }
+    Some((
+        EventBody::BudgetWarning {
+            run_id,
+            dimension: BudgetDimension::Tokens,
+            used,
+            limit,
+        },
+        pct,
+    ))
+}
+
 /// The next thing the model wants to do, as decided by a [`ModelDriver`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelStep {
@@ -393,6 +504,16 @@ pub trait ModelDriver: Send + Sync {
         offered_tools: &[&str],
         sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome>;
+
+    /// The model's context window in tokens, if known — the honest source for
+    /// both the `num_ctx` request hint and the context-usage percentage
+    /// denominator (context-window protection). Defaults to `None`
+    /// ("unknown"), so every driver that doesn't override it (scripted/test
+    /// drivers included) never fabricates a window. [`FrameworkModelDriver`]
+    /// overrides this with the resolved model's configured `context_tokens`.
+    fn context_window(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A driver backed by a fixed queue of pre-set steps — the deterministic engine
@@ -406,6 +527,12 @@ pub struct ScriptedDriver {
     /// code — its requests contribute no cost. [`with_usage`](Self::with_usage)
     /// scripts a measured usage so a test can exercise the cost path.
     usage: Option<ModelUsage>,
+    /// The window [`ModelDriver::context_window`] reports. `None` (the
+    /// default via [`Self::new`]) preserves this driver's existing honest
+    /// "unknown window" behavior; [`with_context_window`](Self::with_context_window)
+    /// scripts a known window so a test can exercise the plain loop's
+    /// `BudgetWarning{Tokens}` emission (context-window protection, T3).
+    context_window: Option<u64>,
 }
 
 impl ScriptedDriver {
@@ -416,6 +543,7 @@ impl ScriptedDriver {
             steps: Mutex::new(steps.into_iter().collect()),
             model_id: ModelId("scripted".to_string()),
             usage: None,
+            context_window: None,
         }
     }
 
@@ -433,12 +561,25 @@ impl ScriptedDriver {
         self.usage = Some(usage);
         self
     }
+
+    /// Script a known context window (`ModelDriver::context_window` then
+    /// returns `Some(window)`), so a test can exercise the plain loop's
+    /// `BudgetWarning{Tokens}` emission. Without this the driver reports
+    /// `None` (unknown window — no emission, the honesty default).
+    pub fn with_context_window(mut self, window: u64) -> Self {
+        self.context_window = Some(window);
+        self
+    }
 }
 
 #[async_trait]
 impl ModelDriver for ScriptedDriver {
     fn model_id(&self) -> ModelId {
         self.model_id.clone()
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        self.context_window
     }
 
     async fn next_step(
@@ -955,6 +1096,16 @@ impl FrameworkAgentRuntime {
         let mut usage: Option<ModelUsage> = None;
         let run_started = Instant::now();
         let mut wall_clock_warned = false;
+        // Context-window protection (T3): the integer percentage
+        // (`used*100/limit`) most recently emitted as a `BudgetWarning{Tokens}`
+        // THIS run, or `None` before the first emission. Local to this run
+        // (never persisted), it is the dedup gate `token_budget_event` checks
+        // against so a step whose percentage hasn't moved doesn't re-emit.
+        let mut last_token_pct: Option<u16> = None;
+        // Resolved once: the model's context window, or `None` when unknown.
+        // `None` here means C5's honesty rule applies for the WHOLE run — the
+        // loop below never emits a `Tokens` event, so the TUI footer stays `—`.
+        let context_window = driver.context_window();
         // Repeated-identical-call guard state (loop-fix Task 2): the identity
         // (tool, args_digest) of the most recently ISSUED call and how many
         // times in a row it has now been issued — reset (to a fresh count of
@@ -998,6 +1149,26 @@ impl FrameworkAgentRuntime {
                     },
                 )
                 .await?;
+            }
+
+            // Context-window protection (T3): estimate live usage against the
+            // known window and emit the SAME `BudgetWarning{Tokens}` event the
+            // workflow budget engine emits, at the identical per-step safe
+            // point as the wall-clock warning above. Honesty (C5): when the
+            // window is unknown (`context_window == None`), this whole block
+            // is skipped — NOT ONE `Tokens` event is ever emitted for this
+            // run, so `RunView.context_percent` stays `None` and the footer
+            // keeps showing `—`. Dedup: `token_budget_event` suppresses the
+            // emit when the integer percentage hasn't changed since
+            // `last_token_pct`, bounding this to at most 101 events/run.
+            if let Some(limit) = context_window {
+                let used = estimate_context_tokens(&transcript) as u64;
+                if let Some((body, pct)) =
+                    token_budget_event(run.run_id, used, limit, last_token_pct)
+                {
+                    last_token_pct = Some(pct);
+                    self.emit(run.session_id, run_actor.clone(), body).await?;
+                }
             }
 
             let started = Instant::now();
@@ -2486,25 +2657,45 @@ fn build_chronicle(
 pub struct FrameworkModelDriver {
     client: std::sync::Arc<dyn agent_framework_core::client::ChatClient>,
     model_id: ModelId,
+    /// The resolved model's context window in tokens, if known — sourced
+    /// from `ModelConfig.context_tokens` by [`Self::from_registry`]. `None`
+    /// (the default via [`Self::new`]) means "unknown": [`Self::context_window`]
+    /// honestly returns `None`, never a fabricated default.
+    context_tokens: Option<u64>,
 }
 
 #[cfg(feature = "provider-openai")]
 impl FrameworkModelDriver {
-    /// Wrap a constructed client and record the model id it serves.
+    /// Wrap a constructed client and record the model id it serves. The
+    /// context window starts `None` (unknown) — callers that have a resolved
+    /// `ModelConfig` should prefer [`Self::from_registry`], which populates
+    /// it; direct callers of `new` (e.g. tests) get the honest default.
     pub fn new(
         client: std::sync::Arc<dyn agent_framework_core::client::ChatClient>,
         model_id: ModelId,
     ) -> Self {
-        Self { client, model_id }
+        Self {
+            client,
+            model_id,
+            context_tokens: None,
+        }
     }
 
-    /// Build a driver from the registry by resolving `model_id` to a client.
+    /// Build a driver from the registry by resolving `model_id` to a client,
+    /// also capturing the resolved [`ModelConfig::context_tokens`] so
+    /// [`Self::context_window`] can answer honestly (`Some` when configured,
+    /// `None` when unset).
     pub async fn from_registry(models: &ModelRegistry, model_id: ModelId) -> anyhow::Result<Self> {
+        let context_tokens = models.get(&model_id).and_then(|cfg| cfg.context_tokens);
         let client = models
             .client_for(&model_id)
             .await
             .map_err(|e| anyhow::anyhow!("could not build client for {model_id}: {e}"))?;
-        Ok(Self::new(client, model_id))
+        Ok(Self {
+            client,
+            model_id,
+            context_tokens,
+        })
     }
 
     /// The full tool SCHEMA catalog — every tool's name, description, and JSON
@@ -2766,6 +2957,10 @@ impl ModelDriver for FrameworkModelDriver {
         self.model_id.clone()
     }
 
+    fn context_window(&self) -> Option<u64> {
+        self.context_tokens
+    }
+
     async fn next_step(
         &self,
         transcript: &[TurnItem],
@@ -2778,6 +2973,7 @@ impl ModelDriver for FrameworkModelDriver {
 
         let mut options = ChatOptions::new();
         options.tools = Self::advertised_tools(offered_tools);
+        apply_context_window(&mut options, self.context_tokens);
 
         let mut stream = self
             .client
@@ -2811,6 +3007,42 @@ impl ModelDriver for FrameworkModelDriver {
         // rides the step).
         let (step, usage, preface) = updates_to_step(updates, |_| {});
         Ok(StepOutcome::new(step, usage).with_preface(preface))
+    }
+}
+
+/// Forward a known context window as the Ollama `num_ctx` request hint
+/// (context-window protection, BT4): when `window` is `Some(n)`, sets
+/// `options.additional_properties["options"] = {"num_ctx": n}` — the shape the
+/// OpenAI converter forwards verbatim onto the request body
+/// (`agent-framework-openai`'s `convert.rs`), and the nested object Ollama
+/// reads generation parameters from at its OpenAI-compatible endpoint.
+///
+/// Honesty (C5): `window == None` leaves `additional_properties` untouched —
+/// no `options` key is inserted, so no `num_ctx` is ever invented for a model
+/// with an unconfigured window.
+///
+/// If `additional_properties["options"]` already holds an object (e.g. other
+/// Ollama generation parameters set elsewhere), `num_ctx` is merged into it
+/// rather than overwriting the existing keys. This is a pure, dependency-free
+/// body-field tweak: an endpoint that ignores it is unaffected, so it never
+/// changes whether a request succeeds.
+#[cfg(feature = "provider-openai")]
+fn apply_context_window(
+    options: &mut agent_framework_core::types::ChatOptions,
+    window: Option<u64>,
+) {
+    let Some(n) = window else {
+        return;
+    };
+    match options.additional_properties.get_mut("options") {
+        Some(serde_json::Value::Object(existing)) => {
+            existing.insert("num_ctx".to_string(), serde_json::json!(n));
+        }
+        _ => {
+            options
+                .additional_properties
+                .insert("options".to_string(), serde_json::json!({ "num_ctx": n }));
+        }
     }
 }
 
@@ -2941,6 +3173,171 @@ fn measured_usage(
 mod tests {
     use super::*;
     use crate::tools::ClosureSink;
+
+    // -----------------------------------------------------------------------
+    // Context-window protection (BT2): estimate_context_tokens / turn_item_text_len
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn estimate_context_tokens_of_empty_transcript_is_zero() {
+        // No turns, no framing overhead to charge — the honest floor.
+        assert_eq!(estimate_context_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn turn_item_text_len_covers_every_variant() {
+        // Plain text variants: the payload's char length, verbatim.
+        assert_eq!(
+            turn_item_text_len(&TurnItem::Objective("hello".to_string())),
+            5
+        );
+        assert_eq!(
+            turn_item_text_len(&TurnItem::Assistant("hi there".to_string())),
+            8
+        );
+        assert_eq!(
+            turn_item_text_len(&TurnItem::Steering("steer this".to_string())),
+            10
+        );
+
+        // ToolCall: must grow with both the tool name and the args, mirroring
+        // to_messages' "[calling {tool}: {args}]" framing — never just a
+        // constant regardless of payload size.
+        let small_call = TurnItem::ToolCall {
+            tool: "shell.run".to_string(),
+            args: json!({"cmd": "ls"}),
+        };
+        let big_call = TurnItem::ToolCall {
+            tool: "shell.run".to_string(),
+            args: json!({"cmd": "ls -la /a/much/longer/argument/payload/here"}),
+        };
+        assert!(turn_item_text_len(&big_call) > turn_item_text_len(&small_call));
+
+        // ToolResult: must grow with the output, mirroring to_messages'
+        // "[tool result: {tool}]\n{output}" framing.
+        let small_result = TurnItem::ToolResult {
+            tool: "shell.run".to_string(),
+            output: "ok".to_string(),
+        };
+        let big_result = TurnItem::ToolResult {
+            tool: "shell.run".to_string(),
+            output: "x".repeat(4000),
+        };
+        assert!(turn_item_text_len(&small_result) < turn_item_text_len(&big_result));
+        assert!(turn_item_text_len(&big_result) >= 4000);
+    }
+
+    #[test]
+    fn estimate_context_tokens_grows_with_a_longer_tool_result_output() {
+        // A transcript whose only difference is a much longer ToolResult
+        // output must yield a strictly larger estimate — the estimator must
+        // not collapse to a flat per-turn constant regardless of payload.
+        let short = vec![TurnItem::ToolResult {
+            tool: "shell.run".to_string(),
+            output: "ok".to_string(),
+        }];
+        let long = vec![TurnItem::ToolResult {
+            tool: "shell.run".to_string(),
+            output: "x".repeat(4000),
+        }];
+        assert!(estimate_context_tokens(&long) > estimate_context_tokens(&short));
+    }
+
+    #[test]
+    fn estimate_context_tokens_applies_per_item_overhead_for_empty_turns() {
+        // N turns with empty text still each carry PER_ITEM_TOKEN_OVERHEAD —
+        // the overhead is per-turn, not a single fixed constant regardless of
+        // transcript length.
+        let n = 5;
+        let turns: Vec<TurnItem> = (0..n).map(|_| TurnItem::Assistant(String::new())).collect();
+        assert_eq!(
+            estimate_context_tokens(&turns),
+            n * PER_ITEM_TOKEN_OVERHEAD,
+            "each empty turn should contribute exactly the per-item overhead"
+        );
+    }
+
+    #[test]
+    fn estimate_context_tokens_is_roughly_chars_over_four_for_a_long_turn() {
+        // Sanity check against the ~4-chars-per-token heuristic: a single
+        // ~4000-char turn should land near 1000 tokens (plus the small
+        // fixed per-item overhead), not wildly off in either direction.
+        let turns = vec![TurnItem::Assistant("a".repeat(4000))];
+        let estimate = estimate_context_tokens(&turns);
+        assert_eq!(estimate, 4000 / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD);
+        assert!(
+            (990..=1010).contains(&estimate),
+            "expected ~1000 tokens (+overhead) for a 4000-char turn, got {estimate}"
+        );
+    }
+
+    #[test]
+    fn estimate_context_tokens_is_monotonic_when_a_turn_is_appended() {
+        // Appending a TurnItem must never lower the estimate.
+        let mut transcript = vec![TurnItem::Objective("start".to_string())];
+        let before = estimate_context_tokens(&transcript);
+        transcript.push(TurnItem::Assistant("more text here".to_string()));
+        let after = estimate_context_tokens(&transcript);
+        assert!(after >= before);
+    }
+
+    // -----------------------------------------------------------------------
+    // Context-window protection (T3): `token_budget_event` — the pure emit
+    // decision behind the plain loop's `BudgetWarning{Tokens}` producer.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn token_budget_event_emits_on_first_call_with_the_computed_percent() {
+        // No prior emission (`last_emitted_pct == None`) always emits, since
+        // `Some(pct) != None` for any `pct`.
+        let run_id = RunId::new();
+        let (body, pct) =
+            token_budget_event(run_id, 8_192, 32_768, None).expect("first call always emits");
+        assert_eq!(pct, 25);
+        match body {
+            EventBody::BudgetWarning {
+                run_id: got_run_id,
+                dimension,
+                used,
+                limit,
+            } => {
+                assert_eq!(got_run_id, run_id);
+                assert_eq!(dimension, BudgetDimension::Tokens);
+                assert_eq!(used, 8_192);
+                assert_eq!(limit, 32_768);
+            }
+            other => panic!("expected BudgetWarning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_budget_event_suppresses_an_unchanged_percentage() {
+        // Dedup: the SAME integer percentage as `last_emitted_pct` must not
+        // re-emit, even though `used` differs slightly (both round to 25%).
+        let run_id = RunId::new();
+        let unchanged = token_budget_event(run_id, 8_200, 32_768, Some(25));
+        assert_eq!(unchanged, None, "unchanged percent must not re-emit");
+    }
+
+    #[test]
+    fn token_budget_event_emits_again_once_the_percentage_moves() {
+        // A percentage that DOES move re-emits with the new value.
+        let run_id = RunId::new();
+        let (_, pct) = token_budget_event(run_id, 16_384, 32_768, Some(25))
+            .expect("changed percent must emit");
+        assert_eq!(pct, 50);
+    }
+
+    #[test]
+    fn token_budget_event_clamps_to_100_and_guards_a_zero_limit() {
+        // `used > limit` clamps to 100%, and a nonsensical zero limit is
+        // guarded (`limit.max(1)`) rather than dividing by zero.
+        let run_id = RunId::new();
+        let (_, pct) = token_budget_event(run_id, 100_000, 32_768, None).expect("emits");
+        assert_eq!(pct, 100);
+        let (_, pct_zero_limit) = token_budget_event(run_id, 5, 0, None).expect("emits");
+        assert_eq!(pct_zero_limit, 100);
+    }
 
     #[test]
     fn run_context_prior_defaults_empty_and_with_prior_exposes_it() {
@@ -3075,6 +3472,18 @@ mod tests {
                 .usage,
             Some(usage)
         );
+    }
+
+    #[test]
+    fn scripted_driver_context_window_defaults_to_none() {
+        // Context-window protection (BT1): `ModelDriver::context_window` has a
+        // default impl returning `None`, so a driver like `ScriptedDriver` that
+        // never overrides it needs no change and stays honestly "unknown" —
+        // never a fabricated window.
+        let driver = ScriptedDriver::new(vec![ModelStep::Finish {
+            summary: "done".to_string(),
+        }]);
+        assert_eq!(driver.context_window(), None);
     }
 
     #[test]
@@ -3233,6 +3642,106 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 0);
         assert_eq!(usage.completion_tokens, 9);
         assert_eq!(usage.cost_micros, None);
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn framework_driver_context_window_reflects_the_resolved_model_config() {
+        // Context-window protection (BT1): `FrameworkModelDriver::context_window`
+        // must source its answer from the resolved `ModelConfig.context_tokens`
+        // — `Some(n)` when the config sets it, `None` when it doesn't. Neither
+        // case fabricates a value.
+        let id = ModelId("local-default".to_string());
+        let known = ModelRegistry::new([crate::models::ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen2.5-coder:14b".to_string(),
+            api_key_env: String::new(),
+            context_tokens: Some(32_768),
+        }]);
+        let driver = FrameworkModelDriver::from_registry(&known, id.clone())
+            .await
+            .expect("driver builds from a registered model");
+        assert_eq!(
+            driver.context_window(),
+            Some(32_768),
+            "a configured context_tokens must surface verbatim"
+        );
+
+        let unknown = ModelRegistry::new([crate::models::ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen2.5-coder:14b".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+        }]);
+        let driver = FrameworkModelDriver::from_registry(&unknown, id)
+            .await
+            .expect("driver builds from a registered model");
+        assert_eq!(
+            driver.context_window(),
+            None,
+            "an unset context_tokens must stay honestly None, never a fabricated default"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn apply_context_window_sets_ollama_num_ctx_when_known() {
+        // Context-window protection (BT4): a known window must be forwarded as
+        // the Ollama request hint `{"options":{"num_ctx":n}}` via
+        // `ChatOptions.additional_properties`, the verified seam the OpenAI
+        // converter forwards onto the request body.
+        use agent_framework_core::types::ChatOptions;
+
+        let mut options = ChatOptions::new();
+        apply_context_window(&mut options, Some(32_768));
+
+        assert_eq!(
+            options.additional_properties.get("options"),
+            Some(&serde_json::json!({ "num_ctx": 32_768 })),
+            "a known window must set additional_properties[\"options\"] = {{num_ctx}}"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn apply_context_window_sets_nothing_when_window_is_unknown() {
+        // Honesty (C5): an unknown window must never invent a num_ctx — the
+        // request body must carry no `options` key at all.
+        use agent_framework_core::types::ChatOptions;
+
+        let mut options = ChatOptions::new();
+        apply_context_window(&mut options, None);
+
+        assert!(
+            !options.additional_properties.contains_key("options"),
+            "an unknown window must not fabricate an `options`/num_ctx key"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn apply_context_window_merges_into_existing_options_without_clobbering() {
+        // If something else has already populated additional_properties["options"]
+        // with other Ollama generation parameters, injecting num_ctx must merge
+        // into that object rather than overwrite it.
+        use agent_framework_core::types::ChatOptions;
+
+        let mut options = ChatOptions::new();
+        options.additional_properties.insert(
+            "options".to_string(),
+            serde_json::json!({ "temperature": 0.2 }),
+        );
+        apply_context_window(&mut options, Some(8_192));
+
+        assert_eq!(
+            options.additional_properties.get("options"),
+            Some(&serde_json::json!({ "temperature": 0.2, "num_ctx": 8_192 })),
+            "existing options keys must survive alongside the injected num_ctx"
+        );
     }
 
     /// A no-op blackboard channel for the FIX 1 advertised-tools tests below:
@@ -3755,6 +4264,29 @@ mod tests {
         deltas
     }
 
+    /// Collect every `BudgetWarning{Tokens}` currently buffered on `events` as
+    /// `(used, limit)` pairs, in publish order — the loop-level counterpart to
+    /// [`drain_deltas`], used by the context-window protection (T3) tests to
+    /// inspect the plain loop's `BudgetWarning{Tokens}` producer without
+    /// caring about the other event kinds a run also emits.
+    fn drain_token_budget_events(
+        events: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+    ) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::BudgetWarning {
+                dimension: BudgetDimension::Tokens,
+                used,
+                limit,
+                ..
+            } = event.body
+            {
+                out.push((used, limit));
+            }
+        }
+        out
+    }
+
     #[tokio::test]
     async fn a_say_step_streams_its_text_as_a_delta_through_the_sink() {
         // A scripted `Say` run emits exactly one `ModelStreamDelta` carrying
@@ -3784,6 +4316,125 @@ mod tests {
 
         let deltas = drain_deltas(&mut events);
         assert_eq!(deltas, vec!["Hello, world.".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Context-window protection (T3): the plain loop's `BudgetWarning{Tokens}`
+    // producer, exercised end to end through `execute_run`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_known_context_window_emits_budget_warning_tokens_matching_the_estimate() {
+        // With `driver.context_window() == Some(limit)`, the loop's very first
+        // pass through the safe point sees `transcript == [Objective(..)]`
+        // (before the scripted `Say`/`Finish` steps run), so the FIRST emitted
+        // `used` must equal `estimate_context_tokens` of exactly that
+        // transcript — proving the loop feeds the estimator the real,
+        // in-flight transcript rather than some placeholder.
+        let objective = "say hello";
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::Say("Hello, world.".to_string()),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ])
+        .with_context_window(32_768);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            objective,
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("scripted run completes");
+
+        let token_events = drain_token_budget_events(&mut events);
+        assert!(
+            !token_events.is_empty(),
+            "a known window must emit at least one BudgetWarning{{Tokens}}"
+        );
+        let expected_used =
+            estimate_context_tokens(&[TurnItem::Objective(objective.to_string())]) as u64;
+        assert_eq!(token_events[0], (expected_used, 32_768));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_context_window_emits_no_budget_warning_tokens() {
+        // Honesty (C5): `driver.context_window() == None` (the default,
+        // undisturbed by `with_context_window`) must suppress EVERY
+        // `BudgetWarning{Tokens}` emission for the whole run, so
+        // `RunView.context_percent` stays `None` and the footer shows `—`.
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::Say("Hello, world.".to_string()),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ]);
+        assert_eq!(driver.context_window(), None);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "say hello",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("scripted run completes");
+
+        let token_events = drain_token_budget_events(&mut events);
+        assert!(
+            token_events.is_empty(),
+            "unknown window must never emit BudgetWarning{{Tokens}}, got {token_events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_percentage_across_steps_does_not_re_emit() {
+        // Dedup: a huge window relative to a short scripted transcript keeps
+        // the integer percentage at 0 across every step, so despite the loop
+        // passing the safe point twice (once before the `Say` step, once
+        // before `Finish`), at most ONE `BudgetWarning{Tokens}` is emitted —
+        // proving the per-step emit does not spam the ledger.
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::Say("Hello, world.".to_string()),
+            ModelStep::Say("Still here.".to_string()),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ])
+        .with_context_window(100_000_000);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "say hello",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("scripted run completes");
+
+        let token_events = drain_token_budget_events(&mut events);
+        assert_eq!(
+            token_events.len(),
+            1,
+            "an unchanged percent across steps must not re-emit, got {token_events:?}"
+        );
     }
 
     /// A driver that records the transcript it is FIRST handed, then finishes —
