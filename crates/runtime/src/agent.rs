@@ -137,6 +137,18 @@ pub enum TurnItem {
         tool: String,
         /// The compacted, model-facing output.
         output: String,
+        /// The bulk-output artifact recorded for this tool call, when one was
+        /// persisted (continuation-content plan, Task 2). Projection metadata
+        /// only — carried through so a later hydration step (Task 3) can read
+        /// the artifact's bytes and replace `output`; this field itself is
+        /// never rendered into a model message (see `to_messages`). `None`
+        /// for a tool call that produced no artifact, or at any construction
+        /// site that has no artifact to offer (compaction, synthetic/legacy
+        /// prior turns). Additive and serde-default so it never breaks
+        /// deserialization of a `TurnItem` persisted before this field
+        /// existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<ArtifactRef>,
     },
     /// User steering text injected at a safe point.
     Steering(String),
@@ -1164,6 +1176,12 @@ impl FrameworkAgentRuntime {
                             transcript.push(TurnItem::ToolResult {
                                 tool,
                                 output: observation,
+                                // The live run loop's own transcript push has
+                                // no artifact ref threaded to it yet — only
+                                // the session_history continuation projection
+                                // (Task 2) populates this field, from the
+                                // persisted `ToolCompleted` event.
+                                artifact: None,
                             });
                             // Safe point: a completed tool call is a steering
                             // boundary.
@@ -2703,9 +2721,14 @@ impl FrameworkModelDriver {
                 // NOT `Role::tool()`: an orphan tool message (no preceding
                 // assistant `tool_calls` with a matching id) is rejected with a
                 // 400 by strict OpenAI-wire servers. See the type-level docs.
-                TurnItem::ToolResult { tool, output } => {
-                    Message::user(format!("[tool result: {tool}]\n{output}"))
-                }
+                // `artifact` is projection metadata only (Task 2) — never
+                // rendered here; only `output` (which Task 3 hydrates from
+                // the artifact when present) reaches the model.
+                TurnItem::ToolResult {
+                    tool,
+                    output,
+                    artifact: _,
+                } => Message::user(format!("[tool result: {tool}]\n{output}")),
                 TurnItem::Steering(text) => Message::user(text.clone()),
             };
             messages.push(message);
@@ -3094,6 +3117,7 @@ mod tests {
             TurnItem::ToolResult {
                 tool: "shell.run".to_string(),
                 output: "exit 0".to_string(),
+                artifact: None,
             },
             TurnItem::Steering("also check CI".to_string()),
         ];
@@ -3125,6 +3149,7 @@ mod tests {
             TurnItem::ToolResult {
                 tool: "workspace.read_file".to_string(),
                 output: "config.toml (lines 1-3 of 3)\n     1\t[x]\n".to_string(),
+                artifact: None,
             },
         ];
         let messages = FrameworkModelDriver::to_messages(&transcript);

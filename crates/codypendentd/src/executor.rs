@@ -1234,6 +1234,12 @@ fn convert_launch_prior(prior: &[PriorTurn]) -> Vec<TurnItem> {
             PriorTurn::ToolResult { tool, output } => TurnItem::ToolResult {
                 tool: tool.clone(),
                 output: output.clone(),
+                // `PriorTurn` (the daemon-crate-local, never-persisted
+                // carrier) has no artifact field to map from — every
+                // construction site of it leaves this empty today (see
+                // `with_prior` above), so there is nothing to thread through
+                // here (continuation-content plan, Task 2).
+                artifact: None,
             },
             PriorTurn::Steering(text) => TurnItem::Steering(text.clone()),
         })
@@ -2124,6 +2130,7 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
                 TurnItem::ToolResult {
                     tool: "shell.run".to_string(),
                     output: "ok".to_string(),
+                    artifact: None,
                 },
                 TurnItem::Steering(String::new()),
             ]
