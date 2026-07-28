@@ -3615,6 +3615,77 @@ mod tests {
         );
     }
 
+    /// WT6 composition check: the two round-trips above each exercise
+    /// `workspace.write_file` and `workspace.edit_file` in isolation on
+    /// separate files. This drives them back-to-back on the *same* file in
+    /// one run — `write_file` creates it, then `edit_file` modifies the
+    /// content it just wrote — and additionally asserts `tool_label` derives
+    /// the expected `path`-only label for each call's raw args, the same
+    /// `args` shape `run_tool` hashes into `ToolStarted.args_digest`.
+    #[tokio::test]
+    async fn write_file_then_edit_file_compose_in_one_run() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let write_args = json!({"path": "compose.txt", "content": "hello world"});
+        assert_eq!(
+            crate::tools::tool_label(WriteFile::NAME, &write_args),
+            Some("compose.txt".to_string()),
+            "the write_file tool card must label with the path"
+        );
+        let prepared = runtime
+            .prepare(WriteFile::NAME, &write_args, &run)
+            .await
+            .expect("write_file prepares");
+        let (observation, _artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(observation.contains("created"), "got {observation:?}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("compose.txt")).expect("file was written"),
+            "hello world"
+        );
+
+        let edit_args = json!({
+            "path": "compose.txt",
+            "edits": [{"search": "world", "replace": "there"}]
+        });
+        assert_eq!(
+            crate::tools::tool_label(EditFile::NAME, &edit_args),
+            Some("compose.txt".to_string()),
+            "the edit_file tool card must label with the path, never the edits array"
+        );
+        let prepared = runtime
+            .prepare(EditFile::NAME, &edit_args, &run)
+            .await
+            .expect("edit_file prepares");
+        let (observation, _artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(
+            observation.contains("applied 1 edit"),
+            "got {observation:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("compose.txt")).expect("file exists"),
+            "hello there",
+            "edit_file must apply on top of what write_file just created, in the same run"
+        );
+    }
+
     /// `prepare`/`execute_prepared` round-trip for `memory.remember` (smarter-memory
     /// M2): the policy engine `Allow`s the `RecordMemory` action, and execution emits
     /// a `NoteAppended` whose text starts with the `memory.propose:` marker the
