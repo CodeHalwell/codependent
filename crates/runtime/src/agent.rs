@@ -1731,7 +1731,36 @@ impl FrameworkAgentRuntime {
                         excerpt.total_lines
                     );
                     let observation = format!("{header}{body}");
-                    (observation, None, ToolOutcome::Succeeded)
+                    // Persist the FULL observation (header + excerpt) as an
+                    // artifact, mirroring shell.rs's `spill` for stdout — this
+                    // is the read_file half of continuation-content
+                    // persistence (Task 1): without it, `ToolCompleted`
+                    // carries `artifact: None` and a later CONTINUATION run
+                    // has nothing to rehydrate, so the model re-reads every
+                    // file it already read. Best-effort: a storage failure
+                    // must not turn a successful read into a failure, so an
+                    // `Err` here only degrades to `None` (logged), never
+                    // changes the outcome or the observation text.
+                    let artifact = match self
+                        .sink
+                        .store(
+                            "text/plain",
+                            Provenance::tool_output(ReadFile::NAME, run.run_id),
+                            observation.as_bytes(),
+                        )
+                        .await
+                    {
+                        Ok(reference) => Some(reference),
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                path = %excerpt.path.display(),
+                                "failed to persist workspace.read_file observation as an artifact; continuing without it"
+                            );
+                            None
+                        }
+                    };
+                    (observation, artifact, ToolOutcome::Succeeded)
                 }
                 Err(e) => (
                     format!("workspace.read_file error: {e}"),
@@ -3357,6 +3386,147 @@ mod tests {
             }
             other => panic!("expected NoteAppended, got {other:?}"),
         }
+    }
+
+    /// Continuation-content persistence, Task 1: `read_file`'s output was
+    /// never persisted as an artifact — `PreparedTool::ReadFile` always
+    /// returned `None`, so a later CONTINUATION run had nothing to rehydrate
+    /// and the model re-read every file it had already read. This asserts the
+    /// fix: `execute_prepared` for `workspace.read_file` now returns
+    /// `Some(artifact)`, and the bytes handed to the sink are exactly the
+    /// observation (the `path (lines X-Y of Z)` header plus the excerpt) —
+    /// so reopening the artifact later reproduces exactly what the model saw.
+    #[tokio::test]
+    async fn read_file_persists_the_observation_as_an_artifact() {
+        type StoredCall = (String, Vec<u8>);
+        let stored: Arc<Mutex<Option<StoredCall>>> = Arc::new(Mutex::new(None));
+        let capture = stored.clone();
+        let sink: Box<dyn ArtifactSink> = Box::new(ClosureSink(
+            move |media_type: String, _provenance: Provenance, bytes: Vec<u8>| {
+                let capture = capture.clone();
+                async move {
+                    *capture.lock().expect("lock") = Some((media_type.clone(), bytes.clone()));
+                    Ok::<ArtifactRef, anyhow::Error>(ArtifactRef {
+                        id: ArtifactId::new(),
+                        media_type,
+                        byte_length: bytes.len() as u64,
+                        sha256: format!("{:x}", Sha256::digest(&bytes)),
+                        sensitivity: codypendent_protocol::DataClassification::Internal,
+                    })
+                }
+            },
+        ));
+        let hub = SubscriptionHub::new();
+        let session_id = SessionId::new();
+        let _events = hub.subscribe(session_id);
+        let runtime = FrameworkAgentRuntime::new(
+            ModelRegistry::new(Vec::new()),
+            PolicyEngine::with_defaults(),
+            ApprovalBroker::new(),
+            hub,
+            in_memory_journal(),
+            sink,
+        );
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("config.toml"), "[x]\ny = 1\n").expect("write fixture");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(ReadFile::NAME, &json!({"path": "config.toml"}), &run)
+            .await
+            .expect("prepares");
+        let (observation, artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+
+        let artifact = artifact
+            .expect("read_file must now persist its observation as an artifact, not return None");
+        assert_eq!(artifact.media_type, "text/plain");
+
+        let (_, stored_bytes) = stored
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("the sink must have been called");
+        assert_eq!(
+            stored_bytes,
+            observation.as_bytes(),
+            "the stored blob must be exactly the observation (header + excerpt)"
+        );
+    }
+
+    /// Companion to the test above: persistence is best-effort. If the
+    /// artifact sink itself fails (a storage error), the read must still
+    /// succeed and the observation must be unaffected — only the artifact
+    /// ref degrades to `None`. A storage hiccup must never turn a successful
+    /// `read_file` into a failure.
+    #[tokio::test]
+    async fn read_file_degrades_to_no_artifact_when_the_sink_fails() {
+        let sink: Box<dyn ArtifactSink> = Box::new(ClosureSink(
+            |_media_type: String, _provenance: Provenance, _bytes: Vec<u8>| async move {
+                Err::<ArtifactRef, anyhow::Error>(anyhow::anyhow!("disk full"))
+            },
+        ));
+        let hub = SubscriptionHub::new();
+        let session_id = SessionId::new();
+        let _events = hub.subscribe(session_id);
+        let runtime = FrameworkAgentRuntime::new(
+            ModelRegistry::new(Vec::new()),
+            PolicyEngine::with_defaults(),
+            ApprovalBroker::new(),
+            hub,
+            in_memory_journal(),
+            sink,
+        );
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::write(repo.path().join("config.toml"), "[x]\n").expect("write fixture");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(ReadFile::NAME, &json!({"path": "config.toml"}), &run)
+            .await
+            .expect("prepares");
+        let (observation, artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+
+        assert!(
+            matches!(outcome, ToolOutcome::Succeeded),
+            "a sink failure must not turn a successful read into a failure"
+        );
+        assert!(
+            artifact.is_none(),
+            "a sink failure must degrade to no artifact, not propagate"
+        );
+        assert!(
+            observation.contains("[x]"),
+            "the observation must be unaffected by the sink failure: {observation}"
+        );
     }
 
     /// FIX 3 (agent & tool fixes spec): a `shell.run` denial for a program that
