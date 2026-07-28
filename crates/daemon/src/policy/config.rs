@@ -223,11 +223,9 @@ impl MergedPolicy {
     /// evaluation time (`eval_command`); widening can move a program from
     /// `Deny` to `RequireApproval`, never to auto-run.
     ///
-    /// Not yet called by [`super::PolicyEngine::load`] — routing the trusted
-    /// global config through this path (vs. the untrusted path) is a
-    /// separate follow-up task; this method is built and unit-tested ahead
-    /// of that wiring.
-    #[allow(dead_code)]
+    /// Called by [`super::PolicyEngine::load`] for the global/config-dir
+    /// layer (PF4) — the untrusted repo-local layer stays on
+    /// [`Self::apply_untrusted_overlay`].
     pub fn apply_trusted_overlay(&mut self, raw: &RawPolicy) {
         if let Some(schema_version) = raw.schema_version {
             self.schema_version = schema_version;
@@ -351,7 +349,6 @@ fn intersect_exact(base: &[String], overlay: &[String]) -> Vec<String> {
 /// the **trusted** widen path (`apply_trusted_overlay`) for `fs_read`;
 /// `fs_write` never calls this — it stays on `intersect_roots` even for a
 /// trusted source.
-#[allow(dead_code)] // called by apply_trusted_overlay, not yet wired into `load`
 fn union_roots(base: &[String], overlay: &[String]) -> Vec<String> {
     let mut out: Vec<String> = base.iter().filter_map(|root| normalize_raw(root)).collect();
     for candidate in overlay {
