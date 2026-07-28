@@ -2921,6 +2921,7 @@ impl ModelDriver for FrameworkModelDriver {
 
         let mut options = ChatOptions::new();
         options.tools = Self::advertised_tools(offered_tools);
+        apply_context_window(&mut options, self.context_tokens);
 
         let mut stream = self
             .client
@@ -2954,6 +2955,42 @@ impl ModelDriver for FrameworkModelDriver {
         // rides the step).
         let (step, usage, preface) = updates_to_step(updates, |_| {});
         Ok(StepOutcome::new(step, usage).with_preface(preface))
+    }
+}
+
+/// Forward a known context window as the Ollama `num_ctx` request hint
+/// (context-window protection, BT4): when `window` is `Some(n)`, sets
+/// `options.additional_properties["options"] = {"num_ctx": n}` — the shape the
+/// OpenAI converter forwards verbatim onto the request body
+/// (`agent-framework-openai`'s `convert.rs`), and the nested object Ollama
+/// reads generation parameters from at its OpenAI-compatible endpoint.
+///
+/// Honesty (C5): `window == None` leaves `additional_properties` untouched —
+/// no `options` key is inserted, so no `num_ctx` is ever invented for a model
+/// with an unconfigured window.
+///
+/// If `additional_properties["options"]` already holds an object (e.g. other
+/// Ollama generation parameters set elsewhere), `num_ctx` is merged into it
+/// rather than overwriting the existing keys. This is a pure, dependency-free
+/// body-field tweak: an endpoint that ignores it is unaffected, so it never
+/// changes whether a request succeeds.
+#[cfg(feature = "provider-openai")]
+fn apply_context_window(
+    options: &mut agent_framework_core::types::ChatOptions,
+    window: Option<u64>,
+) {
+    let Some(n) = window else {
+        return;
+    };
+    match options.additional_properties.get_mut("options") {
+        Some(serde_json::Value::Object(existing)) => {
+            existing.insert("num_ctx".to_string(), serde_json::json!(n));
+        }
+        _ => {
+            options
+                .additional_properties
+                .insert("options".to_string(), serde_json::json!({ "num_ctx": n }));
+        }
     }
 }
 
@@ -3593,6 +3630,63 @@ mod tests {
             driver.context_window(),
             None,
             "an unset context_tokens must stay honestly None, never a fabricated default"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn apply_context_window_sets_ollama_num_ctx_when_known() {
+        // Context-window protection (BT4): a known window must be forwarded as
+        // the Ollama request hint `{"options":{"num_ctx":n}}` via
+        // `ChatOptions.additional_properties`, the verified seam the OpenAI
+        // converter forwards onto the request body.
+        use agent_framework_core::types::ChatOptions;
+
+        let mut options = ChatOptions::new();
+        apply_context_window(&mut options, Some(32_768));
+
+        assert_eq!(
+            options.additional_properties.get("options"),
+            Some(&serde_json::json!({ "num_ctx": 32_768 })),
+            "a known window must set additional_properties[\"options\"] = {{num_ctx}}"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn apply_context_window_sets_nothing_when_window_is_unknown() {
+        // Honesty (C5): an unknown window must never invent a num_ctx — the
+        // request body must carry no `options` key at all.
+        use agent_framework_core::types::ChatOptions;
+
+        let mut options = ChatOptions::new();
+        apply_context_window(&mut options, None);
+
+        assert!(
+            !options.additional_properties.contains_key("options"),
+            "an unknown window must not fabricate an `options`/num_ctx key"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn apply_context_window_merges_into_existing_options_without_clobbering() {
+        // If something else has already populated additional_properties["options"]
+        // with other Ollama generation parameters, injecting num_ctx must merge
+        // into that object rather than overwrite it.
+        use agent_framework_core::types::ChatOptions;
+
+        let mut options = ChatOptions::new();
+        options.additional_properties.insert(
+            "options".to_string(),
+            serde_json::json!({ "temperature": 0.2 }),
+        );
+        apply_context_window(&mut options, Some(8_192));
+
+        assert_eq!(
+            options.additional_properties.get("options"),
+            Some(&serde_json::json!({ "temperature": 0.2, "num_ctx": 8_192 })),
+            "existing options keys must survive alongside the injected num_ctx"
         );
     }
 
