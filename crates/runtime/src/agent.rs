@@ -213,6 +213,46 @@ pub fn estimate_context_tokens(transcript: &[TurnItem]) -> usize {
         .sum()
 }
 
+/// Decide whether the plain loop should emit a `BudgetWarning{Tokens}` event
+/// for this step (context-window protection, component C4), and build it when
+/// it should. Called ONLY when a window is known (`limit` came from
+/// `driver.context_window()` returning `Some`) — the "unknown window ⇒ no
+/// emit" honesty rule (C5) is enforced by the CALLER never invoking this
+/// helper at all when the window is `None`, not by anything in here.
+///
+/// Dedup: computes the integer percentage `used*100/limit` (clamped to
+/// `0..=100`, `limit.max(1)` guarding a nonsensical zero limit exactly as the
+/// TUI reducer already does at `reduce.rs:544`) and compares it against
+/// `last_emitted_pct`, the percentage most recently emitted THIS run. Returns
+/// `None` (suppress) when the percentage hasn't changed, so a run whose usage
+/// isn't moving costs nothing beyond the division — bounding the emitted
+/// events to at most 101 per run (one per integer percentage point, 0..=100),
+/// never one per step.
+///
+/// Pure and `EventBody`-agnostic about `run_id`/`session_id` plumbing beyond
+/// the one field the event needs, so it is unit-testable without a driver, a
+/// sink, or a running loop.
+fn token_budget_event(
+    run_id: RunId,
+    used: u64,
+    limit: u64,
+    last_emitted_pct: Option<u16>,
+) -> Option<(EventBody, u16)> {
+    let pct = (used.saturating_mul(100) / limit.max(1)).min(100) as u16;
+    if Some(pct) == last_emitted_pct {
+        return None;
+    }
+    Some((
+        EventBody::BudgetWarning {
+            run_id,
+            dimension: BudgetDimension::Tokens,
+            used,
+            limit,
+        },
+        pct,
+    ))
+}
+
 /// The next thing the model wants to do, as decided by a [`ModelDriver`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelStep {
@@ -475,6 +515,12 @@ pub struct ScriptedDriver {
     /// code — its requests contribute no cost. [`with_usage`](Self::with_usage)
     /// scripts a measured usage so a test can exercise the cost path.
     usage: Option<ModelUsage>,
+    /// The window [`ModelDriver::context_window`] reports. `None` (the
+    /// default via [`Self::new`]) preserves this driver's existing honest
+    /// "unknown window" behavior; [`with_context_window`](Self::with_context_window)
+    /// scripts a known window so a test can exercise the plain loop's
+    /// `BudgetWarning{Tokens}` emission (context-window protection, T3).
+    context_window: Option<u64>,
 }
 
 impl ScriptedDriver {
@@ -485,6 +531,7 @@ impl ScriptedDriver {
             steps: Mutex::new(steps.into_iter().collect()),
             model_id: ModelId("scripted".to_string()),
             usage: None,
+            context_window: None,
         }
     }
 
@@ -502,12 +549,25 @@ impl ScriptedDriver {
         self.usage = Some(usage);
         self
     }
+
+    /// Script a known context window (`ModelDriver::context_window` then
+    /// returns `Some(window)`), so a test can exercise the plain loop's
+    /// `BudgetWarning{Tokens}` emission. Without this the driver reports
+    /// `None` (unknown window — no emission, the honesty default).
+    pub fn with_context_window(mut self, window: u64) -> Self {
+        self.context_window = Some(window);
+        self
+    }
 }
 
 #[async_trait]
 impl ModelDriver for ScriptedDriver {
     fn model_id(&self) -> ModelId {
         self.model_id.clone()
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        self.context_window
     }
 
     async fn next_step(
@@ -1024,6 +1084,16 @@ impl FrameworkAgentRuntime {
         let mut usage: Option<ModelUsage> = None;
         let run_started = Instant::now();
         let mut wall_clock_warned = false;
+        // Context-window protection (T3): the integer percentage
+        // (`used*100/limit`) most recently emitted as a `BudgetWarning{Tokens}`
+        // THIS run, or `None` before the first emission. Local to this run
+        // (never persisted), it is the dedup gate `token_budget_event` checks
+        // against so a step whose percentage hasn't moved doesn't re-emit.
+        let mut last_token_pct: Option<u16> = None;
+        // Resolved once: the model's context window, or `None` when unknown.
+        // `None` here means C5's honesty rule applies for the WHOLE run — the
+        // loop below never emits a `Tokens` event, so the TUI footer stays `—`.
+        let context_window = driver.context_window();
         // Repeated-identical-call guard state (loop-fix Task 2): the identity
         // (tool, args_digest) of the most recently ISSUED call and how many
         // times in a row it has now been issued — reset (to a fresh count of
@@ -1067,6 +1137,26 @@ impl FrameworkAgentRuntime {
                     },
                 )
                 .await?;
+            }
+
+            // Context-window protection (T3): estimate live usage against the
+            // known window and emit the SAME `BudgetWarning{Tokens}` event the
+            // workflow budget engine emits, at the identical per-step safe
+            // point as the wall-clock warning above. Honesty (C5): when the
+            // window is unknown (`context_window == None`), this whole block
+            // is skipped — NOT ONE `Tokens` event is ever emitted for this
+            // run, so `RunView.context_percent` stays `None` and the footer
+            // keeps showing `—`. Dedup: `token_budget_event` suppresses the
+            // emit when the integer percentage hasn't changed since
+            // `last_token_pct`, bounding this to at most 101 events/run.
+            if let Some(limit) = context_window {
+                let used = estimate_context_tokens(&transcript) as u64;
+                if let Some((body, pct)) =
+                    token_budget_event(run.run_id, used, limit, last_token_pct)
+                {
+                    last_token_pct = Some(pct);
+                    self.emit(run.session_id, run_actor.clone(), body).await?;
+                }
             }
 
             let started = Instant::now();
@@ -3102,6 +3192,64 @@ mod tests {
         assert!(after >= before);
     }
 
+    // -----------------------------------------------------------------------
+    // Context-window protection (T3): `token_budget_event` — the pure emit
+    // decision behind the plain loop's `BudgetWarning{Tokens}` producer.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn token_budget_event_emits_on_first_call_with_the_computed_percent() {
+        // No prior emission (`last_emitted_pct == None`) always emits, since
+        // `Some(pct) != None` for any `pct`.
+        let run_id = RunId::new();
+        let (body, pct) =
+            token_budget_event(run_id, 8_192, 32_768, None).expect("first call always emits");
+        assert_eq!(pct, 25);
+        match body {
+            EventBody::BudgetWarning {
+                run_id: got_run_id,
+                dimension,
+                used,
+                limit,
+            } => {
+                assert_eq!(got_run_id, run_id);
+                assert_eq!(dimension, BudgetDimension::Tokens);
+                assert_eq!(used, 8_192);
+                assert_eq!(limit, 32_768);
+            }
+            other => panic!("expected BudgetWarning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_budget_event_suppresses_an_unchanged_percentage() {
+        // Dedup: the SAME integer percentage as `last_emitted_pct` must not
+        // re-emit, even though `used` differs slightly (both round to 25%).
+        let run_id = RunId::new();
+        let unchanged = token_budget_event(run_id, 8_200, 32_768, Some(25));
+        assert_eq!(unchanged, None, "unchanged percent must not re-emit");
+    }
+
+    #[test]
+    fn token_budget_event_emits_again_once_the_percentage_moves() {
+        // A percentage that DOES move re-emits with the new value.
+        let run_id = RunId::new();
+        let (_, pct) = token_budget_event(run_id, 16_384, 32_768, Some(25))
+            .expect("changed percent must emit");
+        assert_eq!(pct, 50);
+    }
+
+    #[test]
+    fn token_budget_event_clamps_to_100_and_guards_a_zero_limit() {
+        // `used > limit` clamps to 100%, and a nonsensical zero limit is
+        // guarded (`limit.max(1)`) rather than dividing by zero.
+        let run_id = RunId::new();
+        let (_, pct) = token_budget_event(run_id, 100_000, 32_768, None).expect("emits");
+        assert_eq!(pct, 100);
+        let (_, pct_zero_limit) = token_budget_event(run_id, 5, 0, None).expect("emits");
+        assert_eq!(pct_zero_limit, 100);
+    }
+
     #[test]
     fn run_context_prior_defaults_empty_and_with_prior_exposes_it() {
         // Task 2 (continuous-session plan): `prior` is the seed-transcript
@@ -3827,6 +3975,29 @@ mod tests {
         deltas
     }
 
+    /// Collect every `BudgetWarning{Tokens}` currently buffered on `events` as
+    /// `(used, limit)` pairs, in publish order — the loop-level counterpart to
+    /// [`drain_deltas`], used by the context-window protection (T3) tests to
+    /// inspect the plain loop's `BudgetWarning{Tokens}` producer without
+    /// caring about the other event kinds a run also emits.
+    fn drain_token_budget_events(
+        events: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+    ) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::BudgetWarning {
+                dimension: BudgetDimension::Tokens,
+                used,
+                limit,
+                ..
+            } = event.body
+            {
+                out.push((used, limit));
+            }
+        }
+        out
+    }
+
     #[tokio::test]
     async fn a_say_step_streams_its_text_as_a_delta_through_the_sink() {
         // A scripted `Say` run emits exactly one `ModelStreamDelta` carrying
@@ -3856,6 +4027,125 @@ mod tests {
 
         let deltas = drain_deltas(&mut events);
         assert_eq!(deltas, vec!["Hello, world.".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Context-window protection (T3): the plain loop's `BudgetWarning{Tokens}`
+    // producer, exercised end to end through `execute_run`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_known_context_window_emits_budget_warning_tokens_matching_the_estimate() {
+        // With `driver.context_window() == Some(limit)`, the loop's very first
+        // pass through the safe point sees `transcript == [Objective(..)]`
+        // (before the scripted `Say`/`Finish` steps run), so the FIRST emitted
+        // `used` must equal `estimate_context_tokens` of exactly that
+        // transcript — proving the loop feeds the estimator the real,
+        // in-flight transcript rather than some placeholder.
+        let objective = "say hello";
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::Say("Hello, world.".to_string()),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ])
+        .with_context_window(32_768);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            objective,
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("scripted run completes");
+
+        let token_events = drain_token_budget_events(&mut events);
+        assert!(
+            !token_events.is_empty(),
+            "a known window must emit at least one BudgetWarning{{Tokens}}"
+        );
+        let expected_used =
+            estimate_context_tokens(&[TurnItem::Objective(objective.to_string())]) as u64;
+        assert_eq!(token_events[0], (expected_used, 32_768));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_context_window_emits_no_budget_warning_tokens() {
+        // Honesty (C5): `driver.context_window() == None` (the default,
+        // undisturbed by `with_context_window`) must suppress EVERY
+        // `BudgetWarning{Tokens}` emission for the whole run, so
+        // `RunView.context_percent` stays `None` and the footer shows `—`.
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::Say("Hello, world.".to_string()),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ]);
+        assert_eq!(driver.context_window(), None);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "say hello",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("scripted run completes");
+
+        let token_events = drain_token_budget_events(&mut events);
+        assert!(
+            token_events.is_empty(),
+            "unknown window must never emit BudgetWarning{{Tokens}}, got {token_events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_percentage_across_steps_does_not_re_emit() {
+        // Dedup: a huge window relative to a short scripted transcript keeps
+        // the integer percentage at 0 across every step, so despite the loop
+        // passing the safe point twice (once before the `Say` step, once
+        // before `Finish`), at most ONE `BudgetWarning{Tokens}` is emitted —
+        // proving the per-step emit does not spam the ledger.
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::Say("Hello, world.".to_string()),
+            ModelStep::Say("Still here.".to_string()),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ])
+        .with_context_window(100_000_000);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "say hello",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("scripted run completes");
+
+        let token_events = drain_token_budget_events(&mut events);
+        assert_eq!(
+            token_events.len(),
+            1,
+            "an unchanged percent across steps must not re-emit, got {token_events:?}"
+        );
     }
 
     /// A driver that records the transcript it is FIRST handed, then finishes —
