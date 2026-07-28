@@ -947,6 +947,24 @@ pub struct AppState {
     /// text lands here; Enter sends it (starting a run, or steering the active
     /// one). Empty by default.
     pub composer: String,
+    /// Prior composer submissions (shell-style history), oldest first. `Up`
+    /// (`HistoryPrev`) walks backward from the newest entry; `Down`
+    /// (`HistoryNext`) walks forward. Populated by `InputSubmit` on a
+    /// non-empty draft; a submission identical to the last entry is skipped
+    /// (no consecutive duplicates). Client-only — never sent over the wire.
+    pub composer_history: Vec<String>,
+    /// While recalling history, the index into `composer_history` currently
+    /// loaded into `composer`. `None` means `composer` holds the user's own
+    /// in-progress text, not a recalled entry — every edit action
+    /// (`InputChar` / `InputBackspace` / `InputNewline` / `InputPaste`) resets
+    /// this to `None` whenever it touches a recalled entry (shell-style:
+    /// editing a recalled command detaches it from history).
+    pub history_cursor: Option<usize>,
+    /// The user's in-progress draft, stashed by `HistoryPrev` the moment it
+    /// first recalls an entry (`history_cursor` goes `None` → `Some`) — so
+    /// `HistoryNext` walking back past the newest entry can restore it
+    /// verbatim. The in-progress text is never lost.
+    pub composer_stash: Option<String>,
     /// Which base layout is rendered (chat single-column vs. workspace panes).
     /// Toggled with `F2`; defaults to [`LayoutMode::Chat`].
     pub layout: LayoutMode,
@@ -1033,6 +1051,9 @@ impl AppState {
             selected_provider: 0,
             focus: Pane::Sessions,
             composer: String::new(),
+            composer_history: Vec::new(),
+            history_cursor: None,
+            composer_stash: None,
             layout: LayoutMode::Chat,
             transcript_max_scroll: Cell::new(0),
             hit_map: RefCell::new(Vec::new()),
