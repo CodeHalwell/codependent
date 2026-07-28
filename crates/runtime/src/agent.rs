@@ -381,6 +381,16 @@ pub trait ModelDriver: Send + Sync {
         offered_tools: &[&str],
         sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome>;
+
+    /// The model's context window in tokens, if known — the honest source for
+    /// both the `num_ctx` request hint and the context-usage percentage
+    /// denominator (context-window protection). Defaults to `None`
+    /// ("unknown"), so every driver that doesn't override it (scripted/test
+    /// drivers included) never fabricates a window. [`FrameworkModelDriver`]
+    /// overrides this with the resolved model's configured `context_tokens`.
+    fn context_window(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A driver backed by a fixed queue of pre-set steps — the deterministic engine
@@ -2439,25 +2449,45 @@ fn build_chronicle(
 pub struct FrameworkModelDriver {
     client: std::sync::Arc<dyn agent_framework_core::client::ChatClient>,
     model_id: ModelId,
+    /// The resolved model's context window in tokens, if known — sourced
+    /// from `ModelConfig.context_tokens` by [`Self::from_registry`]. `None`
+    /// (the default via [`Self::new`]) means "unknown": [`Self::context_window`]
+    /// honestly returns `None`, never a fabricated default.
+    context_tokens: Option<u64>,
 }
 
 #[cfg(feature = "provider-openai")]
 impl FrameworkModelDriver {
-    /// Wrap a constructed client and record the model id it serves.
+    /// Wrap a constructed client and record the model id it serves. The
+    /// context window starts `None` (unknown) — callers that have a resolved
+    /// `ModelConfig` should prefer [`Self::from_registry`], which populates
+    /// it; direct callers of `new` (e.g. tests) get the honest default.
     pub fn new(
         client: std::sync::Arc<dyn agent_framework_core::client::ChatClient>,
         model_id: ModelId,
     ) -> Self {
-        Self { client, model_id }
+        Self {
+            client,
+            model_id,
+            context_tokens: None,
+        }
     }
 
-    /// Build a driver from the registry by resolving `model_id` to a client.
+    /// Build a driver from the registry by resolving `model_id` to a client,
+    /// also capturing the resolved [`ModelConfig::context_tokens`] so
+    /// [`Self::context_window`] can answer honestly (`Some` when configured,
+    /// `None` when unset).
     pub async fn from_registry(models: &ModelRegistry, model_id: ModelId) -> anyhow::Result<Self> {
+        let context_tokens = models.get(&model_id).and_then(|cfg| cfg.context_tokens);
         let client = models
             .client_for(&model_id)
             .await
             .map_err(|e| anyhow::anyhow!("could not build client for {model_id}: {e}"))?;
-        Ok(Self::new(client, model_id))
+        Ok(Self {
+            client,
+            model_id,
+            context_tokens,
+        })
     }
 
     /// The full tool SCHEMA catalog — every tool's name, description, and JSON
@@ -2712,6 +2742,10 @@ fn compact_args(args: &Value) -> String {
 impl ModelDriver for FrameworkModelDriver {
     fn model_id(&self) -> ModelId {
         self.model_id.clone()
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        self.context_tokens
     }
 
     async fn next_step(
@@ -3026,6 +3060,18 @@ mod tests {
     }
 
     #[test]
+    fn scripted_driver_context_window_defaults_to_none() {
+        // Context-window protection (BT1): `ModelDriver::context_window` has a
+        // default impl returning `None`, so a driver like `ScriptedDriver` that
+        // never overrides it needs no change and stays honestly "unknown" —
+        // never a fabricated window.
+        let driver = ScriptedDriver::new(vec![ModelStep::Finish {
+            summary: "done".to_string(),
+        }]);
+        assert_eq!(driver.context_window(), None);
+    }
+
+    #[test]
     fn cancellation_token_flips_on_cancel() {
         let (handle, token) = cancellation();
         assert!(!token.is_cancelled());
@@ -3179,6 +3225,49 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 0);
         assert_eq!(usage.completion_tokens, 9);
         assert_eq!(usage.cost_micros, None);
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn framework_driver_context_window_reflects_the_resolved_model_config() {
+        // Context-window protection (BT1): `FrameworkModelDriver::context_window`
+        // must source its answer from the resolved `ModelConfig.context_tokens`
+        // — `Some(n)` when the config sets it, `None` when it doesn't. Neither
+        // case fabricates a value.
+        let id = ModelId("local-default".to_string());
+        let known = ModelRegistry::new([crate::models::ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen2.5-coder:14b".to_string(),
+            api_key_env: String::new(),
+            context_tokens: Some(32_768),
+        }]);
+        let driver = FrameworkModelDriver::from_registry(&known, id.clone())
+            .await
+            .expect("driver builds from a registered model");
+        assert_eq!(
+            driver.context_window(),
+            Some(32_768),
+            "a configured context_tokens must surface verbatim"
+        );
+
+        let unknown = ModelRegistry::new([crate::models::ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen2.5-coder:14b".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+        }]);
+        let driver = FrameworkModelDriver::from_registry(&unknown, id)
+            .await
+            .expect("driver builds from a registered model");
+        assert_eq!(
+            driver.context_window(),
+            None,
+            "an unset context_tokens must stay honestly None, never a fabricated default"
+        );
     }
 
     /// A no-op blackboard channel for the FIX 1 advertised-tools tests below:
