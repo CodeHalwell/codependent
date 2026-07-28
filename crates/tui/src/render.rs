@@ -46,11 +46,15 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // a one-row derived shortcuts strip spans the very bottom. Every other
     // surface (runs, approvals, docs, skills, memory, edges) is a centered
     // overlay or the approval modal — minimal permanent chrome.
+    // The box grows past its 3-row minimum when the draft holds more than one
+    // line (a manual `Alt+Enter` break, or a multi-line paste), capped at
+    // `COMPOSER_MAX_HEIGHT` — see `composer_box_height`.
+    let composer_height = composer_box_height(&state.composer);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),                  // conversation transcript
-            Constraint::Length(COMPOSER_HEIGHT), // persistent composer
+            Constraint::Length(composer_height), // persistent composer
             Constraint::Length(1),               // status footer
             Constraint::Length(1),               // shortcuts footer (derived)
         ])
@@ -237,8 +241,24 @@ fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     );
 }
 
-/// The composer's height in rows (a bordered box holding one input line).
+/// The composer's minimum height in rows (a bordered box holding one input
+/// line) — unchanged for the common single-line draft.
 const COMPOSER_HEIGHT: u16 = 3;
+
+/// The composer's maximum height in rows. A manual line break (`Alt+Enter`)
+/// or a multi-line paste grows the box by one row per extra line, capped
+/// here so a large paste can't swallow the whole screen; once the draft has
+/// more lines than fit, the box scrolls to keep the cursor (the last line)
+/// in view.
+const COMPOSER_MAX_HEIGHT: u16 = 8;
+
+/// How tall the composer box should be this frame: `COMPOSER_HEIGHT` (3) for
+/// a single-line draft — including empty — growing by one row per extra
+/// `\n`-separated line, up to `COMPOSER_MAX_HEIGHT`.
+fn composer_box_height(composer: &str) -> u16 {
+    let lines = composer.split('\n').count() as u16;
+    (lines + 2).clamp(COMPOSER_HEIGHT, COMPOSER_MAX_HEIGHT)
+}
 
 /// Wrapped-row height of a line `columns` display-columns wide in an
 /// `inner_width` viewport: ceil(columns/inner_width), min 1.
@@ -730,31 +750,56 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .border_style(Style::default().fg(theme.focus.active))
         .style(Style::default().bg(theme.surface.panel));
 
-    let mut spans = vec![Span::styled(
-        "› ",
-        Style::default()
-            .fg(theme.focus.active)
-            .add_modifier(Modifier::BOLD),
-    )];
-    if state.composer.is_empty() {
+    let prompt_style = Style::default()
+        .fg(theme.focus.active)
+        .add_modifier(Modifier::BOLD);
+    let lines: Vec<Line> = if state.composer.is_empty() {
         let hint = if steering {
             "steer the run · Enter sends · / for commands"
         } else {
             "message the agent to start a run · Enter sends · / for commands"
         };
-        spans.push(Span::styled(hint, Style::default().fg(theme.text.muted)));
+        vec![Line::from(vec![
+            Span::styled("› ", prompt_style),
+            Span::styled(hint, Style::default().fg(theme.text.muted)),
+        ])]
     } else {
-        spans.push(Span::styled(
-            state.composer.as_str(),
-            Style::default().fg(theme.text.primary),
-        ));
-        spans.push(Span::styled("▏", Style::default().fg(theme.focus.active)));
-    }
+        // A manual line break (`Alt+Enter`) or a multi-line paste puts a `\n`
+        // in the draft: render each segment as its own `Line` (a raw `\n`
+        // inside one `Line`'s text does not itself wrap) rather than a single
+        // wrapped line — only the first gets the `› ` prompt, and only the
+        // last gets the cursor.
+        let segments: Vec<&str> = state.composer.split('\n').collect();
+        let last = segments.len() - 1;
+        segments
+            .into_iter()
+            .enumerate()
+            .map(|(i, segment)| {
+                let mut spans = vec![Span::styled(if i == 0 { "› " } else { "  " }, prompt_style)];
+                spans.push(Span::styled(
+                    segment,
+                    Style::default().fg(theme.text.primary),
+                ));
+                if i == last {
+                    spans.push(Span::styled("▏", Style::default().fg(theme.focus.active)));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    };
+
+    // Keep the cursor (the last line) in view once the draft has more lines
+    // than the box shows — the box already grew toward `COMPOSER_MAX_HEIGHT`
+    // (see `composer_box_height`); this only matters once it's capped there.
+    let visible_rows = area.height.saturating_sub(2).max(1);
+    let total_rows = lines.len() as u16;
+    let scroll_y = total_rows.saturating_sub(visible_rows);
 
     frame.render_widget(
-        Paragraph::new(Line::from(spans))
+        Paragraph::new(lines)
             .block(block)
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_y, 0)),
         area,
     );
     // Belt-and-braces: the full-screen scrim (`render_overlays`) already
@@ -4894,6 +4939,33 @@ mod tests {
         assert!(
             text.contains("add a boundary check"),
             "draft not shown:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_manual_newline_renders_as_two_composer_rows_and_grows_the_box() {
+        let mut state = running_build_state();
+        for c in "line one\nline two".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        let text = render_to_string(&state, 100, 30);
+        let lines: Vec<&str> = text.lines().collect();
+        // Both segments show up as their own rows, not concatenated onto one.
+        let one_row = lines.iter().position(|l| l.contains("line one"));
+        let two_row = lines.iter().position(|l| l.contains("line two"));
+        assert!(
+            one_row.is_some() && two_row.is_some(),
+            "both lines should render:\n{text}"
+        );
+        assert_eq!(
+            two_row.unwrap(),
+            one_row.unwrap() + 1,
+            "the second segment should be the very next row, not merged onto the first:\n{text}"
+        );
+        assert!(
+            !lines[one_row.unwrap()].contains("line one line two")
+                && !lines[one_row.unwrap()].contains("line oneline two"),
+            "the newline must not be swallowed onto a single row:\n{text}"
         );
     }
 

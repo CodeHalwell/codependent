@@ -133,12 +133,24 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
 
         Action::InputChar(c) => input_char(state, c),
-        Action::InputPaste(text) => edit_prompt(state, move |buf| buf.push_str(&text)),
-        Action::InputBackspace => edit_prompt(state, |buf| {
-            buf.pop();
-        }),
+        Action::InputPaste(text) => {
+            edit_prompt(state, move |buf| buf.push_str(&text));
+            detach_history_on_edit(state);
+        }
+        Action::InputBackspace => {
+            edit_prompt(state, |buf| {
+                buf.pop();
+            });
+            detach_history_on_edit(state);
+        }
+        Action::InputNewline => {
+            edit_prompt(state, |buf| buf.push('\n'));
+            detach_history_on_edit(state);
+        }
         Action::InputSubmit => submit_prompt(state),
         Action::InputCancel => input_cancel(state),
+        Action::HistoryPrev => history_prev(state),
+        Action::HistoryNext => history_next(state),
 
         Action::OpenSkills => {
             state.overlay = match state.overlay {
@@ -1091,6 +1103,54 @@ fn input_char(state: &mut AppState, c: char) {
         return;
     }
     edit_prompt(state, |buf| buf.push(c));
+    detach_history_on_edit(state);
+}
+
+/// Editing the composer while a recalled history entry is loaded detaches it
+/// from history: `composer` becomes an ordinary in-progress draft again, so
+/// the next `HistoryPrev` stashes *this* text rather than resuming the old
+/// recall walk (shell-style: touching a recalled command loses its history
+/// binding). A no-op for every other overlay's buffer (they have no history).
+fn detach_history_on_edit(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::None) {
+        state.history_cursor = None;
+    }
+}
+
+/// `HistoryPrev` (`Up` in the composer): shell-style recall, walking
+/// backward. The first press stashes the in-progress draft — so it is never
+/// lost — and loads the newest entry; each subsequent press walks toward
+/// older entries, saturating at the oldest. A no-op with empty history.
+fn history_prev(state: &mut AppState) {
+    if state.composer_history.is_empty() {
+        return;
+    }
+    let idx = match state.history_cursor {
+        None => {
+            state.composer_stash = Some(state.composer.clone());
+            state.composer_history.len() - 1
+        }
+        Some(idx) => idx.saturating_sub(1),
+    };
+    state.composer = state.composer_history[idx].clone();
+    state.history_cursor = Some(idx);
+}
+
+/// `HistoryNext` (`Down` in the composer): walk toward newer entries; moving
+/// past the newest restores the stashed in-progress draft and detaches from
+/// history entirely. A no-op when not currently recalling.
+fn history_next(state: &mut AppState) {
+    let Some(idx) = state.history_cursor else {
+        return;
+    };
+    if idx + 1 >= state.composer_history.len() {
+        state.composer = state.composer_stash.take().unwrap_or_default();
+        state.history_cursor = None;
+    } else {
+        let idx = idx + 1;
+        state.composer = state.composer_history[idx].clone();
+        state.history_cursor = Some(idx);
+    }
 }
 
 /// `Esc`: clear the composer draft in the base view, return the block-edit prompt
@@ -1269,6 +1329,14 @@ fn submit_prompt(state: &mut AppState) {
         Overlay::None => {
             let text = state.composer.trim().to_owned();
             if !text.is_empty() {
+                // Shell-style history: record the submission (skip a
+                // consecutive duplicate) and end any in-flight recall — the
+                // walk-back state from *this* submission is stale now.
+                if state.composer_history.last().map(String::as_str) != Some(text.as_str()) {
+                    state.composer_history.push(text.clone());
+                }
+                state.history_cursor = None;
+                state.composer_stash = None;
                 if state.selected_run_is_active() {
                     if let Some(run_id) = state.selected_run().map(|r| r.run_id) {
                         state.outbox.push(Intent::QueueSteering { run_id, text });
@@ -3531,6 +3599,158 @@ mod tests {
             ),
             "expected a StartRun intent, got {intents:?}"
         );
+    }
+
+    #[test]
+    fn alt_enter_inserts_a_newline_without_submitting() {
+        let mut s = AppState::new();
+        for c in "line one".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputNewline);
+        for c in "line two".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        assert_eq!(s.composer, "line one\nline two");
+        // Nothing was submitted — no run started, draft still intact.
+        assert!(s.drain_outbox().is_empty());
+        assert!(!s.composer.is_empty());
+    }
+
+    #[test]
+    fn submitting_pushes_to_history_skipping_consecutive_dupes() {
+        let mut s = AppState::new();
+        for c in "first message".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.composer_history, vec!["first message".to_owned()]);
+
+        // A repeat of the very same message is not pushed again.
+        for c in "first message".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.composer_history,
+            vec!["first message".to_owned()],
+            "consecutive duplicate must be skipped"
+        );
+
+        // A genuinely new message is appended.
+        for c in "second message".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.composer_history,
+            vec!["first message".to_owned(), "second message".to_owned()]
+        );
+    }
+
+    #[test]
+    fn history_prev_stashes_the_in_progress_draft_and_walks_backward() {
+        let mut s = AppState::new();
+        for text in ["oldest", "newest"] {
+            for c in text.chars() {
+                reduce(&mut s, Action::InputChar(c));
+            }
+            reduce(&mut s, Action::InputSubmit);
+        }
+        assert_eq!(
+            s.composer_history,
+            vec!["oldest".to_owned(), "newest".to_owned()]
+        );
+
+        // Start a fresh, in-progress draft — this must never be lost.
+        for c in "in progress".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        assert_eq!(s.composer, "in progress");
+
+        // First Up: stashes the in-progress draft, loads the newest entry.
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "newest");
+        assert_eq!(s.composer_stash, Some("in progress".to_owned()));
+
+        // Second Up: walks to the older entry.
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "oldest");
+
+        // A third Up saturates at the oldest entry (no history before it).
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "oldest");
+    }
+
+    #[test]
+    fn history_next_walks_forward_and_restores_the_stash_past_the_newest() {
+        let mut s = AppState::new();
+        for text in ["oldest", "newest"] {
+            for c in text.chars() {
+                reduce(&mut s, Action::InputChar(c));
+            }
+            reduce(&mut s, Action::InputSubmit);
+        }
+        for c in "in progress".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::HistoryPrev); // -> "newest" (stash "in progress")
+        reduce(&mut s, Action::HistoryPrev); // -> "oldest"
+        assert_eq!(s.composer, "oldest");
+
+        // Down walks back toward newer entries.
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer, "newest");
+
+        // Down again moves past the newest: the stashed draft comes back,
+        // verbatim, and the walk is over (further Down is a no-op).
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer, "in progress");
+        assert_eq!(s.history_cursor, None);
+
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(
+            s.composer, "in progress",
+            "Down with no active recall must be a no-op"
+        );
+    }
+
+    #[test]
+    fn history_prev_is_a_noop_with_empty_history() {
+        let mut s = AppState::new();
+        for c in "draft".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "draft", "no history yet — nothing to recall");
+        assert_eq!(s.history_cursor, None);
+    }
+
+    #[test]
+    fn editing_a_recalled_entry_detaches_it_so_the_next_up_restashes() {
+        let mut s = AppState::new();
+        for c in "old one".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+
+        for c in "working draft".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "old one");
+        assert_eq!(s.history_cursor, Some(0));
+
+        // Typing into the recalled entry detaches it from history.
+        reduce(&mut s, Action::InputChar('!'));
+        assert_eq!(s.composer, "old one!");
+        assert_eq!(s.history_cursor, None);
+
+        // The next Up re-stashes *this* edited text, not the original stash.
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "old one");
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer, "old one!", "the edited draft must not be lost");
     }
 
     #[test]
