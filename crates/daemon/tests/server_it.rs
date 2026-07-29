@@ -356,6 +356,77 @@ async fn daemon_status_reports_build_id_and_active_run_count() {
     shutdown(stream, task).await;
 }
 
+/// Send `ShutdownIfIdle`, expect a clean `ShutdownAck`, and confirm the server
+/// stops (mirrors [`shutdown`], but exercises the idle-guarded path).
+async fn shutdown_if_idle_expect_ack(mut stream: UnixStream, task: ServerTask) {
+    write_envelope(
+        &mut stream,
+        &Envelope::request(ClientId::new(), Payload::ShutdownIfIdle),
+    )
+    .await
+    .expect("write shutdown-if-idle");
+    let mut acked = false;
+    for _ in 0..16 {
+        if matches!(read_frame(&mut stream).await.payload, Payload::ShutdownAck) {
+            acked = true;
+            break;
+        }
+    }
+    assert!(acked, "an idle daemon must ShutdownAck a ShutdownIfIdle");
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("server stops within 5s")
+        .expect("server task must not panic")
+        .expect("server stops cleanly");
+}
+
+/// An idle daemon honours `ShutdownIfIdle` exactly like `Shutdown`.
+#[tokio::test]
+async fn shutdown_if_idle_stops_an_idle_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let stream = connect(&paths).await;
+    shutdown_if_idle_expect_ack(stream, task).await;
+}
+
+/// A daemon with an active run REFUSES `ShutdownIfIdle` (carrying the count it
+/// observed) and keeps serving — the safety gate that lets the client leave an
+/// in-flight run untouched instead of killing it.
+#[tokio::test]
+async fn shutdown_if_idle_refused_when_a_run_is_active() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let mut stream = connect(&paths).await;
+
+    // A single non-terminal run makes the daemon busy.
+    seed_run_in_state(&pool, "Running").await;
+
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(ClientId::new(), Payload::ShutdownIfIdle),
+    )
+    .await;
+    match reply.payload {
+        Payload::ShutdownRefused { active_run_count } => assert_eq!(active_run_count, 1),
+        other => panic!("expected ShutdownRefused, got {other:?}"),
+    }
+
+    // The daemon kept running: a follow-up request still gets a response.
+    let status = send_recv(
+        &mut stream,
+        &Envelope::request(ClientId::new(), Payload::DaemonStatusRequest),
+    )
+    .await;
+    assert!(
+        matches!(status.payload, Payload::DaemonStatusResponse(_)),
+        "daemon must keep serving after refusing an idle-shutdown"
+    );
+
+    // Clean up with an unconditional shutdown.
+    shutdown(stream, task).await;
+}
+
 #[tokio::test]
 async fn create_attach_and_two_clients_observe_one_event() {
     let tmp = tempfile::tempdir().unwrap();

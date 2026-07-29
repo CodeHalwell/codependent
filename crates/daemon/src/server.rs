@@ -145,6 +145,18 @@ pub struct ServerState {
     /// `promotion.transport-unavailable`); the assembly injects a
     /// `codypendent-eval`-backed implementation over the pool.
     pub promotion: Option<Arc<dyn PromotionGateway>>,
+    /// Serializes run admission against an idle-guarded shutdown
+    /// (`Payload::ShutdownIfIdle`), closing the auto-restart TOCTOU window. Every
+    /// write-path command apply is held under a `read()` guard; the idle-guarded
+    /// shutdown takes the exclusive `write()` guard, so its
+    /// `active_run_count`-check and shutdown signal cannot interleave with a
+    /// concurrent `StartRun`/`SubmitUserInput` that would admit a new run.
+    pub run_admission: Arc<tokio::sync::RwLock<()>>,
+    /// Set once an idle-guarded shutdown has been authorized. A run-admitting
+    /// command that was blocked on [`Self::run_admission`] observes this on
+    /// acquiring its read guard and is refused (retryable) rather than admitted
+    /// into a daemon that is about to exit.
+    pub shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -302,6 +314,8 @@ pub async fn run_with_executor_on(
         blackboard_reader,
         workflows,
         workflow_reader,
+        run_admission: Arc::new(tokio::sync::RwLock::new(())),
+        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 
     #[cfg(unix)]
@@ -549,6 +563,20 @@ fn resolve_run_repository(repository: Option<&str>) -> std::path::PathBuf {
     })
 }
 
+/// Whether a command, when applied, can admit a NEW non-terminal run (raise
+/// `active_run_count`). Both `StartRun` and `SubmitUserInput` route through the
+/// same run-creating transaction (`commands.rs`), so both count; every other
+/// command either mutates an existing run's state or touches no run at all.
+/// Used by the idle-guarded-shutdown gate to refuse only run-admitting commands
+/// once a shutdown is authorized — inclusive by design (a spurious retryable in
+/// the sub-millisecond shutdown window is safe; missing an admitter is not).
+fn admits_run(body: &CommandBody) -> bool {
+    matches!(
+        body,
+        CommandBody::StartRun { .. } | CommandBody::SubmitUserInput { .. }
+    )
+}
+
 /// Handle one request. Returns `Ok(true)` when a Shutdown was served (the caller
 /// should stop reading this connection). Replies are framed onto `writer`.
 async fn handle_request(
@@ -594,6 +622,33 @@ async fn handle_request(
             .await?;
         }
         Payload::Shutdown => {
+            send(writer, &Envelope::reply_to(&request, Payload::ShutdownAck)).await?;
+            let _ = state.shutdown.send(true);
+            return Ok(true);
+        }
+        // The idle-guarded shutdown (protocol v1.3): stop ONLY if no run is
+        // active. The exclusive admission guard makes the count-check and the
+        // shutdown signal atomic against a concurrent run-admitting command —
+        // a `StartRun`/`SubmitUserInput` mid-apply has committed its `Queued`
+        // row (so the count sees it → we refuse) or has not yet acquired its
+        // read guard (so it blocks here, then observes `shutting_down` and is
+        // refused). Either way an in-flight run is never silently killed.
+        Payload::ShutdownIfIdle => {
+            let _admit = state.run_admission.write().await;
+            let active = u64::try_from(ledger::active_run_count(&state.pool).await?)?;
+            if active > 0 {
+                let reply = Envelope::reply_to(
+                    &request,
+                    Payload::ShutdownRefused {
+                        active_run_count: active,
+                    },
+                );
+                send(writer, &reply).await?;
+                return Ok(false);
+            }
+            state
+                .shutting_down
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             send(writer, &Envelope::reply_to(&request, Payload::ShutdownAck)).await?;
             let _ = state.shutdown.send(true);
             return Ok(true);
@@ -1457,6 +1512,29 @@ async fn handle_request(
                         client_id: conn.client_id_or(request.client_id),
                         role: conn.role,
                     };
+                    // Hold the shared admission guard across the whole apply so an
+                    // idle-guarded shutdown (`ShutdownIfIdle`) cannot check the run
+                    // count and signal shutdown while this command is mid-commit.
+                    // A run-admitting command that arrives once shutdown is already
+                    // authorized is refused (retryable) rather than admitted into a
+                    // daemon about to exit — the client retries against the fresh one.
+                    let _admit = state.run_admission.read().await;
+                    if admits_run(&command.body)
+                        && state
+                            .shutting_down
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "daemon.restarting",
+                                "the daemon is restarting to load a newer build; retry in a moment",
+                                true,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     let reply_envelope = match state
                         .commands
                         .apply(&state.pool, ctx, command.clone())
@@ -2158,11 +2236,38 @@ mod resume {
 
 #[cfg(test)]
 mod tests {
-    use super::resume;
+    use super::{admits_run, resume};
     use chrono::Utc;
-    use codypendent_protocol::ClientId;
+    use codypendent_protocol::{AgentMode, ClientId, CommandBody, RunId, SessionId};
 
     const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn admits_run_covers_exactly_the_run_creating_commands() {
+        // The idle-guard refuses these once a shutdown is authorized — they are
+        // the only commands that can raise `active_run_count`.
+        assert!(admits_run(&CommandBody::StartRun {
+            session_id: SessionId::new(),
+            objective: "x".to_string(),
+            mode: AgentMode::Build,
+            repository: None,
+            model: None,
+        }));
+        assert!(admits_run(&CommandBody::SubmitUserInput {
+            session_id: SessionId::new(),
+            text: "x".to_string(),
+            mode: AgentMode::Build,
+            model: None,
+        }));
+        // A run-state transition mutates an existing run — it never admits a
+        // new one, so it stays allowed even mid-shutdown.
+        assert!(!admits_run(&CommandBody::CancelRun {
+            run_id: RunId::new(),
+        }));
+        assert!(!admits_run(&CommandBody::PauseRun {
+            run_id: RunId::new(),
+        }));
+    }
 
     #[test]
     fn resume_token_round_trips() {
