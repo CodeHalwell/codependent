@@ -210,3 +210,113 @@ pub async fn session_count(pool: &SqlitePool) -> anyhow::Result<i64> {
         .await?;
     Ok(count)
 }
+
+/// Count of runs whose `state` is **not** one of the three terminal
+/// `RunState`s (`Completed`, `Failed`, `Cancelled`; the DB strings written by
+/// [`crate::projections::run_state_to_db`]). Every other state — including
+/// `Queued`, `Preparing`, `Running`, `WaitingForApproval`,
+/// `WaitingForUserInput`, `Paused`, `Recovering`, and an unrecognized/future
+/// state (`Unknown`) — counts as active: a restart while a run is anything
+/// but terminal would disrupt in-memory state a stopped daemon cannot
+/// recover, so this must never undercount.
+pub async fn active_run_count(pool: &SqlitePool) -> anyhow::Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runs WHERE state NOT IN ('Completed', 'Failed', 'Cancelled')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codypendent_protocol::{RunId, SessionId};
+
+    async fn test_pool(dir: &std::path::Path) -> SqlitePool {
+        crate::db::open_database(&dir.join("test.db"))
+            .await
+            .expect("open database")
+    }
+
+    /// Insert a session, then a run in `state`, under a fresh id.
+    async fn seed_run(pool: &SqlitePool, state: &str) {
+        let session_id = SessionId::new();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO sessions (id, title, state, created_at, updated_at, revision) \
+             VALUES (?, ?, 'open', ?, ?, 0)",
+        )
+        .bind(session_id.to_string())
+        .bind("active-run-count-test")
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert session");
+
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, budget_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(RunId::new().to_string())
+        .bind(session_id.to_string())
+        .bind("diagnose")
+        .bind(state)
+        .bind("Build")
+        .bind("hosted-default")
+        .bind("{}")
+        .execute(pool)
+        .await
+        .expect("insert run");
+    }
+
+    #[tokio::test]
+    async fn active_run_count_is_zero_with_no_runs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = test_pool(tmp.path()).await;
+        assert_eq!(active_run_count(&pool).await.expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_only_runs_do_not_count_as_active() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = test_pool(tmp.path()).await;
+        seed_run(&pool, "Completed").await;
+        seed_run(&pool, "Failed").await;
+        seed_run(&pool, "Cancelled").await;
+        assert_eq!(active_run_count(&pool).await.expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn every_non_terminal_state_counts_as_active() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = test_pool(tmp.path()).await;
+        // A settled terminal baseline...
+        seed_run(&pool, "Completed").await;
+        seed_run(&pool, "Failed").await;
+        seed_run(&pool, "Cancelled").await;
+        assert_eq!(active_run_count(&pool).await.expect("count"), 0);
+
+        // ...then one non-terminal run at a time, each incrementing the count.
+        // Includes waiting/paused states, which must count as active (never
+        // undercount: a restart would disrupt them).
+        let non_terminal = [
+            "Queued",
+            "Preparing",
+            "Running",
+            "WaitingForApproval",
+            "WaitingForUserInput",
+            "Paused",
+            "Recovering",
+        ];
+        for (i, state) in non_terminal.iter().enumerate() {
+            seed_run(&pool, state).await;
+            assert_eq!(
+                active_run_count(&pool).await.expect("count"),
+                (i + 1) as i64,
+                "state {state} must count as active"
+            );
+        }
+    }
+}

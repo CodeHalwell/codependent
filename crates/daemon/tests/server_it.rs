@@ -126,6 +126,15 @@ async fn handshake(stream: &mut UnixStream, client_id: ClientId) {
         Payload::ServerHello(server_hello) => {
             assert_eq!(server_hello.selected_protocol, PROTOCOL_V1);
             assert_eq!(server_hello.heartbeat_interval_ms, 15_000);
+            assert!(
+                !server_hello.build_id.is_empty(),
+                "ServerHello.build_id must carry the daemon's real BUILD_ID, not a placeholder"
+            );
+            assert_eq!(
+                server_hello.build_id,
+                codypendent_protocol::BUILD_ID,
+                "the daemon must report its own compile-time BUILD_ID"
+            );
         }
         other => panic!("expected ServerHello, got {other:?}"),
     }
@@ -255,6 +264,95 @@ async fn handshake_returns_server_hello() {
     let (paths, task) = start_server(&tmp).await;
     let mut stream = connect(&paths).await;
     handshake(&mut stream, ClientId::new()).await;
+    shutdown(stream, task).await;
+}
+
+/// Insert a session, then a run in `state`, directly on `pool` — enough to
+/// exercise `DaemonStatus.active_run_count` without driving the full command
+/// pipeline.
+async fn seed_run_in_state(pool: &SqlitePool, state: &str) {
+    let session_id = SessionId::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO sessions (id, title, state, created_at, updated_at, revision) \
+         VALUES (?, ?, 'open', ?, ?, 0)",
+    )
+    .bind(session_id.to_string())
+    .bind("active-run-count-it")
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .expect("insert session");
+
+    sqlx::query(
+        "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, budget_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(RunId::new().to_string())
+    .bind(session_id.to_string())
+    .bind("diagnose")
+    .bind(state)
+    .bind("Build")
+    .bind("hosted-default")
+    .bind("{}")
+    .execute(pool)
+    .await
+    .expect("insert run");
+}
+
+/// `DaemonStatus.active_run_count` reflects the ledger: a set of terminal
+/// runs (`Completed`/`Failed`/`Cancelled`) contributes zero, and each
+/// subsequently seeded non-terminal run (including waiting/paused states)
+/// increments the count by one — never undercounting a live-but-waiting run.
+#[tokio::test]
+async fn daemon_status_reports_build_id_and_active_run_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+
+    let status_request = || Envelope::request(client_id, Payload::DaemonStatusRequest);
+    let read_status = |reply: Envelope| match reply.payload {
+        Payload::DaemonStatusResponse(status) => status,
+        other => panic!("expected status response, got {other:?}"),
+    };
+
+    // Freshly booted, idle daemon: build id is real, no active runs.
+    let status = read_status(send_recv(&mut stream, &status_request()).await);
+    assert_eq!(status.build_id, codypendent_protocol::BUILD_ID);
+    assert_eq!(status.active_run_count, 0);
+
+    // A terminal-only ledger still reports zero active runs.
+    seed_run_in_state(&pool, "Completed").await;
+    seed_run_in_state(&pool, "Failed").await;
+    seed_run_in_state(&pool, "Cancelled").await;
+    let status = read_status(send_recv(&mut stream, &status_request()).await);
+    assert_eq!(status.active_run_count, 0);
+
+    // Every non-terminal state increments the count — including
+    // WaitingForApproval/WaitingForUserInput/Paused, which are alive and must
+    // never be treated as safe to restart past.
+    let non_terminal = [
+        "Queued",
+        "Preparing",
+        "Running",
+        "WaitingForApproval",
+        "WaitingForUserInput",
+        "Paused",
+        "Recovering",
+    ];
+    for (i, state) in non_terminal.iter().enumerate() {
+        seed_run_in_state(&pool, state).await;
+        let status = read_status(send_recv(&mut stream, &status_request()).await);
+        assert_eq!(
+            status.active_run_count,
+            (i + 1) as u64,
+            "state {state} must count as active"
+        );
+    }
+
     shutdown(stream, task).await;
 }
 

@@ -21,7 +21,7 @@ use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     read_envelope, write_envelope, Catchup, ClientId, ClientRole, CommandBody, DaemonStatus,
     Envelope, FrameError, Payload, ProtocolError, ServerHello, SessionEvent, SessionId,
-    Subscription, PROTOCOL_V1,
+    Subscription, BUILD_ID, PROTOCOL_V1,
 };
 use sqlx::SqlitePool;
 use tokio::net::unix::OwnedWriteHalf;
@@ -622,9 +622,10 @@ async fn handle_request(
                 resume_token: Some(codypendent_protocol::ResumeToken(
                     resume::mint_resume_token(&state.secret, client_id, 0),
                 )),
-                // Populated by the daemon-auto-restart feature's follow-up
-                // task; DR1 only adds the wire field.
-                build_id: String::new(),
+                // The running daemon's per-build id, so a connecting client
+                // can compare it against its own compile-time `BUILD_ID` and
+                // decide whether to restart this daemon (daemon-auto-restart).
+                build_id: BUILD_ID.to_string(),
             };
             send(
                 writer,
@@ -2019,10 +2020,11 @@ async fn status(state: &ServerState) -> anyhow::Result<DaemonStatus> {
             .to_string(),
         socket_path: state.paths.socket_path.display().to_string(),
         session_count: ledger::session_count(&state.pool).await?,
-        // Populated by the daemon-auto-restart feature's follow-up task;
-        // DR1 only adds the wire fields.
-        build_id: String::new(),
-        active_run_count: 0,
+        // The running daemon's per-build id and its count of non-terminal
+        // runs (daemon-auto-restart): a client uses these to decide whether
+        // it is safe to restart this daemon without losing in-flight work.
+        build_id: BUILD_ID.to_string(),
+        active_run_count: u64::try_from(ledger::active_run_count(&state.pool).await?)?,
     })
 }
 
