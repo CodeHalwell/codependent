@@ -6,8 +6,10 @@
 //! This is the SAFETY-CRITICAL crux of the feature: [`decide_restart`] must
 //! never authorize a restart unless the daemon is CONFIRMED idle, and the
 //! effectful driver ([`reconcile_interactive`]) re-confirms idleness under an
-//! advisory lock immediately before stopping anything — closing the TOCTOU
-//! window between the first (pre-lock) check and the stop.
+//! advisory lock immediately before stopping anything — NARROWING (not fully
+//! closing) the TOCTOU window between the first (pre-lock) check and the stop.
+//! See [`reconcile_interactive`] for the residual multi-client window and the
+//! daemon-side idle-guarded-shutdown follow-up that would close it.
 
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
@@ -222,11 +224,22 @@ pub trait RestartOps {
 /// Only a detected mismatch pays for a `status` query.
 ///
 /// The safety invariant (never silently kill a live run) is enforced twice:
-/// once by the initial `decide_restart` call, and again — closing the TOCTOU
+/// once by the initial `decide_restart` call, and again — NARROWING the TOCTOU
 /// window — by a SECOND `status` query issued only after the restart lock is
-/// held, immediately before the stop. A run that started in between cancels
-/// the restart (falls to [`ReconcileOutcome::WarnActive`]) instead of being
-/// silently killed.
+/// held, immediately before the stop. A run that started before this recheck
+/// cancels the restart (falls to [`ReconcileOutcome::WarnActive`]) instead of
+/// being silently killed.
+///
+/// This does NOT fully *close* the window: the actual stop
+/// ([`RestartOps::restart_daemon`]) happens after the recheck returns, and the
+/// daemon's graceful `Shutdown` is not itself idle-guarded, so a run that
+/// another client starts in the sub-window between the recheck and the stop is
+/// still lost. The advisory lock serializes restarts *between clients*, not a
+/// client's restart against a concurrent `StartRun`. Closing it entirely needs
+/// a daemon-side idle-guarded shutdown (re-check `active_run_count` and refuse
+/// atomically at the daemon) — tracked as a follow-up. What ships here is a
+/// strict improvement over the manual `daemon stop`/`restart` paths, which
+/// perform no idle check at all.
 pub async fn reconcile_interactive(
     paths: &RuntimePaths,
     client_build_id: &str,
@@ -276,14 +289,28 @@ async fn restart_under_lock(
     ops: &mut impl RestartOps,
     warn: &mut dyn FnMut(&str),
 ) -> anyhow::Result<ReconcileOutcome> {
-    match try_acquire_restart_lock(paths)? {
+    // A lock-creation failure (disk full, permissions, a missing data dir) is
+    // treated as "can't safely coordinate a restart" — degrade to a warn and
+    // continue on the healthy existing daemon (spec §8), NEVER abort the whole
+    // launch over a transient filesystem hiccup and never restart uncoordinated.
+    let attempt = match try_acquire_restart_lock(paths) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            warn(&format!(
+                "couldn't acquire the daemon-restart lock ({error:#}); not auto-restarting — \
+                 run `codypendent daemon restart` if needed"
+            ));
+            return Ok(ReconcileOutcome::WarnUnknown);
+        }
+    };
+    match attempt {
         LockAttempt::HeldByOther => {
             // Another client is very likely mid-restart already; block-poll
             // briefly for it to finish, then converge (idempotent no-op).
             poll_for_matching_build(client_build_id, ops, warn).await
         }
         LockAttempt::Acquired(guard) => {
-            // Re-check UNDER the lock (closes the TOCTOU window): a run may
+            // Re-check UNDER the lock (narrows the TOCTOU window): a run may
             // have started, or another client may have already restarted the
             // daemon, since the first (pre-lock) check.
             let recheck = match ops.status().await {
@@ -794,6 +821,42 @@ mod reconcile_interactive_tests {
             messages
                 .iter()
                 .any(|m| m.contains("while acquiring the restart lock")),
+            "got: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lock_creation_failure_degrades_to_warn_unknown_never_restarts() {
+        // data_dir is a regular FILE, so creating <data_dir>/daemon-restart.lock
+        // fails with a non-AlreadyExists error (ENOTDIR). The driver must
+        // degrade to a warn and continue — never abort the launch (a `?`), and
+        // never restart when it cannot coordinate.
+        let dir = tempfile::Builder::new()
+            .prefix("cp-restart-lockfail-")
+            .tempdir()
+            .expect("tempdir");
+        let not_a_dir = dir.path().join("this-is-a-file");
+        std::fs::write(&not_a_dir, b"x").expect("create a file where a dir is expected");
+        let paths = RuntimePaths::from_data_dir(not_a_dir);
+
+        let mut ops = FakeOps::new(vec![sample_status("1.0+old", 0)], "1.0+new");
+        let mut messages = no_warnings();
+        let mut warn = |m: &str| messages.push(m.to_string());
+
+        let outcome = reconcile_interactive(&paths, "1.0+new", "1.0+old", &mut ops, &mut warn)
+            .await
+            .expect("a lock-creation failure degrades, never errors");
+
+        assert_eq!(outcome, ReconcileOutcome::WarnUnknown);
+        assert_eq!(
+            ops.restart_call_count(),
+            0,
+            "a lock we cannot create must never lead to a restart"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("couldn't acquire the daemon-restart lock")),
             "got: {messages:?}"
         );
     }
