@@ -62,3 +62,30 @@ pub use version::{ProtocolVersion, PROTOCOL_V1};
 pub use workflow::{
     WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot,
 };
+
+/// A per-build identifier, computed by `build.rs` and identical across the
+/// whole single binary (the client half and the daemon half are one crate
+/// graph in one build). See `build.rs` for the exact precedence:
+/// `CODYPENDENT_BUILD_ID` env override, else `"{version}+{git_short_hash}[-dirty]"`,
+/// else the bare package version when git is unavailable.
+///
+/// Used by the daemon-auto-restart-on-version-mismatch feature: the client
+/// compares its own `BUILD_ID` against the running daemon's reported id
+/// (`ServerHello.build_id`) to detect a stale in-memory daemon after a
+/// reinstall.
+pub const BUILD_ID: &str = env!("CODYPENDENT_BUILD_ID");
+
+#[cfg(test)]
+mod build_id_tests {
+    use super::BUILD_ID;
+
+    #[test]
+    fn build_id_is_non_empty_and_starts_with_the_package_version() {
+        assert!(!BUILD_ID.is_empty(), "BUILD_ID must never be empty");
+        let pkg_version = env!("CARGO_PKG_VERSION");
+        assert!(
+            BUILD_ID.starts_with(pkg_version),
+            "BUILD_ID {BUILD_ID:?} must start with CARGO_PKG_VERSION {pkg_version:?}"
+        );
+    }
+}

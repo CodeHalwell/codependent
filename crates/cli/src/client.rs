@@ -41,3 +41,28 @@ pub async fn shutdown(socket: &Path) -> anyhow::Result<()> {
         other => anyhow::bail!("unexpected reply to shutdown request: {other:?}"),
     }
 }
+
+/// What an idle-guarded shutdown ([`shutdown_if_idle`]) did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownIfIdleOutcome {
+    /// The daemon was idle and acknowledged — it is shutting down.
+    Stopped,
+    /// The daemon refused because a run is active; it keeps running. Carries
+    /// the count it observed.
+    RefusedActive(u64),
+}
+
+/// Ask the daemon to shut down ONLY if it is idle (protocol v1.3). Unlike
+/// [`shutdown`], the daemon may refuse — atomically, against concurrent run
+/// admission — when a run is active, in which case it keeps running and the
+/// caller must not restart it. Only send this to a daemon whose negotiated
+/// minor is ≥ 3 (an older daemon cannot decode `ShutdownIfIdle`).
+pub async fn shutdown_if_idle(socket: &Path) -> anyhow::Result<ShutdownIfIdleOutcome> {
+    match request(socket, Payload::ShutdownIfIdle).await?.payload {
+        Payload::ShutdownAck => Ok(ShutdownIfIdleOutcome::Stopped),
+        Payload::ShutdownRefused { active_run_count } => {
+            Ok(ShutdownIfIdleOutcome::RefusedActive(active_run_count))
+        }
+        other => anyhow::bail!("unexpected reply to idle-shutdown request: {other:?}"),
+    }
+}

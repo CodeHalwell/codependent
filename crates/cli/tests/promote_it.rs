@@ -64,6 +64,7 @@ async fn handshake_and_bind(stream: &mut UnixStream) {
                 daemon_version: "mock".to_string(),
                 daemon_instance: DaemonInstanceId::new(),
                 heartbeat_interval_ms: 15_000,
+                build_id: String::new(),
             }),
         ),
     )

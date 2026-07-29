@@ -14,9 +14,9 @@ use codypendent_knowledge::{
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    AgentMode, ApprovalDecision, ApprovalScope, ClientRole, CommandBody, DocumentId, Payload,
-    PromotionAction, SessionId, Subscription, WorkflowEvent, WorkflowNodeView, WorkflowRunPhase,
-    WorkflowRunSnapshot, WorkspaceId,
+    AgentMode, ApprovalDecision, ApprovalScope, ClientRole, CommandBody, DaemonStatus, DocumentId,
+    Payload, PromotionAction, SessionId, Subscription, WorkflowEvent, WorkflowNodeView,
+    WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceId,
 };
 
 use crate::client;
@@ -27,6 +27,7 @@ use crate::stream::{self, RunExit};
 /// this call spawned and waited for one. Shared by the human-facing
 /// `codypendent daemon start` and the silent variant `run --jsonl` uses (its
 /// stdout must carry nothing but JSONL envelopes).
+#[derive(Debug)]
 pub(crate) enum EnsureOutcome {
     AlreadyRunning,
     Started { pid: u32 },
@@ -87,22 +88,144 @@ pub async fn start(paths: &RuntimePaths) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `codypendent daemon stop`: request graceful shutdown, then wait for the
-/// socket to stop answering (5 second budget).
-pub async fn stop(paths: &RuntimePaths) -> anyhow::Result<()> {
+/// Core of `daemon stop`, with no stdout of its own: if a daemon is
+/// listening, ask it to shut down gracefully and wait (5 second budget) for
+/// the socket to stop answering. Returns whether one was running (`false` is
+/// a no-op, not an error) so callers can report accordingly. Split out so
+/// [`restart_daemon`] can reuse the exact same stop path instead of
+/// reimplementing it.
+async fn stop_running_daemon(paths: &RuntimePaths) -> anyhow::Result<bool> {
     if !client::ping(&paths.socket_path).await {
-        println!("daemon is not running");
-        return Ok(());
+        return Ok(false);
     }
     client::shutdown(&paths.socket_path).await?;
     for _ in 0..50 {
         if !client::ping(&paths.socket_path).await {
-            println!("daemon stopped");
-            return Ok(());
+            return Ok(true);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     anyhow::bail!("daemon acknowledged shutdown but is still answering after 5 seconds")
+}
+
+/// `codypendent daemon stop`: request graceful shutdown, then wait for the
+/// socket to stop answering (5 second budget).
+pub async fn stop(paths: &RuntimePaths) -> anyhow::Result<()> {
+    if stop_running_daemon(paths).await? {
+        println!("daemon stopped");
+    } else {
+        println!("daemon is not running");
+    }
+    Ok(())
+}
+
+/// The composition behind [`restart_daemon`]: stop, then start, in that
+/// order. Split out (taking owned `RuntimePaths` plus injectable stop/start
+/// steps) so a unit test can substitute fakes and assert the ordering and
+/// the none-running short-circuit without touching a real socket or
+/// spawning a real process; production code always calls it with
+/// [`stop_running_daemon`] and [`ensure_daemon`] (see [`restart_daemon`]).
+async fn restart_daemon_with<StopFut, StartFut>(
+    paths: RuntimePaths,
+    stop: impl FnOnce(RuntimePaths) -> StopFut,
+    start: impl FnOnce(RuntimePaths) -> StartFut,
+) -> anyhow::Result<EnsureOutcome>
+where
+    StopFut: std::future::Future<Output = anyhow::Result<bool>>,
+    StartFut: std::future::Future<Output = anyhow::Result<EnsureOutcome>>,
+{
+    stop(paths.clone())
+        .await
+        .context("stopping the running daemon before restart")?;
+    start(paths)
+        .await
+        .context("starting a fresh daemon after restart")
+}
+
+/// The reusable "stop the running daemon if one is running, then start a
+/// fresh one" primitive. Backs the manual `codypendent daemon restart`
+/// subcommand below, and is the building block the auto-restart driver
+/// (`reconcile_daemon_build`) reuses on its idle path rather than
+/// reimplementing stop/spawn.
+///
+/// Idempotent when nothing is running: [`stop_running_daemon`] is then a
+/// no-op and this simply starts one, exactly like `daemon start`. Errors from
+/// either step are legible (the stop-still-answering message or
+/// `ensure_daemon`'s not-ready message) and never hang.
+pub(crate) async fn restart_daemon(paths: &RuntimePaths) -> anyhow::Result<EnsureOutcome> {
+    restart_daemon_with(
+        paths.clone(),
+        |paths| async move { stop_running_daemon(&paths).await },
+        |paths| async move { ensure_daemon(&paths).await },
+    )
+    .await
+}
+
+/// What [`restart_daemon_if_idle`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleRestartOutcome {
+    /// Stopped the old (daemon-confirmed-idle) daemon and started a fresh one.
+    Restarted,
+    /// The daemon refused the idle-guarded shutdown because a run was active;
+    /// nothing was stopped or started. Carries the count the daemon reported.
+    RefusedActive(u64),
+}
+
+/// Like [`restart_daemon`], but asks the daemon to stop ONLY if it is idle
+/// (`client::shutdown_if_idle`, protocol v1.3): the daemon makes the final
+/// idle decision atomically against concurrent run admission, so this fully
+/// closes the auto-restart TOCTOU window. If the daemon refuses (a run is
+/// active) nothing is stopped or spawned and [`IdleRestartOutcome::RefusedActive`]
+/// is returned; the caller continues on the existing daemon. Only call this
+/// against a daemon whose negotiated minor is ≥ 3 — the auto-restart driver
+/// gates on exactly that and otherwise falls back to [`restart_daemon`].
+pub(crate) async fn restart_daemon_if_idle(
+    paths: &RuntimePaths,
+) -> anyhow::Result<IdleRestartOutcome> {
+    // Nothing running → treat as already stopped and just start a fresh one
+    // (idempotent, exactly like `restart_daemon`'s none-running short-circuit).
+    if !client::ping(&paths.socket_path).await {
+        ensure_daemon(paths)
+            .await
+            .context("starting a fresh daemon after restart")?;
+        return Ok(IdleRestartOutcome::Restarted);
+    }
+    match client::shutdown_if_idle(&paths.socket_path)
+        .await
+        .context("requesting an idle-guarded daemon shutdown before restart")?
+    {
+        client::ShutdownIfIdleOutcome::RefusedActive(active) => {
+            Ok(IdleRestartOutcome::RefusedActive(active))
+        }
+        client::ShutdownIfIdleOutcome::Stopped => {
+            // Wait for the socket to stop answering, then spawn the new build —
+            // the same 5s budget and sequence as `stop_running_daemon`.
+            for _ in 0..50 {
+                if !client::ping(&paths.socket_path).await {
+                    ensure_daemon(paths)
+                        .await
+                        .context("starting a fresh daemon after restart")?;
+                    return Ok(IdleRestartOutcome::Restarted);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            anyhow::bail!(
+                "daemon acknowledged idle-shutdown but is still answering after 5 seconds"
+            )
+        }
+    }
+}
+
+/// `codypendent daemon restart`: stop the running daemon (if any) and start a
+/// fresh one, via [`restart_daemon`]. If no daemon was running this simply
+/// starts one — the documented manual fallback for picking up a new build
+/// while the auto-restart driver is deferring because a run is active.
+pub async fn restart(paths: &RuntimePaths) -> anyhow::Result<()> {
+    match restart_daemon(paths).await? {
+        EnsureOutcome::AlreadyRunning => println!("daemon restarted (already running)"),
+        EnsureOutcome::Started { pid } => println!("daemon restarted (pid {pid})"),
+    }
+    Ok(())
 }
 
 /// `codypendent daemon status [--json]`.
@@ -118,18 +241,7 @@ pub async fn status(paths: &RuntimePaths, json: bool) -> anyhow::Result<bool> {
                 let value = serde_json::json!({ "running": true, "status": status });
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                println!("Codypendent daemon");
-                println!("  running      yes");
-                println!("  version      {}", status.daemon_version);
-                println!("  protocol     {}", status.protocol_version);
-                println!("  pid          {}", status.pid);
-                println!("  instance     {}", status.instance_id);
-                println!("  boot count   {}", status.boot_count);
-                println!("  started at   {}", status.started_at.to_rfc3339());
-                println!("  uptime       {}s", status.uptime_seconds);
-                println!("  database     {}", status.database_path);
-                println!("  socket       {}", status.socket_path);
-                println!("  sessions     {}", status.session_count);
+                print!("{}", render_status_text(&status));
             }
             Ok(true)
         }
@@ -142,6 +254,33 @@ pub async fn status(paths: &RuntimePaths, json: bool) -> anyhow::Result<bool> {
             Ok(false)
         }
     }
+}
+
+/// Render `daemon status`'s human-readable text (the `--json` path
+/// serializes `DaemonStatus` directly instead, so it already carries
+/// `build_id`/`active_run_count` without any change here). Split into a pure
+/// function so a test can assert the build id and active-run-count lines
+/// without a running daemon.
+fn render_status_text(status: &DaemonStatus) -> String {
+    let mut out = String::new();
+    out.push_str("Codypendent daemon\n");
+    out.push_str("  running      yes\n");
+    out.push_str(&format!("  version      {}\n", status.daemon_version));
+    out.push_str(&format!("  build        {}\n", status.build_id));
+    out.push_str(&format!("  protocol     {}\n", status.protocol_version));
+    out.push_str(&format!("  pid          {}\n", status.pid));
+    out.push_str(&format!("  instance     {}\n", status.instance_id));
+    out.push_str(&format!("  boot count   {}\n", status.boot_count));
+    out.push_str(&format!(
+        "  started at   {}\n",
+        status.started_at.to_rfc3339()
+    ));
+    out.push_str(&format!("  uptime       {}s\n", status.uptime_seconds));
+    out.push_str(&format!("  database     {}\n", status.database_path));
+    out.push_str(&format!("  socket       {}\n", status.socket_path));
+    out.push_str(&format!("  sessions     {}\n", status.session_count));
+    out.push_str(&format!("  active runs  {}\n", status.active_run_count));
+    out
 }
 
 /// How to launch the daemon: the program to run plus the leading args. The
@@ -253,8 +392,19 @@ pub async fn run_over_connection<W: Write>(
     repository: &str,
     out: &mut W,
 ) -> anyhow::Result<RunExit> {
-    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+    let hello = conn
+        .handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
+    // `run --jsonl` is headless/scripted (T9 scope): a daemon-build mismatch
+    // is WARN-ONLY here, never auto-restarted — bouncing the daemon out from
+    // under a non-interactive invocation (possibly one step in a scripted
+    // batch, with a strict JSONL stdout contract) would be actively wrong.
+    // stderr only; stdout carries nothing but JSONL envelopes.
+    if let Some(message) =
+        crate::restart::headless_mismatch_warning(codypendent_protocol::BUILD_ID, &hello.build_id)
+    {
+        eprintln!("codypendent: {message}");
+    }
 
     // CreateSession: the daemon's `CommandAccepted` *payload* is intentionally
     // minimal (only `command_id` + `sequence`). The freshly created session's id
@@ -2405,5 +2555,136 @@ mod daemon_spawn_tests {
         let command = daemon_command(&inv);
         assert_eq!(command.get_program(), std::ffi::OsStr::new("codypendentd"));
         assert_eq!(command.get_args().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod daemon_status_render_tests {
+    use super::*;
+    use chrono::Utc;
+    use codypendent_protocol::{DaemonInstanceId, PROTOCOL_V1};
+
+    fn sample_status() -> DaemonStatus {
+        DaemonStatus {
+            daemon_version: "0.1.0".to_string(),
+            protocol_version: PROTOCOL_V1,
+            instance_id: DaemonInstanceId::new(),
+            pid: 4242,
+            started_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            uptime_seconds: 3600,
+            boot_count: 1,
+            database_path: "/home/user/.local/share/codypendent/codypendent.db".to_string(),
+            socket_path: "/home/user/.local/share/codypendent/run/daemon.sock".to_string(),
+            session_count: 2,
+            build_id: "0.1.0+a1b2c3d4e5f6".to_string(),
+            active_run_count: 3,
+        }
+    }
+
+    #[test]
+    fn render_status_text_shows_the_build_id_and_active_run_count() {
+        let text = render_status_text(&sample_status());
+        assert!(
+            text.contains("build        0.1.0+a1b2c3d4e5f6"),
+            "got: {text}"
+        );
+        assert!(text.contains("active runs  3"), "got: {text}");
+        // The existing fields are still there — this is additive, not a rewrite.
+        assert!(text.contains("version      0.1.0"));
+        assert!(text.contains("sessions     2"));
+    }
+}
+
+#[cfg(test)]
+mod daemon_restart_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn test_paths() -> RuntimePaths {
+        RuntimePaths::from_data_dir(std::env::temp_dir().join("cp-restart-composition-test"))
+    }
+
+    #[tokio::test]
+    async fn stops_before_starting_when_a_daemon_is_running() {
+        let calls = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let stop_calls = calls.clone();
+        let start_calls = calls.clone();
+
+        let outcome = restart_daemon_with(
+            test_paths(),
+            move |_paths| {
+                stop_calls.lock().unwrap().push("stop");
+                async { Ok(true) }
+            },
+            move |_paths| {
+                start_calls.lock().unwrap().push("start");
+                async { Ok(EnsureOutcome::Started { pid: 4242 }) }
+            },
+        )
+        .await
+        .expect("both steps report success");
+
+        assert_eq!(*calls.lock().unwrap(), vec!["stop", "start"]);
+        assert!(matches!(outcome, EnsureOutcome::Started { pid: 4242 }));
+    }
+
+    #[tokio::test]
+    async fn is_idempotent_and_just_starts_when_nothing_was_running() {
+        // `stop` reporting "nothing was running" (`Ok(false)`) is not an
+        // error — `restart_daemon` still proceeds to `start`, matching
+        // `daemon start`'s own behaviour.
+        let outcome = restart_daemon_with(
+            test_paths(),
+            |_paths| async { Ok(false) },
+            |_paths| async { Ok(EnsureOutcome::Started { pid: 99 }) },
+        )
+        .await
+        .expect("start-only path succeeds");
+        assert!(matches!(outcome, EnsureOutcome::Started { pid: 99 }));
+    }
+
+    #[tokio::test]
+    async fn surfaces_a_legible_error_and_never_starts_when_stop_fails() {
+        let err = restart_daemon_with(
+            test_paths(),
+            |_paths| async {
+                anyhow::bail!("daemon acknowledged shutdown but is still answering after 5 seconds")
+            },
+            |_paths| async {
+                panic!("start must not run when stop fails — restart must not hang or half-restart")
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("stopping the running daemon before restart"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("still answering after 5 seconds"),
+            "got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn surfaces_a_legible_error_when_start_fails() {
+        let err = restart_daemon_with(
+            test_paths(),
+            |_paths| async { Ok(true) },
+            |_paths| async {
+                anyhow::bail!("daemon did not become ready within 5 seconds; check /tmp/daemon.log")
+            },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("starting a fresh daemon after restart"),
+            "got: {message}"
+        );
+        assert!(message.contains("did not become ready"), "got: {message}");
     }
 }

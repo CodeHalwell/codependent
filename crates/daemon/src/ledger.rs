@@ -210,3 +210,125 @@ pub async fn session_count(pool: &SqlitePool) -> anyhow::Result<i64> {
         .await?;
     Ok(count)
 }
+
+/// Count of in-flight work — both session runs and durable **workflow** runs —
+/// whose `state` is **not** terminal. For `runs` the terminal `RunState`s are
+/// `Completed`/`Failed`/`Cancelled` (the DB strings written by
+/// [`crate::projections::run_state_to_db`]); for `workflow_runs` they are the
+/// lowercase `completed`/`failed`/`cancelled` (see
+/// `codypendent_workflow::store::WorkflowRunState`). Every other state —
+/// `Queued`/`Preparing`/`Running`/`WaitingForApproval`/`WaitingForUserInput`/
+/// `Paused`/`Recovering`/`Unknown` for runs, and `pending`/`running`/`paused`
+/// for workflow runs — counts as active.
+///
+/// Both are included because the auto-restart idle gate must mean *no work is
+/// in flight*: a restart while EITHER a session run or a workflow run is live
+/// would disrupt in-memory state a stopped daemon cannot recover, so this must
+/// never undercount. `workflow_runs` is created by the same migrations
+/// (`0010_workflow_runs.sql`) on the same pool, so the two counts sum in one
+/// query.
+pub async fn active_run_count(pool: &SqlitePool) -> anyhow::Result<i64> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT \
+           (SELECT COUNT(*) FROM runs \
+              WHERE state NOT IN ('Completed', 'Failed', 'Cancelled')) \
+         + (SELECT COUNT(*) FROM workflow_runs \
+              WHERE state NOT IN ('completed', 'failed', 'cancelled'))",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codypendent_protocol::{RunId, SessionId};
+
+    async fn test_pool(dir: &std::path::Path) -> SqlitePool {
+        crate::db::open_database(&dir.join("test.db"))
+            .await
+            .expect("open database")
+    }
+
+    /// Insert a session, then a run in `state`, under a fresh id.
+    async fn seed_run(pool: &SqlitePool, state: &str) {
+        let session_id = SessionId::new();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO sessions (id, title, state, created_at, updated_at, revision) \
+             VALUES (?, ?, 'open', ?, ?, 0)",
+        )
+        .bind(session_id.to_string())
+        .bind("active-run-count-test")
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert session");
+
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, budget_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(RunId::new().to_string())
+        .bind(session_id.to_string())
+        .bind("diagnose")
+        .bind(state)
+        .bind("Build")
+        .bind("hosted-default")
+        .bind("{}")
+        .execute(pool)
+        .await
+        .expect("insert run");
+    }
+
+    #[tokio::test]
+    async fn active_run_count_is_zero_with_no_runs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = test_pool(tmp.path()).await;
+        assert_eq!(active_run_count(&pool).await.expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_only_runs_do_not_count_as_active() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = test_pool(tmp.path()).await;
+        seed_run(&pool, "Completed").await;
+        seed_run(&pool, "Failed").await;
+        seed_run(&pool, "Cancelled").await;
+        assert_eq!(active_run_count(&pool).await.expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn every_non_terminal_state_counts_as_active() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = test_pool(tmp.path()).await;
+        // A settled terminal baseline...
+        seed_run(&pool, "Completed").await;
+        seed_run(&pool, "Failed").await;
+        seed_run(&pool, "Cancelled").await;
+        assert_eq!(active_run_count(&pool).await.expect("count"), 0);
+
+        // ...then one non-terminal run at a time, each incrementing the count.
+        // Includes waiting/paused states, which must count as active (never
+        // undercount: a restart would disrupt them).
+        let non_terminal = [
+            "Queued",
+            "Preparing",
+            "Running",
+            "WaitingForApproval",
+            "WaitingForUserInput",
+            "Paused",
+            "Recovering",
+        ];
+        for (i, state) in non_terminal.iter().enumerate() {
+            seed_run(&pool, state).await;
+            assert_eq!(
+                active_run_count(&pool).await.expect("count"),
+                (i + 1) as i64,
+                "state {state} must count as active"
+            );
+        }
+    }
+}

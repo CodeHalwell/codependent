@@ -126,6 +126,15 @@ async fn handshake(stream: &mut UnixStream, client_id: ClientId) {
         Payload::ServerHello(server_hello) => {
             assert_eq!(server_hello.selected_protocol, PROTOCOL_V1);
             assert_eq!(server_hello.heartbeat_interval_ms, 15_000);
+            assert!(
+                !server_hello.build_id.is_empty(),
+                "ServerHello.build_id must carry the daemon's real BUILD_ID, not a placeholder"
+            );
+            assert_eq!(
+                server_hello.build_id,
+                codypendent_protocol::BUILD_ID,
+                "the daemon must report its own compile-time BUILD_ID"
+            );
         }
         other => panic!("expected ServerHello, got {other:?}"),
     }
@@ -256,6 +265,216 @@ async fn handshake_returns_server_hello() {
     let mut stream = connect(&paths).await;
     handshake(&mut stream, ClientId::new()).await;
     shutdown(stream, task).await;
+}
+
+/// Insert a session, then a run in `state`, directly on `pool` — enough to
+/// exercise `DaemonStatus.active_run_count` without driving the full command
+/// pipeline.
+async fn seed_run_in_state(pool: &SqlitePool, state: &str) {
+    let session_id = SessionId::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO sessions (id, title, state, created_at, updated_at, revision) \
+         VALUES (?, ?, 'open', ?, ?, 0)",
+    )
+    .bind(session_id.to_string())
+    .bind("active-run-count-it")
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .expect("insert session");
+
+    sqlx::query(
+        "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, budget_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(RunId::new().to_string())
+    .bind(session_id.to_string())
+    .bind("diagnose")
+    .bind(state)
+    .bind("Build")
+    .bind("hosted-default")
+    .bind("{}")
+    .execute(pool)
+    .await
+    .expect("insert run");
+}
+
+/// `DaemonStatus.active_run_count` reflects the ledger: a set of terminal
+/// runs (`Completed`/`Failed`/`Cancelled`) contributes zero, and each
+/// subsequently seeded non-terminal run (including waiting/paused states)
+/// increments the count by one — never undercounting a live-but-waiting run.
+#[tokio::test]
+async fn daemon_status_reports_build_id_and_active_run_count() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+
+    let status_request = || Envelope::request(client_id, Payload::DaemonStatusRequest);
+    let read_status = |reply: Envelope| match reply.payload {
+        Payload::DaemonStatusResponse(status) => status,
+        other => panic!("expected status response, got {other:?}"),
+    };
+
+    // Freshly booted, idle daemon: build id is real, no active runs.
+    let status = read_status(send_recv(&mut stream, &status_request()).await);
+    assert_eq!(status.build_id, codypendent_protocol::BUILD_ID);
+    assert_eq!(status.active_run_count, 0);
+
+    // A terminal-only ledger still reports zero active runs.
+    seed_run_in_state(&pool, "Completed").await;
+    seed_run_in_state(&pool, "Failed").await;
+    seed_run_in_state(&pool, "Cancelled").await;
+    let status = read_status(send_recv(&mut stream, &status_request()).await);
+    assert_eq!(status.active_run_count, 0);
+
+    // Every non-terminal state increments the count — including
+    // WaitingForApproval/WaitingForUserInput/Paused, which are alive and must
+    // never be treated as safe to restart past.
+    let non_terminal = [
+        "Queued",
+        "Preparing",
+        "Running",
+        "WaitingForApproval",
+        "WaitingForUserInput",
+        "Paused",
+        "Recovering",
+    ];
+    for (i, state) in non_terminal.iter().enumerate() {
+        seed_run_in_state(&pool, state).await;
+        let status = read_status(send_recv(&mut stream, &status_request()).await);
+        assert_eq!(
+            status.active_run_count,
+            (i + 1) as u64,
+            "state {state} must count as active"
+        );
+    }
+
+    shutdown(stream, task).await;
+}
+
+/// Send `ShutdownIfIdle`, expect a clean `ShutdownAck`, and confirm the server
+/// stops (mirrors [`shutdown`], but exercises the idle-guarded path).
+async fn shutdown_if_idle_expect_ack(mut stream: UnixStream, task: ServerTask) {
+    write_envelope(
+        &mut stream,
+        &Envelope::request(ClientId::new(), Payload::ShutdownIfIdle),
+    )
+    .await
+    .expect("write shutdown-if-idle");
+    let mut acked = false;
+    for _ in 0..16 {
+        if matches!(read_frame(&mut stream).await.payload, Payload::ShutdownAck) {
+            acked = true;
+            break;
+        }
+    }
+    assert!(acked, "an idle daemon must ShutdownAck a ShutdownIfIdle");
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("server stops within 5s")
+        .expect("server task must not panic")
+        .expect("server stops cleanly");
+}
+
+/// An idle daemon honours `ShutdownIfIdle` exactly like `Shutdown`.
+#[tokio::test]
+async fn shutdown_if_idle_stops_an_idle_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let stream = connect(&paths).await;
+    shutdown_if_idle_expect_ack(stream, task).await;
+}
+
+/// A daemon with an active run REFUSES `ShutdownIfIdle` (carrying the count it
+/// observed) and keeps serving — the safety gate that lets the client leave an
+/// in-flight run untouched instead of killing it.
+#[tokio::test]
+async fn shutdown_if_idle_refused_when_a_run_is_active() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let mut stream = connect(&paths).await;
+
+    // A single non-terminal run makes the daemon busy.
+    seed_run_in_state(&pool, "Running").await;
+
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(ClientId::new(), Payload::ShutdownIfIdle),
+    )
+    .await;
+    match reply.payload {
+        Payload::ShutdownRefused { active_run_count } => assert_eq!(active_run_count, 1),
+        other => panic!("expected ShutdownRefused, got {other:?}"),
+    }
+
+    // The daemon kept running: a follow-up request still gets a response.
+    let status = send_recv(
+        &mut stream,
+        &Envelope::request(ClientId::new(), Payload::DaemonStatusRequest),
+    )
+    .await;
+    assert!(
+        matches!(status.payload, Payload::DaemonStatusResponse(_)),
+        "daemon must keep serving after refusing an idle-shutdown"
+    );
+
+    // Clean up with an unconditional shutdown.
+    shutdown(stream, task).await;
+}
+
+/// Insert a `workflow_runs` row in `state` directly on `pool` — enough to make
+/// the daemon non-idle via the workflow half of `active_run_count`.
+async fn seed_workflow_run(pool: &SqlitePool, state: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO workflow_runs \
+           (id, workflow_id, workflow_version, graph_signature, inputs_json, state, created_at, updated_at) \
+         VALUES (?, 'wf', 1, 'sig', '{}', ?, ?, ?)",
+    )
+    .bind(format!("wfr-{}", RunId::new()))
+    .bind(state)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .expect("insert workflow_run");
+}
+
+/// A non-terminal WORKFLOW run also defers an idle-guarded shutdown — the
+/// count spans both `runs` and `workflow_runs`, so a running workflow is never
+/// silently killed by an auto-restart.
+#[tokio::test]
+async fn shutdown_if_idle_refused_when_a_workflow_run_is_active() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let mut stream = connect(&paths).await;
+
+    // No session runs, but one live workflow run.
+    seed_workflow_run(&pool, "running").await;
+
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(ClientId::new(), Payload::ShutdownIfIdle),
+    )
+    .await;
+    match reply.payload {
+        Payload::ShutdownRefused { active_run_count } => assert_eq!(active_run_count, 1),
+        other => panic!("expected ShutdownRefused for an active workflow, got {other:?}"),
+    }
+
+    // A terminal workflow run does NOT keep the daemon busy: mark it completed,
+    // and the idle-shutdown now succeeds.
+    sqlx::query("UPDATE workflow_runs SET state = 'completed'")
+        .execute(&pool)
+        .await
+        .expect("complete the workflow run");
+    shutdown_if_idle_expect_ack(stream, task).await;
 }
 
 #[tokio::test]

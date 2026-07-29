@@ -62,6 +62,7 @@ function serverHelloPayload(): Payload {
     daemon_version: "0.1.0",
     daemon_instance: "33333333-3333-3333-3333-333333333333",
     heartbeat_interval_ms: 15000,
+    build_id: "0.1.0+a1b2c3d4e5f6",
   };
   return { type: "ServerHello", ...hello };
 }

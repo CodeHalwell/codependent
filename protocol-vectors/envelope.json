@@ -72,7 +72,7 @@
     "supported_protocols": [
       {
         "major": 1,
-        "minor": 1
+        "minor": 3
       }
     ],
     "type": "ClientHello"
@@ -116,14 +116,16 @@
     "type": "DaemonStatusRequest"
   },
   "Payload_DaemonStatusResponse": {
+    "active_run_count": 1,
     "boot_count": 1,
+    "build_id": "0.1.0+a1b2c3d4e5f6",
     "daemon_version": "0.1.0",
     "database_path": "/home/user/.local/share/codypendent/codypendent.db",
     "instance_id": "a0000000-0000-0000-0000-000000000001",
     "pid": 4242,
     "protocol_version": {
       "major": 1,
-      "minor": 1
+      "minor": 3
     },
     "session_count": 2,
     "socket_path": "/home/user/.local/share/codypendent/run/daemon.sock",
@@ -225,13 +227,14 @@
     "type": "PromotionProposed"
   },
   "Payload_ServerHello": {
+    "build_id": "0.1.0+a1b2c3d4e5f6",
     "daemon_instance": "a0000000-0000-0000-0000-000000000001",
     "daemon_version": "0.1.0",
     "heartbeat_interval_ms": 15000,
     "resume_token": "opaque",
     "selected_protocol": {
       "major": 1,
-      "minor": 1
+      "minor": 3
     },
     "type": "ServerHello"
   },
@@ -240,6 +243,13 @@
   },
   "Payload_ShutdownAck": {
     "type": "ShutdownAck"
+  },
+  "Payload_ShutdownIfIdle": {
+    "type": "ShutdownIfIdle"
+  },
+  "Payload_ShutdownRefused": {
+    "active_run_count": 2,
+    "type": "ShutdownRefused"
   },
   "Payload_WorkflowEvent": {
     "event": {

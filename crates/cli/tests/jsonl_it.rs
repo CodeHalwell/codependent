@@ -80,6 +80,7 @@ async fn mock_daemon(mut stream: UnixStream, session_id: SessionId, events: Vec<
         daemon_version: "mock".to_string(),
         daemon_instance: DaemonInstanceId::new(),
         heartbeat_interval_ms: 15_000,
+        build_id: String::new(),
     };
     write_envelope(
         &mut stream,

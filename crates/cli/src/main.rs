@@ -520,6 +520,11 @@ enum DaemonCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Stop the running daemon (if any) and start a fresh one, reusing the
+    /// exact `stop` and `start` paths. If no daemon is running this simply
+    /// starts one. Useful to pick up a newly installed build by hand — the
+    /// same primitive the auto-restart driver reuses on its idle path.
+    Restart,
 }
 
 /// CLI-facing mirror of [`AgentMode`] so `clap` can derive `--mode`'s parser
@@ -594,6 +599,7 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
+            DaemonCommand::Restart => commands::restart(&paths).await,
         },
         TopCommand::Run {
             objective,

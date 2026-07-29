@@ -52,6 +52,15 @@ async fn ping_status_shutdown_over_socket() {
         Payload::DaemonStatusResponse(status) => {
             assert_eq!(status.boot_count, 1);
             assert_eq!(status.session_count, 0);
+            assert_eq!(
+                status.build_id,
+                codypendent_protocol::BUILD_ID,
+                "status must report the running daemon's real BUILD_ID"
+            );
+            assert_eq!(
+                status.active_run_count, 0,
+                "no runs seeded; active_run_count must be 0"
+            );
         }
         other => panic!("expected status response, got {other:?}"),
     }
