@@ -6,10 +6,11 @@
 //! This is the SAFETY-CRITICAL crux of the feature: [`decide_restart`] must
 //! never authorize a restart unless the daemon is CONFIRMED idle, and the
 //! effectful driver ([`reconcile_interactive`]) re-confirms idleness under an
-//! advisory lock immediately before stopping anything — NARROWING (not fully
-//! closing) the TOCTOU window between the first (pre-lock) check and the stop.
-//! See [`reconcile_interactive`] for the residual multi-client window and the
-//! daemon-side idle-guarded-shutdown follow-up that would close it.
+//! advisory lock immediately before stopping anything. Against a v1.3+ daemon
+//! it then hands the FINAL idle decision to the daemon (`ShutdownIfIdle`),
+//! which re-checks atomically against concurrent run admission — fully closing
+//! the TOCTOU window. A legacy daemon falls back to the plain restart with a
+//! narrow residual window (see [`reconcile_interactive`]).
 
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
@@ -206,8 +207,13 @@ pub trait RestartOps {
     /// `active_run_count`).
     async fn status(&mut self) -> anyhow::Result<DaemonStatus>;
     /// Stop the running daemon and spawn a fresh one (DR3's
-    /// `commands::restart_daemon`).
+    /// `commands::restart_daemon`). Used for legacy (pre-v1.3) daemons that
+    /// cannot make the idle decision themselves.
     async fn restart_daemon(&mut self) -> anyhow::Result<()>;
+    /// Idle-guarded restart (DR7's `commands::restart_daemon_if_idle`): the
+    /// daemon makes the final atomic idle decision and may refuse. Used when the
+    /// daemon's negotiated minor is ≥ [`IDLE_SHUTDOWN_MIN_MINOR`].
+    async fn restart_daemon_if_idle(&mut self) -> anyhow::Result<commands::IdleRestartOutcome>;
     /// Reconnect and re-handshake, returning the fresh `ServerHello`. On
     /// success the implementation's own connection is swapped to the new one
     /// (see [`LiveRestartOps::into_connection`]).
@@ -223,23 +229,24 @@ pub trait RestartOps {
 /// [`ReconcileOutcome::Proceed`] immediately, with no call to `ops` at all.
 /// Only a detected mismatch pays for a `status` query.
 ///
-/// The safety invariant (never silently kill a live run) is enforced twice:
-/// once by the initial `decide_restart` call, and again — NARROWING the TOCTOU
-/// window — by a SECOND `status` query issued only after the restart lock is
-/// held, immediately before the stop. A run that started before this recheck
-/// cancels the restart (falls to [`ReconcileOutcome::WarnActive`]) instead of
-/// being silently killed.
+/// The safety invariant (never silently kill a live run) is enforced in
+/// layers: once by the initial `decide_restart` call, again by a SECOND
+/// `status` query issued only after the restart lock is held, and — for a
+/// daemon that speaks protocol v1.3+ — a THIRD time atomically at the daemon
+/// itself (`ShutdownIfIdle`: the daemon re-checks `active_run_count` under an
+/// exclusive run-admission guard and refuses rather than dying with work in
+/// flight).
 ///
-/// This does NOT fully *close* the window: the actual stop
-/// ([`RestartOps::restart_daemon`]) happens after the recheck returns, and the
-/// daemon's graceful `Shutdown` is not itself idle-guarded, so a run that
-/// another client starts in the sub-window between the recheck and the stop is
-/// still lost. The advisory lock serializes restarts *between clients*, not a
-/// client's restart against a concurrent `StartRun`. Closing it entirely needs
-/// a daemon-side idle-guarded shutdown (re-check `active_run_count` and refuse
-/// atomically at the daemon) — tracked as a follow-up. What ships here is a
-/// strict improvement over the manual `daemon stop`/`restart` paths, which
-/// perform no idle check at all.
+/// For a v1.3+ daemon this fully CLOSES the TOCTOU window: a run that another
+/// client starts in the sub-window between the client's recheck and the stop
+/// is caught by the daemon's own atomic check, and the restart is refused
+/// (falls to [`ReconcileOutcome::WarnActive`]) instead of killing it. For a
+/// legacy (pre-v1.3) daemon — which cannot decode `ShutdownIfIdle` — the client
+/// falls back to the plain restart gated only by the under-lock recheck, so a
+/// narrow residual window remains; it is closed for good once the newly
+/// installed (v1.3+) build is the one running. Either path is a strict
+/// improvement over the manual `daemon stop`/`restart`, which idle-check
+/// nothing.
 pub async fn reconcile_interactive(
     paths: &RuntimePaths,
     client_build_id: &str,
@@ -310,10 +317,12 @@ async fn restart_under_lock(
             poll_for_matching_build(client_build_id, ops, warn).await
         }
         LockAttempt::Acquired(guard) => {
-            // Re-check UNDER the lock (narrows the TOCTOU window): a run may
-            // have started, or another client may have already restarted the
-            // daemon, since the first (pre-lock) check.
-            let recheck = match ops.status().await {
+            // Re-check UNDER the lock: a run may have started, or another client
+            // may have already restarted the daemon, since the first (pre-lock)
+            // check. Keep the whole status — its `protocol_version` decides
+            // whether the daemon can make the FINAL idle decision itself.
+            let recheck_status = ops.status().await;
+            let recheck = match &recheck_status {
                 Ok(status) => decide_restart(
                     client_build_id,
                     &status.build_id,
@@ -346,17 +355,59 @@ async fn restart_under_lock(
                     Ok(ReconcileOutcome::Restarted)
                 }
                 RestartDecision::Restart => {
-                    ops.restart_daemon()
-                        .await
-                        .context("restarting the daemon to load the new build")?;
-                    drop(guard);
-                    reconnect_and_assert(client_build_id, ops).await?;
-                    Ok(ReconcileOutcome::Restarted)
+                    let daemon_minor = recheck_status
+                        .as_ref()
+                        .map(|status| status.protocol_version.minor)
+                        .unwrap_or(0);
+                    if daemon_minor >= IDLE_SHUTDOWN_MIN_MINOR {
+                        // The daemon understands `ShutdownIfIdle`: let IT make the
+                        // final idle decision, atomically against a concurrent run
+                        // admission. This CLOSES the TOCTOU window entirely — a run
+                        // that starts between here and the stop is caught daemon-side
+                        // and the restart is refused rather than killing it.
+                        match ops
+                            .restart_daemon_if_idle()
+                            .await
+                            .context("restarting the daemon (idle-guarded) to load the new build")?
+                        {
+                            commands::IdleRestartOutcome::RefusedActive(active) => {
+                                drop(guard);
+                                warn(&format!(
+                                    "a run became active as the daemon was restarting ({active} \
+                                     active); deferring until it is idle — run \
+                                     `codypendent daemon restart` if needed"
+                                ));
+                                Ok(ReconcileOutcome::WarnActive)
+                            }
+                            commands::IdleRestartOutcome::Restarted => {
+                                drop(guard);
+                                reconnect_and_assert(client_build_id, ops).await?;
+                                Ok(ReconcileOutcome::Restarted)
+                            }
+                        }
+                    } else {
+                        // A legacy (pre-v1.3) daemon can't decode `ShutdownIfIdle`.
+                        // Fall back to the plain restart, gated only by the under-
+                        // lock idle re-check above (the documented residual window
+                        // for legacy daemons — closed once this new build is what
+                        // is running).
+                        ops.restart_daemon()
+                            .await
+                            .context("restarting the daemon to load the new build")?;
+                        drop(guard);
+                        reconnect_and_assert(client_build_id, ops).await?;
+                        Ok(ReconcileOutcome::Restarted)
+                    }
                 }
             }
         }
     }
 }
+
+/// The daemon protocol minor that first understands `Payload::ShutdownIfIdle`
+/// (protocol v1.3). A daemon reporting at least this minor makes the final,
+/// atomic idle decision itself; an older one falls back to the plain restart.
+const IDLE_SHUTDOWN_MIN_MINOR: u16 = 3;
 
 /// Block-poll (bounded, never hangs) for the lock holder's restart to land —
 /// observed as `DaemonStatus.build_id` matching `client_build_id` — then
@@ -450,6 +501,10 @@ impl RestartOps for LiveRestartOps<'_> {
     async fn restart_daemon(&mut self) -> anyhow::Result<()> {
         commands::restart_daemon(self.paths).await?;
         Ok(())
+    }
+
+    async fn restart_daemon_if_idle(&mut self) -> anyhow::Result<commands::IdleRestartOutcome> {
+        commands::restart_daemon_if_idle(self.paths).await
     }
 
     async fn reconnect(&mut self) -> anyhow::Result<ServerHello> {
@@ -627,17 +682,30 @@ mod reconcile_interactive_tests {
         }
     }
 
+    /// A [`DaemonStatus`] reporting protocol v1.3 — a daemon that understands
+    /// the idle-guarded `ShutdownIfIdle`, so the client delegates the final
+    /// idle decision to it.
+    fn sample_status_v3(build_id: &str, active_run_count: u64) -> DaemonStatus {
+        DaemonStatus {
+            protocol_version: ProtocolVersion { major: 1, minor: 3 },
+            ..sample_status(build_id, active_run_count)
+        }
+    }
+
     /// An injected fake [`RestartOps`]: no real socket, daemon, or process.
     /// Scripted `status_sequence` is consumed in order (one entry per `status`
-    /// call); `restart_daemon`/`reconnect` are tracked so a test can assert
-    /// whether they ran at all.
+    /// call); `restart_daemon`/`restart_daemon_if_idle`/`reconnect` are tracked
+    /// so a test can assert exactly which stop path ran.
     struct FakeOps {
         status_sequence: Mutex<Vec<DaemonStatus>>,
         restart_calls: AtomicU32,
+        idle_restart_calls: AtomicU32,
         reconnect_calls: AtomicU32,
         /// What `reconnect` reports as the fresh build id (simulates the new
         /// daemon, post-restart, actually running the client's build).
         reconnected_build_id: String,
+        /// What `restart_daemon_if_idle` returns (default: `Restarted`).
+        idle_restart_result: commands::IdleRestartOutcome,
     }
 
     impl FakeOps {
@@ -645,13 +713,26 @@ mod reconcile_interactive_tests {
             Self {
                 status_sequence: Mutex::new(status_sequence),
                 restart_calls: AtomicU32::new(0),
+                idle_restart_calls: AtomicU32::new(0),
                 reconnect_calls: AtomicU32::new(0),
                 reconnected_build_id: reconnected_build_id.to_string(),
+                idle_restart_result: commands::IdleRestartOutcome::Restarted,
             }
+        }
+
+        /// Script what the idle-guarded restart returns (e.g. a daemon-side
+        /// refusal when a run raced in).
+        fn with_idle_result(mut self, result: commands::IdleRestartOutcome) -> Self {
+            self.idle_restart_result = result;
+            self
         }
 
         fn restart_call_count(&self) -> u32 {
             self.restart_calls.load(Ordering::SeqCst)
+        }
+
+        fn idle_restart_call_count(&self) -> u32 {
+            self.idle_restart_calls.load(Ordering::SeqCst)
         }
 
         fn reconnect_call_count(&self) -> u32 {
@@ -672,6 +753,11 @@ mod reconcile_interactive_tests {
         async fn restart_daemon(&mut self) -> anyhow::Result<()> {
             self.restart_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        async fn restart_daemon_if_idle(&mut self) -> anyhow::Result<commands::IdleRestartOutcome> {
+            self.idle_restart_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.idle_restart_result)
         }
 
         async fn reconnect(&mut self) -> anyhow::Result<ServerHello> {
@@ -727,7 +813,12 @@ mod reconcile_interactive_tests {
         assert_eq!(
             ops.restart_call_count(),
             1,
-            "restart_daemon must run exactly once"
+            "a legacy (v1.2) daemon takes the plain restart path exactly once"
+        );
+        assert_eq!(
+            ops.idle_restart_call_count(),
+            0,
+            "a legacy daemon must NOT be sent ShutdownIfIdle (it can't decode it)"
         );
         assert_eq!(
             ops.reconnect_call_count(),
@@ -736,6 +827,83 @@ mod reconcile_interactive_tests {
         );
         assert!(
             messages.iter().any(|m| m.contains("restarting the daemon")),
+            "got: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_v13_daemon_uses_the_idle_guarded_restart_not_the_plain_path() {
+        // A daemon advertising protocol v1.3 can make the final idle decision
+        // itself, so the client delegates via `restart_daemon_if_idle` and never
+        // issues the plain (unconditional) restart.
+        let mut ops = FakeOps::new(
+            vec![
+                sample_status_v3("1.0+old", 0), // pre-lock: idle
+                sample_status_v3("1.0+old", 0), // under the lock: still idle, minor 3
+            ],
+            "1.0+new",
+        );
+        let mut messages = no_warnings();
+        let mut warn = |m: &str| messages.push(m.to_string());
+        let (_dir, paths) = temp_paths("v13-idle-restart");
+
+        let outcome = reconcile_interactive(&paths, "1.0+new", "1.0+old", &mut ops, &mut warn)
+            .await
+            .expect("a v1.3 idle mismatch restarts cleanly");
+
+        assert_eq!(outcome, ReconcileOutcome::Restarted);
+        assert_eq!(
+            ops.idle_restart_call_count(),
+            1,
+            "a v1.3 daemon takes the idle-guarded path exactly once"
+        );
+        assert_eq!(
+            ops.restart_call_count(),
+            0,
+            "the plain (unconditional) restart must NOT run for a v1.3 daemon"
+        );
+        assert_eq!(
+            ops.reconnect_call_count(),
+            1,
+            "must reconnect after restarting"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_v13_daemon_refusing_idle_shutdown_warns_active_and_does_not_reconnect() {
+        // Idle at BOTH client checks, but the daemon refuses the idle-guarded
+        // shutdown because a run raced in at the daemon-side atomic re-check —
+        // exactly the residual window DR7 closes. The client must warn and keep
+        // running, never reconnect to a daemon that did not actually restart.
+        let mut ops = FakeOps::new(
+            vec![
+                sample_status_v3("1.0+old", 0),
+                sample_status_v3("1.0+old", 0),
+            ],
+            "1.0+new",
+        )
+        .with_idle_result(commands::IdleRestartOutcome::RefusedActive(2));
+        let mut messages = no_warnings();
+        let mut warn = |m: &str| messages.push(m.to_string());
+        let (_dir, paths) = temp_paths("v13-refused");
+
+        let outcome = reconcile_interactive(&paths, "1.0+new", "1.0+old", &mut ops, &mut warn)
+            .await
+            .expect("a daemon-side refusal degrades, never errors");
+
+        assert_eq!(outcome, ReconcileOutcome::WarnActive);
+        assert_eq!(
+            ops.idle_restart_call_count(),
+            1,
+            "the idle-guarded restart was attempted"
+        );
+        assert_eq!(
+            ops.reconnect_call_count(),
+            0,
+            "a refused restart must NOT reconnect — the old daemon is still up"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("became active")),
             "got: {messages:?}"
         );
     }

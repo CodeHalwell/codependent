@@ -161,6 +161,61 @@ pub(crate) async fn restart_daemon(paths: &RuntimePaths) -> anyhow::Result<Ensur
     .await
 }
 
+/// What [`restart_daemon_if_idle`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleRestartOutcome {
+    /// Stopped the old (daemon-confirmed-idle) daemon and started a fresh one.
+    Restarted,
+    /// The daemon refused the idle-guarded shutdown because a run was active;
+    /// nothing was stopped or started. Carries the count the daemon reported.
+    RefusedActive(u64),
+}
+
+/// Like [`restart_daemon`], but asks the daemon to stop ONLY if it is idle
+/// (`client::shutdown_if_idle`, protocol v1.3): the daemon makes the final
+/// idle decision atomically against concurrent run admission, so this fully
+/// closes the auto-restart TOCTOU window. If the daemon refuses (a run is
+/// active) nothing is stopped or spawned and [`IdleRestartOutcome::RefusedActive`]
+/// is returned; the caller continues on the existing daemon. Only call this
+/// against a daemon whose negotiated minor is ≥ 3 — the auto-restart driver
+/// gates on exactly that and otherwise falls back to [`restart_daemon`].
+pub(crate) async fn restart_daemon_if_idle(
+    paths: &RuntimePaths,
+) -> anyhow::Result<IdleRestartOutcome> {
+    // Nothing running → treat as already stopped and just start a fresh one
+    // (idempotent, exactly like `restart_daemon`'s none-running short-circuit).
+    if !client::ping(&paths.socket_path).await {
+        ensure_daemon(paths)
+            .await
+            .context("starting a fresh daemon after restart")?;
+        return Ok(IdleRestartOutcome::Restarted);
+    }
+    match client::shutdown_if_idle(&paths.socket_path)
+        .await
+        .context("requesting an idle-guarded daemon shutdown before restart")?
+    {
+        client::ShutdownIfIdleOutcome::RefusedActive(active) => {
+            Ok(IdleRestartOutcome::RefusedActive(active))
+        }
+        client::ShutdownIfIdleOutcome::Stopped => {
+            // Wait for the socket to stop answering, then spawn the new build —
+            // the same 5s budget and sequence as `stop_running_daemon`.
+            for _ in 0..50 {
+                if !client::ping(&paths.socket_path).await {
+                    ensure_daemon(paths)
+                        .await
+                        .context("starting a fresh daemon after restart")?;
+                    return Ok(IdleRestartOutcome::Restarted);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            anyhow::bail!(
+                "daemon acknowledged idle-shutdown but is still answering after 5 seconds"
+            )
+        }
+    }
+}
+
 /// `codypendent daemon restart`: stop the running daemon (if any) and start a
 /// fresh one, via [`restart_daemon`]. If no daemon was running this simply
 /// starts one — the documented manual fallback for picking up a new build
