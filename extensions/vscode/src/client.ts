@@ -392,6 +392,7 @@ export class DaemonClient extends EventEmitter {
           daemon_instance: hello.daemon_instance,
           heartbeat_interval_ms: hello.heartbeat_interval_ms,
           resume_token: hello.resume_token,
+          build_id: hello.build_id,
         });
         // Send the attach, but do NOT claim "attached" yet: the daemon proves a
         // successful attach by replying with a `Catchup`. Marking attached (and

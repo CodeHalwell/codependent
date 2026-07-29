@@ -64,6 +64,7 @@ async fn mock_daemon(mut stream: UnixStream, workflow_run_id: &str) {
                 daemon_version: "mock".to_string(),
                 daemon_instance: DaemonInstanceId::new(),
                 heartbeat_interval_ms: 15_000,
+                build_id: String::new(),
             }),
         ),
     )
@@ -187,6 +188,7 @@ async fn mock_daemon_fix_ci(mut stream: UnixStream, workflow_run_id: &str) {
                 daemon_version: "mock".to_string(),
                 daemon_instance: DaemonInstanceId::new(),
                 heartbeat_interval_ms: 15_000,
+                build_id: String::new(),
             }),
         ),
     )

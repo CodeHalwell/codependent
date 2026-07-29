@@ -32,8 +32,10 @@ export interface ProtocolVersion {
   minor: number;
 }
 
-/** `version.rs::PROTOCOL_V1`. Additive Phase 1 revision. */
-export const PROTOCOL_V1: ProtocolVersion = { major: 1, minor: 1 };
+/** `version.rs::PROTOCOL_V1`. Additive Phase 1 revision; bumped to 1.2 by the
+ * daemon-auto-restart feature's `ServerHello.build_id` /
+ * `DaemonStatus.build_id` / `DaemonStatus.active_run_count` fields. */
+export const PROTOCOL_V1: ProtocolVersion = { major: 1, minor: 2 };
 
 // ---------------------------------------------------------------------------
 // capabilities.rs
@@ -87,6 +89,14 @@ export interface ServerHello {
    * compatibility with older daemons.
    */
   resume_token?: string;
+  /**
+   * The running daemon's per-build id (`codypendent_protocol::BUILD_ID`),
+   * used to detect a stale in-memory daemon after a reinstall. Always
+   * serializes (`#[serde(default)]` without `skip_serializing_if`, default
+   * `""`) — an older daemon predating this field omits it, so treat a
+   * missing value the same as `""`.
+   */
+  build_id: string;
 }
 
 /** `ClientRole` — internally tagged, `{ "type": "Contributor" }` etc. */

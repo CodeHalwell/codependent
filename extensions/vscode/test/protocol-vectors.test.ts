@@ -600,6 +600,7 @@ function reconstructServerHello(r: Record<string, unknown>): ServerHello {
     daemon_instance: str(r, "daemon_instance"),
     heartbeat_interval_ms: num(r, "heartbeat_interval_ms"),
     resume_token: optStr(r, "resume_token"),
+    build_id: str(r, "build_id"),
   };
 }
 

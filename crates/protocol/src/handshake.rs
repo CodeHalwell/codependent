@@ -52,6 +52,15 @@ pub struct ServerHello {
     /// Optional and defaulted for wire compatibility with older daemons/clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_token: Option<ResumeToken>,
+    /// The running daemon's per-build id
+    /// ([`codypendent_protocol::BUILD_ID`](crate::BUILD_ID)), used by the
+    /// client to detect that the connected daemon is a different build than
+    /// the client binary (a stale in-memory daemon after a reinstall).
+    /// Defaulted for wire compatibility with daemons predating this field —
+    /// an empty string is treated by the client as "unknown build" (i.e. a
+    /// mismatch).
+    #[serde(default)]
+    pub build_id: String,
 }
 
 /// A client's authority over a session it observes (Chapter 03). Exclusivity is
@@ -159,12 +168,14 @@ mod tests {
             daemon_instance: DaemonInstanceId::new(),
             heartbeat_interval_ms: 15_000,
             resume_token: Some(ResumeToken("opaque".to_string())),
+            build_id: "0.1.0+a1b2c3d4e5f6".to_string(),
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let parsed: ServerHello = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, parsed);
 
-        // An older daemon's hello (no resume_token on the wire) still parses.
+        // An older daemon's hello (no resume_token, no build_id on the wire)
+        // still parses — both default (None / "").
         let legacy = serde_json::json!({
             "selected_protocol": PROTOCOL_V1,
             "daemon_version": "0.1.0",
@@ -173,6 +184,23 @@ mod tests {
         });
         let parsed: ServerHello = serde_json::from_value(legacy).expect("legacy hello parses");
         assert_eq!(parsed.resume_token, None);
+        assert_eq!(parsed.build_id, "");
+    }
+
+    #[test]
+    fn server_hello_legacy_payload_without_build_id_defaults_to_empty_string() {
+        // A daemon predating this feature sends resume_token but never
+        // build_id — proving the two additive fields default independently.
+        let legacy = serde_json::json!({
+            "selected_protocol": PROTOCOL_V1,
+            "daemon_version": "0.1.0",
+            "daemon_instance": DaemonInstanceId::new(),
+            "heartbeat_interval_ms": 15_000u64,
+            "resume_token": "opaque",
+        });
+        let parsed: ServerHello = serde_json::from_value(legacy).expect("legacy hello parses");
+        assert_eq!(parsed.resume_token, Some(ResumeToken("opaque".to_string())));
+        assert_eq!(parsed.build_id, "");
     }
 
     #[test]

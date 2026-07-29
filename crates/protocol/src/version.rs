@@ -14,7 +14,12 @@ pub struct ProtocolVersion {
 /// Phase 1 adds handshake, command, catch-up, artifact-reference, and run/tool/
 /// approval event payloads — all additive over Phase 0, so `major` stays `1`
 /// and `minor` advances to `1`.
-pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
+///
+/// The daemon-auto-restart-on-version-mismatch feature adds
+/// `ServerHello.build_id` and `DaemonStatus.build_id`/`active_run_count`, all
+/// `#[serde(default)]` — additive again, so `major` stays `1` and `minor`
+/// advances to `2`.
+pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 2 };
 
 impl ProtocolVersion {
     /// Two versions are compatible when their major versions match.

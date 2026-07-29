@@ -257,11 +257,57 @@ mod tests {
             daemon_instance: DaemonInstanceId::new(),
             heartbeat_interval_ms: 15_000,
             resume_token: None,
+            build_id: "0.1.0+a1b2c3d4e5f6".to_string(),
         });
         assert!(matches!(
             round_trip_payload(server_hello),
             Payload::ServerHello(_)
         ));
+    }
+
+    #[test]
+    fn daemon_status_round_trips_with_the_new_additive_fields() {
+        let original = DaemonStatus {
+            daemon_version: "0.1.0".to_string(),
+            protocol_version: PROTOCOL_V1,
+            instance_id: DaemonInstanceId::new(),
+            pid: 4242,
+            started_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            uptime_seconds: 3600,
+            boot_count: 1,
+            database_path: "/home/user/.local/share/codypendent/codypendent.db".to_string(),
+            socket_path: "/home/user/.local/share/codypendent/run/daemon.sock".to_string(),
+            session_count: 2,
+            build_id: "0.1.0+a1b2c3d4e5f6".to_string(),
+            active_run_count: 3,
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: DaemonStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.build_id, original.build_id);
+        assert_eq!(parsed.active_run_count, original.active_run_count);
+    }
+
+    #[test]
+    fn daemon_status_legacy_payload_without_new_fields_defaults() {
+        // An older daemon's status response (no build_id/active_run_count on
+        // the wire) still parses — both default (""/0).
+        let legacy = serde_json::json!({
+            "daemon_version": "0.1.0",
+            "protocol_version": PROTOCOL_V1,
+            "instance_id": DaemonInstanceId::new(),
+            "pid": 4242,
+            "started_at": "2026-01-01T00:00:00Z",
+            "uptime_seconds": 3600u64,
+            "boot_count": 1,
+            "database_path": "/home/user/.local/share/codypendent/codypendent.db",
+            "socket_path": "/home/user/.local/share/codypendent/run/daemon.sock",
+            "session_count": 2,
+        });
+        let parsed: DaemonStatus = serde_json::from_value(legacy).expect("legacy status parses");
+        assert_eq!(parsed.build_id, "");
+        assert_eq!(parsed.active_run_count, 0);
     }
 
     #[test]
@@ -564,6 +610,21 @@ pub struct DaemonStatus {
     pub database_path: String,
     pub socket_path: String,
     pub session_count: i64,
+    /// The running daemon's per-build id
+    /// ([`codypendent_protocol::BUILD_ID`](crate::BUILD_ID)). Defaulted for
+    /// wire compatibility with daemons predating this field (mirrors
+    /// [`ServerHello::build_id`](crate::ServerHello::build_id)).
+    #[serde(default)]
+    pub build_id: String,
+    /// Count of runs in a non-terminal state (`Queued`, `Preparing`,
+    /// `Running`, `WaitingForApproval`, `WaitingForUserInput`, `Paused`,
+    /// `Recovering` — every [`RunState`](crate::RunState) except `Completed`,
+    /// `Failed`, and `Cancelled`). Used to gate an automatic daemon restart:
+    /// only an idle daemon (`active_run_count == 0`) is safe to restart
+    /// without losing in-flight work. Defaulted for wire compatibility with
+    /// daemons predating this field.
+    #[serde(default)]
+    pub active_run_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

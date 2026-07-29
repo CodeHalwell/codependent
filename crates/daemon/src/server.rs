@@ -622,6 +622,9 @@ async fn handle_request(
                 resume_token: Some(codypendent_protocol::ResumeToken(
                     resume::mint_resume_token(&state.secret, client_id, 0),
                 )),
+                // Populated by the daemon-auto-restart feature's follow-up
+                // task; DR1 only adds the wire field.
+                build_id: String::new(),
             };
             send(
                 writer,
@@ -2016,6 +2019,10 @@ async fn status(state: &ServerState) -> anyhow::Result<DaemonStatus> {
             .to_string(),
         socket_path: state.paths.socket_path.display().to_string(),
         session_count: ledger::session_count(&state.pool).await?,
+        // Populated by the daemon-auto-restart feature's follow-up task;
+        // DR1 only adds the wire fields.
+        build_id: String::new(),
+        active_run_count: 0,
     })
 }
 

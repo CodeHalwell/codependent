@@ -498,6 +498,8 @@ fn envelope_vectors() -> Vec<Vector> {
                 database_path: "/home/user/.local/share/codypendent/codypendent.db".to_string(),
                 socket_path: "/home/user/.local/share/codypendent/run/daemon.sock".to_string(),
                 session_count: 2,
+                build_id: "0.1.0+a1b2c3d4e5f6".to_string(),
+                active_run_count: 1,
             }),
         ),
         vec_of(
@@ -535,6 +537,7 @@ fn envelope_vectors() -> Vec<Vector> {
                 daemon_instance: daemon_instance_id(),
                 heartbeat_interval_ms: 15_000,
                 resume_token: Some(ResumeToken("opaque".to_string())),
+                build_id: "0.1.0+a1b2c3d4e5f6".to_string(),
             }),
         ),
         vec_of(
@@ -1058,6 +1061,7 @@ fn handshake_vectors() -> Vec<Vector> {
                 daemon_instance: daemon_instance_id(),
                 heartbeat_interval_ms: 15_000,
                 resume_token: Some(ResumeToken("opaque".to_string())),
+                build_id: "0.1.0+a1b2c3d4e5f6".to_string(),
             },
         ),
         vec_of("ClientRole_Observer", ClientRole::Observer),
