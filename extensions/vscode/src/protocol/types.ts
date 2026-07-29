@@ -34,8 +34,9 @@ export interface ProtocolVersion {
 
 /** `version.rs::PROTOCOL_V1`. Additive Phase 1 revision; bumped to 1.2 by the
  * daemon-auto-restart feature's `ServerHello.build_id` /
- * `DaemonStatus.build_id` / `DaemonStatus.active_run_count` fields. */
-export const PROTOCOL_V1: ProtocolVersion = { major: 1, minor: 2 };
+ * `DaemonStatus.build_id` / `DaemonStatus.active_run_count` fields, then to 1.3
+ * by its daemon-side idle-guarded shutdown (`ShutdownIfIdle` / `ShutdownRefused`). */
+export const PROTOCOL_V1: ProtocolVersion = { major: 1, minor: 3 };
 
 // ---------------------------------------------------------------------------
 // capabilities.rs
@@ -422,6 +423,8 @@ export type Payload =
   | { type: "Pong" }
   | { type: "Shutdown" }
   | { type: "ShutdownAck" }
+  | { type: "ShutdownIfIdle" }
+  | { type: "ShutdownRefused"; active_run_count?: number }
   | { type: string; [key: string]: unknown };
 
 /**

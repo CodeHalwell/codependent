@@ -78,6 +78,21 @@ pub enum Payload {
     /// Ask the daemon to shut down gracefully.
     Shutdown,
     ShutdownAck,
+    /// Ask the daemon to shut down ONLY if it is idle (no active runs) — the
+    /// daemon-side half of the auto-restart safety gate. Unlike [`Payload::Shutdown`]
+    /// (which stops unconditionally), the daemon re-checks its own
+    /// `active_run_count` atomically against concurrent run admission and, when
+    /// any run is active, refuses with [`Payload::ShutdownRefused`] instead of
+    /// killing in-flight work. Introduced at protocol v1.3; a client only sends
+    /// it to a daemon whose negotiated minor is ≥ 3.
+    ShutdownIfIdle,
+    /// The daemon declined a [`Payload::ShutdownIfIdle`] because a run is active;
+    /// carries the count it observed so the client can warn precisely. The
+    /// daemon keeps running.
+    ShutdownRefused {
+        #[serde(default)]
+        active_run_count: u64,
+    },
     /// Structured protocol-level error (never parse human text to decide
     /// behaviour).
     Error(ProtocolError),
@@ -238,6 +253,27 @@ mod tests {
             round_trip_payload(Payload::ShutdownAck),
             Payload::ShutdownAck
         ));
+        assert!(matches!(
+            round_trip_payload(Payload::ShutdownIfIdle),
+            Payload::ShutdownIfIdle
+        ));
+        match round_trip_payload(Payload::ShutdownRefused {
+            active_run_count: 3,
+        }) {
+            Payload::ShutdownRefused { active_run_count } => assert_eq!(active_run_count, 3),
+            other => panic!("expected ShutdownRefused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shutdown_refused_active_count_defaults_when_absent() {
+        // A peer that omits `active_run_count` (or a future minimal encoder)
+        // still parses — the field is `#[serde(default)]`.
+        let json = serde_json::json!({ "type": "ShutdownRefused" });
+        match serde_json::from_value::<Payload>(json).expect("parse legacy ShutdownRefused") {
+            Payload::ShutdownRefused { active_run_count } => assert_eq!(active_run_count, 0),
+            other => panic!("expected ShutdownRefused, got {other:?}"),
+        }
     }
 
     #[test]

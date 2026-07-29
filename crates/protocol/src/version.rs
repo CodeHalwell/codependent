@@ -19,7 +19,13 @@ pub struct ProtocolVersion {
 /// `ServerHello.build_id` and `DaemonStatus.build_id`/`active_run_count`, all
 /// `#[serde(default)]` — additive again, so `major` stays `1` and `minor`
 /// advances to `2`.
-pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 2 };
+///
+/// The daemon-side idle-guarded shutdown (`Payload::ShutdownIfIdle` /
+/// `ShutdownRefused`) that closes the auto-restart TOCTOU window adds two new
+/// payload variants — additive again (old peers never emit them, and a client
+/// only sends `ShutdownIfIdle` to a daemon whose negotiated minor is ≥ 3), so
+/// `major` stays `1` and `minor` advances to `3`.
+pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
 
 impl ProtocolVersion {
     /// Two versions are compatible when their major versions match.
