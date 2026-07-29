@@ -243,8 +243,11 @@ pub async fn run(
         .resume_token
         .clone()
         .map(codypendent_protocol::ResumeToken);
+    // Advertise the client's own per-build id (DR1/T4/T9) so both halves of
+    // the handshake speak the same id vocabulary — the daemon-auto-restart
+    // feature's detection point is the `hello.build_id` this returns.
     let hello = conn
-        .handshake("codypendent-tui", env!("CARGO_PKG_VERSION"), resume)
+        .handshake("codypendent-tui", codypendent_protocol::BUILD_ID, resume)
         .await?;
     // Store the daemon-issued token so the NEXT launch resumes this client
     // identity (best-effort; an absent token just means a fresh identity).
@@ -252,6 +255,34 @@ pub async fn run(
         store.resume_token = Some(token.0);
         store.save(paths);
     }
+
+    // DR5: detect + (safely) reconcile a daemon build mismatch, right after
+    // the handshake and BEFORE resolving/creating a session — the detection
+    // point the design doc calls for. On a matching build (the overwhelming
+    // common case) this is a single string compare and zero extra round
+    // trips; `conn` is left untouched. On a genuine mismatch it may stop the
+    // OLD daemon, spawn a fresh one, and reconnect — but ONLY when confirmed
+    // idle (never while a run is active, never on uncertainty); otherwise it
+    // warns on stderr and continues on the existing daemon. A restart that
+    // fails, or a reconnect that still mismatches, is a legible hard error —
+    // this function never enters the TUI against a broken or half-restarted
+    // daemon.
+    let resume_for_reconnect = store
+        .resume_token
+        .clone()
+        .map(codypendent_protocol::ResumeToken);
+    let mut restart_ops =
+        crate::restart::LiveRestartOps::new(paths, conn, "codypendent-tui", resume_for_reconnect);
+    let mut warn_stderr = |message: &str| eprintln!("codypendent: {message}");
+    crate::restart::reconcile_interactive(
+        paths,
+        codypendent_protocol::BUILD_ID,
+        &hello.build_id,
+        &mut restart_ops,
+        &mut warn_stderr,
+    )
+    .await?;
+    let mut conn = restart_ops.into_connection();
 
     let (session_id, workspace_id, catchup) =
         resolve_or_create_session(&mut conn, &mut store, paths, &repo).await?;

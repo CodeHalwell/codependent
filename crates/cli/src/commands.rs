@@ -337,8 +337,19 @@ pub async fn run_over_connection<W: Write>(
     repository: &str,
     out: &mut W,
 ) -> anyhow::Result<RunExit> {
-    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+    let hello = conn
+        .handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
         .await?;
+    // `run --jsonl` is headless/scripted (T9 scope): a daemon-build mismatch
+    // is WARN-ONLY here, never auto-restarted — bouncing the daemon out from
+    // under a non-interactive invocation (possibly one step in a scripted
+    // batch, with a strict JSONL stdout contract) would be actively wrong.
+    // stderr only; stdout carries nothing but JSONL envelopes.
+    if let Some(message) =
+        crate::restart::headless_mismatch_warning(codypendent_protocol::BUILD_ID, &hello.build_id)
+    {
+        eprintln!("codypendent: {message}");
+    }
 
     // CreateSession: the daemon's `CommandAccepted` *payload* is intentionally
     // minimal (only `command_id` + `sequence`). The freshly created session's id
