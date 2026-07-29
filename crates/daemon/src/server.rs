@@ -634,8 +634,21 @@ async fn handle_request(
         // read guard (so it blocks here, then observes `shutting_down` and is
         // refused). Either way an in-flight run is never silently killed.
         Payload::ShutdownIfIdle => {
-            let _admit = state.run_admission.write().await;
-            let active = u64::try_from(ledger::active_run_count(&state.pool).await?)?;
+            // Decide UNDER the exclusive guard (atomic against run admission),
+            // then RELEASE it before touching the socket — a slow-reading client
+            // must not wedge all run admission behind its reply. Setting
+            // `shutting_down` while the guard is held is what a blocked admit
+            // observes on resume, so the ordering that matters is preserved.
+            let active = {
+                let _admit = state.run_admission.write().await;
+                let active = u64::try_from(ledger::active_run_count(&state.pool).await?)?;
+                if active == 0 {
+                    state
+                        .shutting_down
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                active
+            };
             if active > 0 {
                 let reply = Envelope::reply_to(
                     &request,
@@ -646,9 +659,6 @@ async fn handle_request(
                 send(writer, &reply).await?;
                 return Ok(false);
             }
-            state
-                .shutting_down
-                .store(true, std::sync::atomic::Ordering::SeqCst);
             send(writer, &Envelope::reply_to(&request, Payload::ShutdownAck)).await?;
             let _ = state.shutdown.send(true);
             return Ok(true);
@@ -1056,6 +1066,27 @@ async fn handle_request(
                         send(writer, &reply).await?;
                         return Ok(false);
                     };
+                    // Admit this durable workflow run under the shared guard,
+                    // exactly like a session `StartRun`: it raises
+                    // `active_run_count`, so an idle-guarded shutdown must not
+                    // check the count and exit while this admission is in flight.
+                    // Refuse (retryable) if a shutdown has already been authorized.
+                    let _admit = state.run_admission.read().await;
+                    if state
+                        .shutting_down
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "daemon.restarting",
+                                "the daemon is restarting to load a newer build; retry in a moment",
+                                true,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     let start = StartWorkflowRequest {
                         manifest: manifest.clone(),
                         workflow_id: workflow_id.clone(),

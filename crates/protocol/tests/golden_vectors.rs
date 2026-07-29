@@ -485,6 +485,13 @@ fn envelope_vectors() -> Vec<Vector> {
         vec_of("Payload_DaemonStatusRequest", Payload::DaemonStatusRequest),
         vec_of("Payload_Shutdown", Payload::Shutdown),
         vec_of("Payload_ShutdownAck", Payload::ShutdownAck),
+        vec_of("Payload_ShutdownIfIdle", Payload::ShutdownIfIdle),
+        vec_of(
+            "Payload_ShutdownRefused",
+            Payload::ShutdownRefused {
+                active_run_count: 2,
+            },
+        ),
         vec_of(
             "Payload_DaemonStatusResponse",
             Payload::DaemonStatusResponse(DaemonStatus {

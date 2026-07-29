@@ -773,6 +773,10 @@ function reconstructModeledPayload(r: Record<string, unknown>): Payload {
       return { type: "Shutdown" };
     case "ShutdownAck":
       return { type: "ShutdownAck" };
+    case "ShutdownIfIdle":
+      return { type: "ShutdownIfIdle" };
+    case "ShutdownRefused":
+      return { type: "ShutdownRefused", active_run_count: num(r, "active_run_count") };
     default:
       throw new Error(`not a modeled Payload variant: ${str(r, "type")}`);
   }
@@ -857,6 +861,8 @@ describe("envelope.json against Payload (src/protocol/types.ts)", () => {
     "Payload_ServerHello",
     "Payload_Shutdown",
     "Payload_ShutdownAck",
+    "Payload_ShutdownIfIdle",
+    "Payload_ShutdownRefused",
   ];
   // Not modeled by name: these payload tags all fall through the union's
   // permissive `{ type: string; [key: string]: unknown }` member. Verified

@@ -211,17 +211,29 @@ pub async fn session_count(pool: &SqlitePool) -> anyhow::Result<i64> {
     Ok(count)
 }
 
-/// Count of runs whose `state` is **not** one of the three terminal
-/// `RunState`s (`Completed`, `Failed`, `Cancelled`; the DB strings written by
-/// [`crate::projections::run_state_to_db`]). Every other state — including
-/// `Queued`, `Preparing`, `Running`, `WaitingForApproval`,
-/// `WaitingForUserInput`, `Paused`, `Recovering`, and an unrecognized/future
-/// state (`Unknown`) — counts as active: a restart while a run is anything
-/// but terminal would disrupt in-memory state a stopped daemon cannot
-/// recover, so this must never undercount.
+/// Count of in-flight work — both session runs and durable **workflow** runs —
+/// whose `state` is **not** terminal. For `runs` the terminal `RunState`s are
+/// `Completed`/`Failed`/`Cancelled` (the DB strings written by
+/// [`crate::projections::run_state_to_db`]); for `workflow_runs` they are the
+/// lowercase `completed`/`failed`/`cancelled` (see
+/// `codypendent_workflow::store::WorkflowRunState`). Every other state —
+/// `Queued`/`Preparing`/`Running`/`WaitingForApproval`/`WaitingForUserInput`/
+/// `Paused`/`Recovering`/`Unknown` for runs, and `pending`/`running`/`paused`
+/// for workflow runs — counts as active.
+///
+/// Both are included because the auto-restart idle gate must mean *no work is
+/// in flight*: a restart while EITHER a session run or a workflow run is live
+/// would disrupt in-memory state a stopped daemon cannot recover, so this must
+/// never undercount. `workflow_runs` is created by the same migrations
+/// (`0010_workflow_runs.sql`) on the same pool, so the two counts sum in one
+/// query.
 pub async fn active_run_count(pool: &SqlitePool) -> anyhow::Result<i64> {
     let (count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM runs WHERE state NOT IN ('Completed', 'Failed', 'Cancelled')",
+        "SELECT \
+           (SELECT COUNT(*) FROM runs \
+              WHERE state NOT IN ('Completed', 'Failed', 'Cancelled')) \
+         + (SELECT COUNT(*) FROM workflow_runs \
+              WHERE state NOT IN ('completed', 'failed', 'cancelled'))",
     )
     .fetch_one(pool)
     .await?;

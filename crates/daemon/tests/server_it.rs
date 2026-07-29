@@ -427,6 +427,56 @@ async fn shutdown_if_idle_refused_when_a_run_is_active() {
     shutdown(stream, task).await;
 }
 
+/// Insert a `workflow_runs` row in `state` directly on `pool` — enough to make
+/// the daemon non-idle via the workflow half of `active_run_count`.
+async fn seed_workflow_run(pool: &SqlitePool, state: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO workflow_runs \
+           (id, workflow_id, workflow_version, graph_signature, inputs_json, state, created_at, updated_at) \
+         VALUES (?, 'wf', 1, 'sig', '{}', ?, ?, ?)",
+    )
+    .bind(format!("wfr-{}", RunId::new()))
+    .bind(state)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .expect("insert workflow_run");
+}
+
+/// A non-terminal WORKFLOW run also defers an idle-guarded shutdown — the
+/// count spans both `runs` and `workflow_runs`, so a running workflow is never
+/// silently killed by an auto-restart.
+#[tokio::test]
+async fn shutdown_if_idle_refused_when_a_workflow_run_is_active() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let mut stream = connect(&paths).await;
+
+    // No session runs, but one live workflow run.
+    seed_workflow_run(&pool, "running").await;
+
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(ClientId::new(), Payload::ShutdownIfIdle),
+    )
+    .await;
+    match reply.payload {
+        Payload::ShutdownRefused { active_run_count } => assert_eq!(active_run_count, 1),
+        other => panic!("expected ShutdownRefused for an active workflow, got {other:?}"),
+    }
+
+    // A terminal workflow run does NOT keep the daemon busy: mark it completed,
+    // and the idle-shutdown now succeeds.
+    sqlx::query("UPDATE workflow_runs SET state = 'completed'")
+        .execute(&pool)
+        .await
+        .expect("complete the workflow run");
+    shutdown_if_idle_expect_ack(stream, task).await;
+}
+
 #[tokio::test]
 async fn create_attach_and_two_clients_observe_one_event() {
     let tmp = tempfile::tempdir().unwrap();

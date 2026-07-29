@@ -244,6 +244,13 @@
   "Payload_ShutdownAck": {
     "type": "ShutdownAck"
   },
+  "Payload_ShutdownIfIdle": {
+    "type": "ShutdownIfIdle"
+  },
+  "Payload_ShutdownRefused": {
+    "active_run_count": 2,
+    "type": "ShutdownRefused"
+  },
   "Payload_WorkflowEvent": {
     "event": {
       "attempt": 1,
