@@ -821,3 +821,97 @@ mod reconcile_interactive_tests {
         assert!(message.contains("1.0+old"));
     }
 }
+
+#[cfg(test)]
+mod restart_lock_tests {
+    //! Direct coverage of the single-flight restart lock (Decision 3). The
+    //! `reconcile_interactive` tests above each use a fresh tempdir, so they
+    //! never actually contend for the lock or exercise stale-holder recovery —
+    //! this module drives `try_acquire_restart_lock` head-on.
+    use super::*;
+
+    fn temp_paths(tag: &str) -> (tempfile::TempDir, RuntimePaths) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("cp-lock-{tag}-"))
+            .tempdir()
+            .expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        (dir, paths)
+    }
+
+    fn expect_acquired(attempt: LockAttempt) -> RestartLockGuard {
+        match attempt {
+            LockAttempt::Acquired(guard) => guard,
+            LockAttempt::HeldByOther => panic!("expected to acquire the lock, but it was held"),
+        }
+    }
+
+    #[test]
+    fn a_second_acquire_while_held_is_reported_as_held_by_other() {
+        let (_dir, paths) = temp_paths("single-flight");
+        // First acquisition succeeds and is kept alive for the whole test.
+        let _guard = expect_acquired(try_acquire_restart_lock(&paths).expect("first acquire"));
+        // A concurrent client (this process still holds it, so it IS alive)
+        // must be told the lock is held — never handed a second acquisition.
+        match try_acquire_restart_lock(&paths).expect("second acquire attempt") {
+            LockAttempt::HeldByOther => {}
+            LockAttempt::Acquired(_) => panic!("single-flight violated: acquired a held lock"),
+        }
+    }
+
+    #[test]
+    fn dropping_the_guard_releases_the_lock() {
+        let (_dir, paths) = temp_paths("release-on-drop");
+        let lock_path = restart_lock_path(&paths);
+        {
+            let _guard = expect_acquired(try_acquire_restart_lock(&paths).expect("acquire"));
+            assert!(lock_path.exists(), "lock file exists while held");
+        }
+        assert!(
+            !lock_path.exists(),
+            "the Drop guard must remove the lock file"
+        );
+        // And a fresh acquisition succeeds now that it is released.
+        let _reacquired = expect_acquired(try_acquire_restart_lock(&paths).expect("re-acquire"));
+    }
+
+    #[test]
+    fn a_stale_lock_from_a_dead_holder_is_reclaimed() {
+        let (_dir, paths) = temp_paths("stale-dead-pid");
+        let lock_path = restart_lock_path(&paths);
+        // A pid far above any real process (macOS pids top out ~99998): the
+        // liveness probe (`kill -0`) reports it gone, so the lock is stale.
+        std::fs::write(&lock_path, "2147483647").expect("plant stale lock");
+        let _guard = expect_acquired(
+            try_acquire_restart_lock(&paths).expect("a dead holder's lock must be reclaimed"),
+        );
+        // The reclaimed lock now records THIS process's pid.
+        assert_eq!(read_lock_pid(&lock_path), Some(std::process::id()));
+    }
+
+    #[test]
+    fn a_corrupt_lock_file_is_treated_as_stale_and_reclaimed() {
+        let (_dir, paths) = temp_paths("corrupt");
+        let lock_path = restart_lock_path(&paths);
+        // An unparseable lock file can never be proof of a live holder.
+        std::fs::write(&lock_path, "not-a-pid").expect("plant corrupt lock");
+        let _guard = expect_acquired(
+            try_acquire_restart_lock(&paths).expect("a corrupt lock must be reclaimed"),
+        );
+    }
+
+    #[test]
+    fn a_live_holders_pid_is_never_reclaimed() {
+        let (_dir, paths) = temp_paths("live-holder");
+        let lock_path = restart_lock_path(&paths);
+        // This test process is unquestionably alive: a lock recording its pid
+        // must be respected, never stolen — the safety side of stale recovery.
+        std::fs::write(&lock_path, std::process::id().to_string()).expect("plant live lock");
+        match try_acquire_restart_lock(&paths).expect("attempt against a live holder") {
+            LockAttempt::HeldByOther => {}
+            LockAttempt::Acquired(_) => {
+                panic!("reclaimed a live holder's lock — must never happen")
+            }
+        }
+    }
+}
