@@ -4,8 +4,9 @@
 //!
 //! Follows the `models.toml` / trusted-publisher-store convention: a bare
 //! `[[server]]` TOML array, a **missing file is an empty config** (no servers —
-//! fine), and a malformed file is a hard error at daemon boot (the `policy.toml`
-//! precedent). The loader takes an explicit path; resolving `<config_dir>` is
+//! fine), and a malformed file is a hard error FOR THE FEATURE (the daemon logs
+//! it loudly and boots with no MCP servers; `codypendent mcp list` fails
+//! non-zero). The loader takes an explicit path; resolving `<config_dir>` is
 //! the caller's job. A server absent from this file is unreachable — the model
 //! can never name one into existence.
 

@@ -26,10 +26,8 @@ use codypendent_protocol::ProposedAction;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub use config::{ApprovalAction, PolicyLoadError};
+pub use config::{ApprovalAction, MergedPolicy, PolicyLoadError};
 pub use scope::{Capability, CommandScope, NetworkDefault, NetworkScope, PathScope, ScopeVerdict};
-
-use config::MergedPolicy;
 
 /// How long a minted capability grant remains valid. Capabilities are
 /// invocation-scoped and time-limited (Chapter 11).
@@ -261,6 +259,14 @@ impl PolicyEngine {
     /// The version identifying this engine's merged policy.
     pub fn policy_version(&self) -> &PolicyVersion {
         &self.version
+    }
+
+    /// The merged, fully-resolved policy, read-only. Exposed for operator-facing
+    /// surfaces — `codypendent mcp list` reports the effective `[mcp]`
+    /// dispositions from it — never for evaluation (that goes through the
+    /// `eval_*` methods, which bind dispositions to capabilities + reasons).
+    pub fn merged(&self) -> &MergedPolicy {
+        &self.merged
     }
 
     /// The read scope for `ctx`, with `$REPOSITORY`/`$WORKTREE`/`$HOME`

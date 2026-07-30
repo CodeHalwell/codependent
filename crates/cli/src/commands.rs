@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
+use codypendent_daemon::policy::{ApprovalAction, MergedPolicy, PolicyEngine};
+use codypendent_integrations::mcp::{load_mcp_config, McpConfig};
 use codypendent_knowledge::{
     db as knowledge_db, plan_publication, publications, register_builtins, retrieve, DocumentStore,
     HashingEmbedder, Publication, PublishTarget as KnowledgePublishTarget, Registry,
@@ -1940,6 +1942,81 @@ fn handoff_message(session_id: SessionId, paths: &RuntimePaths, ide_name: &str) 
     )
 }
 
+/// `codypendent mcp list` (PR B — MCP client): print each operator-declared
+/// MCP server from `<config_dir>/mcp.toml` — its launch line, env KEY NAMES
+/// ONLY (values may be secrets — never printed), `inherit_environment`, and
+/// the effective disposition from the builtin+global merged policy. A
+/// **config-level** view only: no server is ever spawned here. A missing file
+/// is a normal unconfigured state (`Ok`); a malformed file is a broken config
+/// and earns a non-zero exit, its legible load error (path + reason) as the
+/// failure message.
+pub async fn mcp_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let mcp_path = paths.global_mcp_path();
+    if !mcp_path.exists() {
+        println!("no MCP servers configured (create {})", mcp_path.display());
+        return Ok(());
+    }
+    let config = load_mcp_config(&mcp_path).map_err(anyhow::Error::new)?;
+    if config.servers.is_empty() {
+        println!("no MCP servers declared in {}", mcp_path.display());
+        return Ok(());
+    }
+    let engine = PolicyEngine::load(None, Some(&paths.global_policy_path()))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    print!("{}", render_mcp_list(&config, engine.merged()));
+    Ok(())
+}
+
+/// The pure renderer behind [`mcp_list`]: one block per declared server. The
+/// disposition is the per-server `[mcp.servers]` override when present, else
+/// `[mcp] default` — the same resolution the policy engine's
+/// `eval_mcp_tool_call` applies at run time.
+fn render_mcp_list(config: &McpConfig, merged: &MergedPolicy) -> String {
+    let mut out = String::new();
+    for server in &config.servers {
+        let disposition = merged
+            .mcp_servers
+            .get(&server.name)
+            .copied()
+            .unwrap_or(merged.mcp_default);
+        out.push_str(&server.name);
+        out.push('\n');
+        let mut launch = server.command.clone();
+        for arg in &server.args {
+            launch.push(' ');
+            launch.push_str(arg);
+        }
+        out.push_str(&format!("  command: {launch}\n"));
+        if server.env.is_empty() {
+            out.push_str("  env: (none)\n");
+        } else {
+            // KEY NAMES ONLY — env values may be secrets.
+            let keys: Vec<&str> = server.env.iter().map(|(key, _)| key.as_str()).collect();
+            out.push_str(&format!("  env keys: {}\n", keys.join(", ")));
+        }
+        out.push_str(&format!(
+            "  inherit_environment: {}\n",
+            server.inherit_environment
+        ));
+        out.push_str(&format!(
+            "  disposition: {}\n",
+            disposition_label(disposition)
+        ));
+    }
+    out
+}
+
+/// The `[mcp]` disposition as the operator wrote it in `policy.toml`
+/// (kebab-case, matching the serde spelling).
+fn disposition_label(action: ApprovalAction) -> &'static str {
+    match action {
+        ApprovalAction::Allow => "allow",
+        ApprovalAction::Approval => "approval",
+        ApprovalAction::AlwaysApproval => "always-approval",
+        ApprovalAction::Deny => "deny",
+    }
+}
+
 #[cfg(test)]
 mod open_tests {
     use super::*;
@@ -1953,6 +2030,75 @@ mod open_tests {
         assert!(message.contains("VS Code"));
         assert!(message.contains("does not restart"));
         assert!(message.contains(&paths.socket_path.display().to_string()));
+    }
+}
+
+#[cfg(test)]
+mod mcp_tests {
+    use super::*;
+    use codypendent_integrations::mcp::McpServerConfig;
+
+    fn server(name: &str, command: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_owned(),
+            command: command.to_owned(),
+            args: Vec::new(),
+            env: Vec::new(),
+            inherit_environment: true,
+        }
+    }
+
+    #[test]
+    fn render_shows_dispositions_and_never_env_values() {
+        let mut github = server("github", "npx");
+        github.args = vec![
+            "-y".to_owned(),
+            "@modelcontextprotocol/server-github".to_owned(),
+        ];
+        github.env = vec![("GITHUB_TOKEN".to_owned(), "secret-value".to_owned())];
+        let mut hermetic = server("hermetic", "/usr/local/bin/mcp-fs");
+        hermetic.inherit_environment = false;
+        let config = McpConfig {
+            servers: vec![github, hermetic],
+        };
+        let mut merged = MergedPolicy::builtin_defaults();
+        merged
+            .mcp_servers
+            .insert("github".to_owned(), ApprovalAction::Allow);
+
+        let out = render_mcp_list(&config, &merged);
+        assert!(out.starts_with("github\n"), "server block missing:\n{out}");
+        assert!(
+            out.contains("command: npx -y @modelcontextprotocol/server-github\n"),
+            "launch line missing:\n{out}"
+        );
+        assert!(
+            out.contains("env keys: GITHUB_TOKEN\n"),
+            "env key NAMES should render:\n{out}"
+        );
+        assert!(
+            !out.contains("secret-value"),
+            "env VALUES must never render:\n{out}"
+        );
+        assert!(
+            out.contains("disposition: allow\n"),
+            "the per-server override should win:\n{out}"
+        );
+        // No override for `hermetic`: the builtin default (`approval`) shows,
+        // along with its hermetic launch and empty env.
+        assert!(
+            out.contains("hermetic\n  command: /usr/local/bin/mcp-fs\n"),
+            "second server block missing:\n{out}"
+        );
+        assert!(out.contains("env: (none)\n"), "empty env line:\n{out}");
+        assert!(
+            out.contains("inherit_environment: false\n"),
+            "inherit_environment missing:\n{out}"
+        );
+        assert!(
+            out.contains("disposition: approval\n"),
+            "the default disposition should show:\n{out}"
+        );
     }
 }
 

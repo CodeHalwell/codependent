@@ -156,6 +156,15 @@ impl RuntimePaths {
         self.config_dir.join("policy.toml")
     }
 
+    /// Location of the operator-declared MCP server list: `<config_dir>/mcp.toml`.
+    ///
+    /// Only resolves the path — it does not read or validate the file. A
+    /// missing file is a normal, unconfigured state; the caller
+    /// (`load_mcp_config`) treats it as an empty config.
+    pub fn global_mcp_path(&self) -> PathBuf {
+        self.config_dir.join("mcp.toml")
+    }
+
     /// Fail early, with an actionable error, instead of letting `bind` fail
     /// with an opaque SUN_LEN error.
     pub fn validate_socket_path(&self) -> Result<(), DiscoveryError> {
@@ -201,11 +210,16 @@ mod tests {
         std::env::remove_var("CODYPENDENT_CONFIG_DIR");
         std::env::remove_var("CODYPENDENT_DATA_DIR");
 
-        // (0) global_policy_path is just config_dir joined with policy.toml.
+        // (0) global_policy_path is just config_dir joined with policy.toml;
+        // global_mcp_path is the same convention for mcp.toml.
         let paths = RuntimePaths::from_data_dir(PathBuf::from("/tmp/cp-pf3-data"));
         assert_eq!(
             paths.global_policy_path(),
             PathBuf::from("/tmp/cp-pf3-data/config/policy.toml")
+        );
+        assert_eq!(
+            paths.global_mcp_path(),
+            PathBuf::from("/tmp/cp-pf3-data/config/mcp.toml")
         );
 
         // (1) from_data_dir, no override: config_dir must NOT resolve to the

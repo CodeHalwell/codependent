@@ -157,6 +157,11 @@ enum TopCommand {
         #[command(subcommand)]
         command: PluginCommand,
     },
+    /// Inspect the operator-declared MCP servers (PR B — MCP client).
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     /// Expose the daemon as a Zed ACP agent over stdio (STEP 3.6). Zed's
     /// `agent_servers` config points at this; it is not meant to be run by hand.
     Acp {
@@ -203,6 +208,14 @@ impl IdeArg {
 enum IndexCommand {
     /// Delete the derived indexes and rebuild them from the authoritative rows.
     Rebuild,
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// List the MCP servers declared in `<config_dir>/mcp.toml`: launch line,
+    /// env key names (never values), and the effective policy disposition.
+    /// Config-level only — no server is spawned.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -719,6 +732,9 @@ async fn main() -> anyhow::Result<()> {
                 TrustCommand::Remove { id } => commands::plugin_trust_remove(&id),
             },
         },
+        TopCommand::Mcp {
+            command: McpCommand::List,
+        } => commands::mcp_list(&paths).await,
         TopCommand::Acp { repo } => {
             let repo = match repo {
                 Some(repo) => repo,

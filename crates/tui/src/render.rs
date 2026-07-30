@@ -3554,6 +3554,20 @@ fn describe_action(action: &ProposedAction) -> Vec<String> {
             v.push(format!("git action: {git_action}"));
             v
         }
+        // PR B (MCP client): the approver must see WHICH server and tool, the
+        // human summary, and the `args` string VERBATIM — it is canonical JSON,
+        // already auditable — exactly as ExecuteCommand renders program/args/env
+        // verbatim.
+        ProposedAction::McpToolCall {
+            server,
+            tool,
+            summary,
+            args,
+        } => vec![
+            format!("mcp tool: {server}.{tool}"),
+            format!("summary: {summary}"),
+            format!("args: {args}"),
+        ],
         _ => vec!["unsupported action".to_owned()],
     }
 }
@@ -3568,6 +3582,7 @@ fn action_kind(action: &ProposedAction) -> &'static str {
         ProposedAction::GitCommit { .. } => "git commit",
         ProposedAction::GitPush { .. } => "git push",
         ProposedAction::PublishDocument { .. } => "publish document",
+        ProposedAction::McpToolCall { .. } => "mcp tool",
         _ => "unsupported",
     }
 }
@@ -3889,6 +3904,29 @@ mod tests {
             !out.contains("[proposed]"),
             "old bracket style must be gone:\n{out}"
         );
+    }
+
+    /// PR B (MCP client): the approval card renders an `McpToolCall` with the
+    /// server, tool, human summary, and the `args` string VERBATIM (canonical
+    /// JSON, already auditable), and the short verb is `mcp tool` — never the
+    /// wildcard fallbacks.
+    #[test]
+    fn mcp_tool_call_describes_server_tool_summary_and_args_verbatim() {
+        let action = ProposedAction::McpToolCall {
+            server: "github".to_owned(),
+            tool: "create_issue".to_owned(),
+            summary: "create an issue titled bug".to_owned(),
+            args: "{\"labels\":[\"bug\"],\"title\":\"bug\"}".to_owned(),
+        };
+        assert_eq!(
+            describe_action(&action),
+            vec![
+                "mcp tool: github.create_issue".to_owned(),
+                "summary: create an issue titled bug".to_owned(),
+                "args: {\"labels\":[\"bug\"],\"title\":\"bug\"}".to_owned(),
+            ]
+        );
+        assert_eq!(action_kind(&action), "mcp tool");
     }
 
     /// A failed tool card shows a terse `✗` in the collapsed head; the

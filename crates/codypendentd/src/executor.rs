@@ -36,6 +36,7 @@ use codypendent_daemon::workflow_stream::{WorkflowHub, WorkflowReader};
 use codypendent_daemon::worktrees::{WorktreeError, WorktreeManager};
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::github::{GitHubApi, RepoId};
+use codypendent_integrations::mcp::{McpBridge, McpRegistry};
 use codypendent_knowledge::{
     assemble_context, chronicle_candidates, extract_candidates, Curation, ExtractionInput,
     FactExtractor, MemoryStore, NoopExtractor, Revision, Scope,
@@ -132,6 +133,13 @@ pub struct RuntimeExecutor {
     /// discovered at startup (Phase 3 STEP 3.2). `None` leaves those tools
     /// unavailable and the run behaves exactly as before.
     github: Option<Arc<dyn GitHubApi>>,
+    /// The MCP bridge the `mcp.<server>.<tool>` tools dispatch through (PR B —
+    /// MCP client), built from the operator-declared `<config_dir>/mcp.toml` at
+    /// startup. `None` (no file, or no servers declared) leaves those tools
+    /// unoffered and the run behaves exactly as before. Stored pre-coerced to
+    /// the trait object, like `github`, so the runtime's `with_mcp` needs no
+    /// cast at the call sites.
+    mcp: Option<Arc<dyn McpBridge>>,
     /// The workflow-execution host: creates, drives, recovers, and controls durable
     /// workflow runs (Phase 5 STEP 5.2). One shared host backs both the
     /// [`WorkflowStarter`](codypendent_daemon::workflows::WorkflowStarter) and
@@ -225,6 +233,7 @@ impl RuntimeExecutor {
             approvals.clone(),
             None,
             None,
+            None,
             startup_repository_root.clone(),
             blackboards.clone(),
             workflows.clone(),
@@ -241,6 +250,7 @@ impl RuntimeExecutor {
             scanned: Arc::new(Mutex::new(scanned)),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             github: None,
+            mcp: None,
             workflow_host,
             repository_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             promotion,
@@ -289,12 +299,44 @@ impl RuntimeExecutor {
             self.subscriptions.clone(),
             self.approvals.clone(),
             Some(github),
+            // Carry the MCP bridge forward across the rebuild, like the
+            // drive-lock registry below — whichever of `with_github`/`with_mcp`
+            // runs last must not drop the other's injection.
+            self.mcp.clone(),
             Some(drive_locks),
             self.startup_repository_root.clone(),
             self.blackboards.clone(),
             // Carry the SAME node-lifecycle hub + cancellation registry forward (like
             // `drive_locks`), so a drive that started under the OLD host still
             // publishes to — and is cancellable through — the shared instances (T9).
+            self.workflows.clone(),
+            self.workflow_cancellations.clone(),
+            self.routing.clone(),
+        );
+        self
+    }
+
+    /// Inject the MCP bridge (PR B — MCP client). When set, the agent loop gains
+    /// the `mcp.<server>.<tool>` tools the registry's warm servers offer (every
+    /// call is still dispositioned by the policy's `[mcp]` section). The
+    /// workflow host is rebuilt exactly as [`Self::with_github`] rebuilds it —
+    /// SHARING the existing drive-lock registry, hubs, and cancellation
+    /// registry, and carrying the GitHub client forward — so a workflow agent
+    /// node's runtime is configured identically to a single-agent run's no
+    /// matter which builder ran last.
+    pub fn with_mcp(mut self, mcp: Arc<McpRegistry>) -> Self {
+        self.mcp = Some(mcp);
+        let drive_locks = self.workflow_host.drive_locks();
+        self.workflow_host = build_workflow_host(
+            self.pool.clone(),
+            self.paths.clone(),
+            self.subscriptions.clone(),
+            self.approvals.clone(),
+            self.github.clone(),
+            self.mcp.clone(),
+            Some(drive_locks),
+            self.startup_repository_root.clone(),
+            self.blackboards.clone(),
             self.workflows.clone(),
             self.workflow_cancellations.clone(),
             self.routing.clone(),
@@ -533,6 +575,9 @@ impl RuntimeExecutor {
         );
         if let Some(github) = &self.github {
             runtime = runtime.with_github(github.clone());
+        }
+        if let Some(mcp) = &self.mcp {
+            runtime = runtime.with_mcp(mcp.clone());
         }
 
         // Bind the run's worktree (STEP 1.8, the Phase-1 follow-up): a writing

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use codypendent_daemon::{db, instance, recovery, server};
 use codypendent_protocol::discovery::RuntimePaths;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::executor::RuntimeExecutor;
@@ -139,6 +139,37 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
             }
         }
         Err(_) => info!("no github token found; github tools disabled"),
+    }
+
+    // MCP client (PR B): load the operator-declared server list from
+    // `<config_dir>/mcp.toml` (sibling to `policy.toml`) and hand the registry
+    // to the executor, so single-agent runs AND workflow agent nodes are
+    // offered the `mcp.<server>.<tool>` tools their warm servers provide.
+    //
+    // A MALFORMED file is deliberately NOT fatal: MCP is an optional feature,
+    // so a typo in its config must not kill the daemon. The load error is
+    // legible (it names the path and the reason) and is logged loudly here,
+    // and it stays visible via `codypendent mcp list`; the daemon simply
+    // continues with NO MCP servers. An absent file — or one declaring zero
+    // servers — builds no registry at all.
+    match codypendent_integrations::mcp::load_mcp_config(&paths.global_mcp_path()) {
+        Ok(config) if !config.servers.is_empty() => {
+            let server_count = config.servers.len();
+            let registry = Arc::new(codypendent_integrations::mcp::McpRegistry::new(config));
+            executor = executor.with_mcp(registry.clone());
+            // Fire-and-forget pre-warm (the code-graph scan precedent): a
+            // server that won't start is logged inside `warm_all`, never
+            // fatal — its tools stay unoffered until a lazy spawn succeeds.
+            tokio::spawn(async move { registry.warm_all().await });
+            info!(
+                servers = server_count,
+                "mcp registry enabled; warming servers in the background"
+            );
+        }
+        Ok(_) => info!("no mcp servers configured; mcp tools disabled"),
+        Err(error) => {
+            error!(%error, "malformed mcp config; continuing with NO mcp servers");
+        }
     }
 
     let executor = Arc::new(executor);
