@@ -36,7 +36,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use codypendent_cli::{commands, theme_select, tui};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{AgentMode, DocumentId, SessionId};
@@ -185,6 +185,37 @@ enum TopCommand {
         /// Repository path to open. Defaults to the current directory.
         #[arg(long)]
         repo: Option<PathBuf>,
+    },
+    /// Print a shell-completion script for your shell. Install e.g. with:
+    /// `codypendent completion zsh > ~/.zfunc/_codypendent` (zsh),
+    /// `codypendent completion bash > /etc/bash_completion.d/codypendent`, or
+    /// `codypendent completion fish > ~/.config/fish/completions/codypendent.fish`.
+    Completion {
+        /// The shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Diagnose the local setup: binary + build id, daemon health, runtime
+    /// paths, model config, and provider reachability. Read-only. Exits
+    /// non-zero if any check FAILS.
+    Doctor {
+        /// Emit a structured JSON report instead of the human checklist.
+        #[arg(long)]
+        json: bool,
+        /// Probe hosted providers too (a bare TCP connect to host:port), not
+        /// just local model servers.
+        #[arg(long)]
+        deep: bool,
+    },
+    /// Self-update: install the latest GitHub release over the running binary
+    /// (via `gh`, exactly as `install.sh`), then pick up the new build through
+    /// the idle-guarded daemon auto-restart — never kills an active run.
+    Update {
+        /// Only report whether an update is available; download nothing.
+        #[arg(long)]
+        check: bool,
+        /// Install a specific release tag instead of the latest.
+        tag: Option<String>,
     },
 }
 
@@ -758,6 +789,31 @@ async fn main() -> anyhow::Result<()> {
             };
             let (binary, name) = ide.binary_and_name();
             commands::open(&paths, session_id, binary, name, repo).await
+        }
+        TopCommand::Completion { shell } => {
+            // Generate from the app's own derived command so completions never
+            // drift from the real CLI. No daemon, no I/O beyond stdout.
+            commands::completion(shell, &mut Cli::command());
+            Ok(())
+        }
+        TopCommand::Doctor { json, deep } => {
+            // `doctor` returns whether all checks passed; the exit-1-on-failure
+            // decision lives here (the library never calls `std::process::exit`).
+            let healthy = codypendent_cli::doctor::run(&paths, json, deep).await?;
+            if healthy {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
+        }
+        TopCommand::Update { check, tag } => {
+            // `--check` exits 2 when an update is available (scriptable); the
+            // exit decision lives here (the library never calls `process::exit`).
+            let available = codypendent_cli::update::run(&paths, check, tag).await?;
+            if check && available {
+                std::process::exit(2);
+            }
+            Ok(())
         }
     }
 }

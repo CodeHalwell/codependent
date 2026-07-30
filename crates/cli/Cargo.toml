@@ -51,6 +51,7 @@ codypendent-routing = { workspace = true }
 codypendent-providers = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # The workspace HTTP stack (rustls, no system OpenSSL), reused for the add-model
