@@ -845,6 +845,7 @@ dependencies = [
  "codypendent-protocol",
  "codypendent-providers",
  "codypendent-routing",
+ "codypendent-sandbox",
  "futures",
  "hex",
  "serde",

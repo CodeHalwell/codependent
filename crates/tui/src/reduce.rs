@@ -1717,6 +1717,9 @@ pub(crate) fn capability_label(action: &ProposedAction) -> String {
         ProposedAction::GitCommit { repository } => format!("GitCommit ({repository})"),
         ProposedAction::GitPush { remote, branch } => format!("GitPush ({remote} {branch})"),
         ProposedAction::PublishDocument { target, .. } => format!("GitCommit ({target})"),
+        ProposedAction::McpToolCall { server, tool, .. } => {
+            format!("McpToolCall ({server}.{tool})")
+        }
         _ => "unsupported capability".to_owned(),
     }
 }
@@ -2301,6 +2304,23 @@ mod tests {
         );
         assert!(s.pending_approvals.is_empty());
         assert!(!s.show_approval_modal());
+    }
+
+    /// PR B (MCP client): an `McpToolCall` gets its own one-line summary —
+    /// `McpToolCall (server.tool)` — never the wildcard "unsupported
+    /// capability" fallback.
+    #[test]
+    fn mcp_tool_call_capability_label_names_server_and_tool() {
+        let action = ProposedAction::McpToolCall {
+            server: "github".to_owned(),
+            tool: "create_issue".to_owned(),
+            summary: "create an issue".to_owned(),
+            args: "{\"title\":\"bug\"}".to_owned(),
+        };
+        assert_eq!(
+            capability_label(&action),
+            "McpToolCall (github.create_issue)"
+        );
     }
 
     #[test]

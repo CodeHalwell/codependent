@@ -53,6 +53,16 @@ const BENCH_OFFERED_TOOLS: &[&str] = &[
     ApplyPatch::NAME,
 ];
 
+/// The tool DEFINITIONS the bench hands the driver (the `ModelDriver` seam
+/// advertises definitions, not bare names): the static catalog filtered to
+/// [`BENCH_OFFERED_TOOLS`], the same projection the loop applies per run.
+fn bench_tool_definitions() -> Vec<crate::agent::ToolDefinition> {
+    crate::agent::static_tool_definitions()
+        .into_iter()
+        .filter(|def| BENCH_OFFERED_TOOLS.contains(&def.name.as_str()))
+        .collect()
+}
+
 /// One timed generation: how many tokens were produced, how long until the first
 /// token appeared, and the total wall time.
 #[derive(Debug, Clone, PartialEq)]
@@ -321,7 +331,7 @@ impl<'a> DriverBenchTarget<'a> {
         self.driver
             .next_step(
                 &[TurnItem::Objective(prompt.to_string())],
-                BENCH_OFFERED_TOOLS,
+                &bench_tool_definitions(),
                 &mut NullDeltaSink,
             )
             .await

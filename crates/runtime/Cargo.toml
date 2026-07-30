@@ -26,6 +26,11 @@ codypendent-routing = { workspace = true }
 # this is a one-way internal edge — no cycle (see its own Cargo.toml comment).
 codypendent-knowledge = { workspace = true }
 codypendent-providers = { workspace = true }
+# MCP tool results are untrusted content: `execute_prepared`'s MCP arm runs
+# every result through `codypendent_sandbox::sanitize_untrusted` before it can
+# enter the model's observation stream. The sandbox crate is a leaf
+# (serde/toml/thiserror/sha2/ed25519 only), so this adds no cycle.
+codypendent-sandbox = { workspace = true }
 agent-framework-core = { workspace = true }
 agent-framework-openai = { workspace = true, optional = true }
 agent-framework-anthropic = { workspace = true, optional = true }

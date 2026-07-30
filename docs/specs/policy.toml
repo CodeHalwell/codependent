@@ -28,6 +28,17 @@ push = "always-approval"
 force_push = "deny"
 delete_branch = "always-approval"
 
+# Dispositions for tool calls to operator-declared MCP servers (PR B — servers
+# themselves are declared in the trusted `<config_dir>/codypendent/mcp.toml`).
+# `default` covers servers with no explicit entry; `[mcp.servers]` overrides
+# per server. A repo-local layer may only narrow these.
+[mcp]
+default = "approval"
+
+[mcp.servers]
+github = "allow"
+experimental = "deny"
+
 [plugins]
 unsigned = "deny"
 native_process = "approval"

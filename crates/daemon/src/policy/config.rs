@@ -83,6 +83,12 @@ pub struct MergedPolicy {
     pub git_push: ApprovalAction,
     pub git_force_push: ApprovalAction,
     pub git_delete_branch: ApprovalAction,
+    /// The disposition for MCP tool calls to servers with no explicit
+    /// `[mcp.servers]` entry (PR B). Builtin default: `Approval`.
+    pub mcp_default: ApprovalAction,
+    /// Per-server MCP dispositions. A `BTreeMap` so the derived `PolicyVersion`
+    /// hash is deterministic.
+    pub mcp_servers: std::collections::BTreeMap<String, ApprovalAction>,
 }
 
 impl MergedPolicy {
@@ -138,6 +144,8 @@ impl MergedPolicy {
             git_push: ApprovalAction::Approval,
             git_force_push: ApprovalAction::Deny,
             git_delete_branch: ApprovalAction::AlwaysApproval,
+            mcp_default: ApprovalAction::Approval,
+            mcp_servers: std::collections::BTreeMap::new(),
         }
     }
 
@@ -200,6 +208,25 @@ impl MergedPolicy {
             }
             if let Some(delete_branch) = git.delete_branch {
                 self.git_delete_branch = self.git_delete_branch.more_restrictive(delete_branch);
+            }
+        }
+        if let Some(mcp) = &raw.mcp {
+            if let Some(default) = mcp.default {
+                self.mcp_default = self.mcp_default.more_restrictive(default);
+            }
+            if let Some(servers) = &mcp.servers {
+                for (name, action) in servers {
+                    // Narrow-only: the server's *effective* disposition (its
+                    // explicit entry, else the default) may only be raised — a
+                    // repo layer can never relax what the broader layers set.
+                    let effective = self
+                        .mcp_servers
+                        .get(name)
+                        .copied()
+                        .unwrap_or(self.mcp_default);
+                    self.mcp_servers
+                        .insert(name.clone(), effective.more_restrictive(*action));
+                }
             }
         }
         // `scope`, `data`, `plugins`, and `memory` are parsed (and validated for
@@ -287,6 +314,16 @@ impl MergedPolicy {
             }
             if let Some(delete_branch) = git.delete_branch {
                 self.git_delete_branch = delete_branch;
+            }
+        }
+        if let Some(mcp) = &raw.mcp {
+            if let Some(default) = mcp.default {
+                // Either direction: a trusted global may relax or tighten.
+                self.mcp_default = default;
+            }
+            if let Some(servers) = &mcp.servers {
+                // Either direction, per server — entries replace, like `[git]`.
+                self.mcp_servers.extend(servers.clone());
             }
         }
         // `scope`, `data`, `plugins`, and `memory` are parsed (and validated for
@@ -475,6 +512,8 @@ pub struct RawPolicy {
     #[serde(default)]
     pub git: Option<RawGit>,
     #[serde(default)]
+    pub mcp: Option<RawMcp>,
+    #[serde(default)]
     #[allow(dead_code)]
     pub plugins: Option<RawPlugins>,
     #[serde(default)]
@@ -551,6 +590,19 @@ pub struct RawGit {
     pub force_push: Option<ApprovalAction>,
     #[serde(default)]
     pub delete_branch: Option<ApprovalAction>,
+}
+
+/// The `[mcp]` section (PR B — MCP client): the disposition for tool calls to
+/// operator-declared MCP servers. `default` covers servers with no explicit
+/// entry; `[mcp.servers]` overrides per server. The trusted global layer may
+/// relax either direction; the repo-local layer narrows only.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawMcp {
+    #[serde(default)]
+    pub default: Option<ApprovalAction>,
+    #[serde(default)]
+    pub servers: Option<std::collections::BTreeMap<String, ApprovalAction>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -838,8 +890,75 @@ mod tests {
         assert!(raw.filesystem.is_some());
         assert!(raw.shell.is_some());
         assert!(raw.git.is_some());
+        assert!(raw.mcp.is_some());
         assert!(raw.plugins.is_some());
         assert!(raw.memory.is_some());
+    }
+
+    // --- PR B: the `[mcp]` section merge semantics ---
+
+    /// The trusted global may set the default and per-server dispositions in
+    /// either direction (relax or tighten), exactly like `[git]`.
+    #[test]
+    fn trusted_overlay_sets_mcp_dispositions_either_direction() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        let raw = RawPolicy::parse(
+            "[mcp]\ndefault = \"always-approval\"\n[mcp.servers]\ngithub = \"allow\"",
+        )
+        .unwrap();
+        merged.apply_trusted_overlay(&raw);
+        assert_eq!(merged.mcp_default, ApprovalAction::AlwaysApproval);
+        assert_eq!(
+            merged.mcp_servers.get("github"),
+            Some(&ApprovalAction::Allow)
+        );
+    }
+
+    /// An untrusted repo layer may tighten a server's disposition (or deny it
+    /// outright) but never relax what the broader layers set — including
+    /// "relaxing" a server that only inherited a strict default.
+    #[test]
+    fn untrusted_overlay_only_narrows_mcp_dispositions() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        let trusted =
+            RawPolicy::parse("[mcp]\ndefault = \"approval\"\n[mcp.servers]\ngithub = \"allow\"")
+                .unwrap();
+        merged.apply_trusted_overlay(&trusted);
+        // The repo tries to relax the default to `allow` and tighten `github`
+        // to `always-approval`. Only the tightening may take effect.
+        let repo =
+            RawPolicy::parse("[mcp]\ndefault = \"allow\"\n[mcp.servers]\ngithub = \"always-approval\"\nexperimental = \"deny\"")
+                .unwrap();
+        merged.apply_untrusted_overlay(&repo);
+        assert_eq!(merged.mcp_default, ApprovalAction::Approval);
+        assert_eq!(
+            merged.mcp_servers.get("github"),
+            Some(&ApprovalAction::AlwaysApproval)
+        );
+        assert_eq!(
+            merged.mcp_servers.get("experimental"),
+            Some(&ApprovalAction::Deny)
+        );
+    }
+
+    /// A repo layer naming a server no broader layer mentioned narrows from the
+    /// *default*: with the builtin `approval` default, `server = "allow"` must
+    /// NOT take effect, but `server = "deny"` must.
+    #[test]
+    fn untrusted_overlay_new_server_narrows_from_default() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        let repo =
+            RawPolicy::parse("[mcp.servers]\nsneaky = \"allow\"\ncautious = \"deny\"").unwrap();
+        merged.apply_untrusted_overlay(&repo);
+        assert_eq!(
+            merged.mcp_servers.get("sneaky"),
+            Some(&ApprovalAction::Approval),
+            "a repo layer must not relax below the default"
+        );
+        assert_eq!(
+            merged.mcp_servers.get("cautious"),
+            Some(&ApprovalAction::Deny)
+        );
     }
 
     #[test]

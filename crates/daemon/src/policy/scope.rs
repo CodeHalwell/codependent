@@ -40,6 +40,14 @@ pub enum Capability {
     GitCommit,
     /// Push to a Git remote.
     GitPush,
+    /// Call a tool on an operator-declared MCP server (PR B — MCP client). A
+    /// marker: the MCP bridge executes the call itself, so the grant carries no
+    /// path/command/network scope — it exists so the approval and audit record
+    /// names the server the call went to.
+    McpToolCall {
+        /// The server name from the trusted `mcp.toml`.
+        server: String,
+    },
 }
 
 /// The verdict of checking a single path against a [`PathScope`].

@@ -49,6 +49,8 @@ const MAX_LABEL_CHARS: usize = 80;
 ///   way a human reads a command line — falling back to a flat `command`/
 ///   `cmd` string arg if that is what is present instead.
 /// * `workspace.search` (and `search`) → its `query` (or `pattern`) argument.
+/// * `mcp.<server>.<tool>` → the `server.tool` pair itself: the args schema is
+///   server-defined, so no argument is known-safe to surface.
 /// * anything else → `None`, conservatively — no guessing at some other
 ///   argument that might not be safe to show.
 pub fn tool_label(tool: &str, args: &Value) -> Option<String> {
@@ -70,6 +72,11 @@ pub fn tool_label(tool: &str, args: &Value) -> Option<String> {
         EditFile::NAME | "edit_file" => string_arg(args, &["path", "file", "filename"]),
         Shell::NAME => shell_command_label(args),
         Search::NAME | "search" => string_arg(args, &["query", "pattern"]),
+        // MCP client (PR B): an `mcp.<server>.<tool>` args schema is
+        // server-defined, so no argument is known-safe to surface — the
+        // server.tool pair itself (already part of the tool name, and how the
+        // operator declared it) is the only display information.
+        name if name.starts_with("mcp.") => Some(format!("MCP {}", &name["mcp.".len()..])),
         _ => None,
     }?;
     let sanitized = sanitize_label(&raw);
@@ -286,6 +293,14 @@ mod tests {
                 &json!({"patch": "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new", "cwd": "/repo"})
             ),
             None
+        );
+    }
+
+    #[test]
+    fn mcp_label_is_the_server_tool_pair() {
+        assert_eq!(
+            tool_label("mcp.github.create_issue", &json!({"title": "secret?"})),
+            Some("MCP github.create_issue".to_string())
         );
     }
 

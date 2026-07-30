@@ -78,6 +78,7 @@ use codypendent_daemon::worktrees::WorktreeManager;
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::github::model::UpdatePullRequest;
 use codypendent_integrations::github::{github_mutation_action, GitHubApi};
+use codypendent_integrations::mcp::McpBridge;
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     Actor, AgentMode, ApprovalDecision, ArtifactRef, EventBody, ProposedAction, Risk, RiskLevel,
@@ -365,10 +366,11 @@ impl NodeModelDriverFactory for ConfiguredModelDriverFactory {
 /// Build the workflow host over one shared [`AgentLoopNodeExecutor`] carrying the
 /// production driver factory. Used by [`RuntimeExecutor::new`] (`drive_locks:
 /// None` — the first host this process builds, so a fresh registry) and
-/// rebuilt by `with_github` so agent nodes drive with the daemon's GitHub
-/// client (`drive_locks: Some(existing)` — reconfiguring an ALREADY-running
-/// host must carry its per-run drive-lock registry forward, not mint a fresh
-/// one; see [`WorkflowConductorHost::with_drive_locks`], P5-D6c). `routing` is
+/// rebuilt by `with_github`/`with_mcp` so agent nodes drive with the daemon's
+/// GitHub client and MCP bridge (`drive_locks: Some(existing)` — reconfiguring
+/// an ALREADY-running host must carry its per-run drive-lock registry forward,
+/// not mint a fresh one; see [`WorkflowConductorHost::with_drive_locks`],
+/// P5-D6c). `routing` is
 /// the SAME [`RoutingCoordinator`] the single-agent executor uses (built once
 /// by the caller and threaded through both places), so a workflow agent node's
 /// model selection goes through the identical classification hard-filter +
@@ -380,6 +382,7 @@ pub(crate) fn build_workflow_host(
     subscriptions: SubscriptionHub,
     approvals: ApprovalBroker,
     github: Option<Arc<dyn GitHubApi>>,
+    mcp: Option<Arc<dyn McpBridge>>,
     drive_locks: Option<DriveLockRegistry>,
     startup_repository: PathBuf,
     blackboards: BlackboardHub,
@@ -401,6 +404,7 @@ pub(crate) fn build_workflow_host(
         subscriptions,
         approvals,
         github,
+        mcp,
         factory,
         startup_repository,
         blackboards,
@@ -585,6 +589,10 @@ pub struct AgentLoopNodeExecutor {
     subscriptions: SubscriptionHub,
     approvals: ApprovalBroker,
     github: Option<Arc<dyn GitHubApi>>,
+    /// The MCP bridge a workflow agent node's `mcp.<server>.<tool>` tools
+    /// dispatch through (PR B — MCP client), built from the operator-declared
+    /// `mcp.toml` at startup. `None` leaves those tools unoffered.
+    mcp: Option<Arc<dyn McpBridge>>,
     driver_factory: Arc<dyn NodeModelDriverFactory>,
     /// The daemon's startup repository root — the fallback a node's agent runs
     /// against when its workflow run recorded no repository (an older client).
@@ -615,6 +623,7 @@ impl AgentLoopNodeExecutor {
         subscriptions: SubscriptionHub,
         approvals: ApprovalBroker,
         github: Option<Arc<dyn GitHubApi>>,
+        mcp: Option<Arc<dyn McpBridge>>,
         driver_factory: Arc<dyn NodeModelDriverFactory>,
         startup_repository: PathBuf,
         blackboards: BlackboardHub,
@@ -626,6 +635,7 @@ impl AgentLoopNodeExecutor {
             subscriptions,
             approvals,
             github,
+            mcp,
             driver_factory,
             startup_repository,
             blackboards,
@@ -1112,6 +1122,12 @@ impl AgentLoopNodeExecutor {
         );
         if let Some(github) = &self.github {
             runtime = runtime.with_github(github.clone());
+        }
+        // Wire the MCP bridge so this node's agent is offered the
+        // `mcp.<server>.<tool>` tools its warm servers provide (PR B), exactly
+        // like a single-agent run.
+        if let Some(mcp) = &self.mcp {
+            runtime = runtime.with_mcp(mcp.clone());
         }
         // Wire the blackboard channel so this node's agent can post/query its run's
         // board (STEP 5.3). The channel writes the store on the pool and fans each
@@ -2422,7 +2438,7 @@ mod tests {
     use codypendent_daemon::workflows::{StartWorkflowRequest, WorkflowStarter};
     use codypendent_protocol::ClientId;
     use codypendent_runtime::agent::{
-        DeltaSink, ModelStep, ModelUsage, ScriptedDriver, StepOutcome,
+        DeltaSink, ModelStep, ModelUsage, ScriptedDriver, StepOutcome, ToolDefinition,
     };
     use codypendent_workflow::{
         compile_yaml, NodeState, WorkflowConductor, WorkflowRunState, REPAIR_GITHUB_CHECK_ID,
@@ -2515,7 +2531,7 @@ mod tests {
         async fn next_step(
             &self,
             _transcript: &[codypendent_runtime::agent::TurnItem],
-            _offered_tools: &[&str],
+            _tools: &[ToolDefinition],
             sink: &mut dyn DeltaSink,
         ) -> anyhow::Result<StepOutcome> {
             let step = if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -2633,6 +2649,7 @@ steps:
             paths.clone(),
             SubscriptionHub::new(),
             ApprovalBroker::new(),
+            None,
             None,
             factory,
             startup_repository.to_path_buf(),
@@ -4032,6 +4049,7 @@ steps:
             SubscriptionHub::new(),
             approvals,
             github,
+            None,
             factory,
             startup_repository.to_path_buf(),
             BlackboardHub::new(),
@@ -4641,6 +4659,7 @@ steps:
             SubscriptionHub::new(),
             broker,
             github,
+            None,
             Arc::new(ScriptedDriverFactory {
                 steps: vec![],
                 usage: None,
