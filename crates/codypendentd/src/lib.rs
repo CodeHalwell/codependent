@@ -141,6 +141,26 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         Err(_) => info!("no github token found; github tools disabled"),
     }
 
+    // Web search (PR C1): discover the `TAVILY_API_KEY` and enable the
+    // `web.search` tool. Absent (the common case in CI/headless), the tool
+    // stays disabled and the daemon runs exactly as before. The key is a
+    // secret — only whether one was found is ever logged, never its value.
+    match codypendent_integrations::search::TavilyKey::discover() {
+        Ok(key) => {
+            match codypendent_integrations::search::TavilyClient::new("https://api.tavily.com", key)
+            {
+                Ok(client) => {
+                    executor = executor.with_search(Arc::new(client));
+                    info!("tavily web search enabled");
+                }
+                Err(error) => {
+                    warn!(%error, "could not build the tavily client; web search disabled")
+                }
+            }
+        }
+        Err(_) => info!("no TAVILY_API_KEY found; web search disabled"),
+    }
+
     // MCP client (PR B): load the operator-declared server list from
     // `<config_dir>/mcp.toml` (sibling to `policy.toml`) and hand the registry
     // to the executor, so single-agent runs AND workflow agent nodes are

@@ -14,9 +14,9 @@ use codypendent_protocol::{
 
 use crate::action::{Action, Intent, SecretKey};
 use crate::state::{
-    filter_model_names, filter_models, filter_providers, AppState, DocBlockView, DocEdit, DocFocus,
-    DocLeaseState, DocSuggestionView, Overlay, Pane, PatchSummary, PendingApproval, RunActivity,
-    RunView, ToolCard, ToolStatus, TranscriptEntry,
+    filter_model_names, filter_models, filter_modes, filter_providers, AppState, DocBlockView,
+    DocEdit, DocFocus, DocLeaseState, DocSuggestionView, Overlay, Pane, PatchSummary,
+    PendingApproval, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -743,6 +743,16 @@ fn nav(state: &mut AppState, delta: i32) {
             state.selected_provider = indices.get(*selected).copied().unwrap_or(0);
             return;
         }
+        // The mode picker (PR C2): same filtered-cursor shape, over the static
+        // [`MODE_CARDS`] table — there is no `AppState` list to re-resolve.
+        Overlay::ModePicker {
+            ref query,
+            ref mut selected,
+        } => {
+            let indices = filter_modes(query);
+            step(selected, indices.len(), delta);
+            return;
+        }
         // The add-model pick-list (model-discovery): the same shape as the
         // model/provider pickers, over the overlay's own `models` field rather
         // than an `AppState` list.
@@ -1069,6 +1079,13 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
             edit(query);
             *selected = 0;
         }
+        // Same shape as the provider picker (PR C2): editing the mode
+        // picker's query changes the filtered set, so the selection returns
+        // to the top.
+        Overlay::ModePicker { query, selected } => {
+            edit(query);
+            *selected = 0;
+        }
         // The base view: text lands in the persistent composer draft.
         Overlay::None => edit(&mut state.composer),
         _ => {}
@@ -1199,6 +1216,13 @@ fn set_overlay_selected(state: &mut AppState, n: usize) {
             let indices = filter_providers(&state.providers, query);
             state.selected_provider = indices.get(n).copied().unwrap_or(0);
         }
+        // The mode picker keeps no resolved `AppState` index (PR C2) — the
+        // cursor alone identifies the row, exactly like the palette.
+        Overlay::ModePicker {
+            ref mut selected, ..
+        } => {
+            *selected = n;
+        }
         _ => {}
     }
 }
@@ -1211,6 +1235,7 @@ fn activate_row(state: &mut AppState, n: usize) {
         Overlay::Palette { .. }
         | Overlay::ModelPicker { .. }
         | Overlay::ProviderPicker { .. }
+        | Overlay::ModePicker { .. }
         | Overlay::AddModelPick { .. } => {
             set_overlay_selected(state, n);
             submit_prompt(state);
@@ -1320,6 +1345,23 @@ fn submit_prompt(state: &mut AppState) {
                     let can_list_models = card.can_list_models;
                     enter_add_model_flow(state, provider_id, requires_key, can_list_models);
                 }
+            }
+        }
+        // Enter sets the submission mode for the next run on `default_mode`
+        // (PR C2 — plan mode) and emits a status notice. Outbound intents
+        // already read `default_mode`, so a picked mode applies to the very
+        // next message — no wire change. Re-derives the filtered selection
+        // from the overlay's own `query`/`selected` (the zero-match guard the
+        // model picker uses): a query matching nothing sets nothing.
+        // `mem::take` already closed the picker.
+        Overlay::ModePicker { query, selected } => {
+            if let Some(&idx) = filter_modes(&query).get(selected) {
+                let card = crate::state::MODE_CARDS[idx];
+                state.default_mode = card.mode;
+                state.notice = Some((
+                    format!("mode set to {} — applies to your next run", card.label),
+                    state.tick + 25,
+                ));
             }
         }
         // Base view (`mem::take` left `None`): send the composer. A live run is
@@ -1656,6 +1698,18 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
             state.overlay = Overlay::ProviderPicker {
                 query: String::new(),
                 selected: 0,
+            };
+        }
+        // PR C2: open the mode picker with the cursor pre-selected on the
+        // CURRENT default, so the picker's starting point reflects what the
+        // next run would use.
+        PaletteCommand::Mode => {
+            state.overlay = Overlay::ModePicker {
+                query: String::new(),
+                selected: crate::state::MODE_CARDS
+                    .iter()
+                    .position(|card| card.mode == state.default_mode)
+                    .unwrap_or(0),
             };
         }
         PaletteCommand::ToggleLayout => state.layout = state.layout.toggled(),
@@ -4415,6 +4469,215 @@ mod tests {
         reduce(&mut s, Action::InputCancel);
         assert_eq!(s.overlay, Overlay::None);
         assert!(s.outbox.is_empty(), "Esc begins no flow");
+    }
+
+    // --- PR C2 (plan mode): the `/mode` picker (mirrors the pickers above) ---
+
+    /// Open the mode picker via the palette front door: `/` → filter
+    /// "mode picker" → Enter. ("mode" alone also substring-matches the Model
+    /// picker's title, so the full row title is the unambiguous query.) Every
+    /// other test below starts from this.
+    fn open_mode_picker(s: &mut AppState) {
+        reduce(s, Action::OpenPalette);
+        for c in "mode picker".chars() {
+            reduce(s, Action::InputChar(c));
+        }
+        reduce(s, Action::InputSubmit);
+    }
+
+    #[test]
+    fn palette_opens_the_mode_picker_on_the_current_default() {
+        let mut s = AppState::new();
+        open_mode_picker(&mut s);
+        // The cursor pre-selects the current `default_mode` (Build, the
+        // fourth row) rather than the top of the list.
+        assert_eq!(
+            s.overlay,
+            Overlay::ModePicker {
+                query: String::new(),
+                selected: 3,
+            }
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
+    }
+
+    #[test]
+    fn mode_picker_navigation_moves_the_selection() {
+        let mut s = AppState::new();
+        open_mode_picker(&mut s);
+        reduce(&mut s, Action::SelectPrev); // Build (3) -> Plan (2)
+        assert_eq!(
+            s.overlay,
+            Overlay::ModePicker {
+                query: String::new(),
+                selected: 2,
+            }
+        );
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::SelectNext); // Plan -> Build -> Review (4)
+        match &s.overlay {
+            Overlay::ModePicker { selected, .. } => assert_eq!(*selected, 4),
+            other => panic!("expected the mode picker, got {other:?}"),
+        }
+        reduce(&mut s, Action::SelectNext); // clamps at the end
+        match &s.overlay {
+            Overlay::ModePicker { selected, .. } => assert_eq!(*selected, 4),
+            other => panic!("expected the mode picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mode_picker_filters_by_label_and_resets_selection() {
+        let mut s = AppState::new();
+        open_mode_picker(&mut s);
+        for c in "plan".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        match &s.overlay {
+            Overlay::ModePicker { query, selected } => {
+                assert_eq!(query, "plan");
+                assert_eq!(*selected, 0, "the cursor resets to the filtered top");
+            }
+            other => panic!("expected the mode picker, got {other:?}"),
+        }
+        // "plan" matches only the Plan card (its summary names a "plan").
+        assert_eq!(crate::state::filter_modes("plan"), vec![2]);
+    }
+
+    #[test]
+    fn mode_picker_enter_sets_default_mode_and_emits_a_notice() {
+        let mut s = AppState::new();
+        open_mode_picker(&mut s);
+        reduce(&mut s, Action::SelectPrev); // Build -> Plan
+        reduce(&mut s, Action::InputSubmit);
+
+        assert_eq!(s.overlay, Overlay::None, "the picker closes on select");
+        assert_eq!(s.default_mode, AgentMode::Plan);
+        let notice = s.notice.as_ref().expect("a visible notice").0.clone();
+        assert!(
+            notice.contains("Plan"),
+            "the notice names the mode: {notice}"
+        );
+        assert!(
+            notice.contains("next run"),
+            "the notice explains when it applies: {notice}"
+        );
+    }
+
+    #[test]
+    fn mode_picker_enter_with_zero_matches_changes_nothing() {
+        let mut s = AppState::new();
+        open_mode_picker(&mut s);
+        for c in "zzz-no-such-mode".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        assert!(
+            crate::state::filter_modes("zzz-no-such-mode").is_empty(),
+            "precondition: the query must match nothing"
+        );
+
+        reduce(&mut s, Action::InputSubmit);
+
+        assert_eq!(s.overlay, Overlay::None, "the picker still closes");
+        assert_eq!(
+            s.default_mode,
+            AgentMode::Build,
+            "a zero-match submit must not change the mode"
+        );
+        assert!(
+            s.notice.is_none(),
+            "a zero-match submit must not emit a notice"
+        );
+    }
+
+    #[test]
+    fn mode_picker_escape_closes_without_changing_the_default() {
+        let mut s = AppState::new();
+        open_mode_picker(&mut s);
+        reduce(&mut s, Action::SelectPrev); // move onto Plan, then abandon
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.overlay, Overlay::None);
+        assert_eq!(
+            s.default_mode,
+            AgentMode::Build,
+            "Esc must not stage anything"
+        );
+    }
+
+    #[test]
+    fn a_run_started_after_picking_a_mode_carries_it() {
+        // PR C2: the picked `default_mode` flows into the `StartRun` intent —
+        // the plan → build handoff needs no wire change.
+        let mut s = AppState::new();
+        open_mode_picker(&mut s);
+        reduce(&mut s, Action::SelectPrev); // Build -> Plan
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.default_mode, AgentMode::Plan);
+
+        reduce(&mut s, Action::NewRun);
+        for c in "plan the fix".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::StartRun {
+                objective: "plan the fix".to_owned(),
+                mode: AgentMode::Plan,
+                model: None,
+            }],
+            "the started run carries the picked mode"
+        );
+    }
+
+    #[test]
+    fn a_follow_up_after_picking_a_mode_carries_it() {
+        // A continuation (`SubmitUserInput`) reads the same `default_mode`:
+        // reviewing the plan in Build is "switch mode, submit 'implement it'".
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "plan the fix".to_owned(),
+                mode: AgentMode::Plan,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+
+        open_mode_picker(&mut s);
+        reduce(&mut s, Action::SelectPrev); // cursor starts on Build (3) -> Plan (2)
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.default_mode, AgentMode::Plan);
+        // Now flip to Build for the execution handoff: the picker reopens
+        // with the cursor on Plan, so one step lands on Build.
+        open_mode_picker(&mut s);
+        reduce(&mut s, Action::SelectNext); // Plan -> Build
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.default_mode, AgentMode::Build);
+
+        for c in "implement it".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::SubmitUserInput {
+                text: "implement it".to_owned(),
+                mode: AgentMode::Build,
+                model: None,
+            }],
+            "the follow-up carries the re-picked mode"
+        );
     }
 
     // --- Task 4: the add-model flow (pick provider -> name -> masked key -> emit) ---

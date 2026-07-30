@@ -63,6 +63,7 @@ use codypendent_protocol::{
 use codypendent_integrations::github::{GitHubApi, GitHubError, RepoId};
 use codypendent_integrations::ide::digest_bytes;
 use codypendent_integrations::mcp::{McpBridge, McpError};
+use codypendent_integrations::search::SearchApi;
 use codypendent_protocol::ide::{DirtyBufferDigest, SourceProvenance};
 // THE untrusted-content chokepoint for MCP tool results (PR B): every byte a
 // server returns passes through `sanitize_untrusted` before it can enter the
@@ -80,14 +81,15 @@ use crate::tools::{
     new_pull_request, parse_blackboard_post, parse_blackboard_query, parse_create_check_run,
     parse_create_draft_pull_request, parse_edit_file as parse_edit_file_args,
     parse_get_pull_request, parse_list_check_runs, parse_memory_remember,
-    parse_update_pull_request, parse_write_file as parse_write_file_args, render_check_runs,
-    render_pull_request, tool_label, ApplyPatch, ApplyPatchInput, ArtifactSink,
-    BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput, BlackboardQueryTool,
-    CommandRequest, CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
-    CreateDraftPullRequestInput, EditFile, EditFileInput, EnvironmentBinding, GetPullRequest,
-    GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns, ListCheckRunsInput, MemoryRemember,
-    MemoryRememberInput, ReadFile, ReadFileInput, RepositoryTest, Search, SearchInput, Shell,
-    UpdatePullRequestInput, UpdatePullRequestTool, WriteFile, WriteFileInput,
+    parse_update_pull_request, parse_web_search, parse_write_file as parse_write_file_args,
+    render_check_runs, render_pull_request, render_search_outcome, tool_label, ApplyPatch,
+    ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput,
+    BlackboardQueryTool, CommandRequest, CreateCheckRunInput, CreateCheckRunSummary,
+    CreateDraftPullRequest, CreateDraftPullRequestInput, EditFile, EditFileInput,
+    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns,
+    ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput,
+    RepositoryTest, Search, SearchInput, Shell, UpdatePullRequestInput, UpdatePullRequestTool,
+    WebSearch, WebSearchInput, WriteFile, WriteFileInput,
 };
 
 /// Safety valve: the maximum number of `next_step` calls a single run makes
@@ -103,6 +105,25 @@ const MAX_WALL_CLOCK_SECS: u64 = 30 * 60;
 /// Default wall-clock timeout for a model-proposed `shell.run` when the model
 /// does not specify one (further clamped down by the command scope).
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 30;
+
+/// PR C2 (plan mode): the server-side instruction PREPENDED to the seeded
+/// objective of a `Plan`-mode run — and only a Plan run; every other mode's
+/// seeded bytes stay identical to before. The mode overlay already makes a
+/// Plan run read-only (no writes, no network) and `offered_tool_names` no
+/// longer advertises the tools those denials strand, but the model still
+/// needs to know what a Plan run is FOR: investigate with the read-only
+/// tools, then finish with a concrete, numbered implementation plan a human
+/// reviews and re-submits in Build mode to execute. The instruction rides
+/// the transcript SEED (derived from `run.objective` per loop start), never
+/// the ledger, so a continuation re-derives it consistently.
+const PLAN_MODE_INSTRUCTION: &str = "\
+You are running in PLAN MODE. Investigate the request read-only using the \
+available tools (read files, search the workspace, run safe read-only \
+commands); do NOT attempt to write, edit, or patch any files, and do NOT \
+make network calls — such actions are denied in this mode. Then finish with \
+a numbered, concrete implementation plan: the files to change, the ordered \
+steps to change them, and how to verify the result. A human will review \
+your plan and re-submit it in Build mode to execute it.";
 
 /// Defense-in-depth backstop (loop-fix Task 2): the number of CONSECUTIVE,
 /// IDENTICAL tool calls (same tool + same args digest, back to back with no
@@ -955,6 +976,10 @@ pub struct FrameworkAgentRuntime {
     /// process-wide (one registry of operator-declared servers), so it lives on
     /// the runtime, not the run context.
     mcp: Option<Arc<dyn McpBridge>>,
+    /// The web-search client the `web.search` tool calls (PR C1), if a Tavily
+    /// key was discovered at startup. Process-wide (one daemon key), so it
+    /// lives on the runtime, not the run context.
+    search: Option<Arc<dyn SearchApi>>,
     /// The blackboard channel the `blackboard.*` tools post to and query, if wired
     /// (Phase 5 STEP 5.3). Present only when the runtime drives workflow agent
     /// nodes; a run is offered the tools only when this is set AND the run carries a
@@ -992,6 +1017,7 @@ impl FrameworkAgentRuntime {
             sink,
             github: None,
             mcp: None,
+            search: None,
             blackboard: None,
         }
     }
@@ -1010,6 +1036,14 @@ impl FrameworkAgentRuntime {
     /// the registry from the operator-declared `mcp.toml` at startup.
     pub fn with_mcp(mut self, mcp: Arc<dyn McpBridge>) -> Self {
         self.mcp = Some(mcp);
+        self
+    }
+
+    /// Inject the web-search client the `web.search` tool calls (PR C1).
+    /// Without it the tool is never offered (a call returns a clean failure).
+    /// The daemon builds the client from the `TAVILY_API_KEY` at startup.
+    pub fn with_search(mut self, search: Arc<dyn SearchApi>) -> Self {
+        self.search = Some(search);
         self
     }
 
@@ -1038,6 +1072,19 @@ impl FrameworkAgentRuntime {
     /// single source of truth the model-facing advertisement and
     /// [`prepare`](Self::prepare) agree on, so a tool absent here is not
     /// dispatchable for the run.
+    ///
+    /// PR C2 (plan mode): the set is also filtered by `run`'s mode overlay, so
+    /// a read-only run is never advertised a tool whose every call could only
+    /// bounce off a policy denial (denial-bouncing). The invariant: the filter
+    /// only ever REMOVES a name the overlay's policy evaluation would deny —
+    /// `eval_write` under `!write_allowed` (the write tools), `eval_command` /
+    /// `eval_mcp_tool_call` under `!command_allowed` (`shell.run`,
+    /// `repository.test`, `mcp.*`), `eval_network` under `!network_allowed`
+    /// (`github.*`, `web.search`) — so it can never strand a tool the policy
+    /// would allow. The reads, `workspace.search`, `git.diff`, and
+    /// `memory.remember` stay in every mode, and [`prepare`](Self::prepare)
+    /// plus the policy engine remain the enforcement backstop regardless of
+    /// what is offered.
     #[must_use]
     pub fn offered_tool_names(&self, run: &RunContext) -> Vec<String> {
         let mut names: Vec<String> = [
@@ -1077,6 +1124,12 @@ impl FrameworkAgentRuntime {
                 .map(|name| (*name).to_string()),
             );
         }
+        // PR C1: offered whenever a search client is configured — unlike the
+        // github.* tools there is no per-run target to resolve, so the
+        // configured gate alone decides.
+        if self.search.is_some() {
+            names.push(WebSearch::NAME.to_string());
+        }
         if self.offers_blackboard(run) {
             names.extend(
                 [BlackboardPostTool::NAME, BlackboardQueryTool::NAME]
@@ -1092,6 +1145,45 @@ impl FrameworkAgentRuntime {
                     .map(|info| format!("mcp.{}.{}", info.server, info.name)),
             );
         }
+        // PR C2 (plan mode): mirror the mode overlay's denials (see the doc
+        // comment above for the invariant). One pass over the assembled set,
+        // so the configured/workflow gates above stay the only other filters.
+        let overlay = mode_overlay(run.mode);
+        names.retain(|name| {
+            if !overlay.write_allowed
+                && matches!(
+                    name.as_str(),
+                    WriteFile::NAME | EditFile::NAME | ApplyPatch::NAME
+                )
+            {
+                return false;
+            }
+            if !overlay.command_allowed
+                && (matches!(
+                    name.as_str(),
+                    // `git.diff` goes too: its action is `ExecuteCommand{git
+                    // diff}` (tools/git.rs), so `eval_command` would deny it —
+                    // offering it here would break the filter's own invariant.
+                    Shell::NAME | RepositoryTest::NAME | GitDiff::NAME
+                ) || name.starts_with("mcp."))
+            {
+                return false;
+            }
+            if !overlay.network_allowed
+                && matches!(
+                    name.as_str(),
+                    GetPullRequest::NAME
+                        | ListCheckRuns::NAME
+                        | CreateDraftPullRequest::NAME
+                        | UpdatePullRequestTool::NAME
+                        | CreateCheckRunSummary::NAME
+                        | WebSearch::NAME
+                )
+            {
+                return false;
+            }
+            true
+        });
         names
     }
 
@@ -1104,6 +1196,9 @@ impl FrameworkAgentRuntime {
     /// `inputSchema` VERBATIM. MCP definitions are declaration-only
     /// (`executor: None`, `ApprovalMode::NeverRequire`) — the loop executes
     /// them, and the daemon's policy engine (not the framework) gates them.
+    /// The MCP half projects through the SAME offered set (PR C2: a mode whose
+    /// overlay forbids commands drops `mcp.*` from both sides, keeping
+    /// advertised ≡ offered in every mode).
     #[must_use]
     pub fn advertised_tool_definitions(&self, run: &RunContext) -> Vec<ToolDefinition> {
         use agent_framework_core::tools::{ApprovalMode, ToolKind};
@@ -1117,8 +1212,10 @@ impl FrameworkAgentRuntime {
                 bridge
                     .offered_tools()
                     .into_iter()
-                    .map(|info| ToolDefinition {
-                        name: format!("mcp.{}.{}", info.server, info.name),
+                    .map(|info| (format!("mcp.{}.{}", info.server, info.name), info))
+                    .filter(|(name, _)| offered.contains(name))
+                    .map(|(name, info)| ToolDefinition {
+                        name,
                         description: info.description,
                         parameters: info.input_schema,
                         kind: ToolKind::Function,
@@ -1181,7 +1278,17 @@ impl FrameworkAgentRuntime {
         // context. A plain/first run carries an empty `prior`, so the transcript
         // is exactly `[Objective]`, identical to before.
         let mut transcript = run.prior.clone();
-        transcript.push(TurnItem::Objective(run.objective.clone()));
+        // PR C2 (plan mode): a Plan run's seeded objective carries the
+        // server-side plan instruction prepended (see the const's doc
+        // comment); every other mode's objective is seeded byte-identically.
+        // The seed is derived per loop start, so continuations re-derive it
+        // and the ledger is untouched.
+        let objective = if run.mode == AgentMode::Plan {
+            format!("{PLAN_MODE_INSTRUCTION}\n\n{}", run.objective)
+        } else {
+            run.objective.clone()
+        };
+        transcript.push(TurnItem::Objective(objective));
         let mut findings: Vec<String> = Vec::new();
         let mut actions: Vec<Value> = Vec::new();
         let mut changes: Vec<Value> = Vec::new();
@@ -1946,6 +2053,17 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::GitHubCheckSummary { repo, input },
                 })
             }
+            // PR C1: no per-run target to resolve (unlike github.*) — the
+            // configured gate in `offered_tool_names` is the only gate, and a
+            // call with no client wired gets the clean unconfigured failure at
+            // execution (mirroring the github.* arms).
+            WebSearch::NAME => {
+                let input = parse_web_search(args)?;
+                Ok(Prepared {
+                    action: WebSearch::proposed_action(),
+                    tool: PreparedTool::WebSearch(input),
+                })
+            }
             // The blackboard tools are offered ONLY to a workflow agent node with a
             // wired channel (STEP 5.3). The match guard makes a call in a plain
             // single-agent run fall through to the unknown-tool arm below — i.e. the
@@ -2368,6 +2486,46 @@ impl FrameworkAgentRuntime {
             PreparedTool::MemoryRemember(input) => {
                 self.execute_memory_remember(input, run, run_actor).await
             }
+            PreparedTool::WebSearch(input) => match self.search.as_ref() {
+                None => web_search_unconfigured(),
+                Some(client) => match client.search(&input.query, input.max_results).await {
+                    Ok(outcome) => {
+                        // THE untrusted-content chokepoint for web search (PR
+                        // C1): everything the endpoint returns is
+                        // attacker-controllable web content, so it is
+                        // control-stripped, size-capped
+                        // (WEB_SEARCH_CAP_BYTES — context-budget-sized, not the
+                        // MCP 8 MiB bulk cap), and origin-labeled as an
+                        // evidence block BEFORE it enters the model's
+                        // observation stream — never passed through raw.
+                        let sanitized = sanitize_untrusted(
+                            "search:tavily",
+                            &render_search_outcome(&outcome),
+                            WEB_SEARCH_CAP_BYTES,
+                        );
+                        (sanitized.as_evidence_block(), None, ToolOutcome::Succeeded)
+                    }
+                    Err(error) => {
+                        // The error's Display can embed SERVER-CONTROLLED text
+                        // (a non-2xx response body), so it goes through the
+                        // same sanitizer as a result — untrusted content never
+                        // enters the observation raw, on either path. The
+                        // client's own Display never contains the key.
+                        let sanitized = sanitize_untrusted(
+                            "search:tavily",
+                            &format!("web.search error: {error}"),
+                            WEB_SEARCH_CAP_BYTES,
+                        );
+                        (
+                            sanitized.as_evidence_block(),
+                            None,
+                            ToolOutcome::Failed {
+                                message: "web.search.failed".to_string(),
+                            },
+                        )
+                    }
+                },
+            },
             PreparedTool::Mcp { server, tool, args } => match self.mcp.as_ref() {
                 None => mcp_unavailable(&format!("mcp.{server}.{tool}")),
                 Some(bridge) => match bridge.call_tool(&server, &tool, args).await {
@@ -2646,6 +2804,8 @@ enum PreparedTool {
         repo: RepoId,
         input: CreateCheckRunInput,
     },
+    /// A `web.search` call (PR C1): the parsed query + result budget.
+    WebSearch(WebSearchInput),
     BlackboardPost(BlackboardPostInput),
     BlackboardQuery(BlackboardQueryInput),
     MemoryRemember(MemoryRememberInput),
@@ -2698,6 +2858,26 @@ fn github_unconfigured() -> (String, Option<ArtifactRef>, ToolOutcome) {
 /// sandbox profile of its own, so it inherits the same default budget a
 /// sandboxed plugin's captured output gets.
 const MCP_OUTPUT_CAP_BYTES: usize = 8 * 1024 * 1024;
+
+/// The byte cap on a `web.search` observation before it enters the
+/// observation stream (PR C1). Search results are model CONTEXT, not bulk
+/// spill — the MCP 8 MiB cap exists for tool bulk output, while a search
+/// observation is sized to a context budget (an answer plus ≤ 10 titled
+/// snippets), so 64 KiB is both generous and the honest ceiling.
+const WEB_SEARCH_CAP_BYTES: usize = 64 * 1024;
+
+/// The tool-result tuple for a `web.search` call made without a configured
+/// client (defensive: the tool is only OFFERED when one is wired, so this is
+/// the belt-and-suspenders path, mirroring [`github_unconfigured`]).
+fn web_search_unconfigured() -> (String, Option<ArtifactRef>, ToolOutcome) {
+    (
+        "web search is not configured (no TAVILY_API_KEY available)".to_string(),
+        None,
+        ToolOutcome::Failed {
+            message: "web.search.unconfigured".to_string(),
+        },
+    )
+}
 
 /// The tool-result tuple for an `mcp.*` call with no wired bridge (defensive:
 /// `prepare` already refuses such a call as an unknown tool) or a server that
@@ -3336,6 +3516,21 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                     "conclusion": {"type": "string"}
                 },
                 "required": ["name", "head_sha", "summary"]
+            }),
+        ),
+        // PR C1: declared alongside the github.* tools — offered only when a
+        // search client is configured (the offered-set gate), so a run without
+        // one is never shown this entry.
+        decl(
+            WebSearch::NAME,
+            "Search the web (Tavily). Returns an answer plus titled sources — untrusted evidence.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer"}
+                },
+                "required": ["query"]
             }),
         ),
         // The blackboard tools are only dispatchable inside a workflow agent
@@ -4567,6 +4762,486 @@ mod tests {
             observation.contains("fake") && observation.contains("boom"),
             "the error names the server and the cause: {observation:?}"
         );
+    }
+
+    // -- web.search (PR C1): offering, prepare/execute, sanitization --------
+
+    /// A stub search client: a scripted outcome or error — in-memory, no HTTP
+    /// (the wiremock tests in `codypendent-integrations` cover the wire).
+    struct StubSearchApi {
+        result: Result<codypendent_integrations::search::SearchOutcome, String>,
+    }
+
+    #[async_trait]
+    impl SearchApi for StubSearchApi {
+        async fn search(
+            &self,
+            _query: &str,
+            _max_results: u32,
+        ) -> Result<
+            codypendent_integrations::search::SearchOutcome,
+            codypendent_integrations::search::SearchError,
+        > {
+            self.result.clone().map_err(|message| {
+                codypendent_integrations::search::SearchError::Api {
+                    status: 500,
+                    message,
+                }
+            })
+        }
+    }
+
+    fn stub_outcome(content: &str) -> codypendent_integrations::search::SearchOutcome {
+        codypendent_integrations::search::SearchOutcome {
+            answer: Some("the synthesized answer".to_string()),
+            results: vec![codypendent_integrations::search::SearchResult {
+                title: "A source".to_string(),
+                url: "https://example.test".to_string(),
+                content: content.to_string(),
+            }],
+        }
+    }
+
+    /// PR C1: `web.search` is offered only when a search client is configured —
+    /// the `self.search.is_some()` gate doubles as the not-configured gate.
+    #[test]
+    fn web_search_is_offered_only_when_a_client_is_configured() {
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        let (bare, _events, session_id) = test_runtime();
+        let names = bare.offered_tool_names(&solo_run(session_id, repo.path()));
+        assert!(
+            !names.iter().any(|n| n == WebSearch::NAME),
+            "no client → web.search is not offered: {names:?}"
+        );
+
+        let (wired, _events, session_id) = test_runtime();
+        let wired = wired.with_search(Arc::new(StubSearchApi {
+            result: Ok(stub_outcome("x")),
+        }));
+        let run = solo_run(session_id, repo.path());
+        let names = wired.offered_tool_names(&run);
+        assert!(
+            names.iter().any(|n| n == WebSearch::NAME),
+            "a configured client offers web.search: {names:?}"
+        );
+        // Advertised ≡ offered (FIX 1): the decl is in the static catalog and
+        // projects into the advertised set exactly when offered.
+        let advertised = wired.advertised_tool_definitions(&run);
+        assert!(
+            advertised.iter().any(|d| d.name == WebSearch::NAME),
+            "web.search is advertised when offered"
+        );
+    }
+
+    /// PR C1: `prepare` → `execute_prepared` round-trip — the action is a
+    /// network read to the Tavily endpoint, and the rendered outcome is
+    /// sanitized + framed as an untrusted-evidence block, never raw.
+    #[tokio::test]
+    async fn web_search_prepare_and_execute_sanitizes_the_result_into_an_evidence_block() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime.with_search(Arc::new(StubSearchApi {
+            result: Ok(stub_outcome("clean \x1b[31mred\x1b[0m snippet\x07")),
+        }));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = solo_run(session_id, repo.path());
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(WebSearch::NAME, &json!({"query": "rust async"}), &run)
+            .await
+            .expect("an offered tool prepares");
+        match &prepared.action {
+            ProposedAction::NetworkRequest { destination } => assert_eq!(
+                destination,
+                codypendent_daemon::policy::TAVILY_API_ENDPOINT,
+                "a web search is a network read to exactly the Tavily endpoint"
+            ),
+            other => panic!("expected NetworkRequest, got {other:?}"),
+        }
+
+        let (observation, _artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(
+            observation.starts_with("[untrusted output from search:tavily]\n"),
+            "the evidence-block framing: {observation:?}"
+        );
+        assert!(
+            observation.contains("answer: the synthesized answer"),
+            "the answer line renders: {observation:?}"
+        );
+        assert!(
+            observation.contains("1. A source\n   https://example.test\n   clean red snippet"),
+            "numbered title/url/content entries, control sequences stripped: {observation:?}"
+        );
+        assert!(
+            !observation.contains('\x1b') && !observation.contains('\x07'),
+            "no ANSI/control characters survive: {observation:?}"
+        );
+    }
+
+    /// PR C1: a client failure surfaces as a legible tool error with the
+    /// stable dotted code, sanitized through the SAME chokepoint as a result —
+    /// untrusted content never enters the observation raw on either path.
+    #[tokio::test]
+    async fn web_search_execute_failure_is_sanitized_with_a_stable_code() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime.with_search(Arc::new(StubSearchApi {
+            result: Err("boom \x1b[31mred\x1b[0m".to_string()),
+        }));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = solo_run(session_id, repo.path());
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(WebSearch::NAME, &json!({"query": "x"}), &run)
+            .await
+            .expect("an offered tool prepares");
+        let (observation, _artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        match &outcome {
+            ToolOutcome::Failed { message } => assert_eq!(message, "web.search.failed"),
+            other => panic!("expected a failed outcome, got {other:?}"),
+        }
+        assert!(
+            observation.starts_with("[untrusted output from search:tavily]\n"),
+            "the error path is evidence-framed too: {observation:?}"
+        );
+        assert!(
+            observation.contains("boom red"),
+            "the error names the cause, control sequences stripped: {observation:?}"
+        );
+        assert!(
+            !observation.contains('\x1b'),
+            "no ANSI survives on the error path: {observation:?}"
+        );
+    }
+
+    /// PR C1: a `web.search` call with no client wired fails cleanly with the
+    /// unconfigured code (the defensive path — the offering gate already keeps
+    /// the tool out of the advertised set).
+    #[tokio::test]
+    async fn web_search_without_a_client_fails_cleanly() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = solo_run(session_id, repo.path());
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare(WebSearch::NAME, &json!({"query": "x"}), &run)
+            .await
+            .expect("prepare is not the gate");
+        let (_observation, _artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        match &outcome {
+            ToolOutcome::Failed { message } => assert_eq!(message, "web.search.unconfigured"),
+            other => panic!("expected a failed outcome, got {other:?}"),
+        }
+    }
+
+    // -- plan mode (PR C2): the seeded instruction + the mode-aware offered set --
+
+    /// A GitHub client whose methods are never called: the offered-set tests
+    /// only need the configured gate (`self.github.is_some()`) to trip.
+    struct NoopGitHub;
+
+    #[async_trait]
+    impl GitHubApi for NoopGitHub {
+        async fn get_pull_request(
+            &self,
+            _repo: &RepoId,
+            _number: u64,
+        ) -> Result<codypendent_integrations::github::model::PullRequest, GitHubError> {
+            unreachable!("the offered-set tests never call the client")
+        }
+
+        async fn list_check_runs(
+            &self,
+            _repo: &RepoId,
+            _git_ref: &str,
+        ) -> Result<Vec<codypendent_integrations::github::model::CheckRun>, GitHubError> {
+            unreachable!("the offered-set tests never call the client")
+        }
+
+        async fn download_job_logs(
+            &self,
+            _repo: &RepoId,
+            _job_id: u64,
+        ) -> Result<Vec<u8>, GitHubError> {
+            unreachable!("the offered-set tests never call the client")
+        }
+
+        async fn list_review_comments(
+            &self,
+            _repo: &RepoId,
+            _number: u64,
+        ) -> Result<Vec<codypendent_integrations::github::model::ReviewComment>, GitHubError>
+        {
+            unreachable!("the offered-set tests never call the client")
+        }
+
+        async fn create_review_comment(
+            &self,
+            _repo: &RepoId,
+            _number: u64,
+            _body: &str,
+            _idempotency_key: &str,
+        ) -> Result<codypendent_integrations::github::model::ReviewComment, GitHubError> {
+            unreachable!("the offered-set tests never call the client")
+        }
+
+        async fn create_draft_pull_request(
+            &self,
+            _repo: &RepoId,
+            _req: &codypendent_integrations::github::model::NewPullRequest,
+            _idempotency_key: &str,
+        ) -> Result<codypendent_integrations::github::model::PullRequest, GitHubError> {
+            unreachable!("the offered-set tests never call the client")
+        }
+
+        async fn update_pull_request(
+            &self,
+            _repo: &RepoId,
+            _number: u64,
+            _req: &codypendent_integrations::github::model::UpdatePullRequest,
+        ) -> Result<codypendent_integrations::github::model::PullRequest, GitHubError> {
+            unreachable!("the offered-set tests never call the client")
+        }
+
+        async fn create_check_run_summary(
+            &self,
+            _repo: &RepoId,
+            _req: &codypendent_integrations::github::model::NewCheckRun,
+            _idempotency_key: &str,
+        ) -> Result<codypendent_integrations::github::model::CheckRun, GitHubError> {
+            unreachable!("the offered-set tests never call the client")
+        }
+    }
+
+    /// PR C2: a Plan-mode run's transcript is seeded with the server-side plan
+    /// instruction PREPENDED to the objective — the model is told to
+    /// investigate read-only and finish with a numbered implementation plan.
+    #[tokio::test]
+    async fn plan_mode_seeds_the_plan_instruction_with_the_objective() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let driver = CapturingDriver { seen: seen.clone() };
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "add a /mode picker",
+            AgentMode::Plan,
+            repo.path(),
+            repo.path(),
+        );
+
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("plan run completes");
+
+        let seen = seen
+            .lock()
+            .expect("mutex")
+            .clone()
+            .expect("the driver observed a transcript");
+        assert_eq!(
+            seen,
+            vec![TurnItem::Objective(format!(
+                "{PLAN_MODE_INSTRUCTION}\n\nadd a /mode picker"
+            ))],
+            "the Plan instruction is prepended to the seeded objective"
+        );
+    }
+
+    /// PR C2: every other mode's seeded objective stays byte-identical to
+    /// before — the instruction is Plan-only.
+    #[tokio::test]
+    async fn a_build_run_seeds_the_objective_byte_identically() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let driver = CapturingDriver { seen: seen.clone() };
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "add a /mode picker",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("build run completes");
+
+        let seen = seen
+            .lock()
+            .expect("mutex")
+            .clone()
+            .expect("the driver observed a transcript");
+        assert_eq!(
+            seen,
+            vec![TurnItem::Objective("add a /mode picker".to_string())],
+            "no instruction, no reformatting: exactly the objective"
+        );
+    }
+
+    /// PR C2: the offered baseline mirrors the mode overlay exactly — Ask /
+    /// Explore offer only the never-mode-denied tools (reads, search,
+    /// memory.remember — NOT git.diff, whose `ExecuteCommand` action the
+    /// command denial refuses); Plan / Review add the command tools; Build
+    /// offers the full baseline, in the baseline's assembly order.
+    #[test]
+    fn offered_tool_names_mirror_the_mode_overlay() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let names = |mode: AgentMode| {
+            runtime.offered_tool_names(&RunContext::new(
+                session_id,
+                RunId::new(),
+                "solo",
+                mode,
+                repo.path(),
+                repo.path(),
+            ))
+        };
+        let set = |names: &[&str]| names.iter().map(|n| (*n).to_string()).collect::<Vec<_>>();
+
+        // Ask / Explore (read_only: no writes, no commands, no network).
+        let reads = set(&[ReadFile::NAME, Search::NAME, MemoryRemember::NAME]);
+        assert_eq!(names(AgentMode::Ask), reads, "Ask offers the reads only");
+        assert_eq!(
+            names(AgentMode::Explore),
+            reads,
+            "Explore offers the reads only"
+        );
+
+        // Plan / Review (commands yes; writes and network no).
+        let probes = set(&[
+            Shell::NAME,
+            ReadFile::NAME,
+            Search::NAME,
+            GitDiff::NAME,
+            MemoryRemember::NAME,
+            RepositoryTest::NAME,
+        ]);
+        assert_eq!(
+            names(AgentMode::Plan),
+            probes,
+            "Plan adds the command tools, not the write/network tools"
+        );
+        assert_eq!(
+            names(AgentMode::Review),
+            probes,
+            "Review adds the command tools, not the write/network tools"
+        );
+
+        // Build (permissive): the full baseline, unchanged.
+        let everything = set(&[
+            Shell::NAME,
+            ReadFile::NAME,
+            Search::NAME,
+            GitDiff::NAME,
+            ApplyPatch::NAME,
+            WriteFile::NAME,
+            EditFile::NAME,
+            MemoryRemember::NAME,
+            RepositoryTest::NAME,
+        ]);
+        assert_eq!(
+            names(AgentMode::Build),
+            everything,
+            "Build offers the full baseline"
+        );
+    }
+
+    /// PR C2: with every optional tool family wired (github, `web.search`, a
+    /// warm MCP bridge), the network family drops out when the overlay forbids
+    /// network and the MCP names drop out when it forbids commands — and
+    /// advertised ≡ offered (FIX 1) holds in every mode.
+    #[test]
+    fn offered_tool_names_drop_the_network_and_mcp_families_as_the_overlay_denies_them() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_github(Arc::new(NoopGitHub))
+            .with_search(Arc::new(StubSearchApi {
+                result: Ok(stub_outcome("x")),
+            }))
+            .with_mcp(Arc::new(StubMcpBridge::warm()));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let names = |mode: AgentMode| {
+            let run = RunContext::new(
+                session_id,
+                RunId::new(),
+                "solo",
+                mode,
+                repo.path(),
+                repo.path(),
+            )
+            .with_github_repo(RepoId::new("octocat", "hello-world"));
+            let offered = runtime.offered_tool_names(&run);
+            let mut advertised: Vec<String> = runtime
+                .advertised_tool_definitions(&run)
+                .iter()
+                .map(|d| d.name.clone())
+                .collect();
+            let mut sorted = offered.clone();
+            advertised.sort();
+            sorted.sort();
+            assert_eq!(advertised, sorted, "advertised ≡ offered in {mode:?}");
+            offered
+        };
+
+        let build = names(AgentMode::Build);
+        assert!(
+            build.iter().any(|n| n == GetPullRequest::NAME)
+                && build.iter().any(|n| n == WebSearch::NAME)
+                && build.iter().any(|n| n == "mcp.fake.search"),
+            "Build offers every wired family: {build:?}"
+        );
+
+        for mode in [AgentMode::Plan, AgentMode::Review] {
+            let offered = names(mode);
+            assert!(
+                !offered
+                    .iter()
+                    .any(|n| n.starts_with("github.") || n == WebSearch::NAME),
+                "{mode:?} drops the network family: {offered:?}"
+            );
+            assert!(
+                offered.iter().any(|n| n == "mcp.fake.search"),
+                "{mode:?} keeps mcp.* (commands are allowed): {offered:?}"
+            );
+        }
+        for mode in [AgentMode::Ask, AgentMode::Explore] {
+            let offered = names(mode);
+            assert!(
+                !offered
+                    .iter()
+                    .any(|n| n.starts_with("github.") || n == WebSearch::NAME),
+                "{mode:?} drops the network family: {offered:?}"
+            );
+            assert!(
+                !offered.iter().any(|n| n.starts_with("mcp.")),
+                "{mode:?} drops the MCP family (commands are denied): {offered:?}"
+            );
+        }
     }
 
     /// The other half of FIX 1: a real workflow agent node (a wired blackboard

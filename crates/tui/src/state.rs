@@ -162,6 +162,14 @@ pub enum Overlay {
     /// [`Overlay::ModelPicker`]. `Enter` (or `Tab`) begins the add-model flow
     /// for the focused provider (model-discovery).
     ProviderPicker { query: String, selected: usize },
+    /// The mode picker (PR C2 — plan mode): a fuzzy-filterable list of the
+    /// submission modes for the next run (see [`MODE_CARDS`]), opened from the
+    /// command palette's `/mode` entry. `query` filters by label/summary
+    /// substring; `selected` indexes the filtered results (reset to 0 whenever
+    /// the query changes) — the same shape as [`Overlay::ModelPicker`].
+    /// `Enter` sets [`AppState::default_mode`]; the current default is marked
+    /// in the list.
+    ModePicker { query: String, selected: usize },
     /// Add-model flow, free-text fallback (step 2): the provider-side model name,
     /// for the catalog provider chosen in step 1 (`provider_id`). `requires_key`
     /// was read from that provider's card. `api_key`:
@@ -830,6 +838,71 @@ pub(crate) fn filter_providers(providers: &[ProviderCard], query: &str) -> Vec<u
         .collect()
 }
 
+/// One row of the `/mode` picker (PR C2 — plan mode): a submission mode the
+/// operator can pick for the next run. The table is static — the mode set is a
+/// protocol enum, not configured data — so "current" is not a field here
+/// either: the picker marks the row whose `mode` equals
+/// [`AppState::default_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ModeCard {
+    /// The mode `Enter` stages on [`AppState::default_mode`].
+    pub mode: AgentMode,
+    /// The row's display label (also the status line's `next` field).
+    pub label: &'static str,
+    /// A one-line summary of what the mode permits, shown under the label.
+    pub summary: &'static str,
+}
+
+/// The modes the `/mode` picker offers, in presentation order (the read-only
+/// modes first, Build last-but-one so the read-only default-adjacent modes
+/// read top-down). Summaries mirror the policy overlay each mode maps to.
+pub(crate) const MODE_CARDS: &[ModeCard] = &[
+    ModeCard {
+        mode: AgentMode::Ask,
+        label: "Ask",
+        summary: "read-only Q&A — no writes, commands, or network",
+    },
+    ModeCard {
+        mode: AgentMode::Explore,
+        label: "Explore",
+        summary: "read-only investigation — no writes, commands, or network",
+    },
+    ModeCard {
+        mode: AgentMode::Plan,
+        label: "Plan",
+        summary: "investigate read-only, then finish with a numbered implementation plan",
+    },
+    ModeCard {
+        mode: AgentMode::Build,
+        label: "Build",
+        summary: "full worktree access — writes, commands, and network (the default)",
+    },
+    ModeCard {
+        mode: AgentMode::Review,
+        label: "Review",
+        summary: "read-only verification with commands — no writes or network",
+    },
+];
+
+/// The indices into [`MODE_CARDS`] whose label or summary case-insensitively
+/// contains `query` — the mode picker's substring filter, in table order.
+/// Mirrors [`filter_models`], adapted to a static table (no state list to
+/// borrow). An empty query matches every mode.
+#[must_use]
+pub(crate) fn filter_modes(query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    MODE_CARDS
+        .iter()
+        .enumerate()
+        .filter(|(_, card)| {
+            needle.is_empty()
+                || card.label.to_lowercase().contains(&needle)
+                || card.summary.to_lowercase().contains(&needle)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 /// Ceiling on retained transcript entries per run (the ledger is the durable
 /// record; this is a bounded view for an in-terminal scrollback).
 pub(crate) const MAX_TRANSCRIPT_ENTRIES: usize = 2000;
@@ -1078,13 +1151,14 @@ impl AppState {
             | Overlay::AddModelKey { .. }
             | Overlay::AddModelProviderKey { .. } => InputMode::Editing,
             Overlay::ConfirmCancel => InputMode::Confirm,
-            // The palette, the model picker, the provider picker, and the
-            // add-model pick-list all filter on printable keys while staying
-            // arrow-navigable, so they share this input mode (see
+            // The palette, the model picker, the provider picker, the mode
+            // picker, and the add-model pick-list all filter on printable keys
+            // while staying arrow-navigable, so they share this input mode (see
             // [`crate::input::map_palette_key`]).
             Overlay::Palette { .. }
             | Overlay::ModelPicker { .. }
             | Overlay::ProviderPicker { .. }
+            | Overlay::ModePicker { .. }
             | Overlay::AddModelPick { .. } => InputMode::Palette,
             // The Skills / Memory / Docs / Edges / Workflow / Help browsers are
             // navigable with the arrow/command key table, so they stay in `Normal`

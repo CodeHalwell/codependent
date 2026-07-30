@@ -17,6 +17,10 @@
 //!   dependency), per-server lazy spawn behind the [`mcp::McpBridge`] trait the
 //!   runtime consumes. Returned tool content is untrusted evidence, sanitized
 //!   in the runtime.
+//! - [`search`] — web search (PR C1): the [`search::SearchApi`] trait plus a
+//!   bounded `reqwest` Tavily client, with the key brokered opaquely from
+//!   `TAVILY_API_KEY` and all returned content sanitized as untrusted evidence
+//!   in the runtime.
 //!
 //! It depends only on the protocol crate and external crates; the assembly
 //! layer (`codypendentd`) wires the GitHub client into the tool layer and the
@@ -27,4 +31,5 @@ pub mod acp_client;
 pub mod github;
 pub mod ide;
 pub mod mcp;
+pub mod search;
 pub mod webhook;
