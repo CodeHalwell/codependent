@@ -1586,7 +1586,12 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(inner);
 
-    // Left: the item list (name + scope · trust · status).
+    // Left: the item list (name + scope · trust · status). Each row is 2 lines
+    // tall; window the list around the selected skill so a long registry scrolls.
+    const ROW_LINES: usize = 2;
+    let list_area = cols[0];
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(state.selected_skill, state.skills.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.skills.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -1594,7 +1599,7 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (idx, skill) in state.skills.iter().enumerate() {
+    for (idx, skill) in state.skills.iter().enumerate().skip(first) {
         let selected = idx == state.selected_skill;
         let marker = if selected { "› " } else { "  " };
         let head = Line::from(vec![
@@ -1617,7 +1622,7 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     }
     frame.render_widget(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
-        cols[0],
+        list_area,
     );
 
     // Right: the detail panel for the focused skill.
@@ -1689,6 +1694,21 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     );
 }
 
+/// The first row to render so `selected` stays visible in a list viewport that
+/// fits `visible_rows` rows. The knowledge/model/provider browsers hold no
+/// scroll state, so this is recomputed each frame from `selected` alone: it
+/// keeps the selection roughly centered (scrolling only enough to reveal it,
+/// pinned at the ends). Without it a stateless [`List`] renders from row 0 and
+/// the selection walks off the bottom of a long catalog while the detail pane
+/// (which reads the index) keeps updating — the "it doesn't scroll" bug.
+fn first_visible_row(selected: usize, total: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 || total <= visible_rows {
+        return 0;
+    }
+    let max_first = total - visible_rows;
+    selected.saturating_sub(visible_rows / 2).min(max_first)
+}
+
 /// The model picker (MP1): a filter line (the command-palette shape) over a
 /// two-column list+detail view (the [`render_skills`] template) — the
 /// selectable models on the left (current run's serving model marked), and a
@@ -1751,7 +1771,12 @@ fn render_model_picker(
     let current = state.selected_run().and_then(|run| run.model.as_ref());
 
     // Left: the filtered model list (id, current marker, provider + badges).
+    // Each row is 3 lines tall; window the list around `selected` so it scrolls.
+    const ROW_LINES: usize = 3;
+    let list_area = cols[0];
     let matches = filter_models(&state.models, query);
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.models.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -1764,7 +1789,7 @@ fn render_model_picker(
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (row, &idx) in matches.iter().enumerate() {
+    for (row, &idx) in matches.iter().enumerate().skip(first) {
         let card = &state.models[idx];
         let is_selected = row == selected;
         let is_current = current == Some(&card.id);
@@ -1802,13 +1827,13 @@ fn render_model_picker(
     }
     frame.render_widget(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
-        cols[0],
+        list_area,
     );
-    // Each row is a fixed 3 lines tall (head/provider/badges) — register a
-    // rect of that height per filtered row so a click maps to the right index.
-    let list_area = cols[0];
-    for (row, _) in matches.iter().enumerate() {
-        let y = list_area.y + (row as u16) * 3;
+    // Each visible row is a fixed 3 lines tall (head/provider/badges) — register
+    // a rect of that height per rendered row (offset by the scroll window) so a
+    // click maps to the right index even after the list has scrolled.
+    for (row, _) in matches.iter().enumerate().skip(first) {
+        let y = list_area.y + ((row - first) as u16) * ROW_LINES as u16;
         if y >= list_area.y + list_area.height {
             break;
         }
@@ -1817,7 +1842,7 @@ fn render_model_picker(
                 x: list_area.x,
                 y,
                 width: list_area.width,
-                height: 3,
+                height: ROW_LINES as u16,
             },
             Action::ActivateRow(row),
         );
@@ -1987,8 +2012,13 @@ fn render_provider_picker(
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(rows[1]);
 
-    // Left: the filtered provider list (id, name + badges).
+    // Left: the filtered provider list (id, name + badges). Each row is 4 lines
+    // tall; window the list around `selected` so a long catalog scrolls.
+    const ROW_LINES: usize = 4;
+    let list_area = cols[0];
     let matches = filter_providers(&state.providers, query);
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.providers.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -2001,7 +2031,7 @@ fn render_provider_picker(
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (row, &idx) in matches.iter().enumerate() {
+    for (row, &idx) in matches.iter().enumerate().skip(first) {
         let card = &state.providers[idx];
         let is_selected = row == selected;
         let head = Line::from(vec![
@@ -2040,13 +2070,13 @@ fn render_provider_picker(
     }
     frame.render_widget(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
-        cols[0],
+        list_area,
     );
-    // Each row is a fixed 4 lines tall (head/name/badges/auth) — register a
-    // rect of that height per filtered row so a click maps to the right index.
-    let list_area = cols[0];
-    for (row, _) in matches.iter().enumerate() {
-        let y = list_area.y + (row as u16) * 4;
+    // Each visible row is a fixed 4 lines tall (head/name/badges/auth) —
+    // register a rect of that height per rendered row (offset by the scroll
+    // window) so a click maps to the right index even after the list scrolled.
+    for (row, _) in matches.iter().enumerate().skip(first) {
+        let y = list_area.y + ((row - first) as u16) * ROW_LINES as u16;
         if y >= list_area.y + list_area.height {
             break;
         }
@@ -2055,7 +2085,7 @@ fn render_provider_picker(
                 x: list_area.x,
                 y,
                 width: list_area.width,
-                height: 4,
+                height: ROW_LINES as u16,
             },
             Action::ActivateRow(row),
         );
@@ -2172,7 +2202,12 @@ fn render_memory(
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(inner);
 
-    // Left: the memory list (statement + class · scope).
+    // Left: the memory list (statement + class · scope). Each row is 2 lines
+    // tall; window the list around the selected memory so a long scope scrolls.
+    const ROW_LINES: usize = 2;
+    let list_area = cols[0];
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(state.selected_memory, state.memories.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.memories.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -2180,7 +2215,7 @@ fn render_memory(
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (idx, memory) in state.memories.iter().enumerate() {
+    for (idx, memory) in state.memories.iter().enumerate().skip(first) {
         let selected = idx == state.selected_memory;
         let marker = if selected { "› " } else { "  " };
         let head = Line::from(vec![
@@ -2203,7 +2238,7 @@ fn render_memory(
     }
     frame.render_widget(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
-        cols[0],
+        list_area,
     );
 
     // Right: the provenance card for the focused memory.
@@ -2299,7 +2334,13 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
         .split(inner);
 
-    // Left: the document tree (title + scope · status · mode).
+    // Left: the document tree (title + scope · status · mode). Each row is 2
+    // lines tall; window the tree around the selected document so a large
+    // repository scrolls.
+    const ROW_LINES: usize = 2;
+    let list_area = cols[0];
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(state.selected_doc, state.docs.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.docs.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -2307,7 +2348,7 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (idx, doc) in state.docs.iter().enumerate() {
+    for (idx, doc) in state.docs.iter().enumerate().skip(first) {
         let selected = idx == state.selected_doc;
         let marker = if selected { "› " } else { "  " };
         let head = Line::from(vec![
@@ -2330,7 +2371,7 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
     frame.render_widget(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
-        cols[0],
+        list_area,
     );
 
     // Right: the editor rail (blocks) over the review rail (suggestions).
@@ -2487,7 +2528,12 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
         .split(inner);
 
-    // Left: the edge list (relation, then from → to).
+    // Left: the edge list (relation, then from → to). Each row is 2 lines tall;
+    // window it around the selected edge so a large graph scrolls.
+    const ROW_LINES: usize = 2;
+    let list_area = cols[0];
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(state.selected_edge, state.edges.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.edges.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -2495,7 +2541,7 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (idx, edge) in state.edges.iter().enumerate() {
+    for (idx, edge) in state.edges.iter().enumerate().skip(first) {
         let selected = idx == state.selected_edge;
         let marker = if selected { "› " } else { "  " };
         let head = Line::from(vec![
@@ -2608,7 +2654,15 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     // Left: the node list, in topological order. A workflow-label header is
     // folded into the first node of each group so item↔card stays 1:1 (the
     // selection indexes `state.workflow` directly) while the graph still reads
-    // as grouped when a repository declares more than one workflow.
+    // as grouped when a repository declares more than one workflow. Each node's
+    // own row is 2 lines (id/state, then action); the extra group-header line
+    // only appears once per workflow, so 2 is the row height used to window the
+    // list around the selected node (an approximation at group boundaries — the
+    // same trade-off as centering rather than pixel-exact scrolling).
+    const ROW_LINES: usize = 2;
+    let list_area = cols[0];
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(state.selected_node, state.workflow.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.workflow.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -2617,7 +2671,7 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         )));
     }
     let mut previous_workflow: Option<&str> = None;
-    for (idx, node) in state.workflow.iter().enumerate() {
+    for (idx, node) in state.workflow.iter().enumerate().skip(first) {
         let selected = idx == state.selected_node;
         let marker = if selected { "› " } else { "  " };
         let mut lines: Vec<Line> = Vec::new();
@@ -2655,7 +2709,7 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     }
     frame.render_widget(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
-        cols[0],
+        list_area,
     );
 
     // Right: the detail for the focused node — the exit-criterion payload
@@ -2765,6 +2819,14 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
 
     // Left: the artifact list, grouped by run (the run header is folded into the
     // first item of each group so item↔card stays 1:1 with the selection index).
+    // Each artifact's own row is 2 lines (kind, then summary); the extra
+    // group-header line only appears once per run, so 2 is the row height used
+    // to window the list around the selected item (an approximation at group
+    // boundaries, mirroring the workflow browser's node list).
+    const ROW_LINES: usize = 2;
+    let list_area = cols[0];
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(state.selected_item, state.blackboard.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.blackboard.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -2773,7 +2835,7 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         )));
     }
     let mut previous_run: Option<&str> = None;
-    for (idx, card) in state.blackboard.iter().enumerate() {
+    for (idx, card) in state.blackboard.iter().enumerate().skip(first) {
         let selected = idx == state.selected_item;
         let marker = if selected { "› " } else { "  " };
         let mut lines: Vec<Line> = Vec::new();
@@ -2814,7 +2876,7 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     }
     frame.render_widget(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
-        cols[0],
+        list_area,
     );
 
     // Right: the detail for the focused artifact — kind, author, confidence, the
@@ -2981,6 +3043,14 @@ fn render_palette(
     let desc_w = inner_w.saturating_sub(2 + title_w + 1 + key_w).max(1);
     let show_groups = query.trim().is_empty();
 
+    // Each command row is 1 line tall (a group label, when shown, is another
+    // single line); window the list around `selected` so a long, filtered-open
+    // palette scrolls instead of walking the selection off-screen.
+    const ROW_LINES: usize = 1;
+    let list_area = rows[1];
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
+
     let mut items: Vec<ListItem> = Vec::new();
     if matches.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -2989,7 +3059,7 @@ fn render_palette(
         )));
     }
     let mut last_group: Option<&str> = None;
-    for (idx, entry) in matches.iter().enumerate() {
+    for (idx, entry) in matches.iter().enumerate().skip(first) {
         if show_groups && last_group != Some(entry.group) {
             items.push(ListItem::new(Line::styled(
                 format!("  {}", entry.group),
@@ -3036,13 +3106,13 @@ fn render_palette(
         rows[1],
     );
 
-    // Register each selectable row's rect for clicks, re-walking `matches` in
-    // the same order `items` was built so a (non-clickable) group label row
-    // shifts the screen offset exactly as it did above.
-    let list_area = rows[1];
+    // Register each selectable row's rect for clicks, re-walking `matches` from
+    // the same `first` offset the rendered `items` started at (skip + a fresh
+    // `last_group`) so a (non-clickable) group label row shifts the screen
+    // offset exactly as it did above, even after the list has scrolled.
     let mut y = list_area.y;
     let mut last_group: Option<&str> = None;
-    for (fi, entry) in matches.iter().enumerate() {
+    for (fi, entry) in matches.iter().enumerate().skip(first) {
         if show_groups && last_group != Some(entry.group) {
             y = y.saturating_add(1); // the (non-clickable) group label row
             last_group = Some(entry.group);
@@ -3717,6 +3787,35 @@ mod tests {
     use super::*;
     use crate::action::Action;
     use crate::reduce::reduce;
+
+    #[test]
+    fn first_visible_row_keeps_the_selection_in_view() {
+        // Fits entirely: never scrolls.
+        assert_eq!(first_visible_row(0, 5, 10), 0);
+        assert_eq!(first_visible_row(4, 5, 10), 0);
+        // Degenerate viewport: no scroll.
+        assert_eq!(first_visible_row(9, 40, 0), 0);
+
+        // A long list (40 items, 10 visible). The selection stays within the
+        // rendered window [first, first + visible) for EVERY position — the
+        // property that was violated before (selection walked off the bottom).
+        let total = 40;
+        let visible = 10;
+        for selected in 0..total {
+            let first = first_visible_row(selected, total, visible);
+            assert!(
+                selected >= first && selected < first + visible,
+                "selected {selected} must be visible in [{first}, {})",
+                first + visible
+            );
+            // Never scrolls past the final full window.
+            assert!(first <= total - visible, "first {first} overshoots the end");
+        }
+        // Near the top it pins to 0; centered in the middle; pinned at the end.
+        assert_eq!(first_visible_row(0, 40, 10), 0);
+        assert_eq!(first_visible_row(20, 40, 10), 15); // centered (20 - 10/2)
+        assert_eq!(first_visible_row(39, 40, 10), 30); // pinned to last window
+    }
     use crate::state::{MemoryCard, ModelCard, ModelLocationLabel, Pane, SkillCard};
     use chrono::Utc;
     use codypendent_protocol::{
