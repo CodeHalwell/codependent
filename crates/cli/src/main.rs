@@ -187,6 +187,18 @@ enum TopCommand {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Diagnose the local setup: binary + build id, daemon health, runtime
+    /// paths, model config, and provider reachability. Read-only. Exits
+    /// non-zero if any check FAILS.
+    Doctor {
+        /// Emit a structured JSON report instead of the human checklist.
+        #[arg(long)]
+        json: bool,
+        /// Probe hosted providers too (a bare TCP connect to host:port), not
+        /// just local model servers.
+        #[arg(long)]
+        deep: bool,
+    },
 }
 
 /// The IDEs `codypendent open --in <IDE>` knows how to launch.
@@ -752,6 +764,16 @@ async fn main() -> anyhow::Result<()> {
             // drift from the real CLI. No daemon, no I/O beyond stdout.
             commands::completion(shell, &mut Cli::command());
             Ok(())
+        }
+        TopCommand::Doctor { json, deep } => {
+            // `doctor` returns whether all checks passed; the exit-1-on-failure
+            // decision lives here (the library never calls `std::process::exit`).
+            let healthy = codypendent_cli::doctor::run(&paths, json, deep).await?;
+            if healthy {
+                Ok(())
+            } else {
+                std::process::exit(1);
+            }
         }
     }
 }
