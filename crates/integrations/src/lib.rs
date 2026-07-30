@@ -12,6 +12,11 @@
 //! - [`ide`] — the IDE bridge contract ([`ide::IdeBridge`]) and source-provenance
 //!   resolution that prefers an unsaved editor buffer over the filesystem when
 //!   their digests diverge.
+//! - [`mcp`] — the hand-rolled MCP (Model Context Protocol) *client* for stdio
+//!   servers: the `mcp.toml` loader, an ndjson JSON-RPC layer (no new external
+//!   dependency), per-server lazy spawn behind the [`mcp::McpBridge`] trait the
+//!   runtime consumes. Returned tool content is untrusted evidence, sanitized
+//!   in the runtime.
 //!
 //! It depends only on the protocol crate and external crates; the assembly
 //! layer (`codypendentd`) wires the GitHub client into the tool layer and the
@@ -21,4 +26,5 @@ pub mod acp;
 pub mod acp_client;
 pub mod github;
 pub mod ide;
+pub mod mcp;
 pub mod webhook;
