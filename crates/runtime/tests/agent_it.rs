@@ -20,6 +20,7 @@ use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT};
 use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::{ledger, projections};
 use codypendent_integrations::github::{model, GitHubApi, GitHubError, RepoId};
+use codypendent_integrations::mcp::{McpBridge, McpError, McpToolInfo};
 use codypendent_protocol::{
     Actor, AgentMode, ApprovalDecision, ApprovalScope, BlackboardItemView, DataClassification,
     EventBody, ProposedAction, RunDisposition, RunId, RunState, SessionEvent, SessionId,
@@ -1320,7 +1321,7 @@ impl codypendent_runtime::agent::ModelDriver for CapturingDriver {
     async fn next_step(
         &self,
         transcript: &[codypendent_runtime::agent::TurnItem],
-        _offered_tools: &[&str],
+        _tools: &[codypendent_runtime::agent::ToolDefinition],
         sink: &mut dyn codypendent_runtime::agent::DeltaSink,
     ) -> anyhow::Result<StepOutcome> {
         *self.seen.lock().unwrap() = transcript.to_vec();
@@ -2131,14 +2132,14 @@ async fn blackboard_tools_are_offered_only_inside_a_workflow_run() {
 
     let solo_tools = runtime.offered_tool_names(&single);
     assert!(
-        !solo_tools.contains(&BlackboardPostTool::NAME)
-            && !solo_tools.contains(&BlackboardQueryTool::NAME),
+        !solo_tools.iter().any(|n| n == BlackboardPostTool::NAME)
+            && !solo_tools.iter().any(|n| n == BlackboardQueryTool::NAME),
         "a single-agent run is not offered the blackboard tools: {solo_tools:?}"
     );
     let node_tools = runtime.offered_tool_names(&node);
     assert!(
-        node_tools.contains(&BlackboardPostTool::NAME)
-            && node_tools.contains(&BlackboardQueryTool::NAME),
+        node_tools.iter().any(|n| n == BlackboardPostTool::NAME)
+            && node_tools.iter().any(|n| n == BlackboardQueryTool::NAME),
         "a workflow node is offered the blackboard tools: {node_tools:?}"
     );
 
@@ -2200,4 +2201,355 @@ async fn blackboard_tools_are_offered_only_inside_a_workflow_run() {
         post_failed_unknown,
         "the single-agent blackboard.post call must be refused as unknown"
     );
+}
+
+// --- PR B: MCP client tools through the gated loop -------------------------
+
+/// An in-memory stub bridge (no processes): a fixed offered-tool cache and a
+/// scripted result string. The registry's own duplex tests cover the wire.
+struct StubMcpBridge {
+    tools: Vec<McpToolInfo>,
+    result: String,
+}
+
+impl StubMcpBridge {
+    /// A warm bridge offering `mcp.fake.search`, returning `result` per call.
+    fn warm(result: &str) -> Self {
+        Self {
+            tools: vec![McpToolInfo {
+                server: "fake".to_string(),
+                name: "search".to_string(),
+                description: "search things".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}}
+                }),
+            }],
+            result: result.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl McpBridge for StubMcpBridge {
+    fn offered_tools(&self) -> Vec<McpToolInfo> {
+        self.tools.clone()
+    }
+
+    async fn call_tool(
+        &self,
+        _server: &str,
+        _tool: &str,
+        _args: serde_json::Value,
+    ) -> Result<String, McpError> {
+        Ok(self.result.clone())
+    }
+}
+
+/// Drive a run of `steps` against a warm stub MCP bridge under `policy`,
+/// resolving any parked approval with `decision` at `scope` (the deny path
+/// emits no `ToolProposed`, so resolution simply never fires there). Returns
+/// the temp dir (kept alive so the DB survives), the published events, the
+/// transcript the driver last observed (so a test can inspect the observation
+/// the model was fed back), and how many approvals the test ACTUALLY resolved —
+/// a Run-scoped auto-approval arrives already resolved, so it never counts.
+async fn run_mcp(
+    policy: PolicyEngine,
+    bridge_result: &str,
+    steps: Vec<ModelStep>,
+    decision: ApprovalDecision,
+    scope: ApprovalScope,
+) -> (
+    tempfile::TempDir,
+    Vec<SessionEvent>,
+    Vec<codypendent_runtime::agent::TurnItem>,
+    usize,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(dir.path()).unwrap();
+    let pool = open_database(&dir.path().join("db.sqlite")).await.unwrap();
+    let store = ArtifactStore::new(dir.path().join("artifacts"));
+    let broker = ApprovalBroker::new();
+    let hub = SubscriptionHub::new();
+
+    let session = SessionId::new();
+    let run = RunId::new();
+    ledger::create_session(&pool, session, "mcp-it")
+        .await
+        .unwrap();
+    seed_started_run!(pool, session, run, "search", AgentMode::Build);
+
+    let runtime = {
+        let journal = run_journal!(pool, broker);
+        let sink: Box<dyn ArtifactSink> = Box::new(store_sink!(store, pool));
+        FrameworkAgentRuntime::new(
+            ModelRegistry::new(Vec::new()),
+            policy,
+            broker.clone(),
+            hub.clone(),
+            journal,
+            sink,
+        )
+        .with_mcp(Arc::new(StubMcpBridge::warm(bridge_result)))
+    };
+
+    let mut rx = hub.subscribe(session);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let driver = CapturingDriver {
+        steps: std::sync::Mutex::new(steps.into_iter().collect()),
+        seen: seen.clone(),
+    };
+    let ctx = RunContext::new(session, run, "search", AgentMode::Build, repo.clone(), repo);
+
+    let handle = tokio::spawn(async move {
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+    });
+
+    let mut events = Vec::new();
+    let mut resolved = 0usize;
+    loop {
+        let event = rx.recv().await.expect("event");
+        let done = matches!(event.body, EventBody::RunCompleted { .. });
+        if let EventBody::ToolProposed { approval_id, .. } = &event.body {
+            match broker
+                .resolve(&pool, *approval_id, decision, scope, "tester".to_string())
+                .await
+            {
+                Ok(_) => resolved += 1,
+                // Run-scoped auto-approval: the broker resolved the repeat at
+                // `request` time (resolved_by `auto:run-scope`), so there is
+                // nothing left for the approver to do — and no park happened.
+                Err(codypendent_daemon::approvals::ApprovalError::AlreadyResolved { .. }) => {}
+                Err(error) => panic!("approval resolution failed: {error}"),
+            }
+        }
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    handle.await.unwrap().unwrap();
+    let transcript = seen.lock().unwrap().clone();
+    (dir, events, transcript, resolved)
+}
+
+/// The observation a completed `tool` call fed back into the transcript.
+fn mcp_observation(
+    transcript: &[codypendent_runtime::agent::TurnItem],
+    tool: &str,
+) -> Option<String> {
+    transcript.iter().find_map(|item| match item {
+        codypendent_runtime::agent::TurnItem::ToolResult {
+            tool: t, output, ..
+        } if t == tool => Some(output.clone()),
+        _ => None,
+    })
+}
+
+/// PR B, the happy path: the default policy gates the MCP call
+/// (RequireApproval), the run parks on an `McpToolCall` proposal, approval lets
+/// it execute, and the result reaches the transcript ONLY as a sanitized,
+/// origin-labeled evidence block — ANSI/control characters stripped, never raw.
+#[tokio::test]
+async fn mcp_tool_call_parks_for_approval_then_executes_sanitized() {
+    let (_dir, events, transcript, resolved) = run_mcp(
+        PolicyEngine::with_defaults(),
+        "hits: \x1b[31mred\x1b[0m\x07 done",
+        vec![
+            ModelStep::CallTool {
+                tool: "mcp.fake.search".to_string(),
+                args: json!({"q": "x"}),
+            },
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ],
+        ApprovalDecision::Approve,
+        ApprovalScope::Once,
+    )
+    .await;
+
+    match first_proposed_action(&events) {
+        Some(ProposedAction::McpToolCall {
+            server,
+            tool,
+            summary,
+            args,
+        }) => {
+            assert_eq!(server, "fake");
+            assert_eq!(tool, "search");
+            assert_eq!(args, "{\"q\":\"x\"}", "canonical args on the action");
+            assert!(
+                summary.contains("fake.search("),
+                "the card summary names the call: {summary}"
+            );
+        }
+        other => panic!("expected an McpToolCall proposal, got {other:?}"),
+    }
+    assert_eq!(resolved, 1, "the parked approval was resolved by the test");
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.body,
+            EventBody::ToolCompleted {
+                tool,
+                outcome: ToolOutcome::Succeeded,
+                ..
+            } if tool == "mcp.fake.search"
+        )),
+        "the approved call executed"
+    );
+
+    let observation =
+        mcp_observation(&transcript, "mcp.fake.search").expect("a tool result was fed back");
+    assert!(
+        observation.starts_with("[untrusted output from mcp:fake]\n"),
+        "the sanitizer's evidence framing: {observation:?}"
+    );
+    assert!(
+        observation.contains("hits: red done"),
+        "content survives sanitization: {observation:?}"
+    );
+    assert!(
+        !observation.contains('\x1b') && !observation.contains('\x07'),
+        "ANSI/control characters are stripped: {observation:?}"
+    );
+}
+
+/// PR B: with the first approval granted at Run scope, an identical second call
+/// — args keys in a DIFFERENT order — canonicalizes to the same action digest
+/// and auto-approves: the test resolves exactly ONE approval (the repeat is
+/// broker-resolved as `auto:run-scope`, never parked on a human), and both
+/// calls execute.
+#[tokio::test]
+async fn mcp_identical_repeat_auto_approves_under_run_scope_despite_key_order() {
+    let (_dir, events, _transcript, resolved) = run_mcp(
+        PolicyEngine::with_defaults(),
+        "ok",
+        vec![
+            ModelStep::CallTool {
+                tool: "mcp.fake.search".to_string(),
+                args: json!({"a": 1, "q": "x"}),
+            },
+            ModelStep::CallTool {
+                tool: "mcp.fake.search".to_string(),
+                args: json!({"q": "x", "a": 1}),
+            },
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ],
+        ApprovalDecision::Approve,
+        ApprovalScope::Run,
+    )
+    .await;
+
+    assert_eq!(
+        resolved, 1,
+        "the key-reordered identical repeat digests the same and auto-approves — \
+         only the FIRST call parked on a human resolution"
+    );
+    let completions = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.body,
+                EventBody::ToolCompleted {
+                    tool,
+                    outcome: ToolOutcome::Succeeded,
+                    ..
+                } if tool == "mcp.fake.search"
+            )
+        })
+        .count();
+    assert_eq!(completions, 2, "both calls executed");
+}
+
+/// PR B: a policy-denied server never reaches the approval gate — the
+/// observation is the legible `policy denied` refusal.
+#[tokio::test]
+async fn mcp_denied_server_never_parks_and_reports_policy_denied() {
+    let policy_dir = tempfile::tempdir().unwrap();
+    let policy_path = policy_dir.path().join("policy.toml");
+    std::fs::write(&policy_path, "[mcp.servers]\nfake = \"deny\"\n").unwrap();
+    let policy = PolicyEngine::load(Some(&policy_path), None).unwrap();
+
+    let (_dir, events, transcript, _resolved) = run_mcp(
+        policy,
+        "unreachable",
+        vec![
+            ModelStep::CallTool {
+                tool: "mcp.fake.search".to_string(),
+                args: json!({"q": "x"}),
+            },
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ],
+        ApprovalDecision::Approve,
+        ApprovalScope::Once,
+    )
+    .await;
+
+    assert!(
+        first_proposed_action(&events).is_none(),
+        "a denied call must never park for approval"
+    );
+    let denial = events
+        .iter()
+        .find_map(|e| match &e.body {
+            EventBody::ToolCompleted {
+                tool,
+                outcome: ToolOutcome::Failed { message },
+                ..
+            } if tool == "mcp.fake.search" => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the call completed as a policy denial");
+    assert!(
+        denial.starts_with("policy denied"),
+        "the legible refusal: {denial}"
+    );
+    assert!(
+        mcp_observation(&transcript, "mcp.fake.search")
+            .is_some_and(|text| text.starts_with("policy denied")),
+        "the denial is what the model is fed back"
+    );
+}
+
+/// PR B: a call to a server.tool pair the bridge does NOT currently offer (a
+/// cold server, or a tool `tools/list` never returned) is the SAME unknown-tool
+/// refusal the offering gate implies — offered ≡ dispatchable.
+#[tokio::test]
+async fn mcp_call_the_bridge_does_not_offer_is_an_unknown_tool() {
+    let (_dir, events, _transcript, _resolved) = run_mcp(
+        PolicyEngine::with_defaults(),
+        "unreachable",
+        vec![
+            ModelStep::CallTool {
+                tool: "mcp.fake.nonexistent".to_string(),
+                args: json!({}),
+            },
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ],
+        ApprovalDecision::Approve,
+        ApprovalScope::Once,
+    )
+    .await;
+
+    let failure = events
+        .iter()
+        .find_map(|e| match &e.body {
+            EventBody::ToolCompleted {
+                tool,
+                outcome: ToolOutcome::Failed { message },
+                ..
+            } if tool == "mcp.fake.nonexistent" => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the call completed as a refusal");
+    assert_eq!(failure, "unknown tool `mcp.fake.nonexistent`");
 }

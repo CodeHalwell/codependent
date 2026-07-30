@@ -2422,7 +2422,7 @@ mod tests {
     use codypendent_daemon::workflows::{StartWorkflowRequest, WorkflowStarter};
     use codypendent_protocol::ClientId;
     use codypendent_runtime::agent::{
-        DeltaSink, ModelStep, ModelUsage, ScriptedDriver, StepOutcome,
+        DeltaSink, ModelStep, ModelUsage, ScriptedDriver, StepOutcome, ToolDefinition,
     };
     use codypendent_workflow::{
         compile_yaml, NodeState, WorkflowConductor, WorkflowRunState, REPAIR_GITHUB_CHECK_ID,
@@ -2515,7 +2515,7 @@ mod tests {
         async fn next_step(
             &self,
             _transcript: &[codypendent_runtime::agent::TurnItem],
-            _offered_tools: &[&str],
+            _tools: &[ToolDefinition],
             sink: &mut dyn DeltaSink,
         ) -> anyhow::Result<StepOutcome> {
             let step = if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {

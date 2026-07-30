@@ -62,7 +62,17 @@ use codypendent_protocol::{
 
 use codypendent_integrations::github::{GitHubApi, GitHubError, RepoId};
 use codypendent_integrations::ide::digest_bytes;
+use codypendent_integrations::mcp::{McpBridge, McpError};
 use codypendent_protocol::ide::{DirtyBufferDigest, SourceProvenance};
+// THE untrusted-content chokepoint for MCP tool results (PR B): every byte a
+// server returns passes through `sanitize_untrusted` before it can enter the
+// model's observation stream — never raw.
+use codypendent_sandbox::sanitize_untrusted;
+
+/// The tool definition the loop hands a [`ModelDriver`] to advertise
+/// (re-exported so test doubles in downstream crates — which do not depend on
+/// `agent-framework-core` directly — can name the trait's parameter type).
+pub use agent_framework_core::tools::ToolDefinition;
 
 use crate::blackboard::{BlackboardChannel, BlackboardChannelError, BlackboardPost};
 use crate::models::ModelRegistry;
@@ -489,12 +499,13 @@ pub trait ModelDriver: Send + Sync {
     fn model_id(&self) -> ModelId;
 
     /// Given the conversation so far, produce the next step and the MEASURED
-    /// usage for the request that produced it (see [`StepOutcome`]). `offered_tools`
-    /// is the exact tool-name set [`FrameworkAgentRuntime::offered_tool_names`]
-    /// computed for this run (FIX 1: advertise/execute mismatch) — a driver that
-    /// advertises tools to a live provider MUST restrict itself to this set,
-    /// since the loop's `prepare` dispatch gate refuses any call outside it; a
-    /// driver with no provider-facing advertisement (e.g. a scripted test
+    /// usage for the request that produced it (see [`StepOutcome`]). `tools`
+    /// is the exact definition set
+    /// [`FrameworkAgentRuntime::advertised_tool_definitions`] computed for this
+    /// run (FIX 1: advertise/execute mismatch) — a driver that advertises tools
+    /// to a live provider MUST advertise exactly these definitions, since the
+    /// loop's `prepare` dispatch gate refuses any call outside the offered set;
+    /// a driver with no provider-facing advertisement (e.g. a scripted test
     /// driver) may ignore it. A driver that cannot measure usage
     /// returns `usage: None` — never a fabricated zero. As it produces
     /// natural-language text, it pushes each chunk through `sink` (see
@@ -503,7 +514,7 @@ pub trait ModelDriver: Send + Sync {
     async fn next_step(
         &self,
         transcript: &[TurnItem],
-        offered_tools: &[&str],
+        tools: &[ToolDefinition],
         sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome>;
 
@@ -587,7 +598,7 @@ impl ModelDriver for ScriptedDriver {
     async fn next_step(
         &self,
         _transcript: &[TurnItem],
-        _offered_tools: &[&str],
+        _tools: &[ToolDefinition],
         sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome> {
         let step = {
@@ -939,6 +950,11 @@ pub struct FrameworkAgentRuntime {
     /// The GitHub client the `github.*` tools call, if configured. Process-wide
     /// (one daemon token), so it lives on the runtime, not the run context.
     github: Option<Arc<dyn GitHubApi>>,
+    /// The MCP bridge the `mcp.<server>.<tool>` tools dispatch through (PR B —
+    /// MCP client), if any servers are configured. Like `github`, it is
+    /// process-wide (one registry of operator-declared servers), so it lives on
+    /// the runtime, not the run context.
+    mcp: Option<Arc<dyn McpBridge>>,
     /// The blackboard channel the `blackboard.*` tools post to and query, if wired
     /// (Phase 5 STEP 5.3). Present only when the runtime drives workflow agent
     /// nodes; a run is offered the tools only when this is set AND the run carries a
@@ -975,6 +991,7 @@ impl FrameworkAgentRuntime {
             journal,
             sink,
             github: None,
+            mcp: None,
             blackboard: None,
         }
     }
@@ -984,6 +1001,15 @@ impl FrameworkAgentRuntime {
     /// client from the personal-mode token at startup.
     pub fn with_github(mut self, github: Arc<dyn GitHubApi>) -> Self {
         self.github = Some(github);
+        self
+    }
+
+    /// Inject the MCP bridge the `mcp.<server>.<tool>` tools dispatch through
+    /// (PR B — MCP client). Without it those tools are never offered (a cold or
+    /// unconfigured server simply contributes no tool names). The daemon builds
+    /// the registry from the operator-declared `mcp.toml` at startup.
+    pub fn with_mcp(mut self, mcp: Arc<dyn McpBridge>) -> Self {
+        self.mcp = Some(mcp);
         self
     }
 
@@ -1005,13 +1031,16 @@ impl FrameworkAgentRuntime {
     }
 
     /// The tool names offered to `run` — the workspace/git baseline, the `github.*`
-    /// tools when a client is configured, and the `blackboard.*` tools only when
-    /// `run` is a workflow agent node with a wired channel. This is the single
-    /// source of truth the model-facing advertisement and [`prepare`](Self::prepare)
-    /// agree on, so a tool absent here is not dispatchable for the run.
+    /// tools when a client is configured, the `mcp.<server>.<tool>` tools a wired
+    /// MCP bridge currently offers (a cold or failed server contributes none —
+    /// [`McpBridge::offered_tools`] is cache-only), and the `blackboard.*` tools
+    /// only when `run` is a workflow agent node with a wired channel. This is the
+    /// single source of truth the model-facing advertisement and
+    /// [`prepare`](Self::prepare) agree on, so a tool absent here is not
+    /// dispatchable for the run.
     #[must_use]
-    pub fn offered_tool_names(&self, run: &RunContext) -> Vec<&'static str> {
-        let mut names = vec![
+    pub fn offered_tool_names(&self, run: &RunContext) -> Vec<String> {
+        let mut names: Vec<String> = [
             Shell::NAME,
             ReadFile::NAME,
             Search::NAME,
@@ -1031,20 +1060,74 @@ impl FrameworkAgentRuntime {
             // tool node already does. The detected program still goes through
             // the same `shell.run` allow-list + approval gate (see `prepare`).
             RepositoryTest::NAME,
-        ];
+        ]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
         if self.github.is_some() && run.github_repo.is_some() {
-            names.extend_from_slice(&[
-                GetPullRequest::NAME,
-                ListCheckRuns::NAME,
-                CreateDraftPullRequest::NAME,
-                UpdatePullRequestTool::NAME,
-                CreateCheckRunSummary::NAME,
-            ]);
+            names.extend(
+                [
+                    GetPullRequest::NAME,
+                    ListCheckRuns::NAME,
+                    CreateDraftPullRequest::NAME,
+                    UpdatePullRequestTool::NAME,
+                    CreateCheckRunSummary::NAME,
+                ]
+                .iter()
+                .map(|name| (*name).to_string()),
+            );
         }
         if self.offers_blackboard(run) {
-            names.extend_from_slice(&[BlackboardPostTool::NAME, BlackboardQueryTool::NAME]);
+            names.extend(
+                [BlackboardPostTool::NAME, BlackboardQueryTool::NAME]
+                    .iter()
+                    .map(|name| (*name).to_string()),
+            );
+        }
+        if let Some(bridge) = &self.mcp {
+            names.extend(
+                bridge
+                    .offered_tools()
+                    .iter()
+                    .map(|info| format!("mcp.{}.{}", info.server, info.name)),
+            );
         }
         names
+    }
+
+    /// The tool DEFINITIONS advertised to the model for `run` (PR B — MCP
+    /// client): the static catalog filtered to exactly
+    /// [`offered_tool_names`](Self::offered_tool_names) (the FIX 1 projection —
+    /// a name absent there is fail-safe omitted even if the catalog and the
+    /// offered set ever drift), PLUS one definition per tool the MCP bridge
+    /// currently offers, carrying the server-supplied description and
+    /// `inputSchema` VERBATIM. MCP definitions are declaration-only
+    /// (`executor: None`, `ApprovalMode::NeverRequire`) — the loop executes
+    /// them, and the daemon's policy engine (not the framework) gates them.
+    #[must_use]
+    pub fn advertised_tool_definitions(&self, run: &RunContext) -> Vec<ToolDefinition> {
+        use agent_framework_core::tools::{ApprovalMode, ToolKind};
+        let offered = self.offered_tool_names(run);
+        let mut definitions: Vec<ToolDefinition> = static_tool_definitions()
+            .into_iter()
+            .filter(|def| offered.contains(&def.name))
+            .collect();
+        if let Some(bridge) = &self.mcp {
+            definitions.extend(
+                bridge
+                    .offered_tools()
+                    .into_iter()
+                    .map(|info| ToolDefinition {
+                        name: format!("mcp.{}.{}", info.server, info.name),
+                        description: info.description,
+                        parameters: info.input_schema,
+                        kind: ToolKind::Function,
+                        approval_mode: ApprovalMode::NeverRequire,
+                        executor: None,
+                    }),
+            );
+        }
+        definitions
     }
 
     /// The model registry (used by callers to build a [`FrameworkModelDriver`]).
@@ -1195,19 +1278,19 @@ impl FrameworkAgentRuntime {
             let (tx, mut rx) = mpsc::unbounded_channel::<String>();
             let mut sink = ChannelSink { tx };
             let step_result = {
-                // `step_fut` borrows `&transcript`, `&offered_tools`, and
+                // `step_fut` borrows `&transcript`, `&tool_definitions`, and
                 // `&mut sink`; scoping it here releases those borrows before
                 // the `match step` arms below mutate `transcript`. The
                 // `#[async_trait]` future is boxed and `Unpin`, so `&mut
                 // step_fut` polls without `tokio::pin!`.
                 //
-                // `offered_tools` is the SAME set `prepare` will accept for
-                // this run (FIX 1: advertise/execute mismatch) — recomputed
-                // each step so a live provider driver is never advertised (and
-                // so cannot be tempted to call) a tool dispatch would refuse
-                // as "unknown".
-                let offered_tools = self.offered_tool_names(&run);
-                let mut step_fut = driver.next_step(&transcript, &offered_tools, &mut sink);
+                // `tool_definitions` advertises the SAME set `prepare` will
+                // accept for this run (FIX 1: advertise/execute mismatch) —
+                // recomputed each step so a live provider driver is never
+                // advertised (and so cannot be tempted to call) a tool dispatch
+                // would refuse as "unknown".
+                let tool_definitions = self.advertised_tool_definitions(&run);
+                let mut step_fut = driver.next_step(&transcript, &tool_definitions, &mut sink);
                 loop {
                     tokio::select! {
                         // Poll the step future first: its completion is what ends
@@ -1903,6 +1986,32 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::MemoryRemember(input),
                 })
             }
+            // MCP client (PR B): an `mcp.<server>.<tool>` call. The match guard
+            // re-verifies the bridge CURRENTLY offers that exact server.tool pair
+            // (defense in depth, the blackboard match-guard idiom above): a cold
+            // server or an unlisted tool falls through to the unknown-tool arm —
+            // the same refusal the offering gate already promised the model. The
+            // action carries the CANONICAL args (recursively key-sorted) so the
+            // Run-scoped auto-approval digest matches an identical repeat however
+            // the model ordered the keys; the prepared tool keeps the RAW Value
+            // the bridge dispatches verbatim.
+            name if self.mcp_target(name).is_some() => {
+                let (server, tool) = self.mcp_target(name).expect("the guard just checked");
+                let canonical = canonical_json(args);
+                Ok(Prepared {
+                    action: ProposedAction::McpToolCall {
+                        summary: mcp_summary(&server, &tool, &canonical),
+                        server: server.clone(),
+                        tool: tool.clone(),
+                        args: canonical,
+                    },
+                    tool: PreparedTool::Mcp {
+                        server,
+                        tool,
+                        args: args.clone(),
+                    },
+                })
+            }
             other => Err(format!("unknown tool `{other}`")),
         }
     }
@@ -1938,6 +2047,27 @@ impl FrameworkAgentRuntime {
         run.github_repo
             .clone()
             .ok_or_else(|| "no github repository is configured for this run".to_string())
+    }
+
+    /// Split an `mcp.<server>.<tool>` name into its dispatch pair — but only when
+    /// a bridge is wired AND it currently offers that exact pair (the
+    /// offered-tools cache is the same source [`offered_tool_names`](Self::offered_tool_names)
+    /// advertised from). A cold server, an unlisted tool, or a malformed name
+    /// (no `.`, empty part) yields `None`, so `prepare`'s guard falls through to
+    /// the unknown-tool refusal — keeping offered ≡ dispatchable even if the
+    /// cache changed between advertisement and dispatch.
+    fn mcp_target(&self, name: &str) -> Option<(String, String)> {
+        let rest = name.strip_prefix("mcp.")?;
+        let (server, tool) = rest.split_once('.')?;
+        if server.is_empty() || tool.is_empty() {
+            return None;
+        }
+        let bridge = self.mcp.as_ref()?;
+        bridge
+            .offered_tools()
+            .iter()
+            .any(|info| info.server == server && info.name == tool)
+            .then(|| (server.to_string(), tool.to_string()))
     }
 
     /// Execute a prepared tool under the scopes minted from the policy for this
@@ -2238,6 +2368,51 @@ impl FrameworkAgentRuntime {
             PreparedTool::MemoryRemember(input) => {
                 self.execute_memory_remember(input, run, run_actor).await
             }
+            PreparedTool::Mcp { server, tool, args } => match self.mcp.as_ref() {
+                None => mcp_unavailable(&format!("mcp.{server}.{tool}")),
+                Some(bridge) => match bridge.call_tool(&server, &tool, args).await {
+                    Ok(text) => {
+                        // THE untrusted-content chokepoint for MCP (PR B): the
+                        // server's result text is attacker-controllable free
+                        // text, so it is control-stripped, size-capped
+                        // (MCP_OUTPUT_CAP_BYTES mirrors the sandbox executor's
+                        // default profile cap), and origin-labeled as an
+                        // evidence block BEFORE it enters the model's
+                        // observation stream — never passed through raw.
+                        let sanitized = sanitize_untrusted(
+                            format!("mcp:{server}"),
+                            &text,
+                            MCP_OUTPUT_CAP_BYTES,
+                        );
+                        (sanitized.as_evidence_block(), None, ToolOutcome::Succeeded)
+                    }
+                    // The server vanished between `prepare`'s offered-cache
+                    // check and dispatch (reset/crash) — the same stable code
+                    // as a missing bridge.
+                    Err(McpError::UnknownServer(_)) => {
+                        mcp_unavailable(&format!("mcp.{server}.{tool}"))
+                    }
+                    Err(error) => {
+                        // The error's Display can embed SERVER-CONTROLLED text
+                        // (a tool's `isError` content, an RPC error message),
+                        // so it goes through the same sanitizer as a result —
+                        // untrusted content never enters the observation raw,
+                        // on either path.
+                        let sanitized = sanitize_untrusted(
+                            format!("mcp:{server}"),
+                            &format!("mcp.{server}.{tool} error: {error}"),
+                            MCP_OUTPUT_CAP_BYTES,
+                        );
+                        (
+                            sanitized.as_evidence_block(),
+                            None,
+                            ToolOutcome::Failed {
+                                message: "mcp.call_failed".to_string(),
+                            },
+                        )
+                    }
+                },
+            },
         }
     }
 
@@ -2474,6 +2649,14 @@ enum PreparedTool {
     BlackboardPost(BlackboardPostInput),
     BlackboardQuery(BlackboardQueryInput),
     MemoryRemember(MemoryRememberInput),
+    /// An MCP tool call (PR B): the dispatch pair `prepare`'s guard verified
+    /// against the bridge's offered cache, plus the RAW model-supplied args
+    /// (the canonical form lives on the `McpToolCall` action, for the digest).
+    Mcp {
+        server: String,
+        tool: String,
+        args: Value,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -2506,6 +2689,80 @@ fn github_unconfigured() -> (String, Option<ArtifactRef>, ToolOutcome) {
             message: "github.unconfigured".to_string(),
         },
     )
+}
+
+/// The byte cap on an MCP tool's result text before it enters the observation
+/// stream (PR B). Mirrors the sandbox executor's default profile cap
+/// (`SandboxProfile`'s built-in `maximum_output_mb = 8` → 8 MiB, see
+/// `output_cap_bytes` in `crates/sandbox/src/executor.rs`) — an MCP call has no
+/// sandbox profile of its own, so it inherits the same default budget a
+/// sandboxed plugin's captured output gets.
+const MCP_OUTPUT_CAP_BYTES: usize = 8 * 1024 * 1024;
+
+/// The tool-result tuple for an `mcp.*` call with no wired bridge (defensive:
+/// `prepare` already refuses such a call as an unknown tool) or a server that
+/// vanished between dispatch and execution.
+fn mcp_unavailable(tool: &str) -> (String, Option<ArtifactRef>, ToolOutcome) {
+    (
+        format!("{tool} is unavailable (no MCP server connection)"),
+        None,
+        ToolOutcome::Failed {
+            message: "mcp.unavailable".to_string(),
+        },
+    )
+}
+
+/// Render a JSON value canonically — object keys recursively sorted — so two
+/// semantically identical argument objects serialize to the SAME string however
+/// the model ordered the keys. The `McpToolCall` action carries this string and
+/// the Run-scoped auto-approval digest hashes the action, so without a
+/// canonical form `{"a":1,"b":2}` and `{"b":2,"a":1}` would digest differently
+/// and the identical repeat would park for approval again. Does NOT rely on
+/// serde_json's map ordering (which is a build-feature accident).
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by_key(|(key, _)| *key);
+            let inner = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    // A JSON string key always serializes.
+                    let key = Value::String(key.clone()).to_string();
+                    format!("{key}:{}", canonical_json(value))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+        Value::Array(items) => {
+            let inner = items
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{inner}]")
+        }
+        other => other.to_string(),
+    }
+}
+
+/// The approval-card summary for an MCP call: `server.tool(args)` with the
+/// canonical args truncated for display — the FULL args live verbatim in the
+/// action's `args` field, so the card (and the audit) loses nothing.
+fn mcp_summary(server: &str, tool: &str, canonical_args: &str) -> String {
+    /// Roughly one card line of arguments.
+    const MAX_SUMMARY_ARGS_CHARS: usize = 120;
+    let args = if canonical_args.chars().count() > MAX_SUMMARY_ARGS_CHARS {
+        let truncated: String = canonical_args
+            .chars()
+            .take(MAX_SUMMARY_ARGS_CHARS)
+            .collect();
+        format!("{truncated}…")
+    } else {
+        canonical_args.to_string()
+    };
+    format!("{server}.{tool}({args})")
 }
 
 /// Frame rendered GitHub data (a PR summary, a check-run list) as an evidence
@@ -2888,256 +3145,239 @@ impl FrameworkModelDriver {
             context_tokens,
         })
     }
+}
 
-    /// The full tool SCHEMA catalog — every tool's name, description, and JSON
-    /// schema, declaration-only (the loop executes them; the framework never
-    /// does). Membership for a given run is decided downstream, NOT here: see
-    /// [`advertised_tools`](Self::advertised_tools), the FIX 1 projection
-    /// `next_step` actually sends as `options.tools`.
-    fn tool_definitions() -> Vec<agent_framework_core::tools::ToolDefinition> {
-        use agent_framework_core::tools::{ApprovalMode, ToolDefinition, ToolKind};
-        let decl = |name: &str, description: &str, parameters: Value| ToolDefinition {
-            name: name.to_string(),
-            description: description.to_string(),
-            parameters,
-            kind: ToolKind::Function,
-            approval_mode: ApprovalMode::NeverRequire,
-            executor: None,
-        };
-        vec![
-            decl(
-                Shell::NAME,
-                "Run an allow-listed program in the worktree.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "program": {"type": "string"},
-                        "args": {"type": "array", "items": {"type": "string"}}
-                    },
-                    "required": ["program"]
-                }),
-            ),
-            decl(
-                ReadFile::NAME,
-                "Read a line-numbered excerpt of a file.",
-                json!({
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"]
-                }),
-            ),
-            decl(
-                Search::NAME,
-                "Search the repository for a pattern.",
-                json!({
-                    "type": "object",
-                    "properties": {"pattern": {"type": "string"}, "glob": {"type": "string"}},
-                    "required": ["pattern"]
-                }),
-            ),
-            decl(
-                GitDiff::NAME,
-                "Show the worktree diff.",
-                json!({"type": "object", "properties": {}}),
-            ),
-            decl(
-                ApplyPatch::NAME,
-                "Apply a unified-diff patch to the worktree.",
-                json!({
-                    "type": "object",
-                    "properties": {"patch": {"type": "string"}},
-                    "required": ["patch"]
-                }),
-            ),
-            // CORE (write-tools WT5): declared alongside the unconditional
-            // baseline tools — offered to every run, not gated on github/workflow.
-            // Structured-argument alternatives to `git.apply_patch` for a weak
-            // model that struggles to reproduce an exact-context diff.
-            decl(
-                WriteFile::NAME,
-                "Create a new file or overwrite an existing file with the full new contents. \
+/// The full tool SCHEMA catalog — every built-in tool's name, description, and
+/// JSON schema, declaration-only (the loop executes them; the framework never
+/// does). Membership for a given run is decided downstream, NOT here: see
+/// [`FrameworkAgentRuntime::advertised_tool_definitions`], the FIX 1 projection
+/// the loop hands the driver. A free function (not a `FrameworkModelDriver`
+/// method) so the runtime's projection compiles even when no provider feature
+/// is enabled — [`FrameworkModelDriver`] itself is `provider-openai`-gated.
+pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
+    use agent_framework_core::tools::{ApprovalMode, ToolDefinition, ToolKind};
+    let decl = |name: &str, description: &str, parameters: Value| ToolDefinition {
+        name: name.to_string(),
+        description: description.to_string(),
+        parameters,
+        kind: ToolKind::Function,
+        approval_mode: ApprovalMode::NeverRequire,
+        executor: None,
+    };
+    vec![
+        decl(
+            Shell::NAME,
+            "Run an allow-listed program in the worktree.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "program": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["program"]
+            }),
+        ),
+        decl(
+            ReadFile::NAME,
+            "Read a line-numbered excerpt of a file.",
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        ),
+        decl(
+            Search::NAME,
+            "Search the repository for a pattern.",
+            json!({
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}, "glob": {"type": "string"}},
+                "required": ["pattern"]
+            }),
+        ),
+        decl(
+            GitDiff::NAME,
+            "Show the worktree diff.",
+            json!({"type": "object", "properties": {}}),
+        ),
+        decl(
+            ApplyPatch::NAME,
+            "Apply a unified-diff patch to the worktree.",
+            json!({
+                "type": "object",
+                "properties": {"patch": {"type": "string"}},
+                "required": ["patch"]
+            }),
+        ),
+        // CORE (write-tools WT5): declared alongside the unconditional
+        // baseline tools — offered to every run, not gated on github/workflow.
+        // Structured-argument alternatives to `git.apply_patch` for a weak
+        // model that struggles to reproduce an exact-context diff.
+        decl(
+            WriteFile::NAME,
+            "Create a new file or overwrite an existing file with the full new contents. \
                  Use for new files or small full rewrites; for a targeted change to a large \
                  file use `workspace.edit_file`.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"}
-                    },
-                    "required": ["path", "content"]
-                }),
-            ),
-            decl(
-                EditFile::NAME,
-                "Edit an existing file with one or more exact search/replace pairs. Each \
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            }),
+        ),
+        decl(
+            EditFile::NAME,
+            "Edit an existing file with one or more exact search/replace pairs. Each \
                  `search` must appear exactly once in the file — if a match is not unique the \
                  edit is rejected and you should include more surrounding context. All edits \
                  apply together or not at all.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "edits": {
-                            "type": "array",
-                            "minItems": 1,
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "search": {"type": "string"},
-                                    "replace": {"type": "string"}
-                                },
-                                "required": ["search", "replace"]
-                            }
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "edits": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "search": {"type": "string"},
+                                "replace": {"type": "string"}
+                            },
+                            "required": ["search", "replace"]
                         }
-                    },
-                    "required": ["path", "edits"]
-                }),
-            ),
-            // CORE (RT1): argument-less — the command is auto-detected (a
-            // `.codypendent/test-command` override, else `cargo test` / `npm
-            // test` / `pytest` by manifest), never supplied by the model. The
-            // detected program still goes through the `shell.run` allow-list +
-            // approval gate.
-            decl(
-                RepositoryTest::NAME,
-                "Run the repository's own test suite. The command is auto-detected from the \
+                    }
+                },
+                "required": ["path", "edits"]
+            }),
+        ),
+        // CORE (RT1): argument-less — the command is auto-detected (a
+        // `.codypendent/test-command` override, else `cargo test` / `npm
+        // test` / `pytest` by manifest), never supplied by the model. The
+        // detected program still goes through the `shell.run` allow-list +
+        // approval gate.
+        decl(
+            RepositoryTest::NAME,
+            "Run the repository's own test suite. The command is auto-detected from the \
                  worktree (a `.codypendent/test-command` override, else `cargo test` / `npm \
                  test` / `pytest` by build manifest) — takes no arguments.",
-                json!({"type": "object", "properties": {}}),
-            ),
-            // CORE (smarter-memory M2): declared alongside the unconditional
-            // baseline tools — offered to every run, not gated on github/workflow.
-            decl(
-                MemoryRemember::NAME,
-                "Save a durable fact, decision, or learning to long-term memory in your own \
+            json!({"type": "object", "properties": {}}),
+        ),
+        // CORE (smarter-memory M2): declared alongside the unconditional
+        // baseline tools — offered to every run, not gated on github/workflow.
+        decl(
+            MemoryRemember::NAME,
+            "Save a durable fact, decision, or learning to long-term memory in your own \
                  words. Use for a discrete fact worth recalling in future runs — not a summary \
                  of what you just did. One fact per call.",
-                json!({
-                    "type": "object",
-                    "properties": {"statement": {"type": "string"}, "value": {}},
-                    "required": ["statement"]
-                }),
-            ),
-            decl(
-                GetPullRequest::NAME,
-                "Fetch a GitHub pull request by number (read-only).",
-                json!({
-                    "type": "object",
-                    "properties": {"number": {"type": "integer"}},
-                    "required": ["number"]
-                }),
-            ),
-            decl(
-                ListCheckRuns::NAME,
-                "List the GitHub check runs for a git ref (read-only).",
-                json!({
-                    "type": "object",
-                    "properties": {"ref": {"type": "string"}},
-                    "required": ["ref"]
-                }),
-            ),
-            decl(
-                CreateDraftPullRequest::NAME,
-                "Open a draft GitHub pull request (requires approval).",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "head": {"type": "string"},
-                        "base": {"type": "string"},
-                        "body": {"type": "string"}
-                    },
-                    "required": ["title", "head", "base"]
-                }),
-            ),
-            decl(
-                UpdatePullRequestTool::NAME,
-                "Update a GitHub pull request's title/body/state (requires approval).",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "number": {"type": "integer"},
-                        "title": {"type": "string"},
-                        "body": {"type": "string"},
-                        "state": {"type": "string"}
-                    },
-                    "required": ["number"]
-                }),
-            ),
-            decl(
-                CreateCheckRunSummary::NAME,
-                "Post a GitHub check-run summary against a commit (requires approval).",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "head_sha": {"type": "string"},
-                        "summary": {"type": "string"},
-                        "conclusion": {"type": "string"}
-                    },
-                    "required": ["name", "head_sha", "summary"]
-                }),
-            ),
-            // The blackboard tools are only dispatchable inside a workflow agent
-            // node (the loop gates them on the run's workflow binding). They are
-            // declared here in the static schema catalog alongside the github.*
-            // tools, but `next_step` advertises to the model only the
-            // `offered_tool_names` projection (`advertised_tools`, FIX 1) — so a
-            // non-workflow run's model is never even shown these entries.
-            decl(
-                BlackboardPostTool::NAME,
-                "Post a typed artifact (finding, decision, hypothesis, …) to the workflow \
+            json!({
+                "type": "object",
+                "properties": {"statement": {"type": "string"}, "value": {}},
+                "required": ["statement"]
+            }),
+        ),
+        decl(
+            GetPullRequest::NAME,
+            "Fetch a GitHub pull request by number (read-only).",
+            json!({
+                "type": "object",
+                "properties": {"number": {"type": "integer"}},
+                "required": ["number"]
+            }),
+        ),
+        decl(
+            ListCheckRuns::NAME,
+            "List the GitHub check runs for a git ref (read-only).",
+            json!({
+                "type": "object",
+                "properties": {"ref": {"type": "string"}},
+                "required": ["ref"]
+            }),
+        ),
+        decl(
+            CreateDraftPullRequest::NAME,
+            "Open a draft GitHub pull request (requires approval).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "head": {"type": "string"},
+                    "base": {"type": "string"},
+                    "body": {"type": "string"}
+                },
+                "required": ["title", "head", "base"]
+            }),
+        ),
+        decl(
+            UpdatePullRequestTool::NAME,
+            "Update a GitHub pull request's title/body/state (requires approval).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "number": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "state": {"type": "string"}
+                },
+                "required": ["number"]
+            }),
+        ),
+        decl(
+            CreateCheckRunSummary::NAME,
+            "Post a GitHub check-run summary against a commit (requires approval).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "head_sha": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "conclusion": {"type": "string"}
+                },
+                "required": ["name", "head_sha", "summary"]
+            }),
+        ),
+        // The blackboard tools are only dispatchable inside a workflow agent
+        // node (the loop gates them on the run's workflow binding). They are
+        // declared here in the static schema catalog alongside the github.*
+        // tools, but the loop advertises to the model only the
+        // `advertised_tool_definitions` projection (FIX 1) — so a
+        // non-workflow run's model is never even shown these entries.
+        decl(
+            BlackboardPostTool::NAME,
+            "Post a typed artifact (finding, decision, hypothesis, …) to the workflow \
                  blackboard so downstream agents can build on it. Claim-like kinds require \
                  evidence. Pass `supersedes` with a prior item id to correct it.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "kind": {"type": "string"},
-                        "payload": {},
-                        "confidence": {"type": "number"},
-                        "evidence": {"type": "array"},
-                        "supersedes": {"type": "string"}
-                    },
-                    "required": ["kind", "payload"]
-                }),
-            ),
-            decl(
-                BlackboardQueryTool::NAME,
-                "Read the workflow blackboard — the typed artifacts other agents posted — \
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string"},
+                    "payload": {},
+                    "confidence": {"type": "number"},
+                    "evidence": {"type": "array"},
+                    "supersedes": {"type": "string"}
+                },
+                "required": ["kind", "payload"]
+            }),
+        ),
+        decl(
+            BlackboardQueryTool::NAME,
+            "Read the workflow blackboard — the typed artifacts other agents posted — \
                  optionally filtered by `kind`.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "kind": {"type": "string"},
-                        "include_superseded": {"type": "boolean"}
-                    }
-                }),
-            ),
-        ]
-    }
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string"},
+                    "include_superseded": {"type": "boolean"}
+                }
+            }),
+        ),
+    ]
+}
 
-    /// Project [`tool_definitions`](Self::tool_definitions) — the static schema
-    /// catalog — down to exactly `offered_tools` (FIX 1: advertise/execute
-    /// mismatch). Before this projection existed the catalog was advertised
-    /// whole and unconditionally, so a non-workflow run's model could be
-    /// offered `blackboard.*` (workflow-only) or `github.*` (no client
-    /// configured) and then refused by `prepare`'s dispatch gate as "unknown
-    /// tool" — a wasted, confusing call. Filtering here on the SAME names
-    /// [`FrameworkAgentRuntime::offered_tool_names`] computed for the run makes
-    /// the advertised set byte-for-byte what dispatch will accept; a name
-    /// absent from `offered_tools` is fail-safe omitted even if
-    /// `tool_definitions` and `offered_tool_names` ever drift. Pulled out of
-    /// `next_step` so the projection itself is unit-testable without a live
-    /// `ChatClient`.
-    fn advertised_tools(
-        offered_tools: &[&str],
-    ) -> Vec<agent_framework_core::tools::ToolDefinition> {
-        Self::tool_definitions()
-            .into_iter()
-            .filter(|def| offered_tools.contains(&def.name.as_str()))
-            .collect()
-    }
-
+#[cfg(feature = "provider-openai")]
+impl FrameworkModelDriver {
     fn to_messages(transcript: &[TurnItem]) -> Vec<agent_framework_core::types::Message> {
         use agent_framework_core::types::Message;
         let mut messages = vec![Message::system(
@@ -3211,7 +3451,7 @@ impl ModelDriver for FrameworkModelDriver {
     async fn next_step(
         &self,
         transcript: &[TurnItem],
-        offered_tools: &[&str],
+        tools: &[ToolDefinition],
         sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome> {
         use agent_framework_core::client::ChatClient;
@@ -3219,7 +3459,9 @@ impl ModelDriver for FrameworkModelDriver {
         use futures::StreamExt;
 
         let mut options = ChatOptions::new();
-        options.tools = Self::advertised_tools(offered_tools);
+        // The loop already projected the exact definition set for this run
+        // (FIX 1) — advertise it verbatim, MCP definitions included.
+        options.tools = tools.to_vec();
         apply_context_window(&mut options, self.context_tokens);
 
         let mut stream = self
@@ -3999,10 +4241,8 @@ mod tests {
     /// enough to make the tools *available* (the runtime only checks
     /// `is_some()` to decide whether to offer them) without a real board.
     /// Mirrors `tests/agent_it.rs`'s `FakeBlackboardChannel`.
-    #[cfg(feature = "provider-openai")]
     struct NoopBlackboardChannel;
 
-    #[cfg(feature = "provider-openai")]
     #[async_trait]
     impl BlackboardChannel for NoopBlackboardChannel {
         async fn post(
@@ -4024,12 +4264,10 @@ mod tests {
 
     /// FIX 1 (advertise/execute mismatch): a plain single-agent run's model must
     /// never be ADVERTISED a tool `prepare`'s dispatch gate will refuse.
-    /// `FrameworkModelDriver::advertised_tools` is the exact projection
-    /// `next_step` assigns to `options.tools`; feeding it a solo run's own
-    /// `offered_tool_names` must exclude both `blackboard.*` (workflow-only) and
-    /// `github.*` (no client configured on `test_runtime()`), while still
-    /// including the unconditional baseline tools.
-    #[cfg(feature = "provider-openai")]
+    /// `FrameworkAgentRuntime::advertised_tool_definitions` is the exact set the
+    /// loop hands the driver; for a solo run it must exclude both `blackboard.*`
+    /// (workflow-only) and `github.*` (no client configured on `test_runtime()`),
+    /// while still including the unconditional baseline tools.
     #[test]
     fn advertised_tools_excludes_workflow_and_github_tools_for_a_solo_run() {
         let (runtime, _events, session_id) = test_runtime();
@@ -4043,8 +4281,7 @@ mod tests {
             repo.path(),
         );
 
-        let offered = runtime.offered_tool_names(&solo);
-        let advertised = FrameworkModelDriver::advertised_tools(&offered);
+        let advertised = runtime.advertised_tool_definitions(&solo);
         let names: Vec<&str> = advertised.iter().map(|d| d.name.as_str()).collect();
 
         assert!(
@@ -4062,11 +4299,280 @@ mod tests {
         );
     }
 
+    // -- MCP client (PR B): offering, advertisement, canonicalization -------
+
+    /// A stub bridge: a fixed offered-tool cache and a scripted call result —
+    /// in-memory, no processes (the registry's own duplex tests cover the wire).
+    struct StubMcpBridge {
+        tools: Vec<codypendent_integrations::mcp::McpToolInfo>,
+        result: Result<String, String>,
+    }
+
+    impl StubMcpBridge {
+        fn warm() -> Self {
+            Self {
+                tools: vec![fake_search_tool()],
+                result: Ok("search result text".to_string()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpBridge for StubMcpBridge {
+        fn offered_tools(&self) -> Vec<codypendent_integrations::mcp::McpToolInfo> {
+            self.tools.clone()
+        }
+
+        async fn call_tool(
+            &self,
+            server: &str,
+            _tool: &str,
+            _args: Value,
+        ) -> Result<String, McpError> {
+            self.result.clone().map_err(|reason| McpError::Handshake {
+                server: server.to_string(),
+                reason,
+            })
+        }
+    }
+
+    fn fake_search_tool() -> codypendent_integrations::mcp::McpToolInfo {
+        codypendent_integrations::mcp::McpToolInfo {
+            server: "fake".to_string(),
+            name: "search".to_string(),
+            description: "search things".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+                "required": ["q"]
+            }),
+        }
+    }
+
+    fn solo_run(session_id: SessionId, repo: &Path) -> RunContext {
+        RunContext::new(
+            session_id,
+            RunId::new(),
+            "solo",
+            AgentMode::Build,
+            repo,
+            repo,
+        )
+    }
+
+    /// PR B: the offered set gains `mcp.<server>.<tool>` names only from a WARM
+    /// bridge — no bridge, or a cold one (empty cache), contributes nothing.
+    #[test]
+    fn offered_tool_names_includes_mcp_tools_only_when_the_bridge_offers_them() {
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        let (bare, _events, session_id) = test_runtime();
+        assert!(
+            !bare
+                .offered_tool_names(&solo_run(session_id, repo.path()))
+                .iter()
+                .any(|n| n.starts_with("mcp.")),
+            "no bridge → no mcp.* tools"
+        );
+
+        let (cold_runtime, _events, session_id) = test_runtime();
+        let cold = cold_runtime.with_mcp(Arc::new(StubMcpBridge {
+            tools: Vec::new(),
+            result: Ok(String::new()),
+        }));
+        assert!(
+            !cold
+                .offered_tool_names(&solo_run(session_id, repo.path()))
+                .iter()
+                .any(|n| n.starts_with("mcp.")),
+            "a cold bridge offers nothing"
+        );
+
+        let (warm_runtime, _events, session_id) = test_runtime();
+        let warm = warm_runtime.with_mcp(Arc::new(StubMcpBridge::warm()));
+        let names = warm.offered_tool_names(&solo_run(session_id, repo.path()));
+        assert!(
+            names.iter().any(|n| n == "mcp.fake.search"),
+            "a warm bridge offers mcp.fake.search: {names:?}"
+        );
+    }
+
+    /// PR B: the MCP tool's advertised definition carries the server-supplied
+    /// description and `inputSchema` VERBATIM, declaration-only (the framework
+    /// never executes or gates it — policy does), and the advertised set is
+    /// exactly the offered set (the FIX 1 drift guard, MCP case included).
+    #[test]
+    fn advertised_tool_definitions_carry_the_mcp_schema_and_match_the_offered_set() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime.with_mcp(Arc::new(StubMcpBridge::warm()));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let solo = solo_run(session_id, repo.path());
+
+        let advertised = runtime.advertised_tool_definitions(&solo);
+        let mcp = advertised
+            .iter()
+            .find(|d| d.name == "mcp.fake.search")
+            .expect("the MCP tool is advertised");
+        assert_eq!(mcp.description, "search things");
+        assert_eq!(
+            mcp.parameters,
+            fake_search_tool().input_schema,
+            "the server-supplied inputSchema is advertised verbatim"
+        );
+        assert!(
+            mcp.executor.is_none(),
+            "declaration-only: the loop executes"
+        );
+        assert!(
+            matches!(
+                mcp.approval_mode,
+                agent_framework_core::tools::ApprovalMode::NeverRequire
+            ),
+            "policy gates MCP calls, not the framework"
+        );
+
+        let mut advertised_names: Vec<String> = advertised.iter().map(|d| d.name.clone()).collect();
+        let mut offered = runtime.offered_tool_names(&solo);
+        advertised_names.sort();
+        offered.sort();
+        assert_eq!(
+            advertised_names, offered,
+            "advertised ≡ offered (FIX 1), MCP tools included"
+        );
+    }
+
+    /// PR B: the `McpToolCall` action's canonical args make the Run-scoped
+    /// auto-approval digest key-order-insensitive — recursively.
+    #[test]
+    fn canonical_json_is_key_order_insensitive_recursively() {
+        let a = json!({"b": 2, "a": {"y": [1, {"k2": 2, "k1": 1}], "x": true}, "c": "s"});
+        let b = json!({"c": "s", "a": {"x": true, "y": [1, {"k1": 1, "k2": 2}]}, "b": 2});
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+        assert_eq!(
+            canonical_json(&json!({"b": 1, "a": 1})),
+            "{\"a\":1,\"b\":1}",
+            "keys are sorted, never insertion-ordered"
+        );
+    }
+
+    /// PR B: the `prepare` guard refuses an `mcp.*` call the bridge does not
+    /// currently offer (cold server / unlisted tool) with the SAME unknown-tool
+    /// error the offering gate implies — offered ≡ dispatchable.
+    #[tokio::test]
+    async fn prepare_refuses_an_mcp_call_the_bridge_does_not_offer() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime.with_mcp(Arc::new(StubMcpBridge {
+            tools: Vec::new(), // cold
+            result: Ok(String::new()),
+        }));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = solo_run(session_id, repo.path());
+
+        let cold = runtime
+            .prepare("mcp.fake.search", &json!({"q": "x"}), &run)
+            .await;
+        match cold {
+            Err(message) => assert_eq!(message, "unknown tool `mcp.fake.search`"),
+            Ok(_) => panic!("a cold server offers nothing"),
+        }
+        let malformed = runtime.prepare("mcp.fake", &json!({}), &run).await;
+        match malformed {
+            Err(message) => assert_eq!(message, "unknown tool `mcp.fake`"),
+            Ok(_) => panic!("no tool part"),
+        }
+    }
+
+    /// PR B: `prepare` → `execute_prepared` round-trip for an offered MCP tool —
+    /// the action carries the canonical args and card summary, and the result
+    /// text is sanitized + framed as an untrusted-evidence block, never raw.
+    #[tokio::test]
+    async fn mcp_prepare_and_execute_sanitizes_the_result_into_an_evidence_block() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime.with_mcp(Arc::new(StubMcpBridge {
+            result: Ok("clean \x1b[31mred\x1b[0m text\x07".to_string()),
+            ..StubMcpBridge::warm()
+        }));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = solo_run(session_id, repo.path());
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare("mcp.fake.search", &json!({"q": "x", "a": 1}), &run)
+            .await
+            .expect("an offered tool prepares");
+        match &prepared.action {
+            ProposedAction::McpToolCall {
+                server,
+                tool,
+                summary,
+                args,
+            } => {
+                assert_eq!(server, "fake");
+                assert_eq!(tool, "search");
+                assert_eq!(args, "{\"a\":1,\"q\":\"x\"}", "canonical key order");
+                assert_eq!(summary, "fake.search({\"a\":1,\"q\":\"x\"})");
+            }
+            other => panic!("expected McpToolCall, got {other:?}"),
+        }
+
+        let (observation, _artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(
+            observation.starts_with("[untrusted output from mcp:fake]\n"),
+            "the evidence-block framing: {observation:?}"
+        );
+        assert!(
+            observation.contains("clean red text"),
+            "control sequences stripped, content kept: {observation:?}"
+        );
+        assert!(
+            !observation.contains('\x1b') && !observation.contains('\x07'),
+            "no ANSI/control characters survive: {observation:?}"
+        );
+    }
+
+    /// PR B: a bridge failure surfaces as a legible tool error with the stable
+    /// dotted code, never a panic or a silent success.
+    #[tokio::test]
+    async fn mcp_execute_failure_is_a_call_failed_tool_error() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime.with_mcp(Arc::new(StubMcpBridge {
+            result: Err("boom".to_string()),
+            ..StubMcpBridge::warm()
+        }));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = solo_run(session_id, repo.path());
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        let prepared = runtime
+            .prepare("mcp.fake.search", &json!({}), &run)
+            .await
+            .expect("an offered tool prepares");
+        let (observation, _artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        match &outcome {
+            ToolOutcome::Failed { message } => assert_eq!(message, "mcp.call_failed"),
+            other => panic!("expected a failed outcome, got {other:?}"),
+        }
+        assert!(
+            observation.contains("fake") && observation.contains("boom"),
+            "the error names the server and the cause: {observation:?}"
+        );
+    }
+
     /// The other half of FIX 1: a real workflow agent node (a wired blackboard
     /// channel AND a `WorkflowContext`) sees NO behavior change — it is still
     /// advertised `blackboard.*`, exactly as `offered_tool_names` already
     /// promised before this fix.
-    #[cfg(feature = "provider-openai")]
     #[test]
     fn advertised_tools_includes_blackboard_tools_for_a_workflow_run() {
         let (runtime, _events, session_id) = test_runtime();
@@ -4086,8 +4592,7 @@ mod tests {
             agent_role: "investigator".to_string(),
         });
 
-        let offered = runtime.offered_tool_names(&node);
-        let advertised = FrameworkModelDriver::advertised_tools(&offered);
+        let advertised = runtime.advertised_tool_definitions(&node);
         let names: Vec<&str> = advertised.iter().map(|d| d.name.as_str()).collect();
 
         assert!(
@@ -4100,8 +4605,7 @@ mod tests {
     /// no-github solo run is STILL advertised `memory.remember` — it is a CORE tool,
     /// never gated the way `blackboard.*`/`github.*` are. No snapshot/golden file
     /// pins the catalog; this unit test is the only pin (see the module docs on
-    /// `advertised_tools`).
-    #[cfg(feature = "provider-openai")]
+    /// `advertised_tool_definitions`).
     #[test]
     fn advertised_tools_includes_memory_remember_for_a_solo_run() {
         let (runtime, _events, session_id) = test_runtime();
@@ -4115,8 +4619,7 @@ mod tests {
             repo.path(),
         );
 
-        let offered = runtime.offered_tool_names(&solo);
-        let advertised = FrameworkModelDriver::advertised_tools(&offered);
+        let advertised = runtime.advertised_tool_definitions(&solo);
         let names: Vec<&str> = advertised.iter().map(|d| d.name.as_str()).collect();
 
         assert!(
@@ -4130,7 +4633,6 @@ mod tests {
     /// `workspace.edit_file` — they are CORE tools, unconditionally offered
     /// exactly like `git.apply_patch`/`memory.remember`, never gated the way
     /// `blackboard.*`/`github.*` are.
-    #[cfg(feature = "provider-openai")]
     #[test]
     fn advertised_tools_includes_write_file_and_edit_file_for_a_solo_run() {
         let (runtime, _events, session_id) = test_runtime();
@@ -4144,8 +4646,7 @@ mod tests {
             repo.path(),
         );
 
-        let offered = runtime.offered_tool_names(&solo);
-        let advertised = FrameworkModelDriver::advertised_tools(&offered);
+        let advertised = runtime.advertised_tool_definitions(&solo);
         let names: Vec<&str> = advertised.iter().map(|d| d.name.as_str()).collect();
 
         assert!(
@@ -4588,7 +5089,6 @@ mod tests {
     /// RT1: `repository.test` is a CORE tool — offered to a plain, non-workflow
     /// solo run exactly like `memory.remember` (the M2 "+1" precedent), never
     /// gated on a workflow/github binding.
-    #[cfg(feature = "provider-openai")]
     #[test]
     fn advertised_tools_includes_repository_test_for_a_solo_run() {
         let (runtime, _events, session_id) = test_runtime();
@@ -4602,8 +5102,7 @@ mod tests {
             repo.path(),
         );
 
-        let offered = runtime.offered_tool_names(&solo);
-        let advertised = FrameworkModelDriver::advertised_tools(&offered);
+        let advertised = runtime.advertised_tool_definitions(&solo);
         let names: Vec<&str> = advertised.iter().map(|d| d.name.as_str()).collect();
 
         assert!(
@@ -5090,7 +5589,7 @@ mod tests {
         async fn next_step(
             &self,
             transcript: &[TurnItem],
-            _offered_tools: &[&str],
+            _tools: &[ToolDefinition],
             _sink: &mut dyn DeltaSink,
         ) -> anyhow::Result<StepOutcome> {
             let mut slot = self.seen.lock().expect("capturing driver mutex");
@@ -5178,7 +5677,7 @@ mod tests {
         async fn next_step(
             &self,
             _transcript: &[TurnItem],
-            _offered_tools: &[&str],
+            _tools: &[ToolDefinition],
             sink: &mut dyn DeltaSink,
         ) -> anyhow::Result<StepOutcome> {
             for chunk in &self.chunks {
@@ -5248,7 +5747,7 @@ mod tests {
         async fn next_step(
             &self,
             _transcript: &[TurnItem],
-            _offered_tools: &[&str],
+            _tools: &[ToolDefinition],
             sink: &mut dyn DeltaSink,
         ) -> anyhow::Result<StepOutcome> {
             for chunk in &self.chunks {
