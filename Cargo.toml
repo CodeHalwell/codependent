@@ -140,6 +140,7 @@ synoptic = "2.2"
 
 # CLI and paths
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 directories = "6"
 
 # Test utilities

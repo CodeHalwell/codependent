@@ -2235,6 +2235,52 @@ fn default_bench_description() -> codypendent_runtime::bench::TargetDescription 
     }
 }
 
+/// `codypendent completion <shell>`: write a shell-completion script to stdout,
+/// generated from the app's own clap [`Command`](clap::Command) so completions
+/// never drift from the real CLI. The caller passes the derived command (only
+/// `main.rs` has the `Cli` type), keeping this reusable and testable.
+pub fn completion(shell: clap_complete::Shell, cmd: &mut clap::Command) {
+    completion_to(shell, cmd, &mut std::io::stdout());
+}
+
+/// The testable core of [`completion`]: generate into any writer instead of
+/// stdout, so a test can assert the script is non-empty and names the binary.
+pub fn completion_to(shell: clap_complete::Shell, cmd: &mut clap::Command, out: &mut impl std::io::Write) {
+    let name = cmd.get_name().to_string();
+    clap_complete::generate(shell, cmd, name, out);
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    /// Every supported shell generates a non-empty script that names the binary,
+    /// against a stand-in command mirroring the real one's name + a subcommand.
+    #[test]
+    fn generates_non_empty_scripts_naming_the_binary() {
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+        ] {
+            let mut cmd = clap::Command::new("codypendent")
+                .subcommand(clap::Command::new("daemon"))
+                .subcommand(clap::Command::new("doctor"));
+            let mut out = Vec::new();
+            completion_to(shell, &mut cmd, &mut out);
+            let script = String::from_utf8(out).expect("completion output is valid UTF-8");
+            assert!(
+                !script.is_empty(),
+                "{shell} completion must not be empty"
+            );
+            assert!(
+                script.contains("codypendent"),
+                "{shell} completion must name the binary"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod models_bench_tests {
     use super::*;

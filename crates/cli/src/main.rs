@@ -36,7 +36,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use codypendent_cli::{commands, theme_select, tui};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{AgentMode, DocumentId, SessionId};
@@ -177,6 +177,15 @@ enum TopCommand {
         /// Repository path to open. Defaults to the current directory.
         #[arg(long)]
         repo: Option<PathBuf>,
+    },
+    /// Print a shell-completion script for your shell. Install e.g. with:
+    /// `codypendent completion zsh > ~/.zfunc/_codypendent` (zsh),
+    /// `codypendent completion bash > /etc/bash_completion.d/codypendent`, or
+    /// `codypendent completion fish > ~/.config/fish/completions/codypendent.fish`.
+    Completion {
+        /// The shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
@@ -737,6 +746,12 @@ async fn main() -> anyhow::Result<()> {
             };
             let (binary, name) = ide.binary_and_name();
             commands::open(&paths, session_id, binary, name, repo).await
+        }
+        TopCommand::Completion { shell } => {
+            // Generate from the app's own derived command so completions never
+            // drift from the real CLI. No daemon, no I/O beyond stdout.
+            commands::completion(shell, &mut Cli::command());
+            Ok(())
         }
     }
 }
