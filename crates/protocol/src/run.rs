@@ -165,6 +165,27 @@ pub enum ProposedAction {
         /// The workflow run whose board is read (server-derived).
         workflow_run_id: String,
     },
+    /// Call a tool on an external MCP server (PR B — MCP client). The server is
+    /// operator-declared in the trusted `<config_dir>/codypendent/mcp.toml` (the
+    /// model can never name one into existence) and the call is dispositioned by
+    /// the policy engine's `[mcp]` section: allow-listed servers may skip the
+    /// gate, everything else is approval-gated or denied. The approval card
+    /// renders `summary` plus `args` **verbatim**; `args` is canonical JSON
+    /// (recursively key-sorted) so the Run-scoped auto-approval digest matches
+    /// exactly-identical repeats.
+    McpToolCall {
+        /// The server name from `mcp.toml` (server-derived from the tool name's
+        /// `mcp.<server>.<tool>` prefix, never free-form model text).
+        server: String,
+        /// The tool name on that server (from the server's `tools/list`).
+        tool: String,
+        /// A short human-readable description of the call, rendered on the
+        /// approval card (e.g. `github.create_issue("…")`).
+        summary: String,
+        /// The model-supplied arguments as canonical JSON text (a `String`, not
+        /// a `Value`, so the enum stays `Eq` and the digest is stable).
+        args: String,
+    },
     /// Record a memory proposal note (the `memory.remember` core tool, smarter-memory
     /// M2). Appends a `NoteAppended` to the run's own ledger — no filesystem, command,
     /// network, or remote effect. Always policy-`Allow`ed (see the daemon policy

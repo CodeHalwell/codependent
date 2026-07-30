@@ -86,6 +86,13 @@
     "remote": "origin",
     "type": "GitPush"
   },
+  "ProposedAction_McpToolCall": {
+    "args": "{\"body\":\"Retries are missing\",\"title\":\"Add retry logic\"}",
+    "server": "github",
+    "summary": "github.create_issue(\"Add retry logic\")",
+    "tool": "create_issue",
+    "type": "McpToolCall"
+  },
   "ProposedAction_NetworkRequest": {
     "destination": "https://api.github.com",
     "type": "NetworkRequest"

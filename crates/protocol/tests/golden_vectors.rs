@@ -1005,6 +1005,16 @@ fn run_vectors() -> Vec<Vector> {
             },
         ),
         vec_of(
+            "ProposedAction_McpToolCall",
+            ProposedAction::McpToolCall {
+                server: "github".to_string(),
+                tool: "create_issue".to_string(),
+                summary: "github.create_issue(\"Add retry logic\")".to_string(),
+                args: "{\"body\":\"Retries are missing\",\"title\":\"Add retry logic\"}"
+                    .to_string(),
+            },
+        ),
+        vec_of(
             "Risk",
             Risk {
                 level: RiskLevel::Medium,

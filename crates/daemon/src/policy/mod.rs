@@ -304,6 +304,7 @@ impl PolicyEngine {
             ProposedAction::GitCommit { .. } => self.eval_git(GitOp::Commit, ctx),
             ProposedAction::GitPush { .. } => self.eval_git(GitOp::Push, ctx),
             ProposedAction::GitHubMutation { .. } => self.eval_github_mutation(ctx),
+            ProposedAction::McpToolCall { server, .. } => self.eval_mcp_tool_call(server, ctx),
             ProposedAction::BlackboardPost { .. } | ProposedAction::BlackboardQuery { .. } => {
                 self.eval_blackboard()
             }
@@ -477,6 +478,54 @@ impl PolicyEngine {
                 "GitHub writes require approval",
             ),
         )
+    }
+
+    /// Evaluate a tool call to an external MCP server (PR B — MCP client). The
+    /// server is operator-declared in the trusted `mcp.toml` — a name the model
+    /// invents fails earlier, in `prepare` — and the `[mcp]` policy section
+    /// dispositions each call: allow-listed servers run ungated, everything else
+    /// is approval-gated or denied. A call's effect is arbitrary (the server is
+    /// an external process), so it is mode-gated like command execution: a
+    /// read-only mode forbids it. The minted grant is a marker `McpToolCall`
+    /// capability — the MCP bridge executes the call itself and needs no
+    /// path/command/network scope.
+    fn eval_mcp_tool_call(&self, server: &str, ctx: &EvalContext) -> PolicyDecision {
+        if !ctx.mode.command_allowed {
+            return self.deny(PolicyReason::new(
+                "policy.mcp-denied-by-mode",
+                "the active mode forbids command execution, and an MCP tool call is an \
+                 external effect",
+            ));
+        }
+        let disposition = self
+            .merged
+            .mcp_servers
+            .get(server)
+            .copied()
+            .unwrap_or(self.merged.mcp_default);
+        let capability = Capability::McpToolCall {
+            server: server.to_string(),
+        };
+        match disposition {
+            ApprovalAction::Allow => self.allow(
+                capability,
+                PolicyReason::new(
+                    "policy.mcp-allowed",
+                    format!("MCP server `{server}` is allow-listed by policy"),
+                ),
+            ),
+            ApprovalAction::Approval | ApprovalAction::AlwaysApproval => self.require(
+                capability,
+                PolicyReason::new(
+                    "policy.mcp-requires-approval",
+                    format!("MCP tool calls to `{server}` require approval"),
+                ),
+            ),
+            ApprovalAction::Deny => self.deny(PolicyReason::new(
+                "policy.mcp-denied",
+                format!("MCP server `{server}` is denied by policy"),
+            )),
+        }
     }
 
     fn eval_git(&self, op: GitOp, ctx: &EvalContext) -> PolicyDecision {
@@ -878,6 +927,76 @@ mod tests {
         );
         assert_eq!(decision.decision, Decision::Deny);
         assert_eq!(decision.reasons[0].code, "policy.github-denied-by-mode");
+    }
+
+    // --- PR B: MCP tool calls ---
+
+    fn mcp_action(server: &str) -> ProposedAction {
+        ProposedAction::McpToolCall {
+            server: server.to_string(),
+            tool: "create_issue".to_string(),
+            summary: format!("{server}.create_issue(…)"),
+            args: "{\"title\":\"x\"}".to_string(),
+        }
+    }
+
+    /// The builtin default: no `[mcp]` config → every MCP call requires approval,
+    /// and the minted grant is the marker `McpToolCall` capability naming the
+    /// server (no path/command/network scope — the bridge executes the call).
+    #[test]
+    fn mcp_tool_call_defaults_to_require_approval() {
+        let engine = PolicyEngine::with_defaults();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let decision = engine.evaluate(&mcp_action("github"), &ctx(&repo, &repo));
+        assert_eq!(decision.decision, Decision::RequireApproval);
+        assert_eq!(decision.reasons[0].code, "policy.mcp-requires-approval");
+        assert!(matches!(
+            decision.capability_grant.unwrap().capability,
+            Capability::McpToolCall { ref server } if server == "github"
+        ));
+    }
+
+    /// An operator allow-listed server runs ungated; a denied server never runs.
+    #[test]
+    fn mcp_tool_call_follows_per_server_disposition() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        merged
+            .mcp_servers
+            .insert("github".to_string(), ApprovalAction::Allow);
+        merged
+            .mcp_servers
+            .insert("experimental".to_string(), ApprovalAction::Deny);
+        let engine = PolicyEngine::from_merged(merged);
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+
+        let allowed = engine.evaluate(&mcp_action("github"), &ctx(&repo, &repo));
+        assert_eq!(allowed.decision, Decision::Allow);
+        assert_eq!(allowed.reasons[0].code, "policy.mcp-allowed");
+
+        let denied = engine.evaluate(&mcp_action("experimental"), &ctx(&repo, &repo));
+        assert_eq!(denied.decision, Decision::Deny);
+        assert_eq!(denied.reasons[0].code, "policy.mcp-denied");
+    }
+
+    /// An MCP call is an external effect: a read-only mode forbids it outright,
+    /// even for an allow-listed server (mode overlays win over dispositions).
+    #[test]
+    fn mcp_tool_call_denied_by_mode() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        merged
+            .mcp_servers
+            .insert("github".to_string(), ApprovalAction::Allow);
+        let engine = PolicyEngine::from_merged(merged);
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let decision = engine.evaluate(
+            &mcp_action("github"),
+            &ctx(&repo, &repo).with_mode(ModeOverlay::read_only()),
+        );
+        assert_eq!(decision.decision, Decision::Deny);
+        assert_eq!(decision.reasons[0].code, "policy.mcp-denied-by-mode");
     }
 
     #[test]

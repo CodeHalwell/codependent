@@ -400,7 +400,7 @@ function reconstructSubscription(r: Record<string, unknown>): Subscription {
   }
 }
 
-/** Only the 7 variants the extension actually types — PublishDocument,
+/** Only the 8 variants the extension actually types — PublishDocument,
  * BlackboardPost, BlackboardQuery are workflow-scoped and intentionally
  * excluded (see the file-level doc + protocol-vectors/README.md). */
 function reconstructProposedAction(r: Record<string, unknown>): ProposedAction {
@@ -435,6 +435,8 @@ function reconstructProposedAction(r: Record<string, unknown>): ProposedAction {
       return { type: "GitPush", remote: str(r, "remote"), branch: str(r, "branch") };
     case "GitHubMutation":
       return { type: "GitHubMutation", repository: str(r, "repository"), summary: str(r, "summary") };
+    case "McpToolCall":
+      return { type: "McpToolCall", server: str(r, "server"), tool: str(r, "tool"), summary: str(r, "summary"), args: str(r, "args") };
     default:
       throw new Error(`unmodeled or unknown ProposedAction tag: ${str(r, "type")}`);
   }
@@ -989,6 +991,7 @@ describe("run.json against run-domain types (src/protocol/types.ts)", () => {
     "ProposedAction_GitCommit",
     "ProposedAction_GitHubMutation",
     "ProposedAction_GitPush",
+    "ProposedAction_McpToolCall",
     "ProposedAction_NetworkRequest",
     "ProposedAction_ReadFiles",
     "ProposedAction_WritePatch",

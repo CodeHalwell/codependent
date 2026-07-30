@@ -188,6 +188,12 @@ export type ProposedAction =
   | { type: "GitPush"; remote: string; branch: string }
   | { type: "GitHubMutation"; repository: string; summary: string }
   /**
+   * Call a tool on an external MCP server (PR B — MCP client). The approval
+   * card renders `summary` plus `args` (canonical JSON text) verbatim; the
+   * server is operator-declared in the daemon's trusted `mcp.toml`.
+   */
+  | { type: "McpToolCall"; server: string; tool: string; summary: string; args: string }
+  /**
    * Record a memory proposal note (the `memory.remember` core tool,
    * smarter-memory M2). Always policy-Allowed and never serialized into a
    * `ToolProposed`/`ApprovalRequested` wire event (see
