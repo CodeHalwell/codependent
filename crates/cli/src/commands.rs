@@ -2245,7 +2245,11 @@ pub fn completion(shell: clap_complete::Shell, cmd: &mut clap::Command) {
 
 /// The testable core of [`completion`]: generate into any writer instead of
 /// stdout, so a test can assert the script is non-empty and names the binary.
-pub fn completion_to(shell: clap_complete::Shell, cmd: &mut clap::Command, out: &mut impl std::io::Write) {
+pub fn completion_to(
+    shell: clap_complete::Shell,
+    cmd: &mut clap::Command,
+    out: &mut impl std::io::Write,
+) {
     let name = cmd.get_name().to_string();
     clap_complete::generate(shell, cmd, name, out);
 }
@@ -2269,10 +2273,7 @@ mod completion_tests {
             let mut out = Vec::new();
             completion_to(shell, &mut cmd, &mut out);
             let script = String::from_utf8(out).expect("completion output is valid UTF-8");
-            assert!(
-                !script.is_empty(),
-                "{shell} completion must not be empty"
-            );
+            assert!(!script.is_empty(), "{shell} completion must not be empty");
             assert!(
                 script.contains("codypendent"),
                 "{shell} completion must name the binary"

@@ -15,3 +15,4 @@ pub mod restart;
 pub mod stream;
 pub mod theme_select;
 pub mod tui;
+pub mod update;

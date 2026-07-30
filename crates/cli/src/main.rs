@@ -199,6 +199,16 @@ enum TopCommand {
         #[arg(long)]
         deep: bool,
     },
+    /// Self-update: install the latest GitHub release over the running binary
+    /// (via `gh`, exactly as `install.sh`), then pick up the new build through
+    /// the idle-guarded daemon auto-restart — never kills an active run.
+    Update {
+        /// Only report whether an update is available; download nothing.
+        #[arg(long)]
+        check: bool,
+        /// Install a specific release tag instead of the latest.
+        tag: Option<String>,
+    },
 }
 
 /// The IDEs `codypendent open --in <IDE>` knows how to launch.
@@ -774,6 +784,15 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 std::process::exit(1);
             }
+        }
+        TopCommand::Update { check, tag } => {
+            // `--check` exits 2 when an update is available (scriptable); the
+            // exit decision lives here (the library never calls `process::exit`).
+            let available = codypendent_cli::update::run(&paths, check, tag).await?;
+            if check && available {
+                std::process::exit(2);
+            }
+            Ok(())
         }
     }
 }
