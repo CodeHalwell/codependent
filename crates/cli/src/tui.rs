@@ -604,6 +604,10 @@ async fn send_reattach(
             // (Phase 4 STEP 4.3) rather than resetting to the session defaults.
             subscriptions: subscriptions.to_vec(),
             requested_role: ClientRole::Controller,
+            // A gap-repair re-attach to an already-open session: the original
+            // create/attach already carried the repo root (see
+            // `resolve_or_create_session`), so there is nothing new to warm here.
+            repository: None,
         },
     );
     let _ = out_tx.send(attach).await;
@@ -863,6 +867,10 @@ async fn event_loop(
                             last_seen_sequence: Some(tracker.last_seen()),
                             subscriptions: subscriptions.clone(),
                             requested_role: ClientRole::Controller,
+                            // Re-attach to grow this connection's own
+                            // subscription set (a new Document edit) on an
+                            // already-open session: no new repo context to warm.
+                            repository: None,
                         },
                     );
                     if out_tx.send(attach).await.is_err() {
@@ -1502,6 +1510,9 @@ async fn resolve_or_create_session(
                 last_seen_sequence: None,
                 subscriptions: default_subscriptions(),
                 requested_role: ClientRole::Controller,
+                // The canonical repo root, so the daemon can build its code
+                // graph on open — not only on the first run.
+                repository: Some(key.clone()),
             })
             .await?;
         // Only resume when the catch-up proves the session still exists. The
@@ -1539,7 +1550,13 @@ async fn resolve_or_create_session(
         .unwrap_or_else(|| key.clone());
 
     let created = conn
-        .send_command(CommandBody::CreateSession { workspace, title })
+        .send_command(CommandBody::CreateSession {
+            workspace,
+            title,
+            // The canonical repo root, so the daemon can build its code graph
+            // on open — not only on the first run.
+            repository: Some(key.clone()),
+        })
         .await?;
     let session_id = match &created.payload {
         Payload::CommandAccepted { .. } => created.session_id.ok_or_else(|| {
@@ -1557,6 +1574,7 @@ async fn resolve_or_create_session(
             last_seen_sequence: None,
             subscriptions: default_subscriptions(),
             requested_role: ClientRole::Controller,
+            repository: Some(key.clone()),
         })
         .await?;
     let catchup = commands::expect_catchup(attach)?;

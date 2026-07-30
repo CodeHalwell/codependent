@@ -384,6 +384,7 @@ export type CommandBody =
       last_seen_sequence?: number;
       subscriptions: Subscription[];
       requested_role: ClientRole;
+      repository?: string;
     }
   | { type: "SubmitUserInput"; session_id: Uuid; text: string; mode: AgentMode; model?: string }
   | { type: "StartRun"; session_id: Uuid; objective: string; mode: AgentMode; repository?: string; model?: string }

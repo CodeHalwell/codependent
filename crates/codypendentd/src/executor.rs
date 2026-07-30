@@ -1296,6 +1296,19 @@ impl RunExecutor for RuntimeExecutor {
         // server's `Subscription::Workflow` forwarders (Phase 5 STEP 5.2 / T9).
         Some(self.workflows.clone())
     }
+
+    fn ensure_repository_scanned(&self, root: PathBuf) {
+        // Fire-and-forget, exactly like `spawn_run`: the server must never await
+        // this. Reuses `Self::ensure_scanned` — the SAME guarded warm-up
+        // `spawn_run` calls before a run's context opens — so a repository
+        // opened here and later run against is scanned at most once either way,
+        // and a repository already warmed by a run is not re-scanned on open.
+        let executor = self.clone();
+        tokio::spawn(async move {
+            let repository = scan::repository_id_for(&root);
+            executor.ensure_scanned(repository, &root).await;
+        });
+    }
 }
 
 /// Load a model registry + a Phase-1 policy from `<data_dir>/models.toml`, or an

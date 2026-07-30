@@ -434,6 +434,7 @@ pub async fn run_case_over_connection(
         .send_command(CommandBody::CreateSession {
             workspace,
             title: format!("eval: {}", case.id),
+            repository: Some(repository.to_string_lossy().into_owned()),
         })
         .await?;
     let session_id = match &create_reply.payload {
@@ -452,6 +453,7 @@ pub async fn run_case_over_connection(
             last_seen_sequence: None,
             subscriptions: vec![Subscription::SessionSummary, Subscription::AgentActivity],
             requested_role: ClientRole::Controller,
+            repository: Some(repository.to_string_lossy().into_owned()),
         })
         .await?;
     // A freshly created session has nothing to catch up on; the reply is

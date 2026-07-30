@@ -265,6 +265,18 @@ pub trait RunExecutor: Send + Sync {
     fn workflow_hub(&self) -> Option<crate::workflow_stream::WorkflowHub> {
         None
     }
+
+    /// Warm `root`'s code graph in the background, so the code-graph edges
+    /// overlay is populated as soon as a session opens against it (a
+    /// `CreateSession`/`AttachSession` carrying a `repository`) — not only
+    /// after the first [`spawn_run`](RunExecutor::spawn_run), which reaches
+    /// the SAME warm-up once a run's own repository identity resolves.
+    /// Fire-and-forget like `spawn_run`: the implementation spawns its own
+    /// background task and this must return immediately, never blocking the
+    /// command reply the server sends. The default no-op leaves the
+    /// executor-less server path (`server::run`, the daemon's own tests)
+    /// exactly as before — nothing to scan without a runtime behind it.
+    fn ensure_repository_scanned(&self, _root: std::path::PathBuf) {}
 }
 
 #[cfg(test)]

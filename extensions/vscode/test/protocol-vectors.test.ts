@@ -615,6 +615,7 @@ function reconstructCommandBody(r: Record<string, unknown>): CommandBody {
         last_seen_sequence: optNum(r, "last_seen_sequence"),
         subscriptions: arr(r, "subscriptions").map((s) => reconstructSubscription(asRecord(s, "subscriptions[]"))),
         requested_role: reconstructClientRole(rec(r, "requested_role")),
+        repository: optStr(r, "repository"),
       };
     case "SubmitUserInput":
       return {

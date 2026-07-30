@@ -1651,6 +1651,7 @@ mod tests {
                     CommandBody::CreateSession {
                         workspace: codypendent_protocol::WorkspaceId::new(),
                         title: "diagnose the failing test".to_string(),
+                        repository: None,
                     },
                     key,
                 ),
@@ -2467,6 +2468,7 @@ mod tests {
                         last_seen_sequence: None,
                         subscriptions: vec![],
                         requested_role: ClientRole::Observer,
+                        repository: None,
                     },
                     "attach",
                 ),
