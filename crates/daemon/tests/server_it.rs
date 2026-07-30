@@ -39,11 +39,18 @@ async fn start_server(tmp: &tempfile::TempDir) -> (RuntimePaths, ServerTask) {
 #[derive(Clone, Default)]
 struct CapturingExecutor {
     launches: Arc<Mutex<Vec<RunLaunch>>>,
+    /// Repository roots the server asked to warm (code-graph scan on session
+    /// open) — recorded synchronously so a test can assert the scan fired.
+    scans: Arc<Mutex<Vec<std::path::PathBuf>>>,
 }
 
 impl RunExecutor for CapturingExecutor {
     fn spawn_run(&self, launch: RunLaunch) {
         self.launches.lock().expect("launches lock").push(launch);
+    }
+
+    fn ensure_repository_scanned(&self, root: std::path::PathBuf) {
+        self.scans.lock().expect("scans lock").push(root);
     }
 }
 
@@ -156,6 +163,7 @@ async fn attach(
         last_seen_sequence: last_seen,
         subscriptions,
         requested_role: role,
+        repository: None,
     };
     let reply = send_recv(
         stream,
@@ -184,6 +192,7 @@ async fn bind_role(stream: &mut UnixStream, client_id: ClientId, role: ClientRol
                     last_seen_sequence: None,
                     subscriptions: vec![Subscription::SessionSummary],
                     requested_role: role,
+                    repository: None,
                 },
                 key,
             )),
@@ -499,6 +508,7 @@ async fn create_attach_and_two_clients_observe_one_event() {
                 CommandBody::CreateSession {
                     workspace: WorkspaceId::new(),
                     title: "diagnose the failing test".to_string(),
+                    repository: None,
                 },
                 "create-1",
             )),
@@ -654,6 +664,7 @@ async fn a_follow_up_launches_a_new_run_after_a_prior_run() {
                 CommandBody::CreateSession {
                     workspace: WorkspaceId::new(),
                     title: "conversation".to_string(),
+                    repository: None,
                 },
                 "create",
             )),
@@ -768,6 +779,7 @@ async fn a_continuation_inherits_the_session_repository_and_pinned_model() {
                 CommandBody::CreateSession {
                     workspace: WorkspaceId::new(),
                     title: "conversation".to_string(),
+                    repository: None,
                 },
                 "cont-create",
             )),
@@ -897,6 +909,7 @@ async fn a_mid_conversation_repin_applies_instantly() {
                 CommandBody::CreateSession {
                     workspace: WorkspaceId::new(),
                     title: "conversation".to_string(),
+                    repository: None,
                 },
                 "repin-create",
             )),
@@ -1744,6 +1757,7 @@ async fn attaching_a_second_client_emits_presence() {
                 CommandBody::CreateSession {
                     workspace: WorkspaceId::new(),
                     title: "handoff".to_string(),
+                    repository: None,
                 },
                 "create-1",
             )),
@@ -1798,4 +1812,56 @@ async fn attaching_a_second_client_emits_presence() {
 
     drop(b);
     shutdown(a, task).await;
+}
+
+/// Opening a session that carries its repository root warms the code graph:
+/// the server asks the executor to scan it (so the edges overlay populates on
+/// open, not only on the first run), and the server-level guard means opening
+/// a SECOND session against the same repository does not re-scan.
+#[tokio::test]
+async fn creating_a_session_with_a_repository_warms_the_code_graph_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap(); // a real, canonicalizable repo root
+    let executor = CapturingExecutor::default();
+    let (paths, task) = start_server_with_executor(&tmp, Arc::new(executor.clone())).await;
+
+    let c1 = ClientId::new();
+    let mut s1 = connect(&paths).await;
+    handshake(&mut s1, c1).await;
+    bind_role(&mut s1, c1, ClientRole::Contributor, "att-role").await;
+
+    let repo_str = repo.path().to_string_lossy().to_string();
+    let create = |key: &str| {
+        Envelope::request(
+            c1,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "warm the graph".to_string(),
+                    repository: Some(repo_str.clone()),
+                },
+                key,
+            )),
+        )
+    };
+
+    let reply = send_recv(&mut s1, &create("create-repo-1")).await;
+    assert!(matches!(reply.payload, Payload::CommandAccepted { .. }));
+    // A second session against the SAME repo must NOT re-scan (server guard).
+    let reply = send_recv(&mut s1, &create("create-repo-2")).await;
+    assert!(matches!(reply.payload, Payload::CommandAccepted { .. }));
+
+    let scans = executor.scans.lock().expect("scans lock").clone();
+    assert_eq!(
+        scans.len(),
+        1,
+        "the repository is scanned exactly once across two opens, got {scans:?}"
+    );
+    assert_eq!(
+        scans[0],
+        repo.path(),
+        "the server warms the session's repository root"
+    );
+
+    shutdown(s1, task).await;
 }

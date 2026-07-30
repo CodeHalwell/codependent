@@ -196,6 +196,7 @@ async fn attach_document(
             last_seen_sequence: None,
             subscriptions: vec![Subscription::Document { document_id }],
             requested_role: ClientRole::Controller,
+            repository: None,
         },
         key,
     )
@@ -259,6 +260,7 @@ async fn create_session(
         CommandBody::CreateSession {
             workspace: codypendent_protocol::WorkspaceId::new(),
             title: "docs".to_string(),
+            repository: None,
         },
         "create",
     )

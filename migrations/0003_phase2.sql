@@ -112,7 +112,10 @@ CREATE INDEX idx_code_edges_to ON code_edges(to_node);
 -- The index-outbox: every authoritative write appends one row here in the same
 -- transaction. Indexer workers claim unprocessed rows (processed_at IS NULL),
 -- update their derived index, then stamp processed_at. Deleting the derived
--- indexes and replaying the authority is exactly `codypendent index rebuild`.
+-- RETRIEVAL indexes (BM25 + vectors) and replaying the authority is exactly
+-- `codypendent index rebuild` — which does NOT rebuild the code graph
+-- (`code_nodes`/`code_edges`); that is scanned per-repository on session open
+-- or first run.
 CREATE TABLE index_outbox (
     id TEXT PRIMARY KEY,
     event_kind TEXT NOT NULL,         -- registry_item_changed|memory_changed|symbol_changed|document_changed|artifact_created

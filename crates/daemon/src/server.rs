@@ -157,6 +157,17 @@ pub struct ServerState {
     /// acquiring its read guard and is refused (retryable) rather than admitted
     /// into a daemon that is about to exit.
     pub shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Repository roots (canonicalized) this server has already fired a
+    /// background code-graph scan for. Without this, browsing the code-graph
+    /// edges overlay before ever running the agent showed "no edges": the
+    /// tree-sitter scan only ran on daemon boot (the daemon's own startup
+    /// directory) or the first `StartRun`/`SubmitUserInput` for a repository
+    /// (via the executor's own `ensure_scanned`). `CreateSession` and
+    /// `AttachSession` now carry the session's repository root too, so
+    /// [`maybe_scan_repository`] can warm the graph as soon as a session is
+    /// opened — guarded by this set so a session repeatedly created or
+    /// re-attached against the same repository fires at most one scan.
+    pub scanned_repos: Arc<Mutex<std::collections::HashSet<std::path::PathBuf>>>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -316,6 +327,7 @@ pub async fn run_with_executor_on(
         workflow_reader,
         run_admission: Arc::new(tokio::sync::RwLock::new(())),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        scanned_repos: Arc::new(Mutex::new(std::collections::HashSet::new())),
     });
 
     #[cfg(unix)]
@@ -549,6 +561,35 @@ async fn heartbeat_loop(
     }
 }
 
+/// Warm `repository`'s code graph in the background the first time this server
+/// sees a session opened against it (`CreateSession`/`AttachSession` carrying a
+/// `repository`), so the code-graph edges overlay is populated as soon as a
+/// user opens the TUI on a repo — not only after the first `StartRun` (which
+/// reaches the same warm-up through the executor's own `ensure_scanned`).
+///
+/// Guarded by [`ServerState::scanned_repos`] so a session repeatedly created or
+/// re-attached against the same repository fires at most one scan; a `None` or
+/// empty `repository` (an older client, or an attach without repo context) is a
+/// no-op. Fire-and-forget end to end: [`RunExecutor::ensure_repository_scanned`]
+/// is synchronous and spawns its own background task, exactly like
+/// `RunExecutor::spawn_run` — this function never blocks the command reply.
+async fn maybe_scan_repository(state: &Arc<ServerState>, repository: Option<String>) {
+    let Some(root) = repository.filter(|root| !root.is_empty()) else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+    let newly = {
+        let mut seen = state.scanned_repos.lock().await;
+        seen.insert(canonical)
+    };
+    if newly {
+        if let Some(executor) = state.executor.as_ref() {
+            executor.ensure_repository_scanned(root);
+        }
+    }
+}
+
 /// Resolve a run's repository root from an optional per-run repository path,
 /// shared by the `StartRun` and continuation (`SubmitUserInput`) launch arms so
 /// both resolve identically. `Some(path)` binds the run to exactly that
@@ -722,6 +763,7 @@ async fn handle_request(
                     last_seen_sequence,
                     subscriptions,
                     requested_role,
+                    repository,
                 } => {
                     // The requested role binds to the *connection* even when the
                     // attach itself is rejected (unknown session): role is a
@@ -738,6 +780,7 @@ async fn handle_request(
                         *session_id,
                         last_seen_sequence.unwrap_or(0),
                         subscriptions.clone(),
+                        repository.clone(),
                     )
                     .await?;
                     // Remember the attachment so a detach presence event fires when
@@ -1691,6 +1734,17 @@ async fn handle_request(
                             {
                                 executor.cancel_run(*run_id);
                             }
+                            // A freshly created session that carries its
+                            // repository root warms that repository's code
+                            // graph in the background, so the code-graph
+                            // edges overlay is populated as soon as the
+                            // session opens — not only on the first
+                            // `StartRun`. Guarded/fire-and-forget like the
+                            // executor dispatch above; never blocks this
+                            // reply.
+                            if let CommandBody::CreateSession { repository, .. } = &command.body {
+                                maybe_scan_repository(state, repository.clone()).await;
+                            }
                             let mut env = Envelope::reply_to(
                                 &request,
                                 Payload::CommandAccepted {
@@ -1751,7 +1805,16 @@ async fn handle_attach(
     session_id: SessionId,
     last_seen: u64,
     subscriptions: Vec<Subscription>,
+    repository: Option<String>,
 ) -> anyhow::Result<bool> {
+    // Warm this repository's code graph in the background (guarded,
+    // fire-and-forget) so the edges overlay is populated as soon as a session
+    // is (re-)attached, not only after the first run. Done up front — before
+    // the session-existence check below — so a probing re-attach with a
+    // remembered id still warms the graph even on the branch that falls
+    // through to creating a fresh session.
+    maybe_scan_repository(state, repository).await;
+
     // Reject an attach to a session this daemon has never seen. An empty
     // catch-up here used to make a typo'd id indistinguishable from a valid
     // empty session — the client then bound a blank UI to a dead id whose

@@ -249,6 +249,7 @@ fn command_vectors() -> Vec<Vector> {
             CommandBody::CreateSession {
                 workspace: workspace_id(),
                 title: "fix the failing test".to_string(),
+                repository: Some("/home/user/project".to_string()),
             },
         ),
         vec_of(
@@ -258,6 +259,7 @@ fn command_vectors() -> Vec<Vector> {
                 last_seen_sequence: Some(42),
                 subscriptions: vec![Subscription::SessionSummary, Subscription::AgentActivity],
                 requested_role: ClientRole::Approver,
+                repository: Some("/home/user/project".to_string()),
             },
         ),
         vec_of(

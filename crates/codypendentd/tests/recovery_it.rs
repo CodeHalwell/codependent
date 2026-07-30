@@ -161,6 +161,7 @@ async fn kill9_daemon_recovers_parked_run_to_failed() {
         CommandBody::CreateSession {
             workspace: WorkspaceId::new(),
             title: "diagnose".to_string(),
+            repository: None,
         },
         "create",
     )

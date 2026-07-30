@@ -163,6 +163,7 @@ async fn create_session(stream: &mut UnixStream, client: ClientId) -> SessionId 
         CommandBody::CreateSession {
             workspace: WorkspaceId::new(),
             title: "bb".to_string(),
+            repository: None,
         },
         "create",
     )
@@ -188,6 +189,7 @@ async fn attach_as_observer(stream: &mut UnixStream, client: ClientId, session: 
             last_seen_sequence: None,
             subscriptions: vec![Subscription::SessionSummary],
             requested_role: ClientRole::Observer,
+            repository: None,
         },
         "attach",
     )

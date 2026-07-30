@@ -36,6 +36,12 @@ pub enum CommandBody {
     CreateSession {
         workspace: WorkspaceId,
         title: String,
+        /// The canonical filesystem root of the repository this session
+        /// operates on, so the daemon can build its code graph on open (not
+        /// only on the first run). `#[serde(default)]` keeps older clients
+        /// (which send none) working.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository: Option<String>,
     },
     AttachSession {
         session_id: SessionId,
@@ -43,6 +49,12 @@ pub enum CommandBody {
         last_seen_sequence: Option<u64>,
         subscriptions: Vec<Subscription>,
         requested_role: ClientRole,
+        /// The canonical filesystem root of the repository this session
+        /// operates on, so the daemon can build its code graph on open (not
+        /// only on the first run). `#[serde(default)]` keeps older clients
+        /// (which send none) working.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository: Option<String>,
     },
     SubmitUserInput {
         session_id: SessionId,
@@ -503,12 +515,14 @@ mod tests {
         round_trip(CommandBody::CreateSession {
             workspace: WorkspaceId::new(),
             title: "fix the failing test".to_string(),
+            repository: Some("/home/user/project".to_string()),
         });
         round_trip(CommandBody::AttachSession {
             session_id: SessionId::new(),
             last_seen_sequence: Some(42),
             subscriptions: vec![Subscription::SessionSummary],
             requested_role: ClientRole::Contributor,
+            repository: Some("/home/user/project".to_string()),
         });
         round_trip(CommandBody::SubmitUserInput {
             session_id: SessionId::new(),
@@ -783,6 +797,7 @@ mod tests {
                 last_seen_sequence: None,
                 subscriptions: vec![],
                 requested_role: ClientRole::Observer,
+                repository: None,
             },
         };
         let json = serde_json::to_string(&command).expect("serialize");

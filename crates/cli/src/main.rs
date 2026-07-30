@@ -108,7 +108,10 @@ enum TopCommand {
         #[arg(long, value_enum, default_value = "jsonl")]
         events: EventsFormat,
     },
-    /// Maintain the knowledge fabric's derived indexes (Phase 2).
+    /// Maintain the knowledge fabric's derived RETRIEVAL indexes — full-text
+    /// (BM25) + vectors (Phase 2). This is search, NOT the code graph: the
+    /// code-graph nodes/edges are built per-repository when you open a session
+    /// or start a run, not by this command.
     Index {
         #[command(subcommand)]
         command: IndexCommand,
@@ -201,7 +204,9 @@ impl IdeArg {
 
 #[derive(Subcommand)]
 enum IndexCommand {
-    /// Delete the derived indexes and rebuild them from the authoritative rows.
+    /// Delete the derived RETRIEVAL indexes (BM25 + vectors) and rebuild them
+    /// from the authoritative rows. Does NOT rebuild the code graph — that is
+    /// built per-repository on session open / first run.
     Rebuild,
 }
 

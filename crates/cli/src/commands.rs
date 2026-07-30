@@ -419,6 +419,10 @@ pub async fn run_over_connection<W: Write>(
         .send_command(CommandBody::CreateSession {
             workspace,
             title: objective.clone(),
+            // Attribute the session to the `--repo` the client is operating on
+            // (mirrors the `StartRun.repository` below), so the daemon can
+            // build its code graph on open, not only on the first run.
+            repository: Some(repository.to_owned()),
         })
         .await?;
     let session_id = match &create_reply.payload {
@@ -441,6 +445,7 @@ pub async fn run_over_connection<W: Write>(
             last_seen_sequence: None,
             subscriptions: vec![Subscription::SessionSummary, Subscription::AgentActivity],
             requested_role: ClientRole::Controller,
+            repository: Some(repository.to_owned()),
         })
         .await?;
     let catchup = expect_catchup(attach_reply)?;
@@ -509,6 +514,11 @@ pub async fn attach_over_connection<W: Write>(
             last_seen_sequence: from_sequence,
             subscriptions: vec![Subscription::SessionSummary, Subscription::AgentActivity],
             requested_role: ClientRole::Observer,
+            // No repo context here: this attaches to a session another client
+            // already created (and scanned, if it carried one) — see
+            // `crates/cli/src/tui.rs` for the construction sites that do carry
+            // the canonical repo root.
+            repository: None,
         })
         .await?;
     let catchup = expect_catchup(attach_reply)?;
@@ -1177,6 +1187,9 @@ pub async fn workflow_watch_over_connection<W: Write>(
         .send_command(CommandBody::CreateSession {
             workspace: WorkspaceId::new(),
             title: format!("watch {workflow_run_id}"),
+            // Throwaway session (only a connection-level anchor for the
+            // per-run subscription forwarder): no repo context to carry.
+            repository: None,
         })
         .await?;
     let session_id = match &create_reply.payload {
@@ -1195,6 +1208,7 @@ pub async fn workflow_watch_over_connection<W: Write>(
             workflow_run_id: workflow_run_id.clone(),
         }],
         requested_role: ClientRole::Observer,
+        repository: None,
     })
     .await?;
 
@@ -1398,6 +1412,8 @@ async fn bind_control_role(conn: &mut Connection) -> anyhow::Result<()> {
         last_seen_sequence: None,
         subscriptions: vec![],
         requested_role: ClientRole::Controller,
+        // Role-bootstrap-only attach to a throwaway session id: no repo context.
+        repository: None,
     })
     .await?;
     Ok(())

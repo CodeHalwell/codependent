@@ -80,6 +80,9 @@ impl AcpBackend for DaemonAcpBackend {
             .send_command(CommandBody::CreateSession {
                 workspace: WorkspaceId::new(),
                 title: "acp".to_string(),
+                // So the daemon can build its code graph on open, not only on
+                // the first run (mirrors `StartRun.repository` below).
+                repository: Some(self.repo.to_string_lossy().into_owned()),
             })
             .await
             .map_err(|e| AcpError::Backend(e.to_string()))?;
@@ -111,6 +114,7 @@ impl AcpBackend for DaemonAcpBackend {
             // daemon gates `ResolveApproval` to Approver/Controller, and Approver
             // is a superset of Contributor's start/submit permissions.
             requested_role: ClientRole::Approver,
+            repository: Some(self.repo.to_string_lossy().into_owned()),
         })
         .await
         .map_err(|e| AcpError::Backend(e.to_string()))?;

@@ -21,6 +21,7 @@
   },
   "CommandBody_AttachSession": {
     "last_seen_sequence": 42,
+    "repository": "/home/user/project",
     "requested_role": {
       "type": "Approver"
     },
@@ -44,6 +45,7 @@
     "workflow_run_id": "wfrun-abc123"
   },
   "CommandBody_CreateSession": {
+    "repository": "/home/user/project",
     "title": "fix the failing test",
     "type": "CreateSession",
     "workspace": "10000000-0000-0000-0000-000000000001"
