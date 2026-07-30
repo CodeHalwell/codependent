@@ -37,6 +37,12 @@ const CAPABILITY_GRANT_TTL_MINUTES: i64 = 15;
 /// writes are network-scoped to exactly this endpoint (Phase 3 STEP 3.1).
 pub const GITHUB_API_ENDPOINT: &str = "api.github.com:443";
 
+/// The `host:port` a `web.search` call must be network-authorized against
+/// (PR C1 — agent capabilities). Tavily searches are network-scoped to exactly
+/// this endpoint; the executor admits it on the allow-list when a search client
+/// is configured, exactly like [`GITHUB_API_ENDPOINT`].
+pub const TAVILY_API_ENDPOINT: &str = "api.tavily.com:443";
+
 /// The three possible dispositions of a policy evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]

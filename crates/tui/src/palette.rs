@@ -37,6 +37,8 @@ pub enum PaletteCommand {
     Model,
     /// Open the provider catalog picker (Task 8).
     Provider,
+    /// Open the submission-mode picker (PR C2 — plan mode).
+    Mode,
     /// Flip between the chat and workspace layouts.
     ToggleLayout,
     /// Toggle the help overlay.
@@ -124,6 +126,15 @@ pub const COMMANDS: &[PaletteEntry] = &[
         description: "browse the built-in provider catalog and stage one",
         // Palette-only (Task 8): no single-key equivalent, mirroring the
         // model picker's own row.
+        key: "—",
+        group: "Models",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Mode,
+        title: "Mode picker",
+        description: "choose the submission mode for the next run (Ask/Explore/Plan/Build/Review)",
+        // Palette-only (PR C2): no single-key equivalent, mirroring the
+        // model/provider pickers.
         key: "—",
         group: "Models",
     },
@@ -266,6 +277,16 @@ mod tests {
         let provider = filtered("provider");
         assert_eq!(provider.len(), 1);
         assert_eq!(provider[0].command, PaletteCommand::Provider);
+    }
+
+    #[test]
+    fn filters_to_the_mode_picker_command() {
+        // PR C2: "/mode" opens the mode picker via the palette front door.
+        // ("mode" alone also substring-matches the Model picker's title, so
+        // the full row title is the unambiguous query.)
+        let mode = filtered("mode picker");
+        assert_eq!(mode.len(), 1);
+        assert_eq!(mode[0].command, PaletteCommand::Mode);
     }
 
     #[test]

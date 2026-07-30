@@ -24,9 +24,9 @@ use crate::action::Action;
 use crate::input::footer_hints;
 use crate::reduce::capability_label;
 use crate::state::{
-    filter_model_names, filter_models, filter_providers, AppState, DocFocus, DocLeaseState,
-    LayoutMode, ModelCard, ModelLocationLabel, Overlay, Pane, PatchSummary, ProviderCard,
-    RunActivity, RunView, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
+    filter_model_names, filter_models, filter_modes, filter_providers, AppState, DocFocus,
+    DocLeaseState, LayoutMode, ModelCard, ModelLocationLabel, Overlay, Pane, PatchSummary,
+    ProviderCard, RunActivity, RunView, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -1320,6 +1320,14 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                 .map_or("—".to_owned(), |m| mode_label(m).to_owned()),
             theme.status.info,
         ));
+        // PR C2 (plan mode): the submission mode the NEXT run/continuation
+        // will use (`default_mode`, set in the `/mode` picker) — distinct
+        // from the active run's `mode` above, which the daemon reported.
+        ambient.push(field(
+            "next",
+            mode_label(state.default_mode).to_owned(),
+            theme.status.info,
+        ));
     }
     ambient.push(field(
         "state",
@@ -1488,6 +1496,9 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         }
         Overlay::ProviderPicker { query, selected } => {
             render_provider_picker(frame, area, state, theme, query, *selected);
+        }
+        Overlay::ModePicker { query, selected } => {
+            render_mode_picker(frame, area, state, theme, query, *selected);
         }
         // The block-edit prompt floats over the Docs browser it opened from, so the
         // editor stays in view while the writer types the insertion.
@@ -2144,6 +2155,118 @@ fn render_provider_picker(
             .wrap(Wrap { trim: false }),
         cols[1],
     );
+}
+
+/// The mode picker (PR C2 — plan mode): the same filter-line + list shape as
+/// [`render_model_picker`], over the static [`MODE_CARDS`] table — five rows,
+/// so no detail pane and no scroll windowing. The row matching
+/// [`AppState::default_mode`] is marked current; `Enter` stages the focused
+/// row as the next run's submission mode. Colors are Theme tokens only
+/// (RULE 7).
+fn render_mode_picker(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    query: &str,
+    selected: usize,
+) {
+    let rect = centered_rect(60, 50, area);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Mode picker ({}) ", crate::state::MODE_CARDS.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    // The filter line, with a block cursor so it reads as an input (the
+    // command palette's shape).
+    let filter = Line::from(vec![
+        Span::styled("› ", Style::default().fg(theme.focus.active)),
+        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
+        Span::styled("▏", Style::default().fg(theme.focus.active)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(filter).style(Style::default().bg(theme.surface.overlay)),
+        rows[0],
+    );
+
+    // The filtered mode list: each row is 2 lines tall (label, summary), the
+    // current default marked ●. Five rows always fit, so no scroll window.
+    const ROW_LINES: usize = 2;
+    let list_area = rows[1];
+    let matches = filter_modes(query);
+    let mut items: Vec<ListItem> = Vec::new();
+    if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching mode",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate() {
+        let card = &crate::state::MODE_CARDS[idx];
+        let is_selected = row == selected;
+        let is_current = card.mode == state.default_mode;
+        let head = Line::from(vec![
+            Span::styled(
+                if is_selected { "› " } else { "  " },
+                Style::default().fg(theme.focus.active),
+            ),
+            Span::styled(
+                if is_current { "● " } else { "  " },
+                Style::default().fg(theme.status.success),
+            ),
+            Span::styled(card.label, Style::default().fg(theme.text.primary)),
+        ]);
+        let summary_line = Line::styled(
+            format!("      {}", card.summary),
+            Style::default().fg(theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, summary_line]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        list_area,
+    );
+    // Each visible row is a fixed 2 lines tall (label/summary) — register a
+    // rect of that height per row so a click maps to the right index.
+    for (row, _) in matches.iter().enumerate() {
+        let y = list_area.y + (row as u16) * ROW_LINES as u16;
+        if y >= list_area.y + list_area.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: ROW_LINES as u16,
+            },
+            Action::ActivateRow(row),
+        );
+    }
 }
 
 /// A provider card's badges, space-joined: its protocol and local/hosted
@@ -5685,6 +5808,57 @@ mod tests {
         assert!(
             !text.contains("stage"),
             "the dead 'stage' copy must be gone:\n{text}"
+        );
+    }
+
+    #[test]
+    fn mode_picker_snapshot_lists_the_modes_and_marks_the_current_default() {
+        // PR C2 (plan mode): the picker lists every submission mode and marks
+        // the current `default_mode` (Build, out of the box).
+        let mut state = running_build_state();
+        reduce(&mut state, Action::OpenPalette);
+        for c in "mode picker".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputSubmit);
+        assert!(matches!(state.overlay, Overlay::ModePicker { .. }));
+
+        let text = render_to_string(&state, 120, 40);
+        assert!(text.contains("Mode picker"), "title missing:\n{text}");
+        for label in ["Ask", "Explore", "Plan", "Build", "Review"] {
+            assert!(text.contains(label), "the {label} row is missing:\n{text}");
+        }
+        assert!(
+            text.contains("● Build"),
+            "the current default is marked:\n{text}"
+        );
+        assert!(
+            !text.contains("● Plan"),
+            "a non-current mode must not be marked:\n{text}"
+        );
+        assert!(
+            text.contains("investigate read-only, then finish"),
+            "the Plan row's summary is missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_status_line_shows_the_next_runs_submission_mode() {
+        // PR C2: the picked `default_mode` is visible without opening the
+        // picker — the status line's `next` field, distinct from the active
+        // run's `mode` field.
+        let mut state = running_build_state();
+        let before = render_to_string(&state, 120, 40);
+        assert!(
+            before.contains("next Build"),
+            "the default submission mode shows:\n{before}"
+        );
+
+        state.default_mode = AgentMode::Plan;
+        let after = render_to_string(&state, 120, 40);
+        assert!(
+            after.contains("next Plan"),
+            "a picked mode shows immediately:\n{after}"
         );
     }
 

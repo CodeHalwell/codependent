@@ -30,13 +30,14 @@ use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
 use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader};
 use codypendent_daemon::executor::{PriorTurn, RunExecutor, RunLaunch};
-use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT};
+use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT, TAVILY_API_ENDPOINT};
 use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::workflow_stream::{WorkflowHub, WorkflowReader};
 use codypendent_daemon::worktrees::{WorktreeError, WorktreeManager};
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::github::{GitHubApi, RepoId};
 use codypendent_integrations::mcp::{McpBridge, McpRegistry};
+use codypendent_integrations::search::{SearchApi, TavilyClient};
 use codypendent_knowledge::{
     assemble_context, chronicle_candidates, extract_candidates, Curation, ExtractionInput,
     FactExtractor, MemoryStore, NoopExtractor, Revision, Scope,
@@ -140,6 +141,12 @@ pub struct RuntimeExecutor {
     /// the trait object, like `github`, so the runtime's `with_mcp` needs no
     /// cast at the call sites.
     mcp: Option<Arc<dyn McpBridge>>,
+    /// The web-search client the `web.search` tool calls (PR C1), built from
+    /// the `TAVILY_API_KEY` discovered at startup. `None` leaves the tool
+    /// unoffered and the run behaves exactly as before. Stored pre-coerced to
+    /// the trait object, like `github`/`mcp`, so the runtime's `with_search`
+    /// needs no cast at the call sites.
+    search: Option<Arc<dyn SearchApi>>,
     /// The workflow-execution host: creates, drives, recovers, and controls durable
     /// workflow runs (Phase 5 STEP 5.2). One shared host backs both the
     /// [`WorkflowStarter`](codypendent_daemon::workflows::WorkflowStarter) and
@@ -234,6 +241,7 @@ impl RuntimeExecutor {
             None,
             None,
             None,
+            None,
             startup_repository_root.clone(),
             blackboards.clone(),
             workflows.clone(),
@@ -251,6 +259,7 @@ impl RuntimeExecutor {
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             github: None,
             mcp: None,
+            search: None,
             workflow_host,
             repository_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             promotion,
@@ -299,10 +308,12 @@ impl RuntimeExecutor {
             self.subscriptions.clone(),
             self.approvals.clone(),
             Some(github),
-            // Carry the MCP bridge forward across the rebuild, like the
-            // drive-lock registry below — whichever of `with_github`/`with_mcp`
-            // runs last must not drop the other's injection.
+            // Carry the MCP bridge and the search client forward across the
+            // rebuild, like the drive-lock registry below — whichever of
+            // `with_github`/`with_mcp`/`with_search` runs last must not drop
+            // the others' injection.
             self.mcp.clone(),
+            self.search.clone(),
             Some(drive_locks),
             self.startup_repository_root.clone(),
             self.blackboards.clone(),
@@ -321,9 +332,9 @@ impl RuntimeExecutor {
     /// call is still dispositioned by the policy's `[mcp]` section). The
     /// workflow host is rebuilt exactly as [`Self::with_github`] rebuilds it —
     /// SHARING the existing drive-lock registry, hubs, and cancellation
-    /// registry, and carrying the GitHub client forward — so a workflow agent
-    /// node's runtime is configured identically to a single-agent run's no
-    /// matter which builder ran last.
+    /// registry, and carrying the GitHub client and search client forward — so
+    /// a workflow agent node's runtime is configured identically to a
+    /// single-agent run's no matter which builder ran last.
     pub fn with_mcp(mut self, mcp: Arc<McpRegistry>) -> Self {
         self.mcp = Some(mcp);
         let drive_locks = self.workflow_host.drive_locks();
@@ -334,6 +345,36 @@ impl RuntimeExecutor {
             self.approvals.clone(),
             self.github.clone(),
             self.mcp.clone(),
+            self.search.clone(),
+            Some(drive_locks),
+            self.startup_repository_root.clone(),
+            self.blackboards.clone(),
+            self.workflows.clone(),
+            self.workflow_cancellations.clone(),
+            self.routing.clone(),
+        );
+        self
+    }
+
+    /// Inject the web-search client (PR C1). When set, the agent loop gains the
+    /// `web.search` tool and the policy admits the Tavily API endpoint on the
+    /// network allow-list. The workflow host is rebuilt exactly as
+    /// [`Self::with_github`]/[`Self::with_mcp`] rebuild it — SHARING the
+    /// existing drive-lock registry, hubs, and cancellation registry, and
+    /// carrying the GitHub client and MCP bridge forward — so a workflow agent
+    /// node's runtime is configured identically to a single-agent run's no
+    /// matter which builder ran last.
+    pub fn with_search(mut self, search: Arc<TavilyClient>) -> Self {
+        self.search = Some(search);
+        let drive_locks = self.workflow_host.drive_locks();
+        self.workflow_host = build_workflow_host(
+            self.pool.clone(),
+            self.paths.clone(),
+            self.subscriptions.clone(),
+            self.approvals.clone(),
+            self.github.clone(),
+            self.mcp.clone(),
+            self.search.clone(),
             Some(drive_locks),
             self.startup_repository_root.clone(),
             self.blackboards.clone(),
@@ -443,7 +484,8 @@ impl RuntimeExecutor {
     /// network allow-list AFTER the load, so it composes with whatever the
     /// file layers granted rather than being lost to them — admitting the
     /// endpoint alone grants nothing; every GitHub write still requires
-    /// approval.
+    /// approval. [`TAVILY_API_ENDPOINT`] is admitted the same way when a
+    /// web-search client is configured (PR C1).
     ///
     /// A malformed or unknown-key file in EITHER layer is mapped to a legible
     /// error string here, and the caller (`execute`) propagates it with `?` so
@@ -460,6 +502,9 @@ impl RuntimeExecutor {
             .map_err(|e| format!("policy configuration error: {e}"))?;
         if self.github.is_some() {
             policy = policy.admitting_network([GITHUB_API_ENDPOINT.to_string()]);
+        }
+        if self.search.is_some() {
+            policy = policy.admitting_network([TAVILY_API_ENDPOINT.to_string()]);
         }
         Ok(policy)
     }
@@ -578,6 +623,9 @@ impl RuntimeExecutor {
         }
         if let Some(mcp) = &self.mcp {
             runtime = runtime.with_mcp(mcp.clone());
+        }
+        if let Some(search) = &self.search {
+            runtime = runtime.with_search(search.clone());
         }
 
         // Bind the run's worktree (STEP 1.8, the Phase-1 follow-up): a writing
@@ -2370,6 +2418,56 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
             policy.policy_version(),
             codypendent_daemon::policy::PolicyEngine::with_defaults().policy_version(),
             "with no policy files the loaded engine must match with_defaults exactly"
+        );
+    }
+
+    /// PR C1: with a web-search client configured, `load_run_policy` admits
+    /// the Tavily endpoint on the network allow-list — after the file layers
+    /// load, exactly like the GitHub admission — so a `web.search` read
+    /// evaluates `Allow`; with no client configured the same proposal stays
+    /// denied.
+    #[tokio::test]
+    async fn load_run_policy_admits_tavily_endpoint_only_when_search_is_configured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().join("data"));
+        paths.ensure_directories().expect("directories");
+
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).expect("repo root");
+        let repository = scan::repository_id_for(&repo_root);
+        let executor = RuntimeExecutor::new(pool, paths, repository, repo_root.clone());
+
+        let tavily_request = codypendent_protocol::ProposedAction::NetworkRequest {
+            destination: TAVILY_API_ENDPOINT.to_string(),
+        };
+        let eval_ctx = codypendent_daemon::policy::EvalContext::new(&repo_root, &repo_root)
+            .with_mode(mode_overlay(AgentMode::Build));
+
+        let without_search = executor
+            .load_run_policy(&repo_root)
+            .expect("load without search");
+        assert_eq!(
+            without_search.evaluate(&tavily_request, &eval_ctx).decision,
+            codypendent_daemon::policy::Decision::Deny,
+            "no search client → the Tavily endpoint is not admitted"
+        );
+
+        let client = TavilyClient::new(
+            "http://127.0.0.1:9",
+            codypendent_integrations::search::TavilyKey::new("tvly-test"),
+        )
+        .expect("build client");
+        let with_search = executor
+            .with_search(Arc::new(client))
+            .load_run_policy(&repo_root)
+            .expect("load with search");
+        assert_eq!(
+            with_search.evaluate(&tavily_request, &eval_ctx).decision,
+            codypendent_daemon::policy::Decision::Allow,
+            "a configured search client admits the Tavily endpoint for reads"
         );
     }
 

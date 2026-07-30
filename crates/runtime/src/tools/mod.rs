@@ -42,6 +42,7 @@ mod repository;
 mod salient;
 mod search;
 mod shell;
+mod web_search;
 mod write_file;
 
 use std::path::PathBuf;
@@ -73,6 +74,7 @@ pub use repository::{RepositoryTest, RepositoryTestOutcome};
 pub use salient::{SalientStream, SalientView};
 pub use search::{Search, SearchInput, SearchMatch, SearchResults};
 pub use shell::{CommandRequest, EnvironmentBinding, Shell, ShellOutcome};
+pub use web_search::{parse_web_search, render_search_outcome, WebSearch, WebSearchInput};
 pub use write_file::{parse_write_file, WriteFile, WriteFileInput, WriteFileOutcome};
 
 /// A capability class a tool requires. The concrete

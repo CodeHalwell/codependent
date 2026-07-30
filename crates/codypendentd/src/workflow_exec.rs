@@ -71,6 +71,7 @@ use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::blackboard::BlackboardHub;
 use codypendent_daemon::policy::{
     Capability, CommandScope, Decision, EvalContext, PathScope, PolicyEngine, GITHUB_API_ENDPOINT,
+    TAVILY_API_ENDPOINT,
 };
 use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::workflow_stream::WorkflowHub;
@@ -79,6 +80,7 @@ use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::github::model::UpdatePullRequest;
 use codypendent_integrations::github::{github_mutation_action, GitHubApi};
 use codypendent_integrations::mcp::McpBridge;
+use codypendent_integrations::search::SearchApi;
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     Actor, AgentMode, ApprovalDecision, ArtifactRef, EventBody, ProposedAction, Risk, RiskLevel,
@@ -366,8 +368,9 @@ impl NodeModelDriverFactory for ConfiguredModelDriverFactory {
 /// Build the workflow host over one shared [`AgentLoopNodeExecutor`] carrying the
 /// production driver factory. Used by [`RuntimeExecutor::new`] (`drive_locks:
 /// None` — the first host this process builds, so a fresh registry) and
-/// rebuilt by `with_github`/`with_mcp` so agent nodes drive with the daemon's
-/// GitHub client and MCP bridge (`drive_locks: Some(existing)` — reconfiguring
+/// rebuilt by `with_github`/`with_mcp`/`with_search` so agent nodes drive with
+/// the daemon's GitHub client, MCP bridge, and search client (`drive_locks:
+/// Some(existing)` — reconfiguring
 /// an ALREADY-running host must carry its per-run drive-lock registry forward,
 /// not mint a fresh one; see [`WorkflowConductorHost::with_drive_locks`],
 /// P5-D6c). `routing` is
@@ -383,6 +386,7 @@ pub(crate) fn build_workflow_host(
     approvals: ApprovalBroker,
     github: Option<Arc<dyn GitHubApi>>,
     mcp: Option<Arc<dyn McpBridge>>,
+    search: Option<Arc<dyn SearchApi>>,
     drive_locks: Option<DriveLockRegistry>,
     startup_repository: PathBuf,
     blackboards: BlackboardHub,
@@ -405,6 +409,7 @@ pub(crate) fn build_workflow_host(
         approvals,
         github,
         mcp,
+        search,
         factory,
         startup_repository,
         blackboards,
@@ -593,6 +598,9 @@ pub struct AgentLoopNodeExecutor {
     /// dispatch through (PR B — MCP client), built from the operator-declared
     /// `mcp.toml` at startup. `None` leaves those tools unoffered.
     mcp: Option<Arc<dyn McpBridge>>,
+    /// The web-search client a workflow agent node's `web.search` tool calls
+    /// (PR C1). `None` leaves the tool unoffered.
+    search: Option<Arc<dyn SearchApi>>,
     driver_factory: Arc<dyn NodeModelDriverFactory>,
     /// The daemon's startup repository root — the fallback a node's agent runs
     /// against when its workflow run recorded no repository (an older client).
@@ -624,6 +632,7 @@ impl AgentLoopNodeExecutor {
         approvals: ApprovalBroker,
         github: Option<Arc<dyn GitHubApi>>,
         mcp: Option<Arc<dyn McpBridge>>,
+        search: Option<Arc<dyn SearchApi>>,
         driver_factory: Arc<dyn NodeModelDriverFactory>,
         startup_repository: PathBuf,
         blackboards: BlackboardHub,
@@ -636,6 +645,7 @@ impl AgentLoopNodeExecutor {
             approvals,
             github,
             mcp,
+            search,
             driver_factory,
             startup_repository,
             blackboards,
@@ -1107,10 +1117,21 @@ impl AgentLoopNodeExecutor {
         role: &str,
         driver: &dyn ModelDriver,
     ) -> anyhow::Result<RunOutcome> {
-        let policy = if self.github.is_some() {
-            PolicyEngine::with_defaults_allowing_network([GITHUB_API_ENDPOINT.to_string()])
-        } else {
+        // Admit the endpoints of every configured integration on the network
+        // allow-list: GitHub when a client is wired (Phase 3), Tavily when a
+        // search client is wired (PR C1) — mirroring the single-agent
+        // executor's `load_run_policy` admissions.
+        let mut admitted: Vec<String> = Vec::new();
+        if self.github.is_some() {
+            admitted.push(GITHUB_API_ENDPOINT.to_string());
+        }
+        if self.search.is_some() {
+            admitted.push(TAVILY_API_ENDPOINT.to_string());
+        }
+        let policy = if admitted.is_empty() {
             PolicyEngine::with_defaults()
+        } else {
+            PolicyEngine::with_defaults_allowing_network(admitted)
         };
         let mut runtime = FrameworkAgentRuntime::new(
             ModelRegistry::default(),
@@ -1128,6 +1149,11 @@ impl AgentLoopNodeExecutor {
         // like a single-agent run.
         if let Some(mcp) = &self.mcp {
             runtime = runtime.with_mcp(mcp.clone());
+        }
+        // Wire the search client so this node's agent is offered the
+        // `web.search` tool (PR C1), exactly like a single-agent run.
+        if let Some(search) = &self.search {
+            runtime = runtime.with_search(search.clone());
         }
         // Wire the blackboard channel so this node's agent can post/query its run's
         // board (STEP 5.3). The channel writes the store on the pool and fans each
@@ -2651,6 +2677,7 @@ steps:
             ApprovalBroker::new(),
             None,
             None,
+            None,
             factory,
             startup_repository.to_path_buf(),
             BlackboardHub::new(),
@@ -4050,6 +4077,7 @@ steps:
             approvals,
             github,
             None,
+            None,
             factory,
             startup_repository.to_path_buf(),
             BlackboardHub::new(),
@@ -4659,6 +4687,7 @@ steps:
             SubscriptionHub::new(),
             broker,
             github,
+            None,
             None,
             Arc::new(ScriptedDriverFactory {
                 steps: vec![],

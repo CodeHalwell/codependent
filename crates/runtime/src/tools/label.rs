@@ -19,7 +19,7 @@
 
 use serde_json::Value;
 
-use super::{ApplyPatch, EditFile, ReadFile, Search, Shell};
+use super::{ApplyPatch, EditFile, ReadFile, Search, Shell, WebSearch};
 
 /// Hard ceiling on a derived label's length, in `char`s. Longer values are
 /// truncated with a trailing `…`. Short enough to sit on one line next to the
@@ -72,6 +72,8 @@ pub fn tool_label(tool: &str, args: &Value) -> Option<String> {
         EditFile::NAME | "edit_file" => string_arg(args, &["path", "file", "filename"]),
         Shell::NAME => shell_command_label(args),
         Search::NAME | "search" => string_arg(args, &["query", "pattern"]),
+        // `web.search` (PR C1): the query is the label, like `workspace.search`.
+        WebSearch::NAME => string_arg(args, &["query"]),
         // MCP client (PR B): an `mcp.<server>.<tool>` args schema is
         // server-defined, so no argument is known-safe to surface — the
         // server.tool pair itself (already part of the tool name, and how the
@@ -218,6 +220,18 @@ mod tests {
             tool_label("workspace.search", &json!({"query": "TODO"})),
             Some("TODO".to_string())
         );
+    }
+
+    #[test]
+    fn web_search_label_is_the_query() {
+        assert_eq!(
+            tool_label(
+                "web.search",
+                &json!({"query": "rust async", "max_results": 5})
+            ),
+            Some("rust async".to_string())
+        );
+        assert_eq!(tool_label("web.search", &json!({})), None);
     }
 
     #[test]
