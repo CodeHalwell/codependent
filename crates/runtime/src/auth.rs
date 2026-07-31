@@ -75,6 +75,13 @@ impl AuthStore {
         );
     }
 
+    /// Remove the stored API key for `model_id`, returning whether an entry
+    /// was present (the `/keys` flow uses this to skip a pointless save when
+    /// there was nothing to remove).
+    pub fn remove(&mut self, model_id: &str) -> bool {
+        self.entries.remove(model_id).is_some()
+    }
+
     /// Persist to `<data_dir>/auth.json` at mode `0600`, atomically: write a
     /// temp file, explicitly tightened to `0600` immediately after opening —
     /// before any secret bytes are written — then rename it over the target.
@@ -132,6 +139,19 @@ impl AuthStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_deletes_an_entry_and_reports_presence() {
+        let mut store = AuthStore::default();
+        store.set("groq/llama", "sk-abc");
+        assert!(store.remove("groq/llama"), "an existing entry removes");
+        assert_eq!(store.get("groq/llama"), None);
+        assert!(
+            !store.remove("groq/llama"),
+            "a second remove reports nothing was present"
+        );
+        assert!(!store.remove("never-present"), "absent removes as false");
+    }
 
     #[test]
     fn set_save_load_round_trips() {

@@ -9,7 +9,7 @@
 
 use codypendent_protocol::{ApprovalScope, DocumentId, DocumentMutation, RunId, SessionEvent};
 
-use crate::state::{DocBlockView, DocSuggestionView, Pane};
+use crate::state::{DocBlockView, DocSuggestionView, KeyStatus, Pane};
 
 /// A semantic action the reducer folds into [`crate::state::AppState`].
 ///
@@ -193,6 +193,21 @@ pub enum Action {
     /// any already-entered key).
     ProviderModelsFailed { provider_id: String, reason: String },
 
+    /// The `/keys` status projection (D1), loaded by the harness after the
+    /// other projections (it reads `auth.json` + `models.toml` — the tui crate
+    /// does no I/O) and re-fired after every key write and daemon restart.
+    /// `models` is one `(model_id, status)` per configured model; `tavily` is
+    /// the `web.search` row's status. Statuses carry no key material — an env
+    /// status holds the variable NAME, never its value.
+    ApiKeyStatusesLoaded {
+        models: Vec<(String, KeyStatus)>,
+        tavily: KeyStatus,
+    },
+    /// The harness asks to open the restart-offer confirm (D1): shown after a
+    /// Tavily `web.search` key is saved, since the daemon only discovers that
+    /// key at boot. `y` folds to a client-only [`Intent::RestartDaemon`].
+    OfferDaemonRestart,
+
     /// Toggle the command palette (`/`): a searchable list of every command.
     OpenPalette,
     /// Begin the add-model flow for the focused provider in the `/provider`
@@ -238,6 +253,23 @@ impl std::fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SecretKey(<redacted>)")
     }
+}
+
+/// What an API key applies to in the `/keys` flow (D1). Carried by
+/// [`Overlay::ApiKeySet`]/[`Overlay::ApiKeyRemoveConfirm`] and the
+/// [`Intent::SetApiKey`]/[`Intent::RemoveApiKey`] intents. Never carries key
+/// material — `Model` holds the (non-secret) model id, which doubles as the
+/// `auth.json` entry key; the harness maps `Tavily` onto the reserved
+/// `integrations/tavily` entry id.
+///
+/// [`Overlay::ApiKeySet`]: crate::state::Overlay::ApiKeySet
+/// [`Overlay::ApiKeyRemoveConfirm`]: crate::state::Overlay::ApiKeyRemoveConfirm
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyTarget {
+    /// A configured model's key (the `models.toml` id).
+    Model(String),
+    /// The Tavily `web.search` key.
+    Tavily,
 }
 
 /// A semantic command the reducer wants sent to the daemon.
@@ -346,6 +378,26 @@ pub enum Intent {
         provider_id: String,
         api_key: Option<SecretKey>,
     },
+
+    /// Set (or replace) an API key from the `/keys` overlay (D1; client-only —
+    /// NOT a daemon command, keeping the key off the wire exactly like
+    /// `AddModel`). The harness writes it to `auth.json` (load-before-write,
+    /// atomic, mode `0600`); the daemon re-reads `auth.json` per run (model
+    /// keys) or per boot (Tavily), so no wire command exists. Intercepted in
+    /// the harness drain loop; never mapped to a `CommandBody`.
+    SetApiKey { target: KeyTarget, key: SecretKey },
+    /// Remove a saved API key from `auth.json` (D1; client-only, mirroring
+    /// [`Intent::SetApiKey`]). Intercepted in the harness drain loop; never
+    /// mapped to a `CommandBody`.
+    RemoveApiKey { target: KeyTarget },
+    /// Restart the daemon now (D1; client-only — NOT a daemon command). The
+    /// reducer emits this when the operator confirms the restart offer shown
+    /// after saving a Tavily key (the daemon discovers that key only at boot).
+    /// The harness runs the DR7 idle-guarded restart
+    /// (`commands::restart_daemon_if_idle`), which refuses while a run is
+    /// active. Intercepted in the harness drain loop; never mapped to a
+    /// `CommandBody`.
+    RestartDaemon,
 }
 
 #[cfg(test)]
@@ -387,5 +439,22 @@ mod tests {
             !format!("{intent:?}").contains("sk-secret"),
             "the key must never leak through the intent's Debug"
         );
+    }
+
+    #[test]
+    fn set_api_key_intent_debug_redacts_the_key() {
+        for target in [
+            KeyTarget::Model("groq/llama".to_string()),
+            KeyTarget::Tavily,
+        ] {
+            let intent = Intent::SetApiKey {
+                target,
+                key: SecretKey("sk-secret".to_string()),
+            };
+            assert!(
+                !format!("{intent:?}").contains("sk-secret"),
+                "the key must never leak through the intent's Debug"
+            );
+        }
     }
 }

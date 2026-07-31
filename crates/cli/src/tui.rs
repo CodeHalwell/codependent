@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
@@ -47,14 +47,14 @@ use codypendent_protocol::{
     RepositoryId, SessionEvent, SessionId, Subscription, WorkspaceId,
 };
 use codypendent_tui::{
-    map_event, reduce, render, Action, AppState, BlackboardItemCard, DocBlockView, DocCard,
-    DocSuggestionView, GraphEdgeCard, Intent, MemoryCard, ModelCard, ModelLocationLabel,
-    ProviderCard, SkillCard, TerminalGuard, Theme, WorkflowNodeCard,
+    map_event, reduce, render, render_splash, Action, AppState, BlackboardItemCard, DocBlockView,
+    DocCard, DocSuggestionView, GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard,
+    ModelLocationLabel, ProviderCard, SkillCard, TerminalGuard, Theme, WorkflowNodeCard,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::commands;
 use crate::connection::Connection;
@@ -63,6 +63,15 @@ use crate::connection::Connection;
 /// animation when nothing else is happening (5 fps — cheap, and the loop redraws
 /// immediately on any real event anyway).
 const TICK: Duration = Duration::from_millis(200);
+
+/// The splash frame cadence while the TUI boots (D2) — ~12 fps so the stage
+/// spinner animates smoothly during a multi-second daemon spawn.
+const SPLASH_TICK: Duration = Duration::from_millis(80);
+
+/// How long the splash stays up once it has been drawn (D2 flash guard): a
+/// boot faster than the first [`SPLASH_TICK`] never shows it at all, but a
+/// shown splash never flashes away instantly.
+const SPLASH_MIN_HOLD: Duration = Duration::from_millis(600);
 
 /// The most live events [`GapTracker`] will buffer while a gap repair is in
 /// flight before giving up on the incremental replay and re-attaching for a
@@ -217,11 +226,11 @@ pub async fn run(
     repo: PathBuf,
     theme_override: Option<String>,
 ) -> anyhow::Result<()> {
-    // Crash logger, installed FIRST — before repo validation, the daemon
-    // connection, and (much later) `TerminalGuard::enter` — so a panic
-    // anywhere in this function's lifetime is diagnosable, and so it fires
-    // before the guard's `Drop` tears down the alternate screen (see the
-    // module docs above `install_crash_hook` for the full motivation).
+    // Crash logger, installed FIRST — before repo validation, the terminal
+    // guard, and the daemon connection — so a panic anywhere in this
+    // function's lifetime is diagnosable, and so it fires before the guard's
+    // `Drop` tears down the alternate screen (see the module docs above
+    // `install_crash_hook` for the full motivation).
     install_crash_hook(paths);
 
     let repo = repo
@@ -236,130 +245,94 @@ pub async fn run(
     // `Theme::dark()`.
     let theme = crate::theme_select::resolve_theme(paths, theme_override.as_deref())?;
 
-    commands::ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path).await?;
-    let mut store = SessionStore::load(paths);
-    let resume = store
-        .resume_token
-        .clone()
-        .map(codypendent_protocol::ResumeToken);
-    // Advertise the client's own per-build id (DR1/T4/T9) so both halves of
-    // the handshake speak the same id vocabulary — the daemon-auto-restart
-    // feature's detection point is the `hello.build_id` this returns.
-    let hello = conn
-        .handshake("codypendent-tui", codypendent_protocol::BUILD_ID, resume)
-        .await?;
-    // Store the daemon-issued token so the NEXT launch resumes this client
-    // identity (best-effort; an absent token just means a fresh identity).
-    if let Some(token) = hello.resume_token {
-        store.resume_token = Some(token.0);
-        store.save(paths);
-    }
-
-    // DR5: detect + (safely) reconcile a daemon build mismatch, right after
-    // the handshake and BEFORE resolving/creating a session — the detection
-    // point the design doc calls for. On a matching build (the overwhelming
-    // common case) this is a single string compare and zero extra round
-    // trips; `conn` is left untouched. On a genuine mismatch it may stop the
-    // OLD daemon, spawn a fresh one, and reconnect — but ONLY when confirmed
-    // idle (never while a run is active, never on uncertainty); otherwise it
-    // warns on stderr and continues on the existing daemon. A restart that
-    // fails, or a reconnect that still mismatches, is a legible hard error —
-    // this function never enters the TUI against a broken or half-restarted
-    // daemon.
-    let resume_for_reconnect = store
-        .resume_token
-        .clone()
-        .map(codypendent_protocol::ResumeToken);
-    let mut restart_ops =
-        crate::restart::LiveRestartOps::new(paths, conn, "codypendent-tui", resume_for_reconnect);
-    let mut warn_stderr = |message: &str| eprintln!("codypendent: {message}");
-    crate::restart::reconcile_interactive(
-        paths,
-        codypendent_protocol::BUILD_ID,
-        &hello.build_id,
-        &mut restart_ops,
-        &mut warn_stderr,
-    )
-    .await?;
-    let mut conn = restart_ops.into_connection();
-
-    let (session_id, workspace_id, catchup) =
-        resolve_or_create_session(&mut conn, &mut store, paths, &repo).await?;
-
-    // Seed the state from catch-up, then from any live event that outraced the
-    // attach reply and was buffered during setup — both before the loop reads a
-    // single new frame, so no event is dropped or reordered.
-    let mut state = AppState::new();
-    let attach_watermark = fold_catchup(&mut state, catchup);
-    let (read_half, write_half, pending, client_id) = conn.into_split();
-    for envelope in pending {
-        if let Payload::Event(event) = envelope.payload {
-            reduce(&mut state, Action::DaemonEvent(Box::new(event)));
-        }
-    }
-
-    // STEP 2.6 + Phase 4 client wiring: seed the Skill Studio, memory browser,
-    // Docs Studio, and code-graph edge-inspector projections. This reads the
-    // knowledge fabric's authoritative rows directly from SQLite (WAL allows
-    // concurrent reads alongside the daemon) and maps them into the TUI's plain
-    // projection structs — the one place the two worlds meet, done here (not in
-    // the pure TUI crate, which never depends on `codypendent-knowledge`). A read
-    // failure logs and continues with empty lists; it never fails the TUI. Done
-    // before entering the terminal so any diagnostic reaches a cooked screen.
-    let projections = load_knowledge(paths, workspace_id, &repo).await;
-    state.skills = projections.skills;
-    state.memories = projections.memories;
-    state.docs = projections.docs;
-    state.edges = projections.edges;
-    state.blackboard = projections.blackboard;
-    // MP1: seed the model-picker projection (models.toml + any measured
-    // profile from `model_profiles`), exactly like the projections above.
-    state.models = load_model_cards(paths).await;
-    // Task 8: seed the provider-catalog picker projection (the built-in
-    // catalog + any user `providers.toml`), exactly like `load_model_cards`.
-    state.providers = load_provider_cards(paths);
-    // Phase 5 STEP 5.2 + T8: seed the workflow-graph view by compiling the
-    // repository's declared workflow manifests, then overlay each workflow's
-    // LATEST durable run — its per-node live state, measured cost, and
-    // failure/block reason — from the knowledge db (WAL allows a concurrent read
-    // alongside the daemon). A malformed manifest logs and is skipped; a db-open
-    // failure degrades to the compiled (pre-run) view — neither fails the TUI.
-    {
-        let overlay_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
-            .await
-            .ok();
-        state.workflow = load_workflows(&repo, overlay_pool.as_ref()).await;
-    }
-
-    // A persistent read pool for live document editing (Phase 4 STEP 4.3): the
-    // event loop seeds a document's client replica from it and re-reads the
-    // review rail's suggestions when a sync arrives. WAL mode lets this read
-    // concurrently with the daemon. `None` on failure — document editing then
-    // degrades to converging from live syncs alone (no seed, empty review rail).
-    let docs_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
-        .await
-        .ok();
-
-    // Wire the two socket tasks. Start them before the terminal so no live
-    // event or heartbeat is missed during setup.
-    let (out_tx, out_rx) = mpsc::channel::<Envelope>(256);
-    let (event_tx, mut event_rx) = mpsc::channel::<ReaderSignal>(256);
-    // A second sender clone for the model-discovery query tasks, which feed
-    // `ReaderSignal::ProviderModels` back into the same loop (the reader task
-    // owns the first clone).
-    let query_tx = event_tx.clone();
-    let reader = tokio::spawn(read_loop(read_half, event_tx, out_tx.clone(), client_id));
-    let writer = tokio::spawn(write_loop(write_half, out_rx));
-
-    // Enter raw mode + the alternate screen. RAII restores the terminal on any
-    // exit path, including a panic mid-loop. Done before spawning the input
-    // bridge so it never reads a keystroke in cooked mode, and so a non-TTY
-    // error returns here without a stray thread to wind down.
+    // D2: enter raw mode + the alternate screen EARLY — before any daemon
+    // work — so the (possibly multi-second) boot draws a splash instead of
+    // leaving the user staring at a blank cooked terminal. RAII restores the
+    // terminal on any exit path, including a boot error (whose text then
+    // prints to the restored cooked screen) or a panic mid-loop, and the
+    // event loop later takes over the SAME terminal — no teardown/re-enter
+    // between splash and TUI.
     let mut guard = TerminalGuard::enter().context(
         "the interactive TUI needs a terminal (a TTY); for headless use run \
          `codypendent run --jsonl` instead",
     )?;
+
+    // D2: boot steps publish their stage over this channel; the splash loop
+    // below draws the latest stage every SPLASH_TICK until boot completes.
+    let (stage_tx, stage_rx) = watch::channel(SplashStage::StartingDaemon);
+    // Boot diagnostics (reconcile warnings, loader failure notes) collect
+    // BESIDE the stage channel: a `watch` retains only the LATEST value, so a
+    // warning published as a stage would be overwritten by the next stage and
+    // lost. The splash draws them under the stage line; after boot each one
+    // becomes a TUI notice.
+    let boot_warnings: BootWarnings = BootWarnings::default();
+
+    let mut state = AppState::new();
+    let mut store = SessionStore::load(paths);
+
+    // Drive boot and the splash concurrently: poll the pinned boot future to
+    // completion while redrawing the splash on each tick. The flash guard is
+    // implicit on the near side — the first tick lands SPLASH_TICK after
+    // start, so a boot faster than that never draws a single frame — and
+    // explicit below: once drawn, the splash holds for at least
+    // SPLASH_MIN_HOLD so a fast boot doesn't flash one frame away. The block
+    // scopes the pinned future (it borrows `state`/`store`) so its drop runs
+    // before the event loop takes them back.
+    let booted = {
+        let boot = boot_phase(
+            paths,
+            &repo,
+            &mut state,
+            &mut store,
+            &stage_tx,
+            &boot_warnings,
+        );
+        tokio::pin!(boot);
+        let mut splash_ticker =
+            tokio::time::interval_at(tokio::time::Instant::now() + SPLASH_TICK, SPLASH_TICK);
+        let mut splash_ticks: u64 = 0;
+        let mut splash_shown_at: Option<Instant> = None;
+        let booted = loop {
+            tokio::select! {
+                outcome = &mut boot => break outcome?,
+                _ = splash_ticker.tick() => {
+                    splash_ticks += 1;
+                    let stage = stage_rx.borrow().text();
+                    let warnings = boot_warnings
+                        .lock()
+                        .expect("boot warnings mutex poisoned")
+                        .clone();
+                    guard
+                        .terminal_mut()
+                        .draw(|frame| render_splash(frame, splash_ticks, &stage, &warnings, &theme))?;
+                    splash_shown_at.get_or_insert(Instant::now());
+                }
+            }
+        };
+        if let Some(shown_at) = splash_shown_at {
+            let remaining = SPLASH_MIN_HOLD.saturating_sub(shown_at.elapsed());
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining).await;
+            }
+        }
+        booted
+    };
+    // Boot diagnostics become the TUI's own notices — ALWAYS when any were
+    // collected, whether or not the splash drew a single frame: a reconcile
+    // warning or a loader failure note is meaningful after boot regardless
+    // (the pre-splash behavior was a persistent stderr print).
+    drain_boot_warnings(&mut state, &boot_warnings);
+    let Booted {
+        session_id,
+        attach_watermark,
+        docs_pool,
+        client_id,
+        out_tx,
+        mut event_rx,
+        query_tx,
+        reader,
+        writer,
+    } = booted;
 
     let (input_tx, mut input_rx) = mpsc::channel::<CrosstermEvent>(256);
     let input_running = Arc::new(AtomicBool::new(true));
@@ -402,6 +375,257 @@ pub async fn run(
         pool.close().await;
     }
     result
+}
+
+/// The boot stages the D2 splash narrates, published by [`boot_phase`] over a
+/// `watch` channel; the splash loop in [`run`] draws the latest stage each
+/// tick. `Reconciling` carries the build-mismatch warning text for the spinner
+/// line — what used to be a cooked-mode `eprintln!` — so nothing prints to
+/// stderr from inside the alternate screen. The warning text ALSO lands in
+/// [`BootWarnings`]: a `watch` retains only the latest value, so the stage
+/// alone would lose a warning the moment the next stage publishes.
+#[derive(Clone)]
+enum SplashStage {
+    StartingDaemon,
+    Connecting,
+    Reconciling(String),
+    RestoringSession,
+    LoadingWorkspace,
+}
+
+impl SplashStage {
+    fn text(&self) -> String {
+        match self {
+            Self::StartingDaemon => "starting daemon…".to_owned(),
+            Self::Connecting => "connecting…".to_owned(),
+            Self::Reconciling(message) => message.clone(),
+            Self::RestoringSession => "restoring session…".to_owned(),
+            Self::LoadingWorkspace => "loading workspace…".to_owned(),
+        }
+    }
+}
+
+/// Boot diagnostics (D2) collected BESIDE the [`SplashStage`] watch channel:
+/// a `watch` retains only the LATEST value, so a reconcile warning sent as
+/// `SplashStage::Reconciling` is overwritten by the very next stage
+/// (`RestoringSession`/`LoadingWorkspace`) almost immediately — and a boot too
+/// fast to draw a single frame never shows it at all. This shared vec keeps
+/// every diagnostic (reconcile warnings from `warn_stage`, the projection
+/// loaders' best-effort failure notes) so the splash can draw them under the
+/// stage line and [`run`] can surface each as a post-boot `Action::Notice` —
+/// what used to be a cooked-mode `eprintln!`, which the early alternate
+/// screen would swallow.
+type BootWarnings = Arc<Mutex<Vec<String>>>;
+
+/// Push one boot diagnostic onto the shared [`BootWarnings`] vec.
+fn push_boot_warning(warnings: &BootWarnings, message: String) {
+    warnings
+        .lock()
+        .expect("boot warnings mutex poisoned")
+        .push(message);
+}
+
+/// Drain the collected boot diagnostics into post-boot TUI notices (D2):
+/// ALWAYS when any were collected, whether or not the splash drew a frame —
+/// a reconcile warning or a loader failure note is meaningful after boot
+/// regardless (the pre-splash behavior was a persistent stderr print). One
+/// notice per diagnostic.
+fn drain_boot_warnings(state: &mut AppState, warnings: &BootWarnings) {
+    let collected = std::mem::take(&mut *warnings.lock().expect("boot warnings mutex poisoned"));
+    for warning in collected {
+        reduce(state, Action::Notice(warning));
+    }
+}
+
+/// Everything [`boot_phase`] produces that the event loop and teardown still
+/// need, bundled so [`run`]'s splash loop stays small.
+struct Booted {
+    session_id: SessionId,
+    attach_watermark: u64,
+    docs_pool: Option<sqlx::SqlitePool>,
+    client_id: ClientId,
+    out_tx: mpsc::Sender<Envelope>,
+    event_rx: mpsc::Receiver<ReaderSignal>,
+    query_tx: mpsc::Sender<ReaderSignal>,
+    reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+/// Every boot step before the event loop (D2): daemon ensure, handshake,
+/// build-mismatch reconcile, session resolve, catch-up fold, projection
+/// seeding, and the socket reader/writer tasks. Runs as a pinned future
+/// inside [`run`]'s splash loop and publishes each stage over `stage_tx`;
+/// `state` and `store` are seeded in place so nothing needs moving back out.
+/// By the time this runs the terminal is already in the alternate screen, so
+/// diagnostics go to the stage channel (spinner line) and the shared
+/// `boot_warnings` vec (splash warning lines + post-boot notices) — never to
+/// stderr.
+async fn boot_phase(
+    paths: &RuntimePaths,
+    repo: &Path,
+    state: &mut AppState,
+    store: &mut SessionStore,
+    stage_tx: &watch::Sender<SplashStage>,
+    boot_warnings: &BootWarnings,
+) -> anyhow::Result<Booted> {
+    commands::ensure_daemon(paths).await?;
+    let _ = stage_tx.send(SplashStage::Connecting);
+    let mut conn = Connection::connect(&paths.socket_path).await?;
+    let resume = store
+        .resume_token
+        .clone()
+        .map(codypendent_protocol::ResumeToken);
+    // Advertise the client's own per-build id (DR1/T4/T9) so both halves of
+    // the handshake speak the same id vocabulary — the daemon-auto-restart
+    // feature's detection point is the `hello.build_id` this returns.
+    let hello = conn
+        .handshake("codypendent-tui", codypendent_protocol::BUILD_ID, resume)
+        .await?;
+    // Store the daemon-issued token so the NEXT launch resumes this client
+    // identity (best-effort; an absent token just means a fresh identity).
+    if let Some(token) = hello.resume_token {
+        store.resume_token = Some(token.0);
+        store.save(paths);
+    }
+
+    // DR5: detect + (safely) reconcile a daemon build mismatch, right after
+    // the handshake and BEFORE resolving/creating a session — the detection
+    // point the design doc calls for. On a matching build (the overwhelming
+    // common case) this is a single string compare and zero extra round
+    // trips; `conn` is left untouched. On a genuine mismatch it may stop the
+    // OLD daemon, spawn a fresh one, and reconnect — but ONLY when confirmed
+    // idle (never while a run is active, never on uncertainty); otherwise it
+    // warns and continues on the existing daemon. A restart that fails, or a
+    // reconnect that still mismatches, is a legible hard error — this
+    // function never enters the TUI against a broken or half-restarted
+    // daemon.
+    let resume_for_reconnect = store
+        .resume_token
+        .clone()
+        .map(codypendent_protocol::ResumeToken);
+    let mut restart_ops =
+        crate::restart::LiveRestartOps::new(paths, conn, "codypendent-tui", resume_for_reconnect);
+    // D2: these warnings used to be cooked-mode `eprintln!`s; the terminal is
+    // in the alternate screen by now, so they become splash stage text (the
+    // spinner line) AND persist in `boot_warnings` — the `watch` stage channel
+    // alone would drop each one the moment the next stage publishes.
+    let mut warn_stage = |message: &str| {
+        push_boot_warning(boot_warnings, message.to_owned());
+        let _ = stage_tx.send(SplashStage::Reconciling(message.to_owned()));
+    };
+    let reconcile_outcome = crate::restart::reconcile_interactive(
+        paths,
+        codypendent_protocol::BUILD_ID,
+        &hello.build_id,
+        &mut restart_ops,
+        &mut warn_stage,
+    )
+    .await?;
+    // D3: the header shows the running daemon's build id — the handshaken
+    // one, unless the reconcile just restarted the daemon onto THIS build
+    // (`reconnect_and_assert` guarantees the new daemon matches the client).
+    state.daemon_build_id = Some(match reconcile_outcome {
+        crate::restart::ReconcileOutcome::Restarted => codypendent_protocol::BUILD_ID.to_owned(),
+        _ => hello.build_id.clone(),
+    });
+    let mut conn = restart_ops.into_connection();
+
+    let _ = stage_tx.send(SplashStage::RestoringSession);
+    let (session_id, workspace_id, catchup) =
+        resolve_or_create_session(&mut conn, store, paths, repo).await?;
+
+    // Seed the state from catch-up, then from any live event that outraced the
+    // attach reply and was buffered during setup — both before the loop reads a
+    // single new frame, so no event is dropped or reordered.
+    let attach_watermark = fold_catchup(state, catchup);
+    let (read_half, write_half, pending, client_id) = conn.into_split();
+    for envelope in pending {
+        if let Payload::Event(event) = envelope.payload {
+            reduce(state, Action::DaemonEvent(Box::new(event)));
+        }
+    }
+
+    // STEP 2.6 + Phase 4 client wiring: seed the Skill Studio, memory browser,
+    // Docs Studio, and code-graph edge-inspector projections. This reads the
+    // knowledge fabric's authoritative rows directly from SQLite (WAL allows
+    // concurrent reads alongside the daemon) and maps them into the TUI's plain
+    // projection structs — the one place the two worlds meet, done here (not in
+    // the pure TUI crate, which never depends on `codypendent-knowledge`). A read
+    // failure collects a diagnostic (surfaced on the splash and as a post-boot
+    // notice) and continues with empty lists; it never fails the TUI.
+    let _ = stage_tx.send(SplashStage::LoadingWorkspace);
+    let mut loader_warnings = Vec::new();
+    let projections = load_knowledge(paths, workspace_id, repo, &mut loader_warnings).await;
+    state.skills = projections.skills;
+    state.memories = projections.memories;
+    state.docs = projections.docs;
+    state.edges = projections.edges;
+    state.blackboard = projections.blackboard;
+    // MP1: seed the model-picker projection (models.toml + any measured
+    // profile from `model_profiles`), exactly like the projections above.
+    state.models = load_model_cards(paths, &mut loader_warnings).await;
+    // Task 8: seed the provider-catalog picker projection (the built-in
+    // catalog + any user `providers.toml`), exactly like `load_model_cards`.
+    state.providers = load_provider_cards(paths, &mut loader_warnings);
+    // D1 (/keys): seed the API-key status projection — auth.json entries +
+    // models.toml `api_key_env` declarations (the tui crate does no I/O, so
+    // the harness reads the files and folds the projection as an Action, the
+    // same Action re-fired after every key write and daemon restart).
+    {
+        let (models, tavily) = load_key_statuses(paths, &mut loader_warnings);
+        reduce(state, Action::ApiKeyStatusesLoaded { models, tavily });
+    }
+    // Phase 5 STEP 5.2 + T8: seed the workflow-graph view by compiling the
+    // repository's declared workflow manifests, then overlay each workflow's
+    // LATEST durable run — its per-node live state, measured cost, and
+    // failure/block reason — from the knowledge db (WAL allows a concurrent read
+    // alongside the daemon). A malformed manifest collects a diagnostic and is
+    // skipped; a db-open failure degrades to the compiled (pre-run) view —
+    // neither fails the TUI.
+    {
+        let overlay_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
+            .await
+            .ok();
+        state.workflow = load_workflows(repo, overlay_pool.as_ref(), &mut loader_warnings).await;
+    }
+    // Publish the loaders' collected diagnostics alongside the reconcile
+    // warnings so the splash can draw them and `run` notices them post-boot.
+    boot_warnings
+        .lock()
+        .expect("boot warnings mutex poisoned")
+        .append(&mut loader_warnings);
+
+    // A persistent read pool for live document editing (Phase 4 STEP 4.3): the
+    // event loop seeds a document's client replica from it and re-reads the
+    // review rail's suggestions when a sync arrives. WAL mode lets this read
+    // concurrently with the daemon. `None` on failure — document editing then
+    // degrades to converging from live syncs alone (no seed, empty review rail).
+    let docs_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
+        .await
+        .ok();
+
+    // Wire the two socket tasks. Start them before returning so no live event
+    // or heartbeat is missed during the remaining setup.
+    let (out_tx, out_rx) = mpsc::channel::<Envelope>(256);
+    let (event_tx, event_rx) = mpsc::channel::<ReaderSignal>(256);
+    // A second sender clone for the model-discovery query tasks, which feed
+    // `ReaderSignal::ProviderModels` back into the same loop (the reader task
+    // owns the first clone).
+    let query_tx = event_tx.clone();
+    let reader = tokio::spawn(read_loop(read_half, event_tx, out_tx.clone(), client_id));
+    let writer = tokio::spawn(write_loop(write_half, out_rx));
+
+    Ok(Booted {
+        session_id,
+        attach_watermark,
+        docs_pool,
+        client_id,
+        out_tx,
+        event_rx,
+        query_tx,
+        reader,
+        writer,
+    })
 }
 
 /// What [`GapTracker::on_event`] asks the harness to do with one live event.
@@ -787,20 +1011,15 @@ async fn event_loop(
                 api_key,
             } = &intent
             {
-                let key = api_key.as_ref().map(|k| k.0.as_str());
-                match write_add_model(paths, display_id, provider_id, model, key) {
-                    Ok(()) => {
-                        // Re-seed the model picker so the new model shows immediately.
-                        state.models = load_model_cards(paths).await;
-                        reduce(state, Action::Notice(format!("added model {display_id}")));
-                    }
-                    Err(error) => {
-                        reduce(
-                            state,
-                            Action::Notice(format!("could not add model: {error}")),
-                        );
-                    }
-                }
+                apply_add_model(
+                    state,
+                    paths,
+                    display_id,
+                    provider_id,
+                    model,
+                    api_key.as_ref().map(|k| k.0.as_str()),
+                )
+                .await;
                 continue;
             }
             // `QueryProviderModels` is the other client-only intent (model
@@ -849,6 +1068,52 @@ async fn event_loop(
                         })
                         .await;
                 });
+                continue;
+            }
+            // `SetApiKey` / `RemoveApiKey` (D1, `/keys`) are client-only intents
+            // (the keep-secrets-off-the-wire invariant, exactly like `AddModel`):
+            // apply them to `auth.json` locally (load-before-write, atomic,
+            // 0600), re-fire the status projection, and skip the daemon-command
+            // mapping entirely.
+            if let Intent::SetApiKey { target, key } = &intent {
+                apply_set_api_key(state, paths, target, &key.0);
+                continue;
+            }
+            if let Intent::RemoveApiKey { target } = &intent {
+                apply_remove_api_key(state, paths, target);
+                continue;
+            }
+            // `RestartDaemon` (D1) is client-only too: the operator confirmed
+            // the restart offer after saving a Tavily key. The DR7 idle guard
+            // makes the final decision daemon-side, so this never kills an
+            // active run. NOTE: a successful restart severs this connection
+            // (the daemon it was attached to exits) — the reader's Closed
+            // signal then ends the TUI, exactly like any daemon shutdown.
+            if matches!(intent, Intent::RestartDaemon) {
+                match commands::restart_daemon_if_idle(paths).await {
+                    Ok(commands::IdleRestartOutcome::Restarted) => {
+                        reduce(
+                            state,
+                            Action::Notice("daemon restarted — web search enabled".to_owned()),
+                        );
+                    }
+                    Ok(commands::IdleRestartOutcome::RefusedActive(active)) => {
+                        reduce(
+                            state,
+                            Action::Notice(format!(
+                                "will apply on next restart ({active} active run(s))"
+                            )),
+                        );
+                    }
+                    Err(error) => {
+                        reduce(
+                            state,
+                            Action::Notice(format!("could not restart the daemon: {error}")),
+                        );
+                    }
+                }
+                // Statuses may shift across the restart — re-fire the projection.
+                reload_key_statuses(state, paths);
                 continue;
             }
             // The first edit on a document subscribes this client to its live sync
@@ -1140,6 +1405,15 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::QueryProviderModels { .. } => unreachable!(
             "QueryProviderModels is applied locally by the harness (background GET), never sent to the daemon"
         ),
+        // D1: the `/keys` intents are CLIENT-ONLY for the same reason (the
+        // key never crosses the wire; the daemon re-reads auth.json per
+        // run/boot) — intercepted in the drain loop, never mapped.
+        Intent::SetApiKey { .. } | Intent::RemoveApiKey { .. } => unreachable!(
+            "SetApiKey/RemoveApiKey are applied locally by the harness (write_api_key), never sent to the daemon"
+        ),
+        Intent::RestartDaemon => unreachable!(
+            "RestartDaemon is applied locally by the harness (restart_daemon_if_idle), never sent to the daemon"
+        ),
     }
 }
 
@@ -1265,6 +1539,246 @@ fn write_add_model(
             .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     }
     Ok(())
+}
+
+/// Apply the client-only `Intent::AddModel` (the event-loop drain arm,
+/// extracted so the behavior is directly testable): write `models.toml` +
+/// `auth.json` locally, then re-seed the model picker AND re-fire the `/keys`
+/// status projection — a model added WITH a key must show `Stored` in `/keys`
+/// without a TUI restart. Any loader diagnostic surfaces as a notice.
+async fn apply_add_model(
+    state: &mut AppState,
+    paths: &RuntimePaths,
+    display_id: &str,
+    provider_id: &str,
+    model: &str,
+    api_key: Option<&str>,
+) {
+    match write_add_model(paths, display_id, provider_id, model, api_key) {
+        Ok(()) => {
+            // Re-seed the model picker so the new model shows immediately.
+            let mut warnings = Vec::new();
+            state.models = load_model_cards(paths, &mut warnings).await;
+            for warning in warnings {
+                reduce(state, Action::Notice(warning));
+            }
+            reload_key_statuses(state, paths);
+            reduce(state, Action::Notice(format!("added model {display_id}")));
+        }
+        Err(error) => {
+            reduce(
+                state,
+                Action::Notice(format!("could not add model: {error}")),
+            );
+        }
+    }
+}
+
+/// The `auth.json` entry id a [`KeyTarget`] addresses (D1): a model target's
+/// id doubles as the entry key (the add-model flow's convention); the Tavily
+/// target maps onto the reserved, collision-proof `integrations/tavily` id the
+/// daemon's `TavilyKey::discover` reads.
+fn key_target_auth_id(target: &KeyTarget) -> String {
+    match target {
+        KeyTarget::Model(id) => id.clone(),
+        KeyTarget::Tavily => codypendent_integrations::search::TAVILY_AUTH_ID.to_owned(),
+    }
+}
+
+/// Apply an `Intent::SetApiKey` (`Some(key)`) or `Intent::RemoveApiKey`
+/// (`None`) to `<data_dir>/auth.json` (D1). This is the harness's job because
+/// the `tui` crate performs no I/O and never touches the key.
+///
+/// The same load-before-write guard as [`write_add_model`] (M3) applies to
+/// BOTH operations: `AuthStore::load` is fallible, so a hand-corrupted
+/// pre-existing `auth.json` aborts here with a legible error rather than
+/// being silently replaced (a blind `set` on a fresh store would destroy the
+/// other entries). The save is atomic at mode `0600` (`AuthStore::save`). A
+/// blank/whitespace-only key is rejected outright — storing `set(id, "")`
+/// would silently shadow a valid `api_key_env` (the M1 guard). A remove of an
+/// absent entry skips the save (nothing changed, and no empty `auth.json` is
+/// created for a store that never existed).
+fn write_api_key(
+    paths: &RuntimePaths,
+    target: &KeyTarget,
+    key: Option<&str>,
+) -> anyhow::Result<()> {
+    use codypendent_runtime::auth::AuthStore;
+
+    let data_dir = &paths.data_dir;
+    let id = key_target_auth_id(target);
+    let mut auth = AuthStore::load(data_dir)
+        .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
+    match key {
+        Some(key) => {
+            let key = key.trim();
+            if key.is_empty() {
+                bail!("key must not be blank");
+            }
+            auth.set(id, key);
+            auth.save(data_dir)
+                .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+        }
+        None => {
+            if auth.remove(&id) {
+                auth.save(data_dir)
+                    .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply the client-only `Intent::SetApiKey` (the event-loop drain arm,
+/// extracted so the behavior is directly testable): write the key to
+/// `auth.json`, re-fire the status projection, and — for Tavily, whose key the
+/// daemon discovers only at boot — offer the idle-guarded daemon restart. The
+/// key itself never leaves this function.
+fn apply_set_api_key(state: &mut AppState, paths: &RuntimePaths, target: &KeyTarget, key: &str) {
+    match write_api_key(paths, target, Some(key)) {
+        Ok(()) => {
+            reload_key_statuses(state, paths);
+            match target {
+                KeyTarget::Model(id) => {
+                    // The daemon re-reads auth.json per run, so the
+                    // key applies to the NEXT run — no restart.
+                    reduce(
+                        state,
+                        Action::Notice(format!("key saved for {id} — applies to the next run")),
+                    );
+                }
+                KeyTarget::Tavily => {
+                    // The daemon discovers the Tavily key only at
+                    // boot, so offer the idle-guarded restart.
+                    reduce(
+                        state,
+                        Action::Notice(
+                            "Tavily key saved — the daemon picks it up on restart".to_owned(),
+                        ),
+                    );
+                    reduce(state, Action::OfferDaemonRestart);
+                }
+            }
+        }
+        Err(error) => {
+            reduce(
+                state,
+                Action::Notice(format!("could not save key: {error}")),
+            );
+        }
+    }
+}
+
+/// Apply the client-only `Intent::RemoveApiKey` (the event-loop drain arm,
+/// extracted so the behavior is directly testable): remove the entry from
+/// `auth.json` and re-fire the status projection. For Tavily the daemon keeps
+/// its already-discovered key for its lifetime, so the removal can't take
+/// effect without a restart — offer the idle-guarded restart exactly like the
+/// set path does.
+fn apply_remove_api_key(state: &mut AppState, paths: &RuntimePaths, target: &KeyTarget) {
+    match write_api_key(paths, target, None) {
+        Ok(()) => {
+            reload_key_statuses(state, paths);
+            match target {
+                KeyTarget::Model(id) => {
+                    reduce(
+                        state,
+                        Action::Notice(format!("key for {id} removed — applies to the next run")),
+                    );
+                }
+                KeyTarget::Tavily => {
+                    reduce(
+                        state,
+                        Action::Notice(
+                            "Tavily key removed — web search stays on until the daemon restarts"
+                                .to_owned(),
+                        ),
+                    );
+                    reduce(state, Action::OfferDaemonRestart);
+                }
+            }
+        }
+        Err(error) => {
+            reduce(
+                state,
+                Action::Notice(format!("could not remove key: {error}")),
+            );
+        }
+    }
+}
+
+/// Read the `/keys` status projection (D1): one `(model_id, status)` per
+/// `models.toml` model, plus the Tavily row's status — `Stored` when an
+/// `auth.json` entry exists, else `Env(NAME)` when the model declares an
+/// `api_key_env` (the NAME only, never the value), else `Missing`.
+///
+/// The Tavily row mirrors the daemon's `TavilyKey::discover` precedence: the
+/// reserved `auth.json` entry first, then the `TAVILY_API_KEY` env var. The
+/// env check reads THIS client's environment as an approximation of the
+/// daemon's (the same approximation the model rows already make with
+/// `api_key_env`) and checks PRESENCE only — the value is never read into the
+/// projection.
+///
+/// Best-effort: a corrupt `auth.json` or unreadable `models.toml` degrades to
+/// "no stored keys"/"no models" with a diagnostic in `warnings` (the terminal
+/// is already in the alternate screen when this first runs, so nothing prints
+/// to stderr). The WRITE path (`write_api_key`) still surfaces the same
+/// corruption as a hard error — statuses are a view, never the authority.
+fn load_key_statuses(
+    paths: &RuntimePaths,
+    warnings: &mut Vec<String>,
+) -> (Vec<(String, KeyStatus)>, KeyStatus) {
+    use codypendent_runtime::auth::AuthStore;
+    use codypendent_runtime::models::load_models;
+
+    let data_dir = &paths.data_dir;
+    let auth = AuthStore::load(data_dir).unwrap_or_else(|error| {
+        warnings.push(format!(
+            "could not read {}: {error}; /keys statuses may be incomplete",
+            data_dir.join("auth.json").display()
+        ));
+        AuthStore::default()
+    });
+    let configs = load_models(&data_dir.join("models.toml")).unwrap_or_default();
+    let models = configs
+        .iter()
+        .map(|cfg| {
+            let status = if auth.get(&cfg.id.0).is_some() {
+                KeyStatus::Stored
+            } else if cfg.api_key_env.trim().is_empty() {
+                KeyStatus::Missing
+            } else {
+                KeyStatus::Env(cfg.api_key_env.clone())
+            };
+            (cfg.id.0.clone(), status)
+        })
+        .collect();
+    let tavily = if auth
+        .get(codypendent_integrations::search::TAVILY_AUTH_ID)
+        .is_some()
+    {
+        KeyStatus::Stored
+    } else if std::env::var(codypendent_integrations::search::key::TAVILY_API_KEY_ENV)
+        .is_ok_and(|value| !value.trim().is_empty())
+    {
+        KeyStatus::Env(codypendent_integrations::search::key::TAVILY_API_KEY_ENV.to_owned())
+    } else {
+        KeyStatus::Missing
+    };
+    (models, tavily)
+}
+
+/// Re-read the key statuses and fold them into the TUI state (D1) — after the
+/// initial seed, after every key write, and after a daemon restart. A
+/// best-effort read diagnostic (e.g. a corrupt `auth.json`) surfaces as a
+/// notice, exactly like the boot-time seed's diagnostics.
+fn reload_key_statuses(state: &mut AppState, paths: &RuntimePaths) {
+    let mut warnings = Vec::new();
+    let (models, tavily) = load_key_statuses(paths, &mut warnings);
+    reduce(state, Action::ApiKeyStatusesLoaded { models, tavily });
+    for warning in warnings {
+        reduce(state, Action::Notice(warning));
+    }
 }
 
 /// The provider's OpenAI-compatible model-list URL: `<base_url>/models`. The
@@ -1651,6 +2165,7 @@ async fn load_knowledge(
     paths: &RuntimePaths,
     workspace_id: WorkspaceId,
     repo: &Path,
+    warnings: &mut Vec<String>,
 ) -> KnowledgeProjections {
     let empty = || KnowledgeProjections {
         skills: Vec::new(),
@@ -1664,11 +2179,10 @@ async fn load_knowledge(
     let pool = match knowledge_db::open(&database_path).await {
         Ok(pool) => pool,
         Err(error) => {
-            eprintln!(
-                "codypendent: knowledge views unavailable \
-                 (opening {}: {error})",
+            warnings.push(format!(
+                "knowledge views unavailable (opening {}: {error})",
                 database_path.display()
-            );
+            ));
             return empty();
         }
     };
@@ -1676,7 +2190,7 @@ async fn load_knowledge(
     let skills = match Registry::new().list(&pool).await {
         Ok(items) => items.iter().map(skill_card).collect(),
         Err(error) => {
-            eprintln!("codypendent: could not list registry items: {error}");
+            warnings.push(format!("could not list registry items: {error}"));
             Vec::new()
         }
     };
@@ -1694,17 +2208,17 @@ async fn load_knowledge(
     let memories = match MemoryStore::new().query(&pool, &scopes, None).await {
         Ok(records) => records.iter().map(memory_card).collect(),
         Err(error) => {
-            eprintln!("codypendent: could not query memories: {error}");
+            warnings.push(format!("could not query memories: {error}"));
             Vec::new()
         }
     };
 
-    let docs = load_docs(&pool, &scopes).await;
-    let edges = load_edges(&pool, repository).await;
+    let docs = load_docs(&pool, &scopes, warnings).await;
+    let edges = load_edges(&pool, repository, warnings).await;
     // Phase 5 STEP 5.3: the blackboard artifacts on the active workflow runs. The
     // workflow tables share this database (the migrations are workspace-wide), so
     // the same pool serves them; empty until a run posts artifacts.
-    let blackboard = load_blackboard(&pool).await;
+    let blackboard = load_blackboard(&pool, warnings).await;
 
     pool.close().await;
     KnowledgeProjections {
@@ -1727,11 +2241,11 @@ async fn load_knowledge(
 /// projections.
 ///
 /// Never fails the TUI: a missing/unparsable `models.toml` degrades to an
-/// empty picker (with a stderr note); an unopenable database or a profile-list
-/// failure degrades every model to its **id-only fallback** (every badge
-/// absent) since profiles are best-effort enrichment, not the selectable list
-/// itself.
-async fn load_model_cards(paths: &RuntimePaths) -> Vec<ModelCard> {
+/// empty picker (with a diagnostic in `warnings`); an unopenable database or a
+/// profile-list failure degrades every model to its **id-only fallback**
+/// (every badge absent) since profiles are best-effort enrichment, not the
+/// selectable list itself.
+async fn load_model_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> Vec<ModelCard> {
     use codypendent_daemon::model_profiles::ModelProfileStore;
     use codypendent_runtime::models::load_models;
 
@@ -1739,10 +2253,10 @@ async fn load_model_cards(paths: &RuntimePaths) -> Vec<ModelCard> {
     let configs = match load_models(&models_path) {
         Ok(configs) => configs,
         Err(error) => {
-            eprintln!(
-                "codypendent: model picker unavailable (reading {}: {error})",
+            warnings.push(format!(
+                "model picker unavailable (reading {}: {error})",
                 models_path.display()
-            );
+            ));
             return Vec::new();
         }
     };
@@ -1754,11 +2268,11 @@ async fn load_model_cards(paths: &RuntimePaths) -> Vec<ModelCard> {
     let pool = match knowledge_db::open(&database_path).await {
         Ok(pool) => Some(pool),
         Err(error) => {
-            eprintln!(
-                "codypendent: model profiles unavailable (opening {}: {error}); \
+            warnings.push(format!(
+                "model profiles unavailable (opening {}: {error}); \
                  models still list, id-only",
                 database_path.display()
-            );
+            ));
             None
         }
     };
@@ -1776,7 +2290,7 @@ async fn load_model_cards(paths: &RuntimePaths) -> Vec<ModelCard> {
                 }
             }
             Err(error) => {
-                eprintln!("codypendent: could not list model profiles: {error}");
+                warnings.push(format!("could not list model profiles: {error}"));
             }
         }
     }
@@ -1823,15 +2337,15 @@ fn model_card(
 ///
 /// Never fails the TUI: a missing user `providers.toml` is fine (the loader
 /// treats it as absent and returns the built-ins); a *malformed* one degrades
-/// to the built-ins alone, with a stderr note.
-fn load_provider_cards(paths: &RuntimePaths) -> Vec<ProviderCard> {
+/// to the built-ins alone, with a diagnostic in `warnings`.
+fn load_provider_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> Vec<ProviderCard> {
     use codypendent_providers::{AuthMethod, Catalog};
 
     let providers_path = paths.data_dir.join("providers.toml");
     let catalog = match Catalog::load_with_user_overrides(&providers_path) {
         Ok(catalog) => catalog,
         Err(error) => {
-            eprintln!("codypendent: provider catalog fell back to built-ins ({error})");
+            warnings.push(format!("provider catalog fell back to built-ins ({error})"));
             Catalog::builtin()
         }
     };
@@ -1918,15 +2432,20 @@ fn protocol_label(protocol: codypendent_providers::Protocol) -> &'static str {
 }
 
 /// Project each visible-scope document (snapshot + pending suggestions) into a
-/// [`DocCard`]. A per-document read failure logs and skips that document; the
-/// browser degrades to what it could load rather than failing.
-async fn load_docs(pool: &sqlx::SqlitePool, scopes: &[Scope]) -> Vec<DocCard> {
+/// [`DocCard`]. A per-document read failure collects a diagnostic and skips
+/// that document; the browser degrades to what it could load rather than
+/// failing.
+async fn load_docs(
+    pool: &sqlx::SqlitePool,
+    scopes: &[Scope],
+    warnings: &mut Vec<String>,
+) -> Vec<DocCard> {
     let doc_store = DocumentStore::new();
     let suggestion_store = SuggestionStore::new();
     let summaries = match doc_store.list(pool, scopes).await {
         Ok(summaries) => summaries,
         Err(error) => {
-            eprintln!("codypendent: could not list documents: {error}");
+            warnings.push(format!("could not list documents: {error}"));
             return Vec::new();
         }
     };
@@ -1937,10 +2456,7 @@ async fn load_docs(pool: &sqlx::SqlitePool, scopes: &[Scope]) -> Vec<DocCard> {
             Ok(Some(document)) => document,
             Ok(None) => continue,
             Err(error) => {
-                eprintln!(
-                    "codypendent: could not load document {}: {error}",
-                    summary.id
-                );
+                warnings.push(format!("could not load document {}: {error}", summary.id));
                 continue;
             }
         };
@@ -1948,10 +2464,10 @@ async fn load_docs(pool: &sqlx::SqlitePool, scopes: &[Scope]) -> Vec<DocCard> {
             .pending(pool, summary.id)
             .await
             .unwrap_or_else(|error| {
-                eprintln!(
-                    "codypendent: could not load suggestions for {}: {error}",
+                warnings.push(format!(
+                    "could not load suggestions for {}: {error}",
                     summary.id
-                );
+                ));
                 Vec::new()
             });
         docs.push(doc_card(&document, &suggestions));
@@ -1961,8 +2477,12 @@ async fn load_docs(pool: &sqlx::SqlitePool, scopes: &[Scope]) -> Vec<DocCard> {
 
 /// Project this repository's code-graph edges into [`GraphEdgeCard`]s, resolving
 /// each endpoint node id to its qualified name. Bounded by
-/// [`MAX_INSPECTOR_EDGES`] with a note when it truncates.
-async fn load_edges(pool: &sqlx::SqlitePool, repository: RepositoryId) -> Vec<GraphEdgeCard> {
+/// [`MAX_INSPECTOR_EDGES`] with a diagnostic when it truncates.
+async fn load_edges(
+    pool: &sqlx::SqlitePool,
+    repository: RepositoryId,
+    warnings: &mut Vec<String>,
+) -> Vec<GraphEdgeCard> {
     use codypendent_knowledge::codegraph;
 
     let names: HashMap<CodeNodeId, String> = match codegraph::nodes(pool, repository).await {
@@ -1971,7 +2491,7 @@ async fn load_edges(pool: &sqlx::SqlitePool, repository: RepositoryId) -> Vec<Gr
             .map(|node| (node.id, node.key.qualified_name))
             .collect(),
         Err(error) => {
-            eprintln!("codypendent: could not load code-graph nodes: {error}");
+            warnings.push(format!("could not load code-graph nodes: {error}"));
             HashMap::new()
         }
     };
@@ -1979,15 +2499,15 @@ async fn load_edges(pool: &sqlx::SqlitePool, repository: RepositoryId) -> Vec<Gr
     let mut edges = match codegraph::edges(pool, repository).await {
         Ok(edges) => edges,
         Err(error) => {
-            eprintln!("codypendent: could not load code-graph edges: {error}");
+            warnings.push(format!("could not load code-graph edges: {error}"));
             return Vec::new();
         }
     };
     if edges.len() > MAX_INSPECTOR_EDGES {
-        eprintln!(
-            "codypendent: code graph has {} edges; the inspector shows the first {MAX_INSPECTOR_EDGES}",
+        warnings.push(format!(
+            "code graph has {} edges; the inspector shows the first {MAX_INSPECTOR_EDGES}",
             edges.len()
-        );
+        ));
         edges.truncate(MAX_INSPECTOR_EDGES);
     }
     edges.iter().map(|edge| edge_card(edge, &names)).collect()
@@ -2243,7 +2763,11 @@ const MAX_WORKFLOW_NODES: usize = 500;
 /// P5-D4) onto the compiled defaults; `None` (or no run yet) shows the pre-run
 /// values (`pending` / `—`). Read failures degrade to the compiled view, never
 /// fail the TUI.
-async fn load_workflows(repo: &Path, pool: Option<&sqlx::SqlitePool>) -> Vec<WorkflowNodeCard> {
+async fn load_workflows(
+    repo: &Path,
+    pool: Option<&sqlx::SqlitePool>,
+    warnings: &mut Vec<String>,
+) -> Vec<WorkflowNodeCard> {
     let dir = repo.join(".codypendent").join("workflows");
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -2251,10 +2775,10 @@ async fn load_workflows(repo: &Path, pool: Option<&sqlx::SqlitePool>) -> Vec<Wor
         // view, not an error.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(error) => {
-            eprintln!(
-                "codypendent: workflow view unavailable (reading {}: {error})",
+            warnings.push(format!(
+                "workflow view unavailable (reading {}: {error})",
                 dir.display()
-            );
+            ));
             return Vec::new();
         }
     };
@@ -2276,10 +2800,7 @@ async fn load_workflows(repo: &Path, pool: Option<&sqlx::SqlitePool>) -> Vec<Wor
         let yaml = match std::fs::read_to_string(&path) {
             Ok(yaml) => yaml,
             Err(error) => {
-                eprintln!(
-                    "codypendent: skipping workflow {} ({error})",
-                    path.display()
-                );
+                warnings.push(format!("skipping workflow {} ({error})", path.display()));
                 continue;
             }
         };
@@ -2300,19 +2821,19 @@ async fn load_workflows(repo: &Path, pool: Option<&sqlx::SqlitePool>) -> Vec<Wor
                 );
             }
             Err(error) => {
-                eprintln!(
-                    "codypendent: skipping workflow {} (does not compile: {error})",
+                warnings.push(format!(
+                    "skipping workflow {} (does not compile: {error})",
                     path.display()
-                );
+                ));
             }
         }
     }
 
     if cards.len() > MAX_WORKFLOW_NODES {
-        eprintln!(
-            "codypendent: workflow view showing the first {MAX_WORKFLOW_NODES} of {} nodes",
+        warnings.push(format!(
+            "workflow view showing the first {MAX_WORKFLOW_NODES} of {} nodes",
             cards.len()
-        );
+        ));
         cards.truncate(MAX_WORKFLOW_NODES);
     }
     cards
@@ -2488,14 +3009,18 @@ const MAX_BLACKBOARD_ITEMS: usize = 500;
 /// serves them. Runs are the daemon's non-terminal set (the boards worth
 /// watching); each run's full board — live and superseded — is queried so the
 /// view can dim corrected artifacts. Empty until the executor posts artifacts; a
-/// query failure logs and skips that run rather than failing the view.
-async fn load_blackboard(pool: &sqlx::SqlitePool) -> Vec<BlackboardItemCard> {
+/// query failure collects a diagnostic and skips that run rather than failing
+/// the view.
+async fn load_blackboard(
+    pool: &sqlx::SqlitePool,
+    warnings: &mut Vec<String>,
+) -> Vec<BlackboardItemCard> {
     use codypendent_workflow::{BlackboardStore, WorkflowStore};
 
     let runs = match WorkflowStore::new().list_incomplete_runs(pool).await {
         Ok(runs) => runs,
         Err(error) => {
-            eprintln!("codypendent: could not list workflow runs: {error}");
+            warnings.push(format!("could not list workflow runs: {error}"));
             return Vec::new();
         }
     };
@@ -2511,16 +3036,16 @@ async fn load_blackboard(pool: &sqlx::SqlitePool) -> Vec<BlackboardItemCard> {
                     .map(|item| blackboard_item_card(&run_label, item)),
             ),
             Err(error) => {
-                eprintln!(
-                    "codypendent: could not query the blackboard for run {}: {error}",
+                warnings.push(format!(
+                    "could not query the blackboard for run {}: {error}",
                     run.id
-                );
+                ));
             }
         }
         if cards.len() >= MAX_BLACKBOARD_ITEMS {
-            eprintln!(
-                "codypendent: blackboard view showing the first {MAX_BLACKBOARD_ITEMS} artifacts"
-            );
+            warnings.push(format!(
+                "blackboard view showing the first {MAX_BLACKBOARD_ITEMS} artifacts"
+            ));
             cards.truncate(MAX_BLACKBOARD_ITEMS);
             break;
         }
@@ -3294,7 +3819,7 @@ steps:
         let repo = tmp.path();
 
         // No workflows directory → an empty view, not an error.
-        assert!(load_workflows(repo, None).await.is_empty());
+        assert!(load_workflows(repo, None, &mut Vec::new()).await.is_empty());
 
         let dir = repo.join(".codypendent").join("workflows");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3309,7 +3834,8 @@ steps:
         // A non-manifest file is ignored by extension.
         std::fs::write(dir.join("notes.txt"), "ignore me").unwrap();
 
-        let cards = load_workflows(repo, None).await;
+        let mut warnings = Vec::new();
+        let cards = load_workflows(repo, None, &mut warnings).await;
         assert_eq!(
             cards.len(),
             2,
@@ -3319,6 +3845,12 @@ steps:
         // Nodes keep their compiled topological order.
         assert_eq!(cards[0].id, "patch");
         assert_eq!(cards[1].id, "verify");
+        // The skipped manifest left a diagnostic, not a stderr print.
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(
+            warnings[0].contains("broken.yaml") && warnings[0].contains("does not compile"),
+            "the diagnostic names the skipped manifest: {warnings:?}"
+        );
     }
 
     #[test]
@@ -3871,6 +4403,351 @@ steps:
         assert!(
             !paths.data_dir.join("models.toml").exists(),
             "a corrupt auth.json must abort BEFORE models.toml is written (all-or-nothing)"
+        );
+    }
+
+    // -- write_api_key / load_key_statuses (D1, `/keys`) ----------------------
+
+    #[test]
+    fn write_api_key_sets_replaces_and_round_trips_at_mode_0600() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        // An unrelated entry must survive a set (load-before-write).
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("openai/gpt".to_owned()),
+            Some("sk-other"),
+        )
+        .expect("set unrelated");
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("groq/llama".to_owned()),
+            Some("sk-first"),
+        )
+        .expect("set");
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("groq/llama".to_owned()),
+            Some("sk-second"),
+        )
+        .expect("replace");
+
+        let auth =
+            codypendent_runtime::auth::AuthStore::load(&paths.data_dir).expect("auth.json loads");
+        assert_eq!(auth.get("groq/llama"), Some("sk-second"), "replace wins");
+        assert_eq!(
+            auth.get("openai/gpt"),
+            Some("sk-other"),
+            "the unrelated entry survived"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(paths.data_dir.join("auth.json")).expect("metadata");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn write_api_key_remove_deletes_the_entry_and_an_absent_remove_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        // Removing an absent entry creates no auth.json at all.
+        write_api_key(&paths, &KeyTarget::Model("groq/llama".to_owned()), None)
+            .expect("absent remove is a no-op");
+        assert!(
+            !paths.data_dir.join("auth.json").exists(),
+            "a no-op remove must not create an empty auth.json"
+        );
+
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("groq/llama".to_owned()),
+            Some("sk-secret"),
+        )
+        .expect("set");
+        write_api_key(&paths, &KeyTarget::Model("groq/llama".to_owned()), None).expect("remove");
+        let auth =
+            codypendent_runtime::auth::AuthStore::load(&paths.data_dir).expect("auth.json loads");
+        assert_eq!(auth.get("groq/llama"), None, "the entry is gone");
+    }
+
+    #[test]
+    fn write_api_key_maps_the_tavily_target_to_the_reserved_id_the_daemon_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        write_api_key(&paths, &KeyTarget::Tavily, Some("tvly-saved")).expect("set the Tavily key");
+        let auth =
+            codypendent_runtime::auth::AuthStore::load(&paths.data_dir).expect("auth.json loads");
+        assert_eq!(
+            auth.get(codypendent_integrations::search::TAVILY_AUTH_ID),
+            Some("tvly-saved"),
+            "the Tavily target lands under the reserved id"
+        );
+
+        // And the daemon's own discovery (auth.json first, env second) reads
+        // exactly this slot — the file wins regardless of the env, so this
+        // assertion never touches the process environment.
+        let key = codypendent_integrations::search::TavilyKey::discover(&paths.data_dir)
+            .expect("the daemon's discovery reads the saved key");
+        assert_eq!(key.expose(), "tvly-saved");
+
+        write_api_key(&paths, &KeyTarget::Tavily, None).expect("remove");
+        let auth =
+            codypendent_runtime::auth::AuthStore::load(&paths.data_dir).expect("auth.json loads");
+        assert_eq!(
+            auth.get(codypendent_integrations::search::TAVILY_AUTH_ID),
+            None,
+            "the reserved entry removes too"
+        );
+    }
+
+    #[test]
+    fn write_api_key_rejects_a_blank_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("groq/llama".to_owned()),
+            Some("   "),
+        )
+        .expect_err("a blank key is rejected (the M1 shadow guard)");
+        assert!(
+            !paths.data_dir.join("auth.json").exists(),
+            "a rejected write creates no auth.json"
+        );
+    }
+
+    #[test]
+    fn write_api_key_aborts_on_a_corrupt_auth_json_without_touching_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).expect("create data dir");
+        std::fs::write(paths.data_dir.join("auth.json"), b"{ not json")
+            .expect("seed corrupt auth.json");
+
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("groq/llama".to_owned()),
+            Some("sk-secret"),
+        )
+        .expect_err("a corrupt pre-existing auth.json must abort (load-before-write)");
+        write_api_key(&paths, &KeyTarget::Model("groq/llama".to_owned()), None)
+            .expect_err("a remove aborts too");
+        assert_eq!(
+            std::fs::read(paths.data_dir.join("auth.json")).expect("read"),
+            b"{ not json",
+            "the corrupt file is left untouched, never silently replaced"
+        );
+    }
+
+    #[test]
+    fn load_key_statuses_reflects_stored_env_and_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).expect("create data dir");
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            r#"
+[[model]]
+id = "groq/llama"
+provider = "openai-compatible"
+base_url = "https://api.groq.com/openai/v1"
+model = "llama-3.1-8b"
+
+[[model]]
+id = "openai/gpt"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5.1-codex"
+api_key_env = "OPENAI_API_KEY"
+
+[[model]]
+id = "ollama/qwen"
+provider = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "qwen2.5-coder:14b"
+"#,
+        )
+        .expect("write models.toml");
+
+        // Nothing stored yet: env-declared shows the NAME, the rest Missing.
+        let (models, _) = load_key_statuses(&paths, &mut Vec::new());
+        assert_eq!(
+            models,
+            vec![
+                ("groq/llama".to_owned(), KeyStatus::Missing),
+                (
+                    "openai/gpt".to_owned(),
+                    KeyStatus::Env("OPENAI_API_KEY".to_owned())
+                ),
+                ("ollama/qwen".to_owned(), KeyStatus::Missing),
+            ]
+        );
+
+        // A stored key beats the env declaration. (The Tavily row lives in
+        // `load_key_statuses_tavily_row_mirrors_the_daemon_discovery_precedence`
+        // — the ONE test allowed to touch `TAVILY_API_KEY`.)
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("openai/gpt".to_owned()),
+            Some("sk-x"),
+        )
+        .expect("set model key");
+        let (models, _) = load_key_statuses(&paths, &mut Vec::new());
+        assert_eq!(
+            models,
+            vec![
+                ("groq/llama".to_owned(), KeyStatus::Missing),
+                ("openai/gpt".to_owned(), KeyStatus::Stored),
+                ("ollama/qwen".to_owned(), KeyStatus::Missing),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_key_statuses_tavily_row_mirrors_the_daemon_discovery_precedence() {
+        // Every `TAVILY_API_KEY`-touching case lives in this ONE test: the
+        // process environment is global mutable state, so two tests racing
+        // `set_var`/`remove_var` on the SAME variable would flake (the
+        // `search/key.rs` convention). No other test may set the variable or
+        // assert on the Tavily row.
+        use codypendent_integrations::search::key::TAVILY_API_KEY_ENV;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).expect("create data dir");
+
+        // 1. Neither source → Missing.
+        std::env::remove_var(TAVILY_API_KEY_ENV);
+        let (_, tavily) = load_key_statuses(&paths, &mut Vec::new());
+        assert_eq!(tavily, KeyStatus::Missing);
+
+        // 2. Env set (no auth.json entry) → Env(NAME) — the variable NAME
+        //    only; the value is never read into the projection.
+        std::env::set_var(TAVILY_API_KEY_ENV, "tvly-env-key");
+        let (_, tavily) = load_key_statuses(&paths, &mut Vec::new());
+        assert_eq!(tavily, KeyStatus::Env(TAVILY_API_KEY_ENV.to_owned()));
+
+        // 3. A blank env value counts as absent (exactly like `discover`).
+        std::env::set_var(TAVILY_API_KEY_ENV, "   ");
+        let (_, tavily) = load_key_statuses(&paths, &mut Vec::new());
+        assert_eq!(tavily, KeyStatus::Missing);
+
+        // 4. A stored entry beats the env — the file wins, exactly like
+        //    `TavilyKey::discover`.
+        std::env::set_var(TAVILY_API_KEY_ENV, "tvly-env-key");
+        write_api_key(&paths, &KeyTarget::Tavily, Some("tvly-stored")).expect("set tavily");
+        let (_, tavily) = load_key_statuses(&paths, &mut Vec::new());
+        assert_eq!(tavily, KeyStatus::Stored);
+
+        std::env::remove_var(TAVILY_API_KEY_ENV);
+    }
+
+    #[test]
+    fn tavily_key_set_and_remove_both_offer_the_daemon_restart() {
+        use codypendent_tui::Overlay;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        let mut state = AppState::new();
+
+        // Set: the restart offer stands (the daemon discovers the key only at
+        // boot).
+        apply_set_api_key(&mut state, &paths, &KeyTarget::Tavily, "tvly-saved");
+        assert!(
+            matches!(state.overlay, Overlay::ConfirmRestart),
+            "the set path offers the restart: {:?}",
+            state.overlay
+        );
+        assert_eq!(state.tavily_key_status, KeyStatus::Stored);
+
+        // Dismiss the overlay, then remove: the daemon keeps its loaded
+        // credential for its lifetime, so the removal can't take effect
+        // without a restart either — the same offer must appear.
+        state.overlay = Overlay::None;
+        apply_remove_api_key(&mut state, &paths, &KeyTarget::Tavily);
+        assert!(
+            matches!(state.overlay, Overlay::ConfirmRestart),
+            "the remove path offers the restart too: {:?}",
+            state.overlay
+        );
+        let notice = state
+            .notice
+            .as_ref()
+            .map(|(text, _)| text.as_str())
+            .unwrap_or("");
+        assert!(
+            notice.contains("until the daemon restarts"),
+            "the notice explains why a restart is needed: {notice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_add_model_refires_the_key_status_projection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        let mut state = AppState::new();
+
+        // "groq" is a built-in catalog provider (hosted, api-key).
+        apply_add_model(
+            &mut state,
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            Some("sk-secret"),
+        )
+        .await;
+
+        // The picker re-seeded…
+        assert!(
+            state.models.iter().any(|card| card.id.0 == "groq/llama"),
+            "the model picker re-seeded"
+        );
+        // …and the /keys projection re-fired with it — a model added WITH a
+        // key shows `Stored` immediately, without a TUI restart.
+        assert_eq!(
+            state.key_status,
+            vec![("groq/llama".to_owned(), KeyStatus::Stored)]
+        );
+        assert_eq!(
+            state.notice.as_ref().map(|(text, _)| text.as_str()),
+            Some("added model groq/llama")
+        );
+    }
+
+    #[test]
+    fn boot_warnings_survive_the_watch_channel_and_notice_post_boot() {
+        // What `warn_stage` does: the stage channel keeps only the LATEST
+        // value — the very next stage overwrites a `Reconciling` warning —
+        // while the shared vec keeps every one.
+        let (stage_tx, stage_rx) = watch::channel(SplashStage::StartingDaemon);
+        let warnings: BootWarnings = BootWarnings::default();
+        let warn_stage = |message: &str| {
+            push_boot_warning(&warnings, message.to_owned());
+            let _ = stage_tx.send(SplashStage::Reconciling(message.to_owned()));
+        };
+        warn_stage("daemon build mismatch; continuing on the running build");
+        warn_stage("restart refused: 2 active run(s)");
+        let _ = stage_tx.send(SplashStage::RestoringSession);
+
+        // The channel retained only the overwrite…
+        assert_eq!(stage_rx.borrow().text(), "restoring session…");
+        // …but the vec kept both warnings, and draining notices each of them
+        // post-boot (`Action::Notice` keeps the latest until its expiry tick,
+        // so the LAST collected warning is the one on screen).
+        let mut state = AppState::new();
+        drain_boot_warnings(&mut state, &warnings);
+        assert!(
+            warnings.lock().expect("poisoned").is_empty(),
+            "drained exactly once"
+        );
+        assert_eq!(
+            state.notice.as_ref().map(|(text, _)| text.as_str()),
+            Some("restart refused: 2 active run(s)")
         );
     }
 

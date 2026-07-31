@@ -10,23 +10,24 @@
 //! a one-row status line spans the bottom. Overlays (help, prompts, confirm,
 //! and the approval modal) draw on top.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use codypendent_protocol::{
-    AgentMode, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition, RunState,
+    AgentMode, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition, RunState, BUILD_ID,
 };
 
-use crate::action::Action;
+use crate::action::{Action, KeyTarget};
 use crate::input::footer_hints;
 use crate::reduce::capability_label;
 use crate::state::{
-    filter_model_names, filter_models, filter_modes, filter_providers, AppState, DocFocus,
-    DocLeaseState, LayoutMode, ModelCard, ModelLocationLabel, Overlay, Pane, PatchSummary,
-    ProviderCard, RunActivity, RunView, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
+    filter_key_rows, filter_model_names, filter_models, filter_modes, filter_providers, AppState,
+    DocFocus, DocLeaseState, KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, Overlay, Pane,
+    PatchSummary, ProviderCard, RunActivity, RunView, StatusProjection, ToolCard, ToolStatus,
+    TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -41,11 +42,12 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
         area,
     );
 
-    // A conversation-centred shell: the transcript is the workspace, a
-    // persistent composer sits beneath it, a one-row status footer follows, and
-    // a one-row derived shortcuts strip spans the very bottom. Every other
-    // surface (runs, approvals, docs, skills, memory, edges) is a centered
-    // overlay or the approval modal — minimal permanent chrome.
+    // A conversation-centred shell: a one-row header bar spans the top, the
+    // transcript is the workspace, a persistent composer sits beneath it, a
+    // one-row status footer follows, and a one-row derived shortcuts strip
+    // spans the very bottom. Every other surface (runs, approvals, docs,
+    // skills, memory, edges) is a centered overlay or the approval modal —
+    // minimal permanent chrome.
     // The box grows past its 3-row minimum when the draft holds more than one
     // line (a manual `Alt+Enter` break, or a multi-line paste), capped at
     // `COMPOSER_MAX_HEIGHT` — see `composer_box_height`.
@@ -53,6 +55,7 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),               // chat header (D3)
             Constraint::Min(3),                  // conversation transcript
             Constraint::Length(composer_height), // persistent composer
             Constraint::Length(1),               // status footer
@@ -60,17 +63,235 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
         ])
         .split(area);
 
-    // The region above the composer depends on the layout; the composer, status
-    // footer, and shortcuts footer are identical in both.
+    render_header(frame, rows[0], state, theme);
+    // The region between header and composer depends on the layout; the
+    // header, composer, status footer, and shortcuts footer are identical in
+    // both.
     match state.layout {
-        LayoutMode::Chat => render_conversation(frame, rows[0], state, theme),
-        LayoutMode::Workspace => render_workspace(frame, rows[0], state, theme),
+        LayoutMode::Chat => render_conversation(frame, rows[1], state, theme),
+        LayoutMode::Workspace => render_workspace(frame, rows[1], state, theme),
     }
-    render_composer(frame, rows[1], state, theme);
-    render_status_line(frame, rows[2], state, theme);
-    render_shortcuts_bar(frame, rows[3], state, theme);
+    render_composer(frame, rows[2], state, theme);
+    render_status_line(frame, rows[3], state, theme);
+    render_shortcuts_bar(frame, rows[4], state, theme);
 
     render_overlays(frame, area, state, theme);
+}
+
+/// The persistent one-row header bar (D3), identical across layouts. Left —
+/// the `● codypendent` brand and the session title, then width-tiered extras
+/// (model + next-run mode at mid width, the running daemon's build id at full
+/// width, the same tiers as [`render_status_line`]); right — context percent
+/// and cost from the status projection. Theme tokens only (RULE 7).
+fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let status = state.status();
+    let full = area.width >= 96;
+    let mid = area.width >= 64;
+    let sep = || Span::styled(" · ", Style::default().fg(theme.text.muted));
+
+    let mut left: Vec<Span> = vec![
+        Span::raw(" "),
+        Span::styled("●", Style::default().fg(theme.agent.tool)),
+        Span::styled(
+            " codypendent",
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(title) = &state.session_title {
+        left.push(sep());
+        left.push(Span::styled(
+            truncate(title, 24),
+            Style::default().fg(theme.text.secondary),
+        ));
+    }
+    if mid {
+        // The model is omitted entirely while unknown (the same honesty rule
+        // as the transcript's assistant header) — never a "—" placeholder.
+        if let Some(model) = &status.model {
+            left.push(sep());
+            left.push(Span::styled(
+                truncate(&model.0, 20),
+                Style::default().fg(theme.text.primary),
+            ));
+        }
+        left.push(sep());
+        left.push(Span::styled(
+            mode_label(state.default_mode).to_owned(),
+            Style::default().fg(theme.status.info),
+        ));
+    }
+    if full {
+        if let Some(build_id) = &state.daemon_build_id {
+            left.push(sep());
+            left.push(Span::styled(
+                build_id.clone(),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+    }
+
+    let mut right: Vec<Span> = Vec::new();
+    if let Some(percent) = status.context_percent {
+        right.push(Span::styled(
+            format!("{percent}%"),
+            Style::default().fg(theme.status.info),
+        ));
+        right.push(sep());
+    }
+    right.push(Span::styled(
+        format_cost(status.cost_minor),
+        Style::default().fg(theme.status.warning),
+    ));
+
+    // Right-align ctx/cost by padding between the two groups (the status
+    // line's approach: measure the spans directly rather than re-rendering).
+    let left_width: usize = left.iter().map(|span| span.width()).sum();
+    let right_width: usize = right.iter().map(|span| span.width()).sum();
+    let pad = (area.width as usize).saturating_sub(left_width + right_width + 1);
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.extend(right);
+    spans.push(Span::raw(" "));
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.surface.panel)),
+        area,
+    );
+}
+
+/// The D2 startup splash, drawn by the CLI harness on the same alternate
+/// screen while boot proceeds (daemon spawn/poll, handshake, build reconcile,
+/// session restore, projection loads): the `CODYPENDENT` block-letter
+/// wordmark, a one-line tagline, the build id, and the current boot stage
+/// with a spinner animated from `tick`. `warnings` carries the boot
+/// diagnostics collected so far (reconcile warnings, best-effort loader
+/// failures) — rendered as extra lines UNDER the stage line, warning-tinted,
+/// capped at [`MAX_SPLASH_WARNINGS`] with a `+N more` overflow line so a
+/// chatty boot can't push the wordmark off a short terminal. Pure projection
+/// onto the frame — theme tokens only, no I/O.
+///
+/// Degradation: the wordmark is 65 columns wide, so under 70 cols (or 10
+/// rows) it collapses to a plain `codypendent` line; under 8 rows the tagline
+/// and version drop too, leaving just name + stage (+ warnings).
+pub fn render_splash(
+    frame: &mut Frame,
+    tick: u64,
+    stage: &str,
+    warnings: &[String],
+    theme: &Theme,
+) {
+    // Braille-dot spinner frames (the ten glyphs CLI spinners conventionally
+    // use, e.g. pnpm's); cycled by tick so the stage line animates while boot
+    // waits on the daemon.
+    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+    let area = frame.area();
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.surface.background)),
+        area,
+    );
+
+    let mut lines: Vec<Line> = Vec::new();
+    if area.width >= 70 && area.height >= 10 {
+        for row in wordmark_rows("CODYPENDENT") {
+            lines.push(Line::styled(
+                row,
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::raw(""));
+    } else {
+        lines.push(Line::styled(
+            "codypendent",
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if area.height >= 8 {
+        lines.push(Line::styled(
+            "the persistent agent daemon",
+            Style::default().fg(theme.text.secondary),
+        ));
+        lines.push(Line::styled(
+            format!("v{BUILD_ID}"),
+            Style::default().fg(theme.text.muted),
+        ));
+        lines.push(Line::raw(""));
+    }
+    let spinner = SPINNER[(tick % SPINNER.len() as u64) as usize];
+    lines.push(Line::from(vec![
+        Span::styled(spinner.to_string(), Style::default().fg(theme.agent.tool)),
+        Span::styled(
+            format!(" {stage}"),
+            Style::default().fg(theme.text.secondary),
+        ),
+    ]));
+    for warning in warnings.iter().take(MAX_SPLASH_WARNINGS) {
+        lines.push(Line::styled(
+            warning.clone(),
+            Style::default().fg(theme.status.warning),
+        ));
+    }
+    let overflow = warnings.len().saturating_sub(MAX_SPLASH_WARNINGS);
+    if overflow > 0 {
+        lines.push(Line::styled(
+            format!("… +{overflow} more"),
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+
+    // Centered as a block: vertically by offsetting a content-height rect,
+    // horizontally via the paragraph's alignment.
+    let height = (lines.len() as u16).min(area.height);
+    let content = Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: area.width,
+        height,
+    };
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), content);
+}
+
+/// The most boot diagnostics [`render_splash`] draws under the stage line
+/// before collapsing the rest into a `+N more` overflow line.
+const MAX_SPLASH_WARNINGS: usize = 4;
+
+/// The splash wordmark's per-glyph height in rows.
+const WORDMARK_GLYPH_ROWS: usize = 5;
+
+/// One 5×5 block-letter glyph of the splash wordmark (hand-drawn — no figlet
+/// dependency). Only the letters of `CODYPENDENT` are defined.
+fn wordmark_glyph(ch: char) -> [&'static str; WORDMARK_GLYPH_ROWS] {
+    match ch {
+        'C' => [" ███ ", "█   █", "█    ", "█   █", " ███ "],
+        'O' => [" ███ ", "█   █", "█   █", "█   █", " ███ "],
+        'D' => ["████ ", "█   █", "█   █", "█   █", "████ "],
+        'Y' => ["█   █", "█   █", " █ █ ", "  █  ", "  █  "],
+        'P' => ["████ ", "█   █", "████ ", "█    ", "█    "],
+        'E' => ["█████", "█    ", "████ ", "█    ", "█████"],
+        'N' => ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
+        'T' => ["█████", "  █  ", "  █  ", "  █  ", "  █  "],
+        _ => ["     "; WORDMARK_GLYPH_ROWS],
+    }
+}
+
+/// Join `text`'s glyphs into full block-letter rows, one space between letters.
+fn wordmark_rows(text: &str) -> Vec<String> {
+    let mut rows = vec![String::new(); WORDMARK_GLYPH_ROWS];
+    for ch in text.chars() {
+        for (row, cells) in rows.iter_mut().zip(wordmark_glyph(ch)) {
+            if !row.is_empty() {
+                row.push(' ');
+            }
+            row.push_str(cells);
+        }
+    }
+    rows
 }
 
 /// The workspace layout: a runs pane, the conversation, and an approvals + run
@@ -1500,6 +1721,46 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::ModePicker { query, selected } => {
             render_mode_picker(frame, area, state, theme, query, *selected);
         }
+        // D1: the `/keys` overlay, its masked set/replace prompt, and its two
+        // confirms. The set prompt reuses `render_masked_prompt` (the key can
+        // never appear on screen); neither confirm ever carries key material.
+        Overlay::ApiKeys { query, selected } => {
+            render_api_keys(frame, area, state, theme, query, *selected);
+        }
+        Overlay::ApiKeySet { target, buffer } => {
+            let title = match target {
+                KeyTarget::Model(id) => {
+                    format!("API key for {id} (stored locally in auth.json, mode 0600)")
+                }
+                KeyTarget::Tavily => {
+                    "Tavily API key for web.search (stored locally in auth.json, mode 0600)"
+                        .to_owned()
+                }
+            };
+            render_masked_prompt(frame, area, theme, &title, &buffer.0);
+        }
+        Overlay::ApiKeyRemoveConfirm { target } => {
+            let (what, effect) = match target {
+                KeyTarget::Model(id) => (
+                    format!("Remove the saved key for {id}?"),
+                    "The model falls back to its api_key_env (if any) on the next run.",
+                ),
+                KeyTarget::Tavily => (
+                    "Remove the saved Tavily key?".to_owned(),
+                    "web.search stays enabled until the daemon restarts.",
+                ),
+            };
+            render_confirm_box(frame, area, theme, &what, effect);
+        }
+        Overlay::ConfirmRestart => {
+            render_confirm_box(
+                frame,
+                area,
+                theme,
+                "Restart the daemon now?",
+                "Applies the new key; idle-guarded (never kills a run).",
+            );
+        }
         // The block-edit prompt floats over the Docs browser it opened from, so the
         // editor stays in view while the writer types the insertion.
         Overlay::DocEdit { buffer, .. } => {
@@ -2267,6 +2528,202 @@ fn render_mode_picker(
             Action::ActivateRow(row),
         );
     }
+}
+
+/// The `/keys` overlay (D1): the same filter-line + list shape as
+/// [`render_mode_picker`], over one row per configured model plus a final
+/// `Tavily (web.search)` row. Each row shows a status GLYPH (● saved in
+/// auth.json / ◐ an `api_key_env` NAME / ○ missing) and a detail line — never
+/// any key material: [`KeyStatus`] carries no values by construction, and the
+/// env variant holds the variable NAME only. `Enter` opens the masked
+/// set/replace prompt; `d` removes a stored key. Colors are Theme tokens only
+/// (RULE 7).
+fn render_api_keys(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    query: &str,
+    selected: usize,
+) {
+    let rect = centered_rect(60, 50, area);
+    frame.render_widget(Clear, rect);
+
+    let matches = filter_key_rows(&state.models, query);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" API keys ({}) ", matches.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // The filter line, with a block cursor so it reads as an input (the
+    // command palette's shape).
+    let filter = Line::from(vec![
+        Span::styled("› ", Style::default().fg(theme.focus.active)),
+        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
+        Span::styled("▏", Style::default().fg(theme.focus.active)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(filter).style(Style::default().bg(theme.surface.overlay)),
+        rows[0],
+    );
+
+    // The filtered row list: each row is 2 lines tall (glyph + id, provider ·
+    // status detail), windowed around the selection so a long model list
+    // scrolls (the model picker's shape).
+    const ROW_LINES: usize = 2;
+    let list_area = rows[1];
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
+    let mut items: Vec<ListItem> = Vec::new();
+    if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching model",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate().skip(first) {
+        // The row's label, provider/sub-line prefix, and status: indices into
+        // `state.models` are model rows; `models.len()` is the Tavily row.
+        let (label, provider, status) = match state.models.get(idx) {
+            Some(card) => {
+                let status = state
+                    .key_status
+                    .iter()
+                    .find(|(id, _)| id == &card.id.0)
+                    .map(|(_, status)| status)
+                    .unwrap_or(&KeyStatus::Missing);
+                (card.id.0.clone(), card.provider.clone(), status.clone())
+            }
+            None => (
+                "Tavily (web.search)".to_owned(),
+                "web search".to_owned(),
+                state.tavily_key_status.clone(),
+            ),
+        };
+        let (glyph, glyph_color, detail) = key_status_render(&status, theme);
+        let is_selected = row == selected;
+        let head = Line::from(vec![
+            Span::styled(
+                if is_selected { "› " } else { "  " },
+                Style::default().fg(theme.focus.active),
+            ),
+            Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
+            Span::styled(label, Style::default().fg(theme.text.primary)),
+        ]);
+        let detail_line = Line::styled(
+            format!("      {provider} · {detail}"),
+            Style::default().fg(theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, detail_line]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        list_area,
+    );
+    // Each visible row is a fixed 2 lines tall (head/detail) — register a rect
+    // of that height per rendered row (offset by the scroll window) so a click
+    // maps to the right index even after the list scrolled.
+    for (row, _) in matches.iter().enumerate().skip(first) {
+        let y = list_area.y + ((row - first) as u16) * ROW_LINES as u16;
+        if y >= list_area.y + list_area.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: ROW_LINES as u16,
+            },
+            Action::ActivateRow(row),
+        );
+    }
+
+    let hint = Line::styled(
+        "  ↑/↓ select · Enter set/replace · d remove · Esc close",
+        Style::default().fg(theme.text.muted),
+    );
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().bg(theme.surface.overlay)),
+        rows[2],
+    );
+}
+
+/// A `/keys` row's status rendering (D1): the glyph, its color, and the detail
+/// text. Never any key material — the env variant shows the variable NAME
+/// only.
+fn key_status_render(status: &KeyStatus, theme: &Theme) -> (&'static str, Color, String) {
+    match status {
+        KeyStatus::Stored => (
+            "●",
+            theme.status.success,
+            "key saved (auth.json)".to_owned(),
+        ),
+        KeyStatus::Env(name) => ("◐", theme.status.warning, format!("env {name}")),
+        KeyStatus::Missing => ("○", theme.text.muted, "no key configured".to_owned()),
+    }
+}
+
+/// A small yes/no confirm box in the [`render_confirm`] shape, parameterized
+/// so the `/keys` remove confirm and the daemon-restart offer (D1) share it.
+/// Both texts are key-free by construction (they name a target, never a value).
+fn render_confirm_box(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, detail: &str) {
+    let rect = centered_rect(60, 20, area);
+    frame.render_widget(Clear, rect);
+    let lines = vec![
+        Line::styled(
+            title.to_owned(),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(detail.to_owned(), Style::default().fg(theme.text.secondary)),
+        Line::from(vec![
+            Span::styled("[y] yes   ", Style::default().fg(theme.status.warning)),
+            Span::styled("[n] no", Style::default().fg(theme.status.success)),
+        ]),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Confirm ")
+        .border_style(Style::default().fg(theme.status.warning))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
 }
 
 /// A provider card's badges, space-joined: its protocol and local/hosted
@@ -4074,6 +4531,207 @@ mod tests {
         );
     }
 
+    // --- D2: startup splash ---
+
+    fn render_splash_to_string(
+        tick: u64,
+        stage: &str,
+        warnings: &[String],
+        w: u16,
+        h: u16,
+    ) -> String {
+        let theme = Theme::dark();
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_splash(f, tick, stage, warnings, &theme))
+            .expect("draw");
+        buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn splash_shows_wordmark_tagline_version_and_stage() {
+        let text = render_splash_to_string(0, "connecting…", &[], 100, 30);
+        assert!(text.contains("███"), "block wordmark missing:\n{text}");
+        assert!(
+            text.contains("the persistent agent daemon"),
+            "tagline missing:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("v{}", codypendent_protocol::BUILD_ID)),
+            "version missing:\n{text}"
+        );
+        assert!(text.contains("connecting…"), "stage missing:\n{text}");
+    }
+
+    #[test]
+    fn splash_spinner_varies_with_tick() {
+        let first = render_splash_to_string(0, "connecting…", &[], 100, 30);
+        let second = render_splash_to_string(1, "connecting…", &[], 100, 30);
+        assert!(
+            first.contains('⠋'),
+            "tick-0 spinner frame missing:\n{first}"
+        );
+        assert!(
+            second.contains('⠙'),
+            "tick-1 spinner frame missing:\n{second}"
+        );
+        assert_ne!(first, second, "spinner did not animate across ticks");
+    }
+
+    #[test]
+    fn splash_falls_back_to_plain_name_on_narrow_terminals() {
+        let text = render_splash_to_string(0, "loading workspace…", &[], 50, 24);
+        assert!(text.contains("codypendent"), "plain name missing:\n{text}");
+        assert!(
+            !text.contains("███"),
+            "block wordmark should drop at 50 cols:\n{text}"
+        );
+        assert!(
+            text.contains("loading workspace…"),
+            "stage missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn splash_drops_tagline_and_version_on_short_terminals() {
+        let text = render_splash_to_string(0, "starting daemon…", &[], 100, 6);
+        assert!(text.contains("codypendent"), "plain name missing:\n{text}");
+        assert!(text.contains("starting daemon…"), "stage missing:\n{text}");
+        assert!(
+            !text.contains("persistent agent daemon"),
+            "tagline should drop at 6 rows:\n{text}"
+        );
+    }
+
+    #[test]
+    fn splash_renders_boot_warnings_below_the_stage_line() {
+        let warnings = vec![
+            "daemon build mismatch; continuing on the running build".to_owned(),
+            "could not list model profiles: db locked".to_owned(),
+        ];
+        let text = render_splash_to_string(0, "restoring session…", &warnings, 100, 30);
+        assert!(
+            text.contains("restoring session…"),
+            "stage missing:\n{text}"
+        );
+        assert!(
+            text.contains("daemon build mismatch"),
+            "first warning missing:\n{text}"
+        );
+        assert!(
+            text.contains("could not list model profiles"),
+            "second warning missing:\n{text}"
+        );
+        // The warnings render BELOW the stage line.
+        let stage_row = text.find("restoring session…").expect("stage");
+        let warning_row = text.find("daemon build mismatch").expect("warning");
+        assert!(
+            warning_row > stage_row,
+            "the warnings must render below the stage line:\n{text}"
+        );
+    }
+
+    #[test]
+    fn splash_truncates_a_long_warning_list_with_an_overflow_line() {
+        let warnings: Vec<String> = (1..=6).map(|n| format!("warning number {n}")).collect();
+        let text = render_splash_to_string(0, "connecting…", &warnings, 100, 30);
+        for kept in &warnings[..MAX_SPLASH_WARNINGS] {
+            assert!(text.contains(kept), "{kept} should render:\n{text}");
+        }
+        for dropped in &warnings[MAX_SPLASH_WARNINGS..] {
+            assert!(
+                !text.contains(dropped),
+                "{dropped} should be truncated:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("+2 more"),
+            "the overflow count is missing:\n{text}"
+        );
+    }
+
+    // --- D3: chat header ---
+
+    /// A state with every header field populated: session title, model, a
+    /// distinct next-run mode, a daemon build id, context %, and a cost.
+    fn header_state() -> AppState {
+        let mut s = running_build_state();
+        s.daemon_build_id = Some("0.9.0+abc1234".to_owned());
+        s.default_mode = codypendent_protocol::AgentMode::Plan;
+        s.runs[0].cost_minor = Some(1234);
+        s
+    }
+
+    /// Render and return just the header bar (row 0), so presence/absence
+    /// assertions never match transcript text further down.
+    fn header_line(state: &AppState, w: u16) -> String {
+        render_to_string(state, w, 30)
+            .lines()
+            .next()
+            .expect("a header row")
+            .to_owned()
+    }
+
+    #[test]
+    fn header_shows_every_field_at_full_width() {
+        let text = header_line(&header_state(), 120);
+        assert!(text.contains("codypendent"), "brand missing:\n{text}");
+        assert!(text.contains("fix-tests"), "session title missing:\n{text}");
+        assert!(text.contains("gpt-5.1-codex"), "model missing:\n{text}");
+        assert!(text.contains("Plan"), "next-run mode missing:\n{text}");
+        assert!(
+            text.contains("0.9.0+abc1234"),
+            "daemon build id missing:\n{text}"
+        );
+        assert!(text.contains("42%"), "context %% missing:\n{text}");
+        assert!(text.contains("$12.34"), "cost missing:\n{text}");
+    }
+
+    #[test]
+    fn header_drops_build_id_at_mid_width() {
+        let text = header_line(&header_state(), 80);
+        assert!(text.contains("gpt-5.1-codex"), "model missing:\n{text}");
+        assert!(text.contains("Plan"), "next-run mode missing:\n{text}");
+        assert!(
+            !text.contains("0.9.0+abc1234"),
+            "build id should drop at 80 cols:\n{text}"
+        );
+    }
+
+    #[test]
+    fn header_drops_model_mode_and_build_id_at_narrow_width() {
+        let text = header_line(&header_state(), 50);
+        assert!(text.contains("codypendent"), "brand missing:\n{text}");
+        assert!(text.contains("fix-tests"), "session title missing:\n{text}");
+        assert!(
+            !text.contains("gpt-5.1-codex"),
+            "model should drop at 50 cols:\n{text}"
+        );
+        assert!(
+            !text.contains("Plan"),
+            "mode should drop at 50 cols:\n{text}"
+        );
+        assert!(
+            !text.contains("0.9.0+abc1234"),
+            "build id should drop at 50 cols:\n{text}"
+        );
+        assert!(text.contains("42%"), "context %% missing:\n{text}");
+        assert!(text.contains("$12.34"), "cost missing:\n{text}");
+    }
+
+    #[test]
+    fn header_renders_in_the_workspace_layout_too() {
+        let mut state = header_state();
+        state.layout = LayoutMode::Workspace;
+        let text = header_line(&state, 120);
+        assert!(text.contains("codypendent"), "brand missing:\n{text}");
+        assert!(
+            text.contains("0.9.0+abc1234"),
+            "daemon build id missing:\n{text}"
+        );
+    }
+
     /// Task 5 (codex chat shell): the collapsed tool card head restyles into
     /// one compact Codex-style line — a run glyph (`⏺`) and the tool's
     /// verb/name, with a terse outcome mark instead of the old `[status]`
@@ -4774,7 +5432,13 @@ mod tests {
             }),
         );
         let out = render_to_string(&s, 100, 20);
-        let header_row = out.lines().next().expect("a top row");
+        // The conversation header (the pane's top border row) — row 0 is the
+        // D3 chat header bar, so locate the pane border instead of assuming
+        // the transcript starts at the top.
+        let header_row = out
+            .lines()
+            .find(|line| line.starts_with('┌'))
+            .expect("a conversation header row");
         assert!(
             header_row.contains("· Ask"),
             "mode shown in the header:\n{header_row}"
@@ -5842,6 +6506,151 @@ mod tests {
         );
     }
 
+    /// D1: a `/keys` test fixture — two models with one of each status, plus
+    /// the Tavily row. The "known test key" below must NEVER appear in any
+    /// render.
+    fn api_keys_state() -> AppState {
+        let mut state = running_build_state();
+        state.models = vec![
+            ModelCard {
+                id: ModelId("groq/llama".to_owned()),
+                provider: "openai-compatible".to_owned(),
+                location: None,
+                cost_per_1k_usd: None,
+                context_tokens: None,
+            },
+            ModelCard {
+                id: ModelId("openai/gpt".to_owned()),
+                provider: "openai-compatible".to_owned(),
+                location: None,
+                cost_per_1k_usd: None,
+                context_tokens: None,
+            },
+        ];
+        state.key_status = vec![
+            ("groq/llama".to_owned(), crate::state::KeyStatus::Stored),
+            (
+                "openai/gpt".to_owned(),
+                crate::state::KeyStatus::Env("OPENAI_API_KEY".to_owned()),
+            ),
+        ];
+        state.tavily_key_status = crate::state::KeyStatus::Missing;
+        state
+    }
+
+    #[test]
+    fn api_keys_overlay_lists_rows_with_status_glyphs_and_no_key_material() {
+        let mut state = api_keys_state();
+        reduce(&mut state, Action::OpenPalette);
+        for c in "api keys".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputSubmit);
+        assert!(matches!(state.overlay, Overlay::ApiKeys { .. }));
+
+        let text = render_to_string(&state, 120, 40);
+        assert!(text.contains("API keys"), "title missing:\n{text}");
+        assert!(text.contains("groq/llama"), "a model row:\n{text}");
+        assert!(text.contains("openai/gpt"), "the other model row:\n{text}");
+        assert!(
+            text.contains("Tavily (web.search)"),
+            "the final Tavily row:\n{text}"
+        );
+        assert!(
+            text.contains("● groq/llama"),
+            "a stored key renders ●:\n{text}"
+        );
+        assert!(
+            text.contains("◐ openai/gpt"),
+            "an env-declared key renders ◐:\n{text}"
+        );
+        assert!(
+            text.contains("env OPENAI_API_KEY"),
+            "the var NAME (never its value) shows in the detail line:\n{text}"
+        );
+        assert!(
+            text.contains("○ Tavily (web.search)"),
+            "a missing key renders ○:\n{text}"
+        );
+        // No key material anywhere — the env var's VALUE would leak here if
+        // statuses ever carried one (they cannot, by construction).
+        assert!(
+            !text.contains("sk-live-test-key"),
+            "key material must never render:\n{text}"
+        );
+        assert!(
+            !text.contains("tvly-"),
+            "no Tavily key material either:\n{text}"
+        );
+    }
+
+    #[test]
+    fn api_key_set_prompt_masks_the_typed_key() {
+        let mut state = api_keys_state();
+        state.overlay = Overlay::ApiKeySet {
+            target: crate::action::KeyTarget::Model("groq/llama".to_owned()),
+            buffer: crate::action::SecretKey("sk-live-test-key".to_owned()),
+        };
+        let text = render_to_string(&state, 100, 24);
+        assert!(
+            text.contains("API key for groq/llama"),
+            "the prompt names its (non-secret) target:\n{text}"
+        );
+        assert!(text.contains('•'), "the key is masked:\n{text}");
+        assert!(
+            !text.contains("sk-live-test-key"),
+            "the raw key must never render:\n{text}"
+        );
+
+        // The Tavily target gets its own title — still masked.
+        state.overlay = Overlay::ApiKeySet {
+            target: crate::action::KeyTarget::Tavily,
+            buffer: crate::action::SecretKey("tvly-test-secret".to_owned()),
+        };
+        let text = render_to_string(&state, 100, 24);
+        assert!(text.contains("Tavily API key"), "the Tavily title:\n{text}");
+        assert!(
+            !text.contains("tvly-test-secret"),
+            "the raw key must never render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn api_key_remove_confirm_names_the_target_without_key_material() {
+        let mut state = api_keys_state();
+        state.overlay = Overlay::ApiKeyRemoveConfirm {
+            target: crate::action::KeyTarget::Model("groq/llama".to_owned()),
+        };
+        // h=40: at 24 rows the 20%-height box leaves only 2 interior rows and
+        // the y/n line clips (the render_querying comment's constraint).
+        let text = render_to_string(&state, 100, 40);
+        assert!(
+            text.contains("Remove the saved key for groq/llama?"),
+            "the confirm names its target:\n{text}"
+        );
+        assert!(text.contains("[y] yes"), "the y/n affordance:\n{text}");
+        assert!(
+            !text.contains("sk-live-test-key"),
+            "no key material in the confirm:\n{text}"
+        );
+    }
+
+    #[test]
+    fn restart_offer_confirm_explains_the_restart() {
+        let mut state = api_keys_state();
+        reduce(&mut state, Action::OfferDaemonRestart);
+        // h=40: see the remove-confirm test's note on the 20%-height box.
+        let text = render_to_string(&state, 100, 40);
+        assert!(
+            text.contains("Restart the daemon now?"),
+            "the restart offer:\n{text}"
+        );
+        assert!(
+            text.contains("idle-guarded"),
+            "the idle guard is explained:\n{text}"
+        );
+    }
+
     #[test]
     fn the_status_line_shows_the_next_runs_submission_mode() {
         // PR C2: the picked `default_mode` is visible without opening the
@@ -6540,9 +7349,15 @@ mod tests {
             }),
         );
         let out = render_to_string(&s, 90, 20);
-        assert!(out.contains("⏺ codypendent"), "bare header:\n{out}");
+        // Scope to the transcript's assistant header row — the D3 chat header
+        // bar at the top also names "codypendent", so a whole-buffer negative
+        // assertion no longer isolates the turn header.
+        let assistant_header = out
+            .lines()
+            .find(|line| line.contains("⏺ codypendent"))
+            .expect("an assistant header row");
         assert!(
-            !out.contains("codypendent ·"),
+            !assistant_header.contains('·'),
             "no ` · <model>` when unknown (honesty):\n{out}"
         );
     }

@@ -14,7 +14,7 @@ use codypendent_protocol::{
     ModelId, ProposedAction, Risk, RunDisposition, RunId, RunState, ToolOutcome,
 };
 
-use crate::action::{Action, Intent, SecretKey};
+use crate::action::{Action, Intent, KeyTarget, SecretKey};
 
 /// Which pane currently has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +223,34 @@ pub enum Overlay {
         query: String,
         selected: usize,
     },
+    /// The `/keys` overlay (D1): a fuzzy-filterable list of every configured
+    /// model (see [`AppState::models`]) plus a final `Tavily (web.search)` row,
+    /// each with its key status (see [`AppState::key_status`] /
+    /// [`AppState::tavily_key_status`]). `query` filters by id/provider
+    /// substring; `selected` indexes the filtered results (reset to 0 whenever
+    /// the query changes) — the same shape as [`Overlay::ModePicker`]. `Enter`
+    /// opens the masked set/replace prompt; `d` on a row with a stored key opens
+    /// the remove confirm.
+    ApiKeys { query: String, selected: usize },
+    /// The `/keys` set/replace prompt (D1): a masked single-line buffer for the
+    /// key being saved against `target`. `buffer` is the redacting [`SecretKey`]
+    /// newtype (masked in render, redacted in `Debug`). On submit, emits
+    /// [`Intent::SetApiKey`]; a blank buffer is rejected with a notice (nothing
+    /// is written).
+    ApiKeySet {
+        target: KeyTarget,
+        buffer: SecretKey,
+    },
+    /// The `/keys` remove confirmation (D1): `y`/`Enter` emits
+    /// [`Intent::RemoveApiKey`]; `n`/`Esc` dismisses. Opened by `d` on a row
+    /// whose status is [`KeyStatus::Stored`].
+    ApiKeyRemoveConfirm { target: KeyTarget },
+    /// The daemon-restart offer (D1), opened harness-side via
+    /// [`Action::OfferDaemonRestart`] after a Tavily key is saved (the daemon
+    /// discovers that key only at boot). `y`/`Enter` emits the client-only
+    /// [`Intent::RestartDaemon`]; `n`/`Esc` dismisses (the key applies on the
+    /// next restart).
+    ConfirmRestart,
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -789,6 +817,61 @@ pub(crate) fn filter_model_names(models: &[String], query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// How a model's (or the Tavily `web.search` integration's) API key is
+/// configured, projected for the `/keys` overlay (D1). Loaded by the CLI
+/// harness from `auth.json` + `models.toml` and folded in via
+/// [`Action::ApiKeyStatusesLoaded`](crate::action::Action::ApiKeyStatusesLoaded)
+/// — the tui crate does no I/O. Carries NO key material: the env variant holds
+/// the variable NAME (shown to the operator), never its value.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum KeyStatus {
+    /// A key is saved in `auth.json` under this id (rendered `●`).
+    Stored,
+    /// No `auth.json` entry, but `models.toml` declares an `api_key_env` —
+    /// the NAME is shown (rendered `◐ env NAME`), never the value.
+    Env(String),
+    /// No key configured anywhere (rendered `○`). The default: a fresh state
+    /// has loaded no statuses yet, which renders identically to "missing".
+    #[default]
+    Missing,
+}
+
+/// The indices into the `/keys` row list whose model id or provider
+/// case-insensitively contains `query` — the overlay's substring filter, in
+/// list order. The row list is `models` followed by one final Tavily
+/// `web.search` row at index `models.len()`; the Tavily row matches the
+/// `"tavily (web.search)"` label. An empty query matches every row. Mirrors
+/// [`filter_models`], extended by the one non-model row.
+#[must_use]
+pub(crate) fn filter_key_rows(models: &[ModelCard], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    let mut indices: Vec<usize> = models
+        .iter()
+        .enumerate()
+        .filter(|(_, card)| {
+            needle.is_empty()
+                || card.id.0.to_lowercase().contains(&needle)
+                || card.provider.to_lowercase().contains(&needle)
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    if needle.is_empty() || "tavily (web.search)".contains(&needle) {
+        indices.push(models.len());
+    }
+    indices
+}
+
+/// The [`KeyTarget`] a `/keys` row index addresses: indices into `models` are
+/// that model's id; `models.len()` is the final Tavily `web.search` row (see
+/// [`filter_key_rows`]).
+#[must_use]
+pub(crate) fn key_row_target(models: &[ModelCard], idx: usize) -> KeyTarget {
+    match models.get(idx) {
+        Some(card) => KeyTarget::Model(card.id.0.clone()),
+        None => KeyTarget::Tavily,
+    }
+}
+
 /// One provider-catalog row for the `/provider` picker projection (Task 8).
 /// The TUI performs no I/O; the CLI harness seeds this from
 /// `codypendent_providers::Catalog` (the built-in ~40-provider catalog,
@@ -929,6 +1012,11 @@ pub struct StatusProjection {
 pub struct AppState {
     /// The attached session's title, once known.
     pub session_title: Option<String>,
+    /// The running daemon's build id (D3), captured from the handshake by the
+    /// CLI harness AFTER the build-mismatch reconcile (so a just-restarted
+    /// daemon shows the new id, not the stale handshaken one). Rendered by
+    /// the chat header at the full-width tier; `None` before attach.
+    pub daemon_build_id: Option<String>,
     /// Whether the session has been closed.
     pub session_closed: bool,
     /// All runs, in arrival order.
@@ -1013,6 +1101,15 @@ pub struct AppState {
     /// picker's live filtered selection by the reducer, mirroring
     /// `selected_model`.
     pub selected_provider: usize,
+    /// The `/keys` status projection (D1): one `(model_id, status)` per
+    /// configured model, folded from [`Action::ApiKeyStatusesLoaded`] — loaded
+    /// by the CLI harness from `auth.json` + `models.toml` after the other
+    /// projections, and re-fired after every key write and daemon restart.
+    /// The [`Overlay::ApiKeys`] overlay reads it; it carries no key material.
+    pub key_status: Vec<(String, KeyStatus)>,
+    /// The Tavily `web.search` row's key status (D1), folded from the same
+    /// [`Action::ApiKeyStatusesLoaded`] as [`AppState::key_status`].
+    pub tavily_key_status: KeyStatus,
     /// The focused pane. Vestigial in the conversation-centred shell (the
     /// transcript is the single main surface); retained for catch-up/mouse code.
     pub focus: Pane,
@@ -1096,6 +1193,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             session_title: None,
+            daemon_build_id: None,
             session_closed: false,
             runs: Vec::new(),
             selected_run: 0,
@@ -1122,6 +1220,8 @@ impl AppState {
             pending_model: None,
             providers: Vec::new(),
             selected_provider: 0,
+            key_status: Vec::new(),
+            tavily_key_status: KeyStatus::Missing,
             focus: Pane::Sessions,
             composer: String::new(),
             composer_history: Vec::new(),
@@ -1149,16 +1249,20 @@ impl AppState {
             | Overlay::DocEdit { .. }
             | Overlay::AddModelId { .. }
             | Overlay::AddModelKey { .. }
-            | Overlay::AddModelProviderKey { .. } => InputMode::Editing,
-            Overlay::ConfirmCancel => InputMode::Confirm,
+            | Overlay::AddModelProviderKey { .. }
+            | Overlay::ApiKeySet { .. } => InputMode::Editing,
+            Overlay::ConfirmCancel
+            | Overlay::ApiKeyRemoveConfirm { .. }
+            | Overlay::ConfirmRestart => InputMode::Confirm,
             // The palette, the model picker, the provider picker, the mode
-            // picker, and the add-model pick-list all filter on printable keys
-            // while staying arrow-navigable, so they share this input mode (see
-            // [`crate::input::map_palette_key`]).
+            // picker, the `/keys` overlay, and the add-model pick-list all
+            // filter on printable keys while staying arrow-navigable, so they
+            // share this input mode (see [`crate::input::map_palette_key`]).
             Overlay::Palette { .. }
             | Overlay::ModelPicker { .. }
             | Overlay::ProviderPicker { .. }
             | Overlay::ModePicker { .. }
+            | Overlay::ApiKeys { .. }
             | Overlay::AddModelPick { .. } => InputMode::Palette,
             // The Skills / Memory / Docs / Edges / Workflow / Help browsers are
             // navigable with the arrow/command key table, so they stay in `Normal`
@@ -1455,6 +1559,14 @@ mod tests {
                     requires_key: true,
                     api_key: Some(SecretKey("sk-secret".to_owned())),
                     buffer: String::new(),
+                }
+            ),
+            // D1: the `/keys` set prompt carries the key in the same newtype.
+            format!(
+                "{:?}",
+                Overlay::ApiKeySet {
+                    target: KeyTarget::Model("groq/llama".to_owned()),
+                    buffer: SecretKey("sk-secret".to_owned()),
                 }
             ),
         ];
