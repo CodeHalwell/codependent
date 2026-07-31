@@ -165,13 +165,23 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
 /// screen while boot proceeds (daemon spawn/poll, handshake, build reconcile,
 /// session restore, projection loads): the `CODYPENDENT` block-letter
 /// wordmark, a one-line tagline, the build id, and the current boot stage
-/// with a spinner animated from `tick`. Pure projection onto the frame —
-/// theme tokens only, no I/O.
+/// with a spinner animated from `tick`. `warnings` carries the boot
+/// diagnostics collected so far (reconcile warnings, best-effort loader
+/// failures) — rendered as extra lines UNDER the stage line, warning-tinted,
+/// capped at [`MAX_SPLASH_WARNINGS`] with a `+N more` overflow line so a
+/// chatty boot can't push the wordmark off a short terminal. Pure projection
+/// onto the frame — theme tokens only, no I/O.
 ///
 /// Degradation: the wordmark is 65 columns wide, so under 70 cols (or 10
 /// rows) it collapses to a plain `codypendent` line; under 8 rows the tagline
-/// and version drop too, leaving just name + stage.
-pub fn render_splash(frame: &mut Frame, tick: u64, stage: &str, theme: &Theme) {
+/// and version drop too, leaving just name + stage (+ warnings).
+pub fn render_splash(
+    frame: &mut Frame,
+    tick: u64,
+    stage: &str,
+    warnings: &[String],
+    theme: &Theme,
+) {
     // Braille-dot spinner frames (the ten glyphs CLI spinners conventionally
     // use, e.g. pnpm's); cycled by tick so the stage line animates while boot
     // waits on the daemon.
@@ -221,6 +231,19 @@ pub fn render_splash(frame: &mut Frame, tick: u64, stage: &str, theme: &Theme) {
             Style::default().fg(theme.text.secondary),
         ),
     ]));
+    for warning in warnings.iter().take(MAX_SPLASH_WARNINGS) {
+        lines.push(Line::styled(
+            warning.clone(),
+            Style::default().fg(theme.status.warning),
+        ));
+    }
+    let overflow = warnings.len().saturating_sub(MAX_SPLASH_WARNINGS);
+    if overflow > 0 {
+        lines.push(Line::styled(
+            format!("… +{overflow} more"),
+            Style::default().fg(theme.text.muted),
+        ));
+    }
 
     // Centered as a block: vertically by offsetting a content-height rect,
     // horizontally via the paragraph's alignment.
@@ -233,6 +256,10 @@ pub fn render_splash(frame: &mut Frame, tick: u64, stage: &str, theme: &Theme) {
     };
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), content);
 }
+
+/// The most boot diagnostics [`render_splash`] draws under the stage line
+/// before collapsing the rest into a `+N more` overflow line.
+const MAX_SPLASH_WARNINGS: usize = 4;
 
 /// The splash wordmark's per-glyph height in rows.
 const WORDMARK_GLYPH_ROWS: usize = 5;
@@ -4506,19 +4533,25 @@ mod tests {
 
     // --- D2: startup splash ---
 
-    fn render_splash_to_string(tick: u64, stage: &str, w: u16, h: u16) -> String {
+    fn render_splash_to_string(
+        tick: u64,
+        stage: &str,
+        warnings: &[String],
+        w: u16,
+        h: u16,
+    ) -> String {
         let theme = Theme::dark();
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render_splash(f, tick, stage, &theme))
+            .draw(|f| render_splash(f, tick, stage, warnings, &theme))
             .expect("draw");
         buffer_text(terminal.backend().buffer())
     }
 
     #[test]
     fn splash_shows_wordmark_tagline_version_and_stage() {
-        let text = render_splash_to_string(0, "connecting…", 100, 30);
+        let text = render_splash_to_string(0, "connecting…", &[], 100, 30);
         assert!(text.contains("███"), "block wordmark missing:\n{text}");
         assert!(
             text.contains("the persistent agent daemon"),
@@ -4533,8 +4566,8 @@ mod tests {
 
     #[test]
     fn splash_spinner_varies_with_tick() {
-        let first = render_splash_to_string(0, "connecting…", 100, 30);
-        let second = render_splash_to_string(1, "connecting…", 100, 30);
+        let first = render_splash_to_string(0, "connecting…", &[], 100, 30);
+        let second = render_splash_to_string(1, "connecting…", &[], 100, 30);
         assert!(
             first.contains('⠋'),
             "tick-0 spinner frame missing:\n{first}"
@@ -4548,7 +4581,7 @@ mod tests {
 
     #[test]
     fn splash_falls_back_to_plain_name_on_narrow_terminals() {
-        let text = render_splash_to_string(0, "loading workspace…", 50, 24);
+        let text = render_splash_to_string(0, "loading workspace…", &[], 50, 24);
         assert!(text.contains("codypendent"), "plain name missing:\n{text}");
         assert!(
             !text.contains("███"),
@@ -4562,12 +4595,59 @@ mod tests {
 
     #[test]
     fn splash_drops_tagline_and_version_on_short_terminals() {
-        let text = render_splash_to_string(0, "starting daemon…", 100, 6);
+        let text = render_splash_to_string(0, "starting daemon…", &[], 100, 6);
         assert!(text.contains("codypendent"), "plain name missing:\n{text}");
         assert!(text.contains("starting daemon…"), "stage missing:\n{text}");
         assert!(
             !text.contains("persistent agent daemon"),
             "tagline should drop at 6 rows:\n{text}"
+        );
+    }
+
+    #[test]
+    fn splash_renders_boot_warnings_below_the_stage_line() {
+        let warnings = vec![
+            "daemon build mismatch; continuing on the running build".to_owned(),
+            "could not list model profiles: db locked".to_owned(),
+        ];
+        let text = render_splash_to_string(0, "restoring session…", &warnings, 100, 30);
+        assert!(
+            text.contains("restoring session…"),
+            "stage missing:\n{text}"
+        );
+        assert!(
+            text.contains("daemon build mismatch"),
+            "first warning missing:\n{text}"
+        );
+        assert!(
+            text.contains("could not list model profiles"),
+            "second warning missing:\n{text}"
+        );
+        // The warnings render BELOW the stage line.
+        let stage_row = text.find("restoring session…").expect("stage");
+        let warning_row = text.find("daemon build mismatch").expect("warning");
+        assert!(
+            warning_row > stage_row,
+            "the warnings must render below the stage line:\n{text}"
+        );
+    }
+
+    #[test]
+    fn splash_truncates_a_long_warning_list_with_an_overflow_line() {
+        let warnings: Vec<String> = (1..=6).map(|n| format!("warning number {n}")).collect();
+        let text = render_splash_to_string(0, "connecting…", &warnings, 100, 30);
+        for kept in &warnings[..MAX_SPLASH_WARNINGS] {
+            assert!(text.contains(kept), "{kept} should render:\n{text}");
+        }
+        for dropped in &warnings[MAX_SPLASH_WARNINGS..] {
+            assert!(
+                !text.contains(dropped),
+                "{dropped} should be truncated:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("+2 more"),
+            "the overflow count is missing:\n{text}"
         );
     }
 
