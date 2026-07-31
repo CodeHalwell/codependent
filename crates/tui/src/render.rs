@@ -10,14 +10,14 @@
 //! a one-row status line spans the bottom. Overlays (help, prompts, confirm,
 //! and the approval modal) draw on top.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use codypendent_protocol::{
-    AgentMode, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition, RunState,
+    AgentMode, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition, RunState, BUILD_ID,
 };
 
 use crate::action::{Action, KeyTarget};
@@ -42,11 +42,12 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
         area,
     );
 
-    // A conversation-centred shell: the transcript is the workspace, a
-    // persistent composer sits beneath it, a one-row status footer follows, and
-    // a one-row derived shortcuts strip spans the very bottom. Every other
-    // surface (runs, approvals, docs, skills, memory, edges) is a centered
-    // overlay or the approval modal — minimal permanent chrome.
+    // A conversation-centred shell: a one-row header bar spans the top, the
+    // transcript is the workspace, a persistent composer sits beneath it, a
+    // one-row status footer follows, and a one-row derived shortcuts strip
+    // spans the very bottom. Every other surface (runs, approvals, docs,
+    // skills, memory, edges) is a centered overlay or the approval modal —
+    // minimal permanent chrome.
     // The box grows past its 3-row minimum when the draft holds more than one
     // line (a manual `Alt+Enter` break, or a multi-line paste), capped at
     // `COMPOSER_MAX_HEIGHT` — see `composer_box_height`.
@@ -54,6 +55,7 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),               // chat header (D3)
             Constraint::Min(3),                  // conversation transcript
             Constraint::Length(composer_height), // persistent composer
             Constraint::Length(1),               // status footer
@@ -61,17 +63,208 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
         ])
         .split(area);
 
-    // The region above the composer depends on the layout; the composer, status
-    // footer, and shortcuts footer are identical in both.
+    render_header(frame, rows[0], state, theme);
+    // The region between header and composer depends on the layout; the
+    // header, composer, status footer, and shortcuts footer are identical in
+    // both.
     match state.layout {
-        LayoutMode::Chat => render_conversation(frame, rows[0], state, theme),
-        LayoutMode::Workspace => render_workspace(frame, rows[0], state, theme),
+        LayoutMode::Chat => render_conversation(frame, rows[1], state, theme),
+        LayoutMode::Workspace => render_workspace(frame, rows[1], state, theme),
     }
-    render_composer(frame, rows[1], state, theme);
-    render_status_line(frame, rows[2], state, theme);
-    render_shortcuts_bar(frame, rows[3], state, theme);
+    render_composer(frame, rows[2], state, theme);
+    render_status_line(frame, rows[3], state, theme);
+    render_shortcuts_bar(frame, rows[4], state, theme);
 
     render_overlays(frame, area, state, theme);
+}
+
+/// The persistent one-row header bar (D3), identical across layouts. Left —
+/// the `● codypendent` brand and the session title, then width-tiered extras
+/// (model + next-run mode at mid width, the running daemon's build id at full
+/// width, the same tiers as [`render_status_line`]); right — context percent
+/// and cost from the status projection. Theme tokens only (RULE 7).
+fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let status = state.status();
+    let full = area.width >= 96;
+    let mid = area.width >= 64;
+    let sep = || Span::styled(" · ", Style::default().fg(theme.text.muted));
+
+    let mut left: Vec<Span> = vec![
+        Span::raw(" "),
+        Span::styled("●", Style::default().fg(theme.agent.tool)),
+        Span::styled(
+            " codypendent",
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(title) = &state.session_title {
+        left.push(sep());
+        left.push(Span::styled(
+            truncate(title, 24),
+            Style::default().fg(theme.text.secondary),
+        ));
+    }
+    if mid {
+        // The model is omitted entirely while unknown (the same honesty rule
+        // as the transcript's assistant header) — never a "—" placeholder.
+        if let Some(model) = &status.model {
+            left.push(sep());
+            left.push(Span::styled(
+                truncate(&model.0, 20),
+                Style::default().fg(theme.text.primary),
+            ));
+        }
+        left.push(sep());
+        left.push(Span::styled(
+            mode_label(state.default_mode).to_owned(),
+            Style::default().fg(theme.status.info),
+        ));
+    }
+    if full {
+        if let Some(build_id) = &state.daemon_build_id {
+            left.push(sep());
+            left.push(Span::styled(
+                build_id.clone(),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+    }
+
+    let mut right: Vec<Span> = Vec::new();
+    if let Some(percent) = status.context_percent {
+        right.push(Span::styled(
+            format!("{percent}%"),
+            Style::default().fg(theme.status.info),
+        ));
+        right.push(sep());
+    }
+    right.push(Span::styled(
+        format_cost(status.cost_minor),
+        Style::default().fg(theme.status.warning),
+    ));
+
+    // Right-align ctx/cost by padding between the two groups (the status
+    // line's approach: measure the spans directly rather than re-rendering).
+    let left_width: usize = left.iter().map(|span| span.width()).sum();
+    let right_width: usize = right.iter().map(|span| span.width()).sum();
+    let pad = (area.width as usize).saturating_sub(left_width + right_width + 1);
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.extend(right);
+    spans.push(Span::raw(" "));
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.surface.panel)),
+        area,
+    );
+}
+
+/// The D2 startup splash, drawn by the CLI harness on the same alternate
+/// screen while boot proceeds (daemon spawn/poll, handshake, build reconcile,
+/// session restore, projection loads): the `CODYPENDENT` block-letter
+/// wordmark, a one-line tagline, the build id, and the current boot stage
+/// with a spinner animated from `tick`. Pure projection onto the frame —
+/// theme tokens only, no I/O.
+///
+/// Degradation: the wordmark is 65 columns wide, so under 70 cols (or 10
+/// rows) it collapses to a plain `codypendent` line; under 8 rows the tagline
+/// and version drop too, leaving just name + stage.
+pub fn render_splash(frame: &mut Frame, tick: u64, stage: &str, theme: &Theme) {
+    // Braille-dot spinner frames (the ten glyphs CLI spinners conventionally
+    // use, e.g. pnpm's); cycled by tick so the stage line animates while boot
+    // waits on the daemon.
+    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+    let area = frame.area();
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.surface.background)),
+        area,
+    );
+
+    let mut lines: Vec<Line> = Vec::new();
+    if area.width >= 70 && area.height >= 10 {
+        for row in wordmark_rows("CODYPENDENT") {
+            lines.push(Line::styled(
+                row,
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::raw(""));
+    } else {
+        lines.push(Line::styled(
+            "codypendent",
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if area.height >= 8 {
+        lines.push(Line::styled(
+            "the persistent agent daemon",
+            Style::default().fg(theme.text.secondary),
+        ));
+        lines.push(Line::styled(
+            format!("v{BUILD_ID}"),
+            Style::default().fg(theme.text.muted),
+        ));
+        lines.push(Line::raw(""));
+    }
+    let spinner = SPINNER[(tick % SPINNER.len() as u64) as usize];
+    lines.push(Line::from(vec![
+        Span::styled(spinner.to_string(), Style::default().fg(theme.agent.tool)),
+        Span::styled(
+            format!(" {stage}"),
+            Style::default().fg(theme.text.secondary),
+        ),
+    ]));
+
+    // Centered as a block: vertically by offsetting a content-height rect,
+    // horizontally via the paragraph's alignment.
+    let height = (lines.len() as u16).min(area.height);
+    let content = Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: area.width,
+        height,
+    };
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), content);
+}
+
+/// The splash wordmark's per-glyph height in rows.
+const WORDMARK_GLYPH_ROWS: usize = 5;
+
+/// One 5×5 block-letter glyph of the splash wordmark (hand-drawn — no figlet
+/// dependency). Only the letters of `CODYPENDENT` are defined.
+fn wordmark_glyph(ch: char) -> [&'static str; WORDMARK_GLYPH_ROWS] {
+    match ch {
+        'C' => [" ███ ", "█   █", "█    ", "█   █", " ███ "],
+        'O' => [" ███ ", "█   █", "█   █", "█   █", " ███ "],
+        'D' => ["████ ", "█   █", "█   █", "█   █", "████ "],
+        'Y' => ["█   █", "█   █", " █ █ ", "  █  ", "  █  "],
+        'P' => ["████ ", "█   █", "████ ", "█    ", "█    "],
+        'E' => ["█████", "█    ", "████ ", "█    ", "█████"],
+        'N' => ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
+        'T' => ["█████", "  █  ", "  █  ", "  █  ", "  █  "],
+        _ => ["     "; WORDMARK_GLYPH_ROWS],
+    }
+}
+
+/// Join `text`'s glyphs into full block-letter rows, one space between letters.
+fn wordmark_rows(text: &str) -> Vec<String> {
+    let mut rows = vec![String::new(); WORDMARK_GLYPH_ROWS];
+    for ch in text.chars() {
+        for (row, cells) in rows.iter_mut().zip(wordmark_glyph(ch)) {
+            if !row.is_empty() {
+                row.push(' ');
+            }
+            row.push_str(cells);
+        }
+    }
+    rows
 }
 
 /// The workspace layout: a runs pane, the conversation, and an approvals + run
@@ -4311,6 +4504,154 @@ mod tests {
         );
     }
 
+    // --- D2: startup splash ---
+
+    fn render_splash_to_string(tick: u64, stage: &str, w: u16, h: u16) -> String {
+        let theme = Theme::dark();
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| render_splash(f, tick, stage, &theme))
+            .expect("draw");
+        buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn splash_shows_wordmark_tagline_version_and_stage() {
+        let text = render_splash_to_string(0, "connecting…", 100, 30);
+        assert!(text.contains("███"), "block wordmark missing:\n{text}");
+        assert!(
+            text.contains("the persistent agent daemon"),
+            "tagline missing:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("v{}", codypendent_protocol::BUILD_ID)),
+            "version missing:\n{text}"
+        );
+        assert!(text.contains("connecting…"), "stage missing:\n{text}");
+    }
+
+    #[test]
+    fn splash_spinner_varies_with_tick() {
+        let first = render_splash_to_string(0, "connecting…", 100, 30);
+        let second = render_splash_to_string(1, "connecting…", 100, 30);
+        assert!(
+            first.contains('⠋'),
+            "tick-0 spinner frame missing:\n{first}"
+        );
+        assert!(
+            second.contains('⠙'),
+            "tick-1 spinner frame missing:\n{second}"
+        );
+        assert_ne!(first, second, "spinner did not animate across ticks");
+    }
+
+    #[test]
+    fn splash_falls_back_to_plain_name_on_narrow_terminals() {
+        let text = render_splash_to_string(0, "loading workspace…", 50, 24);
+        assert!(text.contains("codypendent"), "plain name missing:\n{text}");
+        assert!(
+            !text.contains("███"),
+            "block wordmark should drop at 50 cols:\n{text}"
+        );
+        assert!(
+            text.contains("loading workspace…"),
+            "stage missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn splash_drops_tagline_and_version_on_short_terminals() {
+        let text = render_splash_to_string(0, "starting daemon…", 100, 6);
+        assert!(text.contains("codypendent"), "plain name missing:\n{text}");
+        assert!(text.contains("starting daemon…"), "stage missing:\n{text}");
+        assert!(
+            !text.contains("persistent agent daemon"),
+            "tagline should drop at 6 rows:\n{text}"
+        );
+    }
+
+    // --- D3: chat header ---
+
+    /// A state with every header field populated: session title, model, a
+    /// distinct next-run mode, a daemon build id, context %, and a cost.
+    fn header_state() -> AppState {
+        let mut s = running_build_state();
+        s.daemon_build_id = Some("0.9.0+abc1234".to_owned());
+        s.default_mode = codypendent_protocol::AgentMode::Plan;
+        s.runs[0].cost_minor = Some(1234);
+        s
+    }
+
+    /// Render and return just the header bar (row 0), so presence/absence
+    /// assertions never match transcript text further down.
+    fn header_line(state: &AppState, w: u16) -> String {
+        render_to_string(state, w, 30)
+            .lines()
+            .next()
+            .expect("a header row")
+            .to_owned()
+    }
+
+    #[test]
+    fn header_shows_every_field_at_full_width() {
+        let text = header_line(&header_state(), 120);
+        assert!(text.contains("codypendent"), "brand missing:\n{text}");
+        assert!(text.contains("fix-tests"), "session title missing:\n{text}");
+        assert!(text.contains("gpt-5.1-codex"), "model missing:\n{text}");
+        assert!(text.contains("Plan"), "next-run mode missing:\n{text}");
+        assert!(
+            text.contains("0.9.0+abc1234"),
+            "daemon build id missing:\n{text}"
+        );
+        assert!(text.contains("42%"), "context %% missing:\n{text}");
+        assert!(text.contains("$12.34"), "cost missing:\n{text}");
+    }
+
+    #[test]
+    fn header_drops_build_id_at_mid_width() {
+        let text = header_line(&header_state(), 80);
+        assert!(text.contains("gpt-5.1-codex"), "model missing:\n{text}");
+        assert!(text.contains("Plan"), "next-run mode missing:\n{text}");
+        assert!(
+            !text.contains("0.9.0+abc1234"),
+            "build id should drop at 80 cols:\n{text}"
+        );
+    }
+
+    #[test]
+    fn header_drops_model_mode_and_build_id_at_narrow_width() {
+        let text = header_line(&header_state(), 50);
+        assert!(text.contains("codypendent"), "brand missing:\n{text}");
+        assert!(text.contains("fix-tests"), "session title missing:\n{text}");
+        assert!(
+            !text.contains("gpt-5.1-codex"),
+            "model should drop at 50 cols:\n{text}"
+        );
+        assert!(
+            !text.contains("Plan"),
+            "mode should drop at 50 cols:\n{text}"
+        );
+        assert!(
+            !text.contains("0.9.0+abc1234"),
+            "build id should drop at 50 cols:\n{text}"
+        );
+        assert!(text.contains("42%"), "context %% missing:\n{text}");
+        assert!(text.contains("$12.34"), "cost missing:\n{text}");
+    }
+
+    #[test]
+    fn header_renders_in_the_workspace_layout_too() {
+        let mut state = header_state();
+        state.layout = LayoutMode::Workspace;
+        let text = header_line(&state, 120);
+        assert!(text.contains("codypendent"), "brand missing:\n{text}");
+        assert!(
+            text.contains("0.9.0+abc1234"),
+            "daemon build id missing:\n{text}"
+        );
+    }
+
     /// Task 5 (codex chat shell): the collapsed tool card head restyles into
     /// one compact Codex-style line — a run glyph (`⏺`) and the tool's
     /// verb/name, with a terse outcome mark instead of the old `[status]`
@@ -5011,7 +5352,13 @@ mod tests {
             }),
         );
         let out = render_to_string(&s, 100, 20);
-        let header_row = out.lines().next().expect("a top row");
+        // The conversation header (the pane's top border row) — row 0 is the
+        // D3 chat header bar, so locate the pane border instead of assuming
+        // the transcript starts at the top.
+        let header_row = out
+            .lines()
+            .find(|line| line.starts_with('┌'))
+            .expect("a conversation header row");
         assert!(
             header_row.contains("· Ask"),
             "mode shown in the header:\n{header_row}"
@@ -6922,9 +7269,15 @@ mod tests {
             }),
         );
         let out = render_to_string(&s, 90, 20);
-        assert!(out.contains("⏺ codypendent"), "bare header:\n{out}");
+        // Scope to the transcript's assistant header row — the D3 chat header
+        // bar at the top also names "codypendent", so a whole-buffer negative
+        // assertion no longer isolates the turn header.
+        let assistant_header = out
+            .lines()
+            .find(|line| line.contains("⏺ codypendent"))
+            .expect("an assistant header row");
         assert!(
-            !out.contains("codypendent ·"),
+            !assistant_header.contains('·'),
             "no ` · <model>` when unknown (honesty):\n{out}"
         );
     }

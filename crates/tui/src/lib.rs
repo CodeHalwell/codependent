@@ -41,7 +41,7 @@ pub use action::{Action, Intent, KeyTarget, SecretKey};
 pub use input::{map_event, pane_at, KeyBinding, KEY_BINDINGS};
 pub use markdown::{RichLine, RichSpan, SpanRole, SyntaxRole};
 pub use reduce::reduce;
-pub use render::render;
+pub use render::{render, render_splash};
 pub use state::{
     AppState, BlackboardItemCard, DocBlockView, DocCard, DocEdit, DocFocus, DocLeaseState,
     DocSuggestionView, GraphEdgeCard, InputMode, KeyStatus, LayoutMode, MemoryCard, ModelCard,

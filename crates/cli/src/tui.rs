@@ -47,14 +47,14 @@ use codypendent_protocol::{
     RepositoryId, SessionEvent, SessionId, Subscription, WorkspaceId,
 };
 use codypendent_tui::{
-    map_event, reduce, render, Action, AppState, BlackboardItemCard, DocBlockView, DocCard,
-    DocSuggestionView, GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard,
+    map_event, reduce, render, render_splash, Action, AppState, BlackboardItemCard, DocBlockView,
+    DocCard, DocSuggestionView, GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard,
     ModelLocationLabel, ProviderCard, SkillCard, TerminalGuard, Theme, WorkflowNodeCard,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::commands;
 use crate::connection::Connection;
@@ -63,6 +63,15 @@ use crate::connection::Connection;
 /// animation when nothing else is happening (5 fps — cheap, and the loop redraws
 /// immediately on any real event anyway).
 const TICK: Duration = Duration::from_millis(200);
+
+/// The splash frame cadence while the TUI boots (D2) — ~12 fps so the stage
+/// spinner animates smoothly during a multi-second daemon spawn.
+const SPLASH_TICK: Duration = Duration::from_millis(80);
+
+/// How long the splash stays up once it has been drawn (D2 flash guard): a
+/// boot faster than the first [`SPLASH_TICK`] never shows it at all, but a
+/// shown splash never flashes away instantly.
+const SPLASH_MIN_HOLD: Duration = Duration::from_millis(600);
 
 /// The most live events [`GapTracker`] will buffer while a gap repair is in
 /// flight before giving up on the incremental replay and re-attaching for a
@@ -217,11 +226,11 @@ pub async fn run(
     repo: PathBuf,
     theme_override: Option<String>,
 ) -> anyhow::Result<()> {
-    // Crash logger, installed FIRST — before repo validation, the daemon
-    // connection, and (much later) `TerminalGuard::enter` — so a panic
-    // anywhere in this function's lifetime is diagnosable, and so it fires
-    // before the guard's `Drop` tears down the alternate screen (see the
-    // module docs above `install_crash_hook` for the full motivation).
+    // Crash logger, installed FIRST — before repo validation, the terminal
+    // guard, and the daemon connection — so a panic anywhere in this
+    // function's lifetime is diagnosable, and so it fires before the guard's
+    // `Drop` tears down the alternate screen (see the module docs above
+    // `install_crash_hook` for the full motivation).
     install_crash_hook(paths);
 
     let repo = repo
@@ -236,138 +245,88 @@ pub async fn run(
     // `Theme::dark()`.
     let theme = crate::theme_select::resolve_theme(paths, theme_override.as_deref())?;
 
-    commands::ensure_daemon(paths).await?;
-    let mut conn = Connection::connect(&paths.socket_path).await?;
-    let mut store = SessionStore::load(paths);
-    let resume = store
-        .resume_token
-        .clone()
-        .map(codypendent_protocol::ResumeToken);
-    // Advertise the client's own per-build id (DR1/T4/T9) so both halves of
-    // the handshake speak the same id vocabulary — the daemon-auto-restart
-    // feature's detection point is the `hello.build_id` this returns.
-    let hello = conn
-        .handshake("codypendent-tui", codypendent_protocol::BUILD_ID, resume)
-        .await?;
-    // Store the daemon-issued token so the NEXT launch resumes this client
-    // identity (best-effort; an absent token just means a fresh identity).
-    if let Some(token) = hello.resume_token {
-        store.resume_token = Some(token.0);
-        store.save(paths);
-    }
-
-    // DR5: detect + (safely) reconcile a daemon build mismatch, right after
-    // the handshake and BEFORE resolving/creating a session — the detection
-    // point the design doc calls for. On a matching build (the overwhelming
-    // common case) this is a single string compare and zero extra round
-    // trips; `conn` is left untouched. On a genuine mismatch it may stop the
-    // OLD daemon, spawn a fresh one, and reconnect — but ONLY when confirmed
-    // idle (never while a run is active, never on uncertainty); otherwise it
-    // warns on stderr and continues on the existing daemon. A restart that
-    // fails, or a reconnect that still mismatches, is a legible hard error —
-    // this function never enters the TUI against a broken or half-restarted
-    // daemon.
-    let resume_for_reconnect = store
-        .resume_token
-        .clone()
-        .map(codypendent_protocol::ResumeToken);
-    let mut restart_ops =
-        crate::restart::LiveRestartOps::new(paths, conn, "codypendent-tui", resume_for_reconnect);
-    let mut warn_stderr = |message: &str| eprintln!("codypendent: {message}");
-    crate::restart::reconcile_interactive(
-        paths,
-        codypendent_protocol::BUILD_ID,
-        &hello.build_id,
-        &mut restart_ops,
-        &mut warn_stderr,
-    )
-    .await?;
-    let mut conn = restart_ops.into_connection();
-
-    let (session_id, workspace_id, catchup) =
-        resolve_or_create_session(&mut conn, &mut store, paths, &repo).await?;
-
-    // Seed the state from catch-up, then from any live event that outraced the
-    // attach reply and was buffered during setup — both before the loop reads a
-    // single new frame, so no event is dropped or reordered.
-    let mut state = AppState::new();
-    let attach_watermark = fold_catchup(&mut state, catchup);
-    let (read_half, write_half, pending, client_id) = conn.into_split();
-    for envelope in pending {
-        if let Payload::Event(event) = envelope.payload {
-            reduce(&mut state, Action::DaemonEvent(Box::new(event)));
-        }
-    }
-
-    // STEP 2.6 + Phase 4 client wiring: seed the Skill Studio, memory browser,
-    // Docs Studio, and code-graph edge-inspector projections. This reads the
-    // knowledge fabric's authoritative rows directly from SQLite (WAL allows
-    // concurrent reads alongside the daemon) and maps them into the TUI's plain
-    // projection structs — the one place the two worlds meet, done here (not in
-    // the pure TUI crate, which never depends on `codypendent-knowledge`). A read
-    // failure logs and continues with empty lists; it never fails the TUI. Done
-    // before entering the terminal so any diagnostic reaches a cooked screen.
-    let projections = load_knowledge(paths, workspace_id, &repo).await;
-    state.skills = projections.skills;
-    state.memories = projections.memories;
-    state.docs = projections.docs;
-    state.edges = projections.edges;
-    state.blackboard = projections.blackboard;
-    // MP1: seed the model-picker projection (models.toml + any measured
-    // profile from `model_profiles`), exactly like the projections above.
-    state.models = load_model_cards(paths).await;
-    // Task 8: seed the provider-catalog picker projection (the built-in
-    // catalog + any user `providers.toml`), exactly like `load_model_cards`.
-    state.providers = load_provider_cards(paths);
-    // D1 (/keys): seed the API-key status projection — auth.json entries +
-    // models.toml `api_key_env` declarations (the tui crate does no I/O, so
-    // the harness reads the files and folds the projection as an Action, the
-    // same Action re-fired after every key write and daemon restart).
-    {
-        let (models, tavily) = load_key_statuses(paths);
-        reduce(&mut state, Action::ApiKeyStatusesLoaded { models, tavily });
-    }
-    // Phase 5 STEP 5.2 + T8: seed the workflow-graph view by compiling the
-    // repository's declared workflow manifests, then overlay each workflow's
-    // LATEST durable run — its per-node live state, measured cost, and
-    // failure/block reason — from the knowledge db (WAL allows a concurrent read
-    // alongside the daemon). A malformed manifest logs and is skipped; a db-open
-    // failure degrades to the compiled (pre-run) view — neither fails the TUI.
-    {
-        let overlay_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
-            .await
-            .ok();
-        state.workflow = load_workflows(&repo, overlay_pool.as_ref()).await;
-    }
-
-    // A persistent read pool for live document editing (Phase 4 STEP 4.3): the
-    // event loop seeds a document's client replica from it and re-reads the
-    // review rail's suggestions when a sync arrives. WAL mode lets this read
-    // concurrently with the daemon. `None` on failure — document editing then
-    // degrades to converging from live syncs alone (no seed, empty review rail).
-    let docs_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
-        .await
-        .ok();
-
-    // Wire the two socket tasks. Start them before the terminal so no live
-    // event or heartbeat is missed during setup.
-    let (out_tx, out_rx) = mpsc::channel::<Envelope>(256);
-    let (event_tx, mut event_rx) = mpsc::channel::<ReaderSignal>(256);
-    // A second sender clone for the model-discovery query tasks, which feed
-    // `ReaderSignal::ProviderModels` back into the same loop (the reader task
-    // owns the first clone).
-    let query_tx = event_tx.clone();
-    let reader = tokio::spawn(read_loop(read_half, event_tx, out_tx.clone(), client_id));
-    let writer = tokio::spawn(write_loop(write_half, out_rx));
-
-    // Enter raw mode + the alternate screen. RAII restores the terminal on any
-    // exit path, including a panic mid-loop. Done before spawning the input
-    // bridge so it never reads a keystroke in cooked mode, and so a non-TTY
-    // error returns here without a stray thread to wind down.
+    // D2: enter raw mode + the alternate screen EARLY — before any daemon
+    // work — so the (possibly multi-second) boot draws a splash instead of
+    // leaving the user staring at a blank cooked terminal. RAII restores the
+    // terminal on any exit path, including a boot error (whose text then
+    // prints to the restored cooked screen) or a panic mid-loop, and the
+    // event loop later takes over the SAME terminal — no teardown/re-enter
+    // between splash and TUI.
     let mut guard = TerminalGuard::enter().context(
         "the interactive TUI needs a terminal (a TTY); for headless use run \
          `codypendent run --jsonl` instead",
     )?;
+
+    // D2: boot steps publish their stage over this channel; the splash loop
+    // below draws the latest stage every SPLASH_TICK until boot completes.
+    let (stage_tx, stage_rx) = watch::channel(SplashStage::StartingDaemon);
+
+    let mut state = AppState::new();
+    let mut store = SessionStore::load(paths);
+
+    // Drive boot and the splash concurrently: poll the pinned boot future to
+    // completion while redrawing the splash on each tick. The flash guard is
+    // implicit on the near side — the first tick lands SPLASH_TICK after
+    // start, so a boot faster than that never draws a single frame — and
+    // explicit below: once drawn, the splash holds for at least
+    // SPLASH_MIN_HOLD so a fast boot doesn't flash one frame away. The block
+    // scopes the pinned future (it borrows `state`/`store`) so its drop runs
+    // before the event loop takes them back.
+    let booted = {
+        let boot = boot_phase(paths, &repo, &mut state, &mut store, &stage_tx);
+        tokio::pin!(boot);
+        let mut splash_ticker =
+            tokio::time::interval_at(tokio::time::Instant::now() + SPLASH_TICK, SPLASH_TICK);
+        let mut splash_ticks: u64 = 0;
+        let mut splash_shown_at: Option<Instant> = None;
+        let booted = loop {
+            tokio::select! {
+                outcome = &mut boot => break outcome?,
+                _ = splash_ticker.tick() => {
+                    splash_ticks += 1;
+                    let stage = stage_rx.borrow().text();
+                    guard
+                        .terminal_mut()
+                        .draw(|frame| render_splash(frame, splash_ticks, &stage, &theme))?;
+                    splash_shown_at.get_or_insert(Instant::now());
+                }
+            }
+        };
+        if let Some(shown_at) = splash_shown_at {
+            let remaining = SPLASH_MIN_HOLD.saturating_sub(shown_at.elapsed());
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining).await;
+            }
+        }
+        // Flash-guard compensation: a reconcile warning published during a boot
+        // too fast to draw a single splash frame must not vanish — capture it
+        // here and surface it as the TUI's own notice (instead of the old
+        // stderr print) once the pinned boot future's borrows have ended.
+        let pending_notice = if splash_shown_at.is_none() {
+            match stage_rx.borrow().clone() {
+                SplashStage::Reconciling(message) => Some(message),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        (booted, pending_notice)
+    };
+    let (booted, pending_notice) = booted;
+    if let Some(message) = pending_notice {
+        reduce(&mut state, Action::Notice(message));
+    }
+    let Booted {
+        session_id,
+        attach_watermark,
+        docs_pool,
+        client_id,
+        out_tx,
+        mut event_rx,
+        query_tx,
+        reader,
+        writer,
+    } = booted;
 
     let (input_tx, mut input_rx) = mpsc::channel::<CrosstermEvent>(256);
     let input_running = Arc::new(AtomicBool::new(true));
@@ -410,6 +369,209 @@ pub async fn run(
         pool.close().await;
     }
     result
+}
+
+/// The boot stages the D2 splash narrates, published by [`boot_phase`] over a
+/// `watch` channel; the splash loop in [`run`] draws the latest stage each
+/// tick. `Reconciling` carries the build-mismatch warning text — what used to
+/// be a cooked-mode `eprintln!` — so nothing prints to stderr from inside the
+/// alternate screen.
+#[derive(Clone)]
+enum SplashStage {
+    StartingDaemon,
+    Connecting,
+    Reconciling(String),
+    RestoringSession,
+    LoadingWorkspace,
+}
+
+impl SplashStage {
+    fn text(&self) -> String {
+        match self {
+            Self::StartingDaemon => "starting daemon…".to_owned(),
+            Self::Connecting => "connecting…".to_owned(),
+            Self::Reconciling(message) => message.clone(),
+            Self::RestoringSession => "restoring session…".to_owned(),
+            Self::LoadingWorkspace => "loading workspace…".to_owned(),
+        }
+    }
+}
+
+/// Everything [`boot_phase`] produces that the event loop and teardown still
+/// need, bundled so [`run`]'s splash loop stays small.
+struct Booted {
+    session_id: SessionId,
+    attach_watermark: u64,
+    docs_pool: Option<sqlx::SqlitePool>,
+    client_id: ClientId,
+    out_tx: mpsc::Sender<Envelope>,
+    event_rx: mpsc::Receiver<ReaderSignal>,
+    query_tx: mpsc::Sender<ReaderSignal>,
+    reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+/// Every boot step before the event loop (D2): daemon ensure, handshake,
+/// build-mismatch reconcile, session resolve, catch-up fold, projection
+/// seeding, and the socket reader/writer tasks. Runs as a pinned future
+/// inside [`run`]'s splash loop and publishes each stage over `stage_tx`;
+/// `state` and `store` are seeded in place so nothing needs moving back out.
+/// By the time this runs the terminal is already in the alternate screen, so
+/// diagnostics go to the stage channel — never to stderr.
+async fn boot_phase(
+    paths: &RuntimePaths,
+    repo: &Path,
+    state: &mut AppState,
+    store: &mut SessionStore,
+    stage_tx: &watch::Sender<SplashStage>,
+) -> anyhow::Result<Booted> {
+    commands::ensure_daemon(paths).await?;
+    let _ = stage_tx.send(SplashStage::Connecting);
+    let mut conn = Connection::connect(&paths.socket_path).await?;
+    let resume = store
+        .resume_token
+        .clone()
+        .map(codypendent_protocol::ResumeToken);
+    // Advertise the client's own per-build id (DR1/T4/T9) so both halves of
+    // the handshake speak the same id vocabulary — the daemon-auto-restart
+    // feature's detection point is the `hello.build_id` this returns.
+    let hello = conn
+        .handshake("codypendent-tui", codypendent_protocol::BUILD_ID, resume)
+        .await?;
+    // Store the daemon-issued token so the NEXT launch resumes this client
+    // identity (best-effort; an absent token just means a fresh identity).
+    if let Some(token) = hello.resume_token {
+        store.resume_token = Some(token.0);
+        store.save(paths);
+    }
+
+    // DR5: detect + (safely) reconcile a daemon build mismatch, right after
+    // the handshake and BEFORE resolving/creating a session — the detection
+    // point the design doc calls for. On a matching build (the overwhelming
+    // common case) this is a single string compare and zero extra round
+    // trips; `conn` is left untouched. On a genuine mismatch it may stop the
+    // OLD daemon, spawn a fresh one, and reconnect — but ONLY when confirmed
+    // idle (never while a run is active, never on uncertainty); otherwise it
+    // warns and continues on the existing daemon. A restart that fails, or a
+    // reconnect that still mismatches, is a legible hard error — this
+    // function never enters the TUI against a broken or half-restarted
+    // daemon.
+    let resume_for_reconnect = store
+        .resume_token
+        .clone()
+        .map(codypendent_protocol::ResumeToken);
+    let mut restart_ops =
+        crate::restart::LiveRestartOps::new(paths, conn, "codypendent-tui", resume_for_reconnect);
+    // D2: these warnings used to be cooked-mode `eprintln!`s; the terminal is
+    // in the alternate screen by now, so they become splash stage text
+    // instead.
+    let mut warn_stage = |message: &str| {
+        let _ = stage_tx.send(SplashStage::Reconciling(message.to_owned()));
+    };
+    let reconcile_outcome = crate::restart::reconcile_interactive(
+        paths,
+        codypendent_protocol::BUILD_ID,
+        &hello.build_id,
+        &mut restart_ops,
+        &mut warn_stage,
+    )
+    .await?;
+    // D3: the header shows the running daemon's build id — the handshaken
+    // one, unless the reconcile just restarted the daemon onto THIS build
+    // (`reconnect_and_assert` guarantees the new daemon matches the client).
+    state.daemon_build_id = Some(match reconcile_outcome {
+        crate::restart::ReconcileOutcome::Restarted => codypendent_protocol::BUILD_ID.to_owned(),
+        _ => hello.build_id.clone(),
+    });
+    let mut conn = restart_ops.into_connection();
+
+    let _ = stage_tx.send(SplashStage::RestoringSession);
+    let (session_id, workspace_id, catchup) =
+        resolve_or_create_session(&mut conn, store, paths, repo).await?;
+
+    // Seed the state from catch-up, then from any live event that outraced the
+    // attach reply and was buffered during setup — both before the loop reads a
+    // single new frame, so no event is dropped or reordered.
+    let attach_watermark = fold_catchup(state, catchup);
+    let (read_half, write_half, pending, client_id) = conn.into_split();
+    for envelope in pending {
+        if let Payload::Event(event) = envelope.payload {
+            reduce(state, Action::DaemonEvent(Box::new(event)));
+        }
+    }
+
+    // STEP 2.6 + Phase 4 client wiring: seed the Skill Studio, memory browser,
+    // Docs Studio, and code-graph edge-inspector projections. This reads the
+    // knowledge fabric's authoritative rows directly from SQLite (WAL allows
+    // concurrent reads alongside the daemon) and maps them into the TUI's plain
+    // projection structs — the one place the two worlds meet, done here (not in
+    // the pure TUI crate, which never depends on `codypendent-knowledge`). A read
+    // failure logs and continues with empty lists; it never fails the TUI.
+    let _ = stage_tx.send(SplashStage::LoadingWorkspace);
+    let projections = load_knowledge(paths, workspace_id, repo).await;
+    state.skills = projections.skills;
+    state.memories = projections.memories;
+    state.docs = projections.docs;
+    state.edges = projections.edges;
+    state.blackboard = projections.blackboard;
+    // MP1: seed the model-picker projection (models.toml + any measured
+    // profile from `model_profiles`), exactly like the projections above.
+    state.models = load_model_cards(paths).await;
+    // Task 8: seed the provider-catalog picker projection (the built-in
+    // catalog + any user `providers.toml`), exactly like `load_model_cards`.
+    state.providers = load_provider_cards(paths);
+    // D1 (/keys): seed the API-key status projection — auth.json entries +
+    // models.toml `api_key_env` declarations (the tui crate does no I/O, so
+    // the harness reads the files and folds the projection as an Action, the
+    // same Action re-fired after every key write and daemon restart).
+    {
+        let (models, tavily) = load_key_statuses(paths);
+        reduce(state, Action::ApiKeyStatusesLoaded { models, tavily });
+    }
+    // Phase 5 STEP 5.2 + T8: seed the workflow-graph view by compiling the
+    // repository's declared workflow manifests, then overlay each workflow's
+    // LATEST durable run — its per-node live state, measured cost, and
+    // failure/block reason — from the knowledge db (WAL allows a concurrent read
+    // alongside the daemon). A malformed manifest logs and is skipped; a db-open
+    // failure degrades to the compiled (pre-run) view — neither fails the TUI.
+    {
+        let overlay_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
+            .await
+            .ok();
+        state.workflow = load_workflows(repo, overlay_pool.as_ref()).await;
+    }
+
+    // A persistent read pool for live document editing (Phase 4 STEP 4.3): the
+    // event loop seeds a document's client replica from it and re-reads the
+    // review rail's suggestions when a sync arrives. WAL mode lets this read
+    // concurrently with the daemon. `None` on failure — document editing then
+    // degrades to converging from live syncs alone (no seed, empty review rail).
+    let docs_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
+        .await
+        .ok();
+
+    // Wire the two socket tasks. Start them before returning so no live event
+    // or heartbeat is missed during the remaining setup.
+    let (out_tx, out_rx) = mpsc::channel::<Envelope>(256);
+    let (event_tx, event_rx) = mpsc::channel::<ReaderSignal>(256);
+    // A second sender clone for the model-discovery query tasks, which feed
+    // `ReaderSignal::ProviderModels` back into the same loop (the reader task
+    // owns the first clone).
+    let query_tx = event_tx.clone();
+    let reader = tokio::spawn(read_loop(read_half, event_tx, out_tx.clone(), client_id));
+    let writer = tokio::spawn(write_loop(write_half, out_rx));
+
+    Ok(Booted {
+        session_id,
+        attach_watermark,
+        docs_pool,
+        client_id,
+        out_tx,
+        event_rx,
+        query_tx,
+        reader,
+        writer,
+    })
 }
 
 /// What [`GapTracker::on_event`] asks the harness to do with one live event.

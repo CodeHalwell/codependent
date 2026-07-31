@@ -1012,6 +1012,11 @@ pub struct StatusProjection {
 pub struct AppState {
     /// The attached session's title, once known.
     pub session_title: Option<String>,
+    /// The running daemon's build id (D3), captured from the handshake by the
+    /// CLI harness AFTER the build-mismatch reconcile (so a just-restarted
+    /// daemon shows the new id, not the stale handshaken one). Rendered by
+    /// the chat header at the full-width tier; `None` before attach.
+    pub daemon_build_id: Option<String>,
     /// Whether the session has been closed.
     pub session_closed: bool,
     /// All runs, in arrival order.
@@ -1188,6 +1193,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             session_title: None,
+            daemon_build_id: None,
             session_closed: false,
             runs: Vec::new(),
             selected_run: 0,
