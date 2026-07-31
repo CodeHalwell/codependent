@@ -39,6 +39,8 @@ pub enum PaletteCommand {
     Provider,
     /// Open the submission-mode picker (PR C2 — plan mode).
     Mode,
+    /// Open the `/keys` overlay (D1): set/replace/remove API keys.
+    ApiKeys,
     /// Flip between the chat and workspace layouts.
     ToggleLayout,
     /// Toggle the help overlay.
@@ -135,6 +137,17 @@ pub const COMMANDS: &[PaletteEntry] = &[
         description: "choose the submission mode for the next run (Ask/Explore/Plan/Build/Review)",
         // Palette-only (PR C2): no single-key equivalent, mirroring the
         // model/provider pickers.
+        key: "—",
+        group: "Models",
+    },
+    PaletteEntry {
+        command: PaletteCommand::ApiKeys,
+        title: "API keys",
+        description: "set, replace, or remove API keys (stored locally in auth.json)",
+        // Palette-only (D1): no single-key equivalent, mirroring the other
+        // pickers. NOTE: the title/description deliberately avoid the words
+        // "model", "provider", and "mode" so those pickers' filter queries
+        // stay unambiguous.
         key: "—",
         group: "Models",
     },

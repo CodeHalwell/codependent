@@ -141,11 +141,13 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         Err(_) => info!("no github token found; github tools disabled"),
     }
 
-    // Web search (PR C1): discover the `TAVILY_API_KEY` and enable the
-    // `web.search` tool. Absent (the common case in CI/headless), the tool
-    // stays disabled and the daemon runs exactly as before. The key is a
-    // secret — only whether one was found is ever logged, never its value.
-    match codypendent_integrations::search::TavilyKey::discover() {
+    // Web search (PR C1, D1): discover the Tavily key — `<data_dir>/auth.json`'s
+    // reserved `integrations/tavily` entry first (what the `/keys` TUI flow
+    // saves), then the `TAVILY_API_KEY` env var — and enable the `web.search`
+    // tool. Absent (the common case in CI/headless), the tool stays disabled
+    // and the daemon runs exactly as before. The key is a secret — only whether
+    // one was found is ever logged, never its value.
+    match codypendent_integrations::search::TavilyKey::discover(&paths.data_dir) {
         Ok(key) => {
             match codypendent_integrations::search::TavilyClient::new("https://api.tavily.com", key)
             {
@@ -158,7 +160,7 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
                 }
             }
         }
-        Err(_) => info!("no TAVILY_API_KEY found; web search disabled"),
+        Err(_) => info!("no Tavily key found (auth.json or TAVILY_API_KEY); web search disabled"),
     }
 
     // MCP client (PR B): load the operator-declared server list from

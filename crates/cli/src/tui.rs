@@ -48,8 +48,8 @@ use codypendent_protocol::{
 };
 use codypendent_tui::{
     map_event, reduce, render, Action, AppState, BlackboardItemCard, DocBlockView, DocCard,
-    DocSuggestionView, GraphEdgeCard, Intent, MemoryCard, ModelCard, ModelLocationLabel,
-    ProviderCard, SkillCard, TerminalGuard, Theme, WorkflowNodeCard,
+    DocSuggestionView, GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard,
+    ModelLocationLabel, ProviderCard, SkillCard, TerminalGuard, Theme, WorkflowNodeCard,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -319,6 +319,14 @@ pub async fn run(
     // Task 8: seed the provider-catalog picker projection (the built-in
     // catalog + any user `providers.toml`), exactly like `load_model_cards`.
     state.providers = load_provider_cards(paths);
+    // D1 (/keys): seed the API-key status projection — auth.json entries +
+    // models.toml `api_key_env` declarations (the tui crate does no I/O, so
+    // the harness reads the files and folds the projection as an Action, the
+    // same Action re-fired after every key write and daemon restart).
+    {
+        let (models, tavily) = load_key_statuses(paths);
+        reduce(&mut state, Action::ApiKeyStatusesLoaded { models, tavily });
+    }
     // Phase 5 STEP 5.2 + T8: seed the workflow-graph view by compiling the
     // repository's declared workflow manifests, then overlay each workflow's
     // LATEST durable run — its per-node live state, measured cost, and
@@ -851,6 +859,106 @@ async fn event_loop(
                 });
                 continue;
             }
+            // `SetApiKey` / `RemoveApiKey` (D1, `/keys`) are client-only intents
+            // (the keep-secrets-off-the-wire invariant, exactly like `AddModel`):
+            // apply them to `auth.json` locally (load-before-write, atomic,
+            // 0600), re-fire the status projection, and skip the daemon-command
+            // mapping entirely.
+            if let Intent::SetApiKey { target, key } = &intent {
+                match write_api_key(paths, target, Some(&key.0)) {
+                    Ok(()) => {
+                        reload_key_statuses(state, paths);
+                        match target {
+                            KeyTarget::Model(id) => {
+                                // The daemon re-reads auth.json per run, so the
+                                // key applies to the NEXT run — no restart.
+                                reduce(
+                                    state,
+                                    Action::Notice(format!(
+                                        "key saved for {id} — applies to the next run"
+                                    )),
+                                );
+                            }
+                            KeyTarget::Tavily => {
+                                // The daemon discovers the Tavily key only at
+                                // boot, so offer the idle-guarded restart.
+                                reduce(
+                                    state,
+                                    Action::Notice(
+                                        "Tavily key saved — the daemon picks it up on restart"
+                                            .to_owned(),
+                                    ),
+                                );
+                                reduce(state, Action::OfferDaemonRestart);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        reduce(
+                            state,
+                            Action::Notice(format!("could not save key: {error}")),
+                        );
+                    }
+                }
+                continue;
+            }
+            if let Intent::RemoveApiKey { target } = &intent {
+                match write_api_key(paths, target, None) {
+                    Ok(()) => {
+                        reload_key_statuses(state, paths);
+                        let notice = match target {
+                            KeyTarget::Model(id) => {
+                                format!("key for {id} removed — applies to the next run")
+                            }
+                            KeyTarget::Tavily => {
+                                "Tavily key removed — web search stays on until the daemon restarts"
+                                    .to_owned()
+                            }
+                        };
+                        reduce(state, Action::Notice(notice));
+                    }
+                    Err(error) => {
+                        reduce(
+                            state,
+                            Action::Notice(format!("could not remove key: {error}")),
+                        );
+                    }
+                }
+                continue;
+            }
+            // `RestartDaemon` (D1) is client-only too: the operator confirmed
+            // the restart offer after saving a Tavily key. The DR7 idle guard
+            // makes the final decision daemon-side, so this never kills an
+            // active run. NOTE: a successful restart severs this connection
+            // (the daemon it was attached to exits) — the reader's Closed
+            // signal then ends the TUI, exactly like any daemon shutdown.
+            if matches!(intent, Intent::RestartDaemon) {
+                match commands::restart_daemon_if_idle(paths).await {
+                    Ok(commands::IdleRestartOutcome::Restarted) => {
+                        reduce(
+                            state,
+                            Action::Notice("daemon restarted — web search enabled".to_owned()),
+                        );
+                    }
+                    Ok(commands::IdleRestartOutcome::RefusedActive(active)) => {
+                        reduce(
+                            state,
+                            Action::Notice(format!(
+                                "will apply on next restart ({active} active run(s))"
+                            )),
+                        );
+                    }
+                    Err(error) => {
+                        reduce(
+                            state,
+                            Action::Notice(format!("could not restart the daemon: {error}")),
+                        );
+                    }
+                }
+                // Statuses may shift across the restart — re-fire the projection.
+                reload_key_statuses(state, paths);
+                continue;
+            }
             // The first edit on a document subscribes this client to its live sync
             // stream (a re-attach carrying the grown subscription set) and seeds its
             // replica, so the edit's own resulting sync — and every other writer's —
@@ -1140,6 +1248,15 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::QueryProviderModels { .. } => unreachable!(
             "QueryProviderModels is applied locally by the harness (background GET), never sent to the daemon"
         ),
+        // D1: the `/keys` intents are CLIENT-ONLY for the same reason (the
+        // key never crosses the wire; the daemon re-reads auth.json per
+        // run/boot) — intercepted in the drain loop, never mapped.
+        Intent::SetApiKey { .. } | Intent::RemoveApiKey { .. } => unreachable!(
+            "SetApiKey/RemoveApiKey are applied locally by the harness (write_api_key), never sent to the daemon"
+        ),
+        Intent::RestartDaemon => unreachable!(
+            "RestartDaemon is applied locally by the harness (restart_daemon_if_idle), never sent to the daemon"
+        ),
     }
 }
 
@@ -1265,6 +1382,115 @@ fn write_add_model(
             .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     }
     Ok(())
+}
+
+/// The `auth.json` entry id a [`KeyTarget`] addresses (D1): a model target's
+/// id doubles as the entry key (the add-model flow's convention); the Tavily
+/// target maps onto the reserved, collision-proof `integrations/tavily` id the
+/// daemon's `TavilyKey::discover` reads.
+fn key_target_auth_id(target: &KeyTarget) -> String {
+    match target {
+        KeyTarget::Model(id) => id.clone(),
+        KeyTarget::Tavily => codypendent_integrations::search::TAVILY_AUTH_ID.to_owned(),
+    }
+}
+
+/// Apply an `Intent::SetApiKey` (`Some(key)`) or `Intent::RemoveApiKey`
+/// (`None`) to `<data_dir>/auth.json` (D1). This is the harness's job because
+/// the `tui` crate performs no I/O and never touches the key.
+///
+/// The same load-before-write guard as [`write_add_model`] (M3) applies to
+/// BOTH operations: `AuthStore::load` is fallible, so a hand-corrupted
+/// pre-existing `auth.json` aborts here with a legible error rather than
+/// being silently replaced (a blind `set` on a fresh store would destroy the
+/// other entries). The save is atomic at mode `0600` (`AuthStore::save`). A
+/// blank/whitespace-only key is rejected outright — storing `set(id, "")`
+/// would silently shadow a valid `api_key_env` (the M1 guard). A remove of an
+/// absent entry skips the save (nothing changed, and no empty `auth.json` is
+/// created for a store that never existed).
+fn write_api_key(
+    paths: &RuntimePaths,
+    target: &KeyTarget,
+    key: Option<&str>,
+) -> anyhow::Result<()> {
+    use codypendent_runtime::auth::AuthStore;
+
+    let data_dir = &paths.data_dir;
+    let id = key_target_auth_id(target);
+    let mut auth = AuthStore::load(data_dir)
+        .with_context(|| format!("reading {}", data_dir.join("auth.json").display()))?;
+    match key {
+        Some(key) => {
+            let key = key.trim();
+            if key.is_empty() {
+                bail!("key must not be blank");
+            }
+            auth.set(id, key);
+            auth.save(data_dir)
+                .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+        }
+        None => {
+            if auth.remove(&id) {
+                auth.save(data_dir)
+                    .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read the `/keys` status projection (D1): one `(model_id, status)` per
+/// `models.toml` model, plus the Tavily row's status — `Stored` when an
+/// `auth.json` entry exists, else `Env(NAME)` when the model declares an
+/// `api_key_env` (the NAME only, never the value), else `Missing`.
+///
+/// Best-effort: a corrupt `auth.json` or unreadable `models.toml` degrades to
+/// "no stored keys"/"no models" with a stderr note (the projection seeds
+/// before the terminal enters raw mode). The WRITE path (`write_api_key`)
+/// still surfaces the same corruption as a hard error — statuses are a view,
+/// never the authority.
+fn load_key_statuses(paths: &RuntimePaths) -> (Vec<(String, KeyStatus)>, KeyStatus) {
+    use codypendent_runtime::auth::AuthStore;
+    use codypendent_runtime::models::load_models;
+
+    let data_dir = &paths.data_dir;
+    let auth = AuthStore::load(data_dir).unwrap_or_else(|error| {
+        eprintln!(
+            "codypendent: could not read {}: {error}; /keys statuses may be incomplete",
+            data_dir.join("auth.json").display()
+        );
+        AuthStore::default()
+    });
+    let configs = load_models(&data_dir.join("models.toml")).unwrap_or_default();
+    let models = configs
+        .iter()
+        .map(|cfg| {
+            let status = if auth.get(&cfg.id.0).is_some() {
+                KeyStatus::Stored
+            } else if cfg.api_key_env.trim().is_empty() {
+                KeyStatus::Missing
+            } else {
+                KeyStatus::Env(cfg.api_key_env.clone())
+            };
+            (cfg.id.0.clone(), status)
+        })
+        .collect();
+    let tavily = if auth
+        .get(codypendent_integrations::search::TAVILY_AUTH_ID)
+        .is_some()
+    {
+        KeyStatus::Stored
+    } else {
+        KeyStatus::Missing
+    };
+    (models, tavily)
+}
+
+/// Re-read the key statuses and fold them into the TUI state (D1) — after the
+/// initial seed, after every key write, and after a daemon restart.
+fn reload_key_statuses(state: &mut AppState, paths: &RuntimePaths) {
+    let (models, tavily) = load_key_statuses(paths);
+    reduce(state, Action::ApiKeyStatusesLoaded { models, tavily });
 }
 
 /// The provider's OpenAI-compatible model-list URL: `<base_url>/models`. The
@@ -3872,6 +4098,210 @@ steps:
             !paths.data_dir.join("models.toml").exists(),
             "a corrupt auth.json must abort BEFORE models.toml is written (all-or-nothing)"
         );
+    }
+
+    // -- write_api_key / load_key_statuses (D1, `/keys`) ----------------------
+
+    #[test]
+    fn write_api_key_sets_replaces_and_round_trips_at_mode_0600() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        // An unrelated entry must survive a set (load-before-write).
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("openai/gpt".to_owned()),
+            Some("sk-other"),
+        )
+        .expect("set unrelated");
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("groq/llama".to_owned()),
+            Some("sk-first"),
+        )
+        .expect("set");
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("groq/llama".to_owned()),
+            Some("sk-second"),
+        )
+        .expect("replace");
+
+        let auth =
+            codypendent_runtime::auth::AuthStore::load(&paths.data_dir).expect("auth.json loads");
+        assert_eq!(auth.get("groq/llama"), Some("sk-second"), "replace wins");
+        assert_eq!(
+            auth.get("openai/gpt"),
+            Some("sk-other"),
+            "the unrelated entry survived"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(paths.data_dir.join("auth.json")).expect("metadata");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn write_api_key_remove_deletes_the_entry_and_an_absent_remove_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        // Removing an absent entry creates no auth.json at all.
+        write_api_key(&paths, &KeyTarget::Model("groq/llama".to_owned()), None)
+            .expect("absent remove is a no-op");
+        assert!(
+            !paths.data_dir.join("auth.json").exists(),
+            "a no-op remove must not create an empty auth.json"
+        );
+
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("groq/llama".to_owned()),
+            Some("sk-secret"),
+        )
+        .expect("set");
+        write_api_key(&paths, &KeyTarget::Model("groq/llama".to_owned()), None).expect("remove");
+        let auth =
+            codypendent_runtime::auth::AuthStore::load(&paths.data_dir).expect("auth.json loads");
+        assert_eq!(auth.get("groq/llama"), None, "the entry is gone");
+    }
+
+    #[test]
+    fn write_api_key_maps_the_tavily_target_to_the_reserved_id_the_daemon_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+
+        write_api_key(&paths, &KeyTarget::Tavily, Some("tvly-saved")).expect("set the Tavily key");
+        let auth =
+            codypendent_runtime::auth::AuthStore::load(&paths.data_dir).expect("auth.json loads");
+        assert_eq!(
+            auth.get(codypendent_integrations::search::TAVILY_AUTH_ID),
+            Some("tvly-saved"),
+            "the Tavily target lands under the reserved id"
+        );
+
+        // And the daemon's own discovery (auth.json first, env second) reads
+        // exactly this slot — the file wins regardless of the env, so this
+        // assertion never touches the process environment.
+        let key = codypendent_integrations::search::TavilyKey::discover(&paths.data_dir)
+            .expect("the daemon's discovery reads the saved key");
+        assert_eq!(key.expose(), "tvly-saved");
+
+        write_api_key(&paths, &KeyTarget::Tavily, None).expect("remove");
+        let auth =
+            codypendent_runtime::auth::AuthStore::load(&paths.data_dir).expect("auth.json loads");
+        assert_eq!(
+            auth.get(codypendent_integrations::search::TAVILY_AUTH_ID),
+            None,
+            "the reserved entry removes too"
+        );
+    }
+
+    #[test]
+    fn write_api_key_rejects_a_blank_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("groq/llama".to_owned()),
+            Some("   "),
+        )
+        .expect_err("a blank key is rejected (the M1 shadow guard)");
+        assert!(
+            !paths.data_dir.join("auth.json").exists(),
+            "a rejected write creates no auth.json"
+        );
+    }
+
+    #[test]
+    fn write_api_key_aborts_on_a_corrupt_auth_json_without_touching_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).expect("create data dir");
+        std::fs::write(paths.data_dir.join("auth.json"), b"{ not json")
+            .expect("seed corrupt auth.json");
+
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("groq/llama".to_owned()),
+            Some("sk-secret"),
+        )
+        .expect_err("a corrupt pre-existing auth.json must abort (load-before-write)");
+        write_api_key(&paths, &KeyTarget::Model("groq/llama".to_owned()), None)
+            .expect_err("a remove aborts too");
+        assert_eq!(
+            std::fs::read(paths.data_dir.join("auth.json")).expect("read"),
+            b"{ not json",
+            "the corrupt file is left untouched, never silently replaced"
+        );
+    }
+
+    #[test]
+    fn load_key_statuses_reflects_stored_env_and_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).expect("create data dir");
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            r#"
+[[model]]
+id = "groq/llama"
+provider = "openai-compatible"
+base_url = "https://api.groq.com/openai/v1"
+model = "llama-3.1-8b"
+
+[[model]]
+id = "openai/gpt"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5.1-codex"
+api_key_env = "OPENAI_API_KEY"
+
+[[model]]
+id = "ollama/qwen"
+provider = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "qwen2.5-coder:14b"
+"#,
+        )
+        .expect("write models.toml");
+
+        // Nothing stored yet: env-declared shows the NAME, the rest Missing.
+        let (models, tavily) = load_key_statuses(&paths);
+        assert_eq!(
+            models,
+            vec![
+                ("groq/llama".to_owned(), KeyStatus::Missing),
+                (
+                    "openai/gpt".to_owned(),
+                    KeyStatus::Env("OPENAI_API_KEY".to_owned())
+                ),
+                ("ollama/qwen".to_owned(), KeyStatus::Missing),
+            ]
+        );
+        assert_eq!(tavily, KeyStatus::Missing);
+
+        // A stored key beats the env declaration; the Tavily row flips too.
+        write_api_key(
+            &paths,
+            &KeyTarget::Model("openai/gpt".to_owned()),
+            Some("sk-x"),
+        )
+        .expect("set model key");
+        write_api_key(&paths, &KeyTarget::Tavily, Some("tvly-x")).expect("set tavily");
+        let (models, tavily) = load_key_statuses(&paths);
+        assert_eq!(
+            models,
+            vec![
+                ("groq/llama".to_owned(), KeyStatus::Missing),
+                ("openai/gpt".to_owned(), KeyStatus::Stored),
+                ("ollama/qwen".to_owned(), KeyStatus::Missing),
+            ]
+        );
+        assert_eq!(tavily, KeyStatus::Stored);
     }
 
     // -- provider_requires_key (Task 8 add-model key step derivation) --------

@@ -20,13 +20,14 @@ use codypendent_protocol::{
     AgentMode, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition, RunState,
 };
 
-use crate::action::Action;
+use crate::action::{Action, KeyTarget};
 use crate::input::footer_hints;
 use crate::reduce::capability_label;
 use crate::state::{
-    filter_model_names, filter_models, filter_modes, filter_providers, AppState, DocFocus,
-    DocLeaseState, LayoutMode, ModelCard, ModelLocationLabel, Overlay, Pane, PatchSummary,
-    ProviderCard, RunActivity, RunView, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
+    filter_key_rows, filter_model_names, filter_models, filter_modes, filter_providers, AppState,
+    DocFocus, DocLeaseState, KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, Overlay, Pane,
+    PatchSummary, ProviderCard, RunActivity, RunView, StatusProjection, ToolCard, ToolStatus,
+    TranscriptEntry,
 };
 use crate::theme::Theme;
 
@@ -1500,6 +1501,46 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::ModePicker { query, selected } => {
             render_mode_picker(frame, area, state, theme, query, *selected);
         }
+        // D1: the `/keys` overlay, its masked set/replace prompt, and its two
+        // confirms. The set prompt reuses `render_masked_prompt` (the key can
+        // never appear on screen); neither confirm ever carries key material.
+        Overlay::ApiKeys { query, selected } => {
+            render_api_keys(frame, area, state, theme, query, *selected);
+        }
+        Overlay::ApiKeySet { target, buffer } => {
+            let title = match target {
+                KeyTarget::Model(id) => {
+                    format!("API key for {id} (stored locally in auth.json, mode 0600)")
+                }
+                KeyTarget::Tavily => {
+                    "Tavily API key for web.search (stored locally in auth.json, mode 0600)"
+                        .to_owned()
+                }
+            };
+            render_masked_prompt(frame, area, theme, &title, &buffer.0);
+        }
+        Overlay::ApiKeyRemoveConfirm { target } => {
+            let (what, effect) = match target {
+                KeyTarget::Model(id) => (
+                    format!("Remove the saved key for {id}?"),
+                    "The model falls back to its api_key_env (if any) on the next run.",
+                ),
+                KeyTarget::Tavily => (
+                    "Remove the saved Tavily key?".to_owned(),
+                    "web.search stays enabled until the daemon restarts.",
+                ),
+            };
+            render_confirm_box(frame, area, theme, &what, effect);
+        }
+        Overlay::ConfirmRestart => {
+            render_confirm_box(
+                frame,
+                area,
+                theme,
+                "Restart the daemon now?",
+                "Applies the new key; idle-guarded (never kills a run).",
+            );
+        }
         // The block-edit prompt floats over the Docs browser it opened from, so the
         // editor stays in view while the writer types the insertion.
         Overlay::DocEdit { buffer, .. } => {
@@ -2267,6 +2308,202 @@ fn render_mode_picker(
             Action::ActivateRow(row),
         );
     }
+}
+
+/// The `/keys` overlay (D1): the same filter-line + list shape as
+/// [`render_mode_picker`], over one row per configured model plus a final
+/// `Tavily (web.search)` row. Each row shows a status GLYPH (● saved in
+/// auth.json / ◐ an `api_key_env` NAME / ○ missing) and a detail line — never
+/// any key material: [`KeyStatus`] carries no values by construction, and the
+/// env variant holds the variable NAME only. `Enter` opens the masked
+/// set/replace prompt; `d` removes a stored key. Colors are Theme tokens only
+/// (RULE 7).
+fn render_api_keys(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    query: &str,
+    selected: usize,
+) {
+    let rect = centered_rect(60, 50, area);
+    frame.render_widget(Clear, rect);
+
+    let matches = filter_key_rows(&state.models, query);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" API keys ({}) ", matches.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // The filter line, with a block cursor so it reads as an input (the
+    // command palette's shape).
+    let filter = Line::from(vec![
+        Span::styled("› ", Style::default().fg(theme.focus.active)),
+        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
+        Span::styled("▏", Style::default().fg(theme.focus.active)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(filter).style(Style::default().bg(theme.surface.overlay)),
+        rows[0],
+    );
+
+    // The filtered row list: each row is 2 lines tall (glyph + id, provider ·
+    // status detail), windowed around the selection so a long model list
+    // scrolls (the model picker's shape).
+    const ROW_LINES: usize = 2;
+    let list_area = rows[1];
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
+    let mut items: Vec<ListItem> = Vec::new();
+    if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching model",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate().skip(first) {
+        // The row's label, provider/sub-line prefix, and status: indices into
+        // `state.models` are model rows; `models.len()` is the Tavily row.
+        let (label, provider, status) = match state.models.get(idx) {
+            Some(card) => {
+                let status = state
+                    .key_status
+                    .iter()
+                    .find(|(id, _)| id == &card.id.0)
+                    .map(|(_, status)| status)
+                    .unwrap_or(&KeyStatus::Missing);
+                (card.id.0.clone(), card.provider.clone(), status.clone())
+            }
+            None => (
+                "Tavily (web.search)".to_owned(),
+                "web search".to_owned(),
+                state.tavily_key_status.clone(),
+            ),
+        };
+        let (glyph, glyph_color, detail) = key_status_render(&status, theme);
+        let is_selected = row == selected;
+        let head = Line::from(vec![
+            Span::styled(
+                if is_selected { "› " } else { "  " },
+                Style::default().fg(theme.focus.active),
+            ),
+            Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
+            Span::styled(label, Style::default().fg(theme.text.primary)),
+        ]);
+        let detail_line = Line::styled(
+            format!("      {provider} · {detail}"),
+            Style::default().fg(theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, detail_line]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        list_area,
+    );
+    // Each visible row is a fixed 2 lines tall (head/detail) — register a rect
+    // of that height per rendered row (offset by the scroll window) so a click
+    // maps to the right index even after the list scrolled.
+    for (row, _) in matches.iter().enumerate().skip(first) {
+        let y = list_area.y + ((row - first) as u16) * ROW_LINES as u16;
+        if y >= list_area.y + list_area.height {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y,
+                width: list_area.width,
+                height: ROW_LINES as u16,
+            },
+            Action::ActivateRow(row),
+        );
+    }
+
+    let hint = Line::styled(
+        "  ↑/↓ select · Enter set/replace · d remove · Esc close",
+        Style::default().fg(theme.text.muted),
+    );
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().bg(theme.surface.overlay)),
+        rows[2],
+    );
+}
+
+/// A `/keys` row's status rendering (D1): the glyph, its color, and the detail
+/// text. Never any key material — the env variant shows the variable NAME
+/// only.
+fn key_status_render(status: &KeyStatus, theme: &Theme) -> (&'static str, Color, String) {
+    match status {
+        KeyStatus::Stored => (
+            "●",
+            theme.status.success,
+            "key saved (auth.json)".to_owned(),
+        ),
+        KeyStatus::Env(name) => ("◐", theme.status.warning, format!("env {name}")),
+        KeyStatus::Missing => ("○", theme.text.muted, "no key configured".to_owned()),
+    }
+}
+
+/// A small yes/no confirm box in the [`render_confirm`] shape, parameterized
+/// so the `/keys` remove confirm and the daemon-restart offer (D1) share it.
+/// Both texts are key-free by construction (they name a target, never a value).
+fn render_confirm_box(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, detail: &str) {
+    let rect = centered_rect(60, 20, area);
+    frame.render_widget(Clear, rect);
+    let lines = vec![
+        Line::styled(
+            title.to_owned(),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(detail.to_owned(), Style::default().fg(theme.text.secondary)),
+        Line::from(vec![
+            Span::styled("[y] yes   ", Style::default().fg(theme.status.warning)),
+            Span::styled("[n] no", Style::default().fg(theme.status.success)),
+        ]),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Confirm ")
+        .border_style(Style::default().fg(theme.status.warning))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
 }
 
 /// A provider card's badges, space-joined: its protocol and local/hosted
@@ -5839,6 +6076,151 @@ mod tests {
         assert!(
             text.contains("investigate read-only, then finish"),
             "the Plan row's summary is missing:\n{text}"
+        );
+    }
+
+    /// D1: a `/keys` test fixture — two models with one of each status, plus
+    /// the Tavily row. The "known test key" below must NEVER appear in any
+    /// render.
+    fn api_keys_state() -> AppState {
+        let mut state = running_build_state();
+        state.models = vec![
+            ModelCard {
+                id: ModelId("groq/llama".to_owned()),
+                provider: "openai-compatible".to_owned(),
+                location: None,
+                cost_per_1k_usd: None,
+                context_tokens: None,
+            },
+            ModelCard {
+                id: ModelId("openai/gpt".to_owned()),
+                provider: "openai-compatible".to_owned(),
+                location: None,
+                cost_per_1k_usd: None,
+                context_tokens: None,
+            },
+        ];
+        state.key_status = vec![
+            ("groq/llama".to_owned(), crate::state::KeyStatus::Stored),
+            (
+                "openai/gpt".to_owned(),
+                crate::state::KeyStatus::Env("OPENAI_API_KEY".to_owned()),
+            ),
+        ];
+        state.tavily_key_status = crate::state::KeyStatus::Missing;
+        state
+    }
+
+    #[test]
+    fn api_keys_overlay_lists_rows_with_status_glyphs_and_no_key_material() {
+        let mut state = api_keys_state();
+        reduce(&mut state, Action::OpenPalette);
+        for c in "api keys".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputSubmit);
+        assert!(matches!(state.overlay, Overlay::ApiKeys { .. }));
+
+        let text = render_to_string(&state, 120, 40);
+        assert!(text.contains("API keys"), "title missing:\n{text}");
+        assert!(text.contains("groq/llama"), "a model row:\n{text}");
+        assert!(text.contains("openai/gpt"), "the other model row:\n{text}");
+        assert!(
+            text.contains("Tavily (web.search)"),
+            "the final Tavily row:\n{text}"
+        );
+        assert!(
+            text.contains("● groq/llama"),
+            "a stored key renders ●:\n{text}"
+        );
+        assert!(
+            text.contains("◐ openai/gpt"),
+            "an env-declared key renders ◐:\n{text}"
+        );
+        assert!(
+            text.contains("env OPENAI_API_KEY"),
+            "the var NAME (never its value) shows in the detail line:\n{text}"
+        );
+        assert!(
+            text.contains("○ Tavily (web.search)"),
+            "a missing key renders ○:\n{text}"
+        );
+        // No key material anywhere — the env var's VALUE would leak here if
+        // statuses ever carried one (they cannot, by construction).
+        assert!(
+            !text.contains("sk-live-test-key"),
+            "key material must never render:\n{text}"
+        );
+        assert!(
+            !text.contains("tvly-"),
+            "no Tavily key material either:\n{text}"
+        );
+    }
+
+    #[test]
+    fn api_key_set_prompt_masks_the_typed_key() {
+        let mut state = api_keys_state();
+        state.overlay = Overlay::ApiKeySet {
+            target: crate::action::KeyTarget::Model("groq/llama".to_owned()),
+            buffer: crate::action::SecretKey("sk-live-test-key".to_owned()),
+        };
+        let text = render_to_string(&state, 100, 24);
+        assert!(
+            text.contains("API key for groq/llama"),
+            "the prompt names its (non-secret) target:\n{text}"
+        );
+        assert!(text.contains('•'), "the key is masked:\n{text}");
+        assert!(
+            !text.contains("sk-live-test-key"),
+            "the raw key must never render:\n{text}"
+        );
+
+        // The Tavily target gets its own title — still masked.
+        state.overlay = Overlay::ApiKeySet {
+            target: crate::action::KeyTarget::Tavily,
+            buffer: crate::action::SecretKey("tvly-test-secret".to_owned()),
+        };
+        let text = render_to_string(&state, 100, 24);
+        assert!(text.contains("Tavily API key"), "the Tavily title:\n{text}");
+        assert!(
+            !text.contains("tvly-test-secret"),
+            "the raw key must never render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn api_key_remove_confirm_names_the_target_without_key_material() {
+        let mut state = api_keys_state();
+        state.overlay = Overlay::ApiKeyRemoveConfirm {
+            target: crate::action::KeyTarget::Model("groq/llama".to_owned()),
+        };
+        // h=40: at 24 rows the 20%-height box leaves only 2 interior rows and
+        // the y/n line clips (the render_querying comment's constraint).
+        let text = render_to_string(&state, 100, 40);
+        assert!(
+            text.contains("Remove the saved key for groq/llama?"),
+            "the confirm names its target:\n{text}"
+        );
+        assert!(text.contains("[y] yes"), "the y/n affordance:\n{text}");
+        assert!(
+            !text.contains("sk-live-test-key"),
+            "no key material in the confirm:\n{text}"
+        );
+    }
+
+    #[test]
+    fn restart_offer_confirm_explains_the_restart() {
+        let mut state = api_keys_state();
+        reduce(&mut state, Action::OfferDaemonRestart);
+        // h=40: see the remove-confirm test's note on the 20%-height box.
+        let text = render_to_string(&state, 100, 40);
+        assert!(
+            text.contains("Restart the daemon now?"),
+            "the restart offer:\n{text}"
+        );
+        assert!(
+            text.contains("idle-guarded"),
+            "the idle guard is explained:\n{text}"
         );
     }
 

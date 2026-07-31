@@ -12,11 +12,12 @@ use codypendent_protocol::{
     EventBody, ProposedAction, RunDisposition, RunState, SessionEvent,
 };
 
-use crate::action::{Action, Intent, SecretKey};
+use crate::action::{Action, Intent, KeyTarget, SecretKey};
 use crate::state::{
-    filter_model_names, filter_models, filter_modes, filter_providers, AppState, DocBlockView,
-    DocEdit, DocFocus, DocLeaseState, DocSuggestionView, Overlay, Pane, PatchSummary,
-    PendingApproval, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    filter_key_rows, filter_model_names, filter_models, filter_modes, filter_providers,
+    key_row_target, AppState, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView,
+    KeyStatus, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView, ToolCard,
+    ToolStatus, TranscriptEntry,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -110,7 +111,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::NewRun => state.overlay = Overlay::NewRun(String::new()),
         Action::Pause => pause_or_resume(state),
         Action::Cancel => request_cancel(state),
-        Action::ConfirmCancel => confirm_cancel(state),
+        Action::ConfirmCancel => confirm_top(state),
         Action::Steer => begin_steering(state),
 
         // `a`/`r` resolve a document suggestion when the Docs review rail is
@@ -251,6 +252,13 @@ pub fn reduce(state: &mut AppState, action: Action) {
             provider_id,
             reason,
         } => on_provider_models_failed(state, provider_id, reason),
+
+        // --- `/keys` (D1): the harness's key-status projection + restart offer ---
+        Action::ApiKeyStatusesLoaded { models, tavily } => {
+            state.key_status = models;
+            state.tavily_key_status = tavily;
+        }
+        Action::OfferDaemonRestart => state.overlay = Overlay::ConfirmRestart,
 
         Action::NoOp => {}
     }
@@ -753,6 +761,17 @@ fn nav(state: &mut AppState, delta: i32) {
             step(selected, indices.len(), delta);
             return;
         }
+        // The `/keys` overlay (D1): the same filtered-cursor shape, over the
+        // model list plus the final Tavily row — no resolved `AppState` index
+        // (like the mode picker).
+        Overlay::ApiKeys {
+            ref query,
+            ref mut selected,
+        } => {
+            let indices = filter_key_rows(&state.models, query);
+            step(selected, indices.len(), delta);
+            return;
+        }
         // The add-model pick-list (model-discovery): the same shape as the
         // model/provider pickers, over the overlay's own `models` field rather
         // than an `AppState` list.
@@ -887,6 +906,27 @@ fn confirm_cancel(state: &mut AppState) {
     if let Some(run) = state.selected_run() {
         let run_id = run.run_id;
         state.outbox.push(Intent::CancelRun { run_id });
+    }
+}
+
+/// `y`/`Enter` on a confirm-style overlay (the shared `InputMode::Confirm` key
+/// table maps both to [`Action::ConfirmCancel`]). Dispatches by which confirm
+/// is open: the run-cancel confirm, the `/keys` remove confirm (D1 — a
+/// client-only `RemoveApiKey` intent), or the daemon-restart offer (D1 — a
+/// client-only `RestartDaemon` intent). A no-op when no confirm is open.
+fn confirm_top(state: &mut AppState) {
+    match state.overlay {
+        Overlay::ConfirmCancel => confirm_cancel(state),
+        Overlay::ApiKeyRemoveConfirm { .. } => {
+            if let Overlay::ApiKeyRemoveConfirm { target } = std::mem::take(&mut state.overlay) {
+                state.outbox.push(Intent::RemoveApiKey { target });
+            }
+        }
+        Overlay::ConfirmRestart => {
+            state.overlay = Overlay::None;
+            state.outbox.push(Intent::RestartDaemon);
+        }
+        _ => {}
     }
 }
 
@@ -1050,6 +1090,8 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
         Overlay::AddModelId { buffer, .. } => edit(buffer),
         // The key buffer is a redacting newtype; edit its inner String.
         Overlay::AddModelKey { buffer, .. } => edit(&mut buffer.0),
+        // The `/keys` set prompt masks the same redacting newtype (D1).
+        Overlay::ApiKeySet { buffer, .. } => edit(&mut buffer.0),
         // The key-first prompt masks a redacting newtype, like `AddModelKey`.
         Overlay::AddModelProviderKey { buffer, .. } => edit(&mut buffer.0),
         // The pick-list filters like the model picker: editing the query resets
@@ -1086,6 +1128,12 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
             edit(query);
             *selected = 0;
         }
+        // Same shape as the mode picker (D1): editing the `/keys` query
+        // changes the filtered set, so the selection returns to the top.
+        Overlay::ApiKeys { query, selected } => {
+            edit(query);
+            *selected = 0;
+        }
         // The base view: text lands in the persistent composer draft.
         Overlay::None => edit(&mut state.composer),
         _ => {}
@@ -1119,8 +1167,40 @@ fn input_char(state: &mut AppState, c: char) {
         };
         return;
     }
+    // The `/keys` overlay (D1) reserves `d` for "remove the stored key" (the
+    // palette's `Tab` → `BeginAddModel` precedent: an overlay-specific command
+    // key handled reducer-side). It never reaches the filter query — a known,
+    // documented trade-off: in this one overlay a query cannot contain `d`.
+    if c == 'd' && matches!(state.overlay, Overlay::ApiKeys { .. }) {
+        begin_remove_key(state);
+        return;
+    }
     edit_prompt(state, |buf| buf.push(c));
     detach_history_on_edit(state);
+}
+
+/// `d` in the `/keys` overlay (D1): open the remove confirm for the focused
+/// row, but only when that row actually has a stored (`auth.json`) key — on a
+/// row with no stored key there is nothing to remove, so the key is a no-op
+/// rather than a confusing confirm.
+fn begin_remove_key(state: &mut AppState) {
+    let Overlay::ApiKeys { query, selected } = &state.overlay else {
+        return;
+    };
+    let Some(&idx) = filter_key_rows(&state.models, query).get(*selected) else {
+        return;
+    };
+    let target = key_row_target(&state.models, idx);
+    let stored = match &target {
+        KeyTarget::Model(id) => state
+            .key_status
+            .iter()
+            .any(|(model_id, status)| model_id == id && matches!(status, KeyStatus::Stored)),
+        KeyTarget::Tavily => matches!(state.tavily_key_status, KeyStatus::Stored),
+    };
+    if stored {
+        state.overlay = Overlay::ApiKeyRemoveConfirm { target };
+    }
 }
 
 /// Editing the composer while a recalled history entry is loaded detaches it
@@ -1223,6 +1303,12 @@ fn set_overlay_selected(state: &mut AppState, n: usize) {
         } => {
             *selected = n;
         }
+        // Same for the `/keys` overlay (D1).
+        Overlay::ApiKeys {
+            ref mut selected, ..
+        } => {
+            *selected = n;
+        }
         _ => {}
     }
 }
@@ -1236,6 +1322,7 @@ fn activate_row(state: &mut AppState, n: usize) {
         | Overlay::ModelPicker { .. }
         | Overlay::ProviderPicker { .. }
         | Overlay::ModePicker { .. }
+        | Overlay::ApiKeys { .. }
         | Overlay::AddModelPick { .. } => {
             set_overlay_selected(state, n);
             submit_prompt(state);
@@ -1362,6 +1449,35 @@ fn submit_prompt(state: &mut AppState) {
                     format!("mode set to {} — applies to your next run", card.label),
                     state.tick + 25,
                 ));
+            }
+        }
+        // Enter on a `/keys` row (D1) opens the masked set/replace prompt for
+        // that row's target. Re-derives the filtered selection from the
+        // overlay's own `query`/`selected` (the zero-match guard the other
+        // pickers use): a query matching nothing opens nothing. `mem::take`
+        // already closed the picker; the prompt replaces it.
+        Overlay::ApiKeys { query, selected } => {
+            if let Some(&idx) = filter_key_rows(&state.models, &query).get(selected) {
+                state.overlay = Overlay::ApiKeySet {
+                    target: key_row_target(&state.models, idx),
+                    buffer: SecretKey(String::new()),
+                };
+            }
+        }
+        // The masked set/replace prompt (D1): emit `Intent::SetApiKey` with the
+        // key handed to the harness (client-only — the key never goes on the
+        // wire). A blank key is rejected with a notice and nothing is emitted:
+        // writing an empty entry would silently shadow a valid `api_key_env`
+        // (the `write_add_model` M1 guard's rule).
+        Overlay::ApiKeySet { target, buffer } => {
+            let key = buffer.0.trim().to_owned();
+            if key.is_empty() {
+                state.notice = Some(("key not saved (blank)".to_owned(), state.tick + 25));
+            } else {
+                state.outbox.push(Intent::SetApiKey {
+                    target,
+                    key: SecretKey(key),
+                });
             }
         }
         // Base view (`mem::take` left `None`): send the composer. A live run is
@@ -1710,6 +1826,14 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
                     .iter()
                     .position(|card| card.mode == state.default_mode)
                     .unwrap_or(0),
+            };
+        }
+        // D1: open the `/keys` overlay (rows come from `state.models` +
+        // `state.key_status`, already seeded by the harness).
+        PaletteCommand::ApiKeys => {
+            state.overlay = Overlay::ApiKeys {
+                query: String::new(),
+                selected: 0,
             };
         }
         PaletteCommand::ToggleLayout => state.layout = state.layout.toggled(),
@@ -4602,6 +4726,234 @@ mod tests {
             AgentMode::Build,
             "Esc must not stage anything"
         );
+    }
+
+    // -- `/keys` (D1): API key management ------------------------------------
+
+    /// Seed two models + statuses and open the `/keys` overlay through the
+    /// palette, mirroring `open_mode_picker`.
+    fn open_api_keys(s: &mut AppState) {
+        s.models = vec![
+            crate::state::ModelCard {
+                id: ModelId("groq/llama".to_owned()),
+                provider: "openai-compatible".to_owned(),
+                location: None,
+                cost_per_1k_usd: None,
+                context_tokens: None,
+            },
+            crate::state::ModelCard {
+                id: ModelId("openai/gpt".to_owned()),
+                provider: "openai-compatible".to_owned(),
+                location: None,
+                cost_per_1k_usd: None,
+                context_tokens: None,
+            },
+        ];
+        reduce(
+            s,
+            Action::ApiKeyStatusesLoaded {
+                models: vec![
+                    ("groq/llama".to_owned(), KeyStatus::Stored),
+                    (
+                        "openai/gpt".to_owned(),
+                        KeyStatus::Env("OPENAI_API_KEY".to_owned()),
+                    ),
+                ],
+                tavily: KeyStatus::Missing,
+            },
+        );
+        reduce(s, Action::OpenPalette);
+        for c in "api keys".chars() {
+            reduce(s, Action::InputChar(c));
+        }
+        reduce(s, Action::InputSubmit);
+    }
+
+    #[test]
+    fn palette_opens_the_api_keys_overlay_with_a_row_per_model_plus_tavily() {
+        let mut s = AppState::new();
+        open_api_keys(&mut s);
+        assert_eq!(
+            s.overlay,
+            Overlay::ApiKeys {
+                query: String::new(),
+                selected: 0,
+            }
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
+        // Two model rows + the final Tavily row, in list order.
+        assert_eq!(
+            crate::state::filter_key_rows(&s.models, ""),
+            vec![0, 1, 2],
+            "the rows are built from state (models, then Tavily)"
+        );
+    }
+
+    #[test]
+    fn api_keys_filters_by_model_id_and_resets_the_selection() {
+        let mut s = AppState::new();
+        open_api_keys(&mut s);
+        reduce(&mut s, Action::SelectNext);
+        for c in "gpt".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        match &s.overlay {
+            Overlay::ApiKeys { query, selected } => {
+                assert_eq!(query, "gpt");
+                assert_eq!(*selected, 0, "the cursor resets to the filtered top");
+            }
+            other => panic!("expected the /keys overlay, got {other:?}"),
+        }
+        assert_eq!(crate::state::filter_key_rows(&s.models, "gpt"), vec![1]);
+        // The provider substring filters too (both models share it here).
+        assert_eq!(
+            crate::state::filter_key_rows(&s.models, "openai-compatible"),
+            vec![0, 1]
+        );
+        // The Tavily row matches its own label.
+        assert_eq!(crate::state::filter_key_rows(&s.models, "tavily"), vec![2]);
+    }
+
+    #[test]
+    fn api_keys_enter_on_a_model_row_opens_the_masked_set_prompt() {
+        let mut s = AppState::new();
+        open_api_keys(&mut s);
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.overlay,
+            Overlay::ApiKeySet {
+                target: KeyTarget::Model("groq/llama".to_owned()),
+                buffer: SecretKey(String::new()),
+            },
+            "Enter opens the masked set/replace prompt for the focused model"
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Editing);
+    }
+
+    #[test]
+    fn api_keys_enter_on_the_tavily_row_targets_tavily() {
+        let mut s = AppState::new();
+        open_api_keys(&mut s);
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::SelectNext); // row 2: Tavily
+        reduce(&mut s, Action::InputSubmit);
+        match &s.overlay {
+            Overlay::ApiKeySet { target, .. } => {
+                assert_eq!(*target, KeyTarget::Tavily)
+            }
+            other => panic!("expected the set prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn api_key_set_submit_emits_the_intent_and_masks_the_buffer() {
+        let mut s = AppState::new();
+        open_api_keys(&mut s);
+        reduce(&mut s, Action::InputSubmit); // -> ApiKeySet for groq/llama
+        for c in "sk-new-key".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        // The buffer holds the typed key (rendered masked); the overlay's Debug
+        // never shows it.
+        match &s.overlay {
+            Overlay::ApiKeySet { buffer, .. } => assert_eq!(buffer.0, "sk-new-key"),
+            other => panic!("expected the set prompt, got {other:?}"),
+        }
+        assert!(!format!("{:?}", s.overlay).contains("sk-new-key"));
+
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::None, "submitting closes the prompt");
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::SetApiKey {
+                target: KeyTarget::Model("groq/llama".to_owned()),
+                key: SecretKey("sk-new-key".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn api_key_set_submit_with_a_blank_key_emits_nothing() {
+        let mut s = AppState::new();
+        open_api_keys(&mut s);
+        reduce(&mut s, Action::InputSubmit); // -> ApiKeySet
+        reduce(&mut s, Action::InputSubmit); // blank buffer
+        assert!(
+            s.drain_outbox().is_empty(),
+            "a blank key must never be written (the M1 shadow guard)"
+        );
+        let notice = s.notice.as_ref().expect("a visible notice").0.clone();
+        assert!(notice.contains("blank"), "the notice says why: {notice}");
+    }
+
+    #[test]
+    fn api_keys_d_on_a_stored_row_confirms_then_emits_remove() {
+        let mut s = AppState::new();
+        open_api_keys(&mut s);
+        // Row 0 (groq/llama) has KeyStatus::Stored.
+        reduce(&mut s, Action::InputChar('d'));
+        assert_eq!(
+            s.overlay,
+            Overlay::ApiKeyRemoveConfirm {
+                target: KeyTarget::Model("groq/llama".to_owned()),
+            },
+            "`d` opens the remove confirm instead of filtering"
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Confirm);
+
+        reduce(&mut s, Action::ConfirmCancel); // `y` maps here in Confirm mode
+        assert_eq!(s.overlay, Overlay::None);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::RemoveApiKey {
+                target: KeyTarget::Model("groq/llama".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn api_keys_d_on_a_row_without_a_stored_key_is_a_no_op() {
+        let mut s = AppState::new();
+        open_api_keys(&mut s);
+        reduce(&mut s, Action::SelectNext); // openai/gpt: Env, not Stored
+        reduce(&mut s, Action::InputChar('d'));
+        assert_eq!(
+            s.overlay,
+            Overlay::ApiKeys {
+                query: String::new(),
+                selected: 1,
+            },
+            "nothing stored → no confirm, and `d` did not reach the query"
+        );
+        assert!(s.drain_outbox().is_empty());
+    }
+
+    #[test]
+    fn api_key_remove_confirm_dismisses_without_an_intent() {
+        let mut s = AppState::new();
+        open_api_keys(&mut s);
+        reduce(&mut s, Action::InputChar('d'));
+        reduce(&mut s, Action::Dismiss); // `n`/Esc
+        assert_eq!(s.overlay, Overlay::None);
+        assert!(s.drain_outbox().is_empty());
+    }
+
+    #[test]
+    fn restart_offer_confirms_to_a_restart_intent() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OfferDaemonRestart);
+        assert_eq!(s.overlay, Overlay::ConfirmRestart);
+        assert_eq!(s.input_mode(), crate::state::InputMode::Confirm);
+
+        reduce(&mut s, Action::ConfirmCancel); // `y`
+        assert_eq!(s.overlay, Overlay::None);
+        assert_eq!(s.drain_outbox(), vec![Intent::RestartDaemon]);
+
+        // Dismissing the offer emits nothing.
+        reduce(&mut s, Action::OfferDaemonRestart);
+        reduce(&mut s, Action::Dismiss);
+        assert_eq!(s.overlay, Overlay::None);
+        assert!(s.drain_outbox().is_empty());
     }
 
     #[test]
