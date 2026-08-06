@@ -707,6 +707,32 @@ async fn handle_request(
 
         // --- handshake ---
         Payload::ClientHello(hello) => {
+            let selected_protocol = hello
+                .supported_protocols
+                .iter()
+                .find(|candidate| candidate.compatible_with(&PROTOCOL_V1))
+                .map(|candidate| codypendent_protocol::ProtocolVersion {
+                    major: PROTOCOL_V1.major,
+                    minor: candidate.minor.min(PROTOCOL_V1.minor),
+                });
+            let Some(selected_protocol) = selected_protocol else {
+                send(
+                    writer,
+                    &Envelope::reply_to(
+                        &request,
+                        Payload::Error(ProtocolError {
+                            code: "protocol.no-common-version".to_string(),
+                            message: format!(
+                                "daemon speaks {PROTOCOL_V1}; client offered {:?}",
+                                hello.supported_protocols
+                            ),
+                            retryable: false,
+                        }),
+                    ),
+                )
+                .await?;
+                return Ok(false);
+            };
             // A valid resume token restores the prior identity; an invalid or
             // expired one is ignored (proceed as a fresh client, do not drop).
             let client_id = hello
@@ -718,7 +744,7 @@ async fn handle_request(
             conn.client_id = Some(client_id);
             conn.handshaken = true;
             let server_hello = ServerHello {
-                selected_protocol: PROTOCOL_V1,
+                selected_protocol,
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 daemon_instance: state.instance.instance_id,
                 heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
@@ -1337,20 +1363,19 @@ async fn handle_request(
                     };
                     send(writer, &reply).await?;
                 }
-                // Advancing through regression/shadow/canary is likewise open to
-                // any role but `Observer` — the same reasoning as
-                // `ProposePromotion`; only the final `approve`/`rollback` step
-                // requires `Controller` (below).
+                // Promotion advancement consumes trusted eval/canary evidence
+                // and may trigger rollback. Keep that authority on an
+                // authenticated human Controller, like approve/rollback.
                 CommandBody::AdvancePromotion {
                     candidate_id,
                     action,
                 } => {
-                    if conn.role == ClientRole::Observer {
+                    if conn.role != ClientRole::Controller {
                         let reply = Envelope::reply_to(
                             &request,
                             Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
                                 "protocol.role-denied",
-                                "an Observer may not advance a promotion candidate".to_string(),
+                                "only a Controller may advance a promotion candidate".to_string(),
                                 false,
                             )),
                         );
@@ -1733,6 +1758,15 @@ async fn handle_request(
                                 (state.executor.as_ref(), &command.body)
                             {
                                 executor.cancel_run(*run_id);
+                            }
+                            if let Some(executor) = state.executor.as_ref() {
+                                match &command.body {
+                                    CommandBody::PauseRun { run_id } => executor.pause_run(*run_id),
+                                    CommandBody::ResumeRun { run_id } => {
+                                        executor.resume_run(*run_id)
+                                    }
+                                    _ => {}
+                                }
                             }
                             // A freshly created session that carries its
                             // repository root warms that repository's code

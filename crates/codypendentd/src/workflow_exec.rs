@@ -1128,11 +1128,13 @@ impl AgentLoopNodeExecutor {
         if self.search.is_some() {
             admitted.push(TAVILY_API_ENDPOINT.to_string());
         }
-        let policy = if admitted.is_empty() {
-            PolicyEngine::with_defaults()
-        } else {
-            PolicyEngine::with_defaults_allowing_network(admitted)
-        };
+        let repo_policy = repository.join(".codypendent").join("policy.toml");
+        let global_policy = self.paths.global_policy_path();
+        let mut policy = PolicyEngine::load(Some(&repo_policy), Some(&global_policy))
+            .map_err(|error| anyhow::anyhow!("policy configuration error: {error}"))?;
+        if !admitted.is_empty() {
+            policy = policy.admitting_network(admitted);
+        }
         let mut runtime = FrameworkAgentRuntime::new(
             ModelRegistry::default(),
             policy,
@@ -3057,6 +3059,7 @@ steps:
             policy,
             data_classification: DataClassification::Secret,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let factory = ConfiguredModelDriverFactory {
             paths: paths.clone(),
@@ -3089,19 +3092,7 @@ steps:
     }
 
     #[tokio::test]
-    async fn a_routed_benched_hosted_model_keeps_node_cost_unmeasured() {
-        // THE fix, end to end on the workflow path (mirrors the honesty matrix, but
-        // for the value the routing seam actually produces): a benched HOSTED model
-        // — its stored `cost_per_1k_tokens_usd` is the bench's `0.0` "unmeasured"
-        // sentinel, since `models bench` cannot price a hosted endpoint — is routed,
-        // and the seam surfaces `price_per_1k_usd == None`. So pricing the run's
-        // MEASURED tokens yields an UNMEASURED `NodeCost.cost_micros` (`None`),
-        // never a fabricated `Some(0)` that would let `maximum_cost_usd` silently
-        // never fire for a paid hosted model. Contrast
-        // `configured_factory_secret_data_never_selects_a_hosted_model_through_the_seam`,
-        // where a routed model with a real `> 0` price yields a measured cost, and
-        // `a_routed_node_prices_measured_tokens_and_the_cost_budget_fires`, where
-        // that measured cost fires the budget.
+    async fn a_routed_benched_hosted_model_without_a_price_fails_closed() {
         let (_tmp, pool, paths) = temp_env().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3131,13 +3122,14 @@ steps:
             policy,
             data_classification: DataClassification::Internal,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let factory = ConfiguredModelDriverFactory {
             paths: paths.clone(),
             routing: RoutingCoordinator::new(pool.clone(), config),
         };
 
-        let built = factory
+        let result = factory
             .build(
                 AgentMode::Build,
                 "hosted-default",
@@ -3145,31 +3137,12 @@ steps:
                 SessionId::new(),
                 RunId::new(),
             )
-            .await
-            .expect("routing ON selects the benched hosted model");
-        assert_eq!(
-            built.driver.model_id(),
-            codypendent_protocol::ModelId("hosted-benched".to_string()),
-            "the benched hosted model is the one selected"
-        );
-        // THE fix: a benched hosted model's price is UNMEASURED, not a fabricated 0.
-        assert_eq!(
-            built.price_per_1k_usd, None,
-            "a benched hosted model's 0.0 is the bench's UNMEASURED sentinel, not free"
-        );
-        // So pricing MEASURED tokens with it keeps the node cost UNMEASURED — the
-        // budget never charges a fabricated `Some(0)`, and `maximum_cost_usd` is not
-        // silently defeated for a paid hosted model.
-        let measured = ModelUsage {
-            prompt_tokens: 1000,
-            completion_tokens: 500,
-            cost_micros: None,
+            .await;
+        let error = match result {
+            Ok(_) => panic!("routing must refuse an unpriced hosted model"),
+            Err(error) => error,
         };
-        assert_eq!(
-            node_cost_micros(built.price_per_1k_usd, Some(measured)),
-            None,
-            "routed hosted (unmeasured price) over measured tokens ⇒ NodeCost.cost_micros None"
-        );
+        assert!(error.contains("no model satisfies"), "{error}");
         drop(listener);
     }
 
@@ -3207,6 +3180,7 @@ steps:
             policy,
             data_classification: DataClassification::Secret,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let factory = ConfiguredModelDriverFactory {
             paths: paths.clone(),
@@ -3275,6 +3249,7 @@ steps:
             policy,
             data_classification: DataClassification::Secret,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
             paths: paths.clone(),

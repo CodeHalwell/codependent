@@ -48,10 +48,10 @@
 //! # Hardening (P7-2, P7-5)
 //!
 //! Two properties the state machine now enforces that an earlier revision did
-//! not: [`Candidate::finish_canary`] refuses a canary with zero recorded
-//! observations ([`PromotionError::CanaryUnobserved`]) — a canary that observed
-//! nothing has no signal to have "passed" on, so it can never *silently* reach
-//! `ComparisonReady` unobserved; and [`Candidate::rollback`] threads the actual
+//! not: [`Candidate::finish_canary`] refuses a canary without a meaningful
+//! sample population ([`PromotionError::CanaryInsufficientEvidence`]) — a
+//! canary with negligible traffic has no trustworthy signal to have "passed"
+//! on; and [`Candidate::rollback`] threads the actual
 //! requesting [`Actor`] onto its [`PromotionRecord`] instead of hardcoding
 //! `"system"`, while [`Candidate::observe_canary`]'s auto-rollback still
 //! attributes `"system"` (with a reason) since nothing else triggered it. Neither
@@ -75,6 +75,12 @@ use std::fmt;
 
 use codypendent_protocol::events::Actor;
 use serde::{Deserialize, Serialize};
+
+/// Minimum number of live observations required before a canary may finish.
+///
+/// This is deliberately enforced by the state machine, not only by a caller,
+/// so a single hand-written "good" observation cannot advance a candidate.
+pub const MIN_CANARY_SAMPLES: u64 = 100;
 
 /// A class of learnable artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,11 +217,13 @@ pub enum PromotionError {
         "cannot activate a version without a completed promotion (record stage was {stage:?})"
     )]
     NotPromoted { stage: PromotionStage },
-    /// `finish_canary` was called with zero recorded observations (P7-2): a
-    /// canary that observed nothing has no signal to have "passed" on, so it
-    /// must not be allowed to reach `ComparisonReady`.
-    #[error("cannot finish a canary with zero observations — at least one is required")]
-    CanaryUnobserved,
+    /// `finish_canary` was called before a meaningful sample population had
+    /// been recorded. This protects the trust boundary even if a client tries
+    /// to submit one hand-written favorable observation.
+    #[error(
+        "cannot finish a canary with only {observed} samples — at least {required} are required"
+    )]
+    CanaryInsufficientEvidence { observed: u64, required: u64 },
 }
 
 /// A record of a promotion or rollback, for the audit trail.
@@ -293,12 +301,12 @@ pub struct Candidate {
     requires_permission_review: bool,
     #[serde(default)]
     permission_reviewed: bool,
-    /// How many canary signal observations have been recorded
-    /// ([`Candidate::observe_canary`]). `finish_canary` requires at least one
-    /// (P7-2) — a canary that observed nothing must not be able to reach
-    /// `ComparisonReady`; "passing" unobserved is not a pass.
-    #[serde(default)]
-    canary_observations: u32,
+    /// How many underlying live samples have contributed to canary evidence.
+    /// The alias reads candidates persisted by older builds conservatively:
+    /// an old observation count is treated as that many samples and therefore
+    /// cannot accidentally satisfy the new threshold.
+    #[serde(default, alias = "canary_observations")]
+    canary_samples: u64,
 }
 
 impl Candidate {
@@ -312,7 +320,7 @@ impl Candidate {
             stage: PromotionStage::Draft,
             requires_permission_review: false,
             permission_reviewed: false,
-            canary_observations: 0,
+            canary_samples: 0,
         }
     }
 
@@ -382,11 +390,28 @@ impl Candidate {
     /// *promote* a good one), producing an audit record attributed to
     /// `"system"` with a reason (P7-5) — distinct from a manual
     /// [`Self::rollback`], which attributes the actual requesting actor. Every
-    /// call — regardless of outcome — counts as an observation (P7-2): this is
-    /// what [`Self::finish_canary`] requires at least one of.
+    /// call records one compatibility sample. Production callers should use
+    /// [`Self::observe_canary_samples`] with the measured population size.
     pub fn observe_canary(&mut self, regressed: bool) -> Result<CanaryOutcome, PromotionError> {
+        self.observe_canary_samples(regressed, 1)
+    }
+
+    /// Feed aggregate canary evidence derived from `sample_count` live
+    /// observations. Zero is rejected, and a regression rolls back
+    /// immediately regardless of the accumulated sample count.
+    pub fn observe_canary_samples(
+        &mut self,
+        regressed: bool,
+        sample_count: u64,
+    ) -> Result<CanaryOutcome, PromotionError> {
         self.expect_stage(PromotionStage::Canary, "observe-canary")?;
-        self.canary_observations += 1;
+        if sample_count == 0 {
+            return Err(PromotionError::CanaryInsufficientEvidence {
+                observed: self.canary_samples,
+                required: MIN_CANARY_SAMPLES,
+            });
+        }
+        self.canary_samples = self.canary_samples.saturating_add(sample_count);
         if regressed {
             self.stage = PromotionStage::RolledBack;
             Ok(CanaryOutcome::AutoRolledBack(PromotionRecord {
@@ -401,13 +426,15 @@ impl Candidate {
     }
 
     /// Finish the canary and assemble the comparison — the candidate now awaits a
-    /// human decision. Requires at least one recorded observation (P7-2,
-    /// [`PromotionError::CanaryUnobserved`] otherwise): a canary that observed
-    /// nothing has no signal to have "passed" on.
+    /// human decision. Requires a meaningful measured population (P7-2,
+    /// [`PromotionError::CanaryInsufficientEvidence`] otherwise).
     pub fn finish_canary(&mut self) -> Result<(), PromotionError> {
         self.expect_stage(PromotionStage::Canary, "finish-canary")?;
-        if self.canary_observations == 0 {
-            return Err(PromotionError::CanaryUnobserved);
+        if self.canary_samples < MIN_CANARY_SAMPLES {
+            return Err(PromotionError::CanaryInsufficientEvidence {
+                observed: self.canary_samples,
+                required: MIN_CANARY_SAMPLES,
+            });
         }
         self.stage = PromotionStage::ComparisonReady;
         Ok(())
@@ -532,6 +559,8 @@ fn actor_kind(actor: &Actor) -> &'static str {
         Actor::Client { .. } => "client",
         Actor::Integration { .. } => "integration",
         Actor::System => "system",
+        Actor::Unknown => "unknown",
+        _ => "unknown",
     }
 }
 
@@ -573,7 +602,10 @@ mod tests {
         c.run_regression(false).unwrap();
         c.start_shadow().unwrap();
         c.start_canary().unwrap();
-        assert_eq!(c.observe_canary(false).unwrap(), CanaryOutcome::Continuing);
+        assert_eq!(
+            c.observe_canary_samples(false, MIN_CANARY_SAMPLES).unwrap(),
+            CanaryOutcome::Continuing
+        );
         c.finish_canary().unwrap();
         assert_eq!(c.stage(), PromotionStage::ComparisonReady);
     }
@@ -651,7 +683,7 @@ mod tests {
         assert_ne!(c.stage(), PromotionStage::Promoted);
         c.start_canary().unwrap();
         assert_ne!(c.stage(), PromotionStage::Promoted);
-        c.observe_canary(false).unwrap();
+        c.observe_canary_samples(false, MIN_CANARY_SAMPLES).unwrap();
         assert_ne!(c.stage(), PromotionStage::Promoted);
         c.finish_canary().unwrap();
         assert_ne!(
@@ -786,17 +818,23 @@ mod tests {
         ));
     }
 
-    // --- P7-2: finish_canary requires at least one observation ---
+    // --- P7-2: finish_canary requires meaningful evidence ---
 
     #[test]
-    fn finish_canary_requires_at_least_one_observation() {
+    fn finish_canary_requires_the_minimum_sample_population() {
         let mut c = Candidate::draft(artifact(), &human());
         c.run_regression(false).unwrap();
         c.start_shadow().unwrap();
         c.start_canary().unwrap();
         // No observe_canary() call at all — zero observations.
         let err = c.finish_canary().unwrap_err();
-        assert_eq!(err, PromotionError::CanaryUnobserved);
+        assert_eq!(
+            err,
+            PromotionError::CanaryInsufficientEvidence {
+                observed: 0,
+                required: MIN_CANARY_SAMPLES,
+            }
+        );
         assert_eq!(
             c.stage(),
             PromotionStage::Canary,
@@ -805,12 +843,12 @@ mod tests {
     }
 
     #[test]
-    fn finish_canary_succeeds_after_at_least_one_observation() {
+    fn finish_canary_succeeds_after_the_minimum_sample_population() {
         let mut c = Candidate::draft(artifact(), &human());
         c.run_regression(false).unwrap();
         c.start_shadow().unwrap();
         c.start_canary().unwrap();
-        c.observe_canary(false).unwrap();
+        c.observe_canary_samples(false, MIN_CANARY_SAMPLES).unwrap();
         assert!(c.finish_canary().is_ok());
         assert_eq!(c.stage(), PromotionStage::ComparisonReady);
     }

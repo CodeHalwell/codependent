@@ -1,12 +1,12 @@
 //! `workspace.read_file` — a line-numbered excerpt of a file, confined to the
 //! granted read scope.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use codypendent_daemon::policy::{PathScope, ScopeVerdict};
+use codypendent_daemon::policy::PathScope;
 use codypendent_protocol::ProposedAction;
 
-use super::{CapabilityKind, ToolError};
+use super::{secure_fs, CapabilityKind, ToolError};
 
 /// Default line ceiling when no explicit range is requested.
 const DEFAULT_MAX_LINES: usize = 200;
@@ -76,9 +76,16 @@ impl ReadFile {
     ) -> Result<FileExcerpt, ToolError> {
         use tokio::io::AsyncBufReadExt;
 
-        // Resolve the path ONCE, then check and read that same canonical path.
-        let canonical = tokio::fs::canonicalize(&input.path).await?;
-        Self::guard_scope(&canonical, scope)?;
+        // Open descriptor-relative to the authorized root, refusing symlinks at
+        // every component. Subsequent reads use this handle, never the pathname.
+        let path = input.path.clone();
+        let scope_for_open = scope.clone();
+        let scoped =
+            tokio::task::spawn_blocking(move || secure_fs::open_read(&path, &scope_for_open))
+                .await
+                .map_err(|error| {
+                    ToolError::Other(anyhow::anyhow!("read worker failed: {error}"))
+                })??;
 
         // Validate an explicit range before touching the file (unchanged errors).
         if let Some((start, end)) = input.range {
@@ -107,11 +114,11 @@ impl ReadFile {
 
         // Refuse non-regular files: a FIFO/device inside the scope would block
         // the read forever (a pipe never reaches EOF while a writer can appear).
-        let metadata = tokio::fs::metadata(&canonical).await?;
+        let metadata = scoped.file.metadata()?;
         if !metadata.is_file() {
             return Err(ToolError::Other(anyhow::anyhow!(
                 "not a regular file: {}",
-                canonical.display()
+                scoped.path.display()
             )));
         }
 
@@ -119,7 +126,7 @@ impl ReadFile {
         // the excerpt semantics (total_lines, truncation) stay exact without the
         // whole file ever residing in memory. The reader is byte-bounded so one
         // enormous newline-free line cannot be buffered whole either.
-        let file = tokio::fs::File::open(&canonical).await?;
+        let file = tokio::fs::File::from_std(scoped.file);
         let bounded = tokio::io::AsyncReadExt::take(file, MAX_READ_BYTES);
         let mut lines = tokio::io::BufReader::new(bounded).lines();
         let mut total = 0usize;
@@ -161,14 +168,5 @@ impl ReadFile {
             truncated: end < total || start > 1,
             content,
         })
-    }
-
-    /// Canonicalize and classify `path`, mapping the verdict to a refusal.
-    fn guard_scope(path: &Path, scope: &PathScope) -> Result<(), ToolError> {
-        match scope.classify(path) {
-            ScopeVerdict::Allowed => Ok(()),
-            ScopeVerdict::Denied => Err(ToolError::PathDenied(path.to_path_buf())),
-            ScopeVerdict::OutsideRoots => Err(ToolError::PathOutOfScope(path.to_path_buf())),
-        }
     }
 }

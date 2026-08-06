@@ -10,6 +10,7 @@
 
 use chrono::Utc;
 use codypendent_protocol::DocumentId;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
@@ -142,7 +143,8 @@ fn render_table(rows: &[Vec<String>], out: &mut String) {
 }
 
 /// Where a publication writes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum PublishTarget {
     /// Write the rendered Markdown to a repository file (via an approval-gated
     /// change set on the working tree).
@@ -190,7 +192,7 @@ impl PublishTarget {
 /// The plan a publish produces and shows before any approval: the target, the
 /// files it changes, the Git action, and the exact rendered bytes (with their
 /// hash, which is also what a published-snapshot row records).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishPlan {
     pub target: PublishTarget,
     pub changed_files: Vec<String>,

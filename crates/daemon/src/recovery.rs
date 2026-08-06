@@ -12,12 +12,11 @@
 //! 3. **Pending-effect reconciliation** — [`CommandProcessor::reconcile_pending_effects`]
 //!    sweeps `pending_effects` still `intended`/`performed` from a crash mid-apply
 //!    so a duplicate external effect can never be re-performed (STEP 1.3 RULE 4).
-//! 4. **Run recovery** — every run in a *live* state at boot ([`is_live`]) is
-//!    ended cleanly. Phase 1 keeps no mid-node checkpoint, so a live run cannot be
-//!    resumed; it is transitioned through `Recovering` and finished as `Failed`
-//!    with a chronicle artifact and its existing artifacts intact. The *only*
-//!    forbidden outcome is silent disappearance — "recovers or cleanly marks the
-//!    run" is the Phase 1 exit criterion.
+//! 4. **Run recovery** — every non-resumable run in a *live* state at boot
+//!    ([`is_live`]) is ended cleanly. Durable document-publish continuations are
+//!    excluded here and re-armed by the assembly layer once its Git adapters are
+//!    available. Other live runs have no mid-node checkpoint, so they transition
+//!    through `Recovering` and finish as `Failed` with a chronicle artifact.
 //! 5. **Orphaned-approval expiry** — [`ApprovalBroker::expire_orphaned`] resolves
 //!    (as rejected) every `pending` approval whose run is now terminal; after
 //!    step 4 that is all of them, and a decision for a dead run can never be
@@ -166,9 +165,20 @@ async fn recover_live_runs(
             continue;
         }
         let run_id = RunId::from_str(&id)?;
+        let resumable_publish: (i64,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM document_publish_jobs \
+             WHERE run_id = ? AND state IN ('pending', 'executing'))",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await?;
+        if resumable_publish.0 != 0 {
+            continue;
+        }
         let session_id = SessionId::from_str(&session)?;
-        fail_live_run(pool, artifacts, run_id, session_id, &objective).await?;
-        failed.push(run_id);
+        if fail_live_run(pool, artifacts, run_id, session_id, &objective).await? {
+            failed.push(run_id);
+        }
     }
     Ok(failed)
 }
@@ -191,7 +201,7 @@ async fn fail_live_run(
     run_id: RunId,
     session_id: SessionId,
     objective: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     // The run's last durable sequence, before recovery appends anything.
     let last_sequence = crate::ledger::next_sequence(pool, session_id)
         .await?
@@ -219,6 +229,20 @@ async fn fail_live_run(
     // approvals/commands atomic-append pattern.
     let now = Utc::now().to_rfc3339();
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    // Another terminal path may have won between the startup scan and this
+    // transaction. Never append a second contradictory terminal outcome.
+    let current: Option<(String,)> = sqlx::query_as("SELECT state FROM runs WHERE id = ?")
+        .bind(run_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+    if !current
+        .as_ref()
+        .is_some_and(|(state,)| is_live(run_state_from_db(state)))
+    {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     let seq = next_sequence(&mut *tx, session_id).await?;
     append_event(
@@ -273,7 +297,7 @@ async fn fail_live_run(
     .await?;
 
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Fail a run cleanly to a terminal `Failed` state — persisting a chronicle and

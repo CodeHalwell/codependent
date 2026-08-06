@@ -6,7 +6,7 @@
 //! authority they build on.
 
 use chrono::{DateTime, Utc};
-use codypendent_protocol::{Actor, EventBody, SessionEvent, SessionId};
+use codypendent_protocol::{Actor, EventBody, RunId, RunState, SessionEvent, SessionId};
 use sqlx::SqlitePool;
 
 /// Insert a session row in state `open`.
@@ -191,6 +191,82 @@ pub async fn append_next_event(
         correlation_id: None,
         actor: actor.clone(),
         body: body.clone(),
+    })
+}
+
+/// Atomically append a `RunStateChanged` event and update the run projection.
+/// The conditional projection update also makes terminal states authoritative:
+/// a late runtime completion can no longer overwrite a concurrently accepted
+/// cancellation.
+pub async fn append_run_state_changed(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    actor: &Actor,
+    run_id: RunId,
+    state: RunState,
+    occurred_at: DateTime<Utc>,
+) -> anyhow::Result<SessionEvent> {
+    let legal_from: &[RunState] = match state {
+        RunState::Preparing => &[RunState::Queued],
+        RunState::Running => &[
+            RunState::Preparing,
+            RunState::WaitingForApproval,
+            RunState::WaitingForUserInput,
+            RunState::Paused,
+        ],
+        RunState::WaitingForApproval => &[RunState::Running],
+        RunState::WaitingForUserInput => &[RunState::Running],
+        RunState::Paused => &[RunState::Running],
+        RunState::Recovering => &[
+            RunState::Preparing,
+            RunState::Running,
+            RunState::WaitingForApproval,
+            RunState::WaitingForUserInput,
+            RunState::Paused,
+        ],
+        RunState::Completed | RunState::Failed | RunState::Cancelled => &[
+            RunState::Queued,
+            RunState::Preparing,
+            RunState::Running,
+            RunState::WaitingForApproval,
+            RunState::WaitingForUserInput,
+            RunState::Paused,
+            RunState::Recovering,
+        ],
+        RunState::Unknown => &[],
+        _ => &[],
+    };
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let affected =
+        crate::projections::set_run_state_if_legal(&mut *tx, run_id, legal_from, state).await?;
+    if affected != 1 {
+        let current = crate::projections::load_run_state(&mut *tx, run_id).await?;
+        return Err(anyhow::anyhow!(
+            "refused stale runtime transition for {run_id}: {current:?} -> {state:?}"
+        ));
+    }
+    let body = EventBody::RunStateChanged { run_id, state };
+    let (sequence,): (i64,) = sqlx::query_as(
+        "INSERT INTO events \
+         (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
+         SELECT ?, COALESCE(MAX(sequence), 0) + 1, ?, ?, ?, NULL, NULL, 1 \
+         FROM events WHERE session_id = ? RETURNING sequence",
+    )
+    .bind(session_id.to_string())
+    .bind(occurred_at.to_rfc3339())
+    .bind(serde_json::to_string(actor)?)
+    .bind(serde_json::to_string(&body)?)
+    .bind(session_id.to_string())
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(SessionEvent {
+        sequence: u64::try_from(sequence)?,
+        occurred_at,
+        causation_id: None,
+        correlation_id: None,
+        actor: actor.clone(),
+        body,
     })
 }
 

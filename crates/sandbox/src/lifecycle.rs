@@ -66,6 +66,8 @@ pub enum LifecycleError {
     /// (exit criterion 1).
     #[error("granted capability not requested by the manifest: {capability}")]
     GrantExceedsManifest { capability: String },
+    #[error("plugin cannot be enabled at undeclared scope `{scope}`")]
+    UndeclaredScope { scope: String },
 }
 
 /// An installed plugin and its trust record. The `state` is the lifecycle
@@ -142,10 +144,15 @@ impl InstalledPlugin {
     /// **Enable at a scope.** A human turns the plugin on; its tools go live at
     /// the chosen scope. Requires a passed smoke test.
     pub fn enable(&mut self, scope: impl Into<String>) -> Result<(), LifecycleError> {
+        let scope = scope.into();
+        if scope.trim().is_empty() || !self.manifest.scopes.iter().any(|allowed| allowed == &scope)
+        {
+            return Err(LifecycleError::UndeclaredScope { scope });
+        }
         match self.state {
             LifecycleState::SmokeTested | LifecycleState::UpdateBlocked => {
                 self.state = LifecycleState::Enabled;
-                self.enabled_scope = Some(scope.into());
+                self.enabled_scope = Some(scope);
                 Ok(())
             }
             state => Err(LifecycleError::IllegalTransition {
@@ -330,6 +337,7 @@ name = "GitHub"
 version = "{version}"
 kind = "native-process"
 publisher = "codypendent-project"
+scopes = ["repository"]
 [runtime]
 command = "codypendent-plugin-github"
 [capabilities]

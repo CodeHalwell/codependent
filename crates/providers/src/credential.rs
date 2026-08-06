@@ -72,6 +72,9 @@ impl CredentialProvider for ApiKeyCredential {
     async fn resolve(&self) -> Result<ResolvedCredential, CredentialError> {
         for var in &self.env {
             if let Ok(value) = std::env::var(var) {
+                if value.trim().is_empty() {
+                    continue;
+                }
                 return Ok(ResolvedCredential::ApiKey {
                     header: self.header.clone(),
                     prefix: self.prefix.clone(),

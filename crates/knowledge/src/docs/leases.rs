@@ -85,7 +85,10 @@ impl DocumentLeaseStore {
     ) -> Result<DocumentLease, LeaseError> {
         let now = Utc::now();
         let key = Self::holder_key(holder);
-        let mut tx = pool.begin().await?;
+        // Serialize the conflict check and insert. A deferred transaction lets
+        // two contenders both observe no lease before either inserts; IMMEDIATE
+        // takes the writer reservation before the check, so at most one wins.
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         // Someone else holding an overlapping active, unexpired lease blocks us.
         if let Some(other) = conflicting_holder(&mut *tx, document_id, block_id, &key, now).await? {

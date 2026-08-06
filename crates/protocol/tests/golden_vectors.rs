@@ -73,17 +73,17 @@ use codypendent_protocol::{
 };
 use codypendent_protocol::{
     AgentMode, ApprovalDecision, ApprovalScope, ArtifactRef, AudioArtifact, BlackboardItemView,
-    BudgetDimension, Catchup, ClientCapabilities, ClientHello, ClientRole, CodypendentError,
-    Command, CommandBody, DaemonStatus, DataClassification, Diagnostic, DiagnosticSeverity,
-    DiffRequest, DirtyBufferDigest, DocumentEditLease, DocumentLeaseGrant, DocumentMutation,
-    DocumentSync, EditorSelection, EventBody, GitHubRefKind, GitHubReference, IdeContextUpdate,
-    IdeRequest, ImageArtifact, ImageRegion, InputBlock, InputEnvelope, InputSource, Location,
-    ModelObservation, OffDevicePolicy, Payload, Position, PromotionAction, ProposedAction,
-    ProtocolError, PublishTarget, Range, ResumeToken, Risk, RiskLevel, RunDisposition, RunState,
-    ScopeLevel, ServerHello, SessionEvent, SessionProjection, SourceProvenance, Subscription,
-    SuggestionInput, SymbolRef, TextEdit, ToolOutcome, Transcript, TranscriptionMode, UserAction,
-    WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot,
-    WorkspaceEdit, PROTOCOL_V1,
+    BudgetDimension, CanaryMetrics, Catchup, ClientCapabilities, ClientHello, ClientRole,
+    CodypendentError, Command, CommandBody, DaemonStatus, DataClassification, Diagnostic,
+    DiagnosticSeverity, DiffRequest, DirtyBufferDigest, DocumentEditLease, DocumentLeaseGrant,
+    DocumentMutation, DocumentSync, EditorSelection, EventBody, GitHubRefKind, GitHubReference,
+    IdeContextUpdate, IdeRequest, ImageArtifact, ImageRegion, InputBlock, InputEnvelope,
+    InputSource, Location, ModelObservation, OffDevicePolicy, Payload, Position, PromotionAction,
+    ProposedAction, ProtocolError, PublishTarget, Range, ResumeToken, Risk, RiskLevel,
+    RunDisposition, RunState, ScopeLevel, ServerHello, SessionEvent, SessionProjection,
+    SourceProvenance, Subscription, SuggestionInput, SymbolRef, TextEdit, ToolOutcome, Transcript,
+    TranscriptionMode, UserAction, WorkflowEvent, WorkflowNodeState, WorkflowNodeView,
+    WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceEdit, PROTOCOL_V1,
 };
 
 // ---------------------------------------------------------------------------
@@ -436,7 +436,7 @@ fn command_vectors() -> Vec<Vector> {
             "CommandBody_AdvancePromotion",
             CommandBody::AdvancePromotion {
                 candidate_id: "cand-abc123".to_string(),
-                action: PromotionAction::RunRegression { regressed: false },
+                action: PromotionAction::RunRegression,
             },
         ),
         vec_of(
@@ -461,13 +461,25 @@ fn command_vectors() -> Vec<Vector> {
         ),
         vec_of(
             "PromotionAction_RunRegression",
-            PromotionAction::RunRegression { regressed: false },
+            PromotionAction::RunRegression,
+        ),
+        vec_of(
+            "PromotionAction_ReviewPermissions",
+            PromotionAction::ReviewPermissions,
         ),
         vec_of("PromotionAction_StartShadow", PromotionAction::StartShadow),
         vec_of("PromotionAction_StartCanary", PromotionAction::StartCanary),
         vec_of(
             "PromotionAction_ObserveCanary",
-            PromotionAction::ObserveCanary { regressed: true },
+            PromotionAction::ObserveCanary {
+                metrics: CanaryMetrics {
+                    sample_count: 100,
+                    error_rate_bps: 300,
+                    baseline_error_rate_bps: 100,
+                    p95_latency_ms: 240,
+                    baseline_p95_latency_ms: 100,
+                },
+            },
         ),
         vec_of(
             "PromotionAction_FinishCanary",
@@ -811,6 +823,19 @@ fn events_vectors() -> Vec<Vector> {
             }),
         ),
         vec_of(
+            "EventBody_ToolDenied",
+            event_with(EventBody::ToolDenied {
+                run_id: run_id(),
+                action: ProposedAction::ExecuteCommand {
+                    program: "rm".to_string(),
+                    args: vec!["-rf".to_string(), "target".to_string()],
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+                reasons: vec!["program is not allow-listed".to_string()],
+            }),
+        ),
+        vec_of(
             "EventBody_ToolStarted",
             event_with(EventBody::ToolStarted {
                 run_id: run_id(),
@@ -1147,6 +1172,7 @@ fn catchup_vectors() -> Vec<Vector> {
                     title: "long session".to_string(),
                     last_sequence: 512,
                     active_runs: vec![run_id()],
+                    pending_approvals: Vec::new(),
                     closed: false,
                 },
             },

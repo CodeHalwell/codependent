@@ -257,6 +257,10 @@ pub enum SandboxError {
     /// The command was structurally invalid (e.g. a non-absolute program path).
     #[error("invalid sandbox command: {0}")]
     InvalidCommand(String),
+    /// The backend cannot enforce a requested capability precisely. Refuse the
+    /// run instead of silently widening it.
+    #[error("sandbox backend cannot safely enforce requested capability: {0}")]
+    UnsupportedCapability(String),
     /// Spawning the sandboxed process failed.
     #[error("spawning the sandboxed process failed: {0}")]
     Spawn(#[source] std::io::Error),
@@ -373,8 +377,8 @@ pub fn seatbelt_profile(profile: &SandboxProfile, target_program: &Path) -> Stri
     // test). It DOES leave file metadata (`stat`) enumerable anywhere; that surface
     // is named in the capability report rather than silently accepted.
     sb.push_str("(import \"bsd.sb\")\n");
-    sb.push_str("(allow process-fork)\n");
     if profile.allow_subprocess {
+        sb.push_str("(allow process-fork)\n");
         sb.push_str("(allow process-exec*)\n");
     } else {
         // Scope exec to just the target so it can start but cannot spawn other
@@ -482,12 +486,10 @@ pub fn bwrap_argv(profile: &SandboxProfile, command: &SandboxCommand) -> Vec<Str
     ] {
         argv.push(ns.into());
     }
-    // Network: unshare (deny) unless the allowlist is non-empty. bwrap alone cannot
-    // filter by host; a non-empty allowlist shares the host network namespace and
-    // relies on the profile/broker for host granularity (deferred — documented).
-    if profile.network_allowlist.is_empty() {
-        argv.push("--unshare-net".into());
-    }
+    // Bubblewrap cannot express host:port allowlists. The executor rejects any
+    // non-empty list before using this generator, so every admitted invocation
+    // receives a private, disconnected network namespace.
+    argv.push("--unshare-net".into());
 
     // Clean environment: clear, then re-add only the allowlisted vars that exist.
     argv.push("--clearenv".into());
@@ -621,6 +623,11 @@ fn spawn_capture_kill(
             }
         }
     }
+    // A successful direct child may have left descendants holding the capture
+    // pipes open. Terminate the process group before joining the drain threads;
+    // otherwise the wall deadline stops being effective once the parent exits.
+    #[cfg(unix)]
+    kill_process_group(pid);
     let duration = started.elapsed();
 
     // Killing the group closes the write ends, so the reader threads reach EOF.
@@ -705,7 +712,13 @@ fn drain_to_void(reader: &mut impl Read) {
 /// `process_group(0)`). The caller also SIGKILLs and reaps the direct child.
 #[cfg(unix)]
 fn kill_process_group(pid: u32) {
-    let _ = Command::new("kill")
+    let kill = ["/bin/kill", "/usr/bin/kill"]
+        .into_iter()
+        .find(|path| is_executable_file(Path::new(path)));
+    let Some(kill) = kill else {
+        return;
+    };
+    let _ = Command::new(kill)
         .arg("-KILL")
         // Keep the negative pgid in operand position. Without `--`, procps
         // `kill` may interpret it as an option and broadcast SIGKILL via pid -1.
@@ -795,8 +808,6 @@ impl SandboxExecutor for MacosSandbox {
             degraded: vec![
                 "memory/CPU rlimits not enforced by Seatbelt (wall-clock kill + output cap are)"
                     .into(),
-                "network allowlist coarsened to outbound-IP (host:port granularity deferred to a broker)"
-                    .into(),
                 "file METADATA (stat: existence/size/mtime/mode) is enumerable anywhere via Apple's \
                  base profile (bsd.sb); file CONTENTS outside the granted read paths stay denied"
                     .into(),
@@ -819,6 +830,7 @@ impl SandboxExecutor for MacosSandbox {
                 command.program.display()
             )));
         }
+        validate_enforceable_profile(profile)?;
         // Seatbelt matches paths *after* symlink resolution, so the granted
         // subpaths must be canonical or the kernel-resolved path (e.g. macOS
         // `/var/folders/…` → `/private/var/folders/…`) never matches and the grant
@@ -915,9 +927,6 @@ impl SandboxExecutor for LinuxSandbox {
     fn capability_report(&self) -> CapabilityReport {
         let available = is_executable_file(&self.tool);
         let mut degraded = vec![
-            "network allowlist coarsened: a non-empty allowlist shares the host network namespace \
-             (host:port granularity deferred to a broker)"
-                .into(),
             "process-group kill is best-effort: a subprocess that calls setsid()/setpgid() (only \
              reachable when allow_subprocess) can escape the group kill, though the direct child \
              is still killed"
@@ -952,11 +961,27 @@ impl SandboxExecutor for LinuxSandbox {
                 command.program.display()
             )));
         }
+        validate_enforceable_profile(profile)?;
+        if !profile.allow_subprocess {
+            return Err(SandboxError::UnsupportedCapability(
+                "Linux bubblewrap cannot prevent exec of bound system binaries when subprocess=false"
+                    .into(),
+            ));
+        }
         // `bwrap_argv` names `bwrap`/`prlimit` bare; resolve `bwrap` to the probed
         // absolute path so the spawn does not depend on PATH ordering.
         let mut argv = bwrap_argv(profile, command);
         if let Some(first) = argv.iter_mut().find(|a| a.as_str() == "bwrap") {
             *first = self.tool.to_string_lossy().into_owned();
+        }
+        if let Some(first) = argv.iter_mut().find(|a| a.as_str() == "prlimit") {
+            *first = locate_on_path("prlimit")
+                .ok_or_else(|| SandboxError::ToolUnavailable {
+                    tool: "prlimit".into(),
+                    diagnostic: "memory/CPU caps require an absolute prlimit executable".into(),
+                })?
+                .to_string_lossy()
+                .into_owned();
         }
         spawn_capture_kill(
             &argv,
@@ -968,6 +993,38 @@ impl SandboxExecutor for LinuxSandbox {
             SandboxBackend::Bubblewrap,
         )
     }
+}
+
+fn validate_enforceable_profile(profile: &SandboxProfile) -> Result<(), SandboxError> {
+    if !profile.network_allowlist.is_empty() {
+        return Err(SandboxError::UnsupportedCapability(
+            "host:port network allowlists require a broker; refusing unrestricted outbound access"
+                .into(),
+        ));
+    }
+    for (field, value) in [
+        ("memory_mb", profile.memory_mb),
+        ("cpu_seconds", profile.cpu_seconds),
+        ("wall_seconds", profile.wall_seconds),
+        ("maximum_output_mb", profile.maximum_output_mb),
+    ] {
+        if value == 0 {
+            return Err(SandboxError::InvalidCommand(format!(
+                "resource cap `{field}` must be greater than zero"
+            )));
+        }
+    }
+    if profile
+        .read_paths
+        .iter()
+        .chain(profile.write_paths.iter())
+        .any(|path| path.trim_end_matches('/').is_empty())
+    {
+        return Err(SandboxError::InvalidCommand(
+            "root/empty filesystem grants are forbidden".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The captured-output byte cap for a profile (`maximum_output_mb` → bytes, with a
@@ -1095,8 +1152,8 @@ command = "x"
 [capabilities]
 filesystem_read = ["/work"]
 [resources]
-memory_mb = 0
-cpu_seconds = 0
+memory_mb = 128
+cpu_seconds = 30
 wall_seconds = 30
 maximum_output_mb = 8
 "#,
@@ -1116,7 +1173,7 @@ maximum_output_mb = 8
     }
 
     #[test]
-    fn bwrap_argv_shares_net_and_prefixes_prlimit_with_caps() {
+    fn bwrap_argv_keeps_network_unshared_and_prefixes_prlimit_with_caps() {
         let p = sample_profile(); // network non-empty, memory 256, cpu 60
         let cmd = SandboxCommand::new("/bin/echo", vec![], "/workspace/repo", "plugin:github");
         let argv = bwrap_argv(&p, &cmd);
@@ -1126,8 +1183,9 @@ maximum_output_mb = 8
         assert!(argv
             .iter()
             .any(|a| a == &format!("--as={}", 256u64 * 1024 * 1024)));
-        // Non-empty network allowlist ⇒ net namespace NOT unshared.
-        assert!(!argv.iter().any(|a| a == "--unshare-net"));
+        // The pure argv stays deny-all. The executor refuses a non-empty
+        // host:port allowlist until a broker can enforce it precisely.
+        assert!(argv.iter().any(|a| a == "--unshare-net"));
         // write path is a read-write bind.
         assert!(argv
             .windows(3)

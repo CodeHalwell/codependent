@@ -45,7 +45,7 @@ task node → data classification & policy (hard filter: eligible providers)
 3. λ weights + quality threshold live in a versioned `RoutingPolicy` (registry item, `router/<name>/<version>`), selectable per scope. Budgets from Phase 5 stay authoritative — the router optimizes inside them.
 4. **Routing evaluation** (exit criterion 1): `codypendent eval route --suite core` compares the [Chapter 16](../16-testing-strategy.md) five arms — static-strongest, static-cheap, router, router+escalation, local-first router — reporting task success, cost, latency, escalation rate, tool-call errors, unsafe proposals. The release gate asserts: router+escalation ≥ quality threshold at cost < static-strongest.
 
-**TESTS** — hard filters (classified data never routes to an ineligible provider — security test); cheapest-above-threshold selection given synthetic profiles; escalation preserves artifacts; transition records complete.
+**TESTS** — hard filters (classified data never routes to an ineligible provider — security test); highest-utility-above-threshold selection given synthetic profiles; escalation preserves artifacts; transition records complete.
 
 **COMMIT** `"phase7: per-node utility router with cascading escalation and eval arms"`
 

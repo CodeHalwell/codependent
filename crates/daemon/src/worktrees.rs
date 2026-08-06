@@ -387,22 +387,23 @@ impl WorktreeManager {
         let worktree = &lease.worktree_path;
 
         // Reconcile with Git's own view before mutating anything.
-        let registered = worktree_is_registered(repo, worktree).await;
+        let registered = worktree_is_registered(repo, worktree).await?;
         let worktree_present = worktree.exists();
 
         // Unmerged commits: on the branch but not reachable from the base commit.
         let range = format!("{}..{}", lease.base_commit, lease.branch);
-        let unmerged_commits = match run_git(repo, &["log", &range, "--oneline"]).await {
-            Ok(out) => out.lines().filter(|l| !l.trim().is_empty()).count(),
-            Err(_) => 0,
-        };
+        let unmerged_commits = run_git(repo, &["log", &range, "--oneline"])
+            .await?
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
 
         // Dirty working tree (tracked modifications, staged changes, untracked).
         let dirty = if worktree_present {
-            match run_git(worktree, &["status", "--porcelain"]).await {
-                Ok(out) => !out.trim().is_empty(),
-                Err(_) => false,
-            }
+            !run_git(worktree, &["status", "--porcelain"])
+                .await?
+                .trim()
+                .is_empty()
         } else {
             false
         };
@@ -650,14 +651,12 @@ async fn run_git<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<String, Work
 }
 
 /// True if `worktree` appears in `git worktree list --porcelain` run from `repo`.
-async fn worktree_is_registered(repo: &Path, worktree: &Path) -> bool {
-    let Ok(listing) = run_git(repo, &["worktree", "list", "--porcelain"]).await else {
-        return false;
-    };
+async fn worktree_is_registered(repo: &Path, worktree: &Path) -> Result<bool, WorktreeError> {
+    let listing = run_git(repo, &["worktree", "list", "--porcelain"]).await?;
     let target = canonicalize_lenient(worktree);
-    parse_worktree_list(&listing)
+    Ok(parse_worktree_list(&listing)
         .iter()
-        .any(|r| canonicalize_lenient(&r.path) == target)
+        .any(|r| canonicalize_lenient(&r.path) == target))
 }
 
 /// One record parsed from `git worktree list --porcelain`.

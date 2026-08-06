@@ -198,7 +198,66 @@ impl ApprovalBroker {
         capabilities: Vec<Capability>,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<ApprovalId, ApprovalError> {
+        self.request_with_reuse(
+            pool,
+            session_id,
+            run_id,
+            action,
+            risk,
+            capabilities,
+            expires_at,
+            true,
+        )
+        .await
+    }
+
+    /// Request an approval while explicitly controlling whether a prior
+    /// run-scoped approval may be reused. `AlwaysApproval` policy decisions pass
+    /// `false`; other approval dispositions retain the normal run-scope behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_with_reuse(
+        &self,
+        pool: &SqlitePool,
+        session_id: SessionId,
+        run_id: RunId,
+        action: ProposedAction,
+        risk: Risk,
+        capabilities: Vec<Capability>,
+        expires_at: Option<DateTime<Utc>>,
+        allow_run_reuse: bool,
+    ) -> Result<ApprovalId, ApprovalError> {
         let approval_id = ApprovalId::new();
+        self.request_with_id_and_reuse(
+            pool,
+            approval_id,
+            session_id,
+            run_id,
+            action,
+            risk,
+            capabilities,
+            expires_at,
+            allow_run_reuse,
+        )
+        .await
+    }
+
+    /// Request an approval using a caller-allocated id. This is used by
+    /// durable continuations which must persist their own work record before
+    /// making the approval visible; ordinary callers should use
+    /// [`Self::request`] or [`Self::request_with_reuse`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_with_id_and_reuse(
+        &self,
+        pool: &SqlitePool,
+        approval_id: ApprovalId,
+        session_id: SessionId,
+        run_id: RunId,
+        action: ProposedAction,
+        risk: Risk,
+        capabilities: Vec<Capability>,
+        expires_at: Option<DateTime<Utc>>,
+        allow_run_reuse: bool,
+    ) -> Result<ApprovalId, ApprovalError> {
         let digest = action_digest(&action)?;
         let action_json = serde_json::to_string(&action)?;
         let risk_json = serde_json::to_string(&risk)?;
@@ -207,7 +266,7 @@ impl ApprovalBroker {
         let now_str = now.to_rfc3339();
         let expires_str = expires_at.map(|t| t.to_rfc3339());
 
-        let auto_approve = self.run_scoped_match(pool, run_id, &digest).await?;
+        let auto_approve = allow_run_reuse && self.run_scoped_match(pool, run_id, &digest).await?;
 
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let state = if auto_approve {

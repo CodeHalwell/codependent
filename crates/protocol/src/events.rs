@@ -35,6 +35,7 @@ pub struct SessionEvent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum Actor {
     Human {
         user_id: UserId,
@@ -51,6 +52,8 @@ pub enum Actor {
         integration_id: String,
     },
     System,
+    #[serde(other)]
+    Unknown,
 }
 
 /// The body of a persisted event.
@@ -100,6 +103,16 @@ pub enum EventBody {
         run_id: RunId,
         approval_id: ApprovalId,
         action: ProposedAction,
+    },
+    /// A model-proposed action that the policy engine refused before
+    /// execution. Keeping the typed action makes policy-denial evaluation and
+    /// audit evidence non-vacuous: observers can prove the unsafe operation
+    /// was attempted and blocked, not merely absent from an execution list.
+    ToolDenied {
+        run_id: RunId,
+        action: ProposedAction,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reasons: Vec<String>,
     },
     ToolStarted {
         run_id: RunId,
@@ -265,6 +278,16 @@ mod tests {
                 environment: Vec::new(),
                 cwd: None,
             },
+        });
+        round_trip(EventBody::ToolDenied {
+            run_id,
+            action: ProposedAction::ExecuteCommand {
+                program: "rm".to_string(),
+                args: vec!["-rf".to_string(), "target".to_string()],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            reasons: vec!["program is not allow-listed".to_string()],
         });
         round_trip(EventBody::ToolStarted {
             run_id,

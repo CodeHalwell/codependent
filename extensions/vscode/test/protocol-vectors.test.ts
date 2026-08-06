@@ -459,7 +459,7 @@ function reconstructActor(r: Record<string, unknown>): Actor {
   }
 }
 
-/** All 17 named variants the extension types — full coverage, no exclusions. */
+/** Every named variant the extension types — full coverage, no exclusions. */
 function reconstructEventBody(r: Record<string, unknown>): EventBody {
   switch (str(r, "type")) {
     case "SessionCreated":
@@ -485,6 +485,13 @@ function reconstructEventBody(r: Record<string, unknown>): EventBody {
         run_id: str(r, "run_id"),
         approval_id: str(r, "approval_id"),
         action: reconstructProposedAction(rec(r, "action")),
+      };
+    case "ToolDenied":
+      return {
+        type: "ToolDenied",
+        run_id: str(r, "run_id"),
+        action: reconstructProposedAction(rec(r, "action")),
+        reasons: optStrArr(r, "reasons"),
       };
     case "ToolStarted":
       return {

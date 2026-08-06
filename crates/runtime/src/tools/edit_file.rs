@@ -27,10 +27,10 @@
 
 use std::path::PathBuf;
 
-use codypendent_daemon::policy::{PathScope, ScopeVerdict};
+use codypendent_daemon::policy::PathScope;
 use serde_json::Value;
 
-use super::{CapabilityKind, ToolError};
+use super::{secure_fs, CapabilityKind, ToolError};
 
 /// Largest file `edit_file` will hold in memory to search. Mirrors
 /// `read_file.rs`'s `MAX_READ_BYTES` ceiling — far larger than any real
@@ -122,68 +122,68 @@ impl EditFile {
         input: &EditFileInput,
         scope: &PathScope,
     ) -> Result<EditFileOutcome, ToolError> {
-        let (resolved, verdict) = scope.resolve(&input.path);
-        match verdict {
-            ScopeVerdict::Allowed => {}
-            ScopeVerdict::Denied => return Err(ToolError::PathDenied(resolved)),
-            ScopeVerdict::OutsideRoots => return Err(ToolError::PathOutOfScope(resolved)),
-        }
+        let path = input.path.clone();
+        let edits = input.edits.clone();
+        let scope = scope.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read as _, Seek as _, Write as _};
 
-        // Leaf guard on the exact resolved path — never re-derived.
-        let metadata = tokio::fs::symlink_metadata(&resolved).await?;
-        if metadata.file_type().is_symlink() || metadata.is_dir() {
-            return Err(ToolError::NotRegularFile(resolved));
-        }
-        if metadata.len() > MAX_EDIT_BYTES {
-            return Err(ToolError::FileTooLarge {
-                path: resolved,
-                cap: MAX_EDIT_BYTES,
-            });
-        }
-
-        let bytes = tokio::fs::read(&resolved).await?;
-        let mut buffer = String::from_utf8(bytes).map_err(|e| {
-            ToolError::Other(anyhow::anyhow!(
-                "{}: file is not valid UTF-8: {e}",
-                resolved.display()
-            ))
-        })?;
-
-        // Compute the full result in memory; nothing is written until every
-        // edit has matched uniquely (atomicity).
-        for (zero_based, edit) in input.edits.iter().enumerate() {
-            let index = zero_based + 1;
-            if edit.search.is_empty() {
-                return Err(ToolError::EmptySearch { index });
+            let mut scoped = secure_fs::open_edit(&path, &scope)?;
+            let metadata = scoped.file.metadata()?;
+            if metadata.len() > MAX_EDIT_BYTES {
+                return Err(ToolError::FileTooLarge {
+                    path: scoped.path,
+                    cap: MAX_EDIT_BYTES,
+                });
             }
-            let count = buffer.matches(edit.search.as_str()).count();
-            match count {
-                0 => {
-                    return Err(ToolError::SearchNotFound {
-                        path: resolved,
-                        index,
-                    })
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            scoped.file.read_to_end(&mut bytes)?;
+            let mut buffer = String::from_utf8(bytes).map_err(|e| {
+                ToolError::Other(anyhow::anyhow!(
+                    "{}: file is not valid UTF-8: {e}",
+                    scoped.path.display()
+                ))
+            })?;
+
+            // Compute the full result in memory; nothing is written until every
+            // edit has matched uniquely (atomicity).
+            for (zero_based, edit) in edits.iter().enumerate() {
+                let index = zero_based + 1;
+                if edit.search.is_empty() {
+                    return Err(ToolError::EmptySearch { index });
                 }
-                1 => {
-                    let pos = buffer.find(edit.search.as_str()).expect("count == 1");
-                    buffer.replace_range(pos..pos + edit.search.len(), &edit.replace);
-                }
-                n => {
-                    return Err(ToolError::SearchAmbiguous {
-                        path: resolved,
-                        index,
-                        count: n,
-                    })
+                let count = buffer.matches(edit.search.as_str()).count();
+                match count {
+                    0 => {
+                        return Err(ToolError::SearchNotFound {
+                            path: scoped.path.clone(),
+                            index,
+                        })
+                    }
+                    1 => {
+                        let pos = buffer.find(edit.search.as_str()).expect("count == 1");
+                        buffer.replace_range(pos..pos + edit.search.len(), &edit.replace);
+                    }
+                    n => {
+                        return Err(ToolError::SearchAmbiguous {
+                            path: scoped.path.clone(),
+                            index,
+                            count: n,
+                        })
+                    }
                 }
             }
-        }
 
-        tokio::fs::write(&resolved, buffer.as_bytes()).await?;
-
-        Ok(EditFileOutcome {
-            edits_applied: input.edits.len(),
-            path: resolved,
+            scoped.file.rewind()?;
+            scoped.file.set_len(0)?;
+            scoped.file.write_all(buffer.as_bytes())?;
+            Ok(EditFileOutcome {
+                edits_applied: edits.len(),
+                path: scoped.path,
+            })
         })
+        .await
+        .map_err(|error| ToolError::Other(anyhow::anyhow!("edit worker failed: {error}")))?
     }
 }
 

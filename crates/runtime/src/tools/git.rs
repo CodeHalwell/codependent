@@ -15,7 +15,7 @@ use std::time::Duration;
 use codypendent_daemon::artifacts::Provenance;
 use codypendent_daemon::policy::{CommandScope, PathScope, ScopeVerdict};
 use codypendent_protocol::{ArtifactRef, ProposedAction, RunId};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use super::{ArtifactSink, CapabilityKind, ToolError, IN_MEMORY_CAP};
@@ -30,6 +30,10 @@ const GIT: &str = "git";
 /// `kill_on_drop`, so expiring the timeout (dropping the wait future) kills the
 /// child.
 const GIT_TIMEOUT_SECS: u64 = 300;
+/// Hard ceiling retained for a Git diff. The prior `Command::output` path read
+/// arbitrary output into daemon memory before applying the display cap.
+const MAX_GIT_DIFF_BYTES: usize = 64 * 1024 * 1024;
+const MAX_GIT_STDERR_BYTES: usize = 1024 * 1024;
 
 /// Await a git wait-future under [`GIT_TIMEOUT_SECS`], surfacing expiry as a
 /// structured [`ToolError::TimedOut`] for `tool`.
@@ -133,34 +137,47 @@ impl GitDiff {
             .stdin(Stdio::null())
             .kill_on_drop(true);
         harden_git_env(&mut command);
-        let output = bounded_git(Self::NAME, command.output())
-            .await
-            .map_err(|e| match e {
-                ToolError::Io(io) => map_spawn(io),
-                other => other,
-            })?;
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn().map_err(map_spawn)?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let out_task = tokio::spawn(drain_capped(stdout, MAX_GIT_DIFF_BYTES));
+        let err_task = tokio::spawn(drain_capped(stderr, MAX_GIT_STDERR_BYTES));
+        let status = bounded_git(Self::NAME, child.wait()).await?;
+        let (stdout, stdout_over) = out_task.await.map_err(|error| {
+            ToolError::Other(anyhow::anyhow!("git stdout task failed: {error}"))
+        })??;
+        let (stderr, _stderr_over) = err_task.await.map_err(|error| {
+            ToolError::Other(anyhow::anyhow!("git stderr task failed: {error}"))
+        })??;
+        if stdout_over {
+            return Err(ToolError::Other(anyhow::anyhow!(
+                "git diff exceeded the {}-byte safety limit",
+                MAX_GIT_DIFF_BYTES
+            )));
+        }
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr).into_owned();
             return Err(ToolError::Other(anyhow::anyhow!(
                 "git diff failed: {}",
                 stderr.trim()
             )));
         }
 
-        let is_empty = output.stdout.is_empty();
+        let is_empty = stdout.is_empty();
         let artifact = if is_empty {
             None
         } else {
             let provenance = Provenance::tool_output(Self::NAME, run_id);
             Some(
-                sink.store("text/x-diff", provenance, &output.stdout)
+                sink.store("text/x-diff", provenance, &stdout)
                     .await
                     .map_err(ToolError::Other)?,
             )
         };
 
-        let full = String::from_utf8_lossy(&output.stdout);
+        let full = String::from_utf8_lossy(&stdout);
         let truncated = full.len() > IN_MEMORY_CAP;
         let diff = if truncated {
             let mut end = IN_MEMORY_CAP;
@@ -179,6 +196,29 @@ impl GitDiff {
             artifact,
         })
     }
+}
+
+async fn drain_capped<R: AsyncRead + Unpin>(
+    reader: Option<R>,
+    cap: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let Some(mut reader) = reader else {
+        return Ok((Vec::new(), false));
+    };
+    let mut retained = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut overflow = false;
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = cap.saturating_sub(retained.len());
+        let take = remaining.min(read);
+        retained.extend_from_slice(&chunk[..take]);
+        overflow |= take < read;
+    }
+    Ok((retained, overflow))
 }
 
 /// Typed input for [`ApplyPatch::execute`].

@@ -40,7 +40,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -101,6 +101,8 @@ const MAX_STEPS: usize = 256;
 /// many model requests are made, not how long each (or its tools) takes; this
 /// bounds the total. A `BudgetWarning { WallClock }` is emitted at 80%.
 const MAX_WALL_CLOCK_SECS: u64 = 30 * 60;
+/// Maximum serialized provider stream retained in one model turn.
+const MAX_MODEL_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
 /// Default wall-clock timeout for a model-proposed `shell.run` when the model
 /// does not specify one (further clamped down by the command scope).
@@ -644,13 +646,20 @@ impl ModelDriver for ScriptedDriver {
 /// every clone.
 #[derive(Debug, Clone)]
 pub struct CancellationToken {
-    rx: tokio::sync::watch::Receiver<bool>,
+    rx: tokio::sync::watch::Receiver<RunControl>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunControl {
+    Running,
+    Paused,
+    Cancelled,
 }
 
 impl CancellationToken {
     /// Whether cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
-        *self.rx.borrow()
+        *self.rx.borrow() == RunControl::Cancelled
     }
 
     /// Resolve once cancellation has been requested — immediately if it already
@@ -659,11 +668,11 @@ impl CancellationToken {
     /// cancelling, this parks forever (letting the other `select!` arm win).
     pub async fn cancelled(&self) {
         let mut rx = self.rx.clone();
-        if *rx.borrow() {
+        if *rx.borrow() == RunControl::Cancelled {
             return;
         }
         while rx.changed().await.is_ok() {
-            if *rx.borrow() {
+            if *rx.borrow() == RunControl::Cancelled {
                 return;
             }
         }
@@ -676,25 +685,71 @@ impl CancellationToken {
     pub fn never() -> Self {
         cancellation().1
     }
+
+    /// Park at a safe point while paused. Returns the time spent parked, or
+    /// `None` when cancellation won while paused.
+    pub async fn wait_until_running(&self) -> Option<Duration> {
+        let mut rx = self.rx.clone();
+        match *rx.borrow() {
+            RunControl::Running => return Some(Duration::ZERO),
+            RunControl::Cancelled => return None,
+            RunControl::Paused => {}
+        }
+        let started = Instant::now();
+        loop {
+            if rx.changed().await.is_err() {
+                return Some(started.elapsed());
+            }
+            match *rx.borrow() {
+                RunControl::Running => return Some(started.elapsed()),
+                RunControl::Cancelled => return None,
+                RunControl::Paused => {}
+            }
+        }
+    }
 }
 
 /// The controlling side of a [`CancellationToken`]. Holding it keeps the channel
 /// alive; calling [`cancel`](CancellationHandle::cancel) requests cancellation.
 #[derive(Debug)]
 pub struct CancellationHandle {
-    tx: tokio::sync::watch::Sender<bool>,
+    tx: tokio::sync::watch::Sender<RunControl>,
 }
 
 impl CancellationHandle {
     /// Request cancellation. Idempotent.
     pub fn cancel(&self) {
-        let _ = self.tx.send(true);
+        let _ = self.tx.send(RunControl::Cancelled);
+    }
+
+    /// Pause at the next runtime safe point. A cancelled run cannot be revived.
+    pub fn pause(&self) {
+        self.tx.send_if_modified(|state| {
+            if *state == RunControl::Running {
+                *state = RunControl::Paused;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Resume a paused runtime. A cancelled run cannot be revived.
+    pub fn resume(&self) {
+        self.tx.send_if_modified(|state| {
+            if *state == RunControl::Paused {
+                *state = RunControl::Running;
+                true
+            } else {
+                false
+            }
+        });
     }
 }
 
 /// Create a linked ([`CancellationHandle`], [`CancellationToken`]) pair.
 pub fn cancellation() -> (CancellationHandle, CancellationToken) {
-    let (tx, rx) = tokio::sync::watch::channel(false);
+    let (tx, rx) = tokio::sync::watch::channel(RunControl::Running);
     (CancellationHandle { tx }, CancellationToken { rx })
 }
 
@@ -878,6 +933,8 @@ pub struct ApprovalRequest {
     pub risk: Risk,
     /// The capabilities the grant would mint.
     pub capabilities: Vec<Capability>,
+    /// Whether a run-scoped approval may be reused for an identical action.
+    pub allow_run_reuse: bool,
 }
 
 /// Pool-erased persistence for the loop.
@@ -1266,6 +1323,68 @@ impl FrameworkAgentRuntime {
         // and show clients two starts). It resumes from the first state
         // transition: Preparing → Running (persist-then-publish, transitions
         // before exposure).
+        // Cancellation may have been accepted after RunStarted was published but
+        // before the executor registered its token. Never resurrect that durable
+        // Cancelled state with Preparing/Running.
+        if cancel.is_cancelled() {
+            let disposition = RunDisposition::Cancelled {
+                reason: Some("run cancelled before execution".to_string()),
+            };
+            let chronicle = build_chronicle(&run.objective, &[], &[], &[], 0, None);
+            let chronicle_ref = self
+                .sink
+                .store(
+                    "application/json",
+                    Provenance::system("run-chronicle"),
+                    &serde_json::to_vec_pretty(&chronicle)?,
+                )
+                .await?;
+            self.emit(
+                run.session_id,
+                run_actor,
+                EventBody::RunCompleted {
+                    run_id: run.run_id,
+                    disposition: disposition.clone(),
+                    chronicle: chronicle_ref,
+                },
+            )
+            .await?;
+            return Ok(RunOutcome {
+                disposition,
+                usage: None,
+            });
+        }
+        // A PauseRun may win before the executor reaches this worker. Honor it
+        // before emitting Preparing/Running so the durable Paused projection is
+        // not immediately overwritten by a worker that has not done any work.
+        if cancel.wait_until_running().await.is_none() {
+            let disposition = RunDisposition::Cancelled {
+                reason: Some("run cancelled while paused before execution".to_string()),
+            };
+            let chronicle = build_chronicle(&run.objective, &[], &[], &[], 0, None);
+            let chronicle_ref = self
+                .sink
+                .store(
+                    "application/json",
+                    Provenance::system("run-chronicle"),
+                    &serde_json::to_vec_pretty(&chronicle)?,
+                )
+                .await?;
+            self.emit(
+                run.session_id,
+                run_actor,
+                EventBody::RunCompleted {
+                    run_id: run.run_id,
+                    disposition: disposition.clone(),
+                    chronicle: chronicle_ref,
+                },
+            )
+            .await?;
+            return Ok(RunOutcome {
+                disposition,
+                usage: None,
+            });
+        }
         self.transition(run.session_id, run.run_id, RunState::Preparing)
             .await?;
         self.transition(run.session_id, run.run_id, RunState::Running)
@@ -1298,6 +1417,7 @@ impl FrameworkAgentRuntime {
         // it `None`, so the cost budget charges nothing — the honesty invariant.
         let mut usage: Option<ModelUsage> = None;
         let run_started = Instant::now();
+        let mut paused_total = Duration::ZERO;
         let mut wall_clock_warned = false;
         // Context-window protection (T3): the integer percentage
         // (`used*100/limit`) most recently emitted as a `BudgetWarning{Tokens}`
@@ -1318,9 +1438,13 @@ impl FrameworkAgentRuntime {
         let mut repeated_call: Option<(String, String, u32)> = None;
 
         // --- Inspect/Plan/Modify/Test: the model-driven inner loop ---
-        let terminal = loop {
+        let terminal = 'agent: loop {
             if cancel.is_cancelled() {
                 break Terminal::Cancelled;
+            }
+            match cancel.wait_until_running().await {
+                Some(paused) => paused_total = paused_total.saturating_add(paused),
+                None => break Terminal::Cancelled,
             }
             // Safe point: apply any queued steering between nodes.
             self.drain_steering(&mut run, &run_actor, &mut transcript)
@@ -1335,7 +1459,7 @@ impl FrameworkAgentRuntime {
             // commands could otherwise burn unbounded time/spend. Warn once at
             // 80%, fail at the ceiling — checked at the same safe point as the
             // step budget so a run never dies mid-effect.
-            let elapsed_secs = run_started.elapsed().as_secs();
+            let elapsed_secs = run_started.elapsed().saturating_sub(paused_total).as_secs();
             if elapsed_secs >= MAX_WALL_CLOCK_SECS {
                 break Terminal::Failed("wall-clock budget exhausted".to_string());
             }
@@ -1407,6 +1531,11 @@ impl FrameworkAgentRuntime {
                         // several chunks within a single poll is caught by the
                         // drain below.
                         biased;
+                        _ = cancel.cancelled() => break 'agent Terminal::Cancelled,
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                            run_started + Duration::from_secs(MAX_WALL_CLOCK_SECS)
+                                + paused_total
+                        )) => break 'agent Terminal::Failed("wall-clock budget exhausted".to_string()),
                         res = &mut step_fut => break res,
                         Some(chunk) = rx.recv() => {
                             self.emit(
@@ -1473,6 +1602,14 @@ impl FrameworkAgentRuntime {
                 usage = ?trace.usage,
                 "model request"
             );
+
+            // Pause arriving during a model request is honored before any
+            // returned tool proposal can be executed. The completed response
+            // remains local and is processed exactly once after resume.
+            match cancel.wait_until_running().await {
+                Some(paused) => paused_total = paused_total.saturating_add(paused),
+                None => break Terminal::Cancelled,
+            }
 
             match step {
                 ModelStep::Say(text) => {
@@ -1748,6 +1885,20 @@ impl FrameworkAgentRuntime {
                          `workspace.search` tools instead of a shell command.",
                     );
                 }
+                self.emit(
+                    run.session_id,
+                    run_actor.clone(),
+                    EventBody::ToolDenied {
+                        run_id: run.run_id,
+                        action: prepared.action.clone(),
+                        reasons: decision
+                            .reasons
+                            .iter()
+                            .map(|reason| reason.message.clone())
+                            .collect(),
+                    },
+                )
+                .await?;
                 // (c) on Deny: emit a denial completion and DO NOT execute.
                 self.emit(
                     run.session_id,
@@ -1786,6 +1937,7 @@ impl FrameworkAgentRuntime {
                         action: prepared.action.clone(),
                         risk,
                         capabilities,
+                        allow_run_reuse: decision.approval_reusable,
                     })
                     .await?;
                 self.transition(run.session_id, run.run_id, RunState::WaitingForApproval)
@@ -1814,6 +1966,9 @@ impl FrameworkAgentRuntime {
                         return Ok(ToolFlow::Cancelled);
                     }
                 };
+                if cancel.is_cancelled() {
+                    return Ok(ToolFlow::Cancelled);
+                }
                 self.transition(run.session_id, run.run_id, RunState::Running)
                     .await?;
                 if decision != ApprovalDecision::Approve {
@@ -1855,8 +2010,12 @@ impl FrameworkAgentRuntime {
             },
         )
         .await?;
-        let (observation, artifact, outcome) =
-            self.execute_prepared(prepared, run, run_actor).await;
+        let execution = self.execute_prepared(prepared, run, run_actor);
+        tokio::pin!(execution);
+        let (observation, artifact, outcome) = tokio::select! {
+            result = &mut execution => result,
+            _ = cancel.cancelled() => return Ok(ToolFlow::Cancelled),
+        };
         // (e/f) emit completion referencing any spilled artifact.
         self.emit(
             run.session_id,
@@ -3713,7 +3872,7 @@ impl ModelDriver for FrameworkModelDriver {
         sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome> {
         use agent_framework_core::client::ChatClient;
-        use agent_framework_core::types::{ChatOptions, ChatResponseUpdate};
+        use agent_framework_core::types::{ChatOptions, ChatResponse};
         use futures::StreamExt;
 
         let mut options = ChatOptions::new();
@@ -3735,13 +3894,24 @@ impl ModelDriver for FrameworkModelDriver {
         // error fails the run" path; chunks already pushed to `sink` stay emitted
         // (they went out as they arrived) and no usage is fabricated (the
         // assembly below is never reached).
-        let mut updates: Vec<ChatResponseUpdate> = Vec::new();
+        let mut assembled = ChatResponse::default();
+        let mut stream_bytes = 0usize;
         while let Some(update) = stream.next().await {
             let update = update.map_err(|e| anyhow::anyhow!("model stream error: {e}"))?;
+            stream_bytes = stream_bytes.saturating_add(serde_json::to_vec(&update)?.len());
+            if stream_bytes > MAX_MODEL_STREAM_BYTES {
+                anyhow::bail!(
+                    "model stream exceeded the {}-byte safety limit",
+                    MAX_MODEL_STREAM_BYTES
+                );
+            }
             if let Some(text) = update_text_delta(&update) {
                 sink.on_text(&text);
             }
-            updates.push(update);
+            // Coalesce incrementally. Retaining every raw update allowed an
+            // endless stream to grow the heap even though the assembled turn is
+            // the only value needed after EOF.
+            assembled.absorb_update(update);
         }
 
         // Text was already streamed to `sink` live above, so the assembler runs
@@ -3752,7 +3922,8 @@ impl ModelDriver for FrameworkModelDriver {
         // mapping did. `preface` is FIX 3's surfaced assistant text when the
         // step is a `CallTool` (`None` for `Say`/`Finish`, whose text already
         // rides the step).
-        let (step, usage, preface) = updates_to_step(updates, |_| {});
+        assembled.finalize();
+        let (step, usage, preface) = chat_response_to_step(&assembled);
         Ok(StepOutcome::new(step, usage).with_preface(preface))
     }
 }
@@ -3872,6 +4043,7 @@ fn chat_response_to_step(
 /// no-op `on_text` purely to assemble; the unit test calls it with a collecting
 /// closure to pin the ordered-chunk / coalesced-text / assembled-usage contract.
 #[cfg(feature = "provider-openai")]
+#[cfg_attr(not(test), allow(dead_code))]
 fn updates_to_step(
     updates: Vec<agent_framework_core::types::ChatResponseUpdate>,
     mut on_text: impl FnMut(&str),

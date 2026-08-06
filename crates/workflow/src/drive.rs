@@ -426,6 +426,19 @@ impl WorkflowDriver {
                     .expect("a ready node is part of the compiled graph");
                 self.run_node(pool, workflow_run_id, node, executor, observer)
                     .await?;
+                // A blocked node pauses the run. Stop this already-computed wave
+                // immediately so siblings do not continue spending against an
+                // exhausted envelope.
+                let state = self
+                    .store
+                    .snapshot(pool, workflow_run_id)
+                    .await?
+                    .ok_or_else(|| WorkflowStoreError::NotFound(workflow_run_id.to_owned()))?
+                    .run
+                    .state;
+                if state != WorkflowRunState::Running {
+                    return Ok(state);
+                }
             }
         }
 
@@ -648,13 +661,29 @@ impl WorkflowDriver {
                 // (the default) waits not at all.
                 NodeOutcome::Failed { error } if attempt < max_attempts => {
                     observer.on_attempt_failed(&node.id, attempt, &error);
+                    let next_attempt = attempt + 1;
+                    // Persist consumption of this failed attempt before sleeping.
+                    // A crash during backoff therefore resumes at the next
+                    // attempt instead of executing the failed one twice.
+                    self.store
+                        .transition_node_with_error(
+                            pool,
+                            workflow_run_id,
+                            &node.id,
+                            NodeState::Pending,
+                            next_attempt,
+                            None,
+                            None,
+                            Some(&error),
+                        )
+                        .await?;
                     if node.retry.backoff_seconds > 0 {
                         tokio::time::sleep(std::time::Duration::from_secs(
                             node.retry.backoff_seconds,
                         ))
                         .await;
                     }
-                    attempt += 1;
+                    attempt = next_attempt;
                 }
                 // Attempts exhausted: mark the node `Failed`, persisting the final
                 // reason on its durable `error` column (P5-D4 — the reason was

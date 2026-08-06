@@ -2426,6 +2426,7 @@ mod tests {
             title,
             last_sequence,
             active_runs: active,
+            pending_approvals: Vec::new(),
             closed,
         };
 

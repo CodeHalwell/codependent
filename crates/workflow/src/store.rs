@@ -18,6 +18,7 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use chrono::Utc;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
@@ -44,8 +45,8 @@ pub enum WorkflowStoreError {
     /// request": a client must not reuse a key across distinct manifests, so
     /// this is a rejection, never a silent success pointing at the first run.
     #[error(
-        "idempotency key {key} already started a different workflow \
-         (expected graph {expected}, found {found})"
+        "idempotency key {key} already started a different workflow request \
+         (expected signature {expected}, found {found})"
     )]
     IdempotencyKeyReused {
         key: String,
@@ -246,6 +247,7 @@ impl WorkflowStore {
         let id = Uuid::now_v7().to_string();
         let now = Utc::now().to_rfc3339();
         let signature = compiled.signature();
+        let inputs_json = serde_json::to_string(inputs)?;
 
         let mut tx = pool.begin().await?;
         sqlx::query(
@@ -259,7 +261,7 @@ impl WorkflowStore {
         .bind(i64::from(compiled.version))
         .bind(&signature)
         .bind(run_id)
-        .bind(serde_json::to_string(inputs)?)
+        .bind(&inputs_json)
         .bind(manifest)
         .bind(&now)
         .bind(&now)
@@ -316,6 +318,8 @@ impl WorkflowStore {
         let id = deterministic_run_id(idempotency_key);
         let now = Utc::now().to_rfc3339();
         let signature = compiled.signature();
+        let inputs_json = serde_json::to_string(inputs)?;
+        let incoming_request_signature = workflow_request_signature(&signature, &inputs_json);
 
         let mut tx = pool.begin().await?;
         let inserted = sqlx::query(
@@ -328,7 +332,7 @@ impl WorkflowStore {
         .bind(&compiled.id)
         .bind(i64::from(compiled.version))
         .bind(&signature)
-        .bind(serde_json::to_string(inputs)?)
+        .bind(&inputs_json)
         .bind(manifest)
         .bind(repository)
         .bind(&now)
@@ -341,17 +345,20 @@ impl WorkflowStore {
         // first application. Compare its stored signature against the incoming
         // compiled workflow's before treating this as a success (P5-D2).
         if inserted == 0 {
-            let existing_signature: String =
-                sqlx::query_scalar("SELECT graph_signature FROM workflow_runs WHERE id = ?")
-                    .bind(&id)
-                    .fetch_one(&mut *tx)
-                    .await?;
+            let (existing_signature, existing_inputs): (String, String) = sqlx::query_as(
+                "SELECT graph_signature, inputs_json FROM workflow_runs WHERE id = ?",
+            )
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await?;
             tx.commit().await?;
-            if existing_signature != signature {
+            let existing_request_signature =
+                workflow_request_signature(&existing_signature, &existing_inputs);
+            if existing_request_signature != incoming_request_signature {
                 return Err(WorkflowStoreError::IdempotencyKeyReused {
                     key: idempotency_key.to_owned(),
-                    expected: existing_signature,
-                    found: signature,
+                    expected: existing_request_signature,
+                    found: incoming_request_signature,
                 });
             }
             return Ok(id);
@@ -987,6 +994,14 @@ fn deterministic_run_id(idempotency_key: &str) -> String {
     hasher.update(b"workflow-run\x00");
     hasher.update(idempotency_key.as_bytes());
     format!("wfrun-{}", hex::encode(&hasher.finalize()[..16]))
+}
+
+fn workflow_request_signature(graph_signature: &str, inputs_json: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(graph_signature.as_bytes());
+    hasher.update([0]);
+    hasher.update(inputs_json.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// The pure scheduling core of [`WorkflowStore::ready_nodes`]: the ids of the

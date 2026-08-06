@@ -29,7 +29,9 @@ use std::collections::{HashMap, HashSet};
 
 use codypendent_protocol::RegistryItemId;
 
-use crate::types::{RegistryItem, RegistryItemKind, RiskClass, Scope, ToolCard, TrustTier};
+use crate::types::{
+    RegistryItem, RegistryItemKind, RegistryStatus, RiskClass, Scope, ToolCard, TrustTier,
+};
 
 pub use bm25::{Bm25Error, Bm25Index};
 pub use config::{RerankWeights, RetrievalConfig};
@@ -265,7 +267,7 @@ pub fn retrieve(
         .collect();
     let ranked_skills: Vec<&RegistryItem> = ranked
         .iter()
-        .filter(|s| s.item.kind != RegistryItemKind::Tool)
+        .filter(|s| s.item.kind == RegistryItemKind::Skill)
         .map(|s| s.item)
         .collect();
 
@@ -389,6 +391,9 @@ fn collapse_shadowed(survivors: Vec<&RegistryItem>) -> Vec<&RegistryItem> {
 /// before it can be scored — a too-risky or out-of-scope item is never merely
 /// down-ranked.
 fn passes_hard_filters(item: &RegistryItem, query: &RetrievalQuery) -> bool {
+    if item.status != RegistryStatus::Active {
+        return false;
+    }
     // Scope: System is always visible; every other tier must be in the chain.
     let scope_visible = item.scope == Scope::System || query.visible_scopes.contains(&item.scope);
     if !scope_visible {

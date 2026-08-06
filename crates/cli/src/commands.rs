@@ -218,16 +218,19 @@ pub(crate) async fn restart_daemon_if_idle(
     }
 }
 
-/// `codypendent daemon restart`: stop the running daemon (if any) and start a
-/// fresh one, via [`restart_daemon`]. If no daemon was running this simply
-/// starts one — the documented manual fallback for picking up a new build
-/// while the auto-restart driver is deferring because a run is active.
+/// `codypendent daemon restart`: atomically ask the daemon to stop only when
+/// no session or workflow run is active, then start a fresh one. A manual
+/// restart has the same no-kill safety invariant as auto-restart.
 pub async fn restart(paths: &RuntimePaths) -> anyhow::Result<()> {
-    match restart_daemon(paths).await? {
-        EnsureOutcome::AlreadyRunning => println!("daemon restarted (already running)"),
-        EnsureOutcome::Started { pid } => println!("daemon restarted (pid {pid})"),
+    match restart_daemon_if_idle(paths).await? {
+        IdleRestartOutcome::Restarted => {
+            println!("daemon restarted");
+            Ok(())
+        }
+        IdleRestartOutcome::RefusedActive(active) => anyhow::bail!(
+            "daemon restart refused: {active} run(s) are active; wait for them to finish or cancel them explicitly"
+        ),
     }
-    Ok(())
 }
 
 /// `codypendent daemon status [--json]`.
@@ -1483,6 +1486,22 @@ pub async fn eval_run(
     let suite_report =
         crate::eval::run_suite(paths, &cases, &fixture_root, routed.as_deref()).await?;
 
+    // Promotion consumes regression evidence from the daemon-owned database,
+    // not a caller-supplied boolean. Persist the exact SuiteReport produced by
+    // this harness before rendering the optional output file.
+    let evidence_pool =
+        codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db")).await?;
+    sqlx::query(
+        "INSERT INTO eval_suite_reports (id, suite, report_json, created_at) \
+         VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+    )
+    .bind(codypendent_protocol::MessageId::new().to_string())
+    .bind(suite)
+    .bind(serde_json::to_string(&suite_report)?)
+    .execute(&evidence_pool)
+    .await
+    .context("persisting eval suite evidence for promotion")?;
+
     let json = crate::eval::report_json_with_routing(&suite_report, routed.as_deref())?;
     std::fs::write(report, json)
         .with_context(|| format!("writing suite report to {}", report.display()))?;
@@ -1554,8 +1573,8 @@ pub async fn promote_propose_over_connection(
     }
 }
 
-/// `codypendent promote advance <CANDIDATE_ID> --step <STEP> [--regressed]`
-/// (Phase 7 STEP 7.5).
+/// `codypendent promote advance <CANDIDATE_ID> --step <STEP>` (Phase 7 STEP
+/// 7.5). Evidence-bearing actions carry metrics in `PromotionAction`.
 pub async fn promote_advance(
     paths: &RuntimePaths,
     candidate_id: String,

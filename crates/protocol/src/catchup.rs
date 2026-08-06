@@ -8,7 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::events::SessionEvent;
-use crate::ids::{RunId, SessionId};
+use crate::ids::{ApprovalId, RunId, SessionId};
+use crate::{ProposedAction, Risk};
 
 /// The daemon's answer to an attach: replay or snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,7 +45,20 @@ pub struct SessionProjection {
     pub last_sequence: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_runs: Vec<RunId>,
+    /// Approvals which are still actionable at the snapshot watermark. A
+    /// compacted catch-up must preserve workflow state, not merely run ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_approvals: Vec<PendingApprovalProjection>,
     pub closed: bool,
+}
+
+/// The actionable part of a pending approval carried in a compact snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingApprovalProjection {
+    pub approval_id: ApprovalId,
+    pub run_id: RunId,
+    pub action: ProposedAction,
+    pub risk: Risk,
 }
 
 #[cfg(test)]
@@ -87,6 +101,7 @@ mod tests {
                 title: "long session".to_string(),
                 last_sequence: 512,
                 active_runs: vec![RunId::new()],
+                pending_approvals: Vec::new(),
                 closed: false,
             },
         };

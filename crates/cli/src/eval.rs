@@ -83,9 +83,9 @@ use codypendent_daemon::db::open_database;
 use codypendent_daemon::model_profiles::ModelProfileStore;
 use codypendent_eval::{Assertion, EvalCase, RunObservation, SuiteReport};
 use codypendent_protocol::{
-    AgentMode, ApprovalDecision, ApprovalId, BudgetDimension, ClientRole, CommandBody,
-    DataClassification, EventBody, ModelId, Payload, ProposedAction, RunId, RunState, Subscription,
-    WorkspaceId,
+    AgentMode, ApprovalDecision, ApprovalId, ApprovalScope, BudgetDimension, ClientRole,
+    CommandBody, DataClassification, EventBody, ModelId, Payload, ProposedAction, RunId, RunState,
+    Subscription, WorkspaceId,
 };
 use codypendent_routing::{
     classify, ModelProfile, RequiredCapabilities, Router, RoutingPolicy, TaskNode, TaskSignals,
@@ -506,6 +506,29 @@ pub async fn run_case_over_connection(
         // should not happen in a session this runner owns exclusively, but
         // mirrors the same defensive check `stream_until_terminal` makes).
         builder.observe(&event.body);
+        // Eval runs are headless by definition. Exercise the real approval
+        // path, then approve once so cases which legitimately need a gated
+        // tool can reach a terminal state instead of waiting forever for a UI
+        // that this command never creates. Hard policy denials remain denials
+        // and therefore never produce an approval to resolve.
+        if let EventBody::ApprovalRequested { approval_id, .. } = &event.body {
+            let reply = conn
+                .send_command(CommandBody::ResolveApproval {
+                    approval_id: *approval_id,
+                    decision: ApprovalDecision::Approve,
+                    scope: ApprovalScope::Once,
+                })
+                .await?;
+            match reply.payload {
+                Payload::CommandAccepted { .. } => {}
+                Payload::CommandRejected(error) => anyhow::bail!(
+                    "ResolveApproval rejected: {} ({})",
+                    error.message,
+                    error.code
+                ),
+                other => anyhow::bail!("unexpected reply to ResolveApproval: {other:?}"),
+            }
+        }
         let owns_event = matches!(event_run_id(&event.body), Some(rid) if Some(rid) == run_id);
         if owns_event && is_terminal(&event.body) {
             break;
@@ -537,6 +560,8 @@ struct ObservationBuilder {
     approval_requested: bool,
     executed_commands: Vec<String>,
     network_hosts: Vec<String>,
+    denied_commands: Vec<String>,
+    denied_network_hosts: Vec<String>,
     cost_usd: f64,
     duration_ms: u64,
     /// A proposed action's approval is requested, then resolved, as two
@@ -566,6 +591,7 @@ impl ObservationBuilder {
                     }
                 }
             }
+            EventBody::ToolDenied { action, .. } => self.record_denied(action),
             EventBody::BudgetWarning {
                 dimension: BudgetDimension::Cost,
                 used,
@@ -607,11 +633,36 @@ impl ObservationBuilder {
         }
     }
 
+    fn record_denied(&mut self, action: &ProposedAction) {
+        match action {
+            ProposedAction::ExecuteCommand { program, args, .. } => {
+                let mut line = program.clone();
+                for arg in args {
+                    line.push(' ');
+                    line.push_str(arg);
+                }
+                self.denied_commands.push(line);
+            }
+            ProposedAction::NetworkRequest { destination } => {
+                self.denied_network_hosts.push(destination.clone());
+            }
+            ProposedAction::GitPush { remote, .. } => {
+                self.denied_network_hosts.push(remote.clone());
+            }
+            ProposedAction::GitHubMutation { .. } => {
+                self.denied_network_hosts.push("api.github.com".to_string());
+            }
+            _ => {}
+        }
+    }
+
     fn finish(self) -> RunObservation {
         RunObservation {
             approval_requested: self.approval_requested,
             executed_commands: self.executed_commands,
+            denied_commands: self.denied_commands,
             network_hosts: self.network_hosts,
+            denied_network_hosts: self.denied_network_hosts,
             cost_usd: self.cost_usd,
             duration_ms: self.duration_ms,
             ..Default::default()

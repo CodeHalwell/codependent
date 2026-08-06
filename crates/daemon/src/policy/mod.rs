@@ -104,6 +104,10 @@ pub struct PolicyDecision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_grant: Option<CapabilityGrant>,
     pub policy_version: PolicyVersion,
+    /// Whether a human `Run`-scoped approval may approve an identical later
+    /// action. `AlwaysApproval` dispositions set this false.
+    #[serde(default)]
+    pub approval_reusable: bool,
 }
 
 /// A mode-derived restriction layered on top of the file policy. Modes
@@ -311,7 +315,9 @@ impl PolicyEngine {
         match action {
             ProposedAction::ReadFiles { paths } => self.eval_read(paths, ctx),
             ProposedAction::WritePatch { .. } => self.eval_write(ctx),
-            ProposedAction::ExecuteCommand { program, .. } => self.eval_command(program, ctx),
+            ProposedAction::ExecuteCommand { program, args, .. } => {
+                self.eval_command(program, args, ctx)
+            }
             ProposedAction::NetworkRequest { destination } => self.eval_network(destination, ctx),
             ProposedAction::GitCommit { .. } => self.eval_git(GitOp::Commit, ctx),
             ProposedAction::GitPush { .. } => self.eval_git(GitOp::Push, ctx),
@@ -344,6 +350,7 @@ impl PolicyEngine {
             )],
             capability_grant: None,
             policy_version: self.version.clone(),
+            approval_reusable: false,
         }
     }
 
@@ -361,6 +368,7 @@ impl PolicyEngine {
             )],
             capability_grant: None,
             policy_version: self.version.clone(),
+            approval_reusable: false,
         }
     }
 
@@ -416,7 +424,7 @@ impl PolicyEngine {
         )
     }
 
-    fn eval_command(&self, program: &str, ctx: &EvalContext) -> PolicyDecision {
+    fn eval_command(&self, program: &str, args: &[String], ctx: &EvalContext) -> PolicyDecision {
         if !ctx.mode.command_allowed {
             return self.deny(PolicyReason::new(
                 "policy.command-denied-by-mode",
@@ -430,6 +438,78 @@ impl PolicyEngine {
                 format!("`{program}` is not in the shell allow-list"),
             ));
         }
+        if program == "git" {
+            let subcommand = args
+                .iter()
+                .find(|arg| !arg.starts_with('-'))
+                .map(String::as_str);
+            let mutating = matches!(
+                subcommand,
+                Some(
+                    "add"
+                        | "am"
+                        | "apply"
+                        | "branch"
+                        | "checkout"
+                        | "cherry-pick"
+                        | "clean"
+                        | "commit"
+                        | "merge"
+                        | "mv"
+                        | "rebase"
+                        | "reset"
+                        | "restore"
+                        | "revert"
+                        | "rm"
+                        | "stash"
+                        | "switch"
+                        | "tag"
+                        | "worktree"
+                )
+            );
+            if mutating && !ctx.mode.write_allowed {
+                return self.deny(PolicyReason::new(
+                    "policy.git-shell-write-denied-by-mode",
+                    "the active mode forbids repository mutations through shell git",
+                ));
+            }
+            let networked = matches!(
+                subcommand,
+                Some("clone" | "fetch" | "pull" | "push" | "ls-remote" | "submodule")
+            );
+            if networked && !ctx.mode.network_allowed {
+                return self.deny(PolicyReason::new(
+                    "policy.git-shell-network-denied-by-mode",
+                    "the active mode forbids networked git commands",
+                ));
+            }
+
+            let force_push = subcommand == Some("push")
+                && args.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "-f" | "--force" | "--force-with-lease" | "--force-if-includes"
+                    ) || arg.starts_with("--force-with-lease=")
+                });
+            if force_push {
+                return self.command_disposition(self.merged.git_force_push, scope, "force-push");
+            }
+            let delete_branch = (subcommand == Some("branch")
+                && args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "-d" | "-D" | "--delete")))
+                || (subcommand == Some("push")
+                    && args
+                        .iter()
+                        .any(|arg| arg == "--delete" || arg.starts_with(':')));
+            if delete_branch {
+                return self.command_disposition(
+                    self.merged.git_delete_branch,
+                    scope,
+                    "branch deletion",
+                );
+            }
+        }
         // The built-in default requires approval for every allow-listed command.
         self.require(
             Capability::CommandExecute(scope),
@@ -438,6 +518,35 @@ impl PolicyEngine {
                 format!("`{program}` is allow-listed; shell execution requires approval"),
             ),
         )
+    }
+
+    fn command_disposition(
+        &self,
+        disposition: ApprovalAction,
+        scope: CommandScope,
+        operation: &str,
+    ) -> PolicyDecision {
+        let capability = Capability::CommandExecute(scope);
+        match disposition {
+            ApprovalAction::Allow | ApprovalAction::Approval => self.require(
+                capability,
+                PolicyReason::new(
+                    "policy.git-shell-requires-approval",
+                    format!("git {operation} requires approval"),
+                ),
+            ),
+            ApprovalAction::AlwaysApproval => self.require_once(
+                capability,
+                PolicyReason::new(
+                    "policy.git-shell-always-requires-approval",
+                    format!("git {operation} requires a fresh approval every time"),
+                ),
+            ),
+            ApprovalAction::Deny => self.deny(PolicyReason::new(
+                "policy.git-shell-denied",
+                format!("git {operation} is denied by policy"),
+            )),
+        }
     }
 
     fn eval_network(&self, destination: &str, ctx: &EvalContext) -> PolicyDecision {
@@ -526,11 +635,18 @@ impl PolicyEngine {
                     format!("MCP server `{server}` is allow-listed by policy"),
                 ),
             ),
-            ApprovalAction::Approval | ApprovalAction::AlwaysApproval => self.require(
+            ApprovalAction::Approval => self.require(
                 capability,
                 PolicyReason::new(
                     "policy.mcp-requires-approval",
                     format!("MCP tool calls to `{server}` require approval"),
+                ),
+            ),
+            ApprovalAction::AlwaysApproval => self.require_once(
+                capability,
+                PolicyReason::new(
+                    "policy.mcp-always-requires-approval",
+                    format!("MCP tool calls to `{server}` require a fresh approval every time"),
                 ),
             ),
             ApprovalAction::Deny => self.deny(PolicyReason::new(
@@ -559,11 +675,18 @@ impl PolicyEngine {
                     format!("git {name} is permitted by policy"),
                 ),
             ),
-            ApprovalAction::Approval | ApprovalAction::AlwaysApproval => self.require(
+            ApprovalAction::Approval => self.require(
                 capability,
                 PolicyReason::new(
                     "policy.git-requires-approval",
                     format!("git {name} requires approval"),
+                ),
+            ),
+            ApprovalAction::AlwaysApproval => self.require_once(
+                capability,
+                PolicyReason::new(
+                    "policy.git-always-requires-approval",
+                    format!("git {name} requires a fresh approval every time"),
                 ),
             ),
             ApprovalAction::Deny => self.deny(PolicyReason::new(
@@ -579,6 +702,7 @@ impl PolicyEngine {
             reasons: vec![reason],
             capability_grant: Some(self.grant(capability)),
             policy_version: self.version.clone(),
+            approval_reusable: false,
         }
     }
 
@@ -588,6 +712,17 @@ impl PolicyEngine {
             reasons: vec![reason],
             capability_grant: Some(self.grant(capability)),
             policy_version: self.version.clone(),
+            approval_reusable: true,
+        }
+    }
+
+    fn require_once(&self, capability: Capability, reason: PolicyReason) -> PolicyDecision {
+        PolicyDecision {
+            decision: Decision::RequireApproval,
+            reasons: vec![reason],
+            capability_grant: Some(self.grant(capability)),
+            policy_version: self.version.clone(),
+            approval_reusable: false,
         }
     }
 
@@ -597,6 +732,7 @@ impl PolicyEngine {
             reasons: vec![reason],
             capability_grant: None,
             policy_version: self.version.clone(),
+            approval_reusable: false,
         }
     }
 

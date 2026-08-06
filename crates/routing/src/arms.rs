@@ -23,7 +23,7 @@ pub enum RouteArm {
     StaticStrongest,
     /// Always the cheapest eligible model.
     StaticCheap,
-    /// The utility router (cheapest above threshold), no escalation.
+    /// The highest-utility router, no escalation.
     Router,
     /// The router plus cascading escalation on objective failure.
     RouterEscalation,

@@ -148,11 +148,24 @@ impl WorkflowConductor {
             }
             match self.drive(pool, &run.id, executor, observer).await {
                 Ok(_) => report.driven += 1,
-                Err(ConductorError::NoManifest(_)) => report.skipped_no_manifest += 1,
-                Err(ConductorError::Compile(_)) => report.skipped_uncompilable += 1,
+                Err(ConductorError::NoManifest(_)) => {
+                    self.store
+                        .set_run_state(pool, &run.id, WorkflowRunState::Failed)
+                        .await?;
+                    report.skipped_no_manifest += 1;
+                }
+                Err(ConductorError::Compile(_)) => {
+                    self.store
+                        .set_run_state(pool, &run.id, WorkflowRunState::Failed)
+                        .await?;
+                    report.skipped_uncompilable += 1;
+                }
                 Err(ConductorError::Store(WorkflowStoreError::GraphSignatureChanged {
                     ..
                 })) => {
+                    self.store
+                        .set_run_state(pool, &run.id, WorkflowRunState::Failed)
+                        .await?;
                     report.signature_changed += 1;
                 }
                 Err(_) => report.errored += 1,

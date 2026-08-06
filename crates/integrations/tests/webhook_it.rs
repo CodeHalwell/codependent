@@ -69,12 +69,13 @@ async fn forged_signature_rejected() {
 
 #[tokio::test]
 async fn replay_is_idempotent_sqlite() {
+    let secret = b"sqlite-secret";
     let (_dir, pool) = temp_pool().await;
     let store = Arc::new(SqliteDeliveryStore::new(pool.clone()));
-    let ingestor = WebhookIngestor::new(store, None, false);
+    let ingestor = WebhookIngestor::new(store, Some(secret.to_vec()), false);
     let body = pull_request_body();
     let headers = DeliveryHeaders {
-        signature: None,
+        signature: Some(sign(secret, &body)),
         event_type: "pull_request".to_string(),
         delivery_id: "same-guid".to_string(),
     };
@@ -96,17 +97,16 @@ async fn replay_is_idempotent_sqlite() {
 
 #[tokio::test]
 async fn policy_off_no_trigger() {
+    let secret = b"policy-secret";
     let store = Arc::new(InMemoryDeliveryStore::default());
-    let ingestor = WebhookIngestor::new(store, None, false);
+    let ingestor = WebhookIngestor::new(store, Some(secret.to_vec()), false);
+    let body = pull_request_body();
     let headers = DeliveryHeaders {
-        signature: None,
+        signature: Some(sign(secret, &body)),
         event_type: "pull_request".to_string(),
         delivery_id: "guid-policy".to_string(),
     };
-    let outcome = ingestor
-        .ingest(&headers, &pull_request_body())
-        .await
-        .expect("ingest");
+    let outcome = ingestor.ingest(&headers, &body).await.expect("ingest");
     match outcome {
         IngestOutcome::Accepted { trigger, event } => {
             assert!(!trigger);

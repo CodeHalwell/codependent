@@ -7,7 +7,9 @@
 //! The reducer ([`crate::reduce::reduce`]) is the only place that reads an
 //! `Action`, and it performs no I/O.
 
-use codypendent_protocol::{ApprovalScope, DocumentId, DocumentMutation, RunId, SessionEvent};
+use codypendent_protocol::{
+    ApprovalScope, DocumentId, DocumentMutation, PendingApprovalProjection, RunId, SessionEvent,
+};
 
 use crate::state::{BlackboardItemCard, DocBlockView, DocSuggestionView, KeyStatus, Pane};
 
@@ -38,6 +40,7 @@ pub enum Action {
         title: String,
         closed: bool,
         runs: Vec<RunId>,
+        pending_approvals: Vec<PendingApprovalProjection>,
     },
     /// A periodic timer tick (spinner animation, elapsed timers). No I/O.
     Tick,

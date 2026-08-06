@@ -41,6 +41,10 @@ pub struct RestGitHubClient {
     http: Client,
     base_url: String,
     token: GitHubToken,
+    /// Serialize list-then-create sequences within this client. GitHub exposes
+    /// no idempotency-key header for these endpoints, so overlapping retries
+    /// must not both observe an empty list and POST.
+    create_lock: tokio::sync::Mutex<()>,
 }
 
 /// The wrapper GitHub returns from the check-runs endpoint.
@@ -69,6 +73,7 @@ impl RestGitHubClient {
             http,
             base_url,
             token,
+            create_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -176,14 +181,24 @@ impl RestGitHubClient {
             self.base_url, path_and_query, separator
         );
         let mut items: Vec<T> = Vec::new();
-        for _ in 0..MAX_LIST_PAGES {
+        for page_index in 0..MAX_LIST_PAGES {
             let response = self.send(self.request(Method::GET, &url)).await?;
             let next = next_page_link(response.headers());
             let bytes = read_bounded(response, MAX_JSON_BODY_BYTES).await?;
             let page: Vec<T> = serde_json::from_slice(&bytes)?;
             items.extend(page);
             match next {
-                Some(next_url) if same_origin(&next_url, &self.base_url) => url = next_url,
+                Some(next_url) if same_origin(&next_url, &self.base_url) => {
+                    if page_index + 1 == MAX_LIST_PAGES {
+                        return Err(GitHubError::Api {
+                            status: 0,
+                            message: format!(
+                                "refusing an incomplete idempotency scan after {MAX_LIST_PAGES} pages"
+                            ),
+                        });
+                    }
+                    url = next_url;
+                }
                 _ => break,
             }
         }
@@ -371,14 +386,24 @@ impl GitHubApi for RestGitHubClient {
             self.base_url, repo.owner, repo.repo
         );
         let mut runs: Vec<model::CheckRun> = Vec::new();
-        for _ in 0..MAX_LIST_PAGES {
+        for page_index in 0..MAX_LIST_PAGES {
             let response = self.send(self.request(Method::GET, &url)).await?;
             let next = next_page_link(response.headers());
             let bytes = read_bounded(response, MAX_JSON_BODY_BYTES).await?;
             let page: CheckRunsResponse = serde_json::from_slice(&bytes)?;
             runs.extend(page.check_runs);
             match next {
-                Some(next_url) if same_origin(&next_url, &self.base_url) => url = next_url,
+                Some(next_url) if same_origin(&next_url, &self.base_url) => {
+                    if page_index + 1 == MAX_LIST_PAGES {
+                        return Err(GitHubError::Api {
+                            status: 0,
+                            message: format!(
+                                "refusing an incomplete idempotency scan after {MAX_LIST_PAGES} pages"
+                            ),
+                        });
+                    }
+                    url = next_url;
+                }
                 _ => break,
             }
         }
@@ -416,6 +441,7 @@ impl GitHubApi for RestGitHubClient {
         idempotency_key: &str,
     ) -> Result<model::ReviewComment, GitHubError> {
         validate_repo(repo)?;
+        let _create_guard = self.create_lock.lock().await;
         // Idempotency: return a prior comment carrying this key, if one exists.
         for comment in self.list_review_comments(repo, number).await? {
             if idempotency::body_matches_key(&comment.body, idempotency_key) {
@@ -442,6 +468,7 @@ impl GitHubApi for RestGitHubClient {
         idempotency_key: &str,
     ) -> Result<model::PullRequest, GitHubError> {
         validate_repo(repo)?;
+        let _create_guard = self.create_lock.lock().await;
         // Idempotency: return a prior PR carrying this key, if one exists. The
         // scan pages through ALL states (a closed marked PR still proves the
         // create happened) — first-page-only, open-only scans silently missed
@@ -454,7 +481,7 @@ impl GitHubApi for RestGitHubClient {
             .await?;
         for pr in existing {
             if let Some(body) = &pr.body {
-                if idempotency::body_matches_key(body, idempotency_key) {
+                if pr.state == "open" && idempotency::body_matches_key(body, idempotency_key) {
                     return Ok(pr);
                 }
             }
@@ -493,6 +520,7 @@ impl GitHubApi for RestGitHubClient {
         idempotency_key: &str,
     ) -> Result<model::CheckRun, GitHubError> {
         validate_repo(repo)?;
+        let _create_guard = self.create_lock.lock().await;
         // Idempotency: check runs have no free-text body to mark, so the key
         // rides in `external_id`, which GitHub stores verbatim and serves back.
         // A prior run on this commit carrying the key proves the create

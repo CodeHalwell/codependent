@@ -132,6 +132,11 @@ pub struct RuntimeExecutor {
     /// (cheap-to-clone) executor shares one registry — the clone the server holds
     /// must see the handle the worker task registered.
     cancellations: Arc<Mutex<HashMap<RunId, CancellationHandle>>>,
+    /// Cancellation commands accepted before `spawn_run` reaches the executor.
+    /// Entries are consumed when the corresponding run is registered.
+    pending_cancellations: Arc<Mutex<HashSet<RunId>>>,
+    /// Pause commands accepted before the worker installs its control handle.
+    pending_pauses: Arc<Mutex<HashSet<RunId>>>,
     /// The GitHub client the `github.*` tools call, if a personal-mode token was
     /// discovered at startup (Phase 3 STEP 3.2). `None` leaves those tools
     /// unavailable and the run behaves exactly as before.
@@ -259,6 +264,8 @@ impl RuntimeExecutor {
             approvals,
             scanned: Arc::new(Mutex::new(scanned)),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+            pending_cancellations: Arc::new(Mutex::new(HashSet::new())),
+            pending_pauses: Arc::new(Mutex::new(HashSet::new())),
             github: None,
             mcp: None,
             search: None,
@@ -288,6 +295,21 @@ impl RuntimeExecutor {
     /// drives run in the background, so this returns as soon as they are spawned.
     pub async fn recover_workflows(&self) -> anyhow::Result<usize> {
         Ok(self.workflow_host.recover().await?)
+    }
+
+    /// Re-arm approval-gated document publications whose durable continuation
+    /// survived a daemon restart.
+    pub async fn recover_document_publications(&self) -> anyhow::Result<usize> {
+        let mut publisher = crate::publish::KnowledgePublisher::new(
+            self.pool.clone(),
+            self.approvals.clone(),
+            self.repository_root.clone(),
+            artifact_store(&self.paths),
+        );
+        if let Some(github) = &self.github {
+            publisher = publisher.with_github(github.clone());
+        }
+        publisher.recover_pending().await
     }
 
     /// Inject the GitHub client (Phase 3 STEP 3.2). When set, the agent loop
@@ -393,12 +415,23 @@ impl RuntimeExecutor {
     /// held across an await — and only the first caller for a repository scans;
     /// later runs reuse the graph.
     async fn ensure_scanned(&self, repository: RepositoryId, root: &Path) {
-        let newly = {
-            let mut seen = self.scanned.lock().expect("scanned set lock");
-            seen.insert(repository)
+        let already_scanned = {
+            let seen = self.scanned.lock().expect("scanned set lock");
+            seen.contains(&repository)
         };
-        if newly {
-            scan::scan_repository(&self.pool, repository, root).await;
+        if already_scanned {
+            return;
+        }
+        match scan::scan_repository(&self.pool, repository, root).await {
+            Ok(()) => {
+                self.scanned
+                    .lock()
+                    .expect("scanned set lock")
+                    .insert(repository);
+            }
+            Err(error) => {
+                warn!(%repository, %error, "code-graph scan failed; a later run will retry");
+            }
         }
     }
 
@@ -1140,6 +1173,28 @@ fn run_transcript_excerpt(events: &[codypendent_protocol::SessionEvent], run_id:
 impl RunExecutor for RuntimeExecutor {
     fn spawn_run(&self, launch: RunLaunch) {
         let executor = self.clone();
+        let run_id = launch.run_id;
+        let (handle, token) = cancellation();
+        if executor
+            .pending_cancellations
+            .lock()
+            .expect("pending cancellations registry lock")
+            .remove(&run_id)
+        {
+            handle.cancel();
+        } else if executor
+            .pending_pauses
+            .lock()
+            .expect("pending pauses registry lock")
+            .remove(&run_id)
+        {
+            handle.pause();
+        }
+        executor
+            .cancellations
+            .lock()
+            .expect("cancellations registry lock")
+            .insert(run_id, handle);
         tokio::spawn(async move {
             // Carry the identity out before `launch` is moved into the worker.
             let session_id = launch.session_id;
@@ -1158,13 +1213,6 @@ impl RunExecutor for RuntimeExecutor {
             // `CancelRun` accepted at any point after this run was launched can
             // stop it. The token drives `execute`; the handle stays in the shared
             // registry for `cancel_run` to fire.
-            let (handle, token) = cancellation();
-            executor
-                .cancellations
-                .lock()
-                .expect("cancellations registry lock")
-                .insert(run_id, handle);
-
             // Warm this repository's code graph the first time the daemon serves a
             // run for it, so the context below opens with the right repository map.
             executor
@@ -1244,6 +1292,16 @@ impl RunExecutor for RuntimeExecutor {
                 .lock()
                 .expect("cancellations registry lock")
                 .remove(&run_id);
+            executor
+                .pending_cancellations
+                .lock()
+                .expect("pending cancellations registry lock")
+                .remove(&run_id);
+            executor
+                .pending_pauses
+                .lock()
+                .expect("pending pauses registry lock")
+                .remove(&run_id);
 
             // The run has now reached a terminal state (either the loop finished
             // it, or `fail_run` above did). Harvest any curated memories from its
@@ -1266,6 +1324,42 @@ impl RunExecutor for RuntimeExecutor {
             .get(&run_id)
         {
             handle.cancel();
+        } else {
+            self.pending_cancellations
+                .lock()
+                .expect("pending cancellations registry lock")
+                .insert(run_id);
+        }
+    }
+
+    fn pause_run(&self, run_id: RunId) {
+        if let Some(handle) = self
+            .cancellations
+            .lock()
+            .expect("run control registry lock")
+            .get(&run_id)
+        {
+            handle.pause();
+        } else {
+            self.pending_pauses
+                .lock()
+                .expect("pending pauses registry lock")
+                .insert(run_id);
+        }
+    }
+
+    fn resume_run(&self, run_id: RunId) {
+        self.pending_pauses
+            .lock()
+            .expect("pending pauses registry lock")
+            .remove(&run_id);
+        if let Some(handle) = self
+            .cancellations
+            .lock()
+            .expect("run control registry lock")
+            .get(&run_id)
+        {
+            handle.resume();
         }
     }
 
@@ -1416,12 +1510,22 @@ pub(crate) fn run_journal(pool: &SqlitePool, approvals: &ApprovalBroker) -> RunJ
         move |session: SessionId, actor: Actor, body: EventBody| {
             let pool = persist_pool.clone();
             async move {
-                let event =
-                    ledger::append_next_event(&pool, session, &actor, &body, Utc::now()).await?;
-                if let EventBody::RunStateChanged { run_id, state } = &event.body {
-                    projections::set_run_state(&pool, *run_id, *state).await?;
+                match body {
+                    EventBody::RunStateChanged { run_id, state } => {
+                        ledger::append_run_state_changed(
+                            &pool,
+                            session,
+                            &actor,
+                            run_id,
+                            state,
+                            Utc::now(),
+                        )
+                        .await
+                    }
+                    body => {
+                        ledger::append_next_event(&pool, session, &actor, &body, Utc::now()).await
+                    }
                 }
-                Ok(event)
             }
         },
         move |req: ApprovalRequest| {
@@ -1429,7 +1533,7 @@ pub(crate) fn run_journal(pool: &SqlitePool, approvals: &ApprovalBroker) -> RunJ
             let broker = approve_broker.clone();
             async move {
                 let id = broker
-                    .request(
+                    .request_with_reuse(
                         &pool,
                         req.session_id,
                         req.run_id,
@@ -1437,6 +1541,7 @@ pub(crate) fn run_journal(pool: &SqlitePool, approvals: &ApprovalBroker) -> RunJ
                         req.risk,
                         req.capabilities,
                         None,
+                        req.allow_run_reuse,
                     )
                     .await?;
                 Ok(id)

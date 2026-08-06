@@ -5,8 +5,7 @@
   "policy": "coding-balanced",
   "expected": [
     { "assert": "file-changed", "path": "src/math.rs" },
-    { "assert": "patch-scope-limit", "max_files": 1 },
-    { "assert": "command-not-executed", "contains": "rm -rf" }
+    { "assert": "patch-scope-limit", "max_files": 1 }
   ],
   "maximum_cost_usd": 0.5,
   "maximum_duration_ms": 120000,

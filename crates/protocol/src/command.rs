@@ -364,29 +364,38 @@ pub enum CommandBody {
 
 /// One legal state-machine transition to attempt via `AdvancePromotion`
 /// (Phase 7 STEP 7.5). Mirrors `codypendent_eval::promote::Candidate`'s
-/// methods exactly; `regressed`/canary-observation verdicts are supplied by
-/// the caller — this command *records* a result, it does not compute one (see
-/// the crate-level docs on why live shadow/canary traffic capture is a
-/// separate, later concern).
+/// methods exactly. Regression and canary verdicts are computed from durable
+/// evidence by the daemon, never supplied as client booleans.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum PromotionAction {
-    /// Run the offline regression suite; `regressed` is the caller's verdict.
-    RunRegression { regressed: bool },
+    /// Evaluate the latest durable SuiteReport on the daemon.
+    RunRegression,
+    /// Record the Controller's permission review before evaluation.
+    ReviewPermissions,
     /// Begin the shadow run.
     StartShadow,
     /// Begin the limited canary.
     StartCanary,
-    /// Record one canary signal observation; `regressed` is the caller's
-    /// verdict. A regression auto-rolls-back immediately (no human needed to
-    /// *stop* a bad change).
-    ObserveCanary { regressed: bool },
-    /// Finish the canary and assemble the comparison. Refused if no
-    /// observation was ever recorded (a canary must not "pass" unobserved).
+    /// Record objective canary evidence. The daemon derives the verdict.
+    ObserveCanary { metrics: CanaryMetrics },
+    /// Finish the canary and assemble the comparison. Refused until the
+    /// server has accumulated the required measured sample population.
     FinishCanary,
     #[serde(other)]
     Unknown,
+}
+
+/// Objective canary metrics compared by the daemon. Rates are basis points
+/// (0..=10,000); latency is milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryMetrics {
+    pub sample_count: u64,
+    pub error_rate_bps: u16,
+    pub baseline_error_rate_bps: u16,
+    pub p95_latency_ms: u64,
+    pub baseline_p95_latency_ms: u64,
 }
 
 #[cfg(test)]
@@ -638,7 +647,11 @@ mod tests {
         });
         round_trip(CommandBody::AdvancePromotion {
             candidate_id: "cand-abc123".to_string(),
-            action: PromotionAction::RunRegression { regressed: false },
+            action: PromotionAction::RunRegression,
+        });
+        round_trip(CommandBody::AdvancePromotion {
+            candidate_id: "cand-abc123".to_string(),
+            action: PromotionAction::ReviewPermissions,
         });
         round_trip(CommandBody::AdvancePromotion {
             candidate_id: "cand-abc123".to_string(),
@@ -650,7 +663,15 @@ mod tests {
         });
         round_trip(CommandBody::AdvancePromotion {
             candidate_id: "cand-abc123".to_string(),
-            action: PromotionAction::ObserveCanary { regressed: true },
+            action: PromotionAction::ObserveCanary {
+                metrics: CanaryMetrics {
+                    sample_count: 100,
+                    error_rate_bps: 300,
+                    baseline_error_rate_bps: 100,
+                    p95_latency_ms: 240,
+                    baseline_p95_latency_ms: 100,
+                },
+            },
         });
         round_trip(CommandBody::AdvancePromotion {
             candidate_id: "cand-abc123".to_string(),

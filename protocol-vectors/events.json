@@ -344,6 +344,35 @@
     "occurred_at": "2026-01-01T00:00:00Z",
     "sequence": 9
   },
+  "EventBody_ToolDenied": {
+    "actor": {
+      "agent_id": "c0000000-0000-0000-0000-000000000001",
+      "model": "claude-sonnet-5",
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "Agent"
+    },
+    "body": {
+      "action": {
+        "args": [
+          "-rf",
+          "target"
+        ],
+        "cwd": null,
+        "environment": [],
+        "program": "rm",
+        "type": "ExecuteCommand"
+      },
+      "reasons": [
+        "program is not allow-listed"
+      ],
+      "run_id": "30000000-0000-0000-0000-000000000001",
+      "type": "ToolDenied"
+    },
+    "causation_id": "40000000-0000-0000-0000-000000000001",
+    "correlation_id": "b0000000-0000-0000-0000-000000000001",
+    "occurred_at": "2026-01-01T00:00:00Z",
+    "sequence": 9
+  },
   "EventBody_ToolProposed": {
     "actor": {
       "agent_id": "c0000000-0000-0000-0000-000000000001",

@@ -116,6 +116,12 @@ pub trait RunExecutor: Send + Sync {
     /// server path (`server::run`, the daemon's own tests) drives no runtime loop.
     fn cancel_run(&self, _run_id: RunId) {}
 
+    /// Pause an in-flight run at the runtime's next safe point.
+    fn pause_run(&self, _run_id: RunId) {}
+
+    /// Resume a run previously paused through [`Self::pause_run`].
+    fn resume_run(&self, _run_id: RunId) {}
+
     /// The shared event fan-out and approval broker this executor publishes a
     /// run's events through and resolves approvals against.
     ///

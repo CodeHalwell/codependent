@@ -1,6 +1,6 @@
 //! The registry: per-server lazy spawn, cached tool lists, and the single
-//! respawn-and-retry policy on a dead transport — behind the [`McpBridge`]
-//! trait the runtime consumes (the `GitHubApi` precedent).
+//! fail-closed transport reset policy — behind the [`McpBridge`] trait the
+//! runtime consumes (the `GitHubApi` precedent).
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -248,28 +248,29 @@ impl McpBridge for McpRegistry {
 
     async fn call_tool(&self, server: &str, tool: &str, args: Value) -> Result<String, McpError> {
         match self.call_once(server, tool, &args).await {
-            Err(error) if is_transport_death(&error) => {
+            Err(error) if invalidates_transport(&error) => {
                 tracing::warn!(
                     server = %server,
                     tool = %tool,
                     %error,
-                    "mcp transport died mid-call; respawning and retrying once"
+                    "mcp transport became unreliable; resetting without retrying an ambiguous effect"
                 );
                 self.mark_cold(server).await;
-                self.call_once(server, tool, &args).await
+                Err(error)
             }
             outcome => outcome,
         }
     }
 }
 
-/// A dead transport (EOF / write failure) justifies one respawn+retry; a
-/// timeout, a JSON-RPC error, or a tool-level failure does not — the server is
-/// alive and answered.
-fn is_transport_death(error: &McpError) -> bool {
+/// EOF, write failure, or timeout invalidates the cached transport. The
+/// current tool call is not replayed because the remote effect is ambiguous;
+/// the next access starts a fresh process. JSON-RPC and tool errors prove the
+/// server answered and therefore keep the transport warm.
+fn invalidates_transport(error: &McpError) -> bool {
     matches!(
         error,
-        McpError::TransportClosed { .. } | McpError::Io { .. }
+        McpError::TransportClosed { .. } | McpError::Io { .. } | McpError::Timeout { .. }
     )
 }
 
@@ -469,20 +470,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dead_transport_respawns_and_retries_once() {
+    async fn a_dead_transport_resets_and_the_next_call_respawns() {
         let spawns = Arc::new(AtomicUsize::new(0));
         let registry = scripted_registry(Behavior::HangUpOnFirstSpawnOnly, Arc::clone(&spawns));
+
+        let error = registry
+            .call_tool("fake", "search", json!({}))
+            .await
+            .expect_err("an ambiguous call is never replayed automatically");
+        assert!(matches!(error, McpError::TransportClosed { .. }));
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
 
         let text = registry
             .call_tool("fake", "search", json!({}))
             .await
-            .expect("respawn + retry succeeds");
+            .expect("the next independent call uses a fresh transport");
         assert_eq!(text, "ok from tool");
         assert_eq!(spawns.load(Ordering::SeqCst), 2, "spawned exactly twice");
     }
 
     #[tokio::test]
-    async fn a_second_dead_transport_surfaces_the_error() {
+    async fn repeated_dead_transports_are_reset_without_replaying_calls() {
         let spawns = Arc::new(AtomicUsize::new(0));
         let registry = scripted_registry(Behavior::HangUpOnCall, Arc::clone(&spawns));
 
@@ -496,10 +504,17 @@ mod tests {
         );
         assert_eq!(
             spawns.load(Ordering::SeqCst),
-            2,
-            "one retry, then the error"
+            1,
+            "the ambiguous call is not retried"
         );
         assert!(error.to_string().contains("fake"), "names the server");
+
+        let second = registry
+            .call_tool("fake", "search", json!({}))
+            .await
+            .expect_err("a fresh process that also dies is surfaced again");
+        assert!(matches!(second, McpError::TransportClosed { .. }));
+        assert_eq!(spawns.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

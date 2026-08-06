@@ -23,7 +23,7 @@ members = [
 exclude = ["benches/crdt-bench"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # 1.88 is the effective MSRV: the `agent-client-protocol` dep (ACP client) is
 # edition-2024 / requires Rust 1.88. The pinned toolchain (rust-toolchain.toml)
@@ -145,6 +145,7 @@ directories = "6"
 
 # Test utilities
 tempfile = "3"
+rustix = { version = "1", features = ["fs"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
