@@ -707,6 +707,9 @@ fn drain_to_void(reader: &mut impl Read) {
 fn kill_process_group(pid: u32) {
     let _ = Command::new("kill")
         .arg("-KILL")
+        // Keep the negative pgid in operand position. Without `--`, procps
+        // `kill` may interpret it as an option and broadcast SIGKILL via pid -1.
+        .arg("--")
         .arg(format!("-{pid}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())

@@ -73,11 +73,9 @@ jobs:
       - name: Run tests
         # Bounded so a test that hangs only under CI fails fast and legibly (as a
         # timeout) instead of running to the 6 h job limit. The whole suite runs
-        # quickly locally. Keep the harness serial on the smaller hosted runner:
-        # several integration tests spawn child processes, and running those in
-        # parallel can starve the runner agent before it can flush a useful log.
+        # in well under a minute locally.
         timeout-minutes: 15
-        run: cargo test --workspace --all-features -- --test-threads=1
+        run: cargo test --workspace --all-features
 
   # Phase 7 STEP 7.1 eval-harness smoke: already covered by `test`'s
   # workspace-wide sweep, but broken out as its own job (like `deny`) so the
