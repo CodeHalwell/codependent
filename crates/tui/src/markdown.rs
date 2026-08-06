@@ -54,31 +54,22 @@ pub enum SyntaxRole {
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use synoptic::{from_extension, TokOpt};
 
-/// Test-only instrumentation: counts `parse` invocations so a later test (the
-/// finalize-cache / theme-change-no-reparse test) can assert a theme change
-/// alone triggers no re-parse.
+// Test-only, per-test-thread instrumentation. A thread-local counter keeps
+// parallel renderer tests from being mistaken for work performed by the
+// code path under test.
 #[cfg(test)]
-pub static PARSE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+std::thread_local! {
+    static PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-/// Test-only: serializes the tests that reset then assert on `PARSE_CALLS`
-/// (`render::theme_change_re_renders_without_re_parsing`,
-/// `reduce::finalize_is_idempotent`) against EACH OTHER. `PARSE_CALLS` is one
-/// process-wide counter and `cargo test` runs test functions in parallel by
-/// default, so without this, two such tests running concurrently could
-/// interleave their reset/read and flake. `parse()` itself does NOT take this
-/// lock (only increments the atomic), so a test holding it across its own
-/// finalize step cannot deadlock against itself; each PARSE_CALLS-dependent
-/// test takes this lock at its start, before it resets the counter.
 #[cfg(test)]
-pub static PARSE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub fn reset_parse_calls() {
+    PARSE_CALLS.set(0);
+}
 
-/// Acquire [`PARSE_LOCK`], recovering from a poisoned lock (a prior panic
-/// while holding it) rather than cascading that failure into the other
-/// PARSE_CALLS-dependent test — the guarded data is a unit `()`, so a panic
-/// leaves nothing inconsistent behind.
 #[cfg(test)]
-pub fn lock_parse_calls() -> std::sync::MutexGuard<'static, ()> {
-    PARSE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+pub fn parse_calls() -> usize {
+    PARSE_CALLS.get()
 }
 
 /// Parse a finalized message's raw text into semantic `RichLine`s. Theme- and
@@ -87,7 +78,7 @@ pub fn lock_parse_calls() -> std::sync::MutexGuard<'static, ()> {
 /// text, never a panic.
 pub fn parse(text: &str) -> Vec<RichLine> {
     #[cfg(test)]
-    PARSE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PARSE_CALLS.set(PARSE_CALLS.get() + 1);
 
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
     let mut b = Builder::default();

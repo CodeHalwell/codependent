@@ -37,7 +37,7 @@ pub mod terminal;
 pub mod theme;
 pub mod theme_pack;
 
-pub use action::{Action, Intent, KeyTarget, SecretKey};
+pub use action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, WorkflowNodeUpdate};
 pub use input::{map_event, pane_at, KeyBinding, KEY_BINDINGS};
 pub use markdown::{RichLine, RichSpan, SpanRole, SyntaxRole};
 pub use reduce::reduce;
@@ -47,6 +47,7 @@ pub use state::{
     DocSuggestionView, GraphEdgeCard, InputMode, KeyStatus, LayoutMode, MemoryCard, ModelCard,
     ModelLocationLabel, Overlay, Pane, PatchSummary, PendingApproval, ProviderCard, RunView,
     SkillCard, StatusProjection, ToolCard, ToolStatus, TranscriptEntry, WorkflowNodeCard,
+    EDGE_PAGE_SIZE,
 };
 pub use terminal::TerminalGuard;
 pub use theme::{ColorDepth, Theme, ThemePreferences, ThemeVariant};

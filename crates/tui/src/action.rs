@@ -9,7 +9,17 @@
 
 use codypendent_protocol::{ApprovalScope, DocumentId, DocumentMutation, RunId, SessionEvent};
 
-use crate::state::{DocBlockView, DocSuggestionView, KeyStatus, Pane};
+use crate::state::{BlackboardItemCard, DocBlockView, DocSuggestionView, KeyStatus, Pane};
+
+/// One live workflow-node projection carried from the socket-owning harness to
+/// the pure reducer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowNodeUpdate {
+    pub node_id: String,
+    pub state: String,
+    pub cost: String,
+    pub error: String,
+}
 
 /// A semantic action the reducer folds into [`crate::state::AppState`].
 ///
@@ -34,6 +44,9 @@ pub enum Action {
     /// A transient status-line notice from the harness (e.g. a rejected
     /// command's code + message). Cleared automatically a few seconds later.
     Notice(String),
+    /// A persistent setup/runtime diagnostic from the harness. De-duplicated by
+    /// the reducer and available in the Issues overlay until explicitly cleared.
+    Issue(String),
 
     // --- navigation (from keys / mouse) ---
     /// Move keyboard focus to the next pane (`Tab`).
@@ -47,6 +60,12 @@ pub enum Action {
     ActivateRow(usize),
     /// Select run N in the runs pane (mouse click). Client-only.
     SelectRun(usize),
+    /// Focus document N in the Docs tree (mouse click). Client-only.
+    SelectDocument(usize),
+    /// Focus block N in the Docs editor rail (mouse click). Client-only.
+    SelectDocumentBlock(usize),
+    /// Focus suggestion N in the Docs review rail (mouse click). Client-only.
+    SelectDocumentSuggestion(usize),
     /// Select the previous item / scroll up in the focused pane (`Up`/`k`/wheel-up).
     SelectPrev,
     /// Select the next item / scroll down in the focused pane (`Down`/`j`/wheel-down).
@@ -121,6 +140,13 @@ pub enum Action {
     OpenDocs,
     /// Toggle the code-graph edge inspector (`G`).
     OpenEdges,
+    /// One database-backed code-graph result page returned by the harness.
+    EdgesLoaded {
+        edges: Vec<crate::state::GraphEdgeCard>,
+        total: usize,
+        query: String,
+        page: usize,
+    },
     /// Toggle the workflow-graph view (`W`): nodes with state, action, agent,
     /// worktree, approval, retry, dependencies, and declared outputs.
     OpenWorkflow,
@@ -133,6 +159,9 @@ pub enum Action {
     /// block-edit prompt. Submitting it acquires the block lease and, on the grant,
     /// sends the mutation.
     EditDoc,
+    /// Publish the focused document to a repository Markdown file (`P`). The
+    /// daemon computes the plan and parks its ordinary human approval first.
+    PublishDoc,
     /// A merged replica update, projected by the CLI harness after it folded an
     /// incoming `DocumentSync` into the document's client replica and re-read its
     /// pending suggestions. Replaces the matching card's blocks/suggestions/revision
@@ -167,6 +196,8 @@ pub enum Action {
     /// overwrite, so an overlap between the snapshot baseline and the live stream is a
     /// harmless re-write.
     WorkflowNodeUpdated {
+        /// The durable workflow run this transition belongs to.
+        workflow_run_id: String,
         /// The node (step) id to overlay — matches [`WorkflowNodeCard::id`].
         node_id: String,
         /// The node's live state, pre-rendered (e.g. `running` / `completed` /
@@ -178,6 +209,24 @@ pub enum Action {
         /// The node's failure/block reason, pre-rendered, or `"—"` when none.
         error: String,
     },
+    /// Full live baseline returned by `ReadWorkflowRun`.
+    WorkflowSnapshotLoaded {
+        workflow_run_id: String,
+        phase: String,
+        nodes: Vec<WorkflowNodeUpdate>,
+    },
+    /// A live workflow-run phase transition.
+    WorkflowPhaseUpdated {
+        workflow_run_id: String,
+        phase: String,
+    },
+    /// Replace one run's blackboard baseline after `ReadBlackboard`.
+    BlackboardLoaded {
+        workflow_run_id: String,
+        items: Vec<BlackboardItemCard>,
+    },
+    /// Merge one live `BlackboardPosted` delivery by stable artifact id.
+    BlackboardItemUpdated(BlackboardItemCard),
 
     /// A provider's model list, fetched by the harness (client-only add-model
     /// flow). Folds into the in-flight `Overlay::AddModelQuerying` (matched by
@@ -195,7 +244,7 @@ pub enum Action {
 
     /// The `/keys` status projection (D1), loaded by the harness after the
     /// other projections (it reads `auth.json` + `models.toml` — the tui crate
-    /// does no I/O) and re-fired after every key write and daemon restart.
+    /// does no I/O) and re-fired after every key write.
     /// `models` is one `(model_id, status)` per configured model; `tavily` is
     /// the `web.search` row's status. Statuses carry no key material — an env
     /// status holds the variable NAME, never its value.
@@ -203,11 +252,6 @@ pub enum Action {
         models: Vec<(String, KeyStatus)>,
         tavily: KeyStatus,
     },
-    /// The harness asks to open the restart-offer confirm (D1): shown after a
-    /// Tavily `web.search` key is saved, since the daemon only discovers that
-    /// key at boot. `y` folds to a client-only [`Intent::RestartDaemon`].
-    OfferDaemonRestart,
-
     /// Toggle the command palette (`/`): a searchable list of every command.
     OpenPalette,
     /// Begin the add-model flow for the focused provider in the `/provider`
@@ -215,12 +259,20 @@ pub enum Action {
     /// a can-list provider queries its `/models` list; a cannot-list one opens
     /// the free-text name prompt. A no-op outside the provider picker.
     BeginAddModel,
+    /// Remove the stored key for the focused `/keys` row (`Delete`). A no-op
+    /// outside that overlay, or when the row is backed only by an environment
+    /// variable / has no key.
+    RemoveApiKey,
     /// Flip between the chat single-column and the workspace panes (`F2`).
     ToggleLayout,
 
     // --- overlays / lifecycle ---
     /// Toggle the help overlay (`?`).
     Help,
+    /// Toggle the persistent setup/diagnostics overlay.
+    OpenIssues,
+    /// Clear the diagnostics list and close its overlay.
+    ClearIssues,
     /// Detach this client (`q`). Never kills the run.
     Detach,
     /// Dismiss the top-most overlay / modal (`Esc`).
@@ -270,6 +322,16 @@ pub enum KeyTarget {
     Model(String),
     /// The Tavily `web.search` key.
     Tavily,
+}
+
+/// A disk-backed advanced-view projection the CLI can refresh without a daemon
+/// command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionKind {
+    Skills,
+    Memory,
+    Docs,
+    Workflow,
 }
 
 /// A semantic command the reducer wants sent to the daemon.
@@ -322,11 +384,17 @@ pub enum Intent {
         scope: ApprovalScope,
     },
     /// Pause a run.
-    PauseRun { run_id: codypendent_protocol::RunId },
+    PauseRun {
+        run_id: codypendent_protocol::RunId,
+    },
     /// Resume a paused run.
-    ResumeRun { run_id: codypendent_protocol::RunId },
+    ResumeRun {
+        run_id: codypendent_protocol::RunId,
+    },
     /// Cancel a run.
-    CancelRun { run_id: codypendent_protocol::RunId },
+    CancelRun {
+        run_id: codypendent_protocol::RunId,
+    },
     /// Queue steering text to apply at the next safe point.
     QueueSteering {
         run_id: codypendent_protocol::RunId,
@@ -343,13 +411,60 @@ pub enum Intent {
         block_id: Option<String>,
     },
     /// Release a held document lease by its id.
-    ReleaseDocumentLease { lease_id: String },
+    ReleaseDocumentLease {
+        lease_id: String,
+    },
     /// Apply a semantic mutation to a document (a direct edit, a proposed edit, or
     /// an accept/reject of a suggestion). The daemon's collaboration mode decides
     /// whether a content edit applies directly or lands as a suggestion.
     MutateDocument {
         document_id: DocumentId,
         mutation: DocumentMutation,
+    },
+    PublishDocument {
+        document_id: DocumentId,
+        target: codypendent_protocol::PublishTarget,
+    },
+    /// Subscribe to a document's live sync stream without mutating it. This is
+    /// client-only: opening/focusing a document should keep the Docs Studio
+    /// projection current even when this client is only reviewing it.
+    WatchDocument {
+        document_id: DocumentId,
+    },
+    /// Load one filtered code-graph page directly from SQLite. Client-only.
+    SearchEdges {
+        query: String,
+        page: usize,
+    },
+    /// Reload one disk-backed advanced view. Client-only.
+    RefreshProjection {
+        kind: ProjectionKind,
+    },
+
+    // --- durable workflow control + live observation ---
+    /// Start the named workflow from the repository/user workflow registry.
+    StartWorkflow {
+        workflow_id: String,
+        inputs: serde_json::Value,
+    },
+    /// Subscribe to and read a durable workflow run plus its blackboard. This is
+    /// client-only; the harness grows the attach subscriptions and issues both
+    /// read baselines before swallowing the intent.
+    WatchWorkflow {
+        workflow_run_id: String,
+    },
+    PauseWorkflow {
+        workflow_run_id: String,
+    },
+    ResumeWorkflow {
+        workflow_run_id: String,
+    },
+    RetryWorkflowNode {
+        workflow_run_id: String,
+        node_id: String,
+    },
+    CancelWorkflow {
+        workflow_run_id: String,
     },
 
     /// Add a usable model from the TUI (client-only — NOT a daemon command). The
@@ -382,22 +497,23 @@ pub enum Intent {
     /// Set (or replace) an API key from the `/keys` overlay (D1; client-only —
     /// NOT a daemon command, keeping the key off the wire exactly like
     /// `AddModel`). The harness writes it to `auth.json` (load-before-write,
-    /// atomic, mode `0600`); the daemon re-reads `auth.json` per run (model
-    /// keys) or per boot (Tavily), so no wire command exists. Intercepted in
-    /// the harness drain loop; never mapped to a `CommandBody`.
-    SetApiKey { target: KeyTarget, key: SecretKey },
+    /// atomic, mode `0600`); model and Tavily credentials are resolved at use
+    /// time, so no wire command or daemon restart exists. Intercepted in the
+    /// harness drain loop; never mapped to a `CommandBody`.
+    SetApiKey {
+        target: KeyTarget,
+        key: SecretKey,
+    },
     /// Remove a saved API key from `auth.json` (D1; client-only, mirroring
     /// [`Intent::SetApiKey`]). Intercepted in the harness drain loop; never
     /// mapped to a `CommandBody`.
-    RemoveApiKey { target: KeyTarget },
-    /// Restart the daemon now (D1; client-only — NOT a daemon command). The
-    /// reducer emits this when the operator confirms the restart offer shown
-    /// after saving a Tavily key (the daemon discovers that key only at boot).
-    /// The harness runs the DR7 idle-guarded restart
-    /// (`commands::restart_daemon_if_idle`), which refuses while a run is
-    /// active. Intercepted in the harness drain loop; never mapped to a
-    /// `CommandBody`.
-    RestartDaemon,
+    RemoveApiKey {
+        target: KeyTarget,
+    },
+    /// Create and attach to a fresh session without leaving the TUI. Client-only:
+    /// the harness creates the session, swaps this connection's attachment, and
+    /// updates the repo→session continuity store while the old run continues.
+    NewConversation,
 }
 
 #[cfg(test)]

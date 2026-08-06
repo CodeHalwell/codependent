@@ -13,6 +13,8 @@
 /// the existing commands, never a second code path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteCommand {
+    /// Open persistent setup/runtime diagnostics.
+    Issues,
     /// Open the new-run prompt.
     NewRun,
     /// Queue steering text for the selected run.
@@ -47,14 +49,10 @@ pub enum PaletteCommand {
     Help,
     /// Detach this client (the run keeps going).
     Detach,
-    /// Start a fresh, unseeded conversation (Task 5, continuous-session plan).
-    /// Continuity keys off "this session already has prior runs," so a
-    /// genuinely fresh conversation needs a brand-new session — which this
-    /// client cannot mint in place. This detaches now (exactly like
-    /// [`PaletteCommand::Detach`] — the current run, if any, is unaffected)
-    /// and forgets this repository's remembered session, so the *next*
-    /// `codypendent` launch here finds nothing to resume and creates a fresh
-    /// one instead.
+    /// Start a fresh, unseeded conversation in place. The harness creates a new
+    /// durable session and atomically hands the running TUI to its own socket;
+    /// the previous run remains alive in the daemon without leaking events into
+    /// the new conversation.
     NewConversation,
 }
 
@@ -79,10 +77,18 @@ pub struct PaletteEntry {
 }
 
 /// Every command the palette offers, grouped into contiguous sections (`Run` →
-/// `Models` → `Browse` → `Session`) so the palette can render a dim group label
+/// `Models` → `Workspace` → `Session`) so the palette can render a dim group label
 /// whenever the group changes. [`filtered`] preserves this table order, so the
 /// selectable index math is unaffected by the grouping.
 pub const COMMANDS: &[PaletteEntry] = &[
+    // --- Setup: first-run health and model configuration. ---
+    PaletteEntry {
+        command: PaletteCommand::Issues,
+        title: "Setup & diagnostics",
+        description: "review persistent configuration and runtime issues",
+        key: "—",
+        group: "Setup",
+    },
     // --- Run: acting on the selected run. ---
     PaletteEntry {
         command: PaletteCommand::NewRun,
@@ -116,7 +122,7 @@ pub const COMMANDS: &[PaletteEntry] = &[
     PaletteEntry {
         command: PaletteCommand::Model,
         title: "Model picker",
-        description: "browse selectable models and stage one for the next run",
+        description: "choose the model pinned to your next and later runs",
         // Palette-only this task: no single-key equivalent (see the field's
         // doc comment).
         key: "—",
@@ -125,7 +131,7 @@ pub const COMMANDS: &[PaletteEntry] = &[
     PaletteEntry {
         command: PaletteCommand::Provider,
         title: "Provider catalog",
-        description: "browse the built-in provider catalog and stage one",
+        description: "browse supported providers and add a usable model",
         // Palette-only (Task 8): no single-key equivalent, mirroring the
         // model picker's own row.
         key: "—",
@@ -151,48 +157,48 @@ pub const COMMANDS: &[PaletteEntry] = &[
         key: "—",
         group: "Models",
     },
-    // --- Browse: read-only studios and inspectors. ---
+    // --- Workspace: live studios, workflow controls, and inspectors. ---
     PaletteEntry {
         command: PaletteCommand::Docs,
         title: "Docs Studio",
-        description: "browse documents (tree / editor / review rails)",
+        description: "edit, review, watch, and publish collaborative documents",
         key: "D",
-        group: "Browse",
+        group: "Workspace",
     },
     PaletteEntry {
         command: PaletteCommand::Edges,
         title: "Code-graph edges",
-        description: "inspect graph edges (relation, evidence, revision)",
+        description: "search and page graph edges with evidence and revision",
         key: "G",
-        group: "Browse",
+        group: "Workspace",
     },
     PaletteEntry {
         command: PaletteCommand::Workflow,
         title: "Workflow graph",
-        description: "view workflow nodes (state, agent, worktree, approval)",
+        description: "start and control durable workflows with live node state",
         key: "W",
-        group: "Browse",
+        group: "Workspace",
     },
     PaletteEntry {
         command: PaletteCommand::Blackboard,
         title: "Blackboard",
-        description: "view workflow artifacts (findings, decisions, evidence)",
+        description: "follow live workflow findings, decisions, and evidence",
         key: "B",
-        group: "Browse",
+        group: "Workspace",
     },
     PaletteEntry {
         command: PaletteCommand::Skills,
         title: "Skill Studio",
         description: "browse skills and their permissions verbatim",
         key: "S",
-        group: "Browse",
+        group: "Workspace",
     },
     PaletteEntry {
         command: PaletteCommand::Memory,
         title: "Memory",
         description: "browse curated memories and their provenance",
         key: "M",
-        group: "Browse",
+        group: "Workspace",
     },
     // --- Session: client-level and housekeeping commands. ---
     PaletteEntry {
@@ -213,35 +219,74 @@ pub const COMMANDS: &[PaletteEntry] = &[
         command: PaletteCommand::Detach,
         title: "Detach",
         description: "leave the TUI; the run keeps going",
-        key: "q",
+        key: "Ctrl-C",
         group: "Session",
     },
     PaletteEntry {
         command: PaletteCommand::NewConversation,
         title: "New conversation",
-        description:
-            "start a fresh, unseeded conversation — detaches now; the next launch begins it",
+        description: "start a fresh, unseeded conversation in this TUI",
         // Palette-only: a deliberate, rare action gets no single-key slot.
         key: "—",
         group: "Session",
     },
 ];
 
-/// The commands matching `query`, in table order. An empty query matches
-/// everything; otherwise a command matches when the (case-folded) query is a
-/// substring of its title, description, or key.
+/// The commands matching `query`, ranked by intent. An empty query preserves
+/// the curated table order. A non-empty query prefers an exact title/word/key,
+/// then title prefixes, then title/description substrings. This matters for
+/// pairs such as `mode` / `model`: typing `mode` must put **Mode picker** first
+/// even though `model` also contains those four characters.
 #[must_use]
 pub fn filtered(query: &str) -> Vec<&'static PaletteEntry> {
     let needle = query.trim().to_lowercase();
-    COMMANDS
+    if needle.is_empty() {
+        return COMMANDS.iter().collect();
+    }
+
+    let mut matches: Vec<_> = COMMANDS
         .iter()
-        .filter(|entry| {
-            needle.is_empty()
-                || entry.title.to_lowercase().contains(&needle)
-                || entry.description.to_lowercase().contains(&needle)
-                || entry.key.to_lowercase() == needle
+        .enumerate()
+        .filter_map(|(table_index, entry)| {
+            palette_match_score(entry, &needle).map(|score| (score, table_index, entry))
         })
-        .collect()
+        .collect();
+    matches.sort_by_key(|(score, table_index, _)| (*score, *table_index));
+    matches.into_iter().map(|(_, _, entry)| entry).collect()
+}
+
+/// Lower is a stronger palette match. Kept deliberately small and predictable:
+/// command discovery should feel smart without making ordering mysterious.
+fn palette_match_score(entry: &PaletteEntry, needle: &str) -> Option<u8> {
+    let title = entry.title.to_lowercase();
+    let description = entry.description.to_lowercase();
+    let key = entry.key.to_lowercase();
+
+    if title == needle {
+        return Some(0);
+    }
+    if title
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| word == needle)
+    {
+        return Some(1);
+    }
+    if key == needle {
+        return Some(2);
+    }
+    if title.starts_with(needle) {
+        return Some(3);
+    }
+    if title.contains(needle) {
+        return Some(4);
+    }
+    if description.starts_with(needle) {
+        return Some(5);
+    }
+    if description.contains(needle) {
+        return Some(6);
+    }
+    None
 }
 
 /// The number of commands matching `query` (the length of the navigable list).
@@ -280,7 +325,8 @@ mod tests {
     fn filters_to_the_model_picker_command() {
         // MP1: "/model" opens the picker via the palette front door.
         let model = filtered("model");
-        assert_eq!(model.len(), 1);
+        // Other commands may legitimately mention models in their richer
+        // descriptions; the exact title match must still rank first.
         assert_eq!(model[0].command, PaletteCommand::Model);
     }
 
@@ -294,12 +340,18 @@ mod tests {
 
     #[test]
     fn filters_to_the_mode_picker_command() {
-        // PR C2: "/mode" opens the mode picker via the palette front door.
-        // ("mode" alone also substring-matches the Model picker's title, so
-        // the full row title is the unambiguous query.)
-        let mode = filtered("mode picker");
-        assert_eq!(mode.len(), 1);
+        // PR C2: `/mode` opens the mode picker via the palette front door even
+        // though the letters also prefix "model". Intent ranking keeps the
+        // exact word match first.
+        let mode = filtered("mode");
         assert_eq!(mode[0].command, PaletteCommand::Mode);
+    }
+
+    #[test]
+    fn exact_word_and_key_matches_beat_incidental_substrings() {
+        assert_eq!(filtered("mode")[0].command, PaletteCommand::Mode);
+        assert_eq!(filtered("model")[0].command, PaletteCommand::Model);
+        assert_eq!(filtered("?")[0].command, PaletteCommand::Help);
     }
 
     #[test]

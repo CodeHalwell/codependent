@@ -121,6 +121,26 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         description: "insert a line break instead of sending",
         mouse: None,
     },
+    KeyBinding {
+        keys: "Delete",
+        description: "remove a saved key, or clear resolved diagnostics",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "n / p / r / c (Workflow)",
+        description: "start · pause/resume · retry from node · cancel workflow",
+        mouse: Some("click a workflow control"),
+    },
+    KeyBinding {
+        keys: "P (Docs)",
+        description: "publish the focused document through approval",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "/ · PgUp/PgDn (Graph)",
+        description: "search graph edges · previous/next result page",
+        mouse: None,
+    },
 ];
 
 /// One footer chip: a compact display label paired with the real `KEY_BINDINGS`
@@ -147,7 +167,12 @@ static FOOTER_HINTS: &[FooterHint] = &[
     },
     FooterHint {
         binding: &KEY_BINDINGS[3],
-        label: "↑↓ scroll",
+        label: "PgUp",
+        action: Action::ScrollPageUp,
+    },
+    FooterHint {
+        binding: &KEY_BINDINGS[3],
+        label: "PgDn",
         action: Action::ScrollPageDown,
     },
     FooterHint {
@@ -162,7 +187,7 @@ static FOOTER_HINTS: &[FooterHint] = &[
     },
     FooterHint {
         binding: &KEY_BINDINGS[12],
-        label: "q detach",
+        label: "Ctrl-C detach",
         action: Action::Detach,
     },
 ];
@@ -248,6 +273,7 @@ fn map_normal_key(key: &KeyEvent) -> Action {
         KeyCode::Down => Action::SelectNext,
         KeyCode::PageUp => Action::ScrollPageUp,
         KeyCode::PageDown => Action::ScrollPageDown,
+        KeyCode::Delete => Action::ClearIssues,
         KeyCode::Esc => Action::Dismiss,
         KeyCode::Char(c) => map_normal_char(c),
         _ => Action::NoOp,
@@ -271,6 +297,7 @@ fn map_normal_char(c: char) -> Action {
         'M' => Action::OpenMemory,
         'o' => Action::OpenSource,
         'e' => Action::EditDoc,
+        'P' => Action::PublishDoc,
         'D' => Action::OpenDocs,
         'G' => Action::OpenEdges,
         'W' => Action::OpenWorkflow,
@@ -304,6 +331,7 @@ fn map_palette_key(key: &KeyEvent) -> Action {
         KeyCode::Backspace => Action::InputBackspace,
         KeyCode::Up => Action::SelectPrev,
         KeyCode::Down => Action::SelectNext,
+        KeyCode::Delete => Action::RemoveApiKey,
         KeyCode::Char('c') if ctrl(key) => Action::InputCancel,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
         KeyCode::Tab => Action::BeginAddModel,

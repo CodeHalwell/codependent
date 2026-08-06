@@ -25,7 +25,7 @@
 //! and pongs from the reader. A third OS thread bridges blocking `crossterm`
 //! input into the async loop.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,25 +34,26 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use codypendent_knowledge::{
-    db as knowledge_db, BlockContent, CapabilityRequest, CodeEdge, CodeRelation, CollaborationMode,
-    DocumentAuthor, DocumentBlock, DocumentReplica, DocumentStore, EvidenceKind, EvidenceRef,
-    KnowledgeDocument, MemoryClass, MemoryRecord, MemoryStore, Registry, RegistryItem,
-    RegistryItemKind, RegistryStatus, RiskClass, Scope, Suggestion, SuggestionStatus,
-    SuggestionStore, TrustTier,
+    db as knowledge_db, BlockContent, CapabilityRequest, CollaborationMode, DocumentAuthor,
+    DocumentBlock, DocumentReplica, DocumentStore, EvidenceRef, KnowledgeDocument, MemoryClass,
+    MemoryRecord, MemoryStore, Registry, RegistryItem, RegistryItemKind, RegistryStatus, RiskClass,
+    Scope, Suggestion, SuggestionStatus, SuggestionStore, TrustTier,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    read_envelope, write_envelope, Catchup, ClientId, ClientRole, CodeNodeId, Command, CommandBody,
-    CommandId, DocumentEditLease, DocumentId, DocumentSync, Envelope, ModelId, Payload,
-    RepositoryId, SessionEvent, SessionId, Subscription, WorkspaceId,
+    read_envelope, write_envelope, Catchup, ClientId, ClientRole, Command, CommandBody, CommandId,
+    DocumentEditLease, DocumentId, DocumentSync, Envelope, ModelId, Payload, RepositoryId,
+    SessionEvent, SessionId, Subscription, WorkspaceId,
 };
 use codypendent_tui::{
     map_event, reduce, render, render_splash, Action, AppState, BlackboardItemCard, DocBlockView,
     DocCard, DocSuggestionView, GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard,
-    ModelLocationLabel, ProviderCard, SkillCard, TerminalGuard, Theme, WorkflowNodeCard,
+    ModelLocationLabel, ProjectionKind, ProviderCard, SkillCard, TerminalGuard, Theme,
+    WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, watch};
 
@@ -324,14 +325,10 @@ pub async fn run(
     drain_boot_warnings(&mut state, &boot_warnings);
     let Booted {
         session_id,
+        workspace_id,
         attach_watermark,
         docs_pool,
-        client_id,
-        out_tx,
-        mut event_rx,
-        query_tx,
-        reader,
-        writer,
+        mut live,
     } = booted;
 
     let (input_tx, mut input_rx) = mpsc::channel::<CrosstermEvent>(256);
@@ -349,13 +346,11 @@ pub async fn run(
         &theme,
         &mut state,
         &mut width,
-        &mut event_rx,
-        query_tx,
+        &mut live,
         &mut input_rx,
         &mut ticker,
-        &out_tx,
-        client_id,
         session_id,
+        workspace_id,
         &repository,
         attach_watermark,
         docs_pool.clone(),
@@ -368,9 +363,7 @@ pub async fn run(
     // error text reaches the (now cooked) screen, then wind down the socket tasks.
     input_running.store(false, Ordering::Relaxed);
     drop(guard);
-    drop(out_tx);
-    reader.abort();
-    writer.abort();
+    live.shutdown();
     if let Some(pool) = docs_pool {
         pool.close().await;
     }
@@ -429,11 +422,11 @@ fn push_boot_warning(warnings: &BootWarnings, message: String) {
 /// ALWAYS when any were collected, whether or not the splash drew a frame —
 /// a reconcile warning or a loader failure note is meaningful after boot
 /// regardless (the pre-splash behavior was a persistent stderr print). One
-/// notice per diagnostic.
+/// persistent issue per diagnostic.
 fn drain_boot_warnings(state: &mut AppState, warnings: &BootWarnings) {
     let collected = std::mem::take(&mut *warnings.lock().expect("boot warnings mutex poisoned"));
     for warning in collected {
-        reduce(state, Action::Notice(warning));
+        reduce(state, Action::Issue(warning));
     }
 }
 
@@ -441,14 +434,51 @@ fn drain_boot_warnings(state: &mut AppState, warnings: &BootWarnings) {
 /// need, bundled so [`run`]'s splash loop stays small.
 struct Booted {
     session_id: SessionId,
+    workspace_id: WorkspaceId,
     attach_watermark: u64,
     docs_pool: Option<sqlx::SqlitePool>,
+    live: LiveIo,
+}
+
+/// The socket tasks and channels for the session currently shown by the TUI.
+/// Keeping them together makes an in-place conversation switch an atomic
+/// transport handoff: the old connection (and all of its old-session
+/// forwarders) is dropped as one unit after the replacement is attached.
+struct LiveIo {
     client_id: ClientId,
     out_tx: mpsc::Sender<Envelope>,
     event_rx: mpsc::Receiver<ReaderSignal>,
     query_tx: mpsc::Sender<ReaderSignal>,
     reader: tokio::task::JoinHandle<()>,
     writer: tokio::task::JoinHandle<()>,
+}
+
+impl LiveIo {
+    fn start(conn: Connection) -> (Self, std::collections::VecDeque<Envelope>) {
+        let (read_half, write_half, pending, client_id) = conn.into_split();
+        let (out_tx, out_rx) = mpsc::channel::<Envelope>(256);
+        let (event_tx, event_rx) = mpsc::channel::<ReaderSignal>(256);
+        let query_tx = event_tx.clone();
+        let reader = tokio::spawn(read_loop(read_half, event_tx, out_tx.clone(), client_id));
+        let writer = tokio::spawn(write_loop(write_half, out_rx));
+        (
+            Self {
+                client_id,
+                out_tx,
+                event_rx,
+                query_tx,
+                reader,
+                writer,
+            },
+            pending,
+        )
+    }
+
+    fn shutdown(self) {
+        drop(self.out_tx);
+        self.reader.abort();
+        self.writer.abort();
+    }
 }
 
 /// Every boot step before the event loop (D2): daemon ensure, handshake,
@@ -537,10 +567,11 @@ async fn boot_phase(
     // Seed the state from catch-up, then from any live event that outraced the
     // attach reply and was buffered during setup — both before the loop reads a
     // single new frame, so no event is dropped or reordered.
-    let attach_watermark = fold_catchup(state, catchup);
-    let (read_half, write_half, pending, client_id) = conn.into_split();
+    let mut attach_watermark = fold_catchup(state, catchup);
+    let (live, pending) = LiveIo::start(conn);
     for envelope in pending {
         if let Payload::Event(event) = envelope.payload {
+            attach_watermark = attach_watermark.max(event.sequence);
             reduce(state, Action::DaemonEvent(Box::new(event)));
         }
     }
@@ -560,6 +591,7 @@ async fn boot_phase(
     state.memories = projections.memories;
     state.docs = projections.docs;
     state.edges = projections.edges;
+    state.edge_total = projections.edge_total;
     state.blackboard = projections.blackboard;
     // MP1: seed the model-picker projection (models.toml + any measured
     // profile from `model_profiles`), exactly like the projections above.
@@ -586,7 +618,14 @@ async fn boot_phase(
         let overlay_pool = knowledge_db::open(&paths.data_dir.join("codypendent.db"))
             .await
             .ok();
-        state.workflow = load_workflows(repo, overlay_pool.as_ref(), &mut loader_warnings).await;
+        let user_workflows = paths.data_dir.join("workflows");
+        state.workflow = load_workflows(
+            repo,
+            Some(&user_workflows),
+            overlay_pool.as_ref(),
+            &mut loader_warnings,
+        )
+        .await;
     }
     // Publish the loaders' collected diagnostics alongside the reconcile
     // warnings so the splash can draw them and `run` notices them post-boot.
@@ -604,27 +643,12 @@ async fn boot_phase(
         .await
         .ok();
 
-    // Wire the two socket tasks. Start them before returning so no live event
-    // or heartbeat is missed during the remaining setup.
-    let (out_tx, out_rx) = mpsc::channel::<Envelope>(256);
-    let (event_tx, event_rx) = mpsc::channel::<ReaderSignal>(256);
-    // A second sender clone for the model-discovery query tasks, which feed
-    // `ReaderSignal::ProviderModels` back into the same loop (the reader task
-    // owns the first clone).
-    let query_tx = event_tx.clone();
-    let reader = tokio::spawn(read_loop(read_half, event_tx, out_tx.clone(), client_id));
-    let writer = tokio::spawn(write_loop(write_half, out_rx));
-
     Ok(Booted {
         session_id,
+        workspace_id,
         attach_watermark,
         docs_pool,
-        client_id,
-        out_tx,
-        event_rx,
-        query_tx,
-        reader,
-        writer,
+        live,
     })
 }
 
@@ -845,18 +869,16 @@ async fn event_loop(
     theme: &Theme,
     state: &mut AppState,
     width: &mut u16,
-    event_rx: &mut mpsc::Receiver<ReaderSignal>,
-    query_tx: mpsc::Sender<ReaderSignal>,
+    live: &mut LiveIo,
     input_rx: &mut mpsc::Receiver<CrosstermEvent>,
     ticker: &mut tokio::time::Interval,
-    out_tx: &mpsc::Sender<Envelope>,
-    client_id: ClientId,
-    session_id: SessionId,
+    mut session_id: SessionId,
+    workspace_id: WorkspaceId,
     repository: &str,
     attach_watermark: u64,
     docs_pool: Option<sqlx::SqlitePool>,
-    // Task 5 (continuous-session plan): only touched by the "New Conversation"
-    // exit path below — everywhere else in the loop is unchanged.
+    // Persist the replacement session after an in-place "New Conversation"
+    // transport swap so the next launch resumes the newly selected thread.
     store: &mut SessionStore,
     paths: &RuntimePaths,
 ) -> anyhow::Result<()> {
@@ -883,14 +905,18 @@ async fn event_loop(
     // the map also marks the document as already subscribed, so an edit
     // subscribes + seeds it exactly once.
     let mut replicas: HashMap<DocumentId, DocumentReplica> = HashMap::new();
+    // Correlate empty blackboard baselines back to the run they were requested
+    // for (the reply carries only command_id when `items` is empty).
+    let mut blackboard_reads: HashMap<CommandId, String> = HashMap::new();
 
     loop {
         // A CRDT sync needs an async merge (+ a suggestion re-read) that cannot run
         // inside the `select!` arm, so the arm stashes it here and the loop body
         // folds it just after.
         let mut pending_sync: Option<Box<DocumentSync>> = None;
+        let mut started_workflow: Option<String> = None;
         let action = tokio::select! {
-            signal = event_rx.recv() => match signal {
+            signal = live.event_rx.recv() => match signal {
                 Some(ReaderSignal::Event(event)) => {
                     match tracker.on_event(*event, Instant::now()) {
                         GapAction::Ignore => Action::NoOp,
@@ -900,8 +926,8 @@ async fn event_loop(
                             // STEP 4.3) so a gap-repair preserves the Document
                             // subscriptions this client added while editing.
                             send_reattach(
-                                out_tx,
-                                client_id,
+                                &live.out_tx,
+                                live.client_id,
                                 session_id,
                                 last_seen_sequence,
                                 &subscriptions,
@@ -929,10 +955,41 @@ async fn event_loop(
                     lease_id,
                 },
                 Some(ReaderSignal::DocumentLeaseBlocked) => Action::DocumentLeaseBlocked,
+                Some(ReaderSignal::DocumentPublishPrepared {
+                    target,
+                    changed_files,
+                    git_action,
+                }) => Action::Notice(format!(
+                    "publish plan ready: {target} · {changed_files} file(s) · {git_action}"
+                )),
                 Some(ReaderSignal::ProviderModels { provider_id, result }) => match result {
                     Ok(models) => Action::ProviderModelsLoaded { provider_id, models },
                     Err(reason) => Action::ProviderModelsFailed { provider_id, reason },
                 },
+                Some(ReaderSignal::WorkflowRunStarted { workflow_run_id }) => {
+                    started_workflow = Some(workflow_run_id);
+                    Action::Notice("workflow started — attaching live view".to_owned())
+                }
+                Some(ReaderSignal::WorkflowSnapshot(snapshot)) => {
+                    workflow_snapshot_action(*snapshot)
+                }
+                Some(ReaderSignal::WorkflowEvent(event)) => workflow_event_action(event),
+                Some(ReaderSignal::BlackboardItems { command_id, items }) => {
+                    let workflow_run_id = blackboard_reads
+                        .remove(&command_id)
+                        .or_else(|| items.first().map(|item| item.workflow_run_id.clone()));
+                    match workflow_run_id {
+                        Some(workflow_run_id) => Action::BlackboardLoaded {
+                            items: wire_blackboard_cards(state, &items),
+                            workflow_run_id,
+                        },
+                        None => Action::NoOp,
+                    }
+                }
+                Some(ReaderSignal::BlackboardPosted(item)) => {
+                    let label = workflow_label_for_run(state, &item.workflow_run_id);
+                    Action::BlackboardItemUpdated(wire_blackboard_item_card(label, &item))
+                }
                 Some(ReaderSignal::Catchup(catchup)) => {
                     // Fold the gap replay (the daemon already windowed it to
                     // `(last_seen, through]`, and a too-large gap arrives as a
@@ -950,8 +1007,8 @@ async fn event_loop(
                         // Same grown subscription set on a repair-during-repair
                         // re-attach (Phase 4 STEP 4.3).
                         send_reattach(
-                            out_tx,
-                            client_id,
+                            &live.out_tx,
+                            live.client_id,
                             session_id,
                             last_seen_sequence,
                             &subscriptions,
@@ -978,8 +1035,8 @@ async fn event_loop(
                 // re-attach afresh to re-drive the catch-up.
                 if let Some(last_seen_sequence) = tracker.on_tick(Instant::now()) {
                     send_reattach(
-                        out_tx,
-                        client_id,
+                        &live.out_tx,
+                        live.client_id,
                         session_id,
                         last_seen_sequence,
                         &subscriptions,
@@ -1000,6 +1057,25 @@ async fn event_loop(
         }
 
         reduce(state, action);
+
+        // `StartWorkflow` replies with the new run id after the durable rows are
+        // committed. Reload once so the manifest cards bind to that exact run,
+        // then queue the same watch path used when an existing run is focused.
+        if let Some(workflow_run_id) = started_workflow.take() {
+            let mut warnings = Vec::new();
+            let user_workflows = paths.data_dir.join("workflows");
+            state.workflow = load_workflows(
+                Path::new(repository),
+                Some(&user_workflows),
+                docs_pool.as_ref(),
+                &mut warnings,
+            )
+            .await;
+            for warning in warnings {
+                reduce(state, Action::Issue(warning));
+            }
+            state.outbox.push(Intent::WatchWorkflow { workflow_run_id });
+        }
 
         for intent in state.drain_outbox() {
             // `AddModel` is the one client-only intent: apply it locally (models.toml
@@ -1057,7 +1133,7 @@ async fn event_loop(
                 };
                 let provider_id = provider_id.clone();
                 let key = api_key.as_ref().map(|k| k.0.clone());
-                let tx = query_tx.clone();
+                let tx = live.query_tx.clone();
                 tokio::spawn(async move {
                     let result =
                         query_provider_models(&base_url, &header, &prefix, key.as_deref()).await;
@@ -1083,37 +1159,268 @@ async fn event_loop(
                 apply_remove_api_key(state, paths, target);
                 continue;
             }
-            // `RestartDaemon` (D1) is client-only too: the operator confirmed
-            // the restart offer after saving a Tavily key. The DR7 idle guard
-            // makes the final decision daemon-side, so this never kills an
-            // active run. NOTE: a successful restart severs this connection
-            // (the daemon it was attached to exits) — the reader's Closed
-            // signal then ends the TUI, exactly like any daemon shutdown.
-            if matches!(intent, Intent::RestartDaemon) {
-                match commands::restart_daemon_if_idle(paths).await {
-                    Ok(commands::IdleRestartOutcome::Restarted) => {
-                        reduce(
-                            state,
-                            Action::Notice("daemon restarted — web search enabled".to_owned()),
+            // Create and attach to a genuinely fresh session without tearing
+            // down the TUI. A brand-new socket is fully handshaken and attached
+            // before it replaces the old one. Dropping the old socket removes
+            // all of its old-session forwarders, so late events from the prior
+            // conversation can never bleed into this fresh state.
+            if matches!(intent, Intent::NewConversation) {
+                let workspace_id = store
+                    .sessions
+                    .get(repository)
+                    .map_or_else(WorkspaceId::new, |stored| stored.workspace_id);
+                let next_subscriptions = default_subscriptions();
+                let resume = store
+                    .resume_token
+                    .clone()
+                    .map(codypendent_protocol::ResumeToken);
+                match create_fresh_session_live(
+                    paths,
+                    repository,
+                    workspace_id,
+                    &next_subscriptions,
+                    resume,
+                )
+                .await
+                {
+                    Ok(fresh) => {
+                        state.begin_new_session();
+                        let mut watermark = fold_catchup(state, fresh.catchup);
+                        for envelope in fresh.pending {
+                            if let Payload::Event(event) = envelope.payload {
+                                watermark = watermark.max(event.sequence);
+                                reduce(state, Action::DaemonEvent(Box::new(event)));
+                            }
+                        }
+
+                        let old_live = std::mem::replace(live, fresh.live);
+                        old_live.shutdown();
+                        session_id = fresh.session_id;
+                        tracker = GapTracker::new(watermark);
+                        subscriptions = next_subscriptions;
+                        replicas.clear();
+                        blackboard_reads.clear();
+
+                        if let Some(token) = fresh.resume_token {
+                            store.resume_token = Some(token);
+                        }
+                        store.sessions.insert(
+                            repository.to_owned(),
+                            StoredSession {
+                                session_id,
+                                workspace_id,
+                            },
                         );
+                        store.save(paths);
+                        reduce(state, Action::Notice("fresh conversation ready".to_owned()));
                     }
-                    Ok(commands::IdleRestartOutcome::RefusedActive(active)) => {
-                        reduce(
-                            state,
-                            Action::Notice(format!(
-                                "will apply on next restart ({active} active run(s))"
-                            )),
-                        );
+                    Err(error) => reduce(
+                        state,
+                        Action::Issue(format!("could not create a fresh conversation: {error}")),
+                    ),
+                }
+                continue;
+            }
+            if let Intent::RefreshProjection { kind } = &intent {
+                let Some(pool) = docs_pool.as_ref() else {
+                    reduce(
+                        state,
+                        Action::Issue(
+                            "advanced views unavailable: knowledge database is closed".into(),
+                        ),
+                    );
+                    continue;
+                };
+                let repository_id =
+                    codypendent_knowledge::stable_repository_id(Path::new(repository));
+                let scopes = [
+                    Scope::System,
+                    Scope::Workspace(workspace_id),
+                    Scope::Repository(repository_id),
+                ];
+                let mut warnings = Vec::new();
+                match *kind {
+                    ProjectionKind::Skills => {
+                        let selected = state.focused_skill().map(|card| card.name.clone());
+                        match Registry::new().list(pool).await {
+                            Ok(items) => {
+                                state.skills = items.iter().map(skill_card).collect();
+                                state.selected_skill = selected
+                                    .as_deref()
+                                    .and_then(|name| {
+                                        state.skills.iter().position(|card| card.name == name)
+                                    })
+                                    .unwrap_or(0);
+                            }
+                            Err(error) => {
+                                warnings.push(format!("could not refresh skills: {error}"));
+                            }
+                        }
                     }
-                    Err(error) => {
-                        reduce(
-                            state,
-                            Action::Notice(format!("could not restart the daemon: {error}")),
-                        );
+                    ProjectionKind::Memory => {
+                        let selected = state.focused_memory().map(|card| card.statement.clone());
+                        match MemoryStore::new().query(pool, &scopes, None).await {
+                            Ok(records) => {
+                                state.memories = records.iter().map(memory_card).collect();
+                                state.selected_memory = selected
+                                    .as_deref()
+                                    .and_then(|statement| {
+                                        state
+                                            .memories
+                                            .iter()
+                                            .position(|card| card.statement == statement)
+                                    })
+                                    .unwrap_or(0);
+                            }
+                            Err(error) => {
+                                warnings.push(format!("could not refresh memories: {error}"));
+                            }
+                        }
+                    }
+                    ProjectionKind::Docs => {
+                        let selected = state.focused_doc().map(|card| card.document_id);
+                        state.docs = load_docs(pool, &scopes, &mut warnings).await;
+                        state.selected_doc = selected
+                            .and_then(|document_id| {
+                                state
+                                    .docs
+                                    .iter()
+                                    .position(|card| card.document_id == document_id)
+                            })
+                            .unwrap_or(0);
+                        if let Some(document_id) = state.focused_doc().map(|card| card.document_id)
+                        {
+                            state.outbox.push(Intent::WatchDocument { document_id });
+                        }
+                    }
+                    ProjectionKind::Workflow => {
+                        let selected = state
+                            .focused_node()
+                            .map(|card| (card.workflow_id.clone(), card.id.clone()));
+                        let user_workflows = paths.data_dir.join("workflows");
+                        state.workflow = load_workflows(
+                            Path::new(repository),
+                            Some(&user_workflows),
+                            Some(pool),
+                            &mut warnings,
+                        )
+                        .await;
+                        state.selected_node = selected
+                            .as_ref()
+                            .and_then(|(workflow_id, node_id)| {
+                                state.workflow.iter().position(|card| {
+                                    &card.workflow_id == workflow_id && &card.id == node_id
+                                })
+                            })
+                            .unwrap_or(0);
+                        if let Some(workflow_run_id) = state
+                            .focused_node()
+                            .and_then(|card| card.workflow_run_id.clone())
+                        {
+                            state.outbox.push(Intent::WatchWorkflow { workflow_run_id });
+                        }
                     }
                 }
-                // Statuses may shift across the restart — re-fire the projection.
-                reload_key_statuses(state, paths);
+                for warning in warnings {
+                    reduce(state, Action::Issue(warning));
+                }
+                continue;
+            }
+            if let Intent::SearchEdges { query, page } = &intent {
+                if let Some(pool) = docs_pool.as_ref() {
+                    let repository_id =
+                        codypendent_knowledge::stable_repository_id(Path::new(repository));
+                    let mut warnings = Vec::new();
+                    let (edges, total, page) =
+                        load_edge_page(pool, repository_id, query, *page, &mut warnings).await;
+                    reduce(
+                        state,
+                        Action::EdgesLoaded {
+                            edges,
+                            total,
+                            query: query.clone(),
+                            page,
+                        },
+                    );
+                    for warning in warnings {
+                        reduce(state, Action::Issue(warning));
+                    }
+                } else {
+                    reduce(
+                        state,
+                        Action::Issue(
+                            "code graph unavailable: knowledge database is closed".into(),
+                        ),
+                    );
+                }
+                continue;
+            }
+            // Opening/focusing a workflow run grows this connection's live
+            // workflow + blackboard subscriptions and reads authoritative
+            // baselines. Repeated watches skip the re-attach but deliberately
+            // re-read both baselines, so reopening a panel is immediately fresh.
+            if let Intent::WatchWorkflow { workflow_run_id } = &intent {
+                let has_workflow = subscriptions.iter().any(|subscription| {
+                    matches!(
+                        subscription,
+                        Subscription::Workflow { workflow_run_id: id } if id == workflow_run_id
+                    )
+                });
+                let has_blackboard = subscriptions.iter().any(|subscription| {
+                    matches!(
+                        subscription,
+                        Subscription::Blackboard { workflow_run_id: id } if id == workflow_run_id
+                    )
+                });
+                if !has_workflow {
+                    subscriptions.push(Subscription::Workflow {
+                        workflow_run_id: workflow_run_id.clone(),
+                    });
+                }
+                if !has_blackboard {
+                    subscriptions.push(Subscription::Blackboard {
+                        workflow_run_id: workflow_run_id.clone(),
+                    });
+                }
+                if !has_workflow || !has_blackboard {
+                    let attach = command_envelope(
+                        live.client_id,
+                        CommandBody::AttachSession {
+                            session_id,
+                            last_seen_sequence: Some(tracker.last_seen()),
+                            subscriptions: subscriptions.clone(),
+                            requested_role: ClientRole::Controller,
+                            repository: None,
+                        },
+                    );
+                    if live.out_tx.send(attach).await.is_err() {
+                        return Ok(());
+                    }
+                }
+
+                let snapshot = command_envelope(
+                    live.client_id,
+                    CommandBody::ReadWorkflowRun {
+                        workflow_run_id: workflow_run_id.clone(),
+                    },
+                );
+                if live.out_tx.send(snapshot).await.is_err() {
+                    return Ok(());
+                }
+                let board = command_envelope(
+                    live.client_id,
+                    CommandBody::ReadBlackboard {
+                        workflow_run_id: workflow_run_id.clone(),
+                        kind: None,
+                        include_superseded: true,
+                    },
+                );
+                if let Payload::Command(command) = &board.payload {
+                    blackboard_reads.insert(command.command_id, workflow_run_id.clone());
+                }
+                if live.out_tx.send(board).await.is_err() {
+                    return Ok(());
+                }
                 continue;
             }
             // The first edit on a document subscribes this client to its live sync
@@ -1126,7 +1433,7 @@ async fn event_loop(
                     slot.insert(seed_replica(docs_pool.as_ref(), document_id).await);
                     subscriptions.push(Subscription::Document { document_id });
                     let attach = command_envelope(
-                        client_id,
+                        live.client_id,
                         CommandBody::AttachSession {
                             session_id,
                             last_seen_sequence: Some(tracker.last_seen()),
@@ -1138,31 +1445,24 @@ async fn event_loop(
                             repository: None,
                         },
                     );
-                    if out_tx.send(attach).await.is_err() {
+                    if live.out_tx.send(attach).await.is_err() {
                         return Ok(());
                     }
                 }
             }
-            let envelope =
-                command_envelope(client_id, intent_to_command(intent, session_id, repository));
-            if out_tx.send(envelope).await.is_err() {
+            if matches!(intent, Intent::WatchDocument { .. }) {
+                continue;
+            }
+            let envelope = command_envelope(
+                live.client_id,
+                intent_to_command(intent, session_id, repository),
+            );
+            if live.out_tx.send(envelope).await.is_err() {
                 return Ok(()); // writer gone → connection is down; leave cleanly
             }
         }
 
         if state.should_detach || state.session_closed {
-            // Task 5 (continuous-session plan): "New Conversation" cannot swap
-            // this connection to a new session live (see
-            // `AppState::start_new_conversation`'s doc comment) — instead it
-            // forgets this repository's remembered session before the TUI
-            // ends, so `resolve_or_create_session` cannot resume it on the
-            // next launch and creates a genuinely fresh, unseeded one. A plain
-            // detach (`start_new_conversation` false) leaves the mapping
-            // alone, exactly as before this task.
-            if state.start_new_conversation {
-                store.sessions.remove(repository);
-                store.save(paths);
-            }
             return Ok(());
         }
 
@@ -1180,7 +1480,10 @@ enum ReaderSignal {
     /// The daemon rejected a command this TUI sent (code + message). Surfaced
     /// as a transient status notice — silence here meant a rejected StartRun
     /// showed the user nothing at all.
-    Rejected { code: String, message: String },
+    Rejected {
+        code: String,
+        message: String,
+    },
     /// A catch-up reply (from the loop's own gap-triggered re-attach).
     Catchup(Box<Catchup>),
     /// A collaborative document's live CRDT sync (Phase 4 STEP 4.3). Boxed — it
@@ -1195,6 +1498,13 @@ enum ReaderSignal {
     /// The daemon refused an edit lease: the block range is held by another writer
     /// (`document.range-leased`) — surfaced as the presence-lite "blocked" signal.
     DocumentLeaseBlocked,
+    /// Human-readable acknowledgement that the publish plan is now parked on
+    /// the ordinary approval rail; no document write has happened yet.
+    DocumentPublishPrepared {
+        target: String,
+        changed_files: usize,
+        git_action: String,
+    },
     /// A provider's fetched model list (model-discovery): the result of the
     /// spawned `<base_url>/models` GET, keyed by `provider_id`. Mapped by the
     /// loop's `select!` to `Action::ProviderModelsLoaded` (Ok) /
@@ -1203,8 +1513,116 @@ enum ReaderSignal {
         provider_id: String,
         result: Result<Vec<String>, String>,
     },
+    /// A newly-created durable workflow run. The loop reloads the compiled/live
+    /// projection, then immediately subscribes and reads its baselines.
+    WorkflowRunStarted {
+        workflow_run_id: String,
+    },
+    WorkflowSnapshot(Box<codypendent_protocol::WorkflowRunSnapshot>),
+    WorkflowEvent(codypendent_protocol::WorkflowEvent),
+    BlackboardItems {
+        command_id: CommandId,
+        items: Vec<codypendent_protocol::BlackboardItemView>,
+    },
+    BlackboardPosted(codypendent_protocol::BlackboardItemView),
     /// The daemon closed the connection.
     Closed,
+}
+
+fn workflow_phase_label(phase: codypendent_protocol::WorkflowRunPhase) -> &'static str {
+    use codypendent_protocol::WorkflowRunPhase;
+    match phase {
+        WorkflowRunPhase::Pending => "pending",
+        WorkflowRunPhase::Running => "running",
+        WorkflowRunPhase::Paused => "paused",
+        WorkflowRunPhase::Completed => "completed",
+        WorkflowRunPhase::Failed => "failed",
+        WorkflowRunPhase::Cancelled => "cancelled",
+        _ => "unknown",
+    }
+}
+
+fn workflow_node_state_label(state: codypendent_protocol::WorkflowNodeState) -> &'static str {
+    use codypendent_protocol::WorkflowNodeState;
+    match state {
+        WorkflowNodeState::Pending => "pending",
+        WorkflowNodeState::Running => "running",
+        WorkflowNodeState::WaitingApproval => "waiting_approval",
+        WorkflowNodeState::Blocked => "blocked",
+        WorkflowNodeState::Completed => "completed",
+        WorkflowNodeState::Failed => "failed",
+        WorkflowNodeState::Skipped => "skipped",
+        _ => "unknown",
+    }
+}
+
+fn workflow_node_update(node: codypendent_protocol::WorkflowNodeView) -> WorkflowNodeUpdate {
+    WorkflowNodeUpdate {
+        node_id: node.node_id,
+        state: workflow_node_state_label(node.state).to_owned(),
+        cost: node
+            .cost
+            .as_ref()
+            .map_or_else(|| "\u{2014}".to_owned(), render_node_cost),
+        error: node.error.unwrap_or_else(|| "\u{2014}".to_owned()),
+    }
+}
+
+fn workflow_snapshot_action(snapshot: codypendent_protocol::WorkflowRunSnapshot) -> Action {
+    Action::WorkflowSnapshotLoaded {
+        workflow_run_id: snapshot.workflow_run_id,
+        phase: workflow_phase_label(snapshot.phase).to_owned(),
+        nodes: snapshot
+            .nodes
+            .into_iter()
+            .map(workflow_node_update)
+            .collect(),
+    }
+}
+
+fn workflow_event_action(event: codypendent_protocol::WorkflowEvent) -> Action {
+    use codypendent_protocol::WorkflowEvent;
+    match event {
+        WorkflowEvent::NodeTransitioned(node) => {
+            let workflow_run_id = node.workflow_run_id.clone();
+            let node = workflow_node_update(node);
+            Action::WorkflowNodeUpdated {
+                workflow_run_id,
+                node_id: node.node_id,
+                state: node.state,
+                cost: node.cost,
+                error: node.error,
+            }
+        }
+        WorkflowEvent::RunPhaseChanged {
+            workflow_run_id,
+            phase,
+        } => Action::WorkflowPhaseUpdated {
+            workflow_run_id,
+            phase: workflow_phase_label(phase).to_owned(),
+        },
+        _ => Action::NoOp,
+    }
+}
+
+fn workflow_label_for_run<'a>(state: &'a AppState, workflow_run_id: &str) -> Option<&'a str> {
+    state
+        .workflow
+        .iter()
+        .find(|card| card.workflow_run_id.as_deref() == Some(workflow_run_id))
+        .map(|card| card.workflow.as_str())
+}
+
+fn wire_blackboard_cards(
+    state: &AppState,
+    items: &[codypendent_protocol::BlackboardItemView],
+) -> Vec<BlackboardItemCard> {
+    items
+        .iter()
+        .map(|item| {
+            wire_blackboard_item_card(workflow_label_for_run(state, &item.workflow_run_id), item)
+        })
+        .collect()
 }
 
 /// Own the read half: forward each live [`SessionEvent`], answer heartbeat
@@ -1262,9 +1680,74 @@ async fn read_loop(
                         break;
                     }
                 }
+                Payload::DocumentPublishRequested {
+                    target,
+                    changed_files,
+                    git_action,
+                    ..
+                } => {
+                    if event_tx
+                        .send(ReaderSignal::DocumentPublishPrepared {
+                            target,
+                            changed_files: changed_files.len(),
+                            git_action,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Payload::DocumentSync(sync) => {
                     if event_tx
                         .send(ReaderSignal::DocumentSync(Box::new(sync)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Payload::WorkflowRunStarted {
+                    workflow_run_id, ..
+                } => {
+                    if event_tx
+                        .send(ReaderSignal::WorkflowRunStarted { workflow_run_id })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Payload::WorkflowRunSnapshot { snapshot, .. } => {
+                    if event_tx
+                        .send(ReaderSignal::WorkflowSnapshot(Box::new(snapshot)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Payload::WorkflowEvent { event } => {
+                    if event_tx
+                        .send(ReaderSignal::WorkflowEvent(event))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Payload::BlackboardItems { command_id, items } => {
+                    if event_tx
+                        .send(ReaderSignal::BlackboardItems { command_id, items })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Payload::BlackboardPosted(item) => {
+                    if event_tx
+                        .send(ReaderSignal::BlackboardPosted(item))
                         .await
                         .is_err()
                     {
@@ -1396,6 +1879,50 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             document_id,
             mutation,
         },
+        Intent::PublishDocument {
+            document_id,
+            target,
+        } => CommandBody::PublishDocument {
+            document_id,
+            target,
+        },
+        Intent::WatchDocument { .. } => unreachable!(
+            "WatchDocument is applied locally by the harness, never sent to the daemon"
+        ),
+        Intent::SearchEdges { .. } => unreachable!(
+            "SearchEdges is applied locally by the harness, never sent to the daemon"
+        ),
+        Intent::RefreshProjection { .. } => unreachable!(
+            "RefreshProjection is applied locally by the harness, never sent to the daemon"
+        ),
+        Intent::StartWorkflow {
+            workflow_id,
+            inputs,
+        } => CommandBody::StartWorkflow {
+            manifest: String::new(),
+            workflow_id: Some(workflow_id),
+            inputs,
+            repository: Some(repository.to_owned()),
+        },
+        Intent::WatchWorkflow { .. } => unreachable!(
+            "WatchWorkflow is applied locally by the harness, never sent to the daemon"
+        ),
+        Intent::PauseWorkflow { workflow_run_id } => {
+            CommandBody::PauseWorkflow { workflow_run_id }
+        }
+        Intent::ResumeWorkflow { workflow_run_id } => {
+            CommandBody::ResumeWorkflow { workflow_run_id }
+        }
+        Intent::RetryWorkflowNode {
+            workflow_run_id,
+            node_id,
+        } => CommandBody::RetryWorkflowNode {
+            workflow_run_id,
+            node_id,
+        },
+        Intent::CancelWorkflow { workflow_run_id } => {
+            CommandBody::CancelWorkflow { workflow_run_id }
+        }
         // `AddModel` and `QueryProviderModels` are CLIENT-ONLY intents applied
         // locally by the harness (see the drain loop's interceptions); neither
         // becomes a daemon command, so these mappings are never reached.
@@ -1405,14 +1932,14 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::QueryProviderModels { .. } => unreachable!(
             "QueryProviderModels is applied locally by the harness (background GET), never sent to the daemon"
         ),
-        // D1: the `/keys` intents are CLIENT-ONLY for the same reason (the
-        // key never crosses the wire; the daemon re-reads auth.json per
-        // run/boot) — intercepted in the drain loop, never mapped.
+        // D1: the `/keys` intents are CLIENT-ONLY for the same reason (the key
+        // never crosses the wire; adapters resolve auth.json at use time) —
+        // intercepted in the drain loop, never mapped.
         Intent::SetApiKey { .. } | Intent::RemoveApiKey { .. } => unreachable!(
             "SetApiKey/RemoveApiKey are applied locally by the harness (write_api_key), never sent to the daemon"
         ),
-        Intent::RestartDaemon => unreachable!(
-            "RestartDaemon is applied locally by the harness (restart_daemon_if_idle), never sent to the daemon"
+        Intent::NewConversation => unreachable!(
+            "NewConversation is applied locally by the harness, never sent to the daemon"
         ),
     }
 }
@@ -1489,10 +2016,19 @@ fn write_add_model(
     // any user providers.toml; a load failure falls back to the built-ins).
     let catalog = Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
         .unwrap_or_else(|_| Catalog::builtin());
-    let base_url = catalog
+    let provider = catalog
         .get(provider_id)
-        .and_then(|p| p.base_url.clone())
-        .unwrap_or_default();
+        .ok_or_else(|| anyhow!("provider `{provider_id}` is not in the catalog"))?;
+    if !provider_runtime_supported(provider) {
+        bail!(
+            "provider `{provider_id}` uses {} and is not executable by this build",
+            protocol_label(provider.protocol)
+        );
+    }
+    let base_url = provider
+        .base_url
+        .clone()
+        .expect("runtime-supported providers have a non-blank base URL");
 
     // Read the existing models.toml (absent ⇒ start empty) through the real
     // loader, drop any entry sharing the new display id (update-in-place), then
@@ -1560,7 +2096,7 @@ async fn apply_add_model(
             let mut warnings = Vec::new();
             state.models = load_model_cards(paths, &mut warnings).await;
             for warning in warnings {
-                reduce(state, Action::Notice(warning));
+                reduce(state, Action::Issue(warning));
             }
             reload_key_statuses(state, paths);
             reduce(state, Action::Notice(format!("added model {display_id}")));
@@ -1631,9 +2167,8 @@ fn write_api_key(
 
 /// Apply the client-only `Intent::SetApiKey` (the event-loop drain arm,
 /// extracted so the behavior is directly testable): write the key to
-/// `auth.json`, re-fire the status projection, and — for Tavily, whose key the
-/// daemon discovers only at boot — offer the idle-guarded daemon restart. The
-/// key itself never leaves this function.
+/// `auth.json` and re-fire the status projection. Model and Tavily credentials
+/// are both resolved lazily by the daemon, so neither path needs a restart.
 fn apply_set_api_key(state: &mut AppState, paths: &RuntimePaths, target: &KeyTarget, key: &str) {
     match write_api_key(paths, target, Some(key)) {
         Ok(()) => {
@@ -1648,15 +2183,10 @@ fn apply_set_api_key(state: &mut AppState, paths: &RuntimePaths, target: &KeyTar
                     );
                 }
                 KeyTarget::Tavily => {
-                    // The daemon discovers the Tavily key only at
-                    // boot, so offer the idle-guarded restart.
                     reduce(
                         state,
-                        Action::Notice(
-                            "Tavily key saved — the daemon picks it up on restart".to_owned(),
-                        ),
+                        Action::Notice("Tavily key saved — web search is ready".to_owned()),
                     );
-                    reduce(state, Action::OfferDaemonRestart);
                 }
             }
         }
@@ -1671,10 +2201,8 @@ fn apply_set_api_key(state: &mut AppState, paths: &RuntimePaths, target: &KeyTar
 
 /// Apply the client-only `Intent::RemoveApiKey` (the event-loop drain arm,
 /// extracted so the behavior is directly testable): remove the entry from
-/// `auth.json` and re-fire the status projection. For Tavily the daemon keeps
-/// its already-discovered key for its lifetime, so the removal can't take
-/// effect without a restart — offer the idle-guarded restart exactly like the
-/// set path does.
+/// `auth.json` and re-fire the status projection. Tavily resolves per call, so
+/// removal also applies immediately.
 fn apply_remove_api_key(state: &mut AppState, paths: &RuntimePaths, target: &KeyTarget) {
     match write_api_key(paths, target, None) {
         Ok(()) => {
@@ -1689,12 +2217,8 @@ fn apply_remove_api_key(state: &mut AppState, paths: &RuntimePaths, target: &Key
                 KeyTarget::Tavily => {
                     reduce(
                         state,
-                        Action::Notice(
-                            "Tavily key removed — web search stays on until the daemon restarts"
-                                .to_owned(),
-                        ),
+                        Action::Notice("Tavily key removed — web search is disabled".to_owned()),
                     );
-                    reduce(state, Action::OfferDaemonRestart);
                 }
             }
         }
@@ -1777,7 +2301,7 @@ fn reload_key_statuses(state: &mut AppState, paths: &RuntimePaths) {
     let (models, tavily) = load_key_statuses(paths, &mut warnings);
     reduce(state, Action::ApiKeyStatusesLoaded { models, tavily });
     for warning in warnings {
-        reduce(state, Action::Notice(warning));
+        reduce(state, Action::Issue(warning));
     }
 }
 
@@ -1879,7 +2403,9 @@ async fn query_provider_models(
 fn doc_intent_target(intent: &Intent) -> Option<DocumentId> {
     match intent {
         Intent::AcquireDocumentLease { document_id, .. }
-        | Intent::MutateDocument { document_id, .. } => Some(*document_id),
+        | Intent::MutateDocument { document_id, .. }
+        | Intent::PublishDocument { document_id, .. }
+        | Intent::WatchDocument { document_id } => Some(*document_id),
         _ => None,
     }
 }
@@ -1967,6 +2493,94 @@ fn command_envelope(client_id: ClientId, body: CommandBody) -> Envelope {
             body,
         }),
     )
+}
+
+/// A replacement transport prepared for an in-place fresh conversation. The
+/// connection is already attached, so swapping it into the event loop cannot
+/// expose an unattached or half-created UI state.
+struct FreshLiveSession {
+    session_id: SessionId,
+    catchup: Catchup,
+    pending: std::collections::VecDeque<Envelope>,
+    resume_token: Option<String>,
+    live: LiveIo,
+}
+
+/// Create a new durable session and attach the same new socket before returning.
+/// The event loop keeps its old transport alive until this whole operation
+/// succeeds; on success it atomically swaps transports and drops every
+/// old-session forwarder with the old socket.
+async fn create_fresh_session_live(
+    paths: &RuntimePaths,
+    repository: &str,
+    workspace: WorkspaceId,
+    subscriptions: &[Subscription],
+    resume: Option<codypendent_protocol::ResumeToken>,
+) -> anyhow::Result<FreshLiveSession> {
+    let mut conn = Connection::connect(&paths.socket_path).await?;
+    let hello = conn
+        .handshake(
+            "codypendent-tui-session-switch",
+            codypendent_protocol::BUILD_ID,
+            resume,
+        )
+        .await?;
+    let title = Path::new(repository)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Codypendent".to_owned());
+    let reply = conn
+        .send_command(CommandBody::CreateSession {
+            workspace,
+            title,
+            repository: Some(repository.to_owned()),
+        })
+        .await?;
+    let session_id = match reply.payload {
+        Payload::CommandAccepted { .. } => reply
+            .session_id
+            .ok_or_else(|| anyhow!("daemon accepted CreateSession without a session id")),
+        Payload::CommandRejected(error) => {
+            bail!("CreateSession rejected: {} ({})", error.message, error.code)
+        }
+        other => bail!("unexpected CreateSession reply: {other:?}"),
+    }?;
+
+    let attach = conn
+        .send_command(CommandBody::AttachSession {
+            session_id,
+            last_seen_sequence: None,
+            subscriptions: subscriptions.to_vec(),
+            requested_role: ClientRole::Controller,
+            repository: Some(repository.to_owned()),
+        })
+        .await?;
+    let catchup = match attach.payload {
+        Payload::Catchup { catchup } => catchup,
+        Payload::CommandRejected(error) => {
+            bail!(
+                "fresh-session attach rejected: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        Payload::Error(error) => {
+            bail!(
+                "fresh-session attach failed: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => bail!("unexpected fresh-session attach reply: {other:?}"),
+    };
+    let (live, pending) = LiveIo::start(conn);
+    Ok(FreshLiveSession {
+        session_id,
+        catchup,
+        pending,
+        resume_token: hello.resume_token.map(|token| token.0),
+        live,
+    })
 }
 
 /// Fold an attach-time [`Catchup`] into fresh state. `Catchup::Events` replays
@@ -2140,14 +2754,9 @@ struct KnowledgeProjections {
     memories: Vec<MemoryCard>,
     docs: Vec<DocCard>,
     edges: Vec<GraphEdgeCard>,
+    edge_total: usize,
     blackboard: Vec<BlackboardItemCard>,
 }
-
-/// The cap on edges surfaced in the inspector. A large repository's graph can
-/// carry thousands of edges; the read-only inspector shows the first
-/// [`MAX_INSPECTOR_EDGES`] (oldest first) and logs when it truncates — never a
-/// silent cut.
-const MAX_INSPECTOR_EDGES: usize = 500;
 
 /// Read the knowledge fabric's registry, memories, documents, and code-graph
 /// edges directly from SQLite and map them into the TUI's plain projection
@@ -2172,6 +2781,7 @@ async fn load_knowledge(
         memories: Vec::new(),
         docs: Vec::new(),
         edges: Vec::new(),
+        edge_total: 0,
         blackboard: Vec::new(),
     };
 
@@ -2214,7 +2824,7 @@ async fn load_knowledge(
     };
 
     let docs = load_docs(&pool, &scopes, warnings).await;
-    let edges = load_edges(&pool, repository, warnings).await;
+    let (edges, edge_total, _) = load_edge_page(&pool, repository, "", 0, warnings).await;
     // Phase 5 STEP 5.3: the blackboard artifacts on the active workflow runs. The
     // workflow tables share this database (the migrations are workspace-wide), so
     // the same pool serves them; empty until a run posts artifacts.
@@ -2226,6 +2836,7 @@ async fn load_knowledge(
         memories,
         docs,
         edges,
+        edge_total,
         blackboard,
     }
 }
@@ -2314,6 +2925,7 @@ fn model_card(
     profiles: &HashMap<(ModelId, String), codypendent_routing::ModelProfile>,
 ) -> ModelCard {
     let profile = profiles.get(&(config.id.clone(), config.base_url.clone()));
+    let configured_context = config.context_tokens;
     ModelCard {
         id: config.id,
         provider: config.provider,
@@ -2325,7 +2937,13 @@ fn model_card(
             }
         }),
         cost_per_1k_usd: profile.map(|profile| profile.performance.cost_per_1k_tokens_usd),
-        context_tokens: profile.and_then(|profile| profile.capabilities.context_tokens),
+        // A measured profile is the freshest source, but an explicit
+        // `models.toml` value is authoritative when no profile exists. The old
+        // projection discarded that configured value and showed `—` even while
+        // the runtime was correctly using it.
+        context_tokens: profile
+            .and_then(|profile| profile.capabilities.context_tokens)
+            .or(configured_context),
     }
 }
 
@@ -2349,7 +2967,7 @@ fn load_provider_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> Vec<
             Catalog::builtin()
         }
     };
-    catalog
+    let mut cards: Vec<_> = catalog
         .providers()
         .map(|p| ProviderCard {
             id: p.id.clone(),
@@ -2380,8 +2998,18 @@ fn load_provider_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> Vec<
             // free-text fallback. Extracted to `provider_can_list_models`, unit
             // tested against the real enums.
             can_list_models: provider_can_list_models(p),
+            available: provider_runtime_supported(p),
         })
-        .collect()
+        .collect();
+    // Put usable providers first, with local endpoints before hosted ones. The
+    // complete catalog remains searchable below them as an honest preview.
+    cards.sort_by(|a, b| {
+        b.available
+            .cmp(&a.available)
+            .then_with(|| b.local.cmp(&a.local))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    cards
 }
 
 /// Whether adding a model from `p` needs an API key: its first configured auth
@@ -2411,6 +3039,13 @@ fn provider_can_list_models(p: &codypendent_providers::Provider) -> bool {
             p.auth.first(),
             Some(AuthMethod::ApiKey { .. } | AuthMethod::None) | None
         )
+}
+
+/// The provider shapes today's runtime can execute. Keeping this separate from
+/// catalog visibility prevents native/ACP/cloud-auth cards from producing an
+/// apparently valid `openai-compatible` model entry that can only fail later.
+fn provider_runtime_supported(p: &codypendent_providers::Provider) -> bool {
+    provider_can_list_models(p)
 }
 
 /// The provider picker's wire-protocol label — the same kebab-case spelling
@@ -2475,42 +3110,108 @@ async fn load_docs(
     docs
 }
 
-/// Project this repository's code-graph edges into [`GraphEdgeCard`]s, resolving
-/// each endpoint node id to its qualified name. Bounded by
-/// [`MAX_INSPECTOR_EDGES`] with a diagnostic when it truncates.
-async fn load_edges(
+/// Read one filtered graph page with endpoint names joined in SQLite. This never
+/// materializes the repository's full node/edge sets: a 50k-edge checkout costs
+/// one `COUNT` plus at most [`EDGE_PAGE_SIZE`] joined rows.
+async fn load_edge_page(
     pool: &sqlx::SqlitePool,
     repository: RepositoryId,
+    query: &str,
+    requested_page: usize,
     warnings: &mut Vec<String>,
-) -> Vec<GraphEdgeCard> {
-    use codypendent_knowledge::codegraph;
+) -> (Vec<GraphEdgeCard>, usize, usize) {
+    let repository = repository.to_string();
+    let query = query.trim();
+    let pattern = format!(
+        "%{}%",
+        query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    let base = " FROM code_edges e \
+                JOIN code_nodes f ON f.id = e.from_node \
+                JOIN code_nodes t ON t.id = e.to_node \
+                WHERE f.repository = ? AND t.repository = ?";
+    let filter = " AND (f.qualified_name LIKE ? ESCAPE '\\' \
+                         OR t.qualified_name LIKE ? ESCAPE '\\' \
+                         OR e.relation LIKE ? ESCAPE '\\' \
+                         OR e.evidence_kind LIKE ? ESCAPE '\\')";
 
-    let names: HashMap<CodeNodeId, String> = match codegraph::nodes(pool, repository).await {
-        Ok(nodes) => nodes
-            .into_iter()
-            .map(|node| (node.id, node.key.qualified_name))
-            .collect(),
+    let total_result = if query.is_empty() {
+        sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*){base}"))
+            .bind(&repository)
+            .bind(&repository)
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*){base}{filter}"))
+            .bind(&repository)
+            .bind(&repository)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .fetch_one(pool)
+            .await
+    };
+    let total = match total_result {
+        Ok(total) => usize::try_from(total.max(0)).unwrap_or(usize::MAX),
         Err(error) => {
-            warnings.push(format!("could not load code-graph nodes: {error}"));
-            HashMap::new()
+            warnings.push(format!("could not count code-graph edges: {error}"));
+            return (Vec::new(), 0, 0);
         }
     };
-
-    let mut edges = match codegraph::edges(pool, repository).await {
-        Ok(edges) => edges,
-        Err(error) => {
-            warnings.push(format!("could not load code-graph edges: {error}"));
-            return Vec::new();
-        }
-    };
-    if edges.len() > MAX_INSPECTOR_EDGES {
-        warnings.push(format!(
-            "code graph has {} edges; the inspector shows the first {MAX_INSPECTOR_EDGES}",
-            edges.len()
-        ));
-        edges.truncate(MAX_INSPECTOR_EDGES);
+    let max_page = total.saturating_sub(1) / EDGE_PAGE_SIZE;
+    let page = requested_page.min(max_page);
+    let select = format!(
+        "SELECT f.qualified_name AS from_name, t.qualified_name AS to_name, \
+                e.relation, e.confidence, e.evidence_kind, e.evidence_artifact, e.revision \
+         {base}{} \
+         ORDER BY f.qualified_name COLLATE NOCASE, t.qualified_name COLLATE NOCASE, \
+                  e.relation, e.id LIMIT ? OFFSET ?",
+        if query.is_empty() { "" } else { filter }
+    );
+    let mut rows_query = sqlx::query(&select).bind(&repository).bind(&repository);
+    if !query.is_empty() {
+        rows_query = rows_query
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern);
     }
-    edges.iter().map(|edge| edge_card(edge, &names)).collect()
+    rows_query = rows_query
+        .bind(i64::try_from(EDGE_PAGE_SIZE).unwrap_or(i64::MAX))
+        .bind(i64::try_from(page * EDGE_PAGE_SIZE).unwrap_or(i64::MAX));
+    let rows = match rows_query.fetch_all(pool).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            warnings.push(format!("could not load code-graph page: {error}"));
+            return (Vec::new(), total, page);
+        }
+    };
+
+    let cards = rows
+        .into_iter()
+        .map(|row| {
+            let evidence_json: Option<String> = row.get("evidence_artifact");
+            let evidence = evidence_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<EvidenceRef>(json).ok())
+                .as_ref()
+                .map_or_else(|| "(none)".to_owned(), evidence_source);
+            GraphEdgeCard {
+                from: row.get("from_name"),
+                to: row.get("to_name"),
+                relation: row.get::<String, _>("relation").replace('_', "-"),
+                confidence: row.get::<f64, _>("confidence") as f32,
+                evidence_kind: row.get("evidence_kind"),
+                evidence,
+                revision: row.get("revision"),
+            }
+        })
+        .collect();
+    (cards, total, page)
 }
 
 /// Map a governed [`RegistryItem`] into the TUI's [`SkillCard`] projection,
@@ -2715,31 +3416,6 @@ fn suggestion_view(suggestion: &Suggestion) -> DocSuggestionView {
     }
 }
 
-/// Map a [`CodeEdge`] into the inspector's [`GraphEdgeCard`], resolving each
-/// endpoint node id to its qualified name via `names` (falling back to the id
-/// when a node is not in the map). Carries the evidence + revision the Phase 4
-/// exit criterion requires the inspector to expose.
-fn edge_card(edge: &CodeEdge, names: &HashMap<CodeNodeId, String>) -> GraphEdgeCard {
-    let name = |id: &CodeNodeId| {
-        names
-            .get(id)
-            .cloned()
-            .unwrap_or_else(|| format!("node {id}"))
-    };
-    GraphEdgeCard {
-        from: name(&edge.from),
-        to: name(&edge.to),
-        relation: code_relation_label(edge.relation).to_owned(),
-        confidence: edge.confidence,
-        evidence_kind: evidence_kind_label(edge.evidence_kind).to_owned(),
-        evidence: edge
-            .evidence
-            .as_ref()
-            .map_or_else(|| "(none)".to_owned(), evidence_source),
-        revision: edge.revision.0.clone(),
-    }
-}
-
 /// The cap on workflow nodes surfaced in the view. A pathological manifest set
 /// could declare a very large graph; the read-only view shows the first
 /// [`MAX_WORKFLOW_NODES`] (in discovery + topological order) and logs when it
@@ -2765,65 +3441,104 @@ const MAX_WORKFLOW_NODES: usize = 500;
 /// fail the TUI.
 async fn load_workflows(
     repo: &Path,
+    user_dir: Option<&Path>,
     pool: Option<&sqlx::SqlitePool>,
     warnings: &mut Vec<String>,
 ) -> Vec<WorkflowNodeCard> {
-    let dir = repo.join(".codypendent").join("workflows");
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        // A repository with no workflows directory is the common case — an empty
-        // view, not an error.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(error) => {
-            warnings.push(format!(
-                "workflow view unavailable (reading {}: {error})",
-                dir.display()
-            ));
-            return Vec::new();
-        }
-    };
+    use codypendent_workflow::{parse_definition, WorkflowSourceRegistry, REPAIR_GITHUB_CHECK_ID};
 
-    // Collect and sort the manifest paths so the view order is deterministic.
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            matches!(
-                path.extension().and_then(|ext| ext.to_str()),
-                Some("yaml" | "yml")
-            )
-        })
-        .collect();
-    files.sort();
+    let repository_dir = repo.join(".codypendent").join("workflows");
+    let registry = WorkflowSourceRegistry::load(user_dir, Some(&repository_dir));
+    let mut ids = BTreeSet::from([REPAIR_GITHUB_CHECK_ID.to_owned()]);
 
-    let mut cards = Vec::new();
-    for path in files {
-        let yaml = match std::fs::read_to_string(&path) {
-            Ok(yaml) => yaml,
+    // Discover the user/repository ids while preserving useful diagnostics for
+    // malformed siblings. Resolution stays with WorkflowSourceRegistry so its
+    // precedence and same-version collision rules remain authoritative.
+    for dir in user_dir
+        .into_iter()
+        .chain(std::iter::once(repository_dir.as_path()))
+    {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                warnings.push(format!("skipping workflow {} ({error})", path.display()));
+                warnings.push(format!(
+                    "could not read workflows in {}: {error}",
+                    dir.display()
+                ));
                 continue;
             }
         };
-        match codypendent_workflow::compile_yaml(&yaml) {
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("yaml" | "yml")
+                )
+            })
+            .collect();
+        files.sort();
+        for path in files {
+            match std::fs::read_to_string(&path) {
+                Ok(yaml) => match parse_definition(&yaml) {
+                    Ok(definition) => {
+                        ids.insert(definition.id);
+                    }
+                    Err(error) => warnings.push(format!(
+                        "skipping workflow {} (does not parse: {error})",
+                        path.display()
+                    )),
+                },
+                Err(error) => {
+                    warnings.push(format!("skipping workflow {} ({error})", path.display()))
+                }
+            }
+        }
+    }
+
+    let mut cards = Vec::new();
+    for workflow_id in ids {
+        let yaml = match registry.resolve(&workflow_id) {
+            Ok(yaml) => yaml,
+            Err(error) => {
+                warnings.push(format!("skipping workflow {workflow_id} ({error})"));
+                continue;
+            }
+        };
+        match codypendent_workflow::compile_yaml(yaml) {
             Ok(compiled) => {
                 let label = format!("{} v{}", compiled.id, compiled.version);
+                let inputs = if compiled.inputs.is_empty() {
+                    "\u{2014}".to_owned()
+                } else {
+                    compiled
+                        .inputs
+                        .iter()
+                        .map(|(name, input)| {
+                            format!(
+                                "{}:{}{}",
+                                name,
+                                input.input_type,
+                                if input.required { "*" } else { "" }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
                 // Overlay the latest durable run's per-node state/cost/error, when
                 // one exists and a pool is available.
-                let records = match pool {
-                    Some(pool) => latest_run_node_records(pool, &compiled.id).await,
-                    None => HashMap::new(),
+                let latest = match pool {
+                    Some(pool) => latest_workflow_run(pool, &compiled.id).await,
+                    None => None,
                 };
-                cards.extend(
-                    compiled
-                        .nodes
-                        .iter()
-                        .map(|node| workflow_node_card(&label, node, records.get(&node.id))),
-                );
+                cards.extend(compiled.nodes.iter().map(|node| {
+                    workflow_node_card(&compiled.id, &label, &inputs, latest.as_ref(), node)
+                }));
             }
             Err(error) => {
                 warnings.push(format!(
-                    "skipping workflow {} (does not compile: {error})",
-                    path.display()
+                    "skipping workflow {workflow_id} (does not compile: {error})"
                 ));
             }
         }
@@ -2843,10 +3558,16 @@ async fn load_workflows(
 /// — the overlay [`load_workflows`] applies so the graph view shows a run's live
 /// state, MEASURED cost, and failure/block reason. An empty map when no run exists
 /// or a read fails: the view then shows the compiled defaults, never a stale one.
-async fn latest_run_node_records(
+struct LatestWorkflowRun {
+    id: String,
+    phase: String,
+    nodes: HashMap<String, codypendent_workflow::WorkflowNodeRecord>,
+}
+
+async fn latest_workflow_run(
     pool: &sqlx::SqlitePool,
     workflow_id: &str,
-) -> HashMap<String, codypendent_workflow::WorkflowNodeRecord> {
+) -> Option<LatestWorkflowRun> {
     let run_id: Option<String> = sqlx::query_scalar(
         "SELECT id FROM workflow_runs WHERE workflow_id = ? \
          ORDER BY created_at DESC, id DESC LIMIT 1",
@@ -2856,19 +3577,21 @@ async fn latest_run_node_records(
     .await
     .ok()
     .flatten();
-    let Some(run_id) = run_id else {
-        return HashMap::new();
-    };
+    let run_id = run_id?;
     match codypendent_workflow::WorkflowStore::new()
         .snapshot(pool, &run_id)
         .await
     {
-        Ok(Some(snapshot)) => snapshot
-            .nodes
-            .into_iter()
-            .map(|node| (node.node_id.clone(), node))
-            .collect(),
-        _ => HashMap::new(),
+        Ok(Some(snapshot)) => Some(LatestWorkflowRun {
+            id: snapshot.run.id,
+            phase: snapshot.run.state.as_str().to_owned(),
+            nodes: snapshot
+                .nodes
+                .into_iter()
+                .map(|node| (node.node_id.clone(), node))
+                .collect(),
+        }),
+        _ => None,
     }
 }
 
@@ -2907,9 +3630,11 @@ fn render_node_cost(cost: &serde_json::Value) -> String {
 /// that turns the forever-`—` cost column and the reasonless `failed`/`blocked`
 /// node into real values.
 fn workflow_node_card(
+    workflow_id: &str,
     workflow: &str,
+    inputs: &str,
+    latest: Option<&LatestWorkflowRun>,
     node: &codypendent_workflow::CompiledNode,
-    record: Option<&codypendent_workflow::WorkflowNodeRecord>,
 ) -> WorkflowNodeCard {
     use codypendent_workflow::{ApprovalPolicy, NodeAction, WorkspaceMode};
 
@@ -2917,6 +3642,7 @@ fn workflow_node_card(
 
     // Live state / measured cost / failure reason from a durable run record, else
     // the compiled node's pre-run defaults.
+    let record = latest.and_then(|run| run.nodes.get(&node.id));
     let state = record.map_or_else(
         || "pending".to_owned(),
         |record| record.state.as_str().to_owned(),
@@ -2981,7 +3707,11 @@ fn workflow_node_card(
     };
 
     WorkflowNodeCard {
+        workflow_id: workflow_id.to_owned(),
         workflow: workflow.to_owned(),
+        workflow_run_id: latest.map(|run| run.id.clone()),
+        run_phase: latest.map_or_else(|| "not started".to_owned(), |run| run.phase.clone()),
+        inputs: inputs.to_owned(),
         id: node.id.clone(),
         action,
         kind,
@@ -3033,7 +3763,7 @@ async fn load_blackboard(
             Ok(items) => cards.extend(
                 items
                     .iter()
-                    .map(|item| blackboard_item_card(&run_label, item)),
+                    .map(|item| blackboard_item_card(&run.id, &run_label, item)),
             ),
             Err(error) => {
                 warnings.push(format!(
@@ -3057,12 +3787,47 @@ async fn load_blackboard(
 /// [`BlackboardItemCard`], rendering its opaque JSON payload/author/evidence to
 /// human strings. `run` is the owning run's label the view groups by.
 fn blackboard_item_card(
+    workflow_run_id: &str,
     run: &str,
     item: &codypendent_workflow::BlackboardItem,
 ) -> BlackboardItemCard {
     BlackboardItemCard {
+        id: item.id.clone(),
+        workflow_run_id: workflow_run_id.to_owned(),
         run: run.to_owned(),
         kind: item.kind.as_str().to_owned(),
+        summary: summarize_json(&item.payload),
+        author: summarize_author(&item.author),
+        confidence: item
+            .confidence
+            .map_or_else(|| "\u{2014}".to_owned(), |c| format!("{c:.2}")),
+        evidence: if item.evidence.is_empty() {
+            "\u{2014}".to_owned()
+        } else {
+            format!("{} ref(s)", item.evidence.len())
+        },
+        revision: format!("r{}", item.revision),
+        superseded: item.superseded_by.is_some(),
+    }
+}
+
+/// Map the protocol's opaque blackboard view into the same card shape used by
+/// the SQLite boot projection. `workflow_label` is resolved from the live
+/// workflow cards when possible; the compact run id is always retained.
+fn wire_blackboard_item_card(
+    workflow_label: Option<&str>,
+    item: &codypendent_protocol::BlackboardItemView,
+) -> BlackboardItemCard {
+    let run = format!(
+        "{} · run {}",
+        workflow_label.unwrap_or("workflow"),
+        short_run_id(&item.workflow_run_id)
+    );
+    BlackboardItemCard {
+        id: item.id.clone(),
+        workflow_run_id: item.workflow_run_id.clone(),
+        run,
+        kind: item.kind.clone(),
         summary: summarize_json(&item.payload),
         author: summarize_author(&item.author),
         confidence: item
@@ -3171,37 +3936,6 @@ fn document_author_label(author: &DocumentAuthor) -> String {
     }
 }
 
-fn code_relation_label(relation: CodeRelation) -> &'static str {
-    match relation {
-        CodeRelation::Contains => "contains",
-        CodeRelation::Defines => "defines",
-        CodeRelation::Imports => "imports",
-        CodeRelation::References => "references",
-        CodeRelation::Calls => "calls",
-        CodeRelation::Implements => "implements",
-        CodeRelation::Extends => "extends",
-        CodeRelation::Reads => "reads",
-        CodeRelation::Writes => "writes",
-        CodeRelation::Mutates => "mutates",
-        CodeRelation::Returns => "returns",
-        CodeRelation::Accepts => "accepts",
-        CodeRelation::Tests => "tests",
-        CodeRelation::Configures => "configures",
-        CodeRelation::Serializes => "serializes",
-        CodeRelation::DependsOn => "depends-on",
-        CodeRelation::GeneratedFrom => "generated-from",
-    }
-}
-
-fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
-    match kind {
-        EvidenceKind::SyntaxInferred => "syntax_inferred",
-        EvidenceKind::LspResolved => "lsp_resolved",
-        EvidenceKind::CompilerResolved => "compiler_resolved",
-        EvidenceKind::RuntimeObserved => "runtime_observed",
-    }
-}
-
 /// The persisted repo → session mapping, so reopening the TUI in a repository
 /// resumes its session instead of starting over. Stored as JSON in the data dir;
 /// a corrupt or absent file reads as empty (the store is a convenience, never a
@@ -3249,6 +3983,76 @@ mod tests {
     use codypendent_protocol::{
         AgentMode, ApprovalDecision, ApprovalId, ApprovalScope, ModelId, RunId,
     };
+
+    #[tokio::test]
+    async fn graph_loader_pages_and_filters_without_materializing_the_full_graph() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = knowledge_db::open(&dir.path().join("graph.db"))
+            .await
+            .expect("knowledge db");
+        let repository = RepositoryId::new();
+        let repository_text = repository.to_string();
+        let created_at = "2026-08-05T00:00:00Z";
+        for (id, name, symbol_key) in [
+            ("node-from", "crate::parser::parse", "parser-parse"),
+            ("node-to", "crate::lexer::next", "lexer-next"),
+        ] {
+            sqlx::query(
+                "INSERT INTO code_nodes \
+                 (id, repository, language, package, source_path, qualified_name, kind, \
+                  signature_hash, symbol_key, revision, created_at) \
+                 VALUES (?, ?, 'rust', NULL, 'src/lib.rs', ?, 'function', NULL, ?, 'rev-1', ?)",
+            )
+            .bind(id)
+            .bind(&repository_text)
+            .bind(name)
+            .bind(symbol_key)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert node");
+        }
+        let mut tx = pool.begin().await.expect("edge transaction");
+        for index in 0..130 {
+            let relation = if index == 129 {
+                "calls_special"
+            } else {
+                "calls"
+            };
+            sqlx::query(
+                "INSERT INTO code_edges \
+                 (id, from_node, to_node, relation, confidence, evidence_kind, \
+                  evidence_artifact, revision, created_at) \
+                 VALUES (?, 'node-from', 'node-to', ?, 0.45, 'syntax_inferred', NULL, 'rev-1', ?)",
+            )
+            .bind(format!("edge-{index:03}"))
+            .bind(relation)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert edge");
+        }
+        tx.commit().await.expect("commit edges");
+
+        let mut warnings = Vec::new();
+        let (first, total, page) = load_edge_page(&pool, repository, "", 0, &mut warnings).await;
+        assert_eq!(total, 130);
+        assert_eq!(page, 0);
+        assert_eq!(first.len(), EDGE_PAGE_SIZE);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+        let (last, total, page) = load_edge_page(&pool, repository, "", 99, &mut warnings).await;
+        assert_eq!(total, 130);
+        assert_eq!(page, 1, "an oversized page clamps to the final page");
+        assert_eq!(last.len(), 30);
+
+        let (filtered, total, page) =
+            load_edge_page(&pool, repository, "special", 0, &mut warnings).await;
+        assert_eq!(total, 1);
+        assert_eq!(page, 0);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].relation, "calls-special");
+    }
 
     #[test]
     fn intents_map_to_the_matching_command_bodies() {
@@ -3587,44 +4391,6 @@ mod tests {
         assert!(SessionStore::load(&paths).sessions.is_empty());
     }
 
-    /// Task 5 (continuous-session plan): "New Conversation" cannot swap the
-    /// live connection to a new session, so it forgets this repository's
-    /// remembered mapping instead (`event_loop`'s exit check, on
-    /// `state.start_new_conversation`) — the exact `sessions.remove` +
-    /// `save` this test exercises. With the entry gone,
-    /// `resolve_or_create_session` finds nothing to resume on the next
-    /// launch and creates a genuinely fresh, unseeded session (never fakes
-    /// continuity by reusing the forgotten one).
-    #[test]
-    fn forgetting_a_repository_removes_its_remembered_session() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = RuntimePaths::from_data_dir(tmp.path().to_path_buf());
-        paths.ensure_directories().unwrap();
-
-        let mut store = SessionStore::default();
-        store.sessions.insert(
-            "/repo/one".into(),
-            StoredSession {
-                session_id: SessionId::new(),
-                workspace_id: WorkspaceId::new(),
-            },
-        );
-        store.save(&paths);
-        assert!(SessionStore::load(&paths)
-            .sessions
-            .contains_key("/repo/one"));
-
-        store.sessions.remove("/repo/one");
-        store.save(&paths);
-
-        assert!(
-            !SessionStore::load(&paths)
-                .sessions
-                .contains_key("/repo/one"),
-            "the forgotten repository must not resume its old session"
-        );
-    }
-
     /// Crash-logger tests (crash investigation follow-up). `format_crash_entry`
     /// is pure (no I/O), so a test can assert its shape with a synthetic
     /// message/location/backtrace without ever touching a real
@@ -3709,7 +4475,7 @@ mod tests {
     /// approval; a tool step with a multi-attempt retry and a dependency.
     const TEST_MANIFEST: &str = "\
 schema_version: 1
-id: repair-github-check
+id: test-workflow
 version: 1
 orchestration_reason: independent-review
 budget:
@@ -3741,11 +4507,11 @@ steps:
         let cards: Vec<_> = compiled
             .nodes
             .iter()
-            .map(|node| workflow_node_card(&label, node, None))
+            .map(|node| workflow_node_card(&compiled.id, &label, "—", None, node))
             .collect();
 
         let patch = cards.iter().find(|c| c.id == "patch").expect("patch node");
-        assert_eq!(patch.workflow, "repair-github-check v1");
+        assert_eq!(patch.workflow, "test-workflow v1");
         assert_eq!(patch.kind, "agent");
         assert_eq!(patch.agent, "implementer");
         assert_eq!(patch.model_policy, "coding");
@@ -3798,7 +4564,12 @@ steps:
             cost: Some(serde_json::json!({ "wall_time_secs": 12, "tool_calls": 3 })),
             error: Some("workflow.budget-exceeded: node budget for `tool_calls`".to_owned()),
         };
-        let card = workflow_node_card(&label, node, Some(&record));
+        let latest = LatestWorkflowRun {
+            id: "workflow-run-1".to_owned(),
+            phase: "running".to_owned(),
+            nodes: HashMap::from([("verify".to_owned(), record)]),
+        };
+        let card = workflow_node_card(&compiled.id, &label, "—", Some(&latest), node);
         assert_eq!(card.state, "blocked");
         assert_eq!(card.cost, "12s \u{b7} 3 tool calls");
         assert!(card.error.contains("budget"), "error: {}", card.error);
@@ -3818,8 +4589,11 @@ steps:
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
 
-        // No workflows directory → an empty view, not an error.
-        assert!(load_workflows(repo, None, &mut Vec::new()).await.is_empty());
+        // A fresh install still exposes the embedded repair workflow.
+        let built_in = load_workflows(repo, None, None, &mut Vec::new()).await;
+        assert!(built_in
+            .iter()
+            .any(|card| card.workflow_id == "repair-github-check"));
 
         let dir = repo.join(".codypendent").join("workflows");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3835,20 +4609,24 @@ steps:
         std::fs::write(dir.join("notes.txt"), "ignore me").unwrap();
 
         let mut warnings = Vec::new();
-        let cards = load_workflows(repo, None, &mut warnings).await;
+        let cards = load_workflows(repo, None, None, &mut warnings).await;
         assert_eq!(
             cards.len(),
-            2,
-            "both nodes of the good manifest, none of the broken"
+            7,
+            "five built-in nodes plus both nodes of the good manifest"
         );
-        assert!(cards.iter().all(|c| c.workflow == "repair-github-check v1"));
+        let test_cards: Vec<_> = cards
+            .iter()
+            .filter(|card| card.workflow_id == "test-workflow")
+            .collect();
+        assert!(test_cards.iter().all(|c| c.workflow == "test-workflow v1"));
         // Nodes keep their compiled topological order.
-        assert_eq!(cards[0].id, "patch");
-        assert_eq!(cards[1].id, "verify");
+        assert_eq!(test_cards[0].id, "patch");
+        assert_eq!(test_cards[1].id, "verify");
         // The skipped manifest left a diagnostic, not a stderr print.
         assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
         assert!(
-            warnings[0].contains("broken.yaml") && warnings[0].contains("does not compile"),
+            warnings[0].contains("broken") && warnings[0].contains("does not compile"),
             "the diagnostic names the skipped manifest: {warnings:?}"
         );
     }
@@ -3868,7 +4646,11 @@ steps:
             revision: 1,
             superseded_by: None,
         };
-        let card = blackboard_item_card("repair-github-check \u{b7} run 0192abcd", &item);
+        let card = blackboard_item_card(
+            "workflow-run-1",
+            "repair-github-check \u{b7} run 0192abcd",
+            &item,
+        );
         assert_eq!(card.kind, "finding");
         assert_eq!(card.summary, "off-by-one in paginate()");
         assert_eq!(card.author, "agent investigator");
@@ -3900,7 +4682,7 @@ steps:
             revision: 3,
             superseded_by: Some("2".to_owned()),
         };
-        let card = blackboard_item_card("run", &item);
+        let card = blackboard_item_card("workflow-run-1", "run", &item);
         assert_eq!(card.summary, "a guess");
         assert_eq!(card.author, "someone");
         assert_eq!(card.confidence, "\u{2014}");
@@ -4648,40 +5430,31 @@ model = "qwen2.5-coder:14b"
     }
 
     #[test]
-    fn tavily_key_set_and_remove_both_offer_the_daemon_restart() {
+    fn tavily_key_set_and_remove_apply_without_a_daemon_restart() {
         use codypendent_tui::Overlay;
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
         let mut state = AppState::new();
 
-        // Set: the restart offer stands (the daemon discovers the key only at
-        // boot).
+        // The daemon's reloading adapter resolves immediately before each call.
         apply_set_api_key(&mut state, &paths, &KeyTarget::Tavily, "tvly-saved");
-        assert!(
-            matches!(state.overlay, Overlay::ConfirmRestart),
-            "the set path offers the restart: {:?}",
-            state.overlay
-        );
+        assert_eq!(state.overlay, Overlay::None);
         assert_eq!(state.tavily_key_status, KeyStatus::Stored);
+        assert!(state.notice.as_ref().unwrap().0.contains("ready"));
 
-        // Dismiss the overlay, then remove: the daemon keeps its loaded
-        // credential for its lifetime, so the removal can't take effect
-        // without a restart either — the same offer must appear.
-        state.overlay = Overlay::None;
+        // Removal is equally immediate (an environment fallback may still be
+        // reported separately by the status projection).
         apply_remove_api_key(&mut state, &paths, &KeyTarget::Tavily);
-        assert!(
-            matches!(state.overlay, Overlay::ConfirmRestart),
-            "the remove path offers the restart too: {:?}",
-            state.overlay
-        );
+        assert_eq!(state.overlay, Overlay::None);
+        assert_eq!(state.tavily_key_status, KeyStatus::Missing);
         let notice = state
             .notice
             .as_ref()
             .map(|(text, _)| text.as_str())
             .unwrap_or("");
         assert!(
-            notice.contains("until the daemon restarts"),
-            "the notice explains why a restart is needed: {notice}"
+            notice.contains("disabled"),
+            "immediate removal notice: {notice}"
         );
     }
 
@@ -4736,19 +5509,23 @@ model = "qwen2.5-coder:14b"
 
         // The channel retained only the overwrite…
         assert_eq!(stage_rx.borrow().text(), "restoring session…");
-        // …but the vec kept both warnings, and draining notices each of them
-        // post-boot (`Action::Notice` keeps the latest until its expiry tick,
-        // so the LAST collected warning is the one on screen).
+        // …but the vec kept both warnings, and draining persists both in the
+        // diagnostics centre instead of losing all but the final transient.
         let mut state = AppState::new();
         drain_boot_warnings(&mut state, &warnings);
         assert!(
             warnings.lock().expect("poisoned").is_empty(),
             "drained exactly once"
         );
-        assert_eq!(
-            state.notice.as_ref().map(|(text, _)| text.as_str()),
-            Some("restart refused: 2 active run(s)")
-        );
+        assert_eq!(state.issues.len(), 2);
+        assert!(state
+            .issues
+            .iter()
+            .any(|issue| issue == "daemon build mismatch; continuing on the running build"));
+        assert!(state
+            .issues
+            .iter()
+            .any(|issue| issue == "restart refused: 2 active run(s)"));
     }
 
     // -- provider_requires_key (Task 8 add-model key step derivation) --------
