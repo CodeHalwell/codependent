@@ -2715,6 +2715,7 @@ impl FrameworkAgentRuntime {
             if !diff.is_empty {
                 if let Some(artifact) = diff.artifact.clone() {
                     let changeset_id = ChangeSetId::new();
+                    let diff_summary = summarize_diff(&diff.diff, diff.truncated);
                     self.emit(
                         run.session_id,
                         run_actor.clone(),
@@ -2722,6 +2723,11 @@ impl FrameworkAgentRuntime {
                             run_id: run.run_id,
                             changeset_id,
                             artifact: artifact.clone(),
+                            files: diff_summary.files,
+                            additions: diff_summary.additions,
+                            deletions: diff_summary.deletions,
+                            preview: diff_summary.preview,
+                            preview_truncated: diff_summary.truncated,
                         },
                     )
                     .await?;
@@ -3199,6 +3205,63 @@ fn action_digest(tool: &str, outcome: &str, artifact: Option<ArtifactId>) -> Val
         "outcome": outcome,
         "artifact": artifact.map(|id| id.to_string()),
     })
+}
+
+const DIFF_PREVIEW_MAX_LINES: usize = 120;
+const DIFF_PREVIEW_MAX_COLUMNS: usize = 240;
+
+struct DiffSummary {
+    files: Vec<String>,
+    additions: u64,
+    deletions: u64,
+    preview: String,
+    truncated: bool,
+}
+
+/// Derive the compact information a timeline needs from a unified diff while
+/// the complete bytes remain in the artifact store. The preview is bounded by
+/// rows and columns so one generated file cannot swamp the event ledger or TUI.
+fn summarize_diff(diff: &str, upstream_truncated: bool) -> DiffSummary {
+    let mut files = Vec::new();
+    let mut additions = 0_u64;
+    let mut deletions = 0_u64;
+    let mut preview_lines = Vec::new();
+    let mut truncated = upstream_truncated;
+
+    for (index, line) in diff.lines().enumerate() {
+        if let Some(path) = line
+            .strip_prefix("+++ b/")
+            .or_else(|| line.strip_prefix("--- a/"))
+        {
+            if path != "/dev/null" && !files.iter().any(|known| known == path) {
+                files.push(path.to_string());
+            }
+        }
+        if line.starts_with('+') && !line.starts_with("+++") {
+            additions = additions.saturating_add(1);
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            deletions = deletions.saturating_add(1);
+        }
+
+        if index < DIFF_PREVIEW_MAX_LINES {
+            let shortened = line
+                .chars()
+                .take(DIFF_PREVIEW_MAX_COLUMNS)
+                .collect::<String>();
+            truncated |= shortened.chars().count() < line.chars().count();
+            preview_lines.push(shortened);
+        } else {
+            truncated = true;
+        }
+    }
+
+    DiffSummary {
+        files,
+        additions,
+        deletions,
+        preview: preview_lines.join("\n"),
+        truncated,
+    }
 }
 
 /// A hex SHA-256 over the JSON serialization of `value` — the request/args
@@ -3857,6 +3920,29 @@ fn measured_usage(
 mod tests {
     use super::*;
     use crate::tools::ClosureSink;
+
+    #[test]
+    fn diff_summary_reports_files_stats_and_bounded_preview() {
+        let oversized = "x".repeat(DIFF_PREVIEW_MAX_COLUMNS + 8);
+        let diff = format!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n-old\n+new\n+{oversized}"
+        );
+
+        let summary = summarize_diff(&diff, false);
+
+        assert_eq!(summary.files, vec!["src/lib.rs"]);
+        assert_eq!(summary.additions, 2);
+        assert_eq!(summary.deletions, 1);
+        assert!(summary.preview.contains("@@ -1 +1,2 @@"));
+        assert!(
+            summary.truncated,
+            "the overlong line marks the preview bounded"
+        );
+        assert!(summary
+            .preview
+            .lines()
+            .all(|line| line.chars().count() <= DIFF_PREVIEW_MAX_COLUMNS));
+    }
 
     // -----------------------------------------------------------------------
     // Context-window protection (BT2): estimate_context_tokens / turn_item_text_len

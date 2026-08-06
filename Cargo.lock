@@ -858,6 +858,7 @@ dependencies = [
  "codypendent-sandbox",
  "futures",
  "hex",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

@@ -1,14 +1,11 @@
 //! `codypendent doctor` — a read-only health check for the single-binary
 //! daemon setup. It never mutates anything; it inspects the binary, the running
 //! daemon, the runtime paths, the model configuration, and (best-effort)
-//! provider reachability, and prints a checklist. The process exits non-zero
+//! provider/model readiness, and prints a checklist. The process exits non-zero
 //! when any check FAILS (scriptable), so `doctor` can gate CI or a setup step.
 //!
 //! The gathering (which does I/O) is kept separate from the pure [`Report`]
 //! rendering so the text/JSON output is unit-testable without a daemon.
-
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
 
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::BUILD_ID;
@@ -256,57 +253,68 @@ async fn check_models_and_providers(report: &mut Report, paths: &RuntimePaths, d
         );
         return;
     }
-    report.ok(
-        "models",
-        format!(
-            "{} configured: {}",
-            configs.len(),
-            configs
-                .iter()
-                .map(|c| c.id.0.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    );
-
-    // Provider reachability — warn-only (offline is legitimate). Local
-    // endpoints (Ollama/LM Studio/vLLM on loopback) are always probed with a
-    // short TCP connect; hosted endpoints only with `--deep` (a bare TCP
-    // connect to host:port, no request, no auth).
-    let mut seen = std::collections::BTreeSet::new();
+    let auth = match codypendent_runtime::auth::AuthStore::load(&paths.data_dir) {
+        Ok(auth) => auth,
+        Err(error) => {
+            report.warn(
+                "model credentials",
+                format!("could not read auth.json: {error}"),
+                "repair or remove the corrupt auth.json before relying on stored keys",
+            );
+            codypendent_runtime::auth::AuthStore::default()
+        }
+    };
+    let registry = codypendent_runtime::models::ModelRegistry::new(configs.clone()).with_auth(auth);
+    let mut checked = 0usize;
+    let mut healthy = 0usize;
     for config in &configs {
         let base = config.base_url.trim();
-        if base.is_empty() || !seen.insert(base.to_string()) {
-            continue;
-        }
         let local = is_local_url(base);
-        if !local && !deep {
-            report.ok(
-                "provider",
-                format!("{base} (hosted — not probed; use `doctor --deep`)"),
+        if !local && !deep && !base.is_empty() {
+            report.warn(
+                "model",
+                format!("{} ({}) — not verified", config.id, config.model),
+                "run `codypendent doctor --deep` to verify hosted credentials and model availability",
             );
             continue;
         }
-        let name = if local {
-            "provider (local)"
-        } else {
-            "provider"
-        };
-        match host_port(base) {
-            Some(hostport) => match reachable(&hostport) {
-                true => report.ok("provider", format!("{base} — reachable")),
-                false => report.warn(
-                    name,
-                    format!("{base} — not reachable"),
-                    "start the local model server, or check the base_url",
-                ),
-            },
-            None => report.warn(
-                "provider",
-                format!("{base} — could not parse a host:port"),
-                "check the base_url in models.toml",
+        checked += 1;
+        match registry.check_model(&config.id).await {
+            Ok(()) => {
+                healthy += 1;
+                report.ok("model", format!("{} ({}) — ready", config.id, config.model));
+            }
+            Err(error) => report.warn(
+                "model",
+                format!("{} ({}) — {error}", config.id, config.model),
+                "install/fix this model or move a healthy model ahead of it in the policy",
             ),
         }
+    }
+
+    if healthy > 0 {
+        report.ok(
+            "models",
+            format!(
+                "{healthy} of {} configured model(s) verified ready",
+                configs.len()
+            ),
+        );
+    } else if checked == configs.len() {
+        report.fail(
+            "models",
+            format!(
+                "none of the {} configured model(s) is usable",
+                configs.len()
+            ),
+            "open the provider catalog, install/select a listed model, then run doctor again",
+        );
+    } else {
+        report.warn(
+            "models",
+            format!("{} configured; none verified without --deep", configs.len()),
+            "run `codypendent doctor --deep` before starting a hosted run",
+        );
     }
 }
 
@@ -316,41 +324,6 @@ fn is_local_url(url: &str) -> bool {
     ["localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1"]
         .iter()
         .any(|h| lower.contains(h))
-}
-
-/// Extract `host:port` from a base URL, defaulting the port from the scheme
-/// (https→443, otherwise 80). Deliberately dependency-free string handling —
-/// enough for a reachability probe, not a general URL parser.
-fn host_port(url: &str) -> Option<String> {
-    let (scheme, rest) = match url.split_once("://") {
-        Some((s, r)) => (s, r),
-        None => ("http", url),
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let authority = authority.rsplit('@').next().unwrap_or(authority); // drop userinfo
-    if authority.is_empty() {
-        return None;
-    }
-    if authority.contains(':') && !authority.ends_with(']') {
-        // host:port (or [ipv6]:port) already present.
-        Some(authority.to_string())
-    } else {
-        let port = if scheme.eq_ignore_ascii_case("https") {
-            443
-        } else {
-            80
-        };
-        Some(format!("{authority}:{port}"))
-    }
-}
-
-/// A bounded TCP connect (never hangs): resolve `host:port` and try to open a
-/// socket within 2s. True on a successful connect.
-fn reachable(hostport: &str) -> bool {
-    let Ok(mut addrs) = hostport.to_socket_addrs() else {
-        return false;
-    };
-    addrs.any(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok())
 }
 
 #[cfg(test)]
@@ -407,22 +380,5 @@ mod tests {
         assert!(is_local_url("http://localhost:11434/v1"));
         assert!(is_local_url("http://127.0.0.1:1234"));
         assert!(!is_local_url("https://api.openai.com/v1"));
-    }
-
-    #[test]
-    fn host_port_parses_scheme_host_and_default_ports() {
-        assert_eq!(
-            host_port("http://localhost:11434/v1").as_deref(),
-            Some("localhost:11434")
-        );
-        assert_eq!(
-            host_port("https://api.openai.com/v1").as_deref(),
-            Some("api.openai.com:443")
-        );
-        assert_eq!(
-            host_port("http://example.com/path").as_deref(),
-            Some("example.com:80")
-        );
-        assert_eq!(host_port("").as_deref(), None);
     }
 }

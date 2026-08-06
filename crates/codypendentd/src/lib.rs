@@ -95,17 +95,12 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         Err(error) => warn!(%error, "failed to register built-in tools"),
     }
 
-    // Derive the process's repository identity from the working directory's
-    // canonical path, so the SAME checkout maps to the SAME id across restarts —
-    // a random id per boot would orphan the previous run's code graph and
-    // repository-scoped memories and bloat the database. Then warm the code graph
-    // so the repository map a run's context opens with is real. The same id is
-    // handed to the executor, so runs, their context maps, and their curated
-    // memories all share one stable repository. The scan is bounded and
-    // failure-tolerant — a parse error on one file must never abort startup.
+    // Derive the process's fallback repository identity without warming the code
+    // graph synchronously. Session attach and run launch schedule valid Git
+    // checkouts in the background; startup must never walk an arbitrary daemon
+    // working directory before it can serve clients.
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let repository = scan::repository_id_for(&workdir);
-    scan::scan_repository(&pool, repository, &workdir).await;
 
     // The executor owns the shared event fan-out + approval broker the server
     // binds to (`RunExecutor::collaborators`), and drives each accepted run

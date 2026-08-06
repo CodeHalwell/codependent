@@ -13,13 +13,10 @@
 //!    [`AgentMode`]. This is *not* the Phase 7 utility router; it is the
 //!    minimal "try this, then that" list called for by STEP 1.9.
 //! 3. [`resolve_model`] — walks a policy's candidates for a mode and returns
-//!    the first one whose endpoint is reachable, falling back on connection
-//!    failure. This does not depend on `provider-openai`: candidate
-//!    selection only needs to know whether an endpoint is reachable, not how
-//!    to speak its wire protocol, so it stays available even if that feature
-//!    is disabled. The caller (the STEP 1.10 agent loop) uses the returned
-//!    [`ResolvedModel::id`] both to attribute the run and to obtain the
-//!    actual client via `ModelRegistry::client_for`.
+//!    the first model the provider actually reports as available. Merely
+//!    accepting a TCP connection is not enough: an Ollama server can be up
+//!    while the configured tag is absent. The caller uses the returned
+//!    [`ResolvedModel::id`] both to attribute the run and obtain the client.
 //!
 //! API keys are read from the configured environment variable at the moment
 //! a client is constructed ([`ModelRegistry::client_for`]) — never persisted,
@@ -178,6 +175,15 @@ pub enum ModelsError {
     #[error("connection check to `{base_url}` failed: {reason}")]
     ConnectionFailed { base_url: String, reason: String },
 
+    /// The endpoint answered, but the configured provider-side model was not
+    /// present in its OpenAI-compatible `/models` catalog.
+    #[error("model `{model}` (`{provider_model}`) is unavailable: {reason}")]
+    ModelUnavailable {
+        model: ModelId,
+        provider_model: String,
+        reason: String,
+    },
+
     /// [`ModelPolicy::candidates`] returned an empty list for the mode.
     #[error("no candidate model is configured for mode {mode:?}")]
     NoCandidates { mode: AgentMode },
@@ -271,6 +277,106 @@ fn config_to_protocol_auth(cfg: &ModelConfig) -> Result<(Protocol, AuthMethod)> 
 
 #[cfg(feature = "provider-openai")]
 impl ModelRegistry {
+    /// Resolve the key exactly as the live client does. Keeping this in one
+    /// helper ensures the readiness probe and the first completion cannot
+    /// disagree because they used different credential precedence.
+    async fn api_key_for(&self, cfg: &ModelConfig) -> Result<String> {
+        if let Some(key) = self
+            .auth
+            .get(cfg.id.0.as_str())
+            .filter(|key| !key.is_empty())
+        {
+            return Ok(key.to_string());
+        }
+        let (_, auth) = config_to_protocol_auth(cfg)?;
+        match credential_for(&auth).resolve().await {
+            Ok(ResolvedCredential::ApiKey { value, .. }) => Ok(value),
+            Ok(ResolvedCredential::None) => Ok(String::new()),
+            Err(CredentialError::MissingEnv { var }) => Err(ModelsError::MissingApiKeyEnv {
+                model: cfg.id.clone(),
+                var,
+            }),
+            Err(other) => Err(ModelsError::ProtocolNotWired {
+                model: cfg.id.clone(),
+                protocol: other.to_string(),
+            }),
+        }
+    }
+
+    /// Verify that a configured model is genuinely usable enough to select:
+    /// credentials resolve, the OpenAI-compatible `/models` endpoint answers,
+    /// and its catalog contains the configured provider-side model name.
+    pub async fn check_model(&self, id: &ModelId) -> Result<()> {
+        let cfg = self
+            .get(id)
+            .ok_or_else(|| ModelsError::UnknownModel(id.clone()))?;
+        let (protocol, _) = config_to_protocol_auth(cfg)?;
+        if !matches!(protocol, Protocol::OpenAiChat) {
+            return Err(ModelsError::ProtocolNotWired {
+                model: id.clone(),
+                protocol: format!("{protocol:?}"),
+            });
+        }
+        if cfg.base_url.trim().is_empty() {
+            return Err(ModelsError::InvalidBaseUrl {
+                base_url: cfg.base_url.clone(),
+                reason: "base_url is blank".to_string(),
+            });
+        }
+
+        let key = self.api_key_for(cfg).await?;
+        let endpoint = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|error| ModelsError::ConnectionFailed {
+                base_url: cfg.base_url.clone(),
+                reason: error.to_string(),
+            })?;
+        let mut request = client.get(endpoint);
+        if !key.is_empty() {
+            request = request.bearer_auth(key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| ModelsError::ConnectionFailed {
+                base_url: cfg.base_url.clone(),
+                reason: error.to_string(),
+            })?;
+        if !response.status().is_success() {
+            return Err(ModelsError::ModelUnavailable {
+                model: id.clone(),
+                provider_model: cfg.model.clone(),
+                reason: format!("provider returned HTTP {} from /models", response.status()),
+            });
+        }
+        let payload: serde_json::Value =
+            response
+                .json()
+                .await
+                .map_err(|error| ModelsError::ModelUnavailable {
+                    model: id.clone(),
+                    provider_model: cfg.model.clone(),
+                    reason: format!("provider returned an invalid /models response: {error}"),
+                })?;
+        let available = payload
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+            .any(|candidate| candidate == cfg.model);
+        if !available {
+            return Err(ModelsError::ModelUnavailable {
+                model: id.clone(),
+                provider_model: cfg.model.clone(),
+                reason: "provider did not list this model".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Build a framework chat client for `id`, dispatching on the model's wire
     /// [`Protocol`] and resolving credentials through the async
     /// `CredentialProvider` seam (`codypendent_providers::credential_for`).
@@ -300,7 +406,7 @@ impl ModelRegistry {
         let cfg = self
             .get(id)
             .ok_or_else(|| ModelsError::UnknownModel(id.clone()))?;
-        let (protocol, auth) = config_to_protocol_auth(cfg)?;
+        let (protocol, _) = config_to_protocol_auth(cfg)?;
         match protocol {
             Protocol::OpenAiChat => {
                 // Key resolution precedence (additive): (a) an `auth.json` key for
@@ -308,31 +414,7 @@ impl ModelRegistry {
                 // path) → (c) none. A model with no `auth.json` entry behaves
                 // exactly as before. The stored key is moved straight into the
                 // client and is never logged or retained by this function.
-                let api_key =
-                    if let Some(key) = self.auth.get(id.0.as_str()).filter(|k| !k.is_empty()) {
-                        key.to_string()
-                    } else {
-                        match credential_for(&auth).resolve().await {
-                            Ok(ResolvedCredential::ApiKey { value, .. }) => value,
-                            Ok(ResolvedCredential::None) => String::new(),
-                            Err(CredentialError::MissingEnv { var }) => {
-                                return Err(ModelsError::MissingApiKeyEnv {
-                                    model: id.clone(),
-                                    var,
-                                });
-                            }
-                            // `CredentialError` is `#[non_exhaustive]`: this also
-                            // catches `NotWired` (unreachable today — the legacy
-                            // bridge above only ever produces `ApiKey`/`None` auth,
-                            // both wired) plus any future variant.
-                            Err(other) => {
-                                return Err(ModelsError::ProtocolNotWired {
-                                    model: id.clone(),
-                                    protocol: other.to_string(),
-                                });
-                            }
-                        }
-                    };
+                let api_key = self.api_key_for(cfg).await?;
                 let client = OpenAIChatCompletionClient::new(api_key, cfg.model.clone())
                     .with_base_url(cfg.base_url.clone());
                 Ok(Arc::new(client))
@@ -497,8 +579,10 @@ pub struct ResolvedModel {
     pub id: ModelId,
 }
 
-/// Walk `policy`'s candidates for `mode` in order, using the default
-/// [`TcpConnectProbe`], returning the first that is reachable.
+/// Walk `policy`'s candidates for `mode` in order, returning the first model
+/// whose credentials resolve and whose provider `/models` catalog contains the
+/// configured model name. This prevents an open Ollama port with a stale model
+/// tag from being selected and failing the run immediately afterward.
 ///
 /// See [`resolve_model_with_probe`] for the fallback semantics and for
 /// injecting a different probe.
@@ -507,7 +591,30 @@ pub async fn resolve_model(
     policy: &ModelPolicy,
     mode: AgentMode,
 ) -> Result<ResolvedModel> {
-    resolve_model_with_probe(registry, policy, mode, &TcpConnectProbe::default()).await
+    #[cfg(not(feature = "provider-openai"))]
+    {
+        return resolve_model_with_probe(registry, policy, mode, &TcpConnectProbe::default()).await;
+    }
+
+    #[cfg(feature = "provider-openai")]
+    {
+        let candidates = policy.candidates(mode);
+        if candidates.is_empty() {
+            return Err(ModelsError::NoCandidates { mode });
+        }
+        let mut attempts = Vec::with_capacity(candidates.len());
+        for id in candidates {
+            if registry.get(id).is_none() {
+                attempts.push((id.clone(), "model not registered".to_string()));
+                continue;
+            }
+            match registry.check_model(id).await {
+                Ok(()) => return Ok(ResolvedModel { id: id.clone() }),
+                Err(error) => attempts.push((id.clone(), error.to_string())),
+            }
+        }
+        Err(ModelsError::AllCandidatesFailed { mode, attempts })
+    }
 }
 
 /// Walk `policy`'s candidates for `mode` in order. For each candidate: if it
@@ -543,6 +650,7 @@ pub async fn resolve_model_with_probe(
 mod tests {
     use super::*;
     use std::io::Write;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     fn model_id(s: &str) -> ModelId {
@@ -918,9 +1026,14 @@ api_key_env = "OPENAI_API_KEY"
         let policy = ModelPolicy::new()
             .with_candidates(AgentMode::Build, vec![closed.clone(), reachable.clone()]);
 
-        let resolved = resolve_model(&registry, &policy, AgentMode::Build)
-            .await
-            .expect("second candidate should be reachable");
+        let resolved = resolve_model_with_probe(
+            &registry,
+            &policy,
+            AgentMode::Build,
+            &TcpConnectProbe::default(),
+        )
+        .await
+        .expect("second candidate should be reachable");
         assert_eq!(resolved.id, reachable);
 
         drop(listener);
@@ -982,12 +1095,76 @@ api_key_env = "OPENAI_API_KEY"
         let policy =
             ModelPolicy::new().with_candidates(AgentMode::Plan, vec![ghost, reachable.clone()]);
 
-        let resolved = resolve_model(&registry, &policy, AgentMode::Plan)
-            .await
-            .expect("second, registered candidate should resolve");
+        let resolved = resolve_model_with_probe(
+            &registry,
+            &policy,
+            AgentMode::Plan,
+            &TcpConnectProbe::default(),
+        )
+        .await
+        .expect("second, registered candidate should resolve");
         assert_eq!(resolved.id, reachable);
 
         drop(listener);
+    }
+
+    #[cfg(feature = "provider-openai")]
+    async fn models_server(models: &[&str]) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let data = models
+            .iter()
+            .map(|id| serde_json::json!({ "id": id }))
+            .collect::<Vec<_>>();
+        let body = serde_json::json!({ "data": data }).to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}/v1"), task)
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn resolve_model_falls_back_past_a_reachable_but_missing_model() {
+        let stale = model_id("stale");
+        let healthy = model_id("healthy");
+        let (stale_url, stale_server) = models_server(&["something-else"]).await;
+        let (healthy_url, healthy_server) = models_server(&["installed-model"]).await;
+        let registry = ModelRegistry::new([
+            ModelConfig {
+                id: stale.clone(),
+                provider: "openai-compatible".to_string(),
+                base_url: stale_url,
+                model: "missing-model".to_string(),
+                api_key_env: String::new(),
+                context_tokens: None,
+            },
+            ModelConfig {
+                id: healthy.clone(),
+                provider: "openai-compatible".to_string(),
+                base_url: healthy_url,
+                model: "installed-model".to_string(),
+                api_key_env: String::new(),
+                context_tokens: None,
+            },
+        ]);
+        let policy =
+            ModelPolicy::new().with_candidates(AgentMode::Build, vec![stale, healthy.clone()]);
+
+        let resolved = resolve_model(&registry, &policy, AgentMode::Build)
+            .await
+            .expect("the installed fallback should be selected");
+        assert_eq!(resolved.id, healthy);
+        stale_server.await.unwrap();
+        healthy_server.await.unwrap();
     }
 
     // -- authority_from_base_url -------------------------------------------

@@ -5,12 +5,11 @@
 //! not one literal color in this module. No function performs I/O; the render
 //! thread only ever draws (RULE 2).
 //!
-//! Layout: left pane = session/run list; center = transcript (streamed model
-//! text, tool cards, patch summaries); right = pending approvals + run details;
-//! a one-row status line spans the bottom. Overlays (help, prompts, confirm,
-//! and the approval modal) draw on top.
+//! Layout: a restrained project header, an unboxed conversation timeline, an
+//! inline composer, and one contextual status row. Secondary inspectors and
+//! approvals draw on top only while requested.
 
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
@@ -21,12 +20,11 @@ use codypendent_protocol::{
 };
 
 use crate::action::{Action, KeyTarget};
-use crate::input::footer_hints;
 use crate::reduce::capability_label;
 use crate::state::{
     filter_key_rows, filter_model_names, filter_models, filter_modes, filter_providers, AppState,
-    DocFocus, DocLeaseState, KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, Overlay, Pane,
-    PatchSummary, ProviderCard, RunActivity, RunView, StatusProjection, ToolCard, ToolStatus,
+    DocFocus, DocLeaseState, KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, ModelReadiness,
+    Overlay, Pane, PatchSummary, ProviderCard, RunActivity, RunView, ToolCard, ToolStatus,
     TranscriptEntry,
 };
 use crate::theme::Theme;
@@ -42,12 +40,10 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
         area,
     );
 
-    // A conversation-centred shell: a one-row header bar spans the top, the
-    // transcript is the workspace, a persistent composer sits beneath it, a
-    // one-row status footer follows, and a one-row derived shortcuts strip
-    // spans the very bottom. Every other surface (runs, approvals, docs,
-    // skills, memory, edges) is a centered overlay or the approval modal —
-    // minimal permanent chrome.
+    // A conversation-centred shell: one calm project header, the transcript,
+    // an inline composer, and one contextual footer. Secondary surfaces remain
+    // overlays, so the primary experience reads like a coding conversation
+    // rather than a dashboard of permanent controls.
     // The box grows past its 3-row minimum when the draft holds more than one
     // line (a manual `Alt+Enter` break, or a multi-line paste), capped at
     // `COMPOSER_MAX_HEIGHT` — see `composer_box_height`.
@@ -55,43 +51,38 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),               // chat header (D3)
+            Constraint::Length(1),               // project header
             Constraint::Min(3),                  // conversation transcript
-            Constraint::Length(composer_height), // persistent composer
-            Constraint::Length(1),               // status footer
-            Constraint::Length(1),               // shortcuts footer (derived)
+            Constraint::Length(composer_height), // inline composer
+            Constraint::Length(1),               // contextual footer
         ])
         .split(area);
 
     render_header(frame, rows[0], state, theme);
     // The region between header and composer depends on the layout; the
-    // header, composer, status footer, and shortcuts footer are identical in
-    // both.
+    // header, composer, and contextual footer are identical in both.
     match state.layout {
         LayoutMode::Chat => render_conversation(frame, rows[1], state, theme),
         LayoutMode::Workspace => render_workspace(frame, rows[1], state, theme),
     }
     render_composer(frame, rows[2], state, theme);
     render_status_line(frame, rows[3], state, theme);
-    render_shortcuts_bar(frame, rows[4], state, theme);
 
     render_overlays(frame, area, state, theme);
 }
 
-/// The persistent one-row header bar (D3), identical across layouts. Left —
-/// the `● codypendent` brand and the session title, then width-tiered extras
-/// (model + next-run mode at mid width, the running daemon's build id at full
-/// width, the same tiers as [`render_status_line`]); right — context percent
-/// and cost from the status projection. Theme tokens only (RULE 7).
+/// The one-row project header. Brand and conversation identity live on the
+/// left; the active model/mode and genuinely-known usage live on the right.
+/// Build ids and diagnostics stay in their dedicated surfaces instead of
+/// competing with the task on every frame.
 fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let status = state.status();
-    let full = area.width >= 96;
     let mid = area.width >= 64;
     let sep = || Span::styled(" · ", Style::default().fg(theme.text.muted));
 
     let mut left: Vec<Span> = vec![
-        Span::raw(" "),
-        Span::styled("●", Style::default().fg(theme.agent.tool)),
+        Span::raw("  "),
+        Span::styled("✦", Style::default().fg(theme.focus.active)),
         Span::styled(
             " codypendent",
             Style::default()
@@ -99,51 +90,52 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    if let Some(title) = &state.session_title {
-        left.push(sep());
+    if let Some(title) = state
+        .session_title
+        .as_deref()
+        .filter(|title| !title.eq_ignore_ascii_case("codypendent"))
+    {
+        left.push(Span::styled("  /  ", Style::default().fg(theme.text.muted)));
         left.push(Span::styled(
-            truncate(title, 24),
+            truncate(title, 30),
             Style::default().fg(theme.text.secondary),
         ));
     }
-    if mid {
-        // The model is omitted entirely while unknown (the same honesty rule
-        // as the transcript's assistant header) — never a "—" placeholder.
-        if let Some(model) = &status.model {
-            left.push(sep());
-            left.push(Span::styled(
-                truncate(&model.0, 20),
-                Style::default().fg(theme.text.primary),
-            ));
-        }
-        left.push(sep());
-        left.push(Span::styled(
-            mode_label(state.default_mode).to_owned(),
-            Style::default().fg(theme.status.info),
-        ));
-    }
-    if full {
-        if let Some(build_id) = &state.daemon_build_id {
-            left.push(sep());
-            left.push(Span::styled(
-                build_id.clone(),
-                Style::default().fg(theme.text.muted),
-            ));
-        }
-    }
 
     let mut right: Vec<Span> = Vec::new();
-    if let Some(percent) = status.context_percent {
+    if mid {
+        if let Some(model) = &status.model {
+            right.push(Span::styled(
+                truncate(&model.0, 22),
+                Style::default().fg(theme.text.secondary),
+            ));
+            right.push(sep());
+        }
         right.push(Span::styled(
-            format!("{percent}%"),
-            Style::default().fg(theme.status.info),
+            mode_label(state.default_mode).to_owned(),
+            Style::default()
+                .fg(theme.focus.active)
+                .add_modifier(Modifier::BOLD),
         ));
-        right.push(sep());
     }
-    right.push(Span::styled(
-        format_cost(status.cost_minor),
-        Style::default().fg(theme.status.warning),
-    ));
+    if let Some(percent) = status.context_percent {
+        if !right.is_empty() {
+            right.push(sep());
+        }
+        right.push(Span::styled(
+            format!("ctx {percent}%"),
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    if let Some(cost) = status.cost_minor {
+        if !right.is_empty() {
+            right.push(sep());
+        }
+        right.push(Span::styled(
+            format_cost(Some(cost)),
+            Style::default().fg(theme.status.warning),
+        ));
+    }
 
     // Right-align ctx/cost by padding between the two groups (the status
     // line's approach: measure the spans directly rather than re-rendering).
@@ -153,7 +145,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(pad)));
     spans.extend(right);
-    spans.push(Span::raw(" "));
+    spans.push(Span::raw("  "));
 
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.surface.panel)),
@@ -462,9 +454,8 @@ fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     );
 }
 
-/// The composer's minimum height in rows (a bordered box holding one input
-/// line) — unchanged for the common single-line draft.
-const COMPOSER_HEIGHT: u16 = 3;
+/// The composer's minimum height: one subtle top rule and one input row.
+const COMPOSER_HEIGHT: u16 = 2;
 
 /// The composer's maximum height in rows. A manual line break (`Alt+Enter`)
 /// or a multi-line paste grows the box by one row per extra line, capped
@@ -473,12 +464,12 @@ const COMPOSER_HEIGHT: u16 = 3;
 /// in view.
 const COMPOSER_MAX_HEIGHT: u16 = 8;
 
-/// How tall the composer box should be this frame: `COMPOSER_HEIGHT` (3) for
-/// a single-line draft — including empty — growing by one row per extra
+/// How tall the composer should be this frame: `COMPOSER_HEIGHT` for a
+/// single-line draft — including empty — growing by one row per extra
 /// `\n`-separated line, up to `COMPOSER_MAX_HEIGHT`.
 fn composer_box_height(composer: &str) -> u16 {
     let lines = composer.split('\n').count() as u16;
-    (lines + 2).clamp(COMPOSER_HEIGHT, COMPOSER_MAX_HEIGHT)
+    (lines + 1).clamp(COMPOSER_HEIGHT, COMPOSER_MAX_HEIGHT)
 }
 
 /// Wrapped-row height of a line `columns` display-columns wide in an
@@ -848,68 +839,67 @@ fn build_transcript_window<'a>(
     (out, scroll, hits)
 }
 
-/// The conversation: every run in the session, in order, as one continuous
-/// scroll (Task 5, continuous-session plan) — the primary surface, full
-/// width. Before this task, the pane showed only the *selected* run, so a
-/// follow-up's new run made the previous turn disappear the instant it
-/// started; [`for_each_row`] now walks all of `state.runs`. The title
-/// names the session + the newest turn (and a turn count once the session has
-/// more than one), plus the header chrome (Task 4, codex chat shell) naming
-/// what's serving it: `model · mode[ · cost]`.
+/// Every run in the session as one continuous, unboxed conversation. Session,
+/// model, mode, and cost live in the project header; this surface is reserved
+/// for the task, agent activity, and results.
 fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let session = state.session_title.as_deref().unwrap_or("Codypendent");
-    let title = match state.selected_run() {
-        // More than one run this session: name the turn count rather than a
-        // "[selected/total] run selector" — every run always renders now, so
-        // there is nothing left to select between.
-        Some(run) if state.runs.len() > 1 => format!(
-            "{session} — {} · {} turns{}",
-            truncate(&run.objective, 36),
-            state.runs.len(),
-            header_chrome(run, &state.status()),
-        ),
-        Some(run) => format!(
-            "{session} — {}{}",
-            truncate(&run.objective, 44),
-            header_chrome(run, &state.status()),
-        ),
-        None => session.to_owned(),
-    };
-    let block = pane_block(&title, true, theme);
-    let inner = block.inner(area);
+    let inner = area.inner(Margin {
+        horizontal: if area.width >= 72 { 3 } else { 1 },
+        vertical: 0,
+    });
 
     if state.runs.is_empty() {
+        state.transcript_max_scroll.set(0);
         let lines = if state.models.is_empty() {
             vec![
                 Line::styled(
-                    "Setup needed — no model is configured.",
+                    "✦  Connect your first model",
                     Style::default()
-                        .fg(theme.status.warning)
+                        .fg(theme.text.heading)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Line::raw(""),
                 Line::styled(
-                    "Press /, choose Provider catalog, then add a ready provider model.",
+                    "Codypendent needs one verified model before it can work with you.",
                     Style::default().fg(theme.text.secondary),
                 ),
                 Line::styled(
-                    "Open Setup & diagnostics for the exact configuration issue.",
+                    "Press / and choose Provider catalog to discover a local or hosted model.",
+                    Style::default().fg(theme.text.primary),
+                ),
+                Line::styled(
+                    "Setup & diagnostics verifies the exact model—not just its endpoint.",
                     Style::default().fg(theme.text.muted),
                 ),
             ]
         } else {
             vec![
                 Line::styled(
-                    "Ready for a new run.",
+                    "✦  What should we build?",
+                    Style::default()
+                        .fg(theme.text.heading)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(""),
+                Line::styled(
+                    "Describe a change, paste an error, or ask Codypendent to explore the codebase.",
                     Style::default().fg(theme.text.secondary),
                 ),
                 Line::styled(
-                    "Type a message below and press Enter to start one.",
+                    "Enter sends  ·  / opens commands  ·  F2 opens the workspace",
                     Style::default().fg(theme.text.muted),
                 ),
             ]
         };
-        let hint = Paragraph::new(lines).block(block);
-        frame.render_widget(hint, area);
+        let height = lines.len() as u16;
+        let side = if inner.width > 84 { 4 } else { 0 };
+        let hero = Rect {
+            x: inner.x + side,
+            y: inner.y + inner.height.saturating_sub(height) / 3,
+            width: inner.width.saturating_sub(side * 2),
+            height: height.min(inner.height),
+        };
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), hero);
         return;
     }
 
@@ -973,29 +963,9 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     }
 
     let paragraph = Paragraph::new(lines)
-        .block(block)
         .wrap(Wrap { trim: false })
         .scroll((r0, 0));
-    frame.render_widget(paragraph, area);
-}
-
-/// The conversation header's `model · mode[ · cost]` chrome (Task 4, codex
-/// chat shell), appended to the pane title after the session/objective so
-/// the operator sees what's serving the run without opening the run-detail
-/// pane. `mode` is always known once a run exists (`RunView::mode` isn't
-/// optional) and is the floor; `model` (learned from the agent actor) and
-/// `cost` (from the status projection's cost budget) are each left out
-/// entirely — never a `—`/`$0.00` placeholder — until known.
-fn header_chrome(run: &RunView, status: &StatusProjection) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(model) = &run.model {
-        parts.push(model.to_string());
-    }
-    parts.push(mode_label(run.mode).to_owned());
-    if let Some(cost) = status.cost_minor {
-        parts.push(format_cost(Some(cost)));
-    }
-    format!(" · {}", parts.join(" · "))
+    frame.render_widget(paragraph, inner);
 }
 
 /// The persistent composer: an always-present input line. Empty, it shows a
@@ -1003,26 +973,32 @@ fn header_chrome(run: &RunView, status: &StatusProjection) -> String {
 /// it shows the text and a cursor.
 fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let steering = state.selected_run_is_active();
+    let area = area.inner(Margin {
+        horizontal: if area.width >= 72 { 2 } else { 1 },
+        vertical: 0,
+    });
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP)
         .title(Span::styled(
-            if steering { " Steer " } else { " Message " },
-            Style::default().fg(theme.text.muted),
+            if steering { " STEER " } else { " MESSAGE " },
+            Style::default()
+                .fg(theme.focus.active)
+                .add_modifier(Modifier::BOLD),
         ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(Style::default().bg(theme.surface.panel));
+        .border_style(Style::default().fg(theme.surface.border))
+        .style(Style::default().bg(theme.surface.background));
 
     let prompt_style = Style::default()
         .fg(theme.focus.active)
         .add_modifier(Modifier::BOLD);
     let lines: Vec<Line> = if state.composer.is_empty() {
         let hint = if steering {
-            "steer the run · Enter sends · / for commands"
+            "Add guidance while the agent works…"
         } else {
-            "message the agent to start a run · Enter sends · / for commands"
+            "Ask Codypendent to build, fix, explain, or explore…"
         };
         vec![Line::from(vec![
-            Span::styled("› ", prompt_style),
+            Span::styled("❯ ", prompt_style),
             Span::styled(hint, Style::default().fg(theme.text.muted)),
         ])]
     } else {
@@ -1037,7 +1013,7 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             .into_iter()
             .enumerate()
             .map(|(i, segment)| {
-                let mut spans = vec![Span::styled(if i == 0 { "› " } else { "  " }, prompt_style)];
+                let mut spans = vec![Span::styled(if i == 0 { "❯ " } else { "  " }, prompt_style)];
                 spans.push(Span::styled(
                     segment,
                     Style::default().fg(theme.text.primary),
@@ -1053,7 +1029,7 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     // Keep the cursor (the last line) in view once the draft has more lines
     // than the box shows — the box already grew toward `COMPOSER_MAX_HEIGHT`
     // (see `composer_box_height`); this only matters once it's capped there.
-    let visible_rows = area.height.saturating_sub(2).max(1);
+    let visible_rows = area.height.saturating_sub(1).max(1);
     let total_rows = lines.len() as u16;
     let scroll_y = total_rows.saturating_sub(visible_rows);
 
@@ -1388,39 +1364,64 @@ fn patch_lines<'a>(
     selected: bool,
     out: &mut Vec<Line<'a>>,
 ) {
-    // Task 5 (codex chat shell): the collapsed head is one compact line — a
-    // patch glyph, the change set's short id standing in for a target name
-    // (`PatchSummary` carries no file path or add/delete line counts yet —
-    // that needs a protocol change, out of scope here), and a `⟳ review`
-    // marker. The protocol has no `PatchApplied`/`PatchRejected` event, so a
-    // `PatchProposed` change set never resolves on the wire: every patch
-    // card sits in the transcript for manual review for its entire
-    // lifetime, so the marker is unconditional rather than derived from a
-    // per-instance status field.
     let marker = if patch.expanded { "▾" } else { "▸" };
     let head_style = if selected {
         theme.selection_style()
     } else {
         Style::default().fg(theme.diff.header)
     };
+    let target = match patch.files.as_slice() {
+        [file] => truncate(file, 48),
+        files if !files.is_empty() => format!("{} files", files.len()),
+        _ => format!("change set {}", short_id(&patch.changeset_id)),
+    };
+    let stats = if patch.additions > 0 || patch.deletions > 0 {
+        format!("  +{} −{}", patch.additions, patch.deletions)
+    } else {
+        String::new()
+    };
     out.push(Line::from(vec![
-        Span::styled(
-            format!("{marker} ❖ patch {} ", short_id(&patch.changeset_id)),
-            head_style,
-        ),
-        Span::styled("⟳ review", Style::default().fg(theme.status.warning)),
+        Span::styled(format!("{marker} ◆ {target}"), head_style),
+        Span::styled(stats, Style::default().fg(theme.text.muted)),
+        Span::styled("  changes ready", Style::default().fg(theme.status.success)),
     ]));
     if patch.expanded {
+        if patch.files.len() > 1 {
+            for file in &patch.files {
+                out.push(Line::styled(
+                    format!("    {file}"),
+                    Style::default().fg(theme.text.secondary),
+                ));
+            }
+            out.push(Line::raw(""));
+        }
+        for line in patch.preview.lines() {
+            let color = if line.starts_with('+') && !line.starts_with("+++") {
+                theme.diff.added
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                theme.diff.removed
+            } else if line.starts_with("@@") || line.starts_with("diff --git") {
+                theme.diff.header
+            } else {
+                theme.diff.context
+            };
+            out.push(Line::styled(
+                format!("    {line}"),
+                Style::default().fg(color),
+            ));
+        }
+        if patch.preview_truncated {
+            out.push(Line::styled(
+                "    … preview truncated; full diff retained as an artifact",
+                Style::default().fg(theme.text.muted),
+            ));
+        }
         out.push(Line::styled(
             format!(
-                "    change set {} — {} ({} bytes)",
-                patch.changeset_id, patch.artifact.media_type, patch.artifact.byte_length
+                "    full diff · {} · {} bytes",
+                patch.artifact.media_type, patch.artifact.byte_length
             ),
             Style::default().fg(theme.diff.context),
-        ));
-        out.push(Line::styled(
-            "    review as a change set; applies only via approval",
-            Style::default().fg(theme.text.muted),
         ));
     }
 }
@@ -1521,188 +1522,131 @@ fn backstage_lines<'a>(
 }
 
 fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let bg = Style::default().bg(theme.surface.overlay);
-
-    // A transient notice (rejected command, presence change) takes the line:
-    // it is the only channel for "the daemon said no", so it must not compete
-    // with the ambient fields for attention.
+    let bg = Style::default().bg(theme.surface.background);
     if let Some((notice, _)) = &state.notice {
         let line = Line::from(vec![
-            Span::raw(" "),
-            Span::styled(notice.clone(), Style::default().fg(theme.status.warning)),
+            Span::raw("  "),
+            Span::styled("● ", Style::default().fg(theme.status.warning)),
+            Span::styled(notice.clone(), Style::default().fg(theme.text.secondary)),
         ]);
-        frame.render_widget(
-            Paragraph::new(line).style(Style::default().bg(theme.surface.panel)),
-            area,
-        );
+        frame.render_widget(Paragraph::new(line).style(bg), area);
         return;
     }
 
     let status = state.status();
-    let width = area.width;
-    // Two tiers: full fields on a wide terminal, then progressively fewer as the
-    // width shrinks, so mode/state/attention always survive.
-    let full = width >= 96;
-    let mid = width >= 64;
+    let key = |text: &'static str| Span::styled(text, Style::default().fg(theme.focus.active));
+    let hint = |text: &'static str| Span::styled(text, Style::default().fg(theme.text.muted));
 
-    let field = |label: &str, value: String, color: Color| -> Vec<Span<'static>> {
-        vec![
-            Span::styled(format!("{label} "), Style::default().fg(theme.text.muted)),
-            Span::styled(value, Style::default().fg(color)),
-        ]
-    };
-    let sep = || Span::styled("  ", Style::default().fg(theme.text.muted));
-
-    // --- ambient state (left) ---
-    let mut ambient: Vec<Vec<Span>> = Vec::new();
-    if mid {
-        ambient.push(field(
-            "mode",
-            status
-                .mode
-                .map_or("—".to_owned(), |m| mode_label(m).to_owned()),
-            theme.status.info,
-        ));
-        // PR C2 (plan mode): the submission mode the NEXT run/continuation
-        // will use (`default_mode`, set in the `/mode` picker) — distinct
-        // from the active run's `mode` above, which the daemon reported.
-        ambient.push(field(
-            "next",
-            mode_label(state.default_mode).to_owned(),
-            theme.status.info,
-        ));
-    }
-    if !state.issues.is_empty() {
-        ambient.push(field(
-            "issues",
-            state.issues.len().to_string(),
-            theme.status.warning,
-        ));
+    let (left, right): (Vec<Span>, Vec<Span>) = if status.pending_approvals > 0 {
+        (
+            vec![
+                Span::raw("  "),
+                Span::styled("● ", Style::default().fg(theme.status.warning)),
+                Span::styled(
+                    format!("Approval needed · {} pending", status.pending_approvals),
+                    Style::default()
+                        .fg(theme.text.primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ],
+            vec![
+                key("a"),
+                hint(" once  "),
+                key("A"),
+                hint(" run  "),
+                key("r"),
+                hint(" reject"),
+            ],
+        )
+    } else if !state.issues.is_empty() {
         state.register_hit(area, Action::OpenIssues);
-    }
-    ambient.push(field(
-        "state",
-        status
-            .run_state
-            .map_or("—".to_owned(), |s| run_state_label(s).to_owned()),
-        status
-            .run_state
-            .map_or(theme.text.muted, |s| run_state_color(s, theme)),
-    ));
-    if mid {
-        ambient.push(field(
-            "ctx",
-            status
-                .context_percent
-                .map_or("—".to_owned(), |p| format!("{p}%")),
-            theme.status.info,
-        ));
-    }
-    if full {
-        ambient.push(field(
-            "cost",
-            format_cost(status.cost_minor),
-            theme.status.warning,
-        ));
-        ambient.push(field(
-            "wt",
-            status.worktree.clone().unwrap_or_else(|| "—".to_owned()),
-            theme.text.secondary,
-        ));
-    }
-    ambient.push(field(
-        "approvals",
-        status.pending_approvals.to_string(),
-        if status.pending_approvals > 0 {
-            theme.status.warning
+        (
+            vec![
+                Span::raw("  "),
+                Span::styled("▲ ", Style::default().fg(theme.status.warning)),
+                Span::styled(
+                    format!("Setup needs attention · {} issue(s)", state.issues.len()),
+                    Style::default().fg(theme.status.warning),
+                ),
+            ],
+            vec![key("/"), hint(" diagnostics")],
+        )
+    } else if !state.composer.is_empty() {
+        (
+            vec![
+                Span::raw("  "),
+                Span::styled("● ", Style::default().fg(theme.focus.active)),
+                Span::styled("Draft ready", Style::default().fg(theme.text.secondary)),
+            ],
+            vec![
+                key("Enter"),
+                hint(" send  "),
+                key("⌥Enter"),
+                hint(" newline  "),
+                key("Esc"),
+                hint(" clear"),
+            ],
+        )
+    } else if state.selected_run().is_some_and(|run| !run.follow) {
+        (
+            vec![
+                Span::raw("  "),
+                Span::styled("↑ ", Style::default().fg(theme.status.info)),
+                Span::styled(
+                    "Viewing earlier output",
+                    Style::default().fg(theme.text.secondary),
+                ),
+            ],
+            vec![key("PgDn"), hint(" latest")],
+        )
+    } else if let Some(run_state) = status.run_state {
+        state.register_hit(area, Action::OpenPalette);
+        let glyph = if matches!(run_state, RunState::Completed) {
+            "✓ "
         } else {
-            theme.text.muted
-        },
-    ));
-
-    let mut left: Vec<Span> = vec![Span::raw(" ")];
-    for (i, group) in ambient.into_iter().enumerate() {
-        if i > 0 {
-            left.push(sep());
-        }
-        left.extend(group);
-    }
-
-    // --- instructional hint (right), by what the user should do next ---
-    let key = |k: &str| Span::styled(k.to_owned(), Style::default().fg(theme.focus.active));
-    let word = |w: &str| Span::styled(w.to_owned(), Style::default().fg(theme.text.muted));
-    let scrolled_up = state.selected_run().is_some_and(|r| !r.follow);
-    let hint: Vec<Span> = if status.pending_approvals > 0 {
-        vec![
-            key("a"),
-            word(" approve  "),
-            key("A"),
-            word(" run  "),
-            key("r"),
-            word(" reject"),
-        ]
-    } else if scrolled_up {
-        vec![key("PgDn"), word(" ↧ latest")]
+            "● "
+        };
+        (
+            vec![
+                Span::raw("  "),
+                Span::styled(
+                    glyph,
+                    Style::default().fg(run_state_color(run_state, theme)),
+                ),
+                Span::styled(
+                    run_state_label(run_state).to_owned(),
+                    Style::default().fg(theme.text.secondary),
+                ),
+            ],
+            vec![key("/"), hint(" commands  "), key("F2"), hint(" workspace")],
+        )
     } else {
-        Vec::new()
+        state.register_hit(area, Action::OpenPalette);
+        (
+            vec![
+                Span::raw("  "),
+                Span::styled("● ", Style::default().fg(theme.status.success)),
+                Span::styled("Ready", Style::default().fg(theme.text.secondary)),
+            ],
+            vec![
+                key("Enter"),
+                hint(" send  "),
+                key("⌥Enter"),
+                hint(" newline  "),
+                key("/"),
+                hint(" commands"),
+            ],
+        )
     };
-    // Right-align the hint by padding between it and the ambient fields. This
-    // renders every frame, so measure widths from the spans directly rather than
-    // cloning `left` and wrapping `hint` in a `Line` just to call `.width()`.
+
     let left_width: usize = left.iter().map(|span| span.width()).sum();
-    let hint_width: usize = hint.iter().map(|span| span.width()).sum();
-    let pad = (width as usize).saturating_sub(left_width + hint_width + 1);
+    let right_width: usize = right.iter().map(|span| span.width()).sum();
+    let pad = (area.width as usize).saturating_sub(left_width + right_width + 2);
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.extend(hint);
-    spans.push(Span::raw(" "));
+    spans.extend(right);
+    spans.push(Span::raw("  "));
 
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
-}
-
-/// The persistent, derived shortcut strip: `·`-separated chips built from
-/// `input::footer_hints()`, so it never drifts from the real key bindings. Chips
-/// drop right-to-left on narrow terminals.
-fn render_shortcuts_bar(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let bg = Style::default().bg(theme.surface.overlay);
-    let mut spans: Vec<Span> = vec![Span::raw(" ")];
-    let mut used = 1usize;
-    let width = area.width as usize;
-    for (i, hint) in footer_hints().iter().enumerate() {
-        let sep = if i > 0 { 3 } else { 0 }; // " · "
-        let chip = Span::raw(hint.label).width(); // DISPLAY width (labels have ⏎/↑↓)
-        if used + sep + chip + 1 > width {
-            break; // drop the rest on a narrow terminal
-        }
-        if i > 0 {
-            spans.push(Span::styled(" · ", Style::default().fg(theme.text.muted)));
-            used += 3;
-        }
-        let chip_start = used as u16 + area.x;
-        // Split "glyph rest" so the key glyph reads as the accent.
-        let (glyph, rest) = hint.label.split_once(' ').unwrap_or((hint.label, ""));
-        spans.push(Span::styled(
-            glyph.to_owned(),
-            Style::default().fg(theme.focus.active),
-        ));
-        if !rest.is_empty() {
-            spans.push(Span::styled(
-                format!(" {rest}"),
-                Style::default().fg(theme.text.muted),
-            ));
-        }
-        used += chip;
-        let chip_end = used as u16 + area.x;
-        state.register_hit(
-            Rect {
-                x: chip_start,
-                y: area.y,
-                width: chip_end.saturating_sub(chip_start),
-                height: 1,
-            },
-            hint.action.clone(),
-        );
-    }
     frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
 }
 
@@ -2045,7 +1989,7 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     let outer = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            format!(" Skill Studio ({}) ", state.skills.len()),
+            format!(" Skill Studio · read only ({}) ", state.skills.len()),
             Style::default()
                 .fg(theme.text.heading)
                 .add_modifier(Modifier::BOLD),
@@ -2072,10 +2016,16 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     let first = first_visible_row(state.selected_skill, state.skills.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.skills.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "  no skills registered",
-            Style::default().fg(theme.text.muted),
-        )));
+        items.push(ListItem::new(vec![
+            Line::styled(
+                "  No registered skills",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  Registry inspection only; installation is not wired here.",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
     }
     for (idx, skill) in state
         .skills
@@ -2308,6 +2258,11 @@ fn render_model_picker(
         let card = &state.models[idx];
         let is_selected = row == selected;
         let is_current = current == Some(&card.id);
+        let (readiness, readiness_color) = match &card.readiness {
+            ModelReadiness::Ready => ("✓ ", theme.status.success),
+            ModelReadiness::Unverified => ("? ", theme.status.warning),
+            ModelReadiness::Unavailable(_) => ("! ", theme.status.error),
+        };
         let head = Line::from(vec![
             Span::styled(
                 if is_selected { "› " } else { "  " },
@@ -2317,8 +2272,9 @@ fn render_model_picker(
                 if is_current { "● " } else { "  " },
                 Style::default().fg(theme.status.success),
             ),
+            Span::styled(readiness, Style::default().fg(readiness_color)),
             Span::styled(
-                truncate(&card.id.0, 26),
+                truncate(&card.id.0, 24),
                 Style::default().fg(theme.text.primary),
             ),
         ]);
@@ -2398,6 +2354,17 @@ fn render_model_picker(
             card.provider.clone(),
             theme.text.secondary,
         ));
+        let (readiness, color) = match &card.readiness {
+            ModelReadiness::Ready => ("ready".to_owned(), theme.status.success),
+            ModelReadiness::Unverified => (
+                "unverified · run doctor --deep".to_owned(),
+                theme.status.warning,
+            ),
+            ModelReadiness::Unavailable(reason) => {
+                (format!("unavailable · {reason}"), theme.status.error)
+            }
+        };
+        lines.push(field("readiness", readiness, color));
         lines.push(field(
             "location",
             location_label(card.location).to_owned(),
@@ -2415,7 +2382,11 @@ fn render_model_picker(
         ));
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "  Enter stages this model for your next run",
+            if matches!(card.readiness, ModelReadiness::Unavailable(_)) {
+                "  This model cannot be staged until it is available"
+            } else {
+                "  Enter stages this model for your next run"
+            },
             Style::default().fg(theme.text.muted),
         ));
     } else {
@@ -2647,9 +2618,9 @@ fn render_provider_picker(
         lines.push(field(
             "status",
             if card.available {
-                "ready".to_owned()
+                "supported adapter".to_owned()
             } else {
-                "catalog only".to_owned()
+                "preview · adapter unavailable".to_owned()
             },
             if card.available {
                 theme.status.success
@@ -3006,7 +2977,11 @@ fn provider_badges(card: &ProviderCard) -> String {
         "{} · {} · {}",
         card.protocol,
         provider_location_label(card.local),
-        if card.available { "ready" } else { "preview" }
+        if card.available {
+            "supported"
+        } else {
+            "preview"
+        }
     )
 }
 
@@ -3063,10 +3038,16 @@ fn render_memory(
     let first = first_visible_row(state.selected_memory, state.memories.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.memories.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "  no memories in scope",
-            Style::default().fg(theme.text.muted),
-        )));
+        items.push(ListItem::new(vec![
+            Line::styled(
+                "  No curated memories yet",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  Durable facts appear after completed runs.",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
     }
     for (idx, memory) in state
         .memories
@@ -3222,7 +3203,7 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let outer = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            format!(" Docs Studio ({}) ", state.docs.len()),
+            format!(" Docs Studio · existing docs ({}) ", state.docs.len()),
             Style::default()
                 .fg(theme.text.heading)
                 .add_modifier(Modifier::BOLD),
@@ -3250,10 +3231,16 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let first = first_visible_row(state.selected_doc, state.docs.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.docs.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "  no documents in scope",
-            Style::default().fg(theme.text.muted),
-        )));
+        items.push(ListItem::new(vec![
+            Line::styled(
+                "  No collaborative documents yet",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  Creation is not wired here yet; this view edits existing documents.",
+                Style::default().fg(theme.status.warning),
+            ),
+        ]));
     }
     for (idx, doc) in state.docs.iter().enumerate().skip(first).take(visible_rows) {
         let selected = idx == state.selected_doc;
@@ -3752,10 +3739,16 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let first = first_visible_row(state.selected_node, state.workflow.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.workflow.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "  no workflow manifests in this repository",
-            Style::default().fg(theme.text.muted),
-        )));
+        items.push(ListItem::new(vec![
+            Line::styled(
+                "  No workflow manifests found",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  Add YAML under .codypendent/workflows, then reopen this view.",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
     }
     for (idx, node) in state
         .workflow
@@ -3975,10 +3968,16 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     let first = first_visible_row(state.selected_item, state.blackboard.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.blackboard.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "  no blackboard artifacts on the active runs",
-            Style::default().fg(theme.text.muted),
-        )));
+        items.push(ListItem::new(vec![
+            Line::styled(
+                "  No workflow artifacts yet",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  Start a workflow; findings and decisions will appear here live.",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
     }
     for (idx, card) in state
         .blackboard
@@ -5150,8 +5149,8 @@ mod tests {
         assert!(text.contains("gpt-5.1-codex"), "model missing:\n{text}");
         assert!(text.contains("42%"), "context %% missing:\n{text}");
         assert!(
-            text.contains("approvals"),
-            "approval count missing:\n{text}"
+            !text.contains("approval"),
+            "zero approvals should stay out of the primary shell:\n{text}"
         );
     }
 
@@ -5277,8 +5276,10 @@ mod tests {
 
     // --- D3: chat header ---
 
-    /// A state with every header field populated: session title, model, a
-    /// distinct next-run mode, a daemon build id, context %, and a cost.
+    /// A state with every user-facing header field populated: session title,
+    /// model, a distinct next-run mode, context %, and cost. The daemon build
+    /// id is deliberately populated too so the tests prove it stays in the
+    /// diagnostics surface instead of leaking into the primary shell.
     fn header_state() -> AppState {
         let mut s = running_build_state();
         s.daemon_build_id = Some("0.9.0+abc1234".to_owned());
@@ -5305,8 +5306,8 @@ mod tests {
         assert!(text.contains("gpt-5.1-codex"), "model missing:\n{text}");
         assert!(text.contains("Plan"), "next-run mode missing:\n{text}");
         assert!(
-            text.contains("0.9.0+abc1234"),
-            "daemon build id missing:\n{text}"
+            !text.contains("0.9.0+abc1234"),
+            "daemon build id belongs in diagnostics, not the header:\n{text}"
         );
         assert!(text.contains("42%"), "context %% missing:\n{text}");
         assert!(text.contains("$12.34"), "cost missing:\n{text}");
@@ -5351,8 +5352,8 @@ mod tests {
         let text = header_line(&state, 120);
         assert!(text.contains("codypendent"), "brand missing:\n{text}");
         assert!(
-            text.contains("0.9.0+abc1234"),
-            "daemon build id missing:\n{text}"
+            !text.contains("0.9.0+abc1234"),
+            "workspace uses the same quiet project header:\n{text}"
         );
     }
 
@@ -5581,12 +5582,8 @@ mod tests {
         assert!(out.contains('…'), "truncation ellipsis missing:\n{out}");
     }
 
-    /// Task 5: a patch card's collapsed head is `❖ patch {short id}` plus a
-    /// `⟳ review` marker. The protocol has no `PatchApplied`/`PatchRejected`
-    /// event — a `PatchProposed` change set never resolves on the wire, so
-    /// every patch card sits in the transcript for manual review for its
-    /// entire lifetime; the marker is unconditional rather than derived from
-    /// a per-instance status field (`PatchSummary` carries none).
+    /// A collapsed patch names its affected file and honest diff stats. The
+    /// old permanent "review" marker implied an action that did not exist.
     #[test]
     fn a_patch_card_renders_compact_with_a_patch_glyph_and_review_marker() {
         let mut s = AppState::new();
@@ -5605,11 +5602,21 @@ mod tests {
                 run_id,
                 changeset_id: ChangeSetId::new(),
                 artifact: filler_chronicle(),
+                files: vec!["src/lib.rs".to_owned()],
+                additions: 2,
+                deletions: 1,
+                preview: "@@ -1 +1 @@\n-old\n+new".to_owned(),
+                preview_truncated: false,
             }),
         );
         let out = render_to_string(&s, 80, 20);
-        assert!(out.contains("❖ patch"), "patch glyph missing:\n{out}");
-        assert!(out.contains("⟳ review"), "review marker missing:\n{out}");
+        assert!(out.contains("◆ src/lib.rs"), "file summary missing:\n{out}");
+        assert!(out.contains("+2 −1"), "diff stats missing:\n{out}");
+        assert!(out.contains("changes ready"), "state missing:\n{out}");
+        assert!(
+            !out.contains("⟳ review"),
+            "the shell must not advertise a fake review action:\n{out}"
+        );
         assert!(
             !out.contains("patch proposed ("),
             "old verbose label must be gone:\n{out}"
@@ -6046,6 +6053,7 @@ mod tests {
     #[test]
     fn the_header_shows_mode_alone_before_a_model_is_learned() {
         let mut s = AppState::new();
+        s.default_mode = AgentMode::Ask;
         let run_id = RunId::new();
         reduce(
             &mut s,
@@ -6056,21 +6064,15 @@ mod tests {
             }),
         );
         let out = render_to_string(&s, 100, 20);
-        // The conversation header (the pane's top border row) — row 0 is the
-        // D3 chat header bar, so locate the pane border instead of assuming
-        // the transcript starts at the top.
-        let header_row = out
-            .lines()
-            .find(|line| line.starts_with('┌'))
-            .expect("a conversation header row");
+        let header_row = out.lines().next().expect("a project header row");
         assert!(
-            header_row.contains("· Ask"),
+            header_row.contains("Ask"),
             "mode shown in the header:\n{header_row}"
         );
         assert_eq!(
-            header_row.matches('·').count(),
-            1,
-            "one separator for the one known field — no slot for model/cost:\n{header_row}"
+            header_row.matches("openai").count(),
+            0,
+            "no placeholder model appears before one is learned:\n{header_row}"
         );
     }
 
@@ -6189,9 +6191,8 @@ mod tests {
             "each turn gets its own assistant header:\n{out}"
         );
         assert!(
-            out.contains("2 turns"),
-            "the header names the turn count (the old [n/n] run-selector \
-             counter no longer applies once every run always renders):\n{out}"
+            !out.contains("[2/2]") && !out.contains("2 turns"),
+            "the continuous timeline needs no dashboard-style run counter:\n{out}"
         );
     }
 
@@ -6472,7 +6473,7 @@ mod tests {
         let text = render_to_string(&state, 80, 24);
         // A truly fresh state cannot start a run yet; the empty conversation
         // guides model setup instead of promising Enter will work.
-        assert!(text.contains("Setup needed"));
+        assert!(text.contains("Connect your first model"));
         assert!(text.contains("Provider catalog"));
     }
 
@@ -6483,18 +6484,20 @@ mod tests {
         let state = running_build_state();
         let text = render_to_string(&state, 100, 30);
 
-        // Conversation title names the session + active run objective.
+        // The quiet project header names the session; the objective belongs
+        // to the user turn in the continuous timeline.
         assert!(text.contains("fix-tests"), "session in title:\n{text}");
         assert!(
             text.contains("diagnose the failing test"),
             "run objective:\n{text}"
         );
         // The persistent composer + its steering placeholder (the run is live).
-        assert!(text.contains("›"), "composer prompt:\n{text}");
-        assert!(text.contains("Enter sends"), "composer hint:\n{text}");
-        assert!(text.contains("steer the run"), "steer placeholder:\n{text}");
-        // The status footer is still present.
-        assert!(text.contains("mode"), "status footer:\n{text}");
+        assert!(text.contains("❯"), "composer prompt:\n{text}");
+        assert!(
+            text.contains("Add guidance while the agent works"),
+            "steer placeholder:\n{text}"
+        );
+        assert!(text.contains("Running"), "context footer:\n{text}");
     }
 
     #[test]
@@ -6553,8 +6556,8 @@ mod tests {
         // The conversation is still the centre surface.
         assert!(text.contains("fix-tests"), "conversation title:\n{text}");
         // The composer and status footer persist across the toggle.
-        assert!(text.contains("›"), "composer:\n{text}");
-        assert!(text.contains("mode"), "status footer:\n{text}");
+        assert!(text.contains("❯"), "composer:\n{text}");
+        assert!(text.contains("Running"), "status footer:\n{text}");
 
         // Toggling back returns to the single-column chat (no Runs pane title).
         reduce(&mut state, Action::ToggleLayout);
@@ -6563,22 +6566,20 @@ mod tests {
     }
 
     #[test]
-    fn the_shortcuts_footer_renders_derived_chips() {
+    fn the_context_footer_keeps_only_high_value_commands() {
         let state = running_build_state();
         let out = render_to_string(&state, 100, 30);
-        // The persistent footer strip (its own row, below the status line).
-        assert!(out.contains("send"), "send chip:\n{out}");
+        assert!(out.contains("Running"), "live state:\n{out}");
         assert!(out.contains("commands"), "commands chip:\n{out}");
-        assert!(out.contains("layout"), "layout chip:\n{out}");
-        assert!(out.contains("help"), "help chip:\n{out}");
+        assert!(out.contains("workspace"), "workspace chip:\n{out}");
+        assert!(
+            !out.contains("help"),
+            "rare controls belong in the command palette:\n{out}"
+        );
     }
 
     #[test]
-    fn shortcuts_footer_row_does_not_clip_composer_or_status_line() {
-        // The root layout gains a 4th row for the shortcuts footer (Task 5) by
-        // shrinking the `Min(3)` transcript region — the fixed-height composer
-        // and status rows keep their full height, unclipped, with the footer as
-        // the new bottom-most row.
+    fn inline_composer_and_context_footer_do_not_clip_each_other() {
         let state = running_build_state();
         let height = 30u16;
         let text = render_to_string(&state, 100, height);
@@ -6589,50 +6590,41 @@ mod tests {
             "expected exactly {height} rendered rows:\n{text}"
         );
 
-        // Bottom-most row: the new shortcuts footer.
+        // Bottom-most row: the one contextual footer.
         let footer_row = lines[lines.len() - 1];
         assert!(
-            footer_row.contains("send") || footer_row.contains("commands"),
-            "bottom row should be the shortcuts footer:\n{footer_row:?}"
+            footer_row.contains("Running") && footer_row.contains("commands"),
+            "bottom row should be the context footer:\n{footer_row:?}"
         );
 
-        // Directly above it: the unchanged status line, still showing its fields.
-        let status_row = lines[lines.len() - 2];
-        assert!(
-            status_row.contains("mode"),
-            "status line should sit directly above the footer, unclipped:\n{status_row:?}"
-        );
-
-        // The `COMPOSER_HEIGHT` rows above that are the persistent composer —
-        // still fully present, not swallowed by the new footer row.
-        let composer_start = lines.len() - 2 - COMPOSER_HEIGHT as usize;
-        let composer_end = lines.len() - 2;
+        let composer_start = lines.len() - 1 - COMPOSER_HEIGHT as usize;
+        let composer_end = lines.len() - 1;
         let composer_rows = lines[composer_start..composer_end].join("\n");
         assert!(
-            composer_rows.contains('›'),
+            composer_rows.contains('❯'),
             "composer should keep its full height, unclipped:\n{composer_rows}"
         );
     }
 
     #[test]
     fn contextual_footer_switches_hint_by_context() {
-        // Idle: full ambient fields + a command hint.
+        // Live and not drafting: operational state + global entry points.
         let mut state = running_build_state();
         let idle = render_to_string(&state, 120, 30);
-        assert!(idle.contains("mode"), "ambient fields:\n{idle}");
+        assert!(idle.contains("Running"), "run state:\n{idle}");
         assert!(
             idle.contains("commands") || idle.contains("F2"),
             "footer command chips:\n{idle}"
         );
 
-        // Drafting still shows the ambient state; the send affordance is in the footer.
+        // Drafting replaces ambient state with editing actions.
         for c in "hello".chars() {
             reduce(&mut state, Action::InputChar(c));
         }
         let drafting = render_to_string(&state, 120, 30);
         assert!(
-            drafting.contains("send"),
-            "send chip in the footer:\n{drafting}"
+            drafting.contains("Draft ready") && drafting.contains("send"),
+            "draft actions in the footer:\n{drafting}"
         );
     }
 
@@ -6640,8 +6632,8 @@ mod tests {
     fn contextual_footer_narrows_by_dropping_low_priority_fields() {
         let state = running_build_state();
         let narrow = render_to_string(&state, 50, 30);
-        // State survives; the model field is dropped at a narrow width.
-        assert!(narrow.contains("state"), "state kept:\n{narrow}");
+        // Operational state survives; duplicated metadata is absent.
+        assert!(narrow.contains("Running"), "run state kept:\n{narrow}");
         assert!(
             !narrow.contains("model"),
             "model dropped when narrow:\n{narrow}"
@@ -6649,12 +6641,12 @@ mod tests {
     }
 
     #[test]
-    fn the_status_line_drops_the_model_but_keeps_honest_placeholders() {
+    fn the_context_footer_drops_duplicate_model_and_unknown_placeholders() {
         let state = running_build_state();
         let out = render_to_string(&state, 120, 30);
         // The model is deduped out of the status line's ambient fields — but still
         // shown in the header chrome + the assistant turn header.
-        let status_row = out.lines().rev().nth(1).unwrap_or(""); // status line is 2nd from bottom
+        let status_row = out.lines().last().unwrap_or("");
         assert!(
             !status_row.contains("model"),
             "no `model` field on the status line:\n{status_row}"
@@ -6663,22 +6655,16 @@ mod tests {
             out.contains("gpt-5.1-codex"),
             "model still shown in chrome/turn header:\n{out}"
         );
-        // Honesty: unmeasured cost/wt still render `—` (running_build_state measures
-        // neither), never a fabricated number.
+        // Unknown fields are omitted entirely instead of filling the calm
+        // primary shell with em-dash dashboard slots.
         assert!(
-            status_row.contains("—"),
-            "unmeasured fields stay em-dash:\n{status_row}"
+            !status_row.contains("—"),
+            "unknown ambient fields should be omitted:\n{status_row}"
         );
     }
 
     #[test]
-    fn context_footer_comes_alive_on_budget_warning_and_reads_dash_without_it() {
-        // BT5 ("the dead footer comes alive"): a plain (non-workflow) run
-        // that never emits `BudgetWarning{Tokens}` must render `ctx —`
-        // (honesty — no fabricated percent); once that event lands, the
-        // exact same footer field must show the live `ctx N%` gauge. This
-        // exercises the reducer arm (`reduce.rs:535-546`) and the render
-        // fallback (`render.rs:1270-1276`) with no production change.
+    fn project_header_adds_context_only_after_a_budget_event() {
         let mut s = AppState::new();
         let run_id = RunId::new();
         reduce(
@@ -6705,8 +6691,8 @@ mod tests {
 
         let before = render_to_string(&s, 110, 30);
         assert!(
-            before.contains("ctx —"),
-            "no BudgetWarning{{Tokens}} yet -> dash:\n{before}"
+            !before.contains("ctx"),
+            "unknown context should be omitted:\n{before}"
         );
         assert!(
             !before.contains("ctx 25%"),
@@ -7028,6 +7014,7 @@ mod tests {
             ModelCard {
                 id: ModelId("gpt-5.1-codex".to_owned()),
                 provider: "openai-compatible".to_owned(),
+                readiness: ModelReadiness::Unverified,
                 location: Some(ModelLocationLabel::Hosted),
                 cost_per_1k_usd: Some(0.03),
                 context_tokens: Some(200_000),
@@ -7035,6 +7022,7 @@ mod tests {
             ModelCard {
                 id: ModelId("qwen2.5-coder".to_owned()),
                 provider: "openai-compatible".to_owned(),
+                readiness: ModelReadiness::Ready,
                 location: Some(ModelLocationLabel::Local),
                 cost_per_1k_usd: None,
                 context_tokens: Some(32_000),
@@ -7072,11 +7060,11 @@ mod tests {
         // current and qwen is merely focused (by the `SelectNext` above), so
         // only gpt's list row may show the leading marker.
         assert!(
-            text.contains("● gpt-5.1-codex"),
+            text.contains("● ? gpt-5.1-codex"),
             "the list's current marker is missing from gpt-5.1-codex's row:\n{text}"
         );
         assert!(
-            !text.contains("● qwen2.5-coder"),
+            !text.contains("● ✓ qwen2.5-coder"),
             "the list must not mark the non-current model's row current:\n{text}"
         );
 
@@ -7288,6 +7276,7 @@ mod tests {
             ModelCard {
                 id: ModelId("groq/llama".to_owned()),
                 provider: "openai-compatible".to_owned(),
+                readiness: ModelReadiness::Ready,
                 location: None,
                 cost_per_1k_usd: None,
                 context_tokens: None,
@@ -7295,6 +7284,7 @@ mod tests {
             ModelCard {
                 id: ModelId("openai/gpt".to_owned()),
                 provider: "openai-compatible".to_owned(),
+                readiness: ModelReadiness::Ready,
                 location: None,
                 cost_per_1k_usd: None,
                 context_tokens: None,
@@ -7407,21 +7397,19 @@ mod tests {
     }
 
     #[test]
-    fn the_status_line_shows_the_next_runs_submission_mode() {
-        // PR C2: the picked `default_mode` is visible without opening the
-        // picker — the status line's `next` field, distinct from the active
-        // run's `mode` field.
+    fn the_project_header_shows_the_next_runs_submission_mode() {
+        // The picked default is visible without opening the mode picker.
         let mut state = running_build_state();
-        let before = render_to_string(&state, 120, 40);
+        let before = header_line(&state, 120);
         assert!(
-            before.contains("next Build"),
+            before.contains("Build"),
             "the default submission mode shows:\n{before}"
         );
 
         state.default_mode = AgentMode::Plan;
-        let after = render_to_string(&state, 120, 40);
+        let after = header_line(&state, 120);
         assert!(
-            after.contains("next Plan"),
+            after.contains("Plan"),
             "a picked mode shows immediately:\n{after}"
         );
     }
@@ -8303,7 +8291,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_footer_chip_registers_its_action() {
+    fn clicking_the_context_footer_opens_commands() {
         let state = running_build_state();
         let _ = render_to_string(&state, 120, 30);
         let map = state.hit_map.borrow();

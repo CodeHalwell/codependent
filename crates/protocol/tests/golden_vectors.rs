@@ -834,6 +834,11 @@ fn events_vectors() -> Vec<Vector> {
                 run_id: run_id(),
                 changeset_id: changeset_id(),
                 artifact: artifact_ref(),
+                files: Vec::new(),
+                additions: 0,
+                deletions: 0,
+                preview: String::new(),
+                preview_truncated: false,
             }),
         ),
         vec_of(

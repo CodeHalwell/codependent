@@ -2971,6 +2971,22 @@ steps:
             .expect("bind ephemeral port");
         let addr = listener.local_addr().expect("local_addr");
         write_models_toml(&paths, &["local-default"], addr);
+        let model_catalog = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut socket, _) = listener.accept().await.expect("accept model probe");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.expect("read model probe");
+            let body = r#"{"data":[{"id":"unused"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write model catalog");
+        });
 
         let factory = ConfiguredModelDriverFactory {
             paths: paths.clone(),
@@ -2995,7 +3011,7 @@ steps:
             built.price_per_1k_usd, None,
             "routing OFF is price-blind: the node's cost stays UNMEASURED, exactly as before"
         );
-        drop(listener);
+        model_catalog.await.expect("model catalog task");
     }
 
     #[tokio::test]
