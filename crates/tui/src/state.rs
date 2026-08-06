@@ -16,6 +16,11 @@ use codypendent_protocol::{
 
 use crate::action::{Action, Intent, KeyTarget, SecretKey};
 
+/// Maximum code-graph rows held in UI state at once. Shared by the renderer,
+/// reducer paging logic, and the CLI's SQLite query so range labels and page
+/// boundaries cannot drift.
+pub const EDGE_PAGE_SIZE: usize = 100;
+
 /// Which pane currently has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
@@ -94,6 +99,10 @@ pub enum Overlay {
     None,
     /// The help overlay listing key bindings.
     Help,
+    /// Persistent setup and runtime diagnostics. Unlike the one-line transient
+    /// notice, issues survive presence chatter and stay available until the
+    /// operator clears them or restarts after resolving the cause.
+    Issues,
     /// The new-run objective prompt (buffer inline).
     NewRun(String),
     /// The steering-text prompt (buffer inline).
@@ -119,20 +128,24 @@ pub enum Overlay {
     /// [`AppState::edges`] list on the left and, for the focused edge, its
     /// relation, confidence, evidence kind + source, and revision on the right.
     Edges,
+    /// Text prompt for the code-graph inspector's database-backed filter.
+    EdgeSearch(String),
     /// The workflow-graph view (Phase 5 STEP 5.2, exit criterion 3): the
     /// [`AppState::workflow`] node list on the left and, for the focused node,
     /// its action, state, agent, workspace, approval, retry, dependencies, and
-    /// declared outputs on the right. Read-only — a projection of the compiled
-    /// workflow graph (the daemon-side executor that fills live per-node
-    /// state/cost is a later wiring step).
+    /// declared outputs on the right. It is also the workflow control surface:
+    /// start, pause/resume, retry-from-node, and cancel are wired to the daemon.
     Workflow,
     /// The blackboard view (Phase 5 STEP 5.3): the [`AppState::blackboard`] item
     /// list (the typed, attributed artifacts agents share within a workflow run —
     /// findings, decisions, patches, …) grouped by run, and — for the focused
     /// item — its kind, author, confidence, evidence, revision, and payload
-    /// summary. Read-only — a projection of the per-run board (populated once the
-    /// executor posts artifacts).
+    /// summary. The focused workflow run is subscribed while this view is open.
     Blackboard,
+    /// Confirm cancellation of a durable workflow run.
+    ConfirmWorkflowCancel { workflow_run_id: String },
+    /// JSON inputs for a new durable workflow run. Blank means `{}`.
+    WorkflowInputs { workflow_id: String, buffer: String },
     /// The command palette: a searchable list of every command the TUI exposes,
     /// so the growing feature set stays reachable without consuming a single-key
     /// binding each. `query` is the live filter; `selected` indexes the filtered
@@ -145,6 +158,11 @@ pub enum Overlay {
     /// directly (Edit) or lands as a suggestion (Suggest). `block_id` is the block
     /// the edit targets, captured when the prompt opened.
     DocEdit { block_id: String, buffer: String },
+    /// Repository-relative Markdown path for publishing the focused document.
+    DocPublishPath {
+        document_id: DocumentId,
+        buffer: String,
+    },
     /// The model picker (MP1): a fuzzy-filterable list of the models
     /// selectable for a run (see [`AppState::models`]), opened from the
     /// command palette's `/model` entry. `query` filters by id/provider
@@ -229,8 +247,8 @@ pub enum Overlay {
     /// [`AppState::tavily_key_status`]). `query` filters by id/provider
     /// substring; `selected` indexes the filtered results (reset to 0 whenever
     /// the query changes) — the same shape as [`Overlay::ModePicker`]. `Enter`
-    /// opens the masked set/replace prompt; `d` on a row with a stored key opens
-    /// the remove confirm.
+    /// opens the masked set/replace prompt; `Delete` on a row with a stored key
+    /// opens the remove confirm.
     ApiKeys { query: String, selected: usize },
     /// The `/keys` set/replace prompt (D1): a masked single-line buffer for the
     /// key being saved against `target`. `buffer` is the redacting [`SecretKey`]
@@ -242,15 +260,9 @@ pub enum Overlay {
         buffer: SecretKey,
     },
     /// The `/keys` remove confirmation (D1): `y`/`Enter` emits
-    /// [`Intent::RemoveApiKey`]; `n`/`Esc` dismisses. Opened by `d` on a row
+    /// [`Intent::RemoveApiKey`]; `n`/`Esc` dismisses. Opened by `Delete` on a row
     /// whose status is [`KeyStatus::Stored`].
     ApiKeyRemoveConfirm { target: KeyTarget },
-    /// The daemon-restart offer (D1), opened harness-side via
-    /// [`Action::OfferDaemonRestart`] after a Tavily key is saved (the daemon
-    /// discovers that key only at boot). `y`/`Enter` emits the client-only
-    /// [`Intent::RestartDaemon`]; `n`/`Esc` dismisses (the key applies on the
-    /// next restart).
-    ConfirmRestart,
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -669,9 +681,17 @@ pub struct GraphEdgeCard {
 /// pile when a repository declares more than one workflow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowNodeCard {
+    /// Stable manifest id used by `StartWorkflow`.
+    pub workflow_id: String,
     /// The owning workflow, pre-rendered (e.g. `"repair-github-check v1"`), so
     /// several workflows can share the list under labeled groups.
     pub workflow: String,
+    /// Latest durable run for this workflow, when one exists.
+    pub workflow_run_id: Option<String>,
+    /// Latest durable run phase (`not started` before the first run).
+    pub run_phase: String,
+    /// Declared workflow inputs, pre-rendered (`name:type*`, `*` = required).
+    pub inputs: String,
     /// The node (step) id, unique within its workflow.
     pub id: String,
     /// The node's action, pre-rendered (e.g. `"agent implementer · skill
@@ -716,6 +736,10 @@ pub struct WorkflowNodeCard {
 /// workflow runs' boards read as labeled groups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlackboardItemCard {
+    /// Stable artifact id, used to merge live revisions idempotently.
+    pub id: String,
+    /// Stable owning workflow-run id, used for subscriptions and replacement.
+    pub workflow_run_id: String,
     /// The owning workflow run, pre-rendered (e.g. `"repair-github-check · run
     /// 0f2a"`), so several runs' boards share the list under labeled groups.
     pub run: String,
@@ -899,6 +923,11 @@ pub struct ProviderCard {
     /// (`provider_can_list_models`), mirroring `requires_key`. Drives the
     /// Enter/Tab branch: `true` → live pick-list; `false` → today's free-text flow.
     pub can_list_models: bool,
+    /// Whether this build can actually execute models configured from this
+    /// provider. Catalog entries for native Anthropic/Gemini, ACP, OAuth, and
+    /// cloud-IAM remain discoverable, but are disabled until their runtime
+    /// adapter/auth flow is wired — never presented as a successful add.
+    pub available: bool,
 }
 
 /// The indices into `providers` whose id/name/protocol case-insensitively
@@ -1060,6 +1089,12 @@ pub struct AppState {
     /// repository's edges, mapped to self-contained [`GraphEdgeCard`]s by the
     /// CLI. May be empty. The [`Overlay::Edges`] inspector reads it.
     pub edges: Vec<GraphEdgeCard>,
+    /// Total matching rows in SQLite, not just the current page.
+    pub edge_total: usize,
+    /// Current zero-based result page.
+    pub edge_page: usize,
+    /// Current graph filter query.
+    pub edge_query: String,
     /// Index into `edges` of the focused edge.
     pub selected_edge: usize,
     /// The workflow-graph projection (Phase 5 STEP 5.2): the nodes of the
@@ -1110,6 +1145,11 @@ pub struct AppState {
     /// The Tavily `web.search` row's key status (D1), folded from the same
     /// [`Action::ApiKeyStatusesLoaded`] as [`AppState::key_status`].
     pub tavily_key_status: KeyStatus,
+    /// Persistent, de-duplicated setup/runtime diagnostics. Boot loader failures
+    /// land here instead of competing for the single transient notice slot.
+    pub issues: Vec<String>,
+    /// Index into [`AppState::issues`] for the diagnostics overlay.
+    pub selected_issue: usize,
     /// The focused pane. Vestigial in the conversation-centred shell (the
     /// transcript is the single main surface); retained for catch-up/mouse code.
     pub focus: Pane,
@@ -1160,18 +1200,6 @@ pub struct AppState {
     /// Set when the user detaches (`q`). The CLI observes this to leave the TUI
     /// loop; the run is never affected.
     pub should_detach: bool,
-    /// Set alongside `should_detach` by `PaletteCommand::NewConversation`
-    /// (continuous-session plan, Task 5). Continuity (Tasks 1-4) keys off "this
-    /// session already has prior runs," so the only way to guarantee an
-    /// unseeded, genuinely fresh conversation is a brand-new session — and a
-    /// pure, I/O-free reducer cannot mint one. Documented precisely so this
-    /// isn't mistaken for a live in-place reset: the CLI harness, on seeing
-    /// this flag set at detach time, forgets this repository's remembered
-    /// session (so the daemon can't resume it) instead of resetting anything
-    /// live. The current run, if any, is completely unaffected — exactly like
-    /// a plain detach — and the fresh conversation itself begins on the next
-    /// `codypendent` launch for this repository, not this instant.
-    pub start_new_conversation: bool,
     /// A monotonic tick counter for spinner animation.
     pub tick: u64,
     /// A transient status-line notice and the tick at which it expires.
@@ -1210,6 +1238,9 @@ impl AppState {
             doc_focus: DocFocus::default(),
             doc_edit: None,
             edges: Vec::new(),
+            edge_total: 0,
+            edge_page: 0,
+            edge_query: String::new(),
             selected_edge: 0,
             workflow: Vec::new(),
             selected_node: 0,
@@ -1222,6 +1253,8 @@ impl AppState {
             selected_provider: 0,
             key_status: Vec::new(),
             tavily_key_status: KeyStatus::Missing,
+            issues: Vec::new(),
+            selected_issue: 0,
             focus: Pane::Sessions,
             composer: String::new(),
             composer_history: Vec::new(),
@@ -1233,7 +1266,6 @@ impl AppState {
             overlay: Overlay::None,
             default_mode: AgentMode::Build,
             should_detach: false,
-            start_new_conversation: false,
             tick: 0,
             notice: None,
             outbox: Vec::new(),
@@ -1246,14 +1278,17 @@ impl AppState {
         match self.overlay {
             Overlay::NewRun(_)
             | Overlay::Steering(_)
+            | Overlay::WorkflowInputs { .. }
+            | Overlay::EdgeSearch(_)
             | Overlay::DocEdit { .. }
+            | Overlay::DocPublishPath { .. }
             | Overlay::AddModelId { .. }
             | Overlay::AddModelKey { .. }
             | Overlay::AddModelProviderKey { .. }
             | Overlay::ApiKeySet { .. } => InputMode::Editing,
             Overlay::ConfirmCancel
-            | Overlay::ApiKeyRemoveConfirm { .. }
-            | Overlay::ConfirmRestart => InputMode::Confirm,
+            | Overlay::ConfirmWorkflowCancel { .. }
+            | Overlay::ApiKeyRemoveConfirm { .. } => InputMode::Confirm,
             // The palette, the model picker, the provider picker, the mode
             // picker, the `/keys` overlay, and the add-model pick-list all
             // filter on printable keys while staying arrow-navigable, so they
@@ -1269,6 +1304,7 @@ impl AppState {
             // mode. The add-model querying box is likewise non-interactive except
             // `Esc` (dismiss), so it shares this mode too.
             Overlay::Help
+            | Overlay::Issues
             | Overlay::Skills
             | Overlay::Memory { .. }
             | Overlay::Docs
@@ -1402,6 +1438,25 @@ impl AppState {
     /// connection task calls this after each reduce to dispatch commands.
     pub fn drain_outbox(&mut self) -> Vec<Intent> {
         std::mem::take(&mut self.outbox)
+    }
+
+    /// Clear only session-scoped state after the harness creates a fresh
+    /// session. Workspace projections, model/provider setup, diagnostics,
+    /// preferences, and composer history remain available in place.
+    pub fn begin_new_session(&mut self) {
+        self.session_title = None;
+        self.session_closed = false;
+        self.runs.clear();
+        self.selected_run = 0;
+        self.pending_approvals.clear();
+        self.selected_approval = 0;
+        self.composer.clear();
+        self.composer_stash = None;
+        self.history_cursor = None;
+        self.doc_edit = None;
+        self.overlay = Overlay::None;
+        self.transcript_max_scroll.set(0);
+        self.should_detach = false;
     }
 
     /// Register an interactive rect → the Action a left click on it fires. Called

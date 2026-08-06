@@ -37,7 +37,9 @@ use codypendent_daemon::worktrees::{WorktreeError, WorktreeManager};
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::github::{GitHubApi, RepoId};
 use codypendent_integrations::mcp::{McpBridge, McpRegistry};
-use codypendent_integrations::search::{SearchApi, TavilyClient};
+use codypendent_integrations::search::SearchApi;
+#[cfg(test)]
+use codypendent_integrations::search::TavilyClient;
 use codypendent_knowledge::{
     assemble_context, chronicle_candidates, extract_candidates, Curation, ExtractionInput,
     FactExtractor, MemoryStore, NoopExtractor, Revision, Scope,
@@ -364,7 +366,7 @@ impl RuntimeExecutor {
     /// carrying the GitHub client and MCP bridge forward — so a workflow agent
     /// node's runtime is configured identically to a single-agent run's no
     /// matter which builder ran last.
-    pub fn with_search(mut self, search: Arc<TavilyClient>) -> Self {
+    pub fn with_search(mut self, search: Arc<dyn SearchApi>) -> Self {
         self.search = Some(search);
         let drive_locks = self.workflow_host.drive_locks();
         self.workflow_host = build_workflow_host(

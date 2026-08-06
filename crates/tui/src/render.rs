@@ -879,14 +879,36 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     let inner = block.inner(area);
 
     if state.runs.is_empty() {
-        let hint = Paragraph::new(vec![
-            Line::styled("No runs yet.", Style::default().fg(theme.text.secondary)),
-            Line::styled(
-                "Type a message below and press Enter to start one.",
-                Style::default().fg(theme.text.muted),
-            ),
-        ])
-        .block(block);
+        let lines = if state.models.is_empty() {
+            vec![
+                Line::styled(
+                    "Setup needed — no model is configured.",
+                    Style::default()
+                        .fg(theme.status.warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(
+                    "Press /, choose Provider catalog, then add a ready provider model.",
+                    Style::default().fg(theme.text.secondary),
+                ),
+                Line::styled(
+                    "Open Setup & diagnostics for the exact configuration issue.",
+                    Style::default().fg(theme.text.muted),
+                ),
+            ]
+        } else {
+            vec![
+                Line::styled(
+                    "Ready for a new run.",
+                    Style::default().fg(theme.text.secondary),
+                ),
+                Line::styled(
+                    "Type a message below and press Enter to start one.",
+                    Style::default().fg(theme.text.muted),
+                ),
+            ]
+        };
+        let hint = Paragraph::new(lines).block(block);
         frame.render_widget(hint, area);
         return;
     }
@@ -1550,6 +1572,14 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             theme.status.info,
         ));
     }
+    if !state.issues.is_empty() {
+        ambient.push(field(
+            "issues",
+            state.issues.len().to_string(),
+            theme.status.warning,
+        ));
+        state.register_hit(area, Action::OpenIssues);
+    }
     ambient.push(field(
         "state",
         status
@@ -1688,6 +1718,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     }
     match &state.overlay {
         Overlay::Help => render_help(frame, area, theme),
+        Overlay::Issues => render_issues(frame, area, state, theme),
         Overlay::NewRun(buffer) => {
             render_prompt(frame, area, theme, "New run objective", buffer);
         }
@@ -1700,13 +1731,43 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 buffer,
             );
         }
+        Overlay::WorkflowInputs {
+            workflow_id,
+            buffer,
+        } => render_prompt(
+            frame,
+            area,
+            theme,
+            &format!("Inputs for {workflow_id} (JSON object; blank = {{}})"),
+            buffer,
+        ),
         Overlay::ConfirmCancel => render_confirm(frame, area, theme),
+        Overlay::ConfirmWorkflowCancel { workflow_run_id } => render_confirm_box(
+            frame,
+            area,
+            theme,
+            "Cancel this workflow run?",
+            &format!(
+                "Stops new nodes and interrupts active work · run {}",
+                truncate(workflow_run_id, 12)
+            ),
+        ),
         Overlay::Skills => render_skills(frame, area, state, theme),
         Overlay::Memory { source_open } => {
             render_memory(frame, area, state, theme, *source_open);
         }
         Overlay::Docs => render_docs(frame, area, state, theme),
         Overlay::Edges => render_edges(frame, area, state, theme),
+        Overlay::EdgeSearch(buffer) => {
+            render_edges(frame, area, state, theme);
+            render_prompt(
+                frame,
+                area,
+                theme,
+                "Search code-graph symbols / relations (blank = all)",
+                buffer,
+            );
+        }
         Overlay::Workflow => render_workflow(frame, area, state, theme),
         Overlay::Blackboard => render_blackboard(frame, area, state, theme),
         Overlay::Palette { query, selected } => {
@@ -1747,19 +1808,10 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 ),
                 KeyTarget::Tavily => (
                     "Remove the saved Tavily key?".to_owned(),
-                    "web.search stays enabled until the daemon restarts.",
+                    "web.search stops using it immediately (env fallback may remain).",
                 ),
             };
             render_confirm_box(frame, area, theme, &what, effect);
-        }
-        Overlay::ConfirmRestart => {
-            render_confirm_box(
-                frame,
-                area,
-                theme,
-                "Restart the daemon now?",
-                "Applies the new key; idle-guarded (never kills a run).",
-            );
         }
         // The block-edit prompt floats over the Docs browser it opened from, so the
         // editor stays in view while the writer types the insertion.
@@ -1770,6 +1822,16 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 area,
                 theme,
                 "Insert text into the focused block",
+                buffer,
+            );
+        }
+        Overlay::DocPublishPath { buffer, .. } => {
+            render_docs(frame, area, state, theme);
+            render_prompt(
+                frame,
+                area,
+                theme,
+                "Publish to repository Markdown path (approval required)",
                 buffer,
             );
         }
@@ -1828,6 +1890,150 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     }
 }
 
+/// Persistent first-run/runtime diagnostics. The left rail keeps every issue
+/// reachable; the detail rail adds a concrete recovery action for common setup
+/// failures without trying to parse errors into control flow.
+fn render_issues(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect_min(82, 76, 60, 14, area);
+    frame.render_widget(Clear, rect);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Setup & diagnostics ({}) ", state.issues.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(if state.issues.is_empty() {
+            theme.status.success
+        } else {
+            theme.status.warning
+        }))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(rows[0]);
+
+    let visible = cols[0].height as usize;
+    let first = first_visible_row(state.selected_issue, state.issues.len(), visible.max(1));
+    let mut items = Vec::new();
+    if state.issues.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  ✓ all clear",
+            Style::default().fg(theme.status.success),
+        )));
+    }
+    for (idx, issue) in state.issues.iter().enumerate().skip(first) {
+        let selected = idx == state.selected_issue;
+        let item = ListItem::new(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(theme.focus.active),
+            ),
+            Span::styled("! ", Style::default().fg(theme.status.warning)),
+            Span::styled(
+                truncate(issue, cols[0].width.saturating_sub(5) as usize),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]));
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+    for (screen_row, idx) in (first..state.issues.len()).enumerate() {
+        if screen_row >= cols[0].height as usize {
+            break;
+        }
+        state.register_hit(
+            Rect {
+                x: cols[0].x,
+                y: cols[0].y + screen_row as u16,
+                width: cols[0].width,
+                height: 1,
+            },
+            Action::ActivateRow(idx),
+        );
+    }
+
+    let detail = if let Some(issue) = state.issues.get(state.selected_issue) {
+        vec![
+            section("What happened", theme),
+            Line::styled(
+                format!("  {issue}"),
+                Style::default().fg(theme.text.primary),
+            ),
+            Line::raw(""),
+            section("Recommended action", theme),
+            Line::styled(
+                format!("  {}", issue_guidance(issue)),
+                Style::default().fg(theme.text.secondary),
+            ),
+        ]
+    } else {
+        vec![
+            Line::styled(
+                "✓ Codypendent is ready.",
+                Style::default()
+                    .fg(theme.status.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                "No persistent setup or runtime diagnostics are active.",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(detail)
+            .block(
+                Block::default()
+                    .borders(Borders::LEFT)
+                    .border_style(Style::default().fg(theme.focus.inactive)),
+            )
+            .wrap(Wrap { trim: false }),
+        cols[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "  ↑/↓ select · Delete clear resolved diagnostics · Esc close",
+            Style::default().fg(theme.text.muted),
+        )),
+        rows[1],
+    );
+}
+
+fn issue_guidance(issue: &str) -> &'static str {
+    let issue = issue.to_lowercase();
+    if issue.contains("model picker") || issue.contains("models.toml") {
+        "Open / → Provider catalog, choose a provider marked ready, and add a model."
+    } else if issue.contains("auth.json") || issue.contains("key") {
+        "Open / → API keys, then set or replace the affected local credential."
+    } else if issue.contains("workflow") {
+        "Open Workflow graph to inspect manifests and the latest durable run state."
+    } else if issue.contains("knowledge") || issue.contains("code graph") {
+        "Keep working normally, then reopen the relevant inspector after the repository index is ready."
+    } else {
+        "Review the message above; resolve the underlying configuration, then clear this diagnostic."
+    }
+}
+
 /// The Skill Studio browser (STEP 2.6): a scrollable list of registered items on
 /// the left, and a detail panel on the right that renders the selected skill's
 /// metadata, description, risk, and — the exit-criterion payload — its requested
@@ -1871,7 +2077,13 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (idx, skill) in state.skills.iter().enumerate().skip(first) {
+    for (idx, skill) in state
+        .skills
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible_rows)
+    {
         let selected = idx == state.selected_skill;
         let marker = if selected { "› " } else { "  " };
         let head = Line::from(vec![
@@ -1896,12 +2108,29 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         list_area,
     );
+    for (screen_row, idx) in (first..state.skills.len()).take(visible_rows).enumerate() {
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y: list_area.y + screen_row as u16 * ROW_LINES as u16,
+                width: list_area.width,
+                height: ROW_LINES as u16,
+            },
+            Action::ActivateRow(idx),
+        );
+    }
 
     // Right: the detail panel for the focused skill.
     let detail_block = Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(theme.focus.inactive))
         .style(Style::default().bg(theme.surface.overlay));
+    let detail_inner = detail_block.inner(cols[1]);
+    frame.render_widget(detail_block, cols[1]);
+    let detail_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(detail_inner);
     let mut lines: Vec<Line> = Vec::new();
     if let Some(skill) = state.focused_skill() {
         lines.push(Line::styled(
@@ -1953,17 +2182,31 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             Style::default().fg(theme.text.muted),
         ));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "  ↑/↓ select · M memory · Esc close",
-        Style::default().fg(theme.text.muted),
-    ));
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(detail_block)
-            .wrap(Wrap { trim: false }),
-        cols[1],
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        detail_rows[0],
     );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "  ↑/↓ skill · M memory · Esc close",
+            Style::default().fg(theme.text.muted),
+        )),
+        detail_rows[1],
+    );
+
+    if detail_rows[1].height >= 1 {
+        for (offset, width, action) in [(14, 8, Action::OpenMemory), (25, 9, Action::Dismiss)] {
+            state.register_hit(
+                Rect {
+                    x: detail_rows[1].x.saturating_add(offset),
+                    y: detail_rows[1].y,
+                    width: width.min(detail_rows[1].width.saturating_sub(offset)),
+                    height: 1,
+                },
+                action,
+            );
+        }
+    }
 }
 
 /// The first row to render so `selected` stays visible in a list viewport that
@@ -2311,7 +2554,14 @@ fn render_provider_picker(
                 if is_selected { "› " } else { "  " },
                 Style::default().fg(theme.focus.active),
             ),
-            Span::styled("  ", Style::default().fg(theme.focus.active)),
+            Span::styled(
+                if card.available { "✓ " } else { "○ " },
+                Style::default().fg(if card.available {
+                    theme.status.success
+                } else {
+                    theme.text.muted
+                }),
+            ),
             Span::styled(
                 truncate(&card.id, 26),
                 Style::default().fg(theme.text.primary),
@@ -2394,10 +2644,31 @@ fn render_provider_picker(
             provider_location_label(card.local).to_owned(),
             theme.status.info,
         ));
+        lines.push(field(
+            "status",
+            if card.available {
+                "ready".to_owned()
+            } else {
+                "catalog only".to_owned()
+            },
+            if card.available {
+                theme.status.success
+            } else {
+                theme.status.warning
+            },
+        ));
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "  Enter or Tab — browse this provider's models to add one",
-            Style::default().fg(theme.text.muted),
+            if card.available {
+                "  Enter or Tab — browse this provider's models to add one"
+            } else {
+                "  Runtime adapter not installed — this provider cannot be added yet"
+            },
+            Style::default().fg(if card.available {
+                theme.text.muted
+            } else {
+                theme.status.warning
+            }),
         ));
     } else {
         lines.push(Line::styled(
@@ -2432,7 +2703,7 @@ fn render_mode_picker(
     query: &str,
     selected: usize,
 ) {
-    let rect = centered_rect(60, 50, area);
+    let rect = centered_rect_min(60, 50, 52, 15, area);
     frame.render_widget(Clear, rect);
 
     let outer = Block::default()
@@ -2470,7 +2741,8 @@ fn render_mode_picker(
     );
 
     // The filtered mode list: each row is 2 lines tall (label, summary), the
-    // current default marked ●. Five rows always fit, so no scroll window.
+    // current default marked ●. The modal has an absolute minimum height so all
+    // five rows fit on an ordinary 80x24 terminal.
     const ROW_LINES: usize = 2;
     let list_area = rows[1];
     let matches = filter_modes(query);
@@ -2546,7 +2818,7 @@ fn render_api_keys(
     query: &str,
     selected: usize,
 ) {
-    let rect = centered_rect(60, 50, area);
+    let rect = centered_rect_min(60, 50, 52, 12, area);
     frame.render_widget(Clear, rect);
 
     let matches = filter_key_rows(&state.models, query);
@@ -2666,7 +2938,7 @@ fn render_api_keys(
     }
 
     let hint = Line::styled(
-        "  ↑/↓ select · Enter set/replace · d remove · Esc close",
+        "  ↑/↓ select · Enter set/replace · Delete remove · Esc close",
         Style::default().fg(theme.text.muted),
     );
     frame.render_widget(
@@ -2691,10 +2963,10 @@ fn key_status_render(status: &KeyStatus, theme: &Theme) -> (&'static str, Color,
 }
 
 /// A small yes/no confirm box in the [`render_confirm`] shape, parameterized
-/// so the `/keys` remove confirm and the daemon-restart offer (D1) share it.
-/// Both texts are key-free by construction (they name a target, never a value).
+/// so run/workflow cancellation and `/keys` removal share a compact, responsive
+/// shape. Text is key-free by construction (it names a target, never a value).
 fn render_confirm_box(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, detail: &str) {
-    let rect = centered_rect(60, 20, area);
+    let rect = centered_rect_min(60, 20, 48, 7, area);
     frame.render_widget(Clear, rect);
     let lines = vec![
         Line::styled(
@@ -2731,9 +3003,10 @@ fn render_confirm_box(frame: &mut Frame, area: Rect, theme: &Theme, title: &str,
 /// (a provider has no measured cost/context, so those columns are omitted).
 fn provider_badges(card: &ProviderCard) -> String {
     format!(
-        "{} · {}",
+        "{} · {} · {}",
         card.protocol,
-        provider_location_label(card.local)
+        provider_location_label(card.local),
+        if card.available { "ready" } else { "preview" }
     )
 }
 
@@ -2795,7 +3068,13 @@ fn render_memory(
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (idx, memory) in state.memories.iter().enumerate().skip(first) {
+    for (idx, memory) in state
+        .memories
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible_rows)
+    {
         let selected = idx == state.selected_memory;
         let marker = if selected { "› " } else { "  " };
         let head = Line::from(vec![
@@ -2820,12 +3099,29 @@ fn render_memory(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         list_area,
     );
+    for (screen_row, idx) in (first..state.memories.len()).take(visible_rows).enumerate() {
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y: list_area.y + screen_row as u16 * ROW_LINES as u16,
+                width: list_area.width,
+                height: ROW_LINES as u16,
+            },
+            Action::ActivateRow(idx),
+        );
+    }
 
     // Right: the provenance card for the focused memory.
     let card_block = Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(theme.focus.inactive))
         .style(Style::default().bg(theme.surface.overlay));
+    let card_inner = card_block.inner(cols[1]);
+    frame.render_widget(card_block, cols[1]);
+    let card_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(card_inner);
     let mut lines: Vec<Line> = Vec::new();
     if let Some(memory) = state.focused_memory() {
         let field = |k: &str, v: &str, color: Color| -> Line {
@@ -2870,24 +3166,55 @@ fn render_memory(
             Style::default().fg(theme.text.muted),
         ));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "  ↑/↓ select · S skills · Esc close",
-        Style::default().fg(theme.text.muted),
-    ));
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(card_block)
-            .wrap(Wrap { trim: false }),
-        cols[1],
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        card_rows[0],
     );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "  ↑/↓ memory · o source",
+                Style::default().fg(theme.focus.active),
+            ),
+            Line::styled(
+                "  S skills · Esc close",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]),
+        card_rows[1],
+    );
+
+    if card_rows[1].height >= 1 {
+        state.register_hit(
+            Rect {
+                x: card_rows[1].x.saturating_add(15),
+                y: card_rows[1].y,
+                width: 8.min(card_rows[1].width.saturating_sub(15)),
+                height: 1,
+            },
+            Action::OpenSource,
+        );
+    }
+    if card_rows[1].height >= 2 {
+        for (offset, width, action) in [(2, 8, Action::OpenSkills), (13, 9, Action::Dismiss)] {
+            state.register_hit(
+                Rect {
+                    x: card_rows[1].x.saturating_add(offset),
+                    y: card_rows[1].y.saturating_add(1),
+                    width: width.min(card_rows[1].width.saturating_sub(offset)),
+                    height: 1,
+                },
+                action,
+            );
+        }
+    }
 }
 
 /// The Docs Studio browser (Phase 4 client wiring): a document **tree** on the
 /// left; on the right, the focused document's **editor rail** (its blocks in
-/// order) over its **review rail** (pending suggestions). Read-only — the live
-/// CRDT edit transport is a separate follow-up. Colors are Theme tokens only
-/// (RULE 7).
+/// order) over its **review rail** (pending suggestions). Edits, suggestion
+/// decisions, live CRDT sync, and approval-gated Markdown publishing all use
+/// this surface. Colors are Theme tokens only (RULE 7).
 fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rect = centered_rect(86, 86, area);
     frame.render_widget(Clear, rect);
@@ -2928,7 +3255,7 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (idx, doc) in state.docs.iter().enumerate().skip(first) {
+    for (idx, doc) in state.docs.iter().enumerate().skip(first).take(visible_rows) {
         let selected = idx == state.selected_doc;
         let marker = if selected { "› " } else { "  " };
         let head = Line::from(vec![
@@ -2953,6 +3280,17 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         list_area,
     );
+    for (screen_row, idx) in (first..state.docs.len()).take(visible_rows).enumerate() {
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y: list_area.y + screen_row as u16 * ROW_LINES as u16,
+                width: list_area.width,
+                height: ROW_LINES as u16,
+            },
+            Action::SelectDocument(idx),
+        );
+    }
 
     // Right: the editor rail (blocks) over the review rail (suggestions).
     let rails = Layout::default()
@@ -2964,10 +3302,15 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(theme.focus.inactive))
         .style(Style::default().bg(theme.surface.overlay));
+    let editor_inner = editor_block.inner(rails[0]);
+    frame.render_widget(editor_block, rails[0]);
     let mut editor_lines: Vec<Line> = Vec::new();
     if let Some(doc) = state.focused_doc() {
         editor_lines.push(Line::styled(
-            format!("{} ({})", doc.title, doc.revision),
+            truncate(
+                &format!("{} ({})", doc.title, doc.revision),
+                editor_inner.width as usize,
+            ),
             Style::default()
                 .fg(theme.text.heading)
                 .add_modifier(Modifier::BOLD),
@@ -2989,7 +3332,19 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Style::default().fg(theme.text.muted),
             ));
         }
-        for (idx, block) in doc.blocks.iter().enumerate() {
+        let visible_blocks = editor_inner.height.saturating_sub(2) as usize;
+        let first_block = first_visible_row(
+            state.selected_block,
+            doc.blocks.len(),
+            visible_blocks.max(1),
+        );
+        for (idx, block) in doc
+            .blocks
+            .iter()
+            .enumerate()
+            .skip(first_block)
+            .take(visible_blocks)
+        {
             let focused = editing && idx == state.selected_block;
             let marker = if focused { "› " } else { "  " };
             let kind_style = if focused {
@@ -3000,10 +3355,24 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             editor_lines.push(Line::from(vec![
                 Span::styled(format!("{marker}{:<10}", block.kind), kind_style),
                 Span::styled(
-                    truncate(&block.text, 58),
+                    truncate(&block.text, editor_inner.width.saturating_sub(12) as usize),
                     Style::default().fg(theme.text.primary),
                 ),
             ]));
+        }
+        for (screen_row, idx) in (first_block..doc.blocks.len())
+            .take(visible_blocks)
+            .enumerate()
+        {
+            state.register_hit(
+                Rect {
+                    x: editor_inner.x,
+                    y: editor_inner.y + 2 + screen_row as u16,
+                    width: editor_inner.width,
+                    height: 1,
+                },
+                Action::SelectDocumentBlock(idx),
+            );
         }
     } else {
         editor_lines.push(Line::styled(
@@ -3012,16 +3381,20 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ));
     }
     frame.render_widget(
-        Paragraph::new(editor_lines)
-            .block(editor_block)
-            .wrap(Wrap { trim: false }),
-        rails[0],
+        Paragraph::new(editor_lines).wrap(Wrap { trim: false }),
+        editor_inner,
     );
 
     let review_block = Block::default()
         .borders(Borders::LEFT | Borders::TOP)
         .border_style(Style::default().fg(theme.focus.inactive))
         .style(Style::default().bg(theme.surface.overlay));
+    let review_inner = review_block.inner(rails[1]);
+    frame.render_widget(review_block, rails[1]);
+    let review_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(review_inner);
     let mut review_lines: Vec<Line> = Vec::new();
     if let Some(doc) = state.focused_doc() {
         let reviewing = state.doc_focus == DocFocus::Review;
@@ -3038,7 +3411,19 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Style::default().fg(theme.text.muted),
             ));
         }
-        for (idx, suggestion) in doc.suggestions.iter().enumerate() {
+        let visible_suggestions = review_rows[0].height.saturating_sub(1) as usize;
+        let first_suggestion = first_visible_row(
+            state.selected_suggestion,
+            doc.suggestions.len(),
+            visible_suggestions.max(1),
+        );
+        for (idx, suggestion) in doc
+            .suggestions
+            .iter()
+            .enumerate()
+            .skip(first_suggestion)
+            .take(visible_suggestions)
+        {
             let focused = reviewing && idx == state.selected_suggestion;
             let bullet = if focused { "› " } else { "  • " };
             let bullet_style = if focused {
@@ -3046,36 +3431,87 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             } else {
                 Style::default().fg(theme.status.info)
             };
+            let rationale = suggestion
+                .rationale
+                .as_deref()
+                .map_or_else(String::new, |text| format!(" · {text}"));
+            let summary = format!(
+                "{} @ {}{} → {}",
+                suggestion.author, suggestion.range, rationale, suggestion.replacement
+            );
             review_lines.push(Line::from(vec![
                 Span::styled(bullet, bullet_style),
                 Span::styled(
-                    format!("{} @ {} ", suggestion.author, suggestion.range),
-                    Style::default().fg(theme.text.muted),
-                ),
-                Span::styled(
-                    format!("→ {}", truncate(&suggestion.replacement, 40)),
+                    truncate(&summary, review_rows[0].width.saturating_sub(4) as usize),
                     Style::default().fg(theme.text.primary),
                 ),
             ]));
-            if let Some(rationale) = &suggestion.rationale {
-                review_lines.push(Line::styled(
-                    format!("      {rationale}"),
-                    Style::default().fg(theme.text.secondary),
-                ));
-            }
+        }
+        for (screen_row, idx) in (first_suggestion..doc.suggestions.len())
+            .take(visible_suggestions)
+            .enumerate()
+        {
+            state.register_hit(
+                Rect {
+                    x: review_rows[0].x,
+                    y: review_rows[0].y + 1 + screen_row as u16,
+                    width: review_rows[0].width,
+                    height: 1,
+                },
+                Action::SelectDocumentSuggestion(idx),
+            );
         }
     }
-    review_lines.push(Line::raw(""));
-    review_lines.push(Line::styled(
-        "  Tab rail · ↑/↓ select · e edit · a/r accept/reject · Esc close",
-        Style::default().fg(theme.text.muted),
-    ));
     frame.render_widget(
-        Paragraph::new(review_lines)
-            .block(review_block)
-            .wrap(Wrap { trim: false }),
-        rails[1],
+        Paragraph::new(review_lines).wrap(Wrap { trim: false }),
+        review_rows[0],
     );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                " Tab rail · ↑/↓ select · Esc close",
+                Style::default().fg(theme.text.muted),
+            ),
+            Line::styled(
+                " e edit · a accept · r reject · P publish",
+                Style::default().fg(theme.focus.active),
+            ),
+        ]),
+        review_rows[1],
+    );
+
+    // Fixed footer controls stay clickable even when long documents or review
+    // queues make the content rails scroll.
+    state.register_hit(
+        Rect {
+            x: review_rows[1].x + 1,
+            y: review_rows[1].y,
+            width: 8.min(review_rows[1].width.saturating_sub(1)),
+            height: 1,
+        },
+        Action::CyclePane,
+    );
+    let mut x = review_rows[1].x + 1;
+    for (width, action) in [
+        (6, Action::EditDoc),
+        (
+            8,
+            Action::Approve(codypendent_protocol::ApprovalScope::Once),
+        ),
+        (8, Action::Reject),
+        (9, Action::PublishDoc),
+    ] {
+        state.register_hit(
+            Rect {
+                x,
+                y: review_rows[1].y + 1,
+                width: width.min(review_rows[1].right().saturating_sub(x)),
+                height: 1,
+            },
+            action,
+        );
+        x = x.saturating_add(width + 3);
+    }
 }
 
 /// The code-graph edge inspector (Phase 4 exit criterion 4): the repository's
@@ -3086,10 +3522,25 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     let rect = centered_rect(86, 86, area);
     frame.render_widget(Clear, rect);
 
+    let first_match = if state.edge_total == 0 {
+        0
+    } else {
+        state.edge_page * crate::state::EDGE_PAGE_SIZE + 1
+    };
+    let last_match =
+        (state.edge_page * crate::state::EDGE_PAGE_SIZE + state.edges.len()).min(state.edge_total);
+    let query = if state.edge_query.is_empty() {
+        String::new()
+    } else {
+        format!(" · filter ‘{}’", truncate(&state.edge_query, 24))
+    };
     let outer = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            format!(" Code-graph edges ({}) ", state.edges.len()),
+            format!(
+                " Code graph ({first_match}–{last_match} of {}{query}) ",
+                state.edge_total
+            ),
             Style::default()
                 .fg(theme.text.heading)
                 .add_modifier(Modifier::BOLD),
@@ -3121,7 +3572,13 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (idx, edge) in state.edges.iter().enumerate().skip(first) {
+    for (idx, edge) in state
+        .edges
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible_rows)
+    {
         let selected = idx == state.selected_edge;
         let marker = if selected { "› " } else { "  " };
         let head = Line::from(vec![
@@ -3150,6 +3607,17 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         cols[0],
     );
+    for (screen_row, idx) in (first..state.edges.len()).take(visible_rows).enumerate() {
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y: list_area.y + screen_row as u16 * ROW_LINES as u16,
+                width: list_area.width,
+                height: ROW_LINES as u16,
+            },
+            Action::ActivateRow(idx),
+        );
+    }
 
     // Right: the detail for the focused edge — relation, confidence, and the
     // exit-criterion payload: evidence kind + source + revision.
@@ -3157,6 +3625,12 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(theme.focus.inactive))
         .style(Style::default().bg(theme.surface.overlay));
+    let detail_inner = detail_block.inner(cols[1]);
+    frame.render_widget(detail_block, cols[1]);
+    let detail_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(detail_inner);
     let mut lines: Vec<Line> = Vec::new();
     if let Some(edge) = state.focused_edge() {
         let field = |k: &str, v: &str, color: Color| -> Line {
@@ -3185,26 +3659,64 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
             Style::default().fg(theme.text.muted),
         ));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "  ↑/↓ select · D docs · Esc close",
-        Style::default().fg(theme.text.muted),
-    ));
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(detail_block)
-            .wrap(Wrap { trim: false }),
-        cols[1],
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        detail_rows[0],
     );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "  ↑/↓ edge · / search",
+                Style::default().fg(theme.focus.active),
+            ),
+            Line::styled(
+                "  PgUp prev · PgDn next · Esc close",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]),
+        detail_rows[1],
+    );
+
+    // The fixed graph footer is mouse-operable as well as keyboard-operable.
+    if detail_rows[1].height >= 1 {
+        state.register_hit(
+            Rect {
+                x: detail_rows[1].x.saturating_add(13),
+                y: detail_rows[1].y,
+                width: 8.min(detail_rows[1].width.saturating_sub(13)),
+                height: 1,
+            },
+            Action::OpenPalette,
+        );
+    }
+    if detail_rows[1].height >= 2 {
+        let y = detail_rows[1].y.saturating_add(1);
+        let mut x = detail_rows[1].x.saturating_add(2);
+        for (width, action) in [
+            (9, Action::ScrollPageUp),
+            (9, Action::ScrollPageDown),
+            (9, Action::Dismiss),
+        ] {
+            state.register_hit(
+                Rect {
+                    x,
+                    y,
+                    width: width.min(detail_rows[1].right().saturating_sub(x)),
+                    height: 1,
+                },
+                action,
+            );
+            x = x.saturating_add(width + 3);
+        }
+    }
 }
 
 /// The workflow-graph view (Phase 5 STEP 5.2, exit criterion 3): a list of the
 /// compiled workflow's nodes on the left — grouped by workflow, in topological
 /// order — and, for the focused node, its action, state, agent, workspace,
-/// approval, retry, dependencies, and declared outputs on the right. Read-only:
-/// a projection of the compiled graph, with per-node state/cost overlaid from a
-/// durable run when one exists (`pending` / `—` otherwise). Colors are Theme
-/// tokens only (RULE 7).
+/// approval, retry, dependencies, and declared outputs on the right. The live
+/// durable run is subscribed while focused and can be started, paused/resumed,
+/// retried from the selected node, or cancelled. Colors are Theme tokens only.
 fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rect = centered_rect(86, 86, area);
     frame.render_widget(Clear, rect);
@@ -3231,15 +3743,10 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
         .split(inner);
 
-    // Left: the node list, in topological order. A workflow-label header is
-    // folded into the first node of each group so item↔card stays 1:1 (the
-    // selection indexes `state.workflow` directly) while the graph still reads
-    // as grouped when a repository declares more than one workflow. Each node's
-    // own row is 2 lines (id/state, then action); the extra group-header line
-    // only appears once per workflow, so 2 is the row height used to window the
-    // list around the selected node (an approximation at group boundaries — the
-    // same trade-off as centering rather than pixel-exact scrolling).
-    const ROW_LINES: usize = 2;
+    // Left: fixed-height node cards in topological order. Repeating the workflow
+    // label makes every card self-contained and, importantly, keeps scrolling
+    // exact when a window begins in the middle of a multi-workflow list.
+    const ROW_LINES: usize = 3;
     let list_area = cols[0];
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(state.selected_node, state.workflow.len(), visible_rows);
@@ -3250,20 +3757,21 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             Style::default().fg(theme.text.muted),
         )));
     }
-    let mut previous_workflow: Option<&str> = None;
-    for (idx, node) in state.workflow.iter().enumerate().skip(first) {
+    for (idx, node) in state
+        .workflow
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible_rows)
+    {
         let selected = idx == state.selected_node;
         let marker = if selected { "› " } else { "  " };
-        let mut lines: Vec<Line> = Vec::new();
-        if previous_workflow != Some(node.workflow.as_str()) {
-            lines.push(Line::styled(
-                node.workflow.clone(),
-                Style::default()
-                    .fg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            previous_workflow = Some(node.workflow.as_str());
-        }
+        let mut lines = vec![Line::styled(
+            truncate(&node.workflow, 36),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        )];
         lines.push(Line::from(vec![
             Span::styled(marker, Style::default().fg(theme.focus.active)),
             Span::styled(
@@ -3291,6 +3799,17 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         list_area,
     );
+    for (screen_row, idx) in (first..state.workflow.len()).take(visible_rows).enumerate() {
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y: list_area.y + screen_row as u16 * ROW_LINES as u16,
+                width: list_area.width,
+                height: ROW_LINES as u16,
+            },
+            Action::ActivateRow(idx),
+        );
+    }
 
     // Right: the detail for the focused node — the exit-criterion payload
     // (state, agent, worktree, cost) plus the graph edges and declared outputs.
@@ -3298,6 +3817,12 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(theme.focus.inactive))
         .style(Style::default().bg(theme.surface.overlay));
+    let detail_inner = detail_block.inner(cols[1]);
+    frame.render_widget(detail_block, cols[1]);
+    let detail_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(detail_inner);
     let mut lines: Vec<Line> = Vec::new();
     if let Some(node) = state.focused_node() {
         let field = |k: &str, v: &str, color: Color| -> Line {
@@ -3308,6 +3833,11 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         };
         lines.push(section("Node", theme));
         lines.push(field("workflow", &node.workflow, theme.text.secondary));
+        lines.push(field("inputs", &node.inputs, theme.text.secondary));
+        lines.push(field("run phase", &node.run_phase, theme.status.info));
+        if let Some(run_id) = &node.workflow_run_id {
+            lines.push(field("run", run_id, theme.text.muted));
+        }
         lines.push(field("id", &node.id, theme.text.primary));
         lines.push(field(
             "state",
@@ -3340,17 +3870,57 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             Style::default().fg(theme.text.muted),
         ));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "  ↑/↓ select · Esc close",
-        Style::default().fg(theme.text.muted),
-    ));
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(detail_block)
-            .wrap(Wrap { trim: false }),
-        cols[1],
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        detail_rows[0],
     );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "  n start · p pause/resume · r retry",
+                Style::default().fg(theme.focus.active),
+            ),
+            Line::styled(
+                "  c cancel · ↑/↓ node · Esc close",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]),
+        detail_rows[1],
+    );
+
+    // Mouse parity for the workflow controls. These hit targets align with the
+    // visible chips on the two fixed footer lines of the detail rail.
+    if detail_rows[1].height >= 1 {
+        let y = detail_rows[1].y;
+        let mut x = detail_rows[1].x.saturating_add(2);
+        for (width, action) in [
+            (7, Action::NewRun),
+            (14, Action::Pause),
+            (7, Action::Reject),
+        ] {
+            state.register_hit(
+                Rect {
+                    x,
+                    y,
+                    width: width.min(detail_rows[1].right().saturating_sub(x)),
+                    height: 1,
+                },
+                action,
+            );
+            x = x.saturating_add(width + 3);
+        }
+    }
+    if detail_rows[1].height >= 2 {
+        state.register_hit(
+            Rect {
+                x: detail_rows[1].x.saturating_add(2),
+                y: detail_rows[1].y.saturating_add(1),
+                width: 8.min(detail_rows[1].width.saturating_sub(2)),
+                height: 1,
+            },
+            Action::Cancel,
+        );
+    }
 }
 
 /// Color for a workflow node's lifecycle state. Terminal-success reads calm;
@@ -3397,13 +3967,9 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
         .split(inner);
 
-    // Left: the artifact list, grouped by run (the run header is folded into the
-    // first item of each group so item↔card stays 1:1 with the selection index).
-    // Each artifact's own row is 2 lines (kind, then summary); the extra
-    // group-header line only appears once per run, so 2 is the row height used
-    // to window the list around the selected item (an approximation at group
-    // boundaries, mirroring the workflow browser's node list).
-    const ROW_LINES: usize = 2;
+    // Left: fixed-height artifact cards. Repeating the owning run keeps every
+    // card understandable and makes selection windowing exact at group edges.
+    const ROW_LINES: usize = 3;
     let list_area = cols[0];
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(state.selected_item, state.blackboard.len(), visible_rows);
@@ -3414,20 +3980,21 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
             Style::default().fg(theme.text.muted),
         )));
     }
-    let mut previous_run: Option<&str> = None;
-    for (idx, card) in state.blackboard.iter().enumerate().skip(first) {
+    for (idx, card) in state
+        .blackboard
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible_rows)
+    {
         let selected = idx == state.selected_item;
         let marker = if selected { "› " } else { "  " };
-        let mut lines: Vec<Line> = Vec::new();
-        if previous_run != Some(card.run.as_str()) {
-            lines.push(Line::styled(
-                card.run.clone(),
-                Style::default()
-                    .fg(theme.text.heading)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            previous_run = Some(card.run.as_str());
-        }
+        let mut lines = vec![Line::styled(
+            truncate(&card.run, 36),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        )];
         // A superseded artifact is dimmed; the live one reads normally.
         let kind_color = if card.superseded {
             theme.text.muted
@@ -3458,6 +4025,20 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         list_area,
     );
+    for (screen_row, idx) in (first..state.blackboard.len())
+        .take(visible_rows)
+        .enumerate()
+    {
+        state.register_hit(
+            Rect {
+                x: list_area.x,
+                y: list_area.y + screen_row as u16 * ROW_LINES as u16,
+                width: list_area.width,
+                height: ROW_LINES as u16,
+            },
+            Action::ActivateRow(idx),
+        );
+    }
 
     // Right: the detail for the focused artifact — kind, author, confidence, the
     // evidence that grounds it (claim-like kinds always carry it), revision, and a
@@ -3466,6 +4047,12 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(theme.focus.inactive))
         .style(Style::default().bg(theme.surface.overlay));
+    let detail_inner = detail_block.inner(cols[1]);
+    frame.render_widget(detail_block, cols[1]);
+    let detail_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(detail_inner);
     let mut lines: Vec<Line> = Vec::new();
     if let Some(card) = state.focused_item() {
         let field = |k: &str, v: &str, color: Color| -> Line {
@@ -3500,17 +4087,28 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
             Style::default().fg(theme.text.muted),
         ));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "  ↑/↓ select · Esc close",
-        Style::default().fg(theme.text.muted),
-    ));
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(detail_block)
-            .wrap(Wrap { trim: false }),
-        cols[1],
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        detail_rows[0],
     );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "  ↑/↓ item · Esc close · live",
+            Style::default().fg(theme.text.muted),
+        )),
+        detail_rows[1],
+    );
+    if detail_rows[1].height >= 1 {
+        state.register_hit(
+            Rect {
+                x: detail_rows[1].x.saturating_add(13),
+                y: detail_rows[1].y,
+                width: 9.min(detail_rows[1].width.saturating_sub(13)),
+                height: 1,
+            },
+            Action::Dismiss,
+        );
+    }
 }
 
 /// Split a one-line summary into wrapped display lines for the payload panel. A
@@ -3623,13 +4221,31 @@ fn render_palette(
     let desc_w = inner_w.saturating_sub(2 + title_w + 1 + key_w).max(1);
     let show_groups = query.trim().is_empty();
 
-    // Each command row is 1 line tall (a group label, when shown, is another
-    // single line); window the list around `selected` so a long, filtered-open
-    // palette scrolls instead of walking the selection off-screen.
-    const ROW_LINES: usize = 1;
+    // Build the actual visual rows first. Group headings consume terminal rows,
+    // so they must participate in the window calculation; counting commands
+    // alone lets the selection walk below the viewport on an 80x24 terminal.
+    enum PaletteVisualRow<'a> {
+        Group(&'a str),
+        Command(usize, &'a crate::palette::PaletteEntry),
+    }
+
     let list_area = rows[1];
-    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
-    let first = first_visible_row(selected, matches.len(), visible_rows);
+    let mut visual_rows = Vec::with_capacity(matches.len() + 4);
+    let mut last_group: Option<&str> = None;
+    for (idx, entry) in matches.iter().enumerate() {
+        if show_groups && last_group != Some(entry.group) {
+            visual_rows.push(PaletteVisualRow::Group(entry.group));
+            last_group = Some(entry.group);
+        }
+        visual_rows.push(PaletteVisualRow::Command(idx, entry));
+    }
+    let selected_visual = visual_rows
+        .iter()
+        .position(|row| matches!(row, PaletteVisualRow::Command(idx, _) if *idx == selected))
+        .unwrap_or(0);
+    let visible_rows = (list_area.height as usize).max(1);
+    let first = first_visible_row(selected_visual, visual_rows.len(), visible_rows);
+    let last = (first + visible_rows).min(visual_rows.len());
 
     let mut items: Vec<ListItem> = Vec::new();
     if matches.is_empty() {
@@ -3638,78 +4254,68 @@ fn render_palette(
             Style::default().fg(theme.text.muted),
         )));
     }
-    let mut last_group: Option<&str> = None;
-    for (idx, entry) in matches.iter().enumerate().skip(first) {
-        if show_groups && last_group != Some(entry.group) {
-            items.push(ListItem::new(Line::styled(
-                format!("  {}", entry.group),
-                Style::default().fg(theme.text.muted),
-            )));
-            last_group = Some(entry.group);
+    for row in &visual_rows[first..last] {
+        match row {
+            PaletteVisualRow::Group(group) => items.push(ListItem::new(Line::styled(
+                format!("  {group}"),
+                Style::default()
+                    .fg(theme.text.muted)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            PaletteVisualRow::Command(idx, entry) => {
+                let is_selected = *idx == selected;
+                let marker = if is_selected { "› " } else { "  " };
+                // Unbound commands (`key == "—"`) show nothing in the shortcut
+                // column — never a fake `[—]` marker.
+                let key = if entry.key == "—" {
+                    " ".repeat(key_w)
+                } else {
+                    format!("{:>width$}", entry.key, width = key_w)
+                };
+                let head = Line::from(vec![
+                    Span::styled(marker, Style::default().fg(theme.focus.active)),
+                    Span::styled(
+                        format!("{:<width$}", entry.title, width = title_w),
+                        Style::default().fg(theme.text.primary),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!(
+                            "{:<width$}",
+                            truncate(entry.description, desc_w),
+                            width = desc_w
+                        ),
+                        Style::default().fg(theme.text.muted),
+                    ),
+                    Span::styled(key, Style::default().fg(theme.status.info)),
+                ]);
+                let item = ListItem::new(head);
+                items.push(if is_selected {
+                    item.style(theme.selection_style())
+                } else {
+                    item
+                });
+            }
         }
-        let is_selected = idx == selected;
-        let marker = if is_selected { "› " } else { "  " };
-        // Unbound commands (`key == "—"`) show nothing in the shortcut
-        // column — never a fake `[—]` marker (the honesty invariant: an
-        // absent binding reads as absent, not as a placeholder value).
-        let key = if entry.key == "—" {
-            " ".repeat(key_w)
-        } else {
-            format!("{:>width$}", entry.key, width = key_w)
-        };
-        let head = Line::from(vec![
-            Span::styled(marker, Style::default().fg(theme.focus.active)),
-            Span::styled(
-                format!("{:<width$}", entry.title, width = title_w),
-                Style::default().fg(theme.text.primary),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!(
-                    "{:<width$}",
-                    truncate(entry.description, desc_w),
-                    width = desc_w
-                ),
-                Style::default().fg(theme.text.muted),
-            ),
-            Span::styled(key, Style::default().fg(theme.status.info)),
-        ]);
-        let item = ListItem::new(head);
-        items.push(if is_selected {
-            item.style(theme.selection_style())
-        } else {
-            item
-        });
     }
     frame.render_widget(
         List::new(items).style(Style::default().bg(theme.surface.overlay)),
         rows[1],
     );
 
-    // Register each selectable row's rect for clicks, re-walking `matches` from
-    // the same `first` offset the rendered `items` started at (skip + a fresh
-    // `last_group`) so a (non-clickable) group label row shifts the screen
-    // offset exactly as it did above, even after the list has scrolled.
-    let mut y = list_area.y;
-    let mut last_group: Option<&str> = None;
-    for (fi, entry) in matches.iter().enumerate().skip(first) {
-        if show_groups && last_group != Some(entry.group) {
-            y = y.saturating_add(1); // the (non-clickable) group label row
-            last_group = Some(entry.group);
+    // Register only the command rows in the exact visual slice rendered above.
+    for (screen_row, row) in visual_rows[first..last].iter().enumerate() {
+        if let PaletteVisualRow::Command(command_index, _) = row {
+            state.register_hit(
+                Rect {
+                    x: list_area.x,
+                    y: list_area.y + screen_row as u16,
+                    width: list_area.width,
+                    height: 1,
+                },
+                Action::ActivateRow(*command_index),
+            );
         }
-        if y >= list_area.y + list_area.height {
-            break;
-        }
-        state.register_hit(
-            Rect {
-                x: list_area.x,
-                y,
-                width: list_area.width,
-                height: 1,
-            },
-            Action::ActivateRow(fi),
-        );
-        y = y.saturating_add(1);
     }
 }
 
@@ -3834,7 +4440,7 @@ fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "q detaches this client — it never stops the run.  ? or Esc closes.",
+        "Ctrl-C detaches this client — it never stops the run.  ? or Esc closes.",
         Style::default().fg(theme.text.secondary),
     ));
 
@@ -3856,7 +4462,7 @@ fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
 }
 
 fn render_prompt(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, buffer: &str) {
-    let rect = centered_rect(70, 20, area);
+    let rect = centered_rect_min(70, 20, 48, 7, area);
     frame.render_widget(Clear, rect);
     let lines = vec![
         Line::styled(title, Style::default().fg(theme.text.heading)),
@@ -3890,7 +4496,7 @@ fn render_prompt(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, buff
 /// so a secret (an API key) is never shown on screen. The buffer is itself a
 /// redacting newtype, so it also cannot leak through `Debug`.
 fn render_masked_prompt(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, buffer: &str) {
-    let rect = centered_rect(70, 20, area);
+    let rect = centered_rect_min(70, 20, 48, 7, area);
     frame.render_widget(Clear, rect);
     let masked: String = "•".repeat(buffer.chars().count());
     let lines = vec![
@@ -3926,11 +4532,8 @@ fn render_masked_prompt(frame: &mut Frame, area: Rect, theme: &Theme, title: &st
 /// `Esc`, which cancels the wait. Colors are Theme tokens only (RULE 7). The key
 /// is NOT in scope here (the overlay's `api_key` field is dropped via `..`).
 fn render_querying(frame: &mut Frame, area: Rect, theme: &Theme, provider_id: &str) {
-    // No blank spacer line between the title and the hint (unlike
-    // `render_prompt`'s 3-line shape): at this box's height (`centered_rect(70,
-    // 20, _)`), a typical terminal's interior only fits 2 rows, and a third line
-    // would silently fall off the bottom (ratatui's `Paragraph` clips rather than
-    // scrolling without an explicit offset).
+    // Compact two-line progress state; the absolute minimum keeps the content
+    // visible on short terminals.
     let lines = vec![
         Line::styled(
             format!("Fetching models from {provider_id}…"),
@@ -3938,7 +4541,7 @@ fn render_querying(frame: &mut Frame, area: Rect, theme: &Theme, provider_id: &s
         ),
         Line::styled("Esc to cancel", Style::default().fg(theme.text.muted)),
     ];
-    let rect = centered_rect(70, 20, area);
+    let rect = centered_rect_min(70, 20, 44, 5, area);
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4062,7 +4665,7 @@ fn render_add_model_pick(
 }
 
 fn render_confirm(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let rect = centered_rect(60, 20, area);
+    let rect = centered_rect_min(60, 20, 48, 7, area);
     frame.render_widget(Clear, rect);
     let lines = vec![
         Line::styled(
@@ -4254,6 +4857,27 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+/// A centered percentage rectangle with an absolute content-driven minimum,
+/// capped to the available terminal. Percentage-only modals collapse to four
+/// rows at 80x24 (20% of 24), clipping prompts and confirmation buttons.
+fn centered_rect_min(
+    percent_x: u16,
+    percent_y: u16,
+    min_width: u16,
+    min_height: u16,
+    area: Rect,
+) -> Rect {
+    let percentage = centered_rect(percent_x, percent_y, area);
+    let width = percentage.width.max(min_width).min(area.width);
+    let height = percentage.height.max(min_height).min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }
 
 fn mode_label(mode: AgentMode) -> &'static str {
@@ -5846,9 +6470,10 @@ mod tests {
     fn renders_empty_state_without_panicking() {
         let state = AppState::new();
         let text = render_to_string(&state, 80, 24);
-        // The empty conversation invites the first message.
-        assert!(text.contains("No runs yet"));
-        assert!(text.contains("start one"));
+        // A truly fresh state cannot start a run yet; the empty conversation
+        // guides model setup instead of promising Enter will work.
+        assert!(text.contains("Setup needed"));
+        assert!(text.contains("Provider catalog"));
     }
 
     #[test]
@@ -6135,6 +6760,23 @@ mod tests {
             text.contains("command: cargo"),
             "verbatim command permission missing:\n{text}"
         );
+
+        state.skills[0]
+            .permissions
+            .extend((0..20).map(|n| format!("mcp: server-{n}/tool-{n}")));
+        let compact = render_to_string(&state, 80, 24);
+        assert!(
+            compact.contains("↑/↓ skill · M memory · Esc close"),
+            "skill controls must remain pinned below long permissions:\n{compact}"
+        );
+        let hits = state.hit_map.borrow();
+        for action in [Action::OpenMemory, Action::Dismiss] {
+            assert!(
+                hits.iter()
+                    .any(|(rect, registered)| registered == &action && rect.width > 0),
+                "{action:?} needs a non-empty mouse hit target"
+            );
+        }
     }
 
     #[test]
@@ -6169,6 +6811,25 @@ mod tests {
         assert!(text.contains("Confidence"), "confidence missing:\n{text}");
         // Before opening, the affordance is offered.
         assert!(text.contains("open source"), "affordance missing:\n{text}");
+
+        state.memories[0].source = "very/long/provenance/source/".repeat(30);
+        let compact = render_to_string(&state, 80, 24);
+        assert!(
+            compact.contains("↑/↓ memory · o source"),
+            "memory source control must remain pinned below long provenance:\n{compact}"
+        );
+        assert!(
+            compact.contains("S skills · Esc close"),
+            "memory navigation must remain pinned below long provenance:\n{compact}"
+        );
+        let hits = state.hit_map.borrow();
+        for action in [Action::OpenSource, Action::OpenSkills, Action::Dismiss] {
+            assert!(
+                hits.iter()
+                    .any(|(rect, registered)| registered == &action && rect.width > 0),
+                "{action:?} needs a non-empty mouse hit target"
+            );
+        }
     }
 
     #[test]
@@ -6250,6 +6911,56 @@ mod tests {
             text.contains("match the code path"),
             "suggestion rationale missing:\n{text}"
         );
+
+        for index in 2..20 {
+            state.docs[0].blocks.push(DocBlockView {
+                id: format!("b{index}"),
+                kind: "paragraph".to_owned(),
+                text: format!("block-{index}"),
+            });
+        }
+        state.doc_focus = DocFocus::Editor;
+        state.selected_block = 19;
+        let compact_editor = render_to_string(&state, 80, 24);
+        assert!(
+            compact_editor.contains("block-19"),
+            "the selected block must scroll into view:\n{compact_editor}"
+        );
+        assert!(
+            compact_editor.contains("P publish"),
+            "Docs controls must remain pinned:\n{compact_editor}"
+        );
+
+        state.docs[0].suggestions = (0..12)
+            .map(|index| DocSuggestionView {
+                id: format!("s{index}"),
+                status: "pending".to_owned(),
+                author: format!("reviewer-{index}"),
+                range: "0..1".to_owned(),
+                replacement: "replacement".to_owned(),
+                rationale: None,
+            })
+            .collect();
+        state.doc_focus = DocFocus::Review;
+        state.selected_suggestion = 11;
+        let compact_review = render_to_string(&state, 80, 24);
+        assert!(
+            compact_review.contains("reviewer-11"),
+            "the selected suggestion must scroll into view:\n{compact_review}"
+        );
+        let hits = state.hit_map.borrow();
+        for action in [
+            Action::CyclePane,
+            Action::EditDoc,
+            Action::Approve(codypendent_protocol::ApprovalScope::Once),
+            Action::Reject,
+            Action::PublishDoc,
+        ] {
+            assert!(
+                hits.iter().any(|(_, registered)| registered == &action),
+                "{action:?} needs a Docs mouse target"
+            );
+        }
     }
 
     #[test]
@@ -6399,6 +7110,7 @@ mod tests {
                 local: false,
                 requires_key: true,
                 can_list_models: true,
+                available: true,
             },
             ProviderCard {
                 id: "ollama".to_owned(),
@@ -6408,6 +7120,7 @@ mod tests {
                 local: true,
                 requires_key: false,
                 can_list_models: true,
+                available: true,
             },
         ];
         reduce(&mut state, Action::OpenPalette);
@@ -6456,6 +7169,7 @@ mod tests {
             local: false,
             requires_key: true,
             can_list_models: true,
+            available: true,
         }];
         reduce(&mut state, Action::OpenPalette);
         for c in "provider".chars() {
@@ -6503,6 +7217,65 @@ mod tests {
         assert!(
             text.contains("investigate read-only, then finish"),
             "the Plan row's summary is missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn command_palette_keeps_the_last_command_visible_at_80x24() {
+        let mut state = running_build_state();
+        state.overlay = Overlay::Palette {
+            query: String::new(),
+            selected: crate::palette::COMMANDS.len() - 1,
+        };
+
+        let text = render_to_string(&state, 80, 24);
+        assert!(
+            text.contains("New conversation"),
+            "the selected final row must scroll into view:\n{text}"
+        );
+        assert!(
+            text.contains("› New conversation"),
+            "the visible final row must remain selected:\n{text}"
+        );
+    }
+
+    #[test]
+    fn mode_picker_fits_every_mode_at_80x24() {
+        let mut state = running_build_state();
+        state.overlay = Overlay::ModePicker {
+            query: String::new(),
+            selected: 4,
+        };
+
+        let text = render_to_string(&state, 80, 24);
+        for label in ["Ask", "Explore", "Plan", "Build", "Review"] {
+            assert!(text.contains(label), "the {label} row is clipped:\n{text}");
+        }
+        assert!(
+            text.contains("›   Review"),
+            "Review stays selected:\n{text}"
+        );
+    }
+
+    #[test]
+    fn issues_overlay_remains_actionable_at_80x24() {
+        let mut state = running_build_state();
+        state.issues = vec!["models.toml has no usable model".to_owned()];
+        state.overlay = Overlay::Issues;
+
+        let text = render_to_string(&state, 80, 24);
+        assert!(
+            text.contains("Setup & diagnostics"),
+            "title clipped:\n{text}"
+        );
+        assert!(text.contains("models.toml"), "issue clipped:\n{text}");
+        assert!(
+            text.contains("Provider catalog"),
+            "recovery guidance clipped:\n{text}"
+        );
+        assert!(
+            text.contains("Delete clear resolved diagnostics"),
+            "the close/clear affordance is clipped:\n{text}"
         );
     }
 
@@ -6621,9 +7394,7 @@ mod tests {
         state.overlay = Overlay::ApiKeyRemoveConfirm {
             target: crate::action::KeyTarget::Model("groq/llama".to_owned()),
         };
-        // h=40: at 24 rows the 20%-height box leaves only 2 interior rows and
-        // the y/n line clips (the render_querying comment's constraint).
-        let text = render_to_string(&state, 100, 40);
+        let text = render_to_string(&state, 80, 24);
         assert!(
             text.contains("Remove the saved key for groq/llama?"),
             "the confirm names its target:\n{text}"
@@ -6632,22 +7403,6 @@ mod tests {
         assert!(
             !text.contains("sk-live-test-key"),
             "no key material in the confirm:\n{text}"
-        );
-    }
-
-    #[test]
-    fn restart_offer_confirm_explains_the_restart() {
-        let mut state = api_keys_state();
-        reduce(&mut state, Action::OfferDaemonRestart);
-        // h=40: see the remove-confirm test's note on the 20%-height box.
-        let text = render_to_string(&state, 100, 40);
-        assert!(
-            text.contains("Restart the daemon now?"),
-            "the restart offer:\n{text}"
-        );
-        assert!(
-            text.contains("idle-guarded"),
-            "the idle guard is explained:\n{text}"
         );
     }
 
@@ -6770,10 +7525,11 @@ mod tests {
             evidence: "artifact 3f2a (src/billing.rs)".to_owned(),
             revision: "79acbf1".to_owned(),
         }];
+        state.edge_total = 1;
         reduce(&mut state, Action::OpenEdges);
         let text = render_to_string(&state, 120, 40);
 
-        assert!(text.contains("Code-graph edges"), "title missing:\n{text}");
+        assert!(text.contains("Code graph"), "title missing:\n{text}");
         assert!(
             text.contains("billing::charge"),
             "from symbol missing:\n{text}"
@@ -6797,6 +7553,29 @@ mod tests {
             "evidence source missing:\n{text}"
         );
         assert!(text.contains("79acbf1"), "revision missing:\n{text}");
+
+        let compact = render_to_string(&state, 80, 24);
+        assert!(
+            compact.contains("↑/↓ edge · / search"),
+            "graph search must stay pinned at 80x24:\n{compact}"
+        );
+        assert!(
+            compact.contains("PgUp prev · PgDn next · Esc close"),
+            "graph paging must stay pinned at 80x24:\n{compact}"
+        );
+        let hits = state.hit_map.borrow();
+        for action in [
+            Action::OpenPalette,
+            Action::ScrollPageUp,
+            Action::ScrollPageDown,
+            Action::Dismiss,
+        ] {
+            assert!(
+                hits.iter()
+                    .any(|(rect, registered)| registered == &action && rect.width > 0),
+                "{action:?} needs a non-empty mouse hit target"
+            );
+        }
     }
 
     #[test]
@@ -6805,7 +7584,11 @@ mod tests {
         let mut state = running_build_state();
         state.workflow = vec![
             WorkflowNodeCard {
+                workflow_id: "repair-github-check".to_owned(),
                 workflow: "repair-github-check v1".to_owned(),
+                workflow_run_id: Some("workflow-run-1".to_owned()),
+                run_phase: "running".to_owned(),
+                inputs: "pull_request:github_pull_request*".to_owned(),
                 id: "patch".to_owned(),
                 action: "agent implementer \u{b7} skill code.repair".to_owned(),
                 kind: "agent".to_owned(),
@@ -6821,7 +7604,11 @@ mod tests {
                 error: "\u{2014}".to_owned(),
             },
             WorkflowNodeCard {
+                workflow_id: "repair-github-check".to_owned(),
                 workflow: "repair-github-check v1".to_owned(),
+                workflow_run_id: Some("workflow-run-1".to_owned()),
+                run_phase: "running".to_owned(),
+                inputs: "pull_request:github_pull_request*".to_owned(),
                 id: "verify".to_owned(),
                 action: "tool repository.test".to_owned(),
                 kind: "tool".to_owned(),
@@ -6857,6 +7644,34 @@ mod tests {
         );
         assert!(text.contains("before write"), "approval missing:\n{text}");
         assert!(text.contains("proposed_patch"), "outputs missing:\n{text}");
+
+        let compact = render_to_string(&state, 80, 24);
+        assert!(
+            compact.contains("n start · p pause/resume"),
+            "workflow controls must stay pinned at 80x24:\n{compact}"
+        );
+        assert!(
+            compact.contains("c cancel · ↑/↓ node · Esc close"),
+            "workflow cancel and navigation must stay visible at 80x24:\n{compact}"
+        );
+        let hits = state.hit_map.borrow();
+        for action in [
+            Action::NewRun,
+            Action::Pause,
+            Action::Reject,
+            Action::Cancel,
+        ] {
+            assert!(
+                hits.iter().any(|(_, registered)| registered == &action),
+                "{action:?} needs a mouse hit target"
+            );
+        }
+        assert!(
+            hits.iter()
+                .filter(|(_, action)| action == &Action::Cancel)
+                .all(|(rect, _)| rect.width > 0),
+            "cancel must never register a zero-width hit target"
+        );
     }
 
     #[test]
@@ -6864,6 +7679,8 @@ mod tests {
         use crate::state::BlackboardItemCard;
         let mut state = running_build_state();
         state.blackboard = vec![BlackboardItemCard {
+            id: "item-1".to_owned(),
+            workflow_run_id: "workflow-run-1".to_owned(),
             run: "repair-github-check \u{b7} run 0f2a".to_owned(),
             kind: "finding".to_owned(),
             summary: "the failing test asserts an off-by-one in paginate()".to_owned(),
@@ -6893,6 +7710,21 @@ mod tests {
         assert!(
             text.contains("off-by-one"),
             "payload summary missing:\n{text}"
+        );
+
+        state.blackboard[0].summary = "long payload evidence ".repeat(80);
+        let compact = render_to_string(&state, 80, 24);
+        assert!(
+            compact.contains("↑/↓ item · Esc close · live"),
+            "blackboard controls must remain pinned below long payloads:\n{compact}"
+        );
+        assert!(
+            state
+                .hit_map
+                .borrow()
+                .iter()
+                .any(|(rect, action)| action == &Action::Dismiss && rect.width > 0),
+            "blackboard close needs a non-empty mouse hit target"
         );
     }
 
@@ -7159,22 +7991,12 @@ mod tests {
 
     #[test]
     fn theme_change_re_renders_without_re_parsing() {
-        use crate::markdown::PARSE_CALLS;
-        use std::sync::atomic::Ordering;
-        // Serialize against the other PARSE_CALLS-dependent test
-        // (`reduce::finalize_is_idempotent`): PARSE_CALLS is one process-wide
-        // counter and `cargo test` runs tests in parallel by default, so two
-        // such tests racing could otherwise interleave their reset/read and
-        // flake this assertion. Held for the whole test (see
-        // `markdown::lock_parse_calls` doc comment for why this cannot
-        // deadlock against this test's own finalize step below).
-        let _serialize_parse_calls = crate::markdown::lock_parse_calls();
         let s = finalized_model_state("# H");
-        PARSE_CALLS.store(0, Ordering::Relaxed);
+        crate::markdown::reset_parse_calls();
         let (dark, _r, _h) = build_transcript_window(&s.runs, &Theme::dark(), 78, 0, 40, 0);
         let (light, _r, _h) = build_transcript_window(&s.runs, &Theme::light(), 78, 0, 40, 0);
         assert_eq!(
-            PARSE_CALLS.load(Ordering::Relaxed),
+            crate::markdown::parse_calls(),
             0,
             "build re-parsed — cache not used"
         );

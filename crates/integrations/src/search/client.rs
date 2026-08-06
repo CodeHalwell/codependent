@@ -12,6 +12,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use std::path::PathBuf;
+
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 use reqwest::{Client, Method};
 use serde::Deserialize;
@@ -35,6 +37,33 @@ pub struct TavilyClient {
     http: Client,
     base_url: String,
     key: TavilyKey,
+}
+
+/// A long-lived search adapter that resolves the Tavily key immediately before
+/// each call. This lets an interactive client update `auth.json` without
+/// restarting the daemon while preserving the opaque-key boundary.
+pub struct ReloadingTavilyClient {
+    data_dir: PathBuf,
+    base_url: String,
+}
+
+impl ReloadingTavilyClient {
+    #[must_use]
+    pub fn new(data_dir: PathBuf, base_url: impl Into<String>) -> Self {
+        Self {
+            data_dir,
+            base_url: base_url.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl SearchApi for ReloadingTavilyClient {
+    async fn search(&self, query: &str, max_results: u32) -> Result<SearchOutcome, SearchError> {
+        let key = TavilyKey::discover(&self.data_dir)?;
+        let client = TavilyClient::new(self.base_url.clone(), key)?;
+        client.search(query, max_results).await
+    }
 }
 
 /// The subset of Tavily's `/search` response this client reads. Every field

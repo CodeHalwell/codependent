@@ -20,7 +20,7 @@
 pub mod client;
 pub mod key;
 
-pub use client::TavilyClient;
+pub use client::{ReloadingTavilyClient, TavilyClient};
 pub use key::{TavilyKey, TAVILY_AUTH_ID};
 
 use async_trait::async_trait;
