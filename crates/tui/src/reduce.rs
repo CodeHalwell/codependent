@@ -16,8 +16,8 @@ use crate::action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, Workfl
 use crate::state::{
     filter_key_rows, filter_model_names, filter_models, filter_modes, filter_providers,
     key_row_target, AppState, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView,
-    KeyStatus, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView, ToolCard,
-    ToolStatus, TranscriptEntry, EDGE_PAGE_SIZE,
+    KeyStatus, ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView,
+    ToolCard, ToolStatus, TranscriptEntry, EDGE_PAGE_SIZE,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -698,6 +698,11 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             run_id,
             changeset_id,
             artifact,
+            files,
+            additions,
+            deletions,
+            preview,
+            preview_truncated,
         } => {
             if let Some(run) = state.run_mut(run_id) {
                 AppState::push_entry(
@@ -705,6 +710,11 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     TranscriptEntry::Patch(PatchSummary {
                         changeset_id,
                         artifact,
+                        files,
+                        additions,
+                        deletions,
+                        preview,
+                        preview_truncated,
                         expanded: false,
                     }),
                 );
@@ -1832,6 +1842,12 @@ fn submit_prompt(state: &mut AppState) {
         Overlay::ModelPicker { query, selected } => {
             if let Some(&idx) = filter_models(&state.models, &query).get(selected) {
                 if let Some(card) = state.models.get(idx) {
+                    if let ModelReadiness::Unavailable(reason) = &card.readiness {
+                        state.overlay = Overlay::ModelPicker { query, selected };
+                        state.notice =
+                            Some((format!("model unavailable — {reason}"), state.tick + 40));
+                        return;
+                    }
                     let id = card.id.clone();
                     state.pending_model = Some(id.clone());
                     state.notice = Some((
@@ -5077,6 +5093,7 @@ mod tests {
         crate::state::ModelCard {
             id: ModelId(id.to_owned()),
             provider: provider.to_owned(),
+            readiness: ModelReadiness::Ready,
             location: None,
             cost_per_1k_usd: None,
             context_tokens: None,
@@ -5197,6 +5214,30 @@ mod tests {
         assert!(
             notice.contains("next run"),
             "the notice explains staging is advisory: {notice}"
+        );
+    }
+
+    #[test]
+    fn model_picker_keeps_an_unavailable_model_open_and_refuses_to_stage_it() {
+        let mut s = AppState::new();
+        let mut unavailable = model_card("missing-local-model", "openai-compatible");
+        unavailable.readiness =
+            ModelReadiness::Unavailable("provider did not list this model".to_owned());
+        s.models = vec![unavailable];
+        open_model_picker(&mut s);
+
+        reduce(&mut s, Action::InputSubmit);
+
+        assert!(
+            matches!(s.overlay, Overlay::ModelPicker { .. }),
+            "the picker stays open so another model can be chosen"
+        );
+        assert_eq!(s.pending_model, None);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|(notice, _)| notice.contains("model unavailable")),
+            "the refusal explains why the model cannot be staged"
         );
     }
 
@@ -5601,6 +5642,7 @@ mod tests {
             crate::state::ModelCard {
                 id: ModelId("groq/llama".to_owned()),
                 provider: "openai-compatible".to_owned(),
+                readiness: ModelReadiness::Ready,
                 location: None,
                 cost_per_1k_usd: None,
                 context_tokens: None,
@@ -5608,6 +5650,7 @@ mod tests {
             crate::state::ModelCard {
                 id: ModelId("openai/gpt".to_owned()),
                 provider: "openai-compatible".to_owned(),
+                readiness: ModelReadiness::Ready,
                 location: None,
                 cost_per_1k_usd: None,
                 context_tokens: None,
@@ -6427,6 +6470,11 @@ mod tests {
                 run_id,
                 changeset_id: ChangeSetId::new(),
                 artifact: artifact(),
+                files: vec!["src/lib.rs".to_owned()],
+                additions: 2,
+                deletions: 1,
+                preview: "@@ -1 +1 @@\n-old\n+new".to_owned(),
+                preview_truncated: false,
             }),
         );
         s.focus = Pane::Transcript;

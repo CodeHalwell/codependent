@@ -48,8 +48,8 @@ use codypendent_protocol::{
 use codypendent_tui::{
     map_event, reduce, render, render_splash, Action, AppState, BlackboardItemCard, DocBlockView,
     DocCard, DocSuggestionView, GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard,
-    ModelLocationLabel, ProjectionKind, ProviderCard, SkillCard, TerminalGuard, Theme,
-    WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
+    ModelLocationLabel, ModelReadiness, ProjectionKind, ProviderCard, SkillCard, TerminalGuard,
+    Theme, WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -1046,6 +1046,8 @@ async fn event_loop(
                 Action::Tick
             }
         };
+        let tick_action = matches!(&action, Action::Tick);
+        let notice_before = state.notice.clone();
 
         // Fold a merged document sync (its async merge could not run in the arm).
         if let Some(sync) = pending_sync.take() {
@@ -1057,6 +1059,11 @@ async fn event_loop(
         }
 
         reduce(state, action);
+        // The steady shell has no frame-based animation. Wakeups still drive
+        // repair and reducer time, but only notice expiry and the periodic
+        // projection refresh need a new frame; input and daemon events redraw
+        // immediately through the non-tick path.
+        let redraw = !tick_action || state.notice != notice_before || state.tick.is_multiple_of(25);
 
         // `StartWorkflow` replies with the new run id after the durable rows are
         // committed. Reload once so the manifest cards bind to that exact run,
@@ -1466,9 +1473,11 @@ async fn event_loop(
             return Ok(());
         }
 
-        guard
-            .terminal_mut()
-            .draw(|frame| render(frame, state, theme))?;
+        if redraw {
+            guard
+                .terminal_mut()
+                .draw(|frame| render(frame, state, theme))?;
+        }
     }
 }
 
@@ -2909,10 +2918,31 @@ async fn load_model_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> V
         pool.close().await;
     }
 
-    configs
-        .into_iter()
-        .map(|config| model_card(config, &profiles))
-        .collect()
+    let auth = codypendent_runtime::auth::AuthStore::load(&paths.data_dir).unwrap_or_default();
+    let registry = codypendent_runtime::models::ModelRegistry::new(configs.clone()).with_auth(auth);
+    let mut cards = Vec::with_capacity(configs.len());
+    for config in configs {
+        let local = local_model_endpoint(&config.base_url);
+        let readiness = if config.base_url.trim().is_empty() {
+            ModelReadiness::Unavailable("base URL is missing".to_owned())
+        } else if local {
+            match registry.check_model(&config.id).await {
+                Ok(()) => ModelReadiness::Ready,
+                Err(error) => ModelReadiness::Unavailable(error.to_string()),
+            }
+        } else {
+            ModelReadiness::Unverified
+        };
+        cards.push(model_card(config, &profiles, readiness, local));
+    }
+    cards
+}
+
+fn local_model_endpoint(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    ["localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1"]
+        .iter()
+        .any(|host| lower.contains(host))
 }
 
 /// Map one configured [`ModelConfig`](codypendent_runtime::models::ModelConfig)
@@ -2923,19 +2953,31 @@ async fn load_model_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> V
 fn model_card(
     config: codypendent_runtime::models::ModelConfig,
     profiles: &HashMap<(ModelId, String), codypendent_routing::ModelProfile>,
+    readiness: ModelReadiness,
+    local: bool,
 ) -> ModelCard {
     let profile = profiles.get(&(config.id.clone(), config.base_url.clone()));
     let configured_context = config.context_tokens;
     ModelCard {
         id: config.id,
         provider: config.provider,
-        location: profile.map(|profile| {
-            if profile.is_local() {
-                ModelLocationLabel::Local
-            } else {
-                ModelLocationLabel::Hosted
-            }
-        }),
+        readiness,
+        location: Some(profile.map_or_else(
+            || {
+                if local {
+                    ModelLocationLabel::Local
+                } else {
+                    ModelLocationLabel::Hosted
+                }
+            },
+            |profile| {
+                if profile.is_local() {
+                    ModelLocationLabel::Local
+                } else {
+                    ModelLocationLabel::Hosted
+                }
+            },
+        )),
         cost_per_1k_usd: profile.map(|profile| profile.performance.cost_per_1k_tokens_usd),
         // A measured profile is the freshest source, but an explicit
         // `models.toml` value is authoritative when no profile exists. The old
@@ -4236,9 +4278,8 @@ mod tests {
 
     /// MP1: `model_card` maps a configured model to its measured profile when
     /// one exists at the SAME endpoint (a profile is keyed by
-    /// `(model_id, endpoint)`), and falls back to an id-only card (every badge
-    /// `None`) when it does not — `models.toml` is the authoritative
-    /// selectable list, so an unprofiled model still appears.
+    /// `(model_id, endpoint)`). Without one, configured endpoint locality and
+    /// context still render honestly while measured cost remains absent.
     #[test]
     fn model_card_matches_a_profile_by_id_and_endpoint_or_falls_back_id_only() {
         use codypendent_routing::{
@@ -4317,7 +4358,7 @@ mod tests {
             profile,
         );
 
-        let hosted_card = model_card(hosted, &profiles);
+        let hosted_card = model_card(hosted, &profiles, ModelReadiness::Unverified, false);
         assert_eq!(hosted_card.id, ModelId("hosted-default".into()));
         assert_eq!(hosted_card.provider, "openai-compatible");
         assert_eq!(hosted_card.location, Some(ModelLocationLabel::Hosted));
@@ -4328,17 +4369,24 @@ mod tests {
         );
         assert_eq!(hosted_card.context_tokens, Some(200_000));
 
-        let other_endpoint_card = model_card(same_id_other_endpoint, &profiles);
+        let other_endpoint_card = model_card(
+            same_id_other_endpoint,
+            &profiles,
+            ModelReadiness::Unverified,
+            false,
+        );
         assert_eq!(
-            other_endpoint_card.location, None,
-            "a profile at a different endpoint must not match"
+            other_endpoint_card.location,
+            Some(ModelLocationLabel::Hosted),
+            "a mismatched profile must not erase configured endpoint locality"
         );
 
-        let unprofiled_card = model_card(unprofiled, &profiles);
+        let unprofiled_card = model_card(unprofiled, &profiles, ModelReadiness::Ready, true);
         assert_eq!(unprofiled_card.id, ModelId("local-default".into()));
         assert_eq!(
-            unprofiled_card.location, None,
-            "no profile row: an id-only fallback"
+            unprofiled_card.location,
+            Some(ModelLocationLabel::Local),
+            "a local configured endpoint remains visible without a profile"
         );
         assert!(unprofiled_card.cost_per_1k_usd.is_none());
         assert!(unprofiled_card.context_tokens.is_none());

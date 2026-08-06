@@ -198,15 +198,16 @@ pub struct RuntimeExecutor {
 impl RuntimeExecutor {
     /// Build an executor over the daemon's pool + paths, minting the shared
     /// fan-out + approval broker the server binds to via [`Self::collaborators`].
-    /// `startup_repository` is the id `main` already scanned from the daemon's own
-    /// directory; it seeds the "already scanned" set so the primary checkout is
-    /// not re-scanned when its first run arrives. `startup_repository_root` is that
-    /// directory's path — the fallback repository a workflow run that recorded
-    /// none is driven against (Phase 5 T5).
+    /// `startup_repository` identifies the daemon's fallback checkout.
+    /// `startup_repository_root` is that directory's path — the fallback
+    /// repository a workflow run that recorded none is driven against (Phase 5
+    /// T5). The scanned set starts empty because startup no longer blocks on a
+    /// code-graph walk; the first session or run warms a valid Git checkout in
+    /// the background.
     pub fn new(
         pool: SqlitePool,
         paths: RuntimePaths,
-        startup_repository: RepositoryId,
+        _startup_repository: RepositoryId,
         startup_repository_root: PathBuf,
     ) -> Self {
         let subscriptions = SubscriptionHub::new();
@@ -214,8 +215,7 @@ impl RuntimeExecutor {
         // `ApprovalRequested` raised by the agent loop reaches attached clients
         // live (not only on re-attach catch-up).
         let approvals = ApprovalBroker::new().with_subscriptions(subscriptions.clone());
-        let mut scanned = HashSet::new();
-        scanned.insert(startup_repository);
+        let scanned = HashSet::new();
         // The per-run blackboard fan-out, shared with every workflow agent node so
         // an agent's posts reach the server's subscribers (Phase 5 STEP 5.3).
         let blackboards = BlackboardHub::new();
@@ -558,6 +558,9 @@ impl RuntimeExecutor {
                     )
                     .await
                     .map_err(|e| format!("routing refused the pinned model: {e}"))?;
+                registry.check_model(pinned).await.map_err(|error| {
+                    format!("pinned model `{pinned}` is not available: {error}")
+                })?;
                 pinned.clone()
             }
             // No pin: the Phase-7 routing seam (STEP 7.2/7.3), DEFAULT OFF. When
@@ -586,6 +589,15 @@ impl RuntimeExecutor {
                     .map_err(|e| format!("routing refused to place this run: {e}"))?;
                 match routed {
                     Some(selection) => {
+                        registry
+                            .check_model(selection.model())
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "routed model `{}` is not available: {error}",
+                                    selection.model()
+                                )
+                            })?;
                         if let Err(error) = self
                             .routing
                             .record_decision(launch.session_id, launch.run_id, &selection.decision)

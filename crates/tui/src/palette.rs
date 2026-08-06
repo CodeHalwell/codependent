@@ -121,7 +121,7 @@ pub const COMMANDS: &[PaletteEntry] = &[
     // --- Models: choosing what runs the next turn. ---
     PaletteEntry {
         command: PaletteCommand::Model,
-        title: "Model picker",
+        title: "/model  Model picker",
         description: "choose the model pinned to your next and later runs",
         // Palette-only this task: no single-key equivalent (see the field's
         // doc comment).
@@ -130,7 +130,7 @@ pub const COMMANDS: &[PaletteEntry] = &[
     },
     PaletteEntry {
         command: PaletteCommand::Provider,
-        title: "Provider catalog",
+        title: "/provider  Provider catalog",
         description: "browse supported providers and add a usable model",
         // Palette-only (Task 8): no single-key equivalent, mirroring the
         // model picker's own row.
@@ -139,7 +139,7 @@ pub const COMMANDS: &[PaletteEntry] = &[
     },
     PaletteEntry {
         command: PaletteCommand::Mode,
-        title: "Mode picker",
+        title: "/mode  Mode picker",
         description: "choose the submission mode for the next run (Ask/Explore/Plan/Build/Review)",
         // Palette-only (PR C2): no single-key equivalent, mirroring the
         // model/provider pickers.
@@ -148,7 +148,7 @@ pub const COMMANDS: &[PaletteEntry] = &[
     },
     PaletteEntry {
         command: PaletteCommand::ApiKeys,
-        title: "API keys",
+        title: "/keys  API keys",
         description: "set, replace, or remove API keys (stored locally in auth.json)",
         // Palette-only (D1): no single-key equivalent, mirroring the other
         // pickers. NOTE: the title/description deliberately avoid the words
@@ -160,42 +160,42 @@ pub const COMMANDS: &[PaletteEntry] = &[
     // --- Workspace: live studios, workflow controls, and inspectors. ---
     PaletteEntry {
         command: PaletteCommand::Docs,
-        title: "Docs Studio",
-        description: "edit, review, watch, and publish collaborative documents",
+        title: "/docs  Docs Studio · existing docs",
+        description: "edit, review, watch, and publish documents that already exist",
         key: "D",
         group: "Workspace",
     },
     PaletteEntry {
         command: PaletteCommand::Edges,
-        title: "Code-graph edges",
+        title: "/edges  Code-graph edges",
         description: "search and page graph edges with evidence and revision",
         key: "G",
         group: "Workspace",
     },
     PaletteEntry {
         command: PaletteCommand::Workflow,
-        title: "Workflow graph",
+        title: "/workflow  Workflow graph",
         description: "start and control durable workflows with live node state",
         key: "W",
         group: "Workspace",
     },
     PaletteEntry {
         command: PaletteCommand::Blackboard,
-        title: "Blackboard",
+        title: "/blackboard  Blackboard",
         description: "follow live workflow findings, decisions, and evidence",
         key: "B",
         group: "Workspace",
     },
     PaletteEntry {
         command: PaletteCommand::Skills,
-        title: "Skill Studio",
-        description: "browse skills and their permissions verbatim",
+        title: "/skills  Skill Studio · read only",
+        description: "inspect registered skills and their permissions",
         key: "S",
         group: "Workspace",
     },
     PaletteEntry {
         command: PaletteCommand::Memory,
-        title: "Memory",
+        title: "/memory  Memory",
         description: "browse curated memories and their provenance",
         key: "M",
         group: "Workspace",

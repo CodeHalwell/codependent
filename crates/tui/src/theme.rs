@@ -128,25 +128,25 @@ impl Theme {
     pub const fn dark() -> Self {
         Self {
             surface: SurfaceTokens {
-                background: Color::Rgb(0x12, 0x14, 0x18),
-                panel: Color::Rgb(0x1a, 0x1d, 0x23),
-                border: Color::Rgb(0x33, 0x38, 0x42),
-                overlay: Color::Rgb(0x22, 0x26, 0x2e),
-                user: Color::Rgb(0x20, 0x24, 0x2c),
+                background: Color::Rgb(0x0b, 0x0d, 0x12),
+                panel: Color::Rgb(0x11, 0x14, 0x1b),
+                border: Color::Rgb(0x2a, 0x2f, 0x3a),
+                overlay: Color::Rgb(0x17, 0x1b, 0x25),
+                user: Color::Rgb(0x18, 0x16, 0x24),
             },
             text: TextTokens {
-                primary: Color::Rgb(0xe6, 0xe9, 0xef),
-                secondary: Color::Rgb(0xb4, 0xba, 0xc6),
-                muted: Color::Rgb(0x7a, 0x82, 0x91),
-                heading: Color::Rgb(0xf2, 0xf4, 0xf8),
+                primary: Color::Rgb(0xe8, 0xec, 0xf4),
+                secondary: Color::Rgb(0xb2, 0xb9, 0xc8),
+                muted: Color::Rgb(0x70, 0x78, 0x89),
+                heading: Color::Rgb(0xf8, 0xfa, 0xfc),
             },
             status: StatusTokens {
-                info: Color::Rgb(0x5c, 0x9d, 0xff),
-                success: Color::Rgb(0x5d, 0xd6, 0x9a),
-                warning: Color::Rgb(0xe6, 0xb4, 0x50),
-                error: Color::Rgb(0xef, 0x6d, 0x6d),
-                running: Color::Rgb(0x74, 0xc0, 0xf0),
-                idle: Color::Rgb(0x8a, 0x93, 0xa3),
+                info: Color::Rgb(0x60, 0xa5, 0xfa),
+                success: Color::Rgb(0x34, 0xd3, 0x99),
+                warning: Color::Rgb(0xfb, 0xbf, 0x24),
+                error: Color::Rgb(0xfb, 0x71, 0x85),
+                running: Color::Rgb(0x67, 0xe8, 0xf9),
+                idle: Color::Rgb(0x94, 0x9b, 0xaa),
             },
             syntax: SyntaxTokens {
                 keyword: Color::Rgb(0xc6, 0x92, 0xff),
@@ -166,17 +166,17 @@ impl Theme {
                 header: Color::Rgb(0x5c, 0x9d, 0xff),
             },
             agent: AgentTokens {
-                model_text: Color::Rgb(0xd7, 0xdc, 0xe4),
-                tool: Color::Rgb(0x74, 0xc0, 0xf0),
-                thinking: Color::Rgb(0x8a, 0x93, 0xa3),
+                model_text: Color::Rgb(0xdc, 0xe2, 0xec),
+                tool: Color::Rgb(0x67, 0xe8, 0xf9),
+                thinking: Color::Rgb(0x94, 0x9b, 0xaa),
             },
             focus: FocusTokens {
-                active: Color::Rgb(0x5c, 0x9d, 0xff),
-                inactive: Color::Rgb(0x33, 0x38, 0x42),
+                active: Color::Rgb(0xa7, 0x8b, 0xfa),
+                inactive: Color::Rgb(0x2a, 0x2f, 0x3a),
             },
             selection: SelectionTokens {
-                foreground: Color::Rgb(0x12, 0x14, 0x18),
-                background: Color::Rgb(0x5c, 0x9d, 0xff),
+                foreground: Color::Rgb(0x0b, 0x0d, 0x12),
+                background: Color::Rgb(0xa7, 0x8b, 0xfa),
             },
         }
     }

@@ -1,12 +1,11 @@
 //! The bounded code-graph warm-up scan, shared by startup and per-run launch.
 //!
-//! At startup `main` scans the daemon's own working directory so the repository
-//! map is non-empty from the first run; when a run arrives for a *different*
-//! checkout (a per-user daemon can serve several — issue #6 item 1), the executor
-//! scans that repository the first time it sees it. Both paths want the same
-//! bounded, failure-tolerant walk, so it lives here rather than in `main`.
+//! Session attach and run launch warm a checkout in the background. Both paths
+//! want the same bounded, failure-tolerant walk, so it lives here rather than in
+//! the server or executor.
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use codypendent_knowledge::{codegraph, GitRevision};
 use codypendent_protocol::RepositoryId;
@@ -31,7 +30,11 @@ pub const SCAN_FILE_CAP: usize = 2000;
 /// do not linger. The code graph is derived and regenerable, so wiping and
 /// rebuilding is safe.
 pub async fn scan_repository(pool: &SqlitePool, repository: RepositoryId, root: &Path) {
-    let revision = head_revision(root);
+    let Some(root) = discover_repository_root(root) else {
+        info!(root = %root.display(), "skipping code-graph scan outside a git repository");
+        return;
+    };
+    let revision = head_revision(&root);
 
     if let Err(error) = codegraph::clear_repository(pool, repository).await {
         warn!(%error, "could not clear the prior code graph before re-scan");
@@ -39,7 +42,7 @@ pub async fn scan_repository(pool: &SqlitePool, repository: RepositoryId, root: 
 
     // The walk is blocking std::fs work — off the async runtime so a large tree
     // does not stall this worker's other tasks.
-    let walk_root = root.to_path_buf();
+    let walk_root = root;
     let files =
         tokio::task::spawn_blocking(move || collect_rust_sources(&walk_root, SCAN_FILE_CAP))
             .await
@@ -64,6 +67,28 @@ pub async fn scan_repository(pool: &SqlitePool, repository: RepositoryId, root: 
         nodes,
         "code-graph scan complete"
     );
+}
+
+/// Resolve `root` to the checkout's top-level directory. An ordinary directory
+/// is deliberately not treated as a repository: recursively indexing a home or
+/// projects directory folds unrelated checkouts into one enormous graph.
+#[must_use]
+pub fn discover_repository_root(root: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    Some(path.canonicalize().unwrap_or(path))
 }
 
 /// The working tree's `HEAD` commit as a [`GitRevision`], or the `"workdir"`
@@ -145,13 +170,23 @@ fn collect_rust_sources(root: &Path, cap: usize) -> Vec<(String, String)> {
 /// startup scan and the per-run executor derive identity identically.
 #[must_use]
 pub fn repository_id_for(root: &Path) -> RepositoryId {
-    let canonical = root.canonicalize().unwrap_or_else(|_| PathBuf::from(root));
+    let canonical = discover_repository_root(root)
+        .unwrap_or_else(|| root.canonicalize().unwrap_or_else(|_| PathBuf::from(root)));
     codypendent_knowledge::stable_repository_id(&canonical)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_repo(path: &Path) {
+        let status = Command::new("git")
+            .current_dir(path)
+            .args(["init", "--quiet"])
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+    }
 
     #[test]
     fn repository_id_is_stable_per_root_and_distinct_across_roots() {
@@ -170,5 +205,25 @@ mod tests {
             repository_id_for(b.path()),
             "different roots → different repository ids"
         );
+    }
+
+    #[test]
+    fn repository_discovery_rejects_an_ordinary_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(discover_repository_root(dir.path()), None);
+    }
+
+    #[test]
+    fn repository_identity_normalizes_subdirectories_to_the_checkout_root() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let nested = repo.path().join("crates").join("demo");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            discover_repository_root(&nested),
+            repo.path().canonicalize().ok()
+        );
+        assert_eq!(repository_id_for(&nested), repository_id_for(repo.path()));
     }
 }

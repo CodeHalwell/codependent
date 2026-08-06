@@ -4,8 +4,9 @@
 //! in the event ledger before any client observes them, and original events
 //! are immutable evidence (invariant 5). The Phase 0 seed (session lifecycle)
 //! is joined here by the Phase 1 run, model, tool, approval, patch, steering,
-//! and budget events. Bulk content is never inlined — events reference an
-//! [`ArtifactRef`] instead.
+//! and budget events. Bulk content is referenced through [`ArtifactRef`]; a
+//! bounded human preview may accompany it when clients need an immediately
+//! useful timeline card.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -132,6 +133,21 @@ pub enum EventBody {
         changeset_id: ChangeSetId,
         /// The patch/diff, stored as an artifact.
         artifact: ArtifactRef,
+        /// Repository-relative paths touched by the change set.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
+        /// Added lines in the unified diff.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        additions: u64,
+        /// Removed lines in the unified diff.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        deletions: u64,
+        /// A bounded unified-diff preview for immediate review in clients.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        preview: String,
+        /// Whether the full artifact contains more diff than `preview`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        preview_truncated: bool,
     },
     ApprovalRequested {
         approval_id: ApprovalId,
@@ -175,6 +191,14 @@ pub enum EventBody {
     /// know (RULE 1). Receivers render a placeholder and continue.
     #[serde(other)]
     Unknown,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[cfg(test)]
@@ -270,6 +294,11 @@ mod tests {
             run_id,
             changeset_id: ChangeSetId::new(),
             artifact: artifact_ref(),
+            files: vec!["src/lib.rs".to_string()],
+            additions: 3,
+            deletions: 1,
+            preview: "@@ -1 +1 @@\n-old\n+new".to_string(),
+            preview_truncated: false,
         });
         round_trip(EventBody::ApprovalRequested {
             approval_id: ApprovalId::new(),

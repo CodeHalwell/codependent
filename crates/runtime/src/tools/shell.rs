@@ -380,6 +380,10 @@ async fn kill_group(pid: Option<u32>, child: &mut Child) {
     if let Some(pid) = pid {
         let _ = Command::new("kill")
             .arg("-KILL")
+            // `--` is safety-critical here. procps `kill` can otherwise parse
+            // a negative pgid as an option and issue `kill(-1, SIGKILL)`, which
+            // terminates every process the current user may signal.
+            .arg("--")
             .arg(format!("-{pid}"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())

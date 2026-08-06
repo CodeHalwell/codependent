@@ -311,6 +311,11 @@ pub struct ToolCard {
 pub struct PatchSummary {
     pub changeset_id: ChangeSetId,
     pub artifact: ArtifactRef,
+    pub files: Vec<String>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub preview: String,
+    pub preview_truncated: bool,
     pub expanded: bool,
 }
 
@@ -776,6 +781,16 @@ pub enum ModelLocationLabel {
     Hosted,
 }
 
+/// Truthful readiness of a configured model at the time the TUI loaded it.
+/// Local endpoints are actively verified; hosted models remain unverified
+/// until an explicit deep check so startup never makes surprise cloud calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelReadiness {
+    Ready,
+    Unverified,
+    Unavailable(String),
+}
+
 /// A model-picker card (MP1): one selectable model from `models.toml`,
 /// enriched with its measured profile from the `model_profiles` table when one
 /// exists. Self-contained — the TUI never depends on `codypendent-routing`;
@@ -791,6 +806,8 @@ pub struct ModelCard {
     /// The wire-protocol adapter this model uses (e.g. `"openai-compatible"`
     /// — the only value Phase 1 supports; see `ModelConfig::provider`).
     pub provider: String,
+    /// Whether the exact provider-side model has been verified available.
+    pub readiness: ModelReadiness,
     /// Where the model runs, when a measured profile exists. `None` when the
     /// model has no `model_profiles` row (badges are best-effort;
     /// `models.toml` is the authoritative selectable list — STEP 1.9).
