@@ -218,16 +218,19 @@ pub(crate) async fn restart_daemon_if_idle(
     }
 }
 
-/// `codypendent daemon restart`: stop the running daemon (if any) and start a
-/// fresh one, via [`restart_daemon`]. If no daemon was running this simply
-/// starts one — the documented manual fallback for picking up a new build
-/// while the auto-restart driver is deferring because a run is active.
+/// `codypendent daemon restart`: atomically ask the daemon to stop only when
+/// no session or workflow run is active, then start a fresh one. A manual
+/// restart has the same no-kill safety invariant as auto-restart.
 pub async fn restart(paths: &RuntimePaths) -> anyhow::Result<()> {
-    match restart_daemon(paths).await? {
-        EnsureOutcome::AlreadyRunning => println!("daemon restarted (already running)"),
-        EnsureOutcome::Started { pid } => println!("daemon restarted (pid {pid})"),
+    match restart_daemon_if_idle(paths).await? {
+        IdleRestartOutcome::Restarted => {
+            println!("daemon restarted");
+            Ok(())
+        }
+        IdleRestartOutcome::RefusedActive(active) => anyhow::bail!(
+            "daemon restart refused: {active} run(s) are active; wait for them to finish or cancel them explicitly"
+        ),
     }
-    Ok(())
 }
 
 /// `codypendent daemon status [--json]`.
@@ -1423,7 +1426,7 @@ async fn bind_control_role(conn: &mut Connection) -> anyhow::Result<()> {
 
 // --- STEP 7.1: eval harness runner -------------------------------------------
 
-/// `codypendent eval run --suite <NAME> [--policy P] --report out.json`
+/// `codypendent eval run --suite <NAME> [--policy P] [--candidate-id ID] --report out.json`
 /// (Phase 7 STEP 7.1; `--policy` closed by the "routing⇄eval composition"
 /// follow-up). Loads every case in the suite, runs each headlessly against
 /// its pinned fixture revision, scores it, and writes the aggregate
@@ -1444,14 +1447,52 @@ async fn bind_control_role(conn: &mut Connection) -> anyhow::Result<()> {
 /// `--policy` is absent, behavior is byte-for-byte unchanged — every case
 /// still sends `model: None` and the daemon resolves/routes as usual (the
 /// `eval-smoke` CI path).
+///
+/// `--candidate-id` turns the resulting report into durable promotion evidence:
+/// the candidate must exist before the run, the core suite is mandatory, and a
+/// router candidate must run under its named policy. Reports without this flag
+/// remain ordinary output files and cannot advance a later candidate.
 pub async fn eval_run(
     paths: &RuntimePaths,
     suite: &str,
     policy: Option<String>,
+    candidate_id: Option<&str>,
     report: &std::path::Path,
 ) -> anyhow::Result<()> {
     let suite_dir = crate::eval::resolve_suite_dir(suite)?;
     let cases = crate::eval::load_suite(&suite_dir)?;
+
+    // Promotion evidence must name its candidate BEFORE any cases execute. The
+    // bound artifact snapshot is copied onto the report row and re-checked by
+    // the daemon at advancement, so neither a stale global report nor a report
+    // for another artifact can be substituted later.
+    let promotion_target = if let Some(candidate_id) = candidate_id {
+        if suite != "core" {
+            anyhow::bail!("promotion regression evidence must run the `core` suite, got `{suite}`");
+        }
+        let pool =
+            codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db")).await?;
+        let artifact: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT artifact_kind, artifact_name, artifact_version \
+             FROM promotion_candidates WHERE id = ?",
+        )
+        .bind(candidate_id)
+        .fetch_optional(&pool)
+        .await
+        .context("loading promotion candidate for eval evidence")?;
+        let Some((kind, name, version)) = artifact else {
+            anyhow::bail!("no such promotion candidate: {candidate_id}");
+        };
+        if kind == "router" && policy.as_deref() != Some(name.as_str()) {
+            anyhow::bail!(
+                "router candidate `{name}` requires `eval run --policy {name}` so the report \
+                 exercises the candidate policy"
+            );
+        }
+        Some((pool, candidate_id.to_string(), kind, name, version))
+    } else {
+        None
+    };
     println!(
         "eval: loaded {} case(s) from {}{}",
         cases.len(),
@@ -1482,6 +1523,29 @@ pub async fn eval_run(
     // module doc).
     let suite_report =
         crate::eval::run_suite(paths, &cases, &fixture_root, routed.as_deref()).await?;
+
+    // Only an explicitly bound run becomes durable promotion evidence. An
+    // ordinary eval still writes its requested report file, but it cannot be
+    // consumed by a later, unrelated promotion candidate.
+    if let Some((pool, candidate_id, kind, name, version)) = promotion_target {
+        sqlx::query(
+            "INSERT INTO eval_suite_reports \
+             (id, candidate_id, artifact_kind, artifact_name, artifact_version, suite, \
+              routing_policy, report_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(codypendent_protocol::MessageId::new().to_string())
+        .bind(candidate_id)
+        .bind(kind)
+        .bind(name)
+        .bind(version)
+        .bind(suite)
+        .bind(policy.as_deref().unwrap_or("daemon-default"))
+        .bind(serde_json::to_string(&suite_report)?)
+        .execute(&pool)
+        .await
+        .context("persisting candidate-bound eval suite evidence for promotion")?;
+    }
 
     let json = crate::eval::report_json_with_routing(&suite_report, routed.as_deref())?;
     std::fs::write(report, json)
@@ -1554,8 +1618,8 @@ pub async fn promote_propose_over_connection(
     }
 }
 
-/// `codypendent promote advance <CANDIDATE_ID> --step <STEP> [--regressed]`
-/// (Phase 7 STEP 7.5).
+/// `codypendent promote advance <CANDIDATE_ID> --step <STEP>` (Phase 7 STEP
+/// 7.5). Evidence-bearing actions carry metrics in `PromotionAction`.
 pub async fn promote_advance(
     paths: &RuntimePaths,
     candidate_id: String,

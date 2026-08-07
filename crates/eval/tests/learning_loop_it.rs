@@ -40,7 +40,8 @@ fn promote_to_receipt(artifact: ArtifactVersion) -> PromotionRecord {
     c.run_regression(false).unwrap();
     c.start_shadow().unwrap();
     c.start_canary().unwrap();
-    c.observe_canary(false).unwrap();
+    c.observe_canary_samples(false, codypendent_eval::MIN_CANARY_SAMPLES)
+        .unwrap();
     c.finish_canary().unwrap();
     c.approve(&human()).unwrap()
 }
@@ -122,7 +123,9 @@ fn a_recurring_failure_clusters_becomes_a_guard_case_and_a_fix_promotes() {
     candidate.start_shadow().unwrap();
     candidate.start_canary().unwrap();
     assert_eq!(
-        candidate.observe_canary(false).unwrap(),
+        candidate
+            .observe_canary_samples(false, codypendent_eval::MIN_CANARY_SAMPLES)
+            .unwrap(),
         CanaryOutcome::Continuing
     );
     candidate.finish_canary().unwrap();

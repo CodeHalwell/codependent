@@ -2619,6 +2619,7 @@ fn fold_catchup(state: &mut AppState, catchup: Catchup) -> u64 {
                     title: projection.title,
                     closed: projection.closed,
                     runs: projection.active_runs,
+                    pending_approvals: projection.pending_approvals,
                 },
             );
             through

@@ -117,7 +117,7 @@ fn a_task_routes_cheap_then_escalates_the_full_chain_on_repeated_failure() {
     // 2. Initial route: the cheapest model above the 0.7 bar is the free local one.
     let first = router.route(&task).unwrap();
     assert_eq!(first.model, ModelId("local-default".into()));
-    assert_eq!(first.reason, SelectionReason::CheapestAboveThreshold);
+    assert_eq!(first.reason, SelectionReason::HighestUtilityAboveThreshold);
     assert_eq!(first.expected_cost_usd, 0.0, "local model is free");
 
     // 3. The local model's patch fails validation → escalate one tier.
@@ -198,17 +198,31 @@ fn five_arm_route_eval_gate_holds_when_the_router_matches_quality_cheaper() {
 
     // Sanity: every arm can select a model for every case (no arm errors out).
     for arm in RouteArm::all() {
-        for case in &cases {
+        for (case_index, case) in cases.iter().enumerate() {
             let decision = arm.select(&router, case).unwrap();
-            // Static-strongest always lands on the strong model; static-cheap and
-            // the router prefer the free local one.
+            // Static-strongest always lands on the strong model and static-cheap
+            // always lands on the free local model. The utility router keeps
+            // Internal data local, but for the Public case the hosted-default
+            // model's quality and latency gains outweigh its cost because there
+            // is no privacy penalty. Local-first remains on-device.
             match arm {
                 RouteArm::StaticStrongest => {
                     assert_eq!(decision.model, ModelId("hosted-strong".into()))
                 }
-                RouteArm::StaticCheap | RouteArm::Router | RouteArm::RouterEscalation => {
+                RouteArm::StaticCheap => {
                     assert_eq!(decision.model, ModelId("local-default".into()))
                 }
+                RouteArm::Router | RouteArm::RouterEscalation => assert_eq!(
+                    decision.model,
+                    ModelId(
+                        if case_index == 2 {
+                            "hosted-default"
+                        } else {
+                            "local-default"
+                        }
+                        .into(),
+                    )
+                ),
                 RouteArm::LocalFirstRouter => {
                     assert_eq!(decision.model, ModelId("local-default".into()))
                 }

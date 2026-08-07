@@ -193,6 +193,13 @@ export type ProposedAction =
    * server is operator-declared in the daemon's trusted `mcp.toml`.
    */
   | { type: "McpToolCall"; server: string; tool: string; summary: string; args: string }
+  | {
+      type: "PublishDocument";
+      document_id: Uuid;
+      target: string;
+      changed_files: string[];
+      git_action: string;
+    }
   /**
    * Record a memory proposal note (the `memory.remember` core tool,
    * smarter-memory M2). Always policy-Allowed and never serialized into a
@@ -284,6 +291,7 @@ export type EventBody =
   | { type: "RunStateChanged"; run_id: Uuid; state: RunState }
   | { type: "ModelStreamDelta"; run_id: Uuid; text: string }
   | { type: "ToolProposed"; run_id: Uuid; approval_id: Uuid; action: ProposedAction }
+  | { type: "ToolDenied"; run_id: Uuid; action: ProposedAction; reasons?: string[] }
   | { type: "ToolStarted"; run_id: Uuid; tool: string; args_digest: string; label?: string }
   | {
       type: "ToolCompleted";
@@ -320,6 +328,12 @@ export interface SessionProjection {
   title: string;
   last_sequence: number;
   active_runs?: Uuid[];
+  pending_approvals?: Array<{
+    approval_id: Uuid;
+    run_id: Uuid;
+    action: ProposedAction;
+    risk: Risk;
+  }>;
   closed: boolean;
 }
 

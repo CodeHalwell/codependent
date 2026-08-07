@@ -290,11 +290,14 @@ pub enum ScopeLevel {
 /// Where a transcription (or any media interpretation) runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum TranscriptionMode {
     /// On-device (e.g. a local whisper-server). Always permitted.
     Local,
     /// Off-device (a hosted/cloud model). Gated by data classification.
     Remote,
+    #[serde(other)]
+    Unknown,
 }
 
 /// A policy describing the most sensitive classification permitted to leave the
@@ -332,6 +335,8 @@ pub enum ClassificationError {
         classification: DataClassification,
         max_off_device: DataClassification,
     },
+    #[error("off-device policy or transcription mode is unknown; refusing to transmit")]
+    UnknownBoundary,
 }
 
 /// The classification gate (exit criterion 3): whether media at `classification`
@@ -346,7 +351,10 @@ pub fn transcription_allowed(
     match mode {
         TranscriptionMode::Local => Ok(()),
         TranscriptionMode::Remote => {
-            if classification.allowed_off_device(policy.max_off_device) {
+            if classification != DataClassification::Unknown
+                && policy.max_off_device != DataClassification::Unknown
+                && classification.allowed_off_device(policy.max_off_device)
+            {
                 Ok(())
             } else {
                 Err(ClassificationError::OffDeviceForbidden {
@@ -355,6 +363,7 @@ pub fn transcription_allowed(
                 })
             }
         }
+        TranscriptionMode::Unknown => Err(ClassificationError::UnknownBoundary),
     }
 }
 

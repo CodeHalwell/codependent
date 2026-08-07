@@ -45,7 +45,7 @@ task node → data classification & policy (hard filter: eligible providers)
 3. λ weights + quality threshold live in a versioned `RoutingPolicy` (registry item, `router/<name>/<version>`), selectable per scope. Budgets from Phase 5 stay authoritative — the router optimizes inside them.
 4. **Routing evaluation** (exit criterion 1): `codypendent eval route --suite core` compares the [Chapter 16](../16-testing-strategy.md) five arms — static-strongest, static-cheap, router, router+escalation, local-first router — reporting task success, cost, latency, escalation rate, tool-call errors, unsafe proposals. The release gate asserts: router+escalation ≥ quality threshold at cost < static-strongest.
 
-**TESTS** — hard filters (classified data never routes to an ineligible provider — security test); cheapest-above-threshold selection given synthetic profiles; escalation preserves artifacts; transition records complete.
+**TESTS** — hard filters (classified data never routes to an ineligible provider — security test); highest-utility-above-threshold selection given synthetic profiles; escalation preserves artifacts; transition records complete.
 
 **COMMIT** `"phase7: per-node utility router with cascading escalation and eval arms"`
 
@@ -78,6 +78,7 @@ candidate (draft, versioned, attributed)
 2. Version identifiers (`skill/rust-ci/4`, `router/tool-selection/12`, `prompt/coding-agent/17`) appear in every trace that used them (exit criterion 4: attributable), and `codypendent versions rollback <id>` restores the prior version, also traced (reversible).
 3. Skill synthesis from successful trace clusters ([Chapter 13](../13-observability-evaluation-learning.md)) creates **drafts** that additionally pass permission review before entering evaluation.
 4. Privacy for eval exports ([Chapter 13](../13-observability-evaluation-learning.md)): secret scrubbing, repository-policy respect, user-deletion propagation, license classification, dataset lineage records. Confidential code never ships to external evaluators.
+5. Regression evidence is candidate-bound: run `codypendent eval run --suite core --candidate-id <ID> --report out.json` after proposing the candidate. The daemon rejects unbound, stale, non-core, artifact-mismatched, and wrong-router-policy reports.
 
 **TESTS** — self-promotion attempt fails structurally; canary auto-rollback on regression; rollback restores behaviour (eval suite proves it); deleted user data absent from a subsequent export.
 

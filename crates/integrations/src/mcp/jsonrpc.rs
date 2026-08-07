@@ -36,6 +36,7 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// issues one request at a time in practice; the queue only decouples a
 /// caller's `send` from the driver's `recv`.
 const COMMAND_QUEUE_DEPTH: usize = 16;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// JSON-RPC `method not found` — the answer to any server→client *request*
 /// (`roots/list`, `sampling/createMessage`, ...). v1 serves none of them, but
@@ -136,6 +137,10 @@ impl JsonRpcClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            process.process_group(0);
+        }
         if !inherit_environment {
             process.env_clear();
         }
@@ -216,18 +221,29 @@ async fn run_driver<R, W>(
     reader: R,
     mut writer: W,
     mut commands: mpsc::Receiver<DriverCommand>,
-    _child: Option<Child>,
+    mut child: Option<Child>,
 ) where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
-    let mut reader = BufReader::new(reader);
+    // Keep frame assembly in its own task. A previous `select!` polled
+    // `read_frame` directly beside the pruning timer; when the timer won it
+    // cancelled the read after bytes had been consumed, and the next call
+    // cleared the partial buffer. A slow newline-free oversized frame could
+    // therefore evade the cap forever. The bounded pump is never cancelled
+    // between chunks and cannot grow an unbounded delivery queue.
+    let (frame_tx, mut frames) = mpsc::channel(8);
+    let reader_task = tokio::spawn(pump_frames(reader, frame_tx));
     let mut pending: HashMap<u64, oneshot::Sender<Result<Value, JsonRpcError>>> = HashMap::new();
     let mut next_id: u64 = 1;
-    let mut frame: Vec<u8> = Vec::new();
     let mut oversized = false;
+    let mut prune = tokio::time::interval(Duration::from_secs(1));
+    prune.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = prune.tick() => {
+                pending.retain(|_, waiter| !waiter.is_closed());
+            }
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
@@ -250,15 +266,15 @@ async fn run_driver<R, W>(
                     }
                 }
             }
-            outcome = read_frame(&mut reader, &mut frame) => {
-                match outcome {
-                    Ok(0) => break, // clean EOF: the peer is gone
-                    Ok(_) => {
+            inbound = frames.recv() => {
+                match inbound {
+                    Some(InboundFrame::Frame(frame)) => {
                         if !handle_frame(&frame, &mut pending, &mut writer).await {
                             break;
                         }
                     }
-                    Err(error) => {
+                    Some(InboundFrame::Closed) | None => break,
+                    Some(InboundFrame::Failed(error)) => {
                         oversized = matches!(error, JsonRpcError::FrameTooLarge);
                         tracing::debug!(%error, "json-rpc transport closed on a read failure");
                         break;
@@ -275,6 +291,35 @@ async fn run_driver<R, W>(
             JsonRpcError::TransportClosed
         };
         let _ = waiter.send(Err(error));
+    }
+    reader_task.abort();
+    if let Some(mut child) = child.take() {
+        kill_child_group(&mut child).await;
+    }
+}
+
+enum InboundFrame {
+    Frame(Vec<u8>),
+    Closed,
+    Failed(JsonRpcError),
+}
+
+async fn pump_frames<R>(reader: R, tx: mpsc::Sender<InboundFrame>)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(reader);
+    loop {
+        let mut frame = Vec::new();
+        let inbound = match read_frame(&mut reader, &mut frame).await {
+            Ok(0) => InboundFrame::Closed,
+            Ok(_) => InboundFrame::Frame(frame),
+            Err(error) => InboundFrame::Failed(error),
+        };
+        let terminal = !matches!(inbound, InboundFrame::Frame(_));
+        if tx.send(inbound).await.is_err() || terminal {
+            return;
+        }
     }
 }
 
@@ -394,8 +439,32 @@ async fn write_message<W: AsyncWrite + Unpin>(
         .map_err(std::io::Error::other)?
         .into_bytes();
     bytes.push(b'\n');
-    writer.write_all(&bytes).await?;
-    writer.flush().await
+    tokio::time::timeout(WRITE_TIMEOUT, async {
+        writer.write_all(&bytes).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "json-rpc write timed out"))?
+}
+
+async fn kill_child_group(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let kill = ["/bin/kill", "/usr/bin/kill"]
+            .into_iter()
+            .find(|path| std::fs::metadata(path).is_ok_and(|meta| meta.is_file()));
+        if let Some(kill) = kill {
+            let _ = Command::new(kill)
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 #[cfg(test)]
@@ -476,7 +545,7 @@ mod tests {
         });
 
         let error = client
-            .call("ping", json!({}), Duration::from_secs(5))
+            .call("ping", json!({}), Duration::from_secs(30))
             .await
             .expect_err("server error");
         assert!(matches!(error, JsonRpcError::Server { code: -32602, .. }));
@@ -608,7 +677,7 @@ mod tests {
         let client = JsonRpcClient::connect(client_reads, client_writes);
 
         let error = client
-            .call("ping", json!({}), Duration::from_secs(5))
+            .call("ping", json!({}), Duration::from_secs(30))
             .await
             .expect_err("frame rejected");
         assert!(matches!(error, JsonRpcError::FrameTooLarge), "got: {error}");

@@ -26,10 +26,10 @@
 
 use std::path::PathBuf;
 
-use codypendent_daemon::policy::{PathScope, ScopeVerdict};
+use codypendent_daemon::policy::PathScope;
 use serde_json::Value;
 
-use super::{CapabilityKind, ToolError};
+use super::{secure_fs, CapabilityKind, ToolError};
 
 /// Typed input for [`WriteFile::execute`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,38 +97,23 @@ impl WriteFile {
         input: &WriteFileInput,
         scope: &PathScope,
     ) -> Result<WriteFileOutcome, ToolError> {
-        let (resolved, verdict) = scope.resolve(&input.path);
-        match verdict {
-            ScopeVerdict::Allowed => {}
-            ScopeVerdict::Denied => return Err(ToolError::PathDenied(resolved)),
-            ScopeVerdict::OutsideRoots => return Err(ToolError::PathOutOfScope(resolved)),
-        }
+        let path = input.path.clone();
+        let content = input.content.clone().into_bytes();
+        let scope = scope.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write as _;
 
-        // Leaf guard + create-vs-overwrite detection from a single stat of
-        // the exact resolved path — never re-derived, so this cannot be
-        // fooled by something swapped in at a different path.
-        let existed = match tokio::fs::symlink_metadata(&resolved).await {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || metadata.is_dir() {
-                    return Err(ToolError::NotRegularFile(resolved));
-                }
-                true
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(ToolError::Io(e)),
-        };
-
-        if let Some(parent) = resolved.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        tokio::fs::write(&resolved, input.content.as_bytes()).await?;
-
-        Ok(WriteFileOutcome {
-            bytes_written: input.content.len() as u64,
-            created: !existed,
-            path: resolved,
+            let mut scoped = secure_fs::open_write(&path, &scope)?;
+            scoped.file.set_len(0)?;
+            scoped.file.write_all(&content)?;
+            Ok(WriteFileOutcome {
+                bytes_written: content.len() as u64,
+                created: scoped.created,
+                path: scoped.path,
+            })
         })
+        .await
+        .map_err(|error| ToolError::Other(anyhow::anyhow!("write worker failed: {error}")))?
     }
 }
 

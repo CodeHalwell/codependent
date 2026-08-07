@@ -135,9 +135,8 @@ impl PromotionStore {
         Ok(())
     }
 
-    /// Run the offline regression suite (STEP 7.4/7.5): `regressed` is the
-    /// caller's verdict (this store records results, it does not compute
-    /// them). See [`Candidate::run_regression`].
+    /// Persist a server-computed offline regression verdict. The assembly
+    /// layer owns evidence collection; this store owns the state transition.
     pub async fn run_regression(
         &self,
         pool: &SqlitePool,
@@ -146,10 +145,10 @@ impl PromotionStore {
     ) -> Result<(), PromotionStoreError> {
         let mut tx = pool.begin().await?;
         let mut candidate = load_for_update(&mut tx, id).await?;
-        candidate.run_regression(regressed)?;
+        let result = candidate.run_regression(regressed);
         save_candidate(&mut tx, id, &candidate).await?;
         tx.commit().await?;
-        Ok(())
+        result.map_err(Into::into)
     }
 
     /// Begin the shadow run. See [`Candidate::start_shadow`].
@@ -180,10 +179,9 @@ impl PromotionStore {
         Ok(())
     }
 
-    /// Record one canary signal observation (STEP 7.5 non-negotiable: this is
-    /// the recording path — `regressed` is the caller-supplied verdict from
-    /// whatever graded the observation; live traffic capture that produces
-    /// this verdict automatically is out of scope here, see the crate docs).
+    /// Record aggregate canary evidence derived by the assembly layer from
+    /// measured metrics. The sample population is persisted in the candidate
+    /// and enforced by [`Candidate::finish_canary`].
     /// A regression auto-rolls-back and this method persists the resulting
     /// system-attributed [`PromotionRecord`] to the audit trail (P7-5) —
     /// [`Self::finish_canary`] can never be reached by fabricating a pass:
@@ -194,9 +192,20 @@ impl PromotionStore {
         id: &str,
         regressed: bool,
     ) -> Result<CanaryOutcome, PromotionStoreError> {
+        self.observe_canary_samples(pool, id, regressed, 1).await
+    }
+
+    /// Record a measured canary population and its server-derived verdict.
+    pub async fn observe_canary_samples(
+        &self,
+        pool: &SqlitePool,
+        id: &str,
+        regressed: bool,
+        sample_count: u64,
+    ) -> Result<CanaryOutcome, PromotionStoreError> {
         let mut tx = pool.begin().await?;
         let mut candidate = load_for_update(&mut tx, id).await?;
-        let outcome = candidate.observe_canary(regressed)?;
+        let outcome = candidate.observe_canary_samples(regressed, sample_count)?;
         save_candidate(&mut tx, id, &candidate).await?;
         if let CanaryOutcome::AutoRolledBack(record) = &outcome {
             append_event(&mut tx, id, record).await?;
@@ -206,7 +215,7 @@ impl PromotionStore {
     }
 
     /// Finish the canary and assemble the comparison. Fails with
-    /// [`PromotionError::CanaryUnobserved`] (surfaced as
+    /// [`PromotionError::CanaryInsufficientEvidence`] (surfaced as
     /// [`PromotionStoreError::Promotion`]) if [`Self::observe_canary`] was
     /// never called — the structural guard against a canary "passing"
     /// unobserved (P7-2). See [`Candidate::finish_canary`].

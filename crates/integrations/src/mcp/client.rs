@@ -2,6 +2,7 @@
 //! `initialize` handshake, `tools/list` with cursor pagination, and `tools/call`
 //! with content-block flattening.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -27,6 +28,8 @@ const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
 /// searches), so this is generous — but a hung server must not park a run
 /// forever; deeper budgeting belongs to the run/policy layer.
 const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_TOOL_PAGES: usize = 100;
+const MAX_TOOLS: usize = 10_000;
 
 /// One tool as the server describes it on `tools/list`.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +113,13 @@ pub enum McpError {
         /// The underlying I/O error.
         #[source]
         source: std::io::Error,
+    },
+    /// The server returned malformed or unbounded pagination metadata.
+    #[error("mcp server `{server}` protocol violation during {operation}: {reason}")]
+    Protocol {
+        server: String,
+        operation: &'static str,
+        reason: String,
     },
 }
 
@@ -234,7 +244,8 @@ impl McpClient {
     pub async fn list_tools(&self) -> Result<Vec<McpToolDescription>, McpError> {
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
-        loop {
+        let mut seen = HashSet::new();
+        for page in 0..MAX_TOOL_PAGES {
             let params = match &cursor {
                 Some(cursor) => json!({ "cursor": cursor }),
                 None => json!({}),
@@ -266,13 +277,42 @@ impl McpClient {
                             .cloned()
                             .unwrap_or_else(|| json!({})),
                     });
+                    if tools.len() > MAX_TOOLS {
+                        return Err(McpError::Protocol {
+                            server: self.server.clone(),
+                            operation: "tools/list",
+                            reason: format!("tool count exceeded {MAX_TOOLS}"),
+                        });
+                    }
                 }
             }
             match result.get("nextCursor").and_then(Value::as_str) {
+                Some("") => {
+                    return Err(McpError::Protocol {
+                        server: self.server.clone(),
+                        operation: "tools/list",
+                        reason: "empty nextCursor".into(),
+                    })
+                }
+                Some(next) if !seen.insert(next.to_string()) => {
+                    return Err(McpError::Protocol {
+                        server: self.server.clone(),
+                        operation: "tools/list",
+                        reason: format!("repeated nextCursor `{next}`"),
+                    })
+                }
                 Some(next) => cursor = Some(next.to_string()),
                 None => return Ok(tools),
             }
+            if page + 1 == MAX_TOOL_PAGES {
+                return Err(McpError::Protocol {
+                    server: self.server.clone(),
+                    operation: "tools/list",
+                    reason: format!("pagination exceeded {MAX_TOOL_PAGES} pages"),
+                });
+            }
         }
+        unreachable!("bounded pagination returns from every terminal branch")
     }
 
     /// Call `tool` with `arguments`, returning the result's content blocks

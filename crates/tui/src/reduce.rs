@@ -9,7 +9,7 @@
 
 use codypendent_protocol::{
     Actor, ApprovalDecision, ApprovalScope, BudgetDimension, DocumentId, DocumentMutation,
-    EventBody, ProposedAction, RunDisposition, RunState, SessionEvent,
+    EventBody, ProposedAction, RunDisposition, RunState, SessionEvent, ToolOutcome,
 };
 
 use crate::action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, WorkflowNodeUpdate};
@@ -68,6 +68,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             title,
             closed,
             runs,
+            pending_approvals,
         } => {
             // Too far behind for an event replay: seed what the snapshot carries.
             // Runs become stubs (their objective/mode fill in from the next live
@@ -78,6 +79,16 @@ pub fn reduce(state: &mut AppState, action: Action) {
             for run_id in runs {
                 state.ensure_run(run_id, String::new(), mode);
             }
+            state.pending_approvals = pending_approvals
+                .into_iter()
+                .map(|approval| PendingApproval {
+                    approval_id: approval.approval_id,
+                    action: approval.action,
+                    risk: approval.risk,
+                    run_id: Some(approval.run_id),
+                })
+                .collect();
+            clamp(&mut state.selected_approval, state.pending_approvals.len());
         }
         Action::Tick => {
             state.tick = state.tick.wrapping_add(1);
@@ -561,12 +572,33 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             objective,
             mode,
         } => {
+            let already_announced = state
+                .runs
+                .iter()
+                .find(|run| run.run_id == run_id)
+                .is_some_and(|run| {
+                    !run.objective.is_empty()
+                        || run
+                            .transcript
+                            .iter()
+                            .any(|entry| matches!(entry, TranscriptEntry::User { .. }))
+                });
             let run = state.ensure_run(run_id, objective.clone(), mode);
-            run.state = RunState::Preparing;
-            // The objective is the run's opening turn — shown once here as the
-            // first transcript entry, in addition to the pane title `ensure_run`
-            // already set on `RunView.objective` (unchanged).
-            AppState::push_entry(run, TranscriptEntry::User { text: objective });
+            if !already_announced {
+                // A snapshot-created stub is filled by the first announcement;
+                // replay/catch-up overlap after that is idempotent. In
+                // particular, a repeated RunStarted must never resurrect a
+                // terminal run or duplicate its opening transcript turn.
+                run.objective = objective.clone();
+                run.mode = mode;
+                if !matches!(
+                    run.state,
+                    RunState::Completed | RunState::Failed | RunState::Cancelled
+                ) {
+                    run.state = RunState::Preparing;
+                }
+                AppState::push_entry(run, TranscriptEntry::User { text: objective });
+            }
         }
         EventBody::RunStateChanged { run_id, state: rs } => {
             if let Some(run) = state.run_mut(run_id) {
@@ -622,6 +654,35 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 pending.run_id = Some(run_id);
             }
         }
+        EventBody::ToolDenied {
+            run_id,
+            action,
+            reasons,
+        } => {
+            if let Some(run) = state.run_mut(run_id) {
+                AppState::push_entry(
+                    run,
+                    TranscriptEntry::Tool(Box::new(ToolCard {
+                        tool: String::new(),
+                        status: ToolStatus::Completed,
+                        action: Some(action),
+                        args_digest: None,
+                        label: None,
+                        outcome: Some(ToolOutcome::Failed {
+                            message: if reasons.is_empty() {
+                                "denied by policy".to_string()
+                            } else {
+                                reasons.join("; ")
+                            },
+                        }),
+                        artifact: None,
+                        approval_id: None,
+                        expanded: false,
+                    })),
+                );
+                run.activity = RunActivity::Thinking;
+            }
+        }
         EventBody::ToolStarted {
             run_id,
             tool,
@@ -633,7 +694,12 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 // card entering `Running` is what `RunActivity::RunningTool`
                 // names.
                 let tool_name = tool.clone();
-                match last_card(run, |c| c.status == ToolStatus::Proposed) {
+                match last_card(run, |c| {
+                    c.status == ToolStatus::Proposed
+                        && c.action
+                            .as_ref()
+                            .is_some_and(|action| tool_matches_action(&tool, action))
+                }) {
                     Some(card) => {
                         card.tool = tool;
                         card.args_digest = Some(args_digest);
@@ -665,7 +731,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             artifact,
         } => {
             if let Some(run) = state.run_mut(run_id) {
-                match last_card(run, |c| c.status != ToolStatus::Completed) {
+                match last_card(run, |c| c.status == ToolStatus::Running && c.tool == tool) {
                     Some(card) => {
                         if card.tool.is_empty() {
                             card.tool = tool;
@@ -855,6 +921,34 @@ fn last_card(run: &mut RunView, pred: impl Fn(&ToolCard) -> bool) -> Option<&mut
         TranscriptEntry::Tool(card) if pred(card) => Some(card.as_mut()),
         _ => None,
     })
+}
+
+/// Correlate a started tool with the action shown on its approval card. The
+/// wire protocol does not yet expose an invocation id on all three lifecycle
+/// events, so matching by capability plus exact tool name is the strongest
+/// stable identity available (and avoids mutating an unrelated parallel card
+/// merely because it happens to be `Proposed`).
+fn tool_matches_action(tool: &str, action: &ProposedAction) -> bool {
+    match action {
+        ProposedAction::ReadFiles { .. } => {
+            matches!(tool, "workspace.read_file" | "workspace.search")
+        }
+        ProposedAction::WritePatch { .. } => matches!(
+            tool,
+            "workspace.write_file" | "workspace.edit_file" | "git.apply_patch"
+        ),
+        ProposedAction::ExecuteCommand { .. } => tool == "shell.run" || tool.starts_with("git."),
+        ProposedAction::NetworkRequest { .. } => tool == "web.search",
+        ProposedAction::GitCommit { .. } | ProposedAction::GitPush { .. } => {
+            tool.starts_with("git.")
+        }
+        ProposedAction::GitHubMutation { .. } => tool.starts_with("github."),
+        ProposedAction::McpToolCall {
+            server, tool: name, ..
+        } => tool == format!("mcp.{server}.{name}"),
+        ProposedAction::PublishDocument { .. } => tool == "document.publish",
+        _ => false,
+    }
 }
 
 /// Which run (if any) owns a proposed approval, inferred from tool cards.
@@ -2954,6 +3048,7 @@ mod tests {
                 title: "long session".to_owned(),
                 closed: false,
                 runs: vec![run_id],
+                pending_approvals: Vec::new(),
             },
         );
         assert_eq!(s.session_title.as_deref(), Some("long session"));

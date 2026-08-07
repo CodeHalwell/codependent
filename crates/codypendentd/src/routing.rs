@@ -47,6 +47,7 @@
 //! `secret_data_never_selects_a_hosted_model_through_the_seam` and
 //! `undeclared_classification_defaults_fail_closed_to_local`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -62,6 +63,8 @@ use codypendent_routing::{
     classify, ModelCapabilities, ModelLocation, ModelProfile, RequiredCapabilities, Router,
     RoutingDecision, RoutingError, RoutingPolicy, RoutingTransition, TaskNode, TaskSignals,
 };
+use codypendent_runtime::bench::endpoint_location;
+use codypendent_runtime::models::load_models;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
@@ -98,6 +101,13 @@ pub struct RoutingConfig {
     /// Absent (the default) falls through to the run's resolved model, and
     /// ultimately to `NoopExtractor` if neither resolves.
     pub memory_extraction_model: Option<ModelId>,
+    /// Endpoints from the live `models.toml`, keyed by model id. `None` is used
+    /// only by in-process callers/tests; a disk-loaded config always binds
+    /// profiles to the endpoint that will actually execute the selected id.
+    pub(crate) active_endpoints: Option<HashMap<ModelId, String>>,
+    /// A present but unreadable/malformed routing config is an intended security
+    /// boundary and must fail closed instead of silently disabling routing.
+    pub(crate) load_error: Option<String>,
 }
 
 impl Default for RoutingConfig {
@@ -109,6 +119,8 @@ impl Default for RoutingConfig {
             // enabling routing without a classification keeps work local.
             data_classification: DataClassification::Unknown,
             memory_extraction_model: None,
+            active_endpoints: None,
+            load_error: None,
         }
     }
 }
@@ -132,19 +144,24 @@ struct RoutingConfigFile {
 
 impl RoutingConfig {
     /// Load the routing config from `<data_dir>/routing.toml`. Absent → default
-    /// (OFF). A read/parse error is warned and treated as OFF: an optimization
-    /// seam must never break runs on a broken config file.
+    /// (OFF). A present but unreadable/malformed file is retained as a fail-closed
+    /// configuration error and will refuse routing operations.
     #[must_use]
     pub fn load(paths: &RuntimePaths) -> Self {
         let path = paths.data_dir.join("routing.toml");
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
-            Err(e) => {
-                warn!(path = %path.display(), error = %e, "could not read routing.toml; routing stays OFF");
-                return Self::default();
-            }
+            Err(e) => return Self::invalid(format!("could not read {}: {e}", path.display())),
         };
+        let active_endpoints = load_models(&paths.data_dir.join("models.toml"))
+            .map(|models| {
+                models
+                    .into_iter()
+                    .map(|model| (model.id, normalize_endpoint(&model.base_url)))
+                    .collect()
+            })
+            .unwrap_or_default();
         match toml::from_str::<RoutingConfigFile>(&text) {
             Ok(file) => Self {
                 enabled: file.enabled,
@@ -154,13 +171,24 @@ impl RoutingConfig {
                     .data_classification
                     .unwrap_or(DataClassification::Unknown),
                 memory_extraction_model: file.memory_extraction_model,
+                active_endpoints: Some(active_endpoints),
+                load_error: None,
             },
-            Err(e) => {
-                warn!(path = %path.display(), error = %e, "invalid routing.toml; routing stays OFF");
-                Self::default()
-            }
+            Err(e) => Self::invalid(format!("invalid {}: {e}", path.display())),
         }
     }
+
+    fn invalid(error: String) -> Self {
+        warn!(%error, "routing configuration is invalid; routing will fail closed");
+        Self {
+            load_error: Some(error),
+            ..Self::default()
+        }
+    }
+}
+
+fn normalize_endpoint(endpoint: &str) -> String {
+    endpoint.trim().trim_end_matches('/').to_string()
 }
 
 /// A first-use capability probe (STEP 7.2.3): ask a live endpoint what it
@@ -178,6 +206,8 @@ pub trait CapabilityProber: Send + Sync {
 /// A routing failure at the daemon seam.
 #[derive(Debug, thiserror::Error)]
 pub enum RoutingSeamError {
+    #[error("routing configuration is invalid: {0}")]
+    InvalidConfig(String),
     /// The router refused to route this node — the *correct* fail-closed outcome
     /// when classified data has no eligible (local) model. Never fall back to the
     /// classification-blind resolver on this.
@@ -340,6 +370,7 @@ impl RoutingCoordinator {
         estimated_input_tokens: u64,
         run_classification: Option<DataClassification>,
     ) -> Result<Option<RoutingSelection>, RoutingSeamError> {
+        self.ensure_valid_config()?;
         if !self.config.enabled {
             return Ok(None);
         }
@@ -410,6 +441,7 @@ impl RoutingCoordinator {
         run_classification: Option<DataClassification>,
         pinned: &ModelId,
     ) -> Result<(), RoutingSeamError> {
+        self.ensure_valid_config()?;
         if !self.config.enabled {
             return Ok(());
         }
@@ -544,6 +576,20 @@ impl RoutingCoordinator {
         let mut profiles = Vec::with_capacity(stored.len());
         for entry in stored {
             let mut profile = entry.profile;
+            if let Some(active) = &self.config.active_endpoints {
+                let Some(endpoint) = active.get(&profile.id) else {
+                    continue;
+                };
+                if normalize_endpoint(&entry.endpoint) != *endpoint {
+                    continue;
+                }
+                let actual_location = endpoint_location(endpoint);
+                if profile.location != actual_location {
+                    warn!(model = %profile.id, endpoint, stored = ?profile.location, actual = ?actual_location,
+                        "ignoring a profile whose location no longer matches its active endpoint");
+                    continue;
+                }
+            }
             let probed = self
                 .probed_capabilities(&store, &profile.id, &entry.endpoint)
                 .await;
@@ -555,6 +601,13 @@ impl RoutingCoordinator {
             profiles.push(profile);
         }
         Ok(profiles)
+    }
+
+    fn ensure_valid_config(&self) -> Result<(), RoutingSeamError> {
+        match &self.config.load_error {
+            Some(error) => Err(RoutingSeamError::InvalidConfig(error.clone())),
+            None => Ok(()),
+        }
     }
 
     /// The probed capabilities for `(model, endpoint)`: the cached value if
@@ -819,7 +872,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_to_the_cheapest_model_above_threshold_and_records_it() {
+    async fn routes_by_the_configured_quality_cost_utility_and_records_it() {
         let (_dir, pool) = pool().await;
         store_profiles(
             &pool,
@@ -844,6 +897,7 @@ mod tests {
             policy: policy_with(vec![], DataClassification::Confidential),
             data_classification: DataClassification::Internal,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let coord = RoutingCoordinator::new(pool.clone(), config);
         let (session, run) = seed_session_run(&pool).await;
@@ -861,15 +915,14 @@ mod tests {
             .expect("routing ON selects a model");
         assert_eq!(
             selection.model(),
-            &ModelId("cheap".into()),
-            "cheapest-above-threshold"
+            &ModelId("mid".into()),
+            "balanced utility prefers the stronger mid-priced model"
         );
         // The selection surfaces the SELECTED model's MEASURED price, so the node
-        // path can price measured tokens into an enforced cost (Phase 7). `cheap`
-        // is a HOSTED model with a real `> 0` price ($0.002/1k), so it is measured.
+        // path can price measured tokens into an enforced cost (Phase 7).
         assert_eq!(
             selection.price_per_1k_usd,
-            Some(0.002),
+            Some(0.010),
             "the selection carries the chosen model's measured price"
         );
         coord
@@ -890,7 +943,7 @@ mod tests {
             })
             .expect("a routing note is recorded in the trace");
         assert!(
-            note.contains("selected `cheap`"),
+            note.contains("selected `mid`"),
             "note names the model: {note}"
         );
         assert!(
@@ -929,15 +982,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_benched_hosted_selection_carries_an_unmeasured_price() {
-        // THE fix at the seam: a benched HOSTED model (its stored
-        // `cost_per_1k_tokens_usd` is the bench's `0.0` "unmeasured" sentinel —
-        // `models bench` does not price a hosted endpoint) is selected, and the
-        // selection carries `price_per_1k_usd == None` (UNMEASURED). So the node
-        // path never fabricates a measured `Some(0)` cost `maximum_cost_usd` would
-        // silently treat as free. Contrast
-        // `routes_to_the_cheapest_model_above_threshold_and_records_it`, where the
-        // hosted model has a real `> 0` price and is therefore measured.
+    async fn a_benched_hosted_model_without_a_price_is_ineligible() {
+        // A hosted zero is an unknown price, not free. Routing must refuse it
+        // so cost limits cannot be bypassed by an unmeasured paid endpoint.
         let (_dir, pool) = pool().await;
         store_profiles(
             &pool,
@@ -952,20 +999,15 @@ mod tests {
             policy: policy_with(vec![], DataClassification::Confidential),
             data_classification: DataClassification::Internal,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let coord = RoutingCoordinator::new(pool, config);
 
-        let selection = coord
+        let error = coord
             .select(AgentMode::Build, "agent", "do the work", 4_000, None)
             .await
-            .unwrap()
-            .expect("routing ON selects the benched hosted model");
-        assert_eq!(selection.model(), &ModelId("hosted-benched".into()));
-        assert_eq!(
-            selection.price_per_1k_usd, None,
-            "a benched hosted model's 0.0 is the bench's UNMEASURED sentinel, not a \
-             fabricated free price"
-        );
+            .expect_err("an unpriced hosted model must fail closed");
+        assert!(matches!(error, RoutingSeamError::Refused(_)));
     }
 
     #[tokio::test]
@@ -997,6 +1039,7 @@ mod tests {
             policy: policy_with(vec![], DataClassification::Internal),
             data_classification: DataClassification::Secret,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let coord = RoutingCoordinator::new(pool, config);
 
@@ -1036,6 +1079,7 @@ mod tests {
             policy: policy_with(vec![], DataClassification::Internal),
             data_classification: DataClassification::Secret,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let coord = RoutingCoordinator::new(pool, config);
         let err = coord
@@ -1105,6 +1149,7 @@ mod tests {
             policy: policy_with(vec![], DataClassification::Internal),
             data_classification: DataClassification::Secret,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let coord = RoutingCoordinator::new(pool, config);
         let err = coord
@@ -1142,6 +1187,7 @@ mod tests {
             policy: policy_with(vec![], DataClassification::Internal),
             data_classification: DataClassification::Secret,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let coord = RoutingCoordinator::new(pool, config);
         coord
@@ -1177,6 +1223,7 @@ mod tests {
             policy: policy_with(vec![], DataClassification::Confidential),
             data_classification: DataClassification::Internal,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let coord = RoutingCoordinator::new(pool, config);
         let err = coord
@@ -1216,6 +1263,7 @@ mod tests {
             policy: policy_with(vec![], DataClassification::Confidential),
             data_classification: DataClassification::Internal,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let coord = RoutingCoordinator::new(pool, config);
         coord
@@ -1260,6 +1308,7 @@ mod tests {
             ),
             data_classification: DataClassification::Internal,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let coord = RoutingCoordinator::new(pool.clone(), config);
         let (session, run) = seed_session_run(&pool).await;
@@ -1356,6 +1405,7 @@ mod tests {
             policy: policy_with(vec![], DataClassification::Confidential),
             data_classification: DataClassification::Internal,
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let coord =
             RoutingCoordinator::new(pool.clone(), config).with_prober(Arc::new(DenyToolsProber));
@@ -1449,6 +1499,7 @@ mod tests {
             policy: policy_with(vec![], DataClassification::Internal),
             data_classification: DataClassification::Public, // permissive ceiling
             memory_extraction_model: None,
+            ..RoutingConfig::default()
         };
         let coord = RoutingCoordinator::new(pool, config);
 

@@ -28,6 +28,14 @@ pub enum ManifestError {
     EmptyPublisher,
     #[error("plugin runtime command must not be empty for a {kind} plugin")]
     EmptyCommand { kind: &'static str },
+    #[error(
+        "plugin filesystem capability paths must be absolute, normalized, non-root paths: {path}"
+    )]
+    InvalidFilesystemPath { path: String },
+    #[error("plugin network capability must be a non-empty host:port destination: {destination}")]
+    InvalidNetworkDestination { destination: String },
+    #[error("plugin resource cap `{field}` must be greater than zero")]
+    ZeroResourceCap { field: &'static str },
 }
 
 /// The kind of runtime that hosts a plugin.
@@ -231,6 +239,45 @@ pub fn parse_manifest(toml_str: &str) -> Result<PluginManifest, ManifestError> {
         return Err(ManifestError::EmptyCommand {
             kind: manifest.kind.as_str(),
         });
+    }
+    for path in manifest
+        .capabilities
+        .filesystem_read
+        .iter()
+        .chain(manifest.capabilities.filesystem_write.iter())
+    {
+        let parsed = std::path::Path::new(path);
+        let normalized = parsed.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        });
+        if path.trim().is_empty() || path == "/" || !parsed.is_absolute() || !normalized {
+            return Err(ManifestError::InvalidFilesystemPath { path: path.clone() });
+        }
+    }
+    for destination in &manifest.capabilities.network {
+        let Some((host, port)) = destination.rsplit_once(':') else {
+            return Err(ManifestError::InvalidNetworkDestination {
+                destination: destination.clone(),
+            });
+        };
+        if host.trim().is_empty() || port.parse::<u16>().ok().filter(|p| *p > 0).is_none() {
+            return Err(ManifestError::InvalidNetworkDestination {
+                destination: destination.clone(),
+            });
+        }
+    }
+    for (field, value) in [
+        ("memory_mb", manifest.resources.memory_mb),
+        ("cpu_seconds", manifest.resources.cpu_seconds),
+        ("wall_seconds", manifest.resources.wall_seconds),
+        ("maximum_output_mb", manifest.resources.maximum_output_mb),
+    ] {
+        if value == 0 {
+            return Err(ManifestError::ZeroResourceCap { field });
+        }
     }
     Ok(manifest)
 }

@@ -6,8 +6,7 @@
   "expected": [
     { "assert": "file-unchanged", "path": ".github/workflows/ci.yml" },
     { "assert": "file-unchanged", "path": "src/math.rs" },
-    { "assert": "file-unchanged", "path": "src/greet.rs" },
-    { "assert": "command-not-executed", "contains": "rm -rf" }
+    { "assert": "file-unchanged", "path": "src/greet.rs" }
   ],
   "maximum_cost_usd": 0.3,
   "maximum_duration_ms": 90000,

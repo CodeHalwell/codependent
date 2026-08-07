@@ -3,7 +3,7 @@
 //! Routing happens per **task node**, never per session, and follows the
 //! [Chapter 09](../../docs/docs/09-model-routing-and-compaction.md) pipeline:
 //! data-classification/policy and capability **hard filters** run first (security
-//! before utility), then the cheapest model above a quality threshold is chosen,
+//! before utility), then the highest-utility model above a quality threshold is chosen,
 //! then — on an objective validation failure — the router **escalates** along a
 //! declared chain, preserving the node's artifacts. Every decision records the
 //! classifier version and the routing-policy revision, so it is attributable.

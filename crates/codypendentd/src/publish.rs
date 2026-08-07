@@ -47,6 +47,7 @@
 //! inspecting it sees a sensible outcome.
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use codypendent_daemon::approvals::ApprovalBroker;
@@ -117,6 +118,87 @@ impl KnowledgePublisher {
         self.github = Some(github);
         self
     }
+
+    /// Re-arm durable publication continuations after restart. Pending
+    /// approvals are registered with the shared broker again; approvals which
+    /// were resolved just before the crash continue from their stored plan.
+    pub async fn recover_pending(&self) -> anyhow::Result<usize> {
+        self.approvals.reload_pending(&self.pool).await?;
+
+        let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT j.approval_id, j.run_id, j.document_id, j.plan_json, a.state \
+             FROM document_publish_jobs j \
+             LEFT JOIN approvals a ON a.id = j.approval_id \
+             WHERE j.state IN ('pending', 'executing')",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut recovered = 0;
+        for (approval, run, document, plan_json, approval_state) in rows {
+            let approval_id = ApprovalId::from_str(&approval)?;
+            let run_id = RunId::from_str(&run)?;
+            let document_id = DocumentId::from_str(&document)?;
+            let plan: PublishPlan = match serde_json::from_str(&plan_json) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    warn!(%approval_id, %error, "stored publish plan is corrupt");
+                    set_publish_job_state(&self.pool, approval_id, "failed").await?;
+                    projections::set_run_state(&self.pool, run_id, RunState::Failed).await?;
+                    continue;
+                }
+            };
+
+            match approval_state.as_deref() {
+                Some("pending") => {
+                    tokio::spawn(execute_after_decision(
+                        self.pool.clone(),
+                        self.approvals.clone(),
+                        self.repository_root.clone(),
+                        self.artifacts.clone(),
+                        self.github.clone(),
+                        approval_id,
+                        run_id,
+                        document_id,
+                        plan,
+                    ));
+                    recovered += 1;
+                }
+                Some("approved") => {
+                    tokio::spawn(execute_approved_plan(
+                        self.pool.clone(),
+                        self.repository_root.clone(),
+                        self.artifacts.clone(),
+                        self.github.clone(),
+                        approval_id,
+                        run_id,
+                        document_id,
+                        plan,
+                    ));
+                    recovered += 1;
+                }
+                Some("rejected" | "expired") => {
+                    set_publish_job_state(&self.pool, approval_id, "cancelled").await?;
+                    projections::set_run_state(&self.pool, run_id, RunState::Cancelled).await?;
+                }
+                Some(other) => {
+                    warn!(%approval_id, state = other, "publish approval has invalid state");
+                    set_publish_job_state(&self.pool, approval_id, "failed").await?;
+                    projections::set_run_state(&self.pool, run_id, RunState::Failed).await?;
+                }
+                None => {
+                    // A crash can occur after the continuation is persisted but
+                    // before the approval transaction commits. The durable job
+                    // makes that window detectable and terminal instead of
+                    // leaving an unresolvable synthetic run forever.
+                    warn!(%approval_id, "publish continuation has no approval row");
+                    set_publish_job_state(&self.pool, approval_id, "failed").await?;
+                    projections::set_run_state(&self.pool, run_id, RunState::Failed).await?;
+                }
+            }
+        }
+        Ok(recovered)
+    }
 }
 
 impl DocumentPublisher for KnowledgePublisher {
@@ -166,10 +248,31 @@ impl DocumentPublisher for KnowledgePublisher {
                 git_action: plan.git_action.clone(),
             };
 
-            let approval_id = approvals
-                .request(&pool, session_id, run_id, action, risk, capabilities, None)
+            // Persist the continuation before the approval becomes visible.
+            // If the process exits after either commit, startup can distinguish
+            // a resumable approval from an incomplete request.
+            let approval_id = ApprovalId::new();
+            persist_publish_job(&pool, approval_id, run_id, document_id, &plan)
                 .await
                 .map_err(internal_error)?;
+            if let Err(error) = approvals
+                .request_with_id_and_reuse(
+                    &pool,
+                    approval_id,
+                    session_id,
+                    run_id,
+                    action,
+                    risk,
+                    capabilities,
+                    None,
+                    true,
+                )
+                .await
+            {
+                let _ = set_publish_job_state(&pool, approval_id, "failed").await;
+                let _ = projections::set_run_state(&pool, run_id, RunState::Failed).await;
+                return Err(internal_error(error));
+            }
 
             // Never block on the human decision: hand the plan to a background
             // task that awaits it, and reply now with exactly what was parked.
@@ -216,6 +319,7 @@ async fn execute_after_decision(
         Ok(decision) => decision,
         Err(error) => {
             warn!(%approval_id, %error, "publish approval waiter ended without a decision");
+            let _ = set_publish_job_state(&pool, approval_id, "failed").await;
             let _ = projections::set_run_state(&pool, run_id, RunState::Failed).await;
             return;
         }
@@ -223,7 +327,38 @@ async fn execute_after_decision(
 
     if decision != ApprovalDecision::Approve {
         // Reject (or an unrecognised future decision): zero writes.
+        let _ = set_publish_job_state(&pool, approval_id, "cancelled").await;
         let _ = projections::set_run_state(&pool, run_id, RunState::Cancelled).await;
+        return;
+    }
+
+    execute_approved_plan(
+        pool,
+        repository_root,
+        artifacts,
+        github,
+        approval_id,
+        run_id,
+        document_id,
+        plan,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_approved_plan(
+    pool: SqlitePool,
+    repository_root: PathBuf,
+    artifacts: ArtifactStore,
+    github: Option<Arc<dyn GitHubApi>>,
+    approval_id: ApprovalId,
+    run_id: RunId,
+    document_id: DocumentId,
+    plan: PublishPlan,
+) {
+    if let Err(error) = set_publish_job_state(&pool, approval_id, "executing").await {
+        warn!(%approval_id, %error, "could not mark publish job executing");
+        let _ = projections::set_run_state(&pool, run_id, RunState::Failed).await;
         return;
     }
 
@@ -242,14 +377,57 @@ async fn execute_after_decision(
                 record_publication(&pool, document_id, &plan, git_commit.as_deref()).await
             {
                 warn!(%document_id, %error, "publish executed but recording it failed");
+                let _ = set_publish_job_state(&pool, approval_id, "failed").await;
+                let _ = projections::set_run_state(&pool, run_id, RunState::Failed).await;
+                return;
             }
+            let _ = set_publish_job_state(&pool, approval_id, "completed").await;
             let _ = projections::set_run_state(&pool, run_id, RunState::Completed).await;
         }
         Err(error) => {
             warn!(%document_id, %error, "publish approved but execution failed");
+            let _ = set_publish_job_state(&pool, approval_id, "failed").await;
             let _ = projections::set_run_state(&pool, run_id, RunState::Failed).await;
         }
     }
+}
+
+async fn persist_publish_job(
+    pool: &SqlitePool,
+    approval_id: ApprovalId,
+    run_id: RunId,
+    document_id: DocumentId,
+    plan: &PublishPlan,
+) -> anyhow::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO document_publish_jobs \
+         (approval_id, run_id, document_id, plan_json, state, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+    )
+    .bind(approval_id.to_string())
+    .bind(run_id.to_string())
+    .bind(document_id.to_string())
+    .bind(serde_json::to_string(plan)?)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn set_publish_job_state(
+    pool: &SqlitePool,
+    approval_id: ApprovalId,
+    state: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE document_publish_jobs SET state = ?, updated_at = ? WHERE approval_id = ?")
+        .bind(state)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(approval_id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Reject a `path` that could escape the repository or a `branch` that could
@@ -915,6 +1093,59 @@ mod tests {
             2,
             "the publish must add exactly one commit: {log}"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_publish_is_rearmed_after_a_daemon_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = temp_pool(dir.path()).await;
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let document_id = seed_document(&pool, "Architecture").await;
+
+        // Daemon instance one parks the request and disappears before a
+        // decision. Its in-memory waiter is deliberately not used again.
+        let old_publisher = build_publisher(
+            pool.clone(),
+            ApprovalBroker::new(),
+            repo.clone(),
+            dir.path(),
+        );
+        let parked = old_publisher
+            .publish(publish_request(
+                document_id,
+                wire_target("docs/recovered.md"),
+            ))
+            .await
+            .expect("publish parks before restart");
+
+        // A fresh broker/publisher pair models the restarted daemon. Recovery
+        // reloads the durable approval and respawns the stored continuation.
+        let recovered_approvals = ApprovalBroker::new();
+        let recovered_publisher = build_publisher(
+            pool.clone(),
+            recovered_approvals.clone(),
+            repo.clone(),
+            dir.path(),
+        );
+        assert_eq!(recovered_publisher.recover_pending().await.unwrap(), 1);
+        resolve(
+            &pool,
+            &recovered_approvals,
+            parked.approval_id,
+            ApprovalDecision::Approve,
+        )
+        .await;
+
+        wait_for_publication_count(&pool, document_id, 1).await;
+        assert!(repo.join("docs/recovered.md").exists());
+        let state: (String,) =
+            sqlx::query_as("SELECT state FROM document_publish_jobs WHERE approval_id = ?")
+                .bind(parked.approval_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state.0, "completed");
     }
 
     #[tokio::test]

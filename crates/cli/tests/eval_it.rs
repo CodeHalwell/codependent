@@ -262,12 +262,40 @@ async fn mock_daemon(
         // Rewrite every event onto the real run id, so tests can build their
         // scripted sequence before the daemon mints one.
         let body = retarget(scripted.body, run_id);
+        let pending_approval = match &body {
+            EventBody::ApprovalRequested { approval_id, .. } => Some(*approval_id),
+            _ => None,
+        };
         let mut envelope = Envelope::request(
             codypendent_protocol::ClientId::new(),
             Payload::Event(SessionEvent { body, ..scripted }),
         );
         envelope.session_id = Some(session_id);
         write_envelope(&mut stream, &envelope).await.unwrap();
+        if let Some(approval_id) = pending_approval {
+            let resolve = read_envelope(&mut stream).await.unwrap().unwrap();
+            assert!(matches!(
+                &expect_command(&resolve).body,
+                CommandBody::ResolveApproval {
+                    approval_id: actual,
+                    decision: ApprovalDecision::Approve,
+                    ..
+                } if *actual == approval_id
+            ));
+            write_envelope(
+                &mut stream,
+                &Envelope::reply_to(
+                    &resolve,
+                    Payload::CommandAccepted {
+                        command_id: command_id_of(&resolve),
+                        sequence: None,
+                        created_run: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        }
     }
 }
 

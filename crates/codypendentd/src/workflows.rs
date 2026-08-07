@@ -310,7 +310,34 @@ impl<E: NodeExecutor + 'static> WorkflowConductorHost<E> {
                         host.publish_run_phase(&run_id, state);
                         info!(run = %run_id, state = state.as_str(), "workflow run driven to a stopping state")
                     }
-                    Err(error) => warn!(run = %run_id, %error, "workflow run drive ended in error"),
+                    Err(error) => {
+                        // A stored manifest which is missing, no longer
+                        // compiles, or compiles to a changed graph can never
+                        // make progress on a later retry. End it durably rather
+                        // than logging-and-skipping it on every daemon boot.
+                        let unrecoverable = matches!(
+                            error,
+                            ConductorError::NoManifest(_)
+                                | ConductorError::Compile(_)
+                                | ConductorError::Store(
+                                    WorkflowStoreError::GraphSignatureChanged { .. }
+                                )
+                        );
+                        if unrecoverable {
+                            match WorkflowStore::new()
+                                .set_run_state(&host.pool, &run_id, WorkflowRunState::Failed)
+                                .await
+                            {
+                                Ok(()) => host.publish_run_phase(&run_id, WorkflowRunState::Failed),
+                                Err(store_error) => warn!(
+                                    run = %run_id,
+                                    %store_error,
+                                    "could not mark unrecoverable workflow failed"
+                                ),
+                            }
+                        }
+                        warn!(run = %run_id, %error, "workflow run drive ended in error")
+                    }
                 }
                 // The drive has fully drained — drop any cancellation entry for this
                 // run so a cancelled run's sticky registry entry does not linger (T9).

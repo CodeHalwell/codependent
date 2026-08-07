@@ -56,6 +56,22 @@ impl DaemonAcpBackend {
     }
 }
 
+fn require_accepted(
+    reply: codypendent_protocol::Envelope,
+    command: &str,
+) -> Result<codypendent_protocol::Envelope, AcpError> {
+    match &reply.payload {
+        Payload::CommandAccepted { .. } => Ok(reply),
+        Payload::CommandRejected(error) => Err(AcpError::Backend(format!(
+            "{command} rejected: {} ({})",
+            error.message, error.code
+        ))),
+        other => Err(AcpError::Backend(format!(
+            "unexpected reply to {command}: {other:?}"
+        ))),
+    }
+}
+
 /// The two options every permission request offers.
 fn permission_options() -> Vec<PermissionOption> {
     vec![
@@ -76,8 +92,8 @@ fn permission_options() -> Vec<PermissionOption> {
 impl AcpBackend for DaemonAcpBackend {
     async fn new_session(&self) -> Result<String, AcpError> {
         let mut conn = self.open().await?;
-        let reply = conn
-            .send_command(CommandBody::CreateSession {
+        let reply = require_accepted(
+            conn.send_command(CommandBody::CreateSession {
                 workspace: WorkspaceId::new(),
                 title: "acp".to_string(),
                 // So the daemon can build its code graph on open, not only on
@@ -85,7 +101,9 @@ impl AcpBackend for DaemonAcpBackend {
                 repository: Some(self.repo.to_string_lossy().into_owned()),
             })
             .await
-            .map_err(|e| AcpError::Backend(e.to_string()))?;
+            .map_err(|e| AcpError::Backend(e.to_string()))?,
+            "CreateSession",
+        )?;
         let session = reply
             .session_id
             .ok_or_else(|| AcpError::Backend("daemon returned no session id".to_string()))?;
@@ -105,31 +123,40 @@ impl AcpBackend for DaemonAcpBackend {
 
         // Attach so this connection receives the run's events, then start the
         // run with the prompt as its objective.
-        conn.send_command(CommandBody::AttachSession {
-            session_id: session,
-            last_seen_sequence: None,
-            subscriptions: vec![Subscription::SessionSummary],
-            // Approver, not Contributor: this connection must both start runs AND
-            // resolve the approvals it surfaces as ACP permission requests. The
-            // daemon gates `ResolveApproval` to Approver/Controller, and Approver
-            // is a superset of Contributor's start/submit permissions.
-            requested_role: ClientRole::Approver,
-            repository: Some(self.repo.to_string_lossy().into_owned()),
-        })
-        .await
-        .map_err(|e| AcpError::Backend(e.to_string()))?;
-        conn.send_command(CommandBody::StartRun {
-            session_id: session,
-            objective: text.to_string(),
-            mode: AgentMode::Build,
-            repository: Some(self.repo.to_string_lossy().into_owned()),
-            // The ACP bridge pins no model; the daemon resolves/routes as usual.
-            model: None,
-        })
-        .await
-        .map_err(|e| AcpError::Backend(e.to_string()))?;
+        require_accepted(
+            conn.send_command(CommandBody::AttachSession {
+                session_id: session,
+                last_seen_sequence: None,
+                subscriptions: vec![Subscription::SessionSummary],
+                // Approver, not Contributor: this connection must both start runs AND
+                // resolve the approvals it surfaces as ACP permission requests. The
+                // daemon gates `ResolveApproval` to Approver/Controller, and Approver
+                // is a superset of Contributor's start/submit permissions.
+                requested_role: ClientRole::Approver,
+                repository: Some(self.repo.to_string_lossy().into_owned()),
+            })
+            .await
+            .map_err(|e| AcpError::Backend(e.to_string()))?,
+            "AttachSession",
+        )?;
+        let start_reply = require_accepted(
+            conn.send_command(CommandBody::StartRun {
+                session_id: session,
+                objective: text.to_string(),
+                mode: AgentMode::Build,
+                repository: Some(self.repo.to_string_lossy().into_owned()),
+                // The ACP bridge pins no model; the daemon resolves/routes as usual.
+                model: None,
+            })
+            .await
+            .map_err(|e| AcpError::Backend(e.to_string()))?,
+            "StartRun",
+        )?;
 
-        let mut run_id: Option<RunId> = None;
+        let mut run_id: Option<RunId> = match start_reply.payload {
+            Payload::CommandAccepted { created_run, .. } => created_run,
+            _ => unreachable!("require_accepted checked payload"),
+        };
         loop {
             tokio::select! {
                 // The client cancelled this turn: stop the run and report it.
@@ -143,10 +170,12 @@ impl AcpBackend for DaemonAcpBackend {
                     if let Some(run) = run_id {
                         match self.open().await {
                             Ok(mut fresh) => {
-                                if let Err(error) = fresh
+                                let cancel = fresh
                                     .send_command(CommandBody::CancelRun { run_id: run })
                                     .await
-                                {
+                                    .map_err(|error| AcpError::Backend(error.to_string()))
+                                    .and_then(|reply| require_accepted(reply, "CancelRun"));
+                                if let Err(error) = cancel {
                                     eprintln!("codypendent acp: cancel could not reach the daemon: {error}");
                                 }
                             }
@@ -215,12 +244,14 @@ async fn resolve(
         PermissionOutcome::Selected(id) if id == "allow" => ApprovalDecision::Approve,
         _ => ApprovalDecision::Reject,
     };
-    conn.send_command(CommandBody::ResolveApproval {
-        approval_id,
-        decision,
-        scope: ApprovalScope::Once,
-    })
-    .await
-    .map_err(|e| AcpError::Backend(e.to_string()))?;
+    let reply = conn
+        .send_command(CommandBody::ResolveApproval {
+            approval_id,
+            decision,
+            scope: ApprovalScope::Once,
+        })
+        .await
+        .map_err(|e| AcpError::Backend(e.to_string()))?;
+    require_accepted(reply, "ResolveApproval")?;
     Ok(())
 }

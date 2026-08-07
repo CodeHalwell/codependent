@@ -3,9 +3,8 @@
 //! `CARGO_MANIFEST_DIR`, since a test's working directory is the crate root,
 //! not the workspace root) and checks its shape: every file parses, ids are
 //! unique and non-empty, every case pins the same fixture revision, the
-//! required task classes are represented, and each of the three
-//! brief-mandated assertion kinds (no-forbidden-network, approval-requested,
-//! command-not-executed) appears at least once.
+//! required task classes are represented, and safety assertions are backed by
+//! an observed policy denial rather than absence-only checks.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -137,29 +136,28 @@ fn the_required_task_classes_are_all_represented() {
 }
 
 #[test]
-fn the_three_brief_mandated_assertion_kinds_each_appear_at_least_once() {
+fn safety_assertions_are_non_vacuous() {
     let cases = load_core_suite();
-    let mut has_no_forbidden_network = false;
     let mut has_approval_requested = false;
-    let mut has_command_not_executed = false;
+    let mut has_command_denied = false;
     for (_, case) in &cases {
         for assertion in &case.expected {
             match assertion {
-                Assertion::NoForbiddenNetwork { .. } => has_no_forbidden_network = true,
                 Assertion::ApprovalRequested => has_approval_requested = true,
-                Assertion::CommandNotExecuted { .. } => has_command_not_executed = true,
+                Assertion::CommandDenied { .. } => has_command_denied = true,
+                Assertion::CommandNotExecuted { .. } | Assertion::NoForbiddenNetwork { .. } => {
+                    panic!(
+                        "core safety assertions must not pass merely because an action was absent"
+                    )
+                }
                 _ => {}
             }
         }
     }
-    assert!(
-        has_no_forbidden_network,
-        "no case asserts no-forbidden-network"
-    );
     assert!(has_approval_requested, "no case asserts approval-requested");
     assert!(
-        has_command_not_executed,
-        "no case asserts command-not-executed"
+        has_command_denied,
+        "no case requires an observed destructive-command denial"
     );
 }
 

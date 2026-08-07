@@ -29,7 +29,7 @@ use codypendent_daemon::documents::{
 };
 use codypendent_knowledge::{
     apply_mutation, ApplyError, CollaborationMode, DocStoreError, DocumentAuthor,
-    DocumentLeaseStore, DocumentStore, LeaseError,
+    DocumentLeaseStore, DocumentStore, LeaseError, SuggestionStore,
 };
 use codypendent_protocol::document::DocumentMutation;
 use codypendent_protocol::{ClientId, CodypendentError, DocumentId, DocumentLeaseGrant, UserId};
@@ -84,6 +84,20 @@ impl DocumentMutator for KnowledgeDocumentMutator {
                 .map_err(map_store_error)?
                 .ok_or_else(|| not_found(document_id))?;
             let mode = CollaborationMode::default_for_scope(&scope);
+
+            // Accepting a suggestion changes its annotated block's content, so
+            // resolve the durable suggestion and enforce that exact block lease.
+            // Rejecting only changes suggestion status and remains lease-free.
+            if let DocumentMutation::AcceptSuggestion { suggestion_id } = &mutation {
+                let suggestion = SuggestionStore::new()
+                    .get(&pool, document_id, suggestion_id)
+                    .await
+                    .map_err(map_store_error)?;
+                leases
+                    .require(&pool, document_id, Some(&suggestion.block_id), &author)
+                    .await
+                    .map_err(map_lease_error)?;
+            }
 
             // Enforce single-writer over the target range before applying.
             match lease_requirement(&mutation) {
@@ -185,13 +199,9 @@ enum LeaseRequirement<'a> {
     WholeDocument,
     /// A text edit or annotation is scoped to its target block.
     Block(&'a str),
-    /// No lease contention at all. Accepting/rejecting a suggestion is a
-    /// *resolution* action — a role decision over an already-annotated range,
-    /// protected by the suggestion store's own drift guards (revision match +
-    /// original-text match + atomic pending-claim) — not a fresh content
-    /// write. Mapping it to a whole-document requirement (the old behavior)
-    /// locked approvers out of the review rail whenever any writer held any
-    /// block lease.
+    /// No generic lease target. Rejecting changes only suggestion status;
+    /// accepting is resolved to its durable target block and checked separately
+    /// before this helper is called.
     None,
 }
 
@@ -426,7 +436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suggestion_resolution_needs_no_lease_while_a_writer_holds_a_block() {
+    async fn suggestion_resolution_requires_the_target_blocks_lease() {
         use codypendent_knowledge::docs::collab::SuggestionStore;
         use codypendent_protocol::document::SuggestionInput;
 
@@ -461,18 +471,28 @@ mod tests {
             .id
             .clone();
 
-        // Approver B holds no lease. Resolution is a role decision guarded by
-        // the suggestion store's own drift checks — the old whole-document
-        // lease mapping refused this with `document.range-leased` whenever any
-        // writer held any block, locking approvers out of the review rail.
+        // Approver B holds no lease. Accepting changes document content, so it
+        // must not race the writer currently editing that same block.
         let b = ClientId::new();
+        let error = mutator
+            .apply_mutation(DocumentMutationRequest {
+                document_id: doc,
+                mutation: DocumentMutation::AcceptSuggestion {
+                    suggestion_id: suggestion_id.clone(),
+                },
+                client_id: b,
+            })
+            .await
+            .expect_err("a non-holder must not mutate a leased target block");
+        assert_eq!(error.code, "document.range-leased");
+
         mutator
             .apply_mutation(DocumentMutationRequest {
                 document_id: doc,
                 mutation: DocumentMutation::AcceptSuggestion { suggestion_id },
-                client_id: b,
+                client_id: a,
             })
             .await
-            .expect("accepting a suggestion must not contend for the writer's lease");
+            .expect("the target-block lease holder may accept the suggestion");
     }
 }

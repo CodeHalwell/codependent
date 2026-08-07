@@ -182,6 +182,7 @@ impl Shell {
             }
         })?;
         let pid = child.id();
+        let mut group_guard = ProcessGroupGuard::new(pid);
 
         // Drain both pipes concurrently so a chatty child never blocks, capping
         // what is held in memory.
@@ -200,6 +201,10 @@ impl Shell {
                 (None, true)
             }
         };
+        // Even a normally-exited parent may leave descendants holding stdout or
+        // stderr open. End the whole group before awaiting the drain tasks.
+        kill_process_group_only(pid).await;
+        group_guard.disarm();
         let duration = started.elapsed();
 
         // After a group kill the pipes normally reach EOF at once — but a
@@ -208,16 +213,8 @@ impl Shell {
         // the drain so `execute` always returns; on that (double-failure) edge
         // the partial capture is abandoned — the stream comes back empty and
         // flagged overflowed, never a silent hang.
-        let (stdout_bytes, stdout_overflow) = if timed_out {
-            join_drain_bounded(out_task).await?
-        } else {
-            join_drain(out_task).await?
-        };
-        let (stderr_bytes, stderr_overflow) = if timed_out {
-            join_drain_bounded(err_task).await?
-        } else {
-            join_drain(err_task).await?
-        };
+        let (stdout_bytes, stdout_overflow) = join_drain_bounded(out_task).await?;
+        let (stderr_bytes, stderr_overflow) = join_drain_bounded(err_task).await?;
 
         // Spill full output and build the salient view referencing it.
         let stdout_ref = spill(sink, "text/plain", run_id, &stdout_bytes).await?;
@@ -260,11 +257,19 @@ fn is_denied_env(name: &str) -> bool {
             | "GIT_SSH"
             | "GIT_EXTERNAL_DIFF"
             | "GIT_PROXY_COMMAND"
+            | "GIT_DIR"
+            | "GIT_WORK_TREE"
+            | "GIT_EXEC_PATH"
+            | "GIT_OBJECT_DIRECTORY"
+            | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
             | "BASH_ENV"
             | "ENV"
             | "SHELLOPTS"
             | "CDPATH"
             | "NODE_OPTIONS"
+            | "JAVA_TOOL_OPTIONS"
+            | "JDK_JAVA_OPTIONS"
+            | "_JAVA_OPTIONS"
             | "PYTHONPATH"
             | "PYTHONSTARTUP"
             | "PYTHONHOME"
@@ -272,6 +277,11 @@ fn is_denied_env(name: &str) -> bool {
             | "PERL5LIB"
             | "RUBYOPT"
             | "RUBYLIB"
+            | "RUSTC"
+            | "RUSTDOC"
+            | "CARGO_HOME"
+            | "RUSTUP_HOME"
+            | "HOME"
     ) || upper.starts_with("LD_")
         || upper.starts_with("DYLD_")
         || upper.starts_with("GIT_CONFIG")
@@ -334,18 +344,6 @@ async fn drain(
     Ok((buf, overflowed))
 }
 
-/// Await a spawned drain task, flattening the join and I/O errors.
-async fn join_drain(
-    task: tokio::task::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
-) -> Result<(Vec<u8>, bool), ToolError> {
-    match task.await {
-        Ok(result) => result.map_err(ToolError::Io),
-        Err(join) => Err(ToolError::Other(anyhow::anyhow!(
-            "output reader task failed: {join}"
-        ))),
-    }
-}
-
 /// Grace period a drain task gets after the child was killed before it is
 /// abandoned (an escaped grandchild can hold the pipe open forever).
 const DRAIN_GRACE: Duration = Duration::from_secs(5);
@@ -376,25 +374,71 @@ async fn join_drain_bounded(
 /// `kill` with a negative pgid, then unconditionally SIGKILL and reap the direct
 /// child (which alone covers a single-process command such as `sleep`).
 async fn kill_group(pid: Option<u32>, child: &mut Child) {
+    kill_process_group_only(pid).await;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+async fn kill_process_group_only(pid: Option<u32>) {
     #[cfg(unix)]
     if let Some(pid) = pid {
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            // `--` is safety-critical here. procps `kill` can otherwise parse
-            // a negative pgid as an option and issue `kill(-1, SIGKILL)`, which
-            // terminates every process the current user may signal.
-            .arg("--")
-            .arg(format!("-{pid}"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
+        if let Some(kill) = fixed_kill_binary() {
+            let _ = Command::new(kill)
+                .arg("-KILL")
+                .arg("--")
+                .arg(format!("-{pid}"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
     }
     #[cfg(not(unix))]
     let _ = pid;
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+}
+
+#[cfg(unix)]
+fn fixed_kill_binary() -> Option<&'static str> {
+    ["/bin/kill", "/usr/bin/kill"]
+        .into_iter()
+        .find(|path| std::fs::metadata(path).is_ok_and(|meta| meta.is_file()))
+}
+
+/// Synchronous drop backstop. If cancellation drops `Shell::execute` while the
+/// child is live, kill the process group rather than relying on `kill_on_drop`,
+/// which targets only the direct child.
+struct ProcessGroupGuard {
+    pid: Option<u32>,
+    armed: bool,
+}
+
+impl ProcessGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.armed {
+            if let (Some(pid), Some(kill)) = (self.pid, fixed_kill_binary()) {
+                let _ = std::process::Command::new(kill)
+                    .arg("-KILL")
+                    .arg("--")
+                    .arg(format!("-{pid}"))
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    }
 }
 
 /// Resolve `program` to an absolute path, searching the daemon PATH for a bare
@@ -491,7 +535,7 @@ mod tests {
     /// deny-list, not a blanket refusal.
     #[test]
     fn allows_ordinary_variables() {
-        for name in ["CARGO_TERM_COLOR", "RUST_LOG", "HOME", "MY_APP_CONFIG"] {
+        for name in ["CARGO_TERM_COLOR", "RUST_LOG", "MY_APP_CONFIG"] {
             assert!(!is_denied_env(name), "{name} should be allowed");
         }
     }

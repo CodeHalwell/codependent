@@ -7,7 +7,7 @@
 //!           → historical task-class performance
 //!           → cost & latency estimate
 //!           → utility = predicted_success − λc·cost − λl·latency − λp·privacy − λf·failure
-//!           → select cheapest model above the quality threshold
+//!           → select the highest-utility model above the quality threshold
 //!           → (caller validates output)
 //!           → escalate on objective failure (preserving artifacts and task state)
 //! ```
@@ -55,8 +55,8 @@ impl TaskNode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SelectionReason {
-    /// The cheapest model whose predicted success clears the quality threshold.
-    CheapestAboveThreshold,
+    /// The highest-utility model whose predicted success clears the quality threshold.
+    HighestUtilityAboveThreshold,
     /// No eligible model cleared the threshold; the best-predicted eligible model
     /// was chosen as a best effort (the caller may escalate).
     BestEffortBelowThreshold,
@@ -141,8 +141,8 @@ impl<'a> Router<'a> {
     }
 
     /// Route a task node to a model. Applies the hard filters first, then selects
-    /// the cheapest model above the quality threshold (falling back to the best
-    /// eligible model if none clears it).
+    /// the highest-utility model above the quality threshold (falling back to the
+    /// highest-utility eligible model if none clears it).
     pub fn route(&self, node: &TaskNode) -> Result<RoutingDecision, RoutingError> {
         let eligible = self.eligible(node);
         if eligible.is_empty() {
@@ -160,12 +160,12 @@ impl<'a> Router<'a> {
             })
             .collect();
 
-        if let Some(chosen) = self.cheapest(&above, node) {
-            Ok(self.decide(chosen, node, SelectionReason::CheapestAboveThreshold))
+        if let Some(chosen) = self.best_utility(&above, node) {
+            Ok(self.decide(chosen, node, SelectionReason::HighestUtilityAboveThreshold))
         } else {
-            // None cleared the bar — best effort: the highest predicted success.
+            // None cleared the bar — best effort under the configured policy.
             let chosen = self
-                .best_predicted(&eligible, node)
+                .best_utility(&eligible, node)
                 .expect("eligible is non-empty");
             Ok(self.decide(chosen, node, SelectionReason::BestEffortBelowThreshold))
         }
@@ -314,6 +314,16 @@ impl<'a> Router<'a> {
         if !self.passes_classification(model, node) {
             return false;
         }
+        // A hosted zero price is the benchmark harness's "unmeasured" sentinel,
+        // not evidence that a paid endpoint is free. It cannot participate in a
+        // cost/utility decision until an operator supplies a real price. Local
+        // zero remains a valid, genuinely free measured price.
+        if !model.performance.cost_per_1k_tokens_usd.is_finite()
+            || model.performance.cost_per_1k_tokens_usd < 0.0
+            || (!model.is_local() && model.performance.cost_per_1k_tokens_usd == 0.0)
+        {
+            return false;
+        }
         // 2 + 3. Required capabilities, with the node's size *estimates* folded into
         //    the fit check, even when the caller left the explicit `min_*`
         //    requirements at their defaults. The context window must hold the whole
@@ -359,6 +369,27 @@ impl<'a> Router<'a> {
             let pb = b.performance.predicted_success(node.class());
             pa.partial_cmp(&pb)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.id.0.cmp(&a.id.0))
+        })
+    }
+
+    /// The candidate with the highest policy utility. Deterministic ties prefer
+    /// higher predicted success and then the lexicographically smaller id.
+    fn best_utility<'m>(
+        &self,
+        candidates: &[&'m ModelProfile],
+        node: &TaskNode,
+    ) -> Option<&'m ModelProfile> {
+        candidates.iter().copied().max_by(|a, b| {
+            self.utility(a, node)
+                .partial_cmp(&self.utility(b, node))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.performance
+                        .predicted_success(node.class())
+                        .partial_cmp(&b.performance.predicted_success(node.class()))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| b.id.0.cmp(&a.id.0))
         })
     }
@@ -430,7 +461,7 @@ impl<'a> Router<'a> {
                 node.data_classification
             );
         }
-        "no model satisfies the required capabilities or size".to_string()
+        "no model satisfies privacy, measured-price, capability, and size requirements".to_string()
     }
 }
 
@@ -521,9 +552,9 @@ mod tests {
     }
 
     #[test]
-    fn selects_cheapest_model_above_threshold() {
-        // Three hosted models all clear the 0.7 bar; the cheapest wins even though
-        // a pricier one is marginally more reliable.
+    fn selects_highest_utility_model_above_threshold() {
+        // Three hosted models clear the bar. Balanced quality/cost/latency
+        // weights choose the middle profile rather than hard-coding cheapest.
         let models = vec![
             model("cheap", ModelLocation::Hosted, 0.80, 0.002, 900.0, 200_000),
             model("mid", ModelLocation::Hosted, 0.88, 0.010, 700.0, 200_000),
@@ -532,8 +563,8 @@ mod tests {
         let policy = RoutingPolicy::balanced();
         let router = Router::new(&models, &policy);
         let d = router.route(&node(DataClassification::Internal)).unwrap();
-        assert_eq!(d.model, ModelId("cheap".into()));
-        assert_eq!(d.reason, SelectionReason::CheapestAboveThreshold);
+        assert_eq!(d.model, ModelId("mid".into()));
+        assert_eq!(d.reason, SelectionReason::HighestUtilityAboveThreshold);
         assert_eq!(d.policy_key, "router/balanced/1");
     }
 

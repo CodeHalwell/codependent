@@ -408,6 +408,11 @@ enum EvalCommand {
         /// resolution, unchanged.
         #[arg(long)]
         policy: Option<String>,
+        /// Bind this run's durable regression evidence to an existing promotion
+        /// candidate. Without this option the report is still written, but it
+        /// cannot advance any candidate's regression gate.
+        #[arg(long)]
+        candidate_id: Option<String>,
         /// Where to write the `SuiteReport` JSON.
         #[arg(long)]
         report: PathBuf,
@@ -449,21 +454,31 @@ enum PromoteCommand {
         #[arg(long)]
         requires_permission_review: bool,
     },
-    /// Advance a candidate through the offline-regression / shadow / canary
-    /// legs of the pipeline. `--regressed` supplies the caller's verdict for
-    /// the `regression`/`observe-canary` steps (default: no regression); this
-    /// command *records* a result, it does not compute one — see the report's
-    /// notes on what live shadow/canary traffic capture still needs.
+    /// Advance a candidate through permission review, stored regression
+    /// evidence, shadow traffic, and measured canary evidence. Regression
+    /// verdicts are computed from the latest durable eval report; canary
+    /// verdicts are derived by the daemon from the supplied raw metrics.
     Advance {
         /// The candidate id (as printed by `promote propose`).
         candidate_id: String,
         /// Which transition to attempt.
         #[arg(long, value_enum)]
         step: PromoteStepArg,
-        /// The regression/canary verdict for `regression`/`observe-canary`
-        /// (ignored by the other steps).
+        /// Number of requests represented by an `observe-canary` sample.
         #[arg(long)]
-        regressed: bool,
+        sample_count: Option<u64>,
+        /// Current canary error rate, in basis points (0..=10000).
+        #[arg(long)]
+        error_rate_bps: Option<u16>,
+        /// Baseline error rate, in basis points (0..=10000).
+        #[arg(long)]
+        baseline_error_rate_bps: Option<u16>,
+        /// Current canary p95 latency in milliseconds.
+        #[arg(long)]
+        p95_latency_ms: Option<u64>,
+        /// Baseline p95 latency in milliseconds.
+        #[arg(long)]
+        baseline_p95_latency_ms: Option<u64>,
     },
     /// **Approve and promote a candidate** (ADR-010: requires the `Controller`
     /// role, which this local-first socket maps to a human operator — an
@@ -476,6 +491,7 @@ enum PromoteCommand {
 /// `codypendent promote advance --step <STEP>`.
 #[derive(Clone, Copy, ValueEnum)]
 enum PromoteStepArg {
+    ReviewPermissions,
     Regression,
     Shadow,
     Canary,
@@ -484,18 +500,41 @@ enum PromoteStepArg {
 }
 
 impl PromoteStepArg {
-    /// Map this CLI-facing step (plus the `--regressed` verdict, which only
-    /// `Regression`/`ObserveCanary` consume) onto the wire [`PromotionAction`](
-    /// codypendent_protocol::PromotionAction).
-    fn into_wire(self, regressed: bool) -> codypendent_protocol::PromotionAction {
-        use codypendent_protocol::PromotionAction;
-        match self {
-            PromoteStepArg::Regression => PromotionAction::RunRegression { regressed },
+    fn into_wire(
+        self,
+        sample_count: Option<u64>,
+        error_rate_bps: Option<u16>,
+        baseline_error_rate_bps: Option<u16>,
+        p95_latency_ms: Option<u64>,
+        baseline_p95_latency_ms: Option<u64>,
+    ) -> anyhow::Result<codypendent_protocol::PromotionAction> {
+        use codypendent_protocol::{CanaryMetrics, PromotionAction};
+        Ok(match self {
+            PromoteStepArg::ReviewPermissions => PromotionAction::ReviewPermissions,
+            PromoteStepArg::Regression => PromotionAction::RunRegression,
             PromoteStepArg::Shadow => PromotionAction::StartShadow,
             PromoteStepArg::Canary => PromotionAction::StartCanary,
-            PromoteStepArg::ObserveCanary => PromotionAction::ObserveCanary { regressed },
+            PromoteStepArg::ObserveCanary => PromotionAction::ObserveCanary {
+                metrics: CanaryMetrics {
+                    sample_count: sample_count.ok_or_else(|| {
+                        anyhow::anyhow!("--sample-count is required for observe-canary")
+                    })?,
+                    error_rate_bps: error_rate_bps.ok_or_else(|| {
+                        anyhow::anyhow!("--error-rate-bps is required for observe-canary")
+                    })?,
+                    baseline_error_rate_bps: baseline_error_rate_bps.ok_or_else(|| {
+                        anyhow::anyhow!("--baseline-error-rate-bps is required for observe-canary")
+                    })?,
+                    p95_latency_ms: p95_latency_ms.ok_or_else(|| {
+                        anyhow::anyhow!("--p95-latency-ms is required for observe-canary")
+                    })?,
+                    baseline_p95_latency_ms: baseline_p95_latency_ms.ok_or_else(|| {
+                        anyhow::anyhow!("--baseline-p95-latency-ms is required for observe-canary")
+                    })?,
+                },
+            },
             PromoteStepArg::FinishCanary => PromotionAction::FinishCanary,
-        }
+        })
     }
 }
 
@@ -569,10 +608,8 @@ enum DaemonCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Stop the running daemon (if any) and start a fresh one, reusing the
-    /// exact `stop` and `start` paths. If no daemon is running this simply
-    /// starts one. Useful to pick up a newly installed build by hand — the
-    /// same primitive the auto-restart driver reuses on its idle path.
+    /// Restart only if the daemon confirms no session or workflow run is active.
+    /// If no daemon is running this simply starts one.
     Restart,
 }
 
@@ -724,8 +761,9 @@ async fn main() -> anyhow::Result<()> {
             EvalCommand::Run {
                 suite,
                 policy,
+                candidate_id,
                 report,
-            } => commands::eval_run(&paths, &suite, policy, &report).await,
+            } => commands::eval_run(&paths, &suite, policy, candidate_id.as_deref(), &report).await,
         },
         TopCommand::Models { command } => match command {
             ModelsCommand::Bench { id } => commands::models_bench(&paths, &id).await,
@@ -743,8 +781,21 @@ async fn main() -> anyhow::Result<()> {
             PromoteCommand::Advance {
                 candidate_id,
                 step,
-                regressed,
-            } => commands::promote_advance(&paths, candidate_id, step.into_wire(regressed)).await,
+                sample_count,
+                error_rate_bps,
+                baseline_error_rate_bps,
+                p95_latency_ms,
+                baseline_p95_latency_ms,
+            } => {
+                let action = step.into_wire(
+                    sample_count,
+                    error_rate_bps,
+                    baseline_error_rate_bps,
+                    p95_latency_ms,
+                    baseline_p95_latency_ms,
+                )?;
+                commands::promote_advance(&paths, candidate_id, action).await
+            }
             PromoteCommand::Approve { candidate_id } => {
                 commands::promote_approve(&paths, candidate_id).await
             }

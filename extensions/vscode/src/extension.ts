@@ -184,7 +184,7 @@ export function activate(context: vscode.ExtensionContext): void {
       output.appendLine(`server hello: daemon ${hello.daemon_version}, protocol ${hello.selected_protocol.major}.${hello.selected_protocol.minor}`);
     });
     nextClient.on("event", (event) => {
-      handleEvent(event, post, showDiff, true);
+      handleEvent(event, post, showDiff, true, nextClient);
     });
     // Render the events replayed on attach/reconnect so the transcript is not
     // blank after opening or reloading an existing session. Replay is
@@ -203,6 +203,17 @@ export function activate(context: vscode.ExtensionContext): void {
         post({ kind: "event", sequence: projection.last_sequence, label: "session", detail: projection.title });
         for (const runId of projection.active_runs ?? []) {
           post({ kind: "runState", runId, state: "Running" });
+        }
+        for (const approval of projection.pending_approvals ?? []) {
+          const summary = describeAction(approval.action);
+          const risk = describeRisk(approval.risk);
+          post({
+            kind: "approval",
+            approvalId: approval.approval_id,
+            summary,
+            risk,
+          });
+          void promptApproval(nextClient, approval.approval_id, summary, risk);
         }
       }
     });
@@ -357,6 +368,7 @@ function handleEvent(
   post: (message: TranscriptMessage) => void,
   showDiff: (t: string, l: string, r: string, left: string, right: string) => Promise<void>,
   interactive: boolean,
+  approvalClient?: DaemonClient,
 ): void {
   const body = event.body;
   switch (body.type) {
@@ -374,6 +386,14 @@ function handleEvent(
     case "ToolProposed":
       post({ kind: "event", sequence: event.sequence, label: "tool", detail: describeAction(body.action) });
       break;
+    case "ToolDenied":
+      post({
+        kind: "event",
+        sequence: event.sequence,
+        label: "tool denied",
+        detail: `${describeAction(body.action)}${body.reasons?.length ? ` — ${body.reasons.join("; ")}` : ""}`,
+      });
+      break;
     case "ApprovalRequested":
       post({
         kind: "approval",
@@ -381,8 +401,13 @@ function handleEvent(
         summary: describeAction(body.action),
         risk: describeRisk(body.risk),
       });
-      if (interactive) {
-        void promptApproval(body.approval_id, describeAction(body.action), describeRisk(body.risk));
+      if (interactive && approvalClient) {
+        void promptApproval(
+          approvalClient,
+          body.approval_id,
+          describeAction(body.action),
+          describeRisk(body.risk),
+        );
       }
       break;
     case "ApprovalResolved":
@@ -440,17 +465,28 @@ function handleEvent(
   }
 }
 
-async function promptApproval(approvalId: Uuid, summary: string, risk: string): Promise<void> {
+async function promptApproval(
+  originatingClient: DaemonClient,
+  approvalId: Uuid,
+  summary: string,
+  risk: string,
+): Promise<void> {
   const choice = await vscode.window.showInformationMessage(
     `Approval required: ${summary} (risk: ${risk})`,
     { modal: false },
     "Approve",
     "Reject",
   );
+  // A session switch can occur while the non-modal prompt is open. Never send
+  // its decision through the replacement client, where the same UUID would be
+  // attributed to the wrong attached session.
+  if (client !== originatingClient) {
+    return;
+  }
   if (choice === "Approve") {
-    client?.resolveApproval(approvalId, "Approve");
+    originatingClient.resolveApproval(approvalId, "Approve");
   } else if (choice === "Reject") {
-    client?.resolveApproval(approvalId, "Reject");
+    originatingClient.resolveApproval(approvalId, "Reject");
   }
 }
 
@@ -492,6 +528,12 @@ function describeAction(action: ProposedAction): string {
       return String(action.summary);
     case "McpToolCall":
       return `${String(action.summary)} args: ${String(action.args)}`;
+    case "PublishDocument": {
+      const files = Array.isArray(action.changed_files)
+        ? action.changed_files.map(String).join(", ")
+        : "";
+      return `publish document to ${String(action.target)}; files: ${files || "none"}; git: ${String(action.git_action)}`;
+    }
     case "RecordMemory":
       // Never actually reaches the client (always-Allow, never on the wire —
       // see the `ProposedAction` doc comment above); handled for completeness.

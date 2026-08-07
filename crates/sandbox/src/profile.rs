@@ -125,6 +125,23 @@ impl SandboxProfile {
 /// executor canonicalizes real paths first, this is the profile-level check.
 fn path_within(base: &str, candidate: &str) -> bool {
     let base = base.trim_end_matches('/');
+    // An empty/root grant is never a valid plugin capability. Keep this guard at
+    // the decision API as defense in depth even though manifest parsing rejects
+    // it, because profiles can also be constructed by tests/other callers.
+    if base.is_empty() || !base.starts_with('/') {
+        return false;
+    }
+    let candidate_path = std::path::Path::new(candidate);
+    if !candidate_path.is_absolute()
+        || candidate_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return false;
+    }
     if candidate == base {
         return true;
     }
@@ -238,5 +255,8 @@ maximum_output_mb = 20
         assert!(path_within("/a/b", "/a/b/c"));
         assert!(!path_within("/a/b", "/a/bc"));
         assert!(!path_within("/a/b", "/a"));
+        assert!(!path_within("/", "/etc/passwd"));
+        assert!(!path_within("", "/etc/passwd"));
+        assert!(!path_within("/a/b", "/a/b/../secret"));
     }
 }

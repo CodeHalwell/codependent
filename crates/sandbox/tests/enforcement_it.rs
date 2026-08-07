@@ -95,7 +95,7 @@ mod macos {
     }
 
     #[test]
-    fn a_non_allowlisted_host_is_unreachable_but_an_allowlisted_one_connects() {
+    fn a_non_allowlisted_host_is_unreachable_and_allowlists_fail_closed_without_a_broker() {
         let exec = MacosSandbox::new().expect("sandbox-exec available on macOS");
         let work = tempfile::tempdir().unwrap();
 
@@ -125,7 +125,6 @@ mod macos {
                     "plugin:test",
                 ),
             )
-            .unwrap()
         };
 
         // Empty network allowlist ⇒ all network denied ⇒ the connect fails.
@@ -135,27 +134,30 @@ mod macos {
             &[],
             30,
             false,
-        ));
+        ))
+        .unwrap();
         assert!(
             denied.denied(),
             "a non-allowlisted host must be unreachable: {}",
             denied.audit_summary()
         );
 
-        // The same command, same listener, but the host allowlisted ⇒ it connects.
-        // Proves the denial above is the sandbox, not the environment.
+        // Seatbelt cannot enforce a host:port allowlist by itself. A non-empty
+        // allowlist must therefore fail closed until a network broker is wired,
+        // rather than silently granting unrestricted outbound access.
         let host = format!("127.0.0.1:{port}");
-        let allowed = nc(&profile(
+        let error = nc(&profile(
             &[work.path().to_str().unwrap()],
             &[],
             &[host.as_str()],
             30,
             false,
-        ));
+        ))
+        .expect_err("a host allowlist without a broker must fail closed");
         assert!(
-            allowed.success(),
-            "an allowlisted host must be reachable: {}",
-            allowed.audit_summary()
+            matches!(error, SandboxError::UnsupportedCapability(ref message)
+                if message.contains("require a broker")),
+            "unexpected allowlist refusal: {error}"
         );
     }
 

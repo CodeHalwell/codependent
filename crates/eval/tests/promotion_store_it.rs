@@ -104,7 +104,10 @@ async fn a_candidate_round_trips_through_every_legal_stage() {
     );
 
     // A clean observation keeps the canary going.
-    let outcome = store.observe_canary(&pool, &id, false).await.unwrap();
+    let outcome = store
+        .observe_canary_samples(&pool, &id, false, codypendent_eval::MIN_CANARY_SAMPLES)
+        .await
+        .unwrap();
     assert_eq!(outcome, CanaryOutcome::Continuing);
 
     store.finish_canary(&pool, &id).await.unwrap();
@@ -174,7 +177,10 @@ async fn there_is_no_persisted_back_door_to_promoted() {
     store.run_regression(&pool, &id, false).await.unwrap();
     store.start_shadow(&pool, &id).await.unwrap();
     store.start_canary(&pool, &id).await.unwrap();
-    store.observe_canary(&pool, &id, false).await.unwrap();
+    store
+        .observe_canary_samples(&pool, &id, false, codypendent_eval::MIN_CANARY_SAMPLES)
+        .await
+        .unwrap();
     store.finish_canary(&pool, &id).await.unwrap();
 
     let err = store.approve(&pool, &id, &agent()).await.unwrap_err();
@@ -217,7 +223,10 @@ async fn a_canary_cannot_finish_unobserved() {
     let err = store.finish_canary(&pool, &id).await.unwrap_err();
     assert!(matches!(
         err,
-        PromotionStoreError::Promotion(PromotionError::CanaryUnobserved)
+        PromotionStoreError::Promotion(PromotionError::CanaryInsufficientEvidence {
+            observed: 0,
+            required: codypendent_eval::MIN_CANARY_SAMPLES,
+        })
     ));
     assert_eq!(
         store
@@ -384,7 +393,10 @@ async fn rollback_without_a_predecessor_leaves_the_active_version_in_place() {
     store.run_regression(&pool, &id, false).await.unwrap();
     store.start_shadow(&pool, &id).await.unwrap();
     store.start_canary(&pool, &id).await.unwrap();
-    store.observe_canary(&pool, &id, false).await.unwrap();
+    store
+        .observe_canary_samples(&pool, &id, false, codypendent_eval::MIN_CANARY_SAMPLES)
+        .await
+        .unwrap();
     store.finish_canary(&pool, &id).await.unwrap();
     store.approve(&pool, &id, &human()).await.unwrap();
 

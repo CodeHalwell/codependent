@@ -321,6 +321,17 @@ pub async fn upsert_file_graph(
     })
 }
 
+/// Parse a file graph without mutating persistence. Full-repository rebuilders
+/// use this preflight so one malformed file cannot trigger a destructive clear
+/// followed by a partial rebuild.
+pub fn validate_file_graph(
+    repository: RepositoryId,
+    path: &str,
+    source: &str,
+) -> Result<(), CodeGraphError> {
+    build_file_graph(repository, path, source).map(|_| ())
+}
+
 /// Read back every node for `repository`, oldest first.
 pub async fn nodes(
     pool: &SqlitePool,
@@ -1460,7 +1471,32 @@ fn is_test_attr(attr: &str) -> bool {
 /// Whether an attribute is `#[cfg(test)]` (a test-only module gate).
 fn is_cfg_test_attr(attr: &str) -> bool {
     let inner = attr_inner(attr);
-    inner.starts_with("cfg") && inner.contains("test")
+    let predicate = inner
+        .strip_prefix("cfg(")
+        .and_then(|value| value.strip_suffix(')'))
+        .or_else(|| {
+            inner
+                .strip_prefix("cfg_attr(")
+                .and_then(|value| value.split_once(',').map(|(predicate, _)| predicate))
+        });
+    predicate.is_some_and(cfg_predicate_requires_test)
+}
+
+fn cfg_predicate_requires_test(predicate: &str) -> bool {
+    let predicate: String = predicate.chars().filter(|c| !c.is_whitespace()).collect();
+    if predicate == "test" {
+        return true;
+    }
+    if predicate.starts_with("not(") {
+        return false;
+    }
+    (predicate.starts_with("any(") || predicate.starts_with("all("))
+        && predicate
+            .trim_start_matches("any(")
+            .trim_start_matches("all(")
+            .trim_end_matches(')')
+            .split(',')
+            .any(cfg_predicate_requires_test)
 }
 
 /// The text inside an attribute's brackets: `#[cfg(test)]` → `cfg(test)`.

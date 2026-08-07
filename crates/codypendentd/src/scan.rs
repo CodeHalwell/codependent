@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use codypendent_knowledge::{codegraph, GitRevision};
 use codypendent_protocol::RepositoryId;
 use sqlx::SqlitePool;
-use tracing::{info, warn};
+use tracing::info;
 
 /// The upper bound on files folded into the code graph in one scan. The scan is
 /// capped so a very large tree never delays the socket opening (startup) or a
@@ -29,16 +29,15 @@ pub const SCAN_FILE_CAP: usize = 2000;
 /// last scan (files deleted outright, which a per-file reparse never revisits)
 /// do not linger. The code graph is derived and regenerable, so wiping and
 /// rebuilding is safe.
-pub async fn scan_repository(pool: &SqlitePool, repository: RepositoryId, root: &Path) {
+pub async fn scan_repository(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    root: &Path,
+) -> anyhow::Result<()> {
     let Some(root) = discover_repository_root(root) else {
-        info!(root = %root.display(), "skipping code-graph scan outside a git repository");
-        return;
+        anyhow::bail!("cannot scan {}: not a git repository", root.display());
     };
     let revision = head_revision(&root);
-
-    if let Err(error) = codegraph::clear_repository(pool, repository).await {
-        warn!(%error, "could not clear the prior code graph before re-scan");
-    }
 
     // The walk is blocking std::fs work — off the async runtime so a large tree
     // does not stall this worker's other tasks.
@@ -46,7 +45,14 @@ pub async fn scan_repository(pool: &SqlitePool, repository: RepositoryId, root: 
     let files =
         tokio::task::spawn_blocking(move || collect_rust_sources(&walk_root, SCAN_FILE_CAP))
             .await
-            .unwrap_or_default();
+            .map_err(|error| anyhow::anyhow!("code-graph walker failed: {error}"))??;
+    for (relative, source) in &files {
+        codegraph::validate_file_graph(repository, relative, source)?;
+    }
+    // Destructive replacement begins only after the entire filesystem walk and
+    // parse preflight succeeded. Any later database failure is returned so the
+    // caller removes its in-process success marker and retries.
+    codegraph::clear_repository(pool, repository).await?;
     let mut scanned = 0usize;
     let mut nodes = 0usize;
     for (relative, source) in files {
@@ -55,9 +61,7 @@ pub async fn scan_repository(pool: &SqlitePool, repository: RepositoryId, root: 
                 scanned += 1;
                 nodes += delta.nodes.len();
             }
-            Err(error) => {
-                warn!(path = %relative, %error, "skipped a file that would not fold into the code graph");
-            }
+            Err(error) => return Err(error.into()),
         }
     }
     info!(
@@ -67,6 +71,7 @@ pub async fn scan_repository(pool: &SqlitePool, repository: RepositoryId, root: 
         nodes,
         "code-graph scan complete"
     );
+    Ok(())
 }
 
 /// Resolve `root` to the checkout's top-level directory. An ordinary directory
@@ -114,18 +119,15 @@ fn head_revision(root: &Path) -> GitRevision {
 /// skipped. The traversal is **sorted** (per-directory, names ascending) so the
 /// cap — if it ever bites — truncates the same files on every boot instead of
 /// rebuilding a different graph per `read_dir` ordering.
-fn collect_rust_sources(root: &Path, cap: usize) -> Vec<(String, String)> {
+fn collect_rust_sources(root: &Path, cap: usize) -> std::io::Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         if out.len() >= cap {
             break;
         }
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        let mut entries: Vec<_> = entries.flatten().collect();
+        let entries = std::fs::read_dir(&dir)?;
+        let mut entries: Vec<_> = entries.collect::<Result<_, _>>()?;
         entries.sort_by_key(|entry| entry.file_name());
         let mut subdirs = Vec::new();
         for entry in entries {
@@ -136,19 +138,14 @@ fn collect_rust_sources(root: &Path, cap: usize) -> Vec<(String, String)> {
             if name.starts_with('.') || name == "target" {
                 continue;
             }
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
+            let file_type = entry.file_type()?;
             if file_type.is_dir() {
                 subdirs.push(path);
             } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
                 if out.len() >= cap {
                     break;
                 }
-                let Ok(source) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
+                let source = std::fs::read_to_string(&path)?;
                 let relative = path
                     .strip_prefix(root)
                     .unwrap_or(&path)
@@ -162,7 +159,7 @@ fn collect_rust_sources(root: &Path, cap: usize) -> Vec<(String, String)> {
             stack.push(subdir);
         }
     }
-    out
+    Ok(out)
 }
 
 /// Canonicalize `root` (falling back to the path as-given) and derive the stable

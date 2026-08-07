@@ -1,26 +1,27 @@
-//! Replay-idempotency store for webhook deliveries.
+//! Atomic replay-idempotency store for webhook deliveries.
 //!
 //! GitHub retries deliveries; every delivery carries a unique
 //! `X-GitHub-Delivery` GUID. Recording that GUID *before* producing any internal
 //! event makes ingestion replay-safe: a redelivered payload (same GUID) is
-//! acknowledged but never normalized a second time. The GUID is the primary key
-//! of `webhook_deliveries`, so the `INSERT OR IGNORE` itself is the idempotency
-//! authority — a duplicate loses the insert (`rows_affected() == 0`).
+//! acknowledged but never normalized a second time. Ingestion also reserves a
+//! signed-content fingerprint to prevent a captured body being replayed under a
+//! forged GUID. Both keys are reserved together: a crash or store failure can
+//! never commit one and permanently burn the legitimate retry of the other.
 
 use std::collections::HashSet;
 
 use super::WebhookError;
 
-/// Records webhook delivery GUIDs and reports whether each is being seen for the
-/// first time.
+/// Atomically reserves a delivery GUID and signed-content fingerprint.
 #[async_trait::async_trait]
 pub trait DeliveryStore: Send + Sync {
-    /// Record `delivery_id`, returning `true` if this is the first time it has
-    /// been seen and `false` if it was already recorded (a replay).
-    async fn record_if_new(
+    /// Reserve both replay keys, returning `true` only when neither has been
+    /// seen. Implementations must insert both or neither.
+    async fn reserve_if_new(
         &self,
         delivery_id: &str,
         event_type: &str,
+        content_fingerprint: &str,
     ) -> Result<bool, WebhookError>;
 }
 
@@ -39,21 +40,40 @@ impl SqliteDeliveryStore {
 
 #[async_trait::async_trait]
 impl DeliveryStore for SqliteDeliveryStore {
-    async fn record_if_new(
+    async fn reserve_if_new(
         &self,
         delivery_id: &str,
         event_type: &str,
+        content_fingerprint: &str,
     ) -> Result<bool, WebhookError> {
-        let result = sqlx::query(
-            "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, event_type, received_at) \
-             VALUES (?, ?, ?)",
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM webhook_deliveries \
+             WHERE delivery_id = ? OR delivery_id = ?)",
+        )
+        .bind(delivery_id)
+        .bind(content_fingerprint)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (delivery_id, event_type, received_at) \
+             VALUES (?, ?, ?), (?, 'signed-content', ?)",
         )
         .bind(delivery_id)
         .bind(event_type)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .bind(&now)
+        .bind(content_fingerprint)
+        .bind(&now)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        tx.commit().await?;
+        Ok(true)
     }
 }
 
@@ -66,13 +86,19 @@ pub struct InMemoryDeliveryStore {
 
 #[async_trait::async_trait]
 impl DeliveryStore for InMemoryDeliveryStore {
-    async fn record_if_new(
+    async fn reserve_if_new(
         &self,
         delivery_id: &str,
         _event_type: &str,
+        content_fingerprint: &str,
     ) -> Result<bool, WebhookError> {
         let mut seen = self.seen.lock().await;
-        Ok(seen.insert(delivery_id.to_string()))
+        if seen.contains(delivery_id) || seen.contains(content_fingerprint) {
+            return Ok(false);
+        }
+        seen.insert(delivery_id.to_string());
+        seen.insert(content_fingerprint.to_string());
+        Ok(true)
     }
 }
 
@@ -81,10 +107,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn in_memory_dedups_by_delivery_id() {
+    async fn in_memory_reservation_is_atomic_and_dedups_both_keys() {
         let store = InMemoryDeliveryStore::default();
-        assert!(store.record_if_new("guid-1", "push").await.unwrap());
-        assert!(!store.record_if_new("guid-1", "push").await.unwrap());
-        assert!(store.record_if_new("guid-2", "push").await.unwrap());
+        assert!(store
+            .reserve_if_new("guid-1", "push", "body-1")
+            .await
+            .unwrap());
+        assert!(!store
+            .reserve_if_new("guid-2", "push", "body-1")
+            .await
+            .unwrap());
+        assert!(store
+            .reserve_if_new("guid-2", "push", "body-2")
+            .await
+            .unwrap());
     }
 }

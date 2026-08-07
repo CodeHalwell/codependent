@@ -89,19 +89,28 @@ fn envelope_for(client_id: ClientId, session_id: SessionId, event: SessionEvent)
 /// Replay an attach-time `Catchup` as JSONL lines. `Catchup::Events` replays
 /// each missed `SessionEvent` in order; `Catchup::Snapshot` (the client was
 /// too far behind — Chapter 03's >500-events rule) carries a projection, not
-/// individual events, so it produces no JSONL lines — the caller's live
-/// stream simply continues from `through`. A future `Catchup::Unknown`
-/// variant is likewise skipped rather than failing the whole attach (RULE 1).
+/// individual events, so it emits the snapshot envelope itself as one JSONL
+/// line. This preserves actionable projection state such as pending approvals
+/// for headless consumers. A future `Catchup::Unknown` variant is skipped.
 pub fn replay_catchup<W: Write>(
     out: &mut W,
     client_id: ClientId,
     session_id: SessionId,
     catchup: Catchup,
 ) -> anyhow::Result<()> {
-    if let Catchup::Events { events, .. } = catchup {
-        for event in events {
-            write_line(out, &envelope_for(client_id, session_id, event))?;
+    match catchup {
+        Catchup::Events { events, .. } => {
+            for event in events {
+                write_line(out, &envelope_for(client_id, session_id, event))?;
+            }
         }
+        snapshot @ Catchup::Snapshot { through, .. } => {
+            let mut envelope = Envelope::request(client_id, Payload::Catchup { catchup: snapshot });
+            envelope.session_id = Some(session_id);
+            envelope.sequence = Some(through);
+            write_line(out, &envelope)?;
+        }
+        _ => {}
     }
     Ok(())
 }

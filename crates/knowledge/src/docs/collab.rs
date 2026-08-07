@@ -388,7 +388,7 @@ impl SuggestionStore {
     }
 
     /// Fetch a suggestion by id, scoped to its document.
-    async fn get(
+    pub async fn get(
         &self,
         pool: &SqlitePool,
         document_id: DocumentId,

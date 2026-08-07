@@ -41,6 +41,7 @@ mod read_file;
 mod repository;
 mod salient;
 mod search;
+mod secure_fs;
 mod shell;
 mod web_search;
 mod write_file;

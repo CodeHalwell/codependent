@@ -29,15 +29,22 @@ pub fn body_with_marker(body: &str, key: &str) -> String {
 
 /// Extract the idempotency key from a body that carries the marker, if any.
 pub fn extract_key(body: &str) -> Option<String> {
-    let start = body.find(MARKER_PREFIX)? + MARKER_PREFIX.len();
-    let rest = &body[start..];
-    let end = rest.find(MARKER_SUFFIX)?;
-    Some(rest[..end].trim().to_string())
+    extract_keys(body).last()
 }
 
 /// Whether `body` carries the marker for exactly `key`.
 pub fn body_matches_key(body: &str, key: &str) -> bool {
-    extract_key(body).as_deref() == Some(key)
+    extract_keys(body).any(|candidate| candidate == key)
+}
+
+/// Iterate every syntactically valid marker. Scanning the complete body avoids
+/// an earlier quoted/example marker hiding the real trailing marker we wrote.
+fn extract_keys(body: &str) -> impl Iterator<Item = String> + '_ {
+    body.match_indices(MARKER_PREFIX).filter_map(|(start, _)| {
+        let rest = &body[start + MARKER_PREFIX.len()..];
+        let end = rest.find(MARKER_SUFFIX)?;
+        Some(rest[..end].trim().to_string())
+    })
 }
 
 #[cfg(test)]
@@ -71,5 +78,12 @@ mod tests {
         assert!(!body_matches_key(&body, "key-two"));
         assert_eq!(extract_key("no marker here"), None);
         assert!(!body_matches_key("no marker here", "key-one"));
+    }
+
+    #[test]
+    fn an_earlier_quoted_marker_cannot_hide_the_real_one() {
+        let body = format!("example: {}\n{}", marker("quoted"), marker("real"));
+        assert!(body_matches_key(&body, "real"));
+        assert_eq!(extract_key(&body).as_deref(), Some("real"));
     }
 }

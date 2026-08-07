@@ -40,7 +40,7 @@ evals/
 
 ## The core suite (`evals/tasks/core/`)
 
-11 cases (this task's brief asked for a real, runnable 8–12; the full 50–100
+12 cases (this task's brief asked for a real, runnable 8–12; the full 50–100
 the roadmap eventually wants is a separate, later content-authoring effort —
 see below). Every case runs against the **same single pinned commit**
 (`8e7644ddbbe0dd04052b47f0e2bfefd45b535ee6`) of the vendored
@@ -57,9 +57,12 @@ Task classes covered (the six the brief named): failing-test-diagnosis
 doc-update (`004`, `011`), ci-diagnosis (`005`), safe-refactor (`006`, `008`,
 `010`). Also covered: an architecture-explanation-style read-only case
 (`007`) and a PR-feedback-response case (`009`) from the broader Chapter 16
-list. The three assertion kinds this task's brief specifically required at
-least one of each: `no-forbidden-network` (`001`, `006`, `007`),
-`approval-requested` (`001`, `008`), `command-not-executed` (every case).
+list. Approval behavior is exercised by `001` and `008`. Case `012` is an
+explicit policy-boundary test: it asks for a destructive command and requires
+an observed `command-denied` event. Absence-only `command-not-executed` and
+`no-forbidden-network` checks were removed from the core corpus because they
+passed vacuously when the default policy prevented those capabilities from
+being attempted.
 
 **A whole-suite caveat, by design:** `RunObservation::tests_passed` is a
 single pass/fail for the *entire* fixture's `cargo test` run, not per-test
@@ -76,10 +79,11 @@ multi-fixture-revision suite (see below) removes this constraint.
 `RunObservation` two ways:
 
 1. **From the run's own event stream** — `approval_requested`,
-   `executed_commands`, `network_hosts`, `cost_usd` come from
-   `ApprovalRequested`/`ApprovalResolved`/`BudgetWarning` events as the run
-   streams by. Only an **approved** action counts as executed/contacted; a
-   rejected proposal never ran. An action that somehow executes *without*
+   `executed_commands`, `network_hosts`, policy-denied commands/destinations,
+   and `cost_usd` come from `ApprovalRequested`/`ApprovalResolved`/
+   `ToolDenied`/`BudgetWarning` events as the run streams by. Only an
+   **approved** action counts as executed/contacted, while `ToolDenied` retains
+   the typed action that was explicitly blocked. An action that somehow executes *without*
    going through the approval flow is invisible to this — every
    allow-listed shell command in this codebase's default policy requires
    approval (`crates/daemon/src/policy/mod.rs`), so this is a narrow,
@@ -149,7 +153,7 @@ daemon start` and a configured `models.toml`.
 
 ## Deferred (named, not faked)
 
-- **The full 50–100 case corpus.** This task ships a real, runnable 11-case
+- **The full 50–100 case corpus.** This task ships a real, runnable 12-case
   core suite per its brief's explicit scope; growing it further is a
   separate, large content-authoring effort (see above).
 - **Citation checking.** `correct_citations` has no wire signal; wiring one

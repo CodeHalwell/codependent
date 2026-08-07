@@ -19,9 +19,9 @@ use codypendent_daemon::promotion::{
     PromotionProposeFuture, ProposePromotionRequest, RollbackPromotionRequest,
 };
 use codypendent_eval::{
-    ArtifactKind, ArtifactVersion, CanaryOutcome, PromotionStore, PromotionStoreError,
+    ArtifactKind, ArtifactVersion, CanaryOutcome, PromotionStore, PromotionStoreError, SuiteReport,
 };
-use codypendent_protocol::{Actor, CodypendentError, PromotionAction};
+use codypendent_protocol::{Actor, CanaryMetrics, CodypendentError, PromotionAction};
 use sqlx::SqlitePool;
 
 /// Drives the promotion pipeline over the daemon's pool. Cheap to clone (a
@@ -72,7 +72,7 @@ impl PromotionGateway for PromotionStoreGateway {
                     &request.idempotency_key,
                     artifact,
                     &author,
-                    request.requires_permission_review,
+                    request.requires_permission_review || kind == ArtifactKind::Skill,
                 )
                 .await
                 .map_err(store_error_to_protocol)
@@ -83,9 +83,80 @@ impl PromotionGateway for PromotionStoreGateway {
         let host = self.clone();
         Box::pin(async move {
             match request.action {
-                PromotionAction::RunRegression { regressed } => host
+                PromotionAction::RunRegression => {
+                    let row: Option<(String, String)> = sqlx::query_as(
+                        "SELECT report.id, report.report_json \
+                         FROM eval_suite_reports AS report \
+                         JOIN promotion_candidates AS candidate \
+                           ON candidate.id = report.candidate_id \
+                         WHERE report.candidate_id = ? \
+                           AND report.suite = 'core' \
+                           AND report.artifact_kind = candidate.artifact_kind \
+                           AND report.artifact_name = candidate.artifact_name \
+                           AND report.artifact_version = candidate.artifact_version \
+                           AND (candidate.artifact_kind != 'router' \
+                                OR report.routing_policy = candidate.artifact_name) \
+                         ORDER BY report.created_at DESC, report.id DESC LIMIT 1",
+                    )
+                    .bind(&request.candidate_id)
+                    .fetch_optional(&host.pool)
+                    .await
+                    .map_err(|error| {
+                        CodypendentError::new("promotion.store-error", error.to_string(), true)
+                    })?;
+                    let Some((report_id, report_json)) = row else {
+                        return Err(CodypendentError::new(
+                            "promotion.regression-evidence-missing",
+                            format!(
+                                "run `codypendent eval run --suite core --candidate-id {}` \
+                                 against this candidate before advancing regression",
+                                request.candidate_id
+                            ),
+                            false,
+                        ));
+                    };
+                    let report: SuiteReport =
+                        serde_json::from_str(&report_json).map_err(|error| {
+                            CodypendentError::new("promotion.corrupt", error.to_string(), false)
+                        })?;
+                    if report.results.is_empty() {
+                        return Err(CodypendentError::new(
+                            "promotion.regression-evidence-empty",
+                            "an empty eval suite is not regression evidence".to_string(),
+                            false,
+                        ));
+                    }
+                    let failures = report
+                        .results
+                        .iter()
+                        .filter(|result| !result.passed())
+                        .map(|result| result.case_id.clone())
+                        .collect::<Vec<_>>();
+                    let regressed = !failures.is_empty();
+                    sqlx::query(
+                        "INSERT OR REPLACE INTO promotion_regression_evidence \
+                         (candidate_id, report_id, regressed, failures_json, evaluated_at) \
+                         VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                    )
+                    .bind(&request.candidate_id)
+                    .bind(report_id)
+                    .bind(if regressed { 1_i64 } else { 0_i64 })
+                    .bind(serde_json::to_string(&failures).map_err(|error| {
+                        CodypendentError::new("promotion.store-error", error.to_string(), true)
+                    })?)
+                    .execute(&host.pool)
+                    .await
+                    .map_err(|error| {
+                        CodypendentError::new("promotion.store-error", error.to_string(), true)
+                    })?;
+                    host.store
+                        .run_regression(&host.pool, &request.candidate_id, regressed)
+                        .await
+                        .map_err(store_error_to_protocol)
+                }
+                PromotionAction::ReviewPermissions => host
                     .store
-                    .run_regression(&host.pool, &request.candidate_id, regressed)
+                    .mark_permission_reviewed(&host.pool, &request.candidate_id)
                     .await
                     .map_err(store_error_to_protocol),
                 PromotionAction::StartShadow => host
@@ -98,21 +169,52 @@ impl PromotionGateway for PromotionStoreGateway {
                     .start_canary(&host.pool, &request.candidate_id)
                     .await
                     .map_err(store_error_to_protocol),
-                PromotionAction::ObserveCanary { regressed } => host
-                    .store
-                    .observe_canary(&host.pool, &request.candidate_id, regressed)
+                PromotionAction::ObserveCanary { metrics } => {
+                    validate_canary_metrics(&metrics)?;
+                    let regressed = canary_regressed(&metrics);
+                    sqlx::query(
+                        "INSERT INTO promotion_canary_evidence \
+                         (id, candidate_id, metrics_json, sample_count, regressed, observed_at) \
+                         VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                    )
+                    .bind(uuid::Uuid::now_v7().to_string())
+                    .bind(&request.candidate_id)
+                    .bind(serde_json::to_string(&metrics).map_err(|error| {
+                        CodypendentError::new("promotion.store-error", error.to_string(), true)
+                    })?)
+                    .bind(i64::try_from(metrics.sample_count).map_err(|_| {
+                        CodypendentError::new(
+                            "promotion.invalid-canary-evidence",
+                            "sample_count is too large".to_string(),
+                            false,
+                        )
+                    })?)
+                    .bind(if regressed { 1_i64 } else { 0_i64 })
+                    .execute(&host.pool)
                     .await
-                    .map(|outcome| {
-                        // The auto-rollback record is already persisted (with
-                        // its own audit row) by the store; the command reply
-                        // only needs to signal success, so the outcome itself
-                        // is not surfaced further here (a `PromotionProposed`-
-                        // style reply carrying it is a natural follow-up if a
-                        // client ever needs to react to an auto-rollback
-                        // synchronously — see the report's deferred-items list).
-                        let _: CanaryOutcome = outcome;
-                    })
-                    .map_err(store_error_to_protocol),
+                    .map_err(|error| {
+                        CodypendentError::new("promotion.store-error", error.to_string(), true)
+                    })?;
+                    host.store
+                        .observe_canary_samples(
+                            &host.pool,
+                            &request.candidate_id,
+                            regressed,
+                            metrics.sample_count,
+                        )
+                        .await
+                        .map(|outcome| {
+                            // The auto-rollback record is already persisted (with
+                            // its own audit row) by the store; the command reply
+                            // only needs to signal success, so the outcome itself
+                            // is not surfaced further here (a `PromotionProposed`-
+                            // style reply carrying it is a natural follow-up if a
+                            // client ever needs to react to an auto-rollback
+                            // synchronously — see the report's deferred-items list).
+                            let _: CanaryOutcome = outcome;
+                        })
+                        .map_err(store_error_to_protocol)
+                }
                 PromotionAction::FinishCanary => host
                     .store
                     .finish_canary(&host.pool, &request.candidate_id)
@@ -153,6 +255,30 @@ impl PromotionGateway for PromotionStoreGateway {
     }
 }
 
+fn validate_canary_metrics(metrics: &CanaryMetrics) -> Result<(), CodypendentError> {
+    if metrics.sample_count == 0
+        || metrics.error_rate_bps > 10_000
+        || metrics.baseline_error_rate_bps > 10_000
+        || metrics.baseline_p95_latency_ms == 0
+    {
+        return Err(CodypendentError::new(
+            "promotion.invalid-canary-evidence",
+            "canary evidence requires samples, rates in 0..=10000, and a nonzero baseline latency"
+                .to_string(),
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn canary_regressed(metrics: &CanaryMetrics) -> bool {
+    let error_regressed =
+        metrics.error_rate_bps > metrics.baseline_error_rate_bps.saturating_add(100);
+    let latency_regressed = u128::from(metrics.p95_latency_ms) * 100
+        > u128::from(metrics.baseline_p95_latency_ms) * 120;
+    error_regressed || latency_regressed
+}
+
 /// Map a [`PromotionStoreError`] to the wire [`CodypendentError`] a client
 /// branches on by code. A store/database hiccup is retryable; every semantic
 /// rejection (unknown candidate, illegal transition, non-human approver,
@@ -181,7 +307,9 @@ fn promotion_error_code(error: &codypendent_eval::PromotionError) -> &'static st
         PromotionError::IllegalTransition { .. } => "promotion.illegal-transition",
         PromotionError::PermissionReviewRequired => "promotion.permission-review-required",
         PromotionError::NotPromoted { .. } => "promotion.not-promoted",
-        PromotionError::CanaryUnobserved => "promotion.canary-unobserved",
+        PromotionError::CanaryInsufficientEvidence { .. } => {
+            "promotion.canary-insufficient-evidence"
+        }
     }
 }
 
@@ -192,7 +320,7 @@ mod tests {
         AdvancePromotionRequest, ApprovePromotionRequest, ProposePromotionRequest,
         RollbackPromotionRequest,
     };
-    use codypendent_eval::PromotionStage;
+    use codypendent_eval::{AssertionResult, CaseResult, PromotionStage};
     use codypendent_protocol::ids::{AgentId, ModelId, RunId, UserId};
     use codypendent_protocol::ClientId;
 
@@ -202,6 +330,69 @@ mod tests {
             .await
             .unwrap();
         (tmp, pool)
+    }
+
+    fn passing_report() -> SuiteReport {
+        SuiteReport::new(vec![CaseResult {
+            case_id: "stored-regression-case".to_string(),
+            assertion_results: Vec::new(),
+            within_cost: true,
+            within_duration: true,
+        }])
+    }
+
+    async fn bind_report(
+        pool: &SqlitePool,
+        candidate_id: &str,
+        report_id: &str,
+        report: &SuiteReport,
+    ) {
+        let (kind, name, version): (String, String, i64) = sqlx::query_as(
+            "SELECT artifact_kind, artifact_name, artifact_version \
+             FROM promotion_candidates WHERE id = ?",
+        )
+        .bind(candidate_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let routing_policy = if kind == "router" {
+            name.clone()
+        } else {
+            "daemon-default".to_string()
+        };
+        sqlx::query(
+            "INSERT INTO eval_suite_reports \
+             (id, candidate_id, artifact_kind, artifact_name, artifact_version, suite, \
+              routing_policy, report_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, 'core', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(report_id)
+        .bind(candidate_id)
+        .bind(kind)
+        .bind(name)
+        .bind(version)
+        .bind(routing_policy)
+        .bind(serde_json::to_string(report).unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn passing_canary_metrics() -> CanaryMetrics {
+        CanaryMetrics {
+            sample_count: codypendent_eval::MIN_CANARY_SAMPLES,
+            error_rate_bps: 100,
+            baseline_error_rate_bps: 100,
+            p95_latency_ms: 100,
+            baseline_p95_latency_ms: 100,
+        }
+    }
+
+    fn regressing_canary_metrics() -> CanaryMetrics {
+        CanaryMetrics {
+            error_rate_bps: 201,
+            ..passing_canary_metrics()
+        }
     }
 
     fn human_client_id() -> ClientId {
@@ -244,12 +435,15 @@ mod tests {
             })
             .await
             .expect("propose accepted");
+        bind_report(&pool, &candidate_id, "report-promote", &passing_report()).await;
 
         for action in [
-            PromotionAction::RunRegression { regressed: false },
+            PromotionAction::RunRegression,
             PromotionAction::StartShadow,
             PromotionAction::StartCanary,
-            PromotionAction::ObserveCanary { regressed: false },
+            PromotionAction::ObserveCanary {
+                metrics: passing_canary_metrics(),
+            },
             PromotionAction::FinishCanary,
         ] {
             gateway
@@ -288,6 +482,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regression_requires_durable_evidence_and_persists_a_rejection() {
+        let (_tmp, pool) = temp_pool().await;
+        let gateway = PromotionStoreGateway::new(pool.clone());
+        let client_id = human_client_id();
+        let candidate_id = gateway
+            .propose(ProposePromotionRequest {
+                kind: "router".to_string(),
+                name: "evidence-gate".to_string(),
+                version: 1,
+                requires_permission_review: false,
+                idempotency_key: "evidence-gate".to_string(),
+                client_id,
+            })
+            .await
+            .unwrap();
+        let unrelated_id = gateway
+            .propose(ProposePromotionRequest {
+                kind: "prompt".to_string(),
+                name: "unrelated-passing-eval".to_string(),
+                version: 1,
+                requires_permission_review: false,
+                idempotency_key: "unrelated-passing-eval".to_string(),
+                client_id,
+            })
+            .await
+            .unwrap();
+        bind_report(
+            &pool,
+            &unrelated_id,
+            "unrelated-passing-report",
+            &passing_report(),
+        )
+        .await;
+        let missing = gateway
+            .advance(AdvancePromotionRequest {
+                candidate_id: candidate_id.clone(),
+                action: PromotionAction::RunRegression,
+                client_id,
+            })
+            .await
+            .expect_err("another candidate's passing report is not evidence for this candidate");
+        assert_eq!(missing.code, "promotion.regression-evidence-missing");
+
+        let report = SuiteReport::new(vec![CaseResult {
+            case_id: "regressed-case".to_string(),
+            assertion_results: vec![AssertionResult {
+                label: "tests-pass".to_string(),
+                passed: false,
+            }],
+            within_cost: true,
+            within_duration: true,
+        }]);
+        bind_report(&pool, &candidate_id, "failed-report", &report).await;
+        let rejected = gateway
+            .advance(AdvancePromotionRequest {
+                candidate_id: candidate_id.clone(),
+                action: PromotionAction::RunRegression,
+                client_id,
+            })
+            .await
+            .expect_err("failing stored evidence rejects the candidate");
+        assert_eq!(rejected.code, "promotion.regressed-offline");
+        let snapshot = PromotionStore::new()
+            .get(&pool, &candidate_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.candidate.stage(), PromotionStage::Rejected);
+    }
+
+    #[tokio::test]
     async fn an_agent_actor_handed_to_approve_is_refused_even_by_the_real_gateway() {
         // The gateway performs NO actor gating itself (see the module doc — it
         // must not re-implement or loosen the rule); this proves the guard it
@@ -311,11 +576,33 @@ mod tests {
             })
             .await
             .unwrap();
+        bind_report(
+            &pool,
+            &candidate_id,
+            "report-agent-approval",
+            &passing_report(),
+        )
+        .await;
+        let permission_error = gateway
+            .advance(AdvancePromotionRequest {
+                candidate_id: candidate_id.clone(),
+                action: PromotionAction::RunRegression,
+                client_id,
+            })
+            .await
+            .expect_err("skills require review even when the proposer omitted the flag");
+        assert_eq!(
+            permission_error.code,
+            "promotion.permission-review-required"
+        );
         for action in [
-            PromotionAction::RunRegression { regressed: false },
+            PromotionAction::ReviewPermissions,
+            PromotionAction::RunRegression,
             PromotionAction::StartShadow,
             PromotionAction::StartCanary,
-            PromotionAction::ObserveCanary { regressed: false },
+            PromotionAction::ObserveCanary {
+                metrics: passing_canary_metrics(),
+            },
             PromotionAction::FinishCanary,
         ] {
             gateway
@@ -349,7 +636,7 @@ mod tests {
     #[tokio::test]
     async fn finishing_an_unobserved_canary_is_rejected_with_the_right_code() {
         let (_tmp, pool) = temp_pool().await;
-        let gateway = PromotionStoreGateway::new(pool);
+        let gateway = PromotionStoreGateway::new(pool.clone());
         let client_id = human_client_id();
         let candidate_id = gateway
             .propose(ProposePromotionRequest {
@@ -362,8 +649,9 @@ mod tests {
             })
             .await
             .unwrap();
+        bind_report(&pool, &candidate_id, "report-unobserved", &passing_report()).await;
         for action in [
-            PromotionAction::RunRegression { regressed: false },
+            PromotionAction::RunRegression,
             PromotionAction::StartShadow,
             PromotionAction::StartCanary,
         ] {
@@ -385,7 +673,30 @@ mod tests {
             })
             .await
             .expect_err("zero observations must not finish the canary");
-        assert_eq!(error.code, "promotion.canary-unobserved");
+        assert_eq!(error.code, "promotion.canary-insufficient-evidence");
+
+        gateway
+            .advance(AdvancePromotionRequest {
+                candidate_id: candidate_id.clone(),
+                action: PromotionAction::ObserveCanary {
+                    metrics: CanaryMetrics {
+                        sample_count: 1,
+                        ..passing_canary_metrics()
+                    },
+                },
+                client_id,
+            })
+            .await
+            .unwrap();
+        let too_small = gateway
+            .advance(AdvancePromotionRequest {
+                candidate_id,
+                action: PromotionAction::FinishCanary,
+                client_id,
+            })
+            .await
+            .expect_err("one favorable sample is not canary evidence");
+        assert_eq!(too_small.code, "promotion.canary-insufficient-evidence");
     }
 
     #[tokio::test]
@@ -404,8 +715,15 @@ mod tests {
             })
             .await
             .unwrap();
+        bind_report(
+            &pool,
+            &candidate_id,
+            "report-auto-rollback",
+            &passing_report(),
+        )
+        .await;
         for action in [
-            PromotionAction::RunRegression { regressed: false },
+            PromotionAction::RunRegression,
             PromotionAction::StartShadow,
             PromotionAction::StartCanary,
         ] {
@@ -424,7 +742,9 @@ mod tests {
         gateway
             .advance(AdvancePromotionRequest {
                 candidate_id: candidate_id.clone(),
-                action: PromotionAction::ObserveCanary { regressed: true },
+                action: PromotionAction::ObserveCanary {
+                    metrics: regressing_canary_metrics(),
+                },
                 client_id,
             })
             .await
@@ -449,11 +769,20 @@ mod tests {
             })
             .await
             .unwrap();
+        bind_report(
+            &pool,
+            &promoted_id,
+            "report-manual-rollback",
+            &passing_report(),
+        )
+        .await;
         for action in [
-            PromotionAction::RunRegression { regressed: false },
+            PromotionAction::RunRegression,
             PromotionAction::StartShadow,
             PromotionAction::StartCanary,
-            PromotionAction::ObserveCanary { regressed: false },
+            PromotionAction::ObserveCanary {
+                metrics: passing_canary_metrics(),
+            },
             PromotionAction::FinishCanary,
         ] {
             gateway

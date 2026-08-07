@@ -491,7 +491,7 @@ async fn suggest_mode_annotate_then_accept_is_byte_exact() {
         "lease-a",
     )
     .await;
-    let _lease_a = recv_lease_reply(&mut a).await.expect("A leases the block");
+    let lease_a = recv_lease_reply(&mut a).await.expect("A leases the block");
 
     send(
         &mut a,
@@ -512,8 +512,30 @@ async fn suggest_mode_annotate_then_accept_is_byte_exact() {
     );
     assert_eq!(blocks_text(&replica_b), "draft");
 
-    // The approver (B, a Controller) accepts it — no lease needed for a resolution.
+    // Accepting changes content, so A releases its edit lease and the approver
+    // B acquires the target block before resolving the suggestion.
     let suggestion_id = wait_for_suggestion(&read_pool, doc).await;
+    send(
+        &mut a,
+        ca,
+        CommandBody::ReleaseDocumentLease { lease_id: lease_a },
+        "release-a",
+    )
+    .await;
+    recv_command_accepted(&mut a).await;
+    send(
+        &mut b,
+        cb,
+        CommandBody::AcquireDocumentLease {
+            lease: block_lease(doc, "p"),
+            ttl_seconds: None,
+        },
+        "lease-b",
+    )
+    .await;
+    recv_lease_reply(&mut b)
+        .await
+        .expect("B acquires the target block lease");
     send(
         &mut b,
         cb,

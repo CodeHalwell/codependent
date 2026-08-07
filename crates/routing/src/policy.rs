@@ -72,6 +72,10 @@ pub enum PolicyError {
     /// id repeats, so this is rejected outright rather than tolerated.
     #[error("escalation chain contains duplicate model id: {model}")]
     DuplicateModelInChain { model: ModelId },
+    /// `Unknown` is a data label for unclassified inputs, not a permission to
+    /// send every possible classification off-device.
+    #[error("max_off_device must be an explicit known classification, not Unknown")]
+    UnknownOffDeviceCeiling,
 }
 
 /// A named, versioned routing policy.
@@ -97,7 +101,7 @@ pub struct RoutingPolicy {
     /// The utility λ weights.
     pub lambdas: Lambdas,
     /// The minimum predicted success a model must clear to be *eligible*
-    /// (cheapest-above-threshold selects among models over this bar).
+    /// (the utility router selects among models over this bar).
     pub quality_threshold: f64,
     /// The escalation chain, cheapest → strongest, as model ids. On an objective
     /// validation failure the router advances along this chain.
@@ -151,7 +155,9 @@ impl RoutingPolicy {
     /// policy's privacy ceiling.
     #[must_use]
     pub fn hosted_allows(&self, classification: DataClassification) -> bool {
-        classification.allowed_off_device(self.max_off_device)
+        self.max_off_device != DataClassification::Unknown
+            && classification != DataClassification::Unknown
+            && classification.allowed_off_device(self.max_off_device)
     }
 
     /// Validate that this policy's numbers are meaningful (P7-6) and its
@@ -161,6 +167,9 @@ impl RoutingPolicy {
     /// automatically on deserialization (`TryFrom<RoutingPolicyWire>`); exposed
     /// so any other constructor path can call it too.
     pub fn validate(&self) -> Result<(), PolicyError> {
+        if self.max_off_device == DataClassification::Unknown {
+            return Err(PolicyError::UnknownOffDeviceCeiling);
+        }
         for (field, value) in [
             ("cost", self.lambdas.cost),
             ("latency", self.lambdas.latency),

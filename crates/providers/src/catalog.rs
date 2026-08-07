@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::model::{Provider, ProvidersFile};
+use crate::model::{Model, Provider, ProvidersFile};
 
 /// The curated catalog, embedded at build time.
 const BUILTIN_CATALOG_TOML: &str = include_str!("../builtin_catalog.toml");
@@ -35,24 +35,46 @@ pub fn builtin_providers() -> Vec<Provider> {
     file.providers
 }
 
+/// Models shipped alongside the built-in providers.
+#[must_use]
+pub fn builtin_models() -> Vec<Model> {
+    let file: ProvidersFile =
+        toml::from_str(BUILTIN_CATALOG_TOML).expect("the embedded built-in catalog is valid TOML");
+    file.models
+}
+
 /// The resolved provider catalog, keyed by id (BTreeMap → stable ordering for the
 /// picker).
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     providers: BTreeMap<String, Provider>,
+    models: BTreeMap<(String, String), Model>,
 }
 
 impl Catalog {
     /// The built-in catalog only.
     #[must_use]
     pub fn builtin() -> Self {
-        Self::from_providers(builtin_providers())
+        Self::from_parts(builtin_providers(), builtin_models())
     }
 
     /// Build from an explicit provider list (later ids overwrite earlier).
     pub fn from_providers(providers: impl IntoIterator<Item = Provider>) -> Self {
+        Self::from_parts(providers, std::iter::empty())
+    }
+
+    /// Build from explicit providers and model metadata. Later duplicate keys
+    /// overwrite earlier ones deterministically.
+    pub fn from_parts(
+        providers: impl IntoIterator<Item = Provider>,
+        models: impl IntoIterator<Item = Model>,
+    ) -> Self {
         let providers = providers.into_iter().map(|p| (p.id.clone(), p)).collect();
-        Self { providers }
+        let models = models
+            .into_iter()
+            .map(|m| ((m.provider_id.clone(), m.id.clone()), m))
+            .collect();
+        Self { providers, models }
     }
 
     /// Built-ins, then the user's `providers.toml` layered on top (same id shadows;
@@ -61,6 +83,10 @@ impl Catalog {
         let mut providers: BTreeMap<String, Provider> = builtin_providers()
             .into_iter()
             .map(|p| (p.id.clone(), p))
+            .collect();
+        let mut models: BTreeMap<(String, String), Model> = builtin_models()
+            .into_iter()
+            .map(|m| ((m.provider_id.clone(), m.id.clone()), m))
             .collect();
         if path.exists() {
             let text = std::fs::read_to_string(path).map_err(|source| CatalogError::Read {
@@ -75,8 +101,11 @@ impl Catalog {
             for p in file.providers {
                 providers.insert(p.id.clone(), p);
             }
+            for model in file.models {
+                models.insert((model.provider_id.clone(), model.id.clone()), model);
+            }
         }
-        Ok(Self { providers })
+        Ok(Self { providers, models })
     }
 
     /// Look up a provider by id.
@@ -88,6 +117,17 @@ impl Catalog {
     /// Iterate every provider, in id order.
     pub fn providers(&self) -> impl Iterator<Item = &Provider> {
         self.providers.values()
+    }
+
+    /// Look up model metadata by provider and provider-side model id.
+    #[must_use]
+    pub fn model(&self, provider_id: &str, id: &str) -> Option<&Model> {
+        self.models.get(&(provider_id.to_string(), id.to_string()))
+    }
+
+    /// Iterate all catalog model rows in stable provider/id order.
+    pub fn models(&self) -> impl Iterator<Item = &Model> {
+        self.models.values()
     }
 
     #[must_use]

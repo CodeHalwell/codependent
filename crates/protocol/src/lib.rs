@@ -31,8 +31,8 @@ pub mod workflow;
 pub use artifact::{ArtifactRef, DataClassification};
 pub use blackboard::BlackboardItemView;
 pub use capabilities::ClientCapabilities;
-pub use catchup::{Catchup, SessionProjection};
-pub use command::{Command, CommandBody, PromotionAction};
+pub use catchup::{Catchup, PendingApprovalProjection, SessionProjection};
+pub use command::{CanaryMetrics, Command, CommandBody, PromotionAction};
 pub use document::{
     DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync, PublishTarget,
     SuggestionInput,

@@ -253,11 +253,31 @@ pub async fn session_projection(
         }
     }
 
+    let approval_rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT a.id, a.run_id, a.action_json, a.risk_json \
+         FROM approvals a JOIN runs r ON r.id = a.run_id \
+         WHERE r.session_id = ? AND a.state = 'pending' \
+         ORDER BY a.requested_at ASC, a.id ASC",
+    )
+    .bind(session_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let mut pending_approvals = Vec::with_capacity(approval_rows.len());
+    for (approval_id, run_id, action_json, risk_json) in approval_rows {
+        pending_approvals.push(codypendent_protocol::PendingApprovalProjection {
+            approval_id: codypendent_protocol::ApprovalId::from_str(&approval_id)?,
+            run_id: RunId::from_str(&run_id)?,
+            action: serde_json::from_str(&action_json)?,
+            risk: serde_json::from_str(&risk_json)?,
+        });
+    }
+
     Ok(SessionProjection {
         session_id,
         title,
         last_sequence: u64::try_from(last_sequence)?,
         active_runs,
+        pending_approvals,
         closed,
     })
 }

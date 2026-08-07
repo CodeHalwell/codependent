@@ -155,7 +155,10 @@ impl ResourceChange {
     /// auto-applicable.
     #[must_use]
     pub fn is_increase(&self) -> bool {
-        self.new > self.old
+        // Zero is the executor's legacy "unlimited" sentinel for memory, CPU,
+        // and wall time. Treat any transition to zero as an expansion so even a
+        // programmatically-constructed manifest cannot auto-apply it.
+        (self.new == 0 && self.old != 0) || self.new > self.old
     }
 }
 

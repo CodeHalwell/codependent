@@ -43,7 +43,7 @@ pub use cluster::{cluster_failures, rank_by_frequency, ClusterKey, FailureCluste
 pub use grade::{grade, Signal, Trace, TraceGrade};
 pub use promote::{
     ActiveVersions, ArtifactKind, ArtifactVersion, CanaryOutcome, Candidate, PromotionError,
-    PromotionRecord, PromotionStage,
+    PromotionRecord, PromotionStage, MIN_CANARY_SAMPLES,
 };
 pub use regression::{RegressionReport, RegressionSuite};
 pub use store::{CandidateSnapshot, PromotionStore, PromotionStoreError};

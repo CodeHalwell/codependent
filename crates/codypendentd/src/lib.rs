@@ -203,6 +203,16 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         Err(error) => warn!(%error, "could not resume workflow runs at startup"),
     }
 
+    // Re-arm approval-gated document publication from its durable plan. Generic
+    // recovery deliberately leaves these synthetic runs live; this step runs
+    // after GitHub/MCP adapter assembly so every publication target has the same
+    // capabilities it had before the restart.
+    match executor.recover_document_publications().await {
+        Ok(0) => {}
+        Ok(n) => info!(recovered = n, "resumed document publication jobs"),
+        Err(error) => warn!(%error, "could not resume document publication jobs"),
+    }
+
     // Optionally open the GitHub webhook listener (Phase 3 STEP 3.3). It is
     // disabled unless `<data_dir>/webhooks.toml` sets `enabled = true`, and even
     // then binds loopback by default. Deliveries are verified, deduplicated by

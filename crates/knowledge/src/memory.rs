@@ -197,7 +197,15 @@ impl MemoryStore {
             q = q.bind(rev.0.clone()).bind(rev.0.clone());
         }
         let rows = q.fetch_all(pool).await?;
-        rows.iter().map(memory_from_row).collect()
+        let now = Utc::now();
+        rows.iter()
+            .map(memory_from_row)
+            .filter_map(|record| match record {
+                Ok(record) if memory_is_retained(&record, now) => Some(Ok(record)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
     }
 
     /// Supersede `old_id` with `new`: stamp the old record's `valid_until` to
@@ -319,13 +327,12 @@ impl MemoryStore {
     /// 2. **scope classification** — the candidate's scope is validated
     ///    ([`classify_scope`]); the cross-repository `User` scope is reserved for
     ///    preference-class facts.
-    /// 3. **dedup** — a same-scope, same-class live memory more than
-    ///    [`DEDUP_SIMILARITY`] similar (self-contained trigram cosine) drops the
-    ///    candidate as [`Curation::Duplicate`].
-    /// 4. **contradiction** — a same-scope, same-class live memory with the same
+    /// 3. **contradiction** — a same-scope, same-class live memory with the same
     ///    subject but an incompatible value is *superseded* (never deleted),
     ///    yielding [`Curation::Superseded`]. Only an evidence-bearing candidate
     ///    may supersede — an evidence-free one falls through to gate 5.
+    /// 4. **dedup** — a same-scope, same-class live memory more than
+    ///    [`DEDUP_SIMILARITY`] similar drops the candidate as [`Curation::Duplicate`].
     /// 5. **provenance** — a candidate with zero [`EvidenceRef`]s is rejected as
     ///    [`Curation::Rejected`] (`"evidence-free"`).
     /// 6. **retention** — the candidate's [`RetentionPolicy`] (default 365 days)
@@ -346,6 +353,14 @@ impl MemoryStore {
                 return Ok(Curation::Redacted { reason });
             }
         }
+        if matches!(
+            candidate.sensitivity,
+            DataClassification::Secret | DataClassification::Unknown
+        ) {
+            return Ok(Curation::Redacted {
+                reason: "candidate sensitivity may not be persisted as reusable memory".into(),
+            });
+        }
 
         // (b) scope classification.
         let scope = match classify_scope(&candidate) {
@@ -357,29 +372,31 @@ impl MemoryStore {
         // compare against these only.
         let existing = self.query(pool, std::slice::from_ref(&scope), None).await?;
 
-        // (c) dedup.
+        // (c) contradiction → supersession. This must precede fuzzy dedup: a
+        // tiny value flip often leaves statements >92% similar.
+        // supersede; an evidence-free contradiction is left for gate (e) to
+        // reject, so a record without provenance is never inserted.
+        if !candidate.provenance.is_empty() {
+            if let Some(old) = existing
+                .iter()
+                .find(|m| m.class == candidate.class && memories_contradict(m, &candidate))
+            {
+                let record = build_record(&candidate, scope);
+                let stored = self.supersede(pool, old.id, record).await?;
+                return Ok(Curation::Superseded {
+                    old_id: old.id,
+                    record: stored,
+                });
+            }
+        }
+
+        // (d) dedup only after contradictions have had a chance to supersede.
         for memory in &existing {
             if memory.class == candidate.class
                 && trigram_cosine(&memory.statement, &candidate.statement) > DEDUP_SIMILARITY
             {
                 return Ok(Curation::Duplicate {
                     existing_id: memory.id,
-                });
-            }
-        }
-
-        // (d) contradiction → supersession. Only evidence-bearing candidates may
-        // supersede; an evidence-free contradiction is left for gate (e) to
-        // reject, so a record without provenance is never inserted.
-        if !candidate.provenance.is_empty() {
-            if let Some(old) = existing.iter().find(|m| {
-                m.class == candidate.class && contradicts(&m.statement, &candidate.statement)
-            }) {
-                let record = build_record(&candidate, scope);
-                let stored = self.supersede(pool, old.id, record).await?;
-                return Ok(Curation::Superseded {
-                    old_id: old.id,
-                    record: stored,
                 });
             }
         }
@@ -395,6 +412,16 @@ impl MemoryStore {
         let record = build_record(&candidate, scope);
         self.insert(pool, &record).await?;
         Ok(Curation::Accepted(record))
+    }
+}
+
+fn memory_is_retained(record: &MemoryRecord, now: DateTime<Utc>) -> bool {
+    match record.retention.ttl_days {
+        None => true,
+        Some(days) => record
+            .observed_at
+            .checked_add_signed(chrono::Duration::days(i64::from(days)))
+            .is_some_and(|expires| expires > now),
     }
 }
 
@@ -548,6 +575,32 @@ fn contradicts(existing: &str, candidate: &str) -> bool {
     // Both must carry a value (a real separator); equal subjects, differing
     // values.
     ev.is_some() && cv.is_some() && !es.is_empty() && es == cs && ev != cv
+}
+
+fn memories_contradict(existing: &MemoryRecord, candidate: &CandidateMemory) -> bool {
+    if contradicts(&existing.statement, &candidate.statement) {
+        return true;
+    }
+    match (&existing.structured_value, &candidate.structured_value) {
+        (Some(old), Some(new)) if old != new => {
+            // A structured value attached to the same normalized statement is
+            // an explicit value update even when prose has no `is` separator.
+            if normalize(&existing.statement) == normalize(&candidate.statement) {
+                return true;
+            }
+            // Common object-shaped facts identify their subject/key separately
+            // from `value`; compare identity while allowing the value to change.
+            let identity = |value: &serde_json::Value| {
+                value.as_object().and_then(|object| {
+                    ["subject", "key", "name"]
+                        .into_iter()
+                        .find_map(|key| object.get(key).map(|value| (key, value.clone())))
+                })
+            };
+            identity(old).is_some() && identity(old) == identity(new)
+        }
+        _ => false,
+    }
 }
 
 /// Split a statement into a normalized `(subject, value)` pair on the first
