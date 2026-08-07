@@ -408,6 +408,11 @@ enum EvalCommand {
         /// resolution, unchanged.
         #[arg(long)]
         policy: Option<String>,
+        /// Bind this run's durable regression evidence to an existing promotion
+        /// candidate. Without this option the report is still written, but it
+        /// cannot advance any candidate's regression gate.
+        #[arg(long)]
+        candidate_id: Option<String>,
         /// Where to write the `SuiteReport` JSON.
         #[arg(long)]
         report: PathBuf,
@@ -756,8 +761,9 @@ async fn main() -> anyhow::Result<()> {
             EvalCommand::Run {
                 suite,
                 policy,
+                candidate_id,
                 report,
-            } => commands::eval_run(&paths, &suite, policy, &report).await,
+            } => commands::eval_run(&paths, &suite, policy, candidate_id.as_deref(), &report).await,
         },
         TopCommand::Models { command } => match command {
             ModelsCommand::Bench { id } => commands::models_bench(&paths, &id).await,

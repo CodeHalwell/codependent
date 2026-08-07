@@ -97,7 +97,7 @@ fn open_scoped(
                 OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::empty(),
             )
-            .map_err(errno_to_io)?,
+            .map_err(|error| leaf_open_error(error, &resolved))?,
             false,
         ),
         Access::ReadWrite => (
@@ -107,7 +107,7 @@ fn open_scoped(
                 OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::empty(),
             )
-            .map_err(errno_to_io)?,
+            .map_err(|error| leaf_open_error(error, &resolved))?,
             false,
         ),
         Access::Write => match openat(
@@ -131,7 +131,7 @@ fn open_scoped(
                 .map_err(errno_to_io)?,
                 true,
             ),
-            Err(error) => return Err(ToolError::Io(errno_to_io(error))),
+            Err(error) => return Err(leaf_open_error(error, &resolved)),
         },
     };
     let file = std::fs::File::from(fd);
@@ -143,6 +143,17 @@ fn open_scoped(
         file,
         created,
     })
+}
+
+#[cfg(unix)]
+fn leaf_open_error(error: rustix::io::Errno, path: &Path) -> ToolError {
+    use rustix::io::Errno;
+
+    if matches!(error, Errno::LOOP | Errno::ISDIR) {
+        ToolError::NotRegularFile(path.to_path_buf())
+    } else {
+        ToolError::Io(errno_to_io(error))
+    }
 }
 
 #[cfg(unix)]

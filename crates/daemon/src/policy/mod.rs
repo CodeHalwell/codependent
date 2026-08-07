@@ -439,10 +439,15 @@ impl PolicyEngine {
             ));
         }
         if program == "git" {
-            let subcommand = args
-                .iter()
-                .find(|arg| !arg.starts_with('-'))
-                .map(String::as_str);
+            let subcommand = match git_subcommand(args) {
+                Ok(subcommand) => subcommand,
+                Err(message) => {
+                    return self.deny(PolicyReason::new(
+                        "policy.git-global-option-unsupported",
+                        message,
+                    ));
+                }
+            };
             let mutating = matches!(
                 subcommand,
                 Some(
@@ -750,6 +755,93 @@ enum GitOp {
     Push,
 }
 
+/// Locate the actual git subcommand after parsing the documented global-option
+/// prefix. Options such as `-C <path>` and `-c <name=value>` consume a following
+/// non-option argument, so looking for the first argument that does not start
+/// with `-` mistakes the option's value for the subcommand and bypasses the
+/// mutation/network/force-push policy. Unknown global options fail closed: a
+/// future option may also consume an operand, and guessing would recreate the
+/// same policy hole.
+fn git_subcommand(args: &[String]) -> Result<Option<&str>, String> {
+    let mut index = 0;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        if arg == "--" {
+            return Ok(args.get(index + 1).map(String::as_str));
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            return Ok(Some(arg));
+        }
+
+        let consumes_next = matches!(
+            arg,
+            "-C" | "-c"
+                | "--config-env"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--attr-source"
+        );
+        if consumes_next {
+            if args.get(index + 1).is_none() {
+                return Err(format!("git global option `{arg}` is missing its value"));
+            }
+            index += 2;
+            continue;
+        }
+
+        let attached_value = (arg.starts_with("-C") || arg.starts_with("-c")) && arg.len() > 2;
+        let long_value = [
+            "--config-env=",
+            "--exec-path=",
+            "--git-dir=",
+            "--work-tree=",
+            "--namespace=",
+            "--super-prefix=",
+            "--attr-source=",
+            "--list-cmds=",
+        ]
+        .iter()
+        .any(|prefix| arg.starts_with(prefix));
+        if attached_value || long_value {
+            index += 1;
+            continue;
+        }
+
+        let flag = matches!(
+            arg,
+            "-p" | "-P"
+                | "-h"
+                | "--paginate"
+                | "--no-pager"
+                | "--no-replace-objects"
+                | "--bare"
+                | "--literal-pathspecs"
+                | "--glob-pathspecs"
+                | "--noglob-pathspecs"
+                | "--icase-pathspecs"
+                | "--no-optional-locks"
+                | "--no-lazy-fetch"
+                | "--no-advice"
+                | "--version"
+                | "--help"
+                | "--exec-path"
+                | "--html-path"
+                | "--man-path"
+                | "--info-path"
+        );
+        if flag {
+            index += 1;
+            continue;
+        }
+
+        return Err(format!(
+            "unsupported git global option `{arg}`; refusing to guess the subcommand"
+        ));
+    }
+    Ok(None)
+}
+
 /// Build a canonical [`PathScope`] from unexpanded root/deny strings and a
 /// context.
 ///
@@ -1015,6 +1107,106 @@ mod tests {
             &ctx(&repo, &repo),
         );
         assert_eq!(commit.decision, Decision::RequireApproval);
+    }
+
+    #[test]
+    fn git_global_options_cannot_hide_a_mutating_subcommand() {
+        let engine = PolicyEngine::with_defaults();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let decision = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "git".to_string(),
+                args: vec![
+                    "-C".to_string(),
+                    ".".to_string(),
+                    "-c".to_string(),
+                    "user.name=review".to_string(),
+                    "checkout".to_string(),
+                    "other".to_string(),
+                ],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo).with_mode(ModeOverlay {
+                write_allowed: false,
+                command_allowed: true,
+                network_allowed: false,
+            }),
+        );
+        assert_eq!(decision.decision, Decision::Deny);
+        assert_eq!(
+            decision.reasons[0].code,
+            "policy.git-shell-write-denied-by-mode"
+        );
+    }
+
+    #[test]
+    fn git_global_options_cannot_hide_network_or_force_push_policy() {
+        let mut merged = MergedPolicy::builtin_defaults();
+        merged.git_force_push = ApprovalAction::Deny;
+        let engine = PolicyEngine::from_merged(merged);
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+
+        let read_only = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "git".to_string(),
+                args: vec!["-C.".to_string(), "push".to_string(), "--force".to_string()],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo).with_mode(ModeOverlay {
+                write_allowed: false,
+                command_allowed: true,
+                network_allowed: false,
+            }),
+        );
+        assert_eq!(read_only.decision, Decision::Deny);
+        assert_eq!(
+            read_only.reasons[0].code,
+            "policy.git-shell-network-denied-by-mode"
+        );
+
+        let build = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "git".to_string(),
+                args: vec![
+                    "--git-dir".to_string(),
+                    ".git".to_string(),
+                    "--work-tree".to_string(),
+                    ".".to_string(),
+                    "push".to_string(),
+                    "--force-with-lease=main".to_string(),
+                ],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(build.decision, Decision::Deny);
+        assert_eq!(build.reasons[0].code, "policy.git-shell-denied");
+    }
+
+    #[test]
+    fn unknown_git_global_options_fail_closed() {
+        let engine = PolicyEngine::with_defaults();
+        let dir = tempdir().unwrap();
+        let repo = dir.path().to_path_buf();
+        let decision = engine.evaluate(
+            &ProposedAction::ExecuteCommand {
+                program: "git".to_string(),
+                args: vec!["--future-option".to_string(), "checkout".to_string()],
+                environment: Vec::new(),
+                cwd: None,
+            },
+            &ctx(&repo, &repo),
+        );
+        assert_eq!(decision.decision, Decision::Deny);
+        assert_eq!(
+            decision.reasons[0].code,
+            "policy.git-global-option-unsupported"
+        );
     }
 
     #[test]

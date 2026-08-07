@@ -78,6 +78,7 @@ candidate (draft, versioned, attributed)
 2. Version identifiers (`skill/rust-ci/4`, `router/tool-selection/12`, `prompt/coding-agent/17`) appear in every trace that used them (exit criterion 4: attributable), and `codypendent versions rollback <id>` restores the prior version, also traced (reversible).
 3. Skill synthesis from successful trace clusters ([Chapter 13](../13-observability-evaluation-learning.md)) creates **drafts** that additionally pass permission review before entering evaluation.
 4. Privacy for eval exports ([Chapter 13](../13-observability-evaluation-learning.md)): secret scrubbing, repository-policy respect, user-deletion propagation, license classification, dataset lineage records. Confidential code never ships to external evaluators.
+5. Regression evidence is candidate-bound: run `codypendent eval run --suite core --candidate-id <ID> --report out.json` after proposing the candidate. The daemon rejects unbound, stale, non-core, artifact-mismatched, and wrong-router-policy reports.
 
 **TESTS** — self-promotion attempt fails structurally; canary auto-rollback on regression; rollback restores behaviour (eval suite proves it); deleted user data absent from a subsequent export.
 

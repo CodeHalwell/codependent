@@ -689,19 +689,30 @@ impl CancellationToken {
     /// Park at a safe point while paused. Returns the time spent parked, or
     /// `None` when cancellation won while paused.
     pub async fn wait_until_running(&self) -> Option<Duration> {
+        self.wait_until_running_observed()
+            .await
+            .map(|(duration, _was_paused)| duration)
+    }
+
+    /// The same wait plus whether this call actually observed `Paused`. The
+    /// startup path needs that distinction: after a pre-start pause is resumed,
+    /// `ResumeRun` has already moved the durable projection to `Running`, so
+    /// emitting the ordinary `Preparing` transition would be an illegal
+    /// `Running -> Preparing` regression.
+    async fn wait_until_running_observed(&self) -> Option<(Duration, bool)> {
         let mut rx = self.rx.clone();
         match *rx.borrow() {
-            RunControl::Running => return Some(Duration::ZERO),
+            RunControl::Running => return Some((Duration::ZERO, false)),
             RunControl::Cancelled => return None,
             RunControl::Paused => {}
         }
         let started = Instant::now();
         loop {
             if rx.changed().await.is_err() {
-                return Some(started.elapsed());
+                return Some((started.elapsed(), true));
             }
             match *rx.borrow() {
-                RunControl::Running => return Some(started.elapsed()),
+                RunControl::Running => return Some((started.elapsed(), true)),
                 RunControl::Cancelled => return None,
                 RunControl::Paused => {}
             }
@@ -920,6 +931,7 @@ pub fn mode_overlay(mode: AgentMode) -> ModeOverlay {
 // ---------------------------------------------------------------------------
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+type RunStateReader = dyn Fn(RunId) -> BoxFuture<anyhow::Result<Option<RunState>>> + Send + Sync;
 
 /// The arguments an approval request carries into the [`ApprovalBroker`].
 pub struct ApprovalRequest {
@@ -958,6 +970,7 @@ pub struct RunJournal {
     >,
     request_approval:
         Box<dyn Fn(ApprovalRequest) -> BoxFuture<anyhow::Result<ApprovalId>> + Send + Sync>,
+    load_run_state: Option<Box<RunStateReader>>,
 }
 
 impl RunJournal {
@@ -972,7 +985,22 @@ impl RunJournal {
         Self {
             persist: Box::new(move |session, actor, body| Box::pin(persist(session, actor, body))),
             request_approval: Box::new(move |req| Box::pin(request_approval(req))),
+            load_run_state: None,
         }
+    }
+
+    /// Attach a durable run-state reader. The runtime uses it to make terminal
+    /// transitions idempotent with lifecycle commands (for example, a
+    /// `CancelRun` command persists `Cancelled` before firing the in-memory
+    /// token) and to recognize a pre-start pause that `ResumeRun` has already
+    /// returned to `Running`.
+    pub fn with_state_reader<SF, SFut>(mut self, load_run_state: SF) -> Self
+    where
+        SF: Fn(RunId) -> SFut + Send + Sync + 'static,
+        SFut: Future<Output = anyhow::Result<Option<RunState>>> + Send + 'static,
+    {
+        self.load_run_state = Some(Box::new(move |run_id| Box::pin(load_run_state(run_id))));
+        self
     }
 
     async fn record(
@@ -986,6 +1014,13 @@ impl RunJournal {
 
     async fn request(&self, request: ApprovalRequest) -> anyhow::Result<ApprovalId> {
         (self.request_approval)(request).await
+    }
+
+    async fn run_state(&self, run_id: RunId) -> anyhow::Result<Option<RunState>> {
+        match &self.load_run_state {
+            Some(load) => load(run_id).await,
+            None => Ok(None),
+        }
     }
 }
 
@@ -1339,6 +1374,8 @@ impl FrameworkAgentRuntime {
                     &serde_json::to_vec_pretty(&chronicle)?,
                 )
                 .await?;
+            self.transition_if_needed(run.session_id, run.run_id, RunState::Cancelled)
+                .await?;
             self.emit(
                 run.session_id,
                 run_actor,
@@ -1357,38 +1394,46 @@ impl FrameworkAgentRuntime {
         // A PauseRun may win before the executor reaches this worker. Honor it
         // before emitting Preparing/Running so the durable Paused projection is
         // not immediately overwritten by a worker that has not done any work.
-        if cancel.wait_until_running().await.is_none() {
-            let disposition = RunDisposition::Cancelled {
-                reason: Some("run cancelled while paused before execution".to_string()),
-            };
-            let chronicle = build_chronicle(&run.objective, &[], &[], &[], 0, None);
-            let chronicle_ref = self
-                .sink
-                .store(
-                    "application/json",
-                    Provenance::system("run-chronicle"),
-                    &serde_json::to_vec_pretty(&chronicle)?,
+        let resumed_before_start = match cancel.wait_until_running_observed().await {
+            Some((_paused, was_paused)) => was_paused,
+            None => {
+                let disposition = RunDisposition::Cancelled {
+                    reason: Some("run cancelled while paused before execution".to_string()),
+                };
+                let chronicle = build_chronicle(&run.objective, &[], &[], &[], 0, None);
+                let chronicle_ref = self
+                    .sink
+                    .store(
+                        "application/json",
+                        Provenance::system("run-chronicle"),
+                        &serde_json::to_vec_pretty(&chronicle)?,
+                    )
+                    .await?;
+                self.transition_if_needed(run.session_id, run.run_id, RunState::Cancelled)
+                    .await?;
+                self.emit(
+                    run.session_id,
+                    run_actor,
+                    EventBody::RunCompleted {
+                        run_id: run.run_id,
+                        disposition: disposition.clone(),
+                        chronicle: chronicle_ref,
+                    },
                 )
                 .await?;
-            self.emit(
-                run.session_id,
-                run_actor,
-                EventBody::RunCompleted {
-                    run_id: run.run_id,
-                    disposition: disposition.clone(),
-                    chronicle: chronicle_ref,
-                },
-            )
-            .await?;
-            return Ok(RunOutcome {
-                disposition,
-                usage: None,
-            });
+                return Ok(RunOutcome {
+                    disposition,
+                    usage: None,
+                });
+            }
+        };
+        let durable_state = self.journal.run_state(run.run_id).await?;
+        if !resumed_before_start && durable_state != Some(RunState::Running) {
+            self.transition(run.session_id, run.run_id, RunState::Preparing)
+                .await?;
+            self.transition(run.session_id, run.run_id, RunState::Running)
+                .await?;
         }
-        self.transition(run.session_id, run.run_id, RunState::Preparing)
-            .await?;
-        self.transition(run.session_id, run.run_id, RunState::Running)
-            .await?;
 
         // Accumulators folded into the chronicle at the terminal state. A
         // continuation run is SEEDED with the prior conversation
@@ -1747,7 +1792,8 @@ impl FrameworkAgentRuntime {
             Terminal::Failed(reason) => (RunState::Failed, RunDisposition::Failed { reason }),
         };
 
-        self.transition(run.session_id, run.run_id, state).await?;
+        self.transition_if_needed(run.session_id, run.run_id, state)
+            .await?;
         self.emit(
             run.session_id,
             run_actor,
@@ -1791,6 +1837,23 @@ impl FrameworkAgentRuntime {
             EventBody::RunStateChanged { run_id, state },
         )
         .await?;
+        Ok(())
+    }
+
+    /// Persist `state` unless a lifecycle command has already committed it.
+    /// Commands persist before signalling their in-memory control token, so the
+    /// existing durable terminal state is authoritative and already has its own
+    /// `RunStateChanged` event; emitting it again would either fail the legal
+    /// transition guard or duplicate the lifecycle event.
+    async fn transition_if_needed(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        state: RunState,
+    ) -> anyhow::Result<()> {
+        if self.journal.run_state(run_id).await? != Some(state) {
+            self.transition(session_id, run_id, state).await?;
+        }
         Ok(())
     }
 
@@ -4440,6 +4503,49 @@ mod tests {
         assert!(token.is_cancelled());
         // A `never` token stays false even with its source dropped.
         assert!(!CancellationToken::never().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_run_resumed_before_start_skips_preparing() {
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "resume during launch",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let driver = ScriptedDriver::new(vec![ModelStep::Finish {
+            summary: "done".to_string(),
+        }]);
+        let (handle, token) = cancellation();
+        handle.pause();
+
+        let task = tokio::spawn(async move { runtime.execute_run(&driver, ctx, token).await });
+        tokio::task::yield_now().await;
+        handle.resume();
+        let outcome = task
+            .await
+            .expect("run task joins")
+            .expect("resumed run completes");
+        assert!(matches!(
+            outcome.disposition,
+            RunDisposition::Completed { .. }
+        ));
+
+        let mut states = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::RunStateChanged { state, .. } = event.body {
+                states.push(state);
+            }
+        }
+        assert_eq!(
+            states,
+            vec![RunState::Completed],
+            "ResumeRun already emitted Running; the worker must not regress it to Preparing"
+        );
     }
 
     #[test]

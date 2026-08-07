@@ -544,7 +544,9 @@ steps:
             .set_run_state(&pool, &paused, WorkflowRunState::Paused)
             .await
             .unwrap();
-        // A run with no manifest is skipped, never errored.
+        // A run with no manifest is marked failed and counted as skipped, so
+        // startup recovery does not retry the permanently undriveable row on
+        // every daemon restart.
         let compiled = compile_yaml(LINEAR).unwrap();
         let no_manifest = store
             .create_run(&pool, &compiled, None, &json!({}), None)
@@ -562,7 +564,7 @@ steps:
         assert_eq!(report.skipped_no_manifest, 1);
 
         // The pending run completed; the paused run is untouched; the no-manifest
-        // run stays pending.
+        // run is terminally failed after being counted in the recovery report.
         let state_of = |snap: WorkflowRunSnapshot| snap.run.state;
         assert_eq!(
             state_of(store.snapshot(&pool, &pending).await.unwrap().unwrap()),
@@ -574,7 +576,7 @@ steps:
         );
         assert_eq!(
             state_of(store.snapshot(&pool, &no_manifest).await.unwrap().unwrap()),
-            WorkflowRunState::Pending
+            WorkflowRunState::Failed
         );
     }
 

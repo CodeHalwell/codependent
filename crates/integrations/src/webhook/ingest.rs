@@ -109,24 +109,18 @@ impl WebhookIngestor {
         // a later valid GitHub retry look like a duplicate.
         let event = normalize::normalize(&headers.event_type, body)?;
 
-        // 3. Reject replay of the same authenticated content under a forged new
-        // delivery/event header. GitHub's standard HMAC covers only the body, so
-        // this durable signature fingerprint supplies the missing binding.
+        // 3. Atomically reserve both replay identities: the delivery GUID and a
+        // signature fingerprint that rejects the same authenticated content
+        // under a forged new delivery/event header. GitHub's standard HMAC
+        // covers only the body, so the fingerprint supplies the missing binding.
+        // Reserving them in one store transaction prevents a crash between two
+        // writes from burning a legitimate retry forever.
         let replay_key = format!("body-sha256:{}", hex::encode(Sha256::digest(signature)));
         if !self
             .store
-            .record_if_new(&replay_key, "signed-content")
+            .reserve_if_new(&headers.delivery_id, &headers.event_type, &replay_key)
             .await?
         {
-            return Ok(IngestOutcome::Duplicate);
-        }
-
-        // 4. Deduplicate by delivery GUID before producing any event.
-        let is_new = self
-            .store
-            .record_if_new(&headers.delivery_id, &headers.event_type)
-            .await?;
-        if !is_new {
             return Ok(IngestOutcome::Duplicate);
         }
 

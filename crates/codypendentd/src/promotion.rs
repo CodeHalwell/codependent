@@ -85,9 +85,20 @@ impl PromotionGateway for PromotionStoreGateway {
             match request.action {
                 PromotionAction::RunRegression => {
                     let row: Option<(String, String)> = sqlx::query_as(
-                        "SELECT id, report_json FROM eval_suite_reports \
-                         ORDER BY created_at DESC, id DESC LIMIT 1",
+                        "SELECT report.id, report.report_json \
+                         FROM eval_suite_reports AS report \
+                         JOIN promotion_candidates AS candidate \
+                           ON candidate.id = report.candidate_id \
+                         WHERE report.candidate_id = ? \
+                           AND report.suite = 'core' \
+                           AND report.artifact_kind = candidate.artifact_kind \
+                           AND report.artifact_name = candidate.artifact_name \
+                           AND report.artifact_version = candidate.artifact_version \
+                           AND (candidate.artifact_kind != 'router' \
+                                OR report.routing_policy = candidate.artifact_name) \
+                         ORDER BY report.created_at DESC, report.id DESC LIMIT 1",
                     )
+                    .bind(&request.candidate_id)
                     .fetch_optional(&host.pool)
                     .await
                     .map_err(|error| {
@@ -96,7 +107,11 @@ impl PromotionGateway for PromotionStoreGateway {
                     let Some((report_id, report_json)) = row else {
                         return Err(CodypendentError::new(
                             "promotion.regression-evidence-missing",
-                            "run `codypendent eval run` before advancing regression".to_string(),
+                            format!(
+                                "run `codypendent eval run --suite core --candidate-id {}` \
+                                 against this candidate before advancing regression",
+                                request.candidate_id
+                            ),
                             false,
                         ));
                     };
@@ -314,21 +329,53 @@ mod tests {
         let pool = codypendent_eval::db::open(&tmp.path().join("codypendent.db"))
             .await
             .unwrap();
-        let report = SuiteReport::new(vec![CaseResult {
+        (tmp, pool)
+    }
+
+    fn passing_report() -> SuiteReport {
+        SuiteReport::new(vec![CaseResult {
             case_id: "stored-regression-case".to_string(),
             assertion_results: Vec::new(),
             within_cost: true,
             within_duration: true,
-        }]);
-        sqlx::query(
-            "INSERT INTO eval_suite_reports (id, suite, report_json, created_at) \
-             VALUES ('report-1', 'test-suite', ?, '2026-08-06T00:00:00.000Z')",
+        }])
+    }
+
+    async fn bind_report(
+        pool: &SqlitePool,
+        candidate_id: &str,
+        report_id: &str,
+        report: &SuiteReport,
+    ) {
+        let (kind, name, version): (String, String, i64) = sqlx::query_as(
+            "SELECT artifact_kind, artifact_name, artifact_version \
+             FROM promotion_candidates WHERE id = ?",
         )
-        .bind(serde_json::to_string(&report).unwrap())
-        .execute(&pool)
+        .bind(candidate_id)
+        .fetch_one(pool)
         .await
         .unwrap();
-        (tmp, pool)
+        let routing_policy = if kind == "router" {
+            name.clone()
+        } else {
+            "daemon-default".to_string()
+        };
+        sqlx::query(
+            "INSERT INTO eval_suite_reports \
+             (id, candidate_id, artifact_kind, artifact_name, artifact_version, suite, \
+              routing_policy, report_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, 'core', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(report_id)
+        .bind(candidate_id)
+        .bind(kind)
+        .bind(name)
+        .bind(version)
+        .bind(routing_policy)
+        .bind(serde_json::to_string(report).unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     fn passing_canary_metrics() -> CanaryMetrics {
@@ -388,6 +435,7 @@ mod tests {
             })
             .await
             .expect("propose accepted");
+        bind_report(&pool, &candidate_id, "report-promote", &passing_report()).await;
 
         for action in [
             PromotionAction::RunRegression,
@@ -436,10 +484,6 @@ mod tests {
     #[tokio::test]
     async fn regression_requires_durable_evidence_and_persists_a_rejection() {
         let (_tmp, pool) = temp_pool().await;
-        sqlx::query("DELETE FROM eval_suite_reports")
-            .execute(&pool)
-            .await
-            .unwrap();
         let gateway = PromotionStoreGateway::new(pool.clone());
         let client_id = human_client_id();
         let candidate_id = gateway
@@ -453,6 +497,24 @@ mod tests {
             })
             .await
             .unwrap();
+        let unrelated_id = gateway
+            .propose(ProposePromotionRequest {
+                kind: "prompt".to_string(),
+                name: "unrelated-passing-eval".to_string(),
+                version: 1,
+                requires_permission_review: false,
+                idempotency_key: "unrelated-passing-eval".to_string(),
+                client_id,
+            })
+            .await
+            .unwrap();
+        bind_report(
+            &pool,
+            &unrelated_id,
+            "unrelated-passing-report",
+            &passing_report(),
+        )
+        .await;
         let missing = gateway
             .advance(AdvancePromotionRequest {
                 candidate_id: candidate_id.clone(),
@@ -460,7 +522,7 @@ mod tests {
                 client_id,
             })
             .await
-            .expect_err("a caller cannot supply a favorable verdict");
+            .expect_err("another candidate's passing report is not evidence for this candidate");
         assert_eq!(missing.code, "promotion.regression-evidence-missing");
 
         let report = SuiteReport::new(vec![CaseResult {
@@ -472,14 +534,7 @@ mod tests {
             within_cost: true,
             within_duration: true,
         }]);
-        sqlx::query(
-            "INSERT INTO eval_suite_reports (id, suite, report_json, created_at) \
-             VALUES ('failed-report', 'core', ?, '2027-01-01T00:00:00.000Z')",
-        )
-        .bind(serde_json::to_string(&report).unwrap())
-        .execute(&pool)
-        .await
-        .unwrap();
+        bind_report(&pool, &candidate_id, "failed-report", &report).await;
         let rejected = gateway
             .advance(AdvancePromotionRequest {
                 candidate_id: candidate_id.clone(),
@@ -521,6 +576,13 @@ mod tests {
             })
             .await
             .unwrap();
+        bind_report(
+            &pool,
+            &candidate_id,
+            "report-agent-approval",
+            &passing_report(),
+        )
+        .await;
         let permission_error = gateway
             .advance(AdvancePromotionRequest {
                 candidate_id: candidate_id.clone(),
@@ -574,7 +636,7 @@ mod tests {
     #[tokio::test]
     async fn finishing_an_unobserved_canary_is_rejected_with_the_right_code() {
         let (_tmp, pool) = temp_pool().await;
-        let gateway = PromotionStoreGateway::new(pool);
+        let gateway = PromotionStoreGateway::new(pool.clone());
         let client_id = human_client_id();
         let candidate_id = gateway
             .propose(ProposePromotionRequest {
@@ -587,6 +649,7 @@ mod tests {
             })
             .await
             .unwrap();
+        bind_report(&pool, &candidate_id, "report-unobserved", &passing_report()).await;
         for action in [
             PromotionAction::RunRegression,
             PromotionAction::StartShadow,
@@ -652,6 +715,13 @@ mod tests {
             })
             .await
             .unwrap();
+        bind_report(
+            &pool,
+            &candidate_id,
+            "report-auto-rollback",
+            &passing_report(),
+        )
+        .await;
         for action in [
             PromotionAction::RunRegression,
             PromotionAction::StartShadow,
@@ -699,6 +769,13 @@ mod tests {
             })
             .await
             .unwrap();
+        bind_report(
+            &pool,
+            &promoted_id,
+            "report-manual-rollback",
+            &passing_report(),
+        )
+        .await;
         for action in [
             PromotionAction::RunRegression,
             PromotionAction::StartShadow,

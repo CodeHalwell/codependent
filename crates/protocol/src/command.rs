@@ -370,7 +370,7 @@ pub enum CommandBody {
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum PromotionAction {
-    /// Evaluate the latest durable SuiteReport on the daemon.
+    /// Evaluate the latest durable core SuiteReport bound to this candidate.
     RunRegression,
     /// Record the Controller's permission review before evaluation.
     ReviewPermissions,

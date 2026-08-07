@@ -1426,7 +1426,7 @@ async fn bind_control_role(conn: &mut Connection) -> anyhow::Result<()> {
 
 // --- STEP 7.1: eval harness runner -------------------------------------------
 
-/// `codypendent eval run --suite <NAME> [--policy P] --report out.json`
+/// `codypendent eval run --suite <NAME> [--policy P] [--candidate-id ID] --report out.json`
 /// (Phase 7 STEP 7.1; `--policy` closed by the "routing⇄eval composition"
 /// follow-up). Loads every case in the suite, runs each headlessly against
 /// its pinned fixture revision, scores it, and writes the aggregate
@@ -1447,14 +1447,52 @@ async fn bind_control_role(conn: &mut Connection) -> anyhow::Result<()> {
 /// `--policy` is absent, behavior is byte-for-byte unchanged — every case
 /// still sends `model: None` and the daemon resolves/routes as usual (the
 /// `eval-smoke` CI path).
+///
+/// `--candidate-id` turns the resulting report into durable promotion evidence:
+/// the candidate must exist before the run, the core suite is mandatory, and a
+/// router candidate must run under its named policy. Reports without this flag
+/// remain ordinary output files and cannot advance a later candidate.
 pub async fn eval_run(
     paths: &RuntimePaths,
     suite: &str,
     policy: Option<String>,
+    candidate_id: Option<&str>,
     report: &std::path::Path,
 ) -> anyhow::Result<()> {
     let suite_dir = crate::eval::resolve_suite_dir(suite)?;
     let cases = crate::eval::load_suite(&suite_dir)?;
+
+    // Promotion evidence must name its candidate BEFORE any cases execute. The
+    // bound artifact snapshot is copied onto the report row and re-checked by
+    // the daemon at advancement, so neither a stale global report nor a report
+    // for another artifact can be substituted later.
+    let promotion_target = if let Some(candidate_id) = candidate_id {
+        if suite != "core" {
+            anyhow::bail!("promotion regression evidence must run the `core` suite, got `{suite}`");
+        }
+        let pool =
+            codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db")).await?;
+        let artifact: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT artifact_kind, artifact_name, artifact_version \
+             FROM promotion_candidates WHERE id = ?",
+        )
+        .bind(candidate_id)
+        .fetch_optional(&pool)
+        .await
+        .context("loading promotion candidate for eval evidence")?;
+        let Some((kind, name, version)) = artifact else {
+            anyhow::bail!("no such promotion candidate: {candidate_id}");
+        };
+        if kind == "router" && policy.as_deref() != Some(name.as_str()) {
+            anyhow::bail!(
+                "router candidate `{name}` requires `eval run --policy {name}` so the report \
+                 exercises the candidate policy"
+            );
+        }
+        Some((pool, candidate_id.to_string(), kind, name, version))
+    } else {
+        None
+    };
     println!(
         "eval: loaded {} case(s) from {}{}",
         cases.len(),
@@ -1486,21 +1524,28 @@ pub async fn eval_run(
     let suite_report =
         crate::eval::run_suite(paths, &cases, &fixture_root, routed.as_deref()).await?;
 
-    // Promotion consumes regression evidence from the daemon-owned database,
-    // not a caller-supplied boolean. Persist the exact SuiteReport produced by
-    // this harness before rendering the optional output file.
-    let evidence_pool =
-        codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db")).await?;
-    sqlx::query(
-        "INSERT INTO eval_suite_reports (id, suite, report_json, created_at) \
-         VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-    )
-    .bind(codypendent_protocol::MessageId::new().to_string())
-    .bind(suite)
-    .bind(serde_json::to_string(&suite_report)?)
-    .execute(&evidence_pool)
-    .await
-    .context("persisting eval suite evidence for promotion")?;
+    // Only an explicitly bound run becomes durable promotion evidence. An
+    // ordinary eval still writes its requested report file, but it cannot be
+    // consumed by a later, unrelated promotion candidate.
+    if let Some((pool, candidate_id, kind, name, version)) = promotion_target {
+        sqlx::query(
+            "INSERT INTO eval_suite_reports \
+             (id, candidate_id, artifact_kind, artifact_name, artifact_version, suite, \
+              routing_policy, report_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(codypendent_protocol::MessageId::new().to_string())
+        .bind(candidate_id)
+        .bind(kind)
+        .bind(name)
+        .bind(version)
+        .bind(suite)
+        .bind(policy.as_deref().unwrap_or("daemon-default"))
+        .bind(serde_json::to_string(&suite_report)?)
+        .execute(&pool)
+        .await
+        .context("persisting candidate-bound eval suite evidence for promotion")?;
+    }
 
     let json = crate::eval::report_json_with_routing(&suite_report, routed.as_deref())?;
     std::fs::write(report, json)

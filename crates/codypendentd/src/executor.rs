@@ -1505,6 +1505,7 @@ pub(crate) fn load_model_registry(
 pub(crate) fn run_journal(pool: &SqlitePool, approvals: &ApprovalBroker) -> RunJournal {
     let persist_pool = pool.clone();
     let approve_pool = pool.clone();
+    let state_pool = pool.clone();
     let approve_broker = approvals.clone();
     RunJournal::new(
         move |session: SessionId, actor: Actor, body: EventBody| {
@@ -1548,6 +1549,10 @@ pub(crate) fn run_journal(pool: &SqlitePool, approvals: &ApprovalBroker) -> RunJ
             }
         },
     )
+    .with_state_reader(move |run_id| {
+        let pool = state_pool.clone();
+        async move { projections::load_run_state(&pool, run_id).await }
+    })
 }
 
 /// The content-addressed [`ArtifactStore`] rooted at `<data_dir>/artifacts`.

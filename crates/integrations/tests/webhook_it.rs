@@ -10,7 +10,9 @@ use std::sync::Arc;
 use codypendent_integrations::webhook::ingest::{DeliveryHeaders, IngestOutcome, WebhookIngestor};
 use codypendent_integrations::webhook::normalize::NormalizedEvent;
 use codypendent_integrations::webhook::server;
-use codypendent_integrations::webhook::store::{InMemoryDeliveryStore, SqliteDeliveryStore};
+use codypendent_integrations::webhook::store::{
+    DeliveryStore, InMemoryDeliveryStore, SqliteDeliveryStore,
+};
 use codypendent_integrations::webhook::verify::sign;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -93,6 +95,32 @@ async fn replay_is_idempotent_sqlite() {
             .await
             .expect("count rows");
     assert_eq!(count, 1);
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries")
+        .fetch_one(&pool)
+        .await
+        .expect("count all replay keys");
+    assert_eq!(total, 2, "the GUID and body fingerprint commit together");
+}
+
+#[tokio::test]
+async fn duplicate_fingerprint_does_not_burn_a_fresh_guid_sqlite() {
+    let (_dir, pool) = temp_pool().await;
+    let store = SqliteDeliveryStore::new(pool);
+    assert!(store
+        .reserve_if_new("guid-1", "push", "body-1")
+        .await
+        .unwrap());
+    assert!(!store
+        .reserve_if_new("guid-2", "push", "body-1")
+        .await
+        .unwrap());
+    assert!(
+        store
+            .reserve_if_new("guid-2", "push", "body-2")
+            .await
+            .unwrap(),
+        "a rejected replay must insert neither key, leaving its fresh GUID reusable"
+    );
 }
 
 #[tokio::test]

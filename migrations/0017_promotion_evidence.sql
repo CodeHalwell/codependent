@@ -4,13 +4,18 @@
 
 CREATE TABLE eval_suite_reports (
     id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL REFERENCES promotion_candidates(id) ON DELETE CASCADE,
+    artifact_kind TEXT NOT NULL,
+    artifact_name TEXT NOT NULL,
+    artifact_version INTEGER NOT NULL,
     suite TEXT NOT NULL,
+    routing_policy TEXT NOT NULL,
     report_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
 
-CREATE INDEX ix_eval_suite_reports_created
-    ON eval_suite_reports (created_at DESC);
+CREATE INDEX ix_eval_suite_reports_candidate_created
+    ON eval_suite_reports (candidate_id, created_at DESC);
 
 CREATE TABLE promotion_regression_evidence (
     candidate_id TEXT PRIMARY KEY REFERENCES promotion_candidates(id) ON DELETE CASCADE,

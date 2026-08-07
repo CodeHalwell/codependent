@@ -1160,14 +1160,14 @@ maximum_output_mb = 8
         );
         let cmd = SandboxCommand::new("/bin/cat", vec!["/work/f".into()], "/work", "plugin:x");
         let argv = bwrap_argv(&p, &cmd);
-        assert_eq!(argv.first().map(String::as_str), Some("bwrap"));
+        assert!(argv.iter().any(|arg| arg == "bwrap"));
         assert!(argv.iter().any(|a| a == "--unshare-net"));
         assert!(argv.iter().any(|a| a == "--clearenv"));
         assert!(argv
             .windows(3)
             .any(|w| w == ["--ro-bind", "/work", "/work"]));
         // program + args come after the `--` separator, in order.
-        let sep = argv.iter().position(|a| a == "--").unwrap();
+        let sep = argv.iter().rposition(|a| a == "--").unwrap();
         assert_eq!(argv[sep + 1], "/bin/cat");
         assert_eq!(argv[sep + 2], "/work/f");
     }

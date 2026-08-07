@@ -62,6 +62,7 @@ macro_rules! run_journal {
     ($pool:expr, $broker:expr) => {{
         let persist_pool = $pool.clone();
         let approve_pool = $pool.clone();
+        let state_pool = $pool.clone();
         let approve_broker = $broker.clone();
         RunJournal::new(
             move |session: SessionId, actor: Actor, body: EventBody| {
@@ -104,6 +105,10 @@ macro_rules! run_journal {
                 }
             },
         )
+        .with_state_reader(move |run_id| {
+            let pool = state_pool.clone();
+            async move { projections::load_run_state(&pool, run_id).await }
+        })
     }};
 }
 
