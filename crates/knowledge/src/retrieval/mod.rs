@@ -23,6 +23,7 @@
 mod bm25;
 mod config;
 mod embed;
+mod persist;
 mod vector;
 
 use std::collections::{HashMap, HashSet};
@@ -35,7 +36,11 @@ use crate::types::{
 
 pub use bm25::{Bm25Error, Bm25Index};
 pub use config::{RerankWeights, RetrievalConfig};
-pub use embed::{Embedder, HashingEmbedder, EMBEDDING_DIMENSION};
+pub use embed::{EmbedError, Embedder, HashingEmbedder, SemanticEmbedder, EMBEDDING_DIMENSION};
+pub use persist::{
+    drain_outbox, embedding_content_hash, load_embeddings, reconcile_embeddings, semantic_indexes,
+    upsert_embedding, DrainReport, PersistError, StoredEmbedding,
+};
 pub use vector::VectorIndex;
 
 /// A failure building the derived indexes or running retrieval.
@@ -64,11 +69,20 @@ pub struct RetrievalQuery {
     /// Ids of items that recently succeeded on similar tasks (history source);
     /// empty when no history is available.
     pub history: Vec<RegistryItemId>,
+    /// A pre-computed dense vector for [`text`](Self::text), in the SAME space
+    /// as the indexes' [`VectorIndex`]. `None` (the default) embeds the query
+    /// through the indexes' retained [`Embedder`] — today's behavior. Set by
+    /// [`semantic_indexes`] callers, whose item vectors come from an async
+    /// remote model the sync funnel cannot call: without the override the query
+    /// would be embedded in a different space than the items and dense scoring
+    /// would silently degrade to zero.
+    pub query_vector: Option<Vec<f32>>,
 }
 
 impl RetrievalQuery {
     /// A query with the common defaults: no history, [`TrustTier::Untrusted`]
-    /// floor (admit every tier), and the given text/scopes/ceiling.
+    /// floor (admit every tier), the retained-embedder query vector, and the
+    /// given text/scopes/ceiling.
     #[must_use]
     pub fn new(
         text: impl Into<String>,
@@ -81,6 +95,7 @@ impl RetrievalQuery {
             risk_ceiling,
             min_trust: TrustTier::Untrusted,
             history: Vec::new(),
+            query_vector: None,
         }
     }
 }
@@ -148,6 +163,29 @@ impl RetrievalIndexes {
             embedder: Box::new(embedder),
         })
     }
+
+    /// Assemble indexes from an already-built [`VectorIndex`] (persisted /
+    /// remote-model vectors), building only BM25 over `items` here. `embedder`
+    /// is retained as the query-time fallback; a caller whose vector index came
+    /// from a DIFFERENT embedding space must pass the matching query vector via
+    /// [`RetrievalQuery::query_vector`] — a fallback-embedded query then scores
+    /// dense 0 (cosine of mismatched dims), degrading gracefully rather than
+    /// mis-ranking.
+    pub fn from_parts<E>(
+        items: &[RegistryItem],
+        vector: VectorIndex,
+        embedder: E,
+    ) -> Result<Self, RetrievalError>
+    where
+        E: Embedder + Send + Sync + 'static,
+    {
+        let bm25 = Bm25Index::build(items)?;
+        Ok(Self {
+            vector,
+            bm25,
+            embedder: Box::new(embedder),
+        })
+    }
 }
 
 /// The text a registry item is embedded from: its name, description, and intents
@@ -177,7 +215,12 @@ pub fn retrieve(
         items.iter().map(|item| (item.id, item)).collect();
 
     // ---- Candidate union: four complementary sources ------------------------
-    let query_vec = indexes.embedder.embed(&query.text);
+    // A caller-supplied vector (async/remote model, same space as the index)
+    // wins; otherwise the retained embedder embeds the query as before.
+    let query_vec = match &query.query_vector {
+        Some(vector) => vector.clone(),
+        None => indexes.embedder.embed(&query.text),
+    };
     let dense = indexes.vector.search(&query_vec, config.dense_top);
     let lexical = indexes.bm25.search(&query.text, config.bm25_top)?;
     let exact = exact_match(items, &query.text, config.exact_top);

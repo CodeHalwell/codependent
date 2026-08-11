@@ -114,6 +114,116 @@ pub fn load_models(path: &Path) -> Result<Vec<ModelConfig>> {
 }
 
 // ---------------------------------------------------------------------------
+// models.toml extras: the `[embedding]` entry + `[retrieval]` tuning
+// ---------------------------------------------------------------------------
+
+/// The `[embedding]` entry in `models.toml` (rubric 9 — real embeddings):
+/// names the OpenAI-compatible `/embeddings` endpoint retrieval embeds with.
+/// Absent, retrieval keeps the offline hashing embedder (today's behavior).
+///
+/// ```toml
+/// [embedding]
+/// provider = "openai-compatible"          # the default; may be omitted
+/// base_url = "http://localhost:11434/v1"  # Ollama, OpenAI, Nebius, …
+/// model = "nomic-embed-text"
+/// api_key_env = ""                        # env var NAME; value never stored
+/// dims = 768                              # optional: verified against responses
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingConfig {
+    /// The runtime adapter; only `"openai-compatible"` is wired.
+    #[serde(default = "default_embedding_provider")]
+    pub provider: String,
+    /// The OpenAI-compatible base URL (`POST {base_url}/embeddings`).
+    pub base_url: String,
+    /// Provider-side embedding model name (e.g. `nomic-embed-text`,
+    /// `Qwen/Qwen3-Embedding-8B`).
+    pub model: String,
+    /// The NAME of the environment variable holding the API key, read at call
+    /// time — never persisted (the `ModelConfig::api_key_env` contract). Empty
+    /// means no key (a local endpoint).
+    #[serde(default)]
+    pub api_key_env: String,
+    /// Expected vector dimensionality. `None` accepts whatever the model
+    /// returns; `Some(n)` rejects a mismatched response (a wrong-model guard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dims: Option<usize>,
+}
+
+fn default_embedding_provider() -> String {
+    "openai-compatible".to_string()
+}
+
+/// Default `[retrieval] mcp_top_k`: when a run's MCP bridge offers more than
+/// this many tools, only the `mcp_top_k` most relevant to the run are
+/// advertised (at or below it, all are — today's behavior). `0` disables the
+/// gate entirely (full injection).
+pub const DEFAULT_MCP_TOP_K: usize = 8;
+
+/// The `[retrieval]` tuning table in `models.toml`.
+///
+/// ```toml
+/// [retrieval]
+/// mcp_top_k = 8   # 0 disables retrieval gating (advertise every MCP tool)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalSettings {
+    /// See [`DEFAULT_MCP_TOP_K`].
+    #[serde(default = "default_mcp_top_k")]
+    pub mcp_top_k: usize,
+}
+
+fn default_mcp_top_k() -> usize {
+    DEFAULT_MCP_TOP_K
+}
+
+impl Default for RetrievalSettings {
+    fn default() -> Self {
+        Self {
+            mcp_top_k: DEFAULT_MCP_TOP_K,
+        }
+    }
+}
+
+/// The non-`[[model]]` tables of `models.toml`, parsed independently of
+/// [`load_models`] so both readers ignore each other's keys and an existing
+/// file is back-compatible in both directions.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ModelExtras {
+    /// The `[embedding]` entry, when configured.
+    #[serde(default)]
+    pub embedding: Option<EmbeddingConfig>,
+    /// The `[retrieval]` tuning; every field defaults when the table is absent.
+    #[serde(default)]
+    pub retrieval: RetrievalSettings,
+}
+
+/// Parse the `[embedding]` / `[retrieval]` extras from `models.toml`. An
+/// ABSENT file yields the defaults (no embedding model, default tuning) —
+/// unlike [`load_models`], because these tables are optional configuration and
+/// a daemon with no `models.toml` at all must still assemble context. A
+/// present-but-malformed file is an error, so a typo is legible rather than a
+/// silent fallback.
+pub fn load_model_extras(path: &Path) -> Result<ModelExtras> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ModelExtras::default())
+        }
+        Err(source) => {
+            return Err(ModelsError::ReadConfig {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    toml::from_str(&text).map_err(|source| ModelsError::ParseConfig {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -1244,6 +1354,87 @@ api_key_env = "OPENAI_API_KEY"
         assert_eq!(resolved.id, healthy);
         stale_server.await.unwrap();
         healthy_server.await.unwrap();
+    }
+
+    // -- models.toml extras: [embedding] + [retrieval] ---------------------
+
+    #[test]
+    fn extras_parse_embedding_and_retrieval_alongside_model_entries() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        write!(
+            file,
+            r#"
+[[model]]
+id = "local-default"
+provider = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "qwen2.5-coder:14b"
+api_key_env = ""
+
+[embedding]
+base_url = "http://localhost:11434/v1"
+model = "nomic-embed-text"
+dims = 768
+
+[retrieval]
+mcp_top_k = 5
+"#
+        )
+        .expect("write temp file");
+
+        // Both readers coexist on one file: `load_models` ignores the new
+        // tables; `load_model_extras` ignores the [[model]] entries.
+        let models = load_models(file.path()).expect("model entries still parse");
+        assert_eq!(models.len(), 1);
+        let extras = load_model_extras(file.path()).expect("extras parse");
+        let embedding = extras.embedding.expect("embedding entry present");
+        assert_eq!(embedding.provider, "openai-compatible", "provider defaults");
+        assert_eq!(embedding.base_url, "http://localhost:11434/v1");
+        assert_eq!(embedding.model, "nomic-embed-text");
+        assert_eq!(embedding.api_key_env, "", "api_key_env defaults empty");
+        assert_eq!(embedding.dims, Some(768));
+        assert_eq!(extras.retrieval.mcp_top_k, 5);
+    }
+
+    #[test]
+    fn extras_default_when_tables_or_file_are_absent() {
+        // A models.toml with only [[model]] entries (the existing shape) yields
+        // the defaults: no embedding model, default MCP top-k.
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        write!(
+            file,
+            r#"
+[[model]]
+id = "hosted-default"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5.1-codex"
+api_key_env = "OPENAI_API_KEY"
+"#
+        )
+        .expect("write temp file");
+        let extras = load_model_extras(file.path()).expect("extras parse");
+        assert_eq!(extras.embedding, None);
+        assert_eq!(extras.retrieval.mcp_top_k, DEFAULT_MCP_TOP_K);
+
+        // No file at all: defaults too (context assembly must not need one).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extras =
+            load_model_extras(&dir.path().join("models.toml")).expect("absent file defaults");
+        assert_eq!(extras, ModelExtras::default());
+    }
+
+    #[test]
+    fn malformed_extras_are_a_legible_error_not_a_silent_default() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        write!(file, "[embedding]\nmodel = 42\n").expect("write temp file");
+        assert!(
+            matches!(
+                load_model_extras(file.path()),
+                Err(ModelsError::ParseConfig { .. })
+            ),
+            "a typo'd [embedding] table must error, never silently disable embeddings"
+        );
     }
 
     // -- authority_from_base_url -------------------------------------------

@@ -24,7 +24,7 @@ use crate::codegraph::CodeGraphError;
 use crate::memory::{MemoryError, MemoryStore};
 use crate::registry::{Registry, RegistryError};
 use crate::retrieval::{
-    retrieve, HashingEmbedder, RetrievalConfig, RetrievalError, RetrievalIndexes, RetrievalQuery,
+    retrieve, semantic_indexes, RetrievalConfig, RetrievalError, RetrievalQuery, SemanticEmbedder,
 };
 use crate::types::{EvidenceRef, MemoryRecord, RiskClass, Scope, ToolCard, TrustTier};
 
@@ -221,6 +221,22 @@ pub async fn assemble_context(
     objective: &str,
     scopes: &[Scope],
 ) -> Result<ContextManifest, ContextError> {
+    assemble_context_with(pool, repository, objective, scopes, None).await
+}
+
+/// [`assemble_context`] with an injected embedding model (the `FactExtractor`
+/// injection pattern): when `semantic` is `Some`, dense retrieval runs over the
+/// persisted `registry_embeddings` vectors that model produced (missing items —
+/// and the query — embedded in one batch call), instead of the offline hashing
+/// embedder. `None` — or any model failure — keeps the exact pre-embedding
+/// behavior, so an unconfigured `models.toml` changes nothing.
+pub async fn assemble_context_with(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    objective: &str,
+    scopes: &[Scope],
+    semantic: Option<&dyn SemanticEmbedder>,
+) -> Result<ContextManifest, ContextError> {
     // 1. Repository map — fold the persisted graph into the compact tree.
     let repository_map = crate::repomap::repository_map(pool, repository)
         .await?
@@ -228,12 +244,13 @@ pub async fn assemble_context(
 
     // 2. Retrieve the disclosed tool + skill cards over the whole registry.
     let items = Registry::new().list(pool).await?;
-    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new())?;
-    let query = RetrievalQuery::new(
+    let (indexes, query_vector) = semantic_indexes(pool, &items, semantic, objective).await?;
+    let mut query = RetrievalQuery::new(
         objective,
         visible_scopes(repository, scopes),
         RiskClass::Medium,
     );
+    query.query_vector = query_vector;
     let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default())?;
     let tool_cards = result.tools.iter().map(ContextCard::from_card).collect();
     let skill_cards = result.skills.iter().map(ContextCard::from_card).collect();
