@@ -1152,6 +1152,20 @@ pub struct UiViewport {
     pub density: Option<f64>,
 }
 
+/// Sustained worker-to-host message rate, in messages per second.
+///
+/// A worker's self-imposed budget must never exceed the host's, or a
+/// legitimate burst is a *kill* (the host drops the worker on
+/// `MessageRateExceeded`) instead of a recoverable local error the worker can
+/// coalesce around. These two constants are the single source for both sides
+/// and are mirrored in `sdk/ui/src/protocol.ts` as
+/// `UI_WORKER_MESSAGE_RATE_PER_SECOND` / `UI_WORKER_MESSAGE_BURST`.
+pub const UI_WORKER_MESSAGE_RATE_PER_SECOND: u32 = 240;
+
+/// Burst allowance above [`UI_WORKER_MESSAGE_RATE_PER_SECOND`] for the
+/// snapshot-then-patch storm a surface emits when it first mounts.
+pub const UI_WORKER_MESSAGE_BURST: u32 = 120;
+
 /// Hard resource ceilings applied before a tree or patch reaches a renderer.
 /// Defaults are deliberately conservative enough for a full-screen app while
 /// bounding CPU, allocation, and pathological recursive/value input.

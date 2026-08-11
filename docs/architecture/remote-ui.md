@@ -106,7 +106,7 @@ The shared component library covers these families:
 
 | Family | Primitives |
 | --- | --- |
-| Layout | box, stack, row, grid, split, spacer, divider, scroll area, virtual list |
+| Layout | box, stack, row, grid, split, spacer, scroll area, virtual list, portal |
 | Content | text, markdown, code, diff, image, audio, JSON tree, log viewer |
 | Data | list, table, tree, key/value, timeline, graph, chart, sparkline |
 | Feedback | badge, progress, spinner, alert, toast, empty state, error boundary |
@@ -116,6 +116,24 @@ The shared component library covers these families:
 
 Properties express meaning rather than CSS or terminal coordinates. Layout
 sizes are constraints; the client performs definitive measurement and clipping.
+
+Two layout properties carry a shape worth naming, because both hosts normalize
+them identically:
+
+- **`Grid.columns`** is either a track *count* (`columns={3}` — three equal
+  tracks) or an explicit *track list* (`columns={["2fr", "1fr"]}`, also
+  accepting `"40%"`, `"auto"`, and plain cell counts). A count above 24 tracks
+  is clamped. `Table.columns` is unrelated: there it is the column-descriptor
+  list.
+- **`Split.ratio`** weights the first pane; every later pane is weighted
+  `1 - ratio`. It is clamped to `0.1..=0.9`, and `Split.direction` selects a
+  row or a column of panes.
+
+`Graph` carries `nodes` plus a top-level `edges: [{ from, to }]` array
+(endpoints are node ids, falling back to labels). Hosts draw it as a layered
+DAG — longest-path layering, honouring `direction` — and degrade to an
+adjacency list, then a node card list, when the viewport or the data cannot
+support a diagram.
 
 Domain cards such as tool calls, approvals, patches, workflow nodes, tests,
 traces and permission diffs are library components composed from these
@@ -180,7 +198,12 @@ origin-labelled, and redacted.
 
 Startup is a bounded capabilities offer, intersection selection and explicit
 readiness handshake. A ready worker is subject to total-message, message-rate,
-wall-clock and heartbeat limits. Graceful disposal has a short acknowledgement
+wall-clock and heartbeat limits. The message-rate ceiling
+(`UI_WORKER_MESSAGE_RATE_PER_SECOND` + `UI_WORKER_MESSAGE_BURST`, 240/s + 120)
+lives in the shared protocol crate and is mirrored by the SDK, which defaults a
+worker's *self-imposed* budget to the same numbers. A worker permitted to send
+more than the host accepts turns a legitimate mount-time patch burst into a
+kill instead of a recoverable local error it can coalesce around. Graceful disposal has a short acknowledgement
 deadline followed by deterministic process-group termination and reaping.
 Unexpected exits, heartbeat loss and protocol violations feed exponential
 restart backoff and a per-plugin rolling-window circuit breaker. Resync requests
@@ -269,7 +292,7 @@ document props cannot claim core identity or hide the extension boundary.
 ## Performance and recovery
 
 Clients coalesce compatible patch batches, virtualise large collections, cache
-measurement, and skip unchanged subtrees. Plugin updates are frame-budgeted and
+measurement for the duration of a frame, and skip unchanged subtrees. Plugin updates are frame-budgeted and
 may be throttled independently from first-party state.
 
 On a component crash or deadline:
