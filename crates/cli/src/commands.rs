@@ -11,7 +11,8 @@ use base64::Engine as _;
 use codypendent_daemon::policy::{ApprovalAction, MergedPolicy, PolicyEngine};
 use codypendent_integrations::mcp::{load_mcp_config, McpConfig};
 use codypendent_knowledge::{
-    db as knowledge_db, plan_publication, publications, register_builtins, retrieve, DocumentStore,
+    anchor_repository_id, db as knowledge_db, install_package, is_retrievable_status,
+    plan_publication, publications, register_builtins, retrieve, user_skills_root, DocumentStore,
     HashingEmbedder, Publication, PublishTarget as KnowledgePublishTarget, Registry,
     RetrievalConfig, RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
 };
@@ -594,6 +595,54 @@ pub async fn index_rebuild(paths: &RuntimePaths) -> anyhow::Result<()> {
         result.tools.len(),
         result.skills.len(),
     );
+    Ok(())
+}
+
+/// `codypendent skill add <dir>`: validate the skill package at `dir`, install a
+/// copy under `<data_dir>/skills/<id>/`, and register it into the governed
+/// registry so retrieval can disclose it to a run.
+///
+/// Self-contained like `index rebuild` — it opens the database directly rather
+/// than requiring a running daemon, and the daemon's own startup scan re-walks
+/// the same root on its next boot, so an install taken while the daemon is down
+/// is picked up rather than lost.
+///
+/// A package declaring `scope = "repository"` anchors to the checkout `dir`
+/// lives in (its Git toplevel), derived exactly as the daemon derives a run's
+/// repository identity — a mismatch there would register the skill under an
+/// identity no run ever queries, leaving it silently invisible.
+///
+/// A non-`active` package installs and registers, but is reported loudly: the
+/// retrieval funnel hard-filters everything but Active, so a draft skill is
+/// installed-but-never-disclosed, and that is precisely the failure mode the
+/// only shipped package spent its life in.
+pub async fn skill_add(paths: &RuntimePaths, dir: &std::path::Path) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = knowledge_db::open(&database_path)
+        .await
+        .with_context(|| format!("opening {}", database_path.display()))?;
+
+    let skills_root = user_skills_root(&paths.data_dir);
+    let anchor = anchor_repository_id(dir);
+    let (item, installed) = install_package(&pool, dir, &skills_root, anchor)
+        .await
+        .with_context(|| format!("installing the skill package at {}", dir.display()))?;
+
+    println!(
+        "installed skill {} {} ({}) -> {}",
+        item.name,
+        item.version.0,
+        item.scope.tier(),
+        installed.display()
+    );
+    if !is_retrievable_status(item.status) {
+        println!(
+            "warning: status is {:?}, so retrieval will never disclose this skill \
+             — set `status = \"active\"` in skill.toml and re-add it",
+            item.status
+        );
+    }
     Ok(())
 }
 
