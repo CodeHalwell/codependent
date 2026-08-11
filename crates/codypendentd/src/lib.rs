@@ -14,6 +14,7 @@
 //! the server.
 
 mod blackboard;
+mod docs_job;
 mod documents;
 mod executor;
 mod promotion;

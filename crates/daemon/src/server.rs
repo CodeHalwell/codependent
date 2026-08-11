@@ -39,7 +39,8 @@ use crate::artifacts::ArtifactStore;
 use crate::blackboard::{BlackboardHub, BlackboardReader, ReadBlackboardRequest};
 use crate::commands::{ApplyContext, CommandProcessor};
 use crate::documents::{
-    DocumentHub, DocumentLeaseReleaseRequest, DocumentLeaseRequest, DocumentLeaser,
+    DocsCheckRequest, DocumentCreateRequest, DocumentCreator, DocumentHub,
+    DocumentLeaseReleaseRequest, DocumentLeaseRequest, DocumentLeaser, DocumentMaintainer,
     DocumentMutationRequest, DocumentMutator, DocumentPublisher, PublishDocumentRequest,
 };
 use crate::executor::{RunExecutor, RunLaunch};
@@ -121,6 +122,15 @@ pub struct ServerState {
     /// `document.transport-unavailable`); injected together with `mutator` by the
     /// assembly.
     pub leaser: Option<Arc<dyn DocumentLeaser>>,
+    /// Creates a collaborative document from an accepted `CreateDocument` (rubric
+    /// #4 doc-writer). `None` in a lib-only / test embedding (the command is then
+    /// rejected `document.transport-unavailable`); injected together with
+    /// `mutator`/`leaser` by the assembly.
+    pub creator: Option<Arc<dyn DocumentCreator>>,
+    /// Runs the documentation staleness sweep for an accepted `CheckDocuments`
+    /// (`/update-docs`, Phase 4 STEP 4.6). `None` in a lib-only / test embedding
+    /// (the command is then rejected `document.transport-unavailable`).
+    pub maintainer: Option<Arc<dyn DocumentMaintainer>>,
     /// Creates a durable run from an accepted `StartWorkflow` (Phase 5 STEP 5.2).
     /// `None` in a lib-only / test embedding (the command is then rejected
     /// `workflow.transport-unavailable`); the assembly injects a
@@ -277,6 +287,8 @@ pub async fn run_with_executor_on(
     let mutator = executor.as_ref().and_then(|e| e.document_mutator());
     let leaser = executor.as_ref().and_then(|e| e.document_leaser());
     let publisher = executor.as_ref().and_then(|e| e.document_publisher());
+    let creator = executor.as_ref().and_then(|e| e.document_creator());
+    let maintainer = executor.as_ref().and_then(|e| e.document_maintainer());
     let starter = executor.as_ref().and_then(|e| e.workflow_starter());
     let lifecycle = executor.as_ref().and_then(|e| e.workflow_lifecycle());
     let promotion = executor.as_ref().and_then(|e| e.promotion_gateway());
@@ -387,6 +399,8 @@ pub async fn run_with_executor_on(
         documents,
         mutator,
         leaser,
+        creator,
+        maintainer,
         starter,
         lifecycle,
         publisher,
@@ -994,6 +1008,110 @@ async fn handle_request(
                                 true,
                             )),
                         ),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Creating a collaborative document goes to the knowledge fabric,
+                // not the session ledger, so it is intercepted here exactly like
+                // `MutateDocument` below. Creating is a write, so — as with a
+                // non-resolving mutation — an Observer may not do it.
+                CommandBody::CreateDocument {
+                    title,
+                    scope,
+                    repository,
+                    initial_markdown,
+                } => {
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not create documents".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(creator) = state.creator.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "document.transport-unavailable",
+                                "document transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let create = DocumentCreateRequest {
+                        title: title.clone(),
+                        scope: scope.clone(),
+                        repository: repository.clone(),
+                        initial_markdown: initial_markdown.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match creator.create(create).await {
+                        Ok(document_id) => Envelope::reply_to(
+                            &request,
+                            Payload::DocumentCreated {
+                                command_id: command.command_id,
+                                document_id,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // The `/update-docs` staleness sweep: it FILES SUGGESTIONS (never
+                // direct edits), so it is a write and an Observer may not run it.
+                // Intercepted here like the other document commands.
+                CommandBody::CheckDocuments {
+                    repository,
+                    session_id,
+                } => {
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not run the documentation check".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(maintainer) = state.maintainer.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "document.transport-unavailable",
+                                "document transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let check = DocsCheckRequest {
+                        repository: repository.clone(),
+                        session_id: *session_id,
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match maintainer.check(check).await {
+                        Ok(report) => Envelope::reply_to(
+                            &request,
+                            Payload::DocsCheckCompleted {
+                                command_id: command.command_id,
+                                documents_checked: report.documents_checked,
+                                links_resolved: report.links_resolved,
+                                stale_findings: report.stale_findings,
+                                suggestions_filed: report.suggestions_filed,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
                     };
                     send(writer, &reply).await?;
                 }

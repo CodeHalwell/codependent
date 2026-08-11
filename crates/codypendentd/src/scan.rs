@@ -99,7 +99,11 @@ pub fn discover_repository_root(root: &Path) -> Option<PathBuf> {
 /// The working tree's `HEAD` commit as a [`GitRevision`], or the `"workdir"`
 /// placeholder when Git is unavailable or `root` is not a repository. Shelling
 /// out keeps this free of a Git library dependency.
-fn head_revision(root: &Path) -> GitRevision {
+///
+/// Crate-visible because the `/update-docs` sweep labels its staleness findings
+/// with the same revision the scan resolved links at (`crate::docs_job`).
+#[must_use]
+pub fn head_revision(root: &Path) -> GitRevision {
     let head = std::process::Command::new("git")
         .arg("-C")
         .arg(root)

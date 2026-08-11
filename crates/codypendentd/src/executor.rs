@@ -2078,6 +2078,28 @@ impl RunExecutor for RuntimeExecutor {
         )))
     }
 
+    fn document_creator(&self) -> Option<Arc<dyn codypendent_daemon::documents::DocumentCreator>> {
+        // Create a document from `CreateDocument`, importing any seed Markdown
+        // into typed blocks. Falls back to this daemon's startup checkout when a
+        // request names no repository, exactly as the publisher does.
+        Some(Arc::new(crate::docs_job::KnowledgeDocumentCreator::new(
+            self.pool.clone(),
+            self.startup_repository_root.clone(),
+        )))
+    }
+
+    fn document_maintainer(
+        &self,
+    ) -> Option<Arc<dyn codypendent_daemon::documents::DocumentMaintainer>> {
+        // The `/update-docs` staleness sweep. Shares the daemon's fan-out so a
+        // sweep asked to report into a session reaches attached clients live.
+        Some(Arc::new(crate::docs_job::KnowledgeDocumentMaintainer::new(
+            self.pool.clone(),
+            self.startup_repository_root.clone(),
+            self.subscriptions.clone(),
+        )))
+    }
+
     fn document_publisher(
         &self,
     ) -> Option<Arc<dyn codypendent_daemon::documents::DocumentPublisher>> {

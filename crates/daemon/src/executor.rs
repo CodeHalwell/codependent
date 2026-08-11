@@ -172,6 +172,27 @@ pub trait RunExecutor: Send + Sync {
         None
     }
 
+    /// The assembly-provided [`DocumentCreator`](crate::documents::DocumentCreator)
+    /// that creates a collaborative document from an accepted `CreateDocument`
+    /// command (rubric #4 doc-writer). Bundled with the other document seams for
+    /// the same reason — it names `codypendent-knowledge`, which only the
+    /// assembly can. The default `None` leaves creation unwired (rejected
+    /// `document.transport-unavailable`).
+    fn document_creator(&self) -> Option<std::sync::Arc<dyn crate::documents::DocumentCreator>> {
+        None
+    }
+
+    /// The assembly-provided [`DocumentMaintainer`](crate::documents::DocumentMaintainer)
+    /// that runs the documentation staleness sweep for an accepted
+    /// `CheckDocuments` command (`/update-docs`, Phase 4 STEP 4.6). Bundled with
+    /// the other document seams; the default `None` leaves the sweep unwired
+    /// (rejected `document.transport-unavailable`).
+    fn document_maintainer(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::documents::DocumentMaintainer>> {
+        None
+    }
+
     /// The assembly-provided [`DocumentPublisher`](crate::documents::DocumentPublisher)
     /// that computes an accepted `PublishDocument` command's plan, parks its
     /// approval, and (once approved) executes it (Phase 4 STEP 4.4). Bundled with
