@@ -240,6 +240,8 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::ScrollPageUp => scroll_page(state, true),
         Action::ScrollPageDown => scroll_page(state, false),
         Action::Expand => expand_selected(state),
+        Action::BrowseFoldPrev => browse_fold(state, -1),
+        Action::BrowseFoldNext => browse_fold(state, 1),
         Action::RemoveApiKey => begin_remove_key(state),
 
         Action::PrevRun => cycle_run(state, -1),
@@ -310,9 +312,17 @@ pub fn reduce(state: &mut AppState, action: Action) {
             });
             detach_history_on_edit(state);
         }
+        // `Alt-Enter` expands the browsed transcript fold when one is under the
+        // cursor (the keyboard path to tool cards and patch diffs), and is a
+        // plain line break otherwise. The input mapper is stateless, so the
+        // decision lives here, where the browse flag does.
         Action::InputNewline => {
-            edit_prompt(state, |buf| buf.push('\n'));
-            detach_history_on_edit(state);
+            if state.transcript_browse && matches!(state.overlay, Overlay::None) {
+                expand_selected(state);
+            } else {
+                edit_prompt(state, |buf| buf.push('\n'));
+                detach_history_on_edit(state);
+            }
         }
         Action::InputSubmit => submit_prompt(state),
         Action::InputCancel => input_cancel(state),
@@ -1689,6 +1699,8 @@ fn scroll_page(state: &mut AppState, up: bool) {
         request_edge_page(state, page);
         return;
     }
+    // Scrolling means the user is driving the viewport, not the fold cursor.
+    end_browse(state);
     const PAGE: u16 = 10;
     // The renderer cached the true bottom last frame; use it so leaving follow
     // mode starts a page up from the bottom (not a jump to the top), and paging
@@ -1719,13 +1731,69 @@ fn request_edge_page(state: &mut AppState, page: usize) {
     });
 }
 
+/// `Alt-↑`/`Alt-↓`: walk the selected run's *foldable* entries — tool cards,
+/// patch diffs, the backstage fold, long notes, failed-run errors — and mark
+/// the transcript as being browsed, so the renderer highlights the landing
+/// entry, keeps it in the viewport, and `Alt-Enter` expands it. Stepping only
+/// over foldable entries means every stop has something to open (the mouse's
+/// click targets are exactly this set — see `TranscriptEntry::is_foldable`).
+/// A no-op when the selected run has no foldable entry at all.
+fn browse_fold(state: &mut AppState, delta: i32) {
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    let browsing = state.transcript_browse;
+    let Some(run) = state.selected_run_mut() else {
+        return;
+    };
+    let folds: Vec<usize> = run
+        .transcript
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.is_foldable())
+        .map(|(idx, _)| idx)
+        .collect();
+    let Some(&last) = folds.last() else {
+        return;
+    };
+    // The first Alt-↑/Alt-↓ enters browse mode at the newest fold (the one the
+    // tail of the conversation is showing); later presses walk from there.
+    if !browsing {
+        run.transcript_selected = last;
+        state.transcript_browse = true;
+        return;
+    }
+    let current = run.transcript_selected;
+    let position = folds
+        .iter()
+        .position(|&idx| idx == current)
+        .unwrap_or(folds.len() - 1);
+    let next = if delta < 0 {
+        position.saturating_sub(1)
+    } else {
+        (position + 1).min(folds.len() - 1)
+    };
+    run.transcript_selected = folds[next];
+}
+
+/// Leave transcript-browse mode: the selection stops being highlighted and
+/// `Alt-Enter` goes back to inserting a line break. Called by every gesture
+/// that means "I am driving the composer or the viewport again".
+fn end_browse(state: &mut AppState) {
+    state.transcript_browse = false;
+}
+
 fn expand_selected(state: &mut AppState) {
     // In the memory browser, `Enter` opens the focused memory's source.
     if matches!(state.overlay, Overlay::Memory { .. }) {
         open_source(state);
         return;
     }
-    if state.focus != Pane::Transcript {
+    // The transcript fold is reachable from the base conversation — by click
+    // (`ActivateRow`) or by `Alt-Enter` while browsing — and from the
+    // workspace transcript pane. An open browser overlay owns `Enter` for its
+    // own list, so it must not silently toggle a fold behind the modal.
+    if !matches!(state.overlay, Overlay::None) && state.focus != Pane::Transcript {
         return;
     }
     let idx = state.selected_run;
@@ -2286,6 +2354,9 @@ fn begin_remove_key(state: &mut AppState) {
 fn detach_history_on_edit(state: &mut AppState) {
     if matches!(state.overlay, Overlay::None) {
         state.history_cursor = None;
+        // Typing means the composer, not the transcript, has the user's
+        // attention: leave fold-browse mode so `Alt-Enter` is a line break again.
+        end_browse(state);
     }
 }
 
@@ -2361,6 +2432,13 @@ fn input_cancel(state: &mut AppState) {
         }
         return;
     }
+    // `Esc` while browsing folds steps out of browse mode first, so an
+    // in-progress draft is never destroyed by a keypress the user meant as
+    // "stop browsing".
+    if state.transcript_browse && matches!(state.overlay, Overlay::None) {
+        end_browse(state);
+        return;
+    }
     match state.overlay {
         Overlay::None => state.composer.clear(),
         // Abandoning the block-edit prompt returns to the browser, not the base
@@ -2377,6 +2455,8 @@ fn input_cancel(state: &mut AppState) {
 /// Switch the conversation to another run (`Ctrl-↑/↓`), clamping at the ends.
 fn cycle_run(state: &mut AppState, delta: i32) {
     step(&mut state.selected_run, state.runs.len(), delta);
+    // The browsed fold belonged to the run we just left.
+    end_browse(state);
 }
 
 /// Set the open list overlay's `selected` to `n`, mirroring `nav`'s picker
@@ -2490,6 +2570,10 @@ fn activate_row(state: &mut AppState, n: usize) {
             if let Some(run) = state.runs.get_mut(idx) {
                 if n < run.transcript.len() {
                     run.transcript_selected = n;
+                    // A clicked fold becomes the browsed one, so the keyboard
+                    // can carry on from where the mouse left off (and the row
+                    // the click landed on is visibly selected).
+                    state.transcript_browse = true;
                 }
             }
             expand_selected(state);
@@ -8225,5 +8309,286 @@ mod tests {
             0,
             "already-cached entry re-parsed"
         );
+    }
+
+    // --- Alt-↑/↓ + Alt-Enter: the keyboard path to tool cards and diffs ---
+
+    /// Builds a run whose transcript is: [0] User objective, [1] Tool card,
+    /// [2] Model prose, [3] Patch — two folds separated by a non-foldable
+    /// entry, so a walk that stepped one *entry* at a time would land on
+    /// something with nothing to open.
+    fn run_with_two_folds() -> AppState {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc".to_owned(),
+                label: Some("cargo test".to_owned()),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "on it".to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::PatchProposed {
+                run_id,
+                changeset_id: ChangeSetId::new(),
+                artifact: artifact(),
+                files: vec!["src/lib.rs".to_owned()],
+                additions: 2,
+                deletions: 1,
+                preview: "@@ -1 +1 @@\n-old\n+new".to_owned(),
+                preview_truncated: false,
+            }),
+        );
+        assert!(matches!(s.runs[0].transcript[1], TranscriptEntry::Tool(_)));
+        assert!(matches!(
+            s.runs[0].transcript[2],
+            TranscriptEntry::Model { .. }
+        ));
+        assert!(matches!(s.runs[0].transcript[3], TranscriptEntry::Patch(_)));
+        s
+    }
+
+    fn tool_expanded(s: &AppState) -> bool {
+        let TranscriptEntry::Tool(card) = &s.runs[0].transcript[1] else {
+            unreachable!()
+        };
+        card.expanded
+    }
+
+    fn patch_expanded(s: &AppState) -> bool {
+        let TranscriptEntry::Patch(patch) = &s.runs[0].transcript[3] else {
+            unreachable!()
+        };
+        patch.expanded
+    }
+
+    #[test]
+    fn alt_arrows_walk_only_foldable_entries_and_alt_enter_expands_them() {
+        let mut s = run_with_two_folds();
+        assert!(!s.transcript_browse, "the base view composes by default");
+
+        // The first Alt-↑ enters browse mode at the NEWEST fold — the one the
+        // tail of the conversation is already showing.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert!(s.transcript_browse);
+        assert_eq!(
+            s.runs[0].transcript_selected, 3,
+            "entered at the newest fold"
+        );
+
+        // Alt-Enter expands it: the diff renderer was unreachable before this.
+        reduce(&mut s, Action::InputNewline);
+        assert!(patch_expanded(&s), "Alt-Enter expands the browsed patch");
+        assert!(
+            s.composer.is_empty(),
+            "Alt-Enter while browsing must not type a newline into the draft"
+        );
+        reduce(&mut s, Action::InputNewline);
+        assert!(!patch_expanded(&s), "Alt-Enter toggles it back");
+
+        // Alt-↑ SKIPS the model prose at index 2 (nothing to open there).
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!(
+            s.runs[0].transcript_selected, 1,
+            "skipped the non-foldable model entry"
+        );
+        reduce(&mut s, Action::InputNewline);
+        assert!(tool_expanded(&s), "Alt-Enter expands the browsed tool card");
+
+        // Saturates at the oldest fold rather than wrapping into the objective…
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!(s.runs[0].transcript_selected, 1);
+        // …and walks forward again.
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert_eq!(s.runs[0].transcript_selected, 3);
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert_eq!(
+            s.runs[0].transcript_selected, 3,
+            "saturates at the newest fold"
+        );
+    }
+
+    #[test]
+    fn alt_enter_is_still_a_line_break_when_not_browsing() {
+        let mut s = run_with_two_folds();
+        reduce(&mut s, Action::InputChar('h'));
+        reduce(&mut s, Action::InputNewline);
+        reduce(&mut s, Action::InputChar('i'));
+        assert_eq!(s.composer, "h\ni");
+        assert!(!tool_expanded(&s) && !patch_expanded(&s));
+    }
+
+    #[test]
+    fn typing_scrolling_esc_and_run_switching_leave_browse_mode() {
+        // Browse mode is a transient "the transcript has my attention" state:
+        // every gesture meaning "I am driving the composer or the viewport
+        // again" ends it, so Alt-Enter is a line break once more.
+        let mut s = run_with_two_folds();
+
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(&mut s, Action::InputChar('x'));
+        assert!(!s.transcript_browse, "typing returns to composing");
+        assert_eq!(s.composer, "x");
+
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(&mut s, Action::ScrollPageUp);
+        assert!(
+            !s.transcript_browse,
+            "scrolling drives the viewport by hand"
+        );
+
+        // Esc steps out of browse mode WITHOUT destroying the draft; a second
+        // Esc then clears the draft as it always did.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(&mut s, Action::InputCancel);
+        assert!(!s.transcript_browse);
+        assert_eq!(s.composer, "x", "Esc out of browse mode keeps the draft");
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.composer, "", "a second Esc clears the draft");
+
+        // Switching runs abandons a selection that belonged to the other run.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(&mut s, Action::PrevRun);
+        assert!(!s.transcript_browse);
+    }
+
+    #[test]
+    fn browsing_is_a_no_op_without_folds_or_under_an_overlay() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // Only the User objective — nothing foldable.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert!(!s.transcript_browse, "no fold to browse, no browse mode");
+
+        // An open overlay owns the arrows; browsing must not run underneath it.
+        let mut s = run_with_two_folds();
+        s.overlay = Overlay::Help;
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert!(!s.transcript_browse);
+    }
+
+    #[test]
+    fn expand_no_longer_needs_the_unreachable_transcript_pane_focus() {
+        // The old guard required `focus == Pane::Transcript`, which `Tab` could
+        // not reach from the base view — that is what made tool cards and patch
+        // diffs dead UI. In the base view (no overlay) the fold expands from
+        // whatever the vestigial pane focus happens to be.
+        let mut s = run_with_two_folds();
+        s.focus = Pane::Sessions;
+        s.runs[0].transcript_selected = 1;
+        reduce(&mut s, Action::Expand);
+        assert!(tool_expanded(&s));
+
+        // A browser overlay still owns Enter for its own list: no silent
+        // toggling of a fold hidden behind the modal.
+        let mut s = run_with_two_folds();
+        s.focus = Pane::Sessions;
+        s.overlay = Overlay::Skills;
+        s.runs[0].transcript_selected = 1;
+        reduce(&mut s, Action::Expand);
+        assert!(!tool_expanded(&s));
+    }
+
+    #[test]
+    fn clicking_a_fold_row_hands_the_keyboard_the_same_selection() {
+        // RULE 3 both ways: a click selects + toggles and leaves the fold
+        // browsable, so Alt-↑ carries on from the clicked row.
+        let mut s = run_with_two_folds();
+        reduce(&mut s, Action::ActivateRow(3));
+        assert!(patch_expanded(&s));
+        assert!(s.transcript_browse, "the clicked fold is the browsed fold");
+        assert_eq!(s.runs[0].transcript_selected, 3);
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!(
+            s.runs[0].transcript_selected, 1,
+            "the keyboard continues from the click"
+        );
+    }
+
+    #[test]
+    fn every_foldable_entry_kind_is_reachable_by_both_click_and_keyboard() {
+        // `TranscriptEntry::is_foldable` is the single predicate the renderer's
+        // click targets and the Alt-↑/↓ walk share, so this list IS the parity
+        // guarantee.
+        let tool = TranscriptEntry::Tool(Box::new(crate::state::ToolCard {
+            tool: "shell.run".to_owned(),
+            status: crate::state::ToolStatus::Running,
+            action: None,
+            args_digest: None,
+            label: None,
+            outcome: None,
+            artifact: None,
+            approval_id: None,
+            expanded: false,
+        }));
+        assert!(tool.is_foldable(), "tool cards were the dead feature");
+        assert!(TranscriptEntry::Patch(PatchSummary {
+            changeset_id: ChangeSetId::new(),
+            artifact: artifact(),
+            files: vec!["a.rs".to_owned()],
+            additions: 1,
+            deletions: 0,
+            preview: "@@".to_owned(),
+            preview_truncated: false,
+            expanded: false,
+        })
+        .is_foldable());
+        assert!(TranscriptEntry::Backstage {
+            context_lines: Some(3),
+            memory_updates: 0,
+            raw: vec!["x".to_owned()],
+            expanded: false,
+        }
+        .is_foldable());
+        assert!(TranscriptEntry::Note {
+            text: "a\nb\nc".to_owned(),
+            expanded: false,
+        }
+        .is_foldable());
+        assert!(
+            !TranscriptEntry::Note {
+                text: "one liner".to_owned(),
+                expanded: false,
+            }
+            .is_foldable(),
+            "a short note renders inline — there is nothing to unfold"
+        );
+        assert!(TranscriptEntry::Completed {
+            disposition: RunDisposition::Failed {
+                reason: "boom".to_owned()
+            },
+            expanded: false,
+        }
+        .is_foldable());
+        assert!(!TranscriptEntry::User {
+            text: "hi".to_owned()
+        }
+        .is_foldable());
     }
 }

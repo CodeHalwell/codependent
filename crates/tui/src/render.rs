@@ -29,6 +29,7 @@ use crate::state::{
     filter_providers, AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus, DocLeaseState,
     KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, ModelReadiness, Overlay, Pane,
     PatchSummary, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    NOTE_INLINE_LINE_THRESHOLD,
 };
 use crate::theme::Theme;
 use crate::{render_remote_ui, RemoteUiRenderOptions};
@@ -938,6 +939,10 @@ struct Row<'a> {
     /// A full-width background for this row (the `You` container). Cosmetic —
     /// `columns()`/`rows()` ignore it; applied only to visible rows at build.
     bg: Option<Color>,
+    /// Whether this row belongs to the browsed (`Alt-↑`/`Alt-↓`) transcript
+    /// entry. The measure pass sums these rows' offsets so the viewport can
+    /// keep the browsed fold in sight.
+    selected: bool,
 }
 
 enum RowKind<'a> {
@@ -960,6 +965,7 @@ impl<'a> Row<'a> {
             kind: RowKind::Built(line),
             hit_entry: None,
             bg: None,
+            selected: false,
         }
     }
     fn model(prefix: &'static str, text: &'a str, caret: bool, style: Style) -> Self {
@@ -972,6 +978,7 @@ impl<'a> Row<'a> {
             },
             hit_entry: None,
             bg: None,
+            selected: false,
         }
     }
     fn rich(rl: &'a crate::markdown::RichLine) -> Self {
@@ -979,6 +986,7 @@ impl<'a> Row<'a> {
             kind: RowKind::Rich(rl),
             hit_entry: None,
             bg: None,
+            selected: false,
         }
     }
     /// Wrapped visual-row height, allocation-free: drives the same
@@ -1084,6 +1092,7 @@ fn for_each_row<'a>(
     runs: &'a [RunView],
     theme: &Theme,
     selected_run: usize,
+    browsed: Option<usize>,
     mut visit: impl FnMut(Row<'a>),
 ) {
     let mut awaiting_header = false;
@@ -1172,7 +1181,11 @@ fn for_each_row<'a>(
                 },
                 other => {
                     scratch.clear();
-                    entry_lines(other, theme, false, false, &mut scratch);
+                    // Highlighted only while the transcript is being BROWSED
+                    // (`Alt-↑`/`Alt-↓`); a stale `transcript_selected` from an
+                    // earlier click must not paint a selection nobody asked for.
+                    let selected = run_idx == selected_run && browsed == Some(idx);
+                    entry_lines(other, theme, selected, false, &mut scratch);
                     let hit = if run_idx == selected_run {
                         fold_hit_entry(other, idx)
                     } else {
@@ -1192,6 +1205,7 @@ fn for_each_row<'a>(
                             );
                         }
                         let mut row = Row::built(line);
+                        row.selected = selected;
                         if j == 0 {
                             row.hit_entry = hit;
                         }
@@ -1217,29 +1231,49 @@ fn for_each_row<'a>(
     }
 }
 
-/// The entry index if this entry renders a clickable fold HEAD (its first line):
-/// a backstage summary, a folded (multi-line) note, or a failed-run summary.
+/// The entry index if this entry renders a clickable fold HEAD (its first
+/// line): a tool card, a patch diff, a backstage summary, a folded
+/// (multi-line) note, or a failed-run summary. Delegates to
+/// [`TranscriptEntry::is_foldable`], the same predicate `Alt-↑`/`Alt-↓` walk,
+/// so click targets and the keyboard walk cover exactly the same entries
+/// (RULE 3).
 fn fold_hit_entry(entry: &TranscriptEntry, idx: usize) -> Option<usize> {
-    match entry {
-        TranscriptEntry::Backstage { .. } => Some(idx),
-        TranscriptEntry::Note { text, .. } if text.lines().count() > NOTE_INLINE_LINE_THRESHOLD => {
-            Some(idx)
-        }
-        TranscriptEntry::Completed {
-            disposition: RunDisposition::Failed { .. },
-            ..
-        } => Some(idx),
-        _ => None,
-    }
+    entry.is_foldable().then_some(idx)
 }
 
-/// Total wrapped-row height of the whole transcript (the measure pass).
+/// Total wrapped-row height of the whole transcript — [`measure_transcript`]
+/// without a browsed entry. Test-facing shorthand for the many virtualization
+/// tests that only care about the height.
+#[cfg(test)]
 fn transcript_rows(runs: &[RunView], theme: &Theme, inner_width: u16) -> u16 {
+    measure_transcript(runs, theme, inner_width, usize::MAX, None).0
+}
+
+/// The measure pass: the transcript's total wrapped height and, when the
+/// transcript is being browsed, the `[start, end)` row range of the browsed
+/// entry's rows in that same coordinate space. `render_conversation` uses the
+/// range to keep the browsed fold inside the viewport — a pure projection of
+/// the selection, not a mutation of `run.scroll`.
+fn measure_transcript(
+    runs: &[RunView],
+    theme: &Theme,
+    inner_width: u16,
+    selected_run: usize,
+    browsed: Option<usize>,
+) -> (u16, Option<(u16, u16)>) {
     let mut total: u16 = 0;
-    for_each_row(runs, theme, usize::MAX, |row| {
+    let mut span: Option<(u16, u16)> = None;
+    for_each_row(runs, theme, selected_run, browsed, |row| {
+        let start = total;
         total = total.saturating_add(row.rows(inner_width));
+        if row.selected {
+            span = Some(match span {
+                Some((first, _)) => (first, total),
+                None => (start, total),
+            });
+        }
     });
-    total
+    (total, span)
 }
 
 /// Build only the rows whose wrapped range intersects `[first_row, first_row+height)`.
@@ -1250,6 +1284,7 @@ fn build_transcript_window<'a>(
     first_row: u16,
     height: u16,
     selected_run: usize,
+    browsed: Option<usize>,
 ) -> (Vec<Line<'a>>, u16, Vec<(usize, usize)>) {
     let last_row = first_row.saturating_add(height);
     let mut out: Vec<Line> = Vec::with_capacity(height as usize + 2);
@@ -1257,7 +1292,7 @@ fn build_transcript_window<'a>(
     let mut cursor: u16 = 0;
     let mut scroll: u16 = 0;
     let mut first_seen = false;
-    for_each_row(runs, theme, selected_run, |row| {
+    for_each_row(runs, theme, selected_run, browsed, |row| {
         let h = row.rows(inner_width);
         let row_start = cursor;
         let row_end = cursor.saturating_add(h);
@@ -1373,7 +1408,14 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     // reducer's paging leaves/enters follow mode precisely), then BUILD only the
     // visible window — per-frame allocation is bounded by the viewport, not the
     // transcript length (the crash fix).
-    let content_rows = transcript_rows(&state.runs, theme, inner_width);
+    // The browsed (`Alt-↑`/`Alt-↓`) fold, if any: highlighted, and kept inside
+    // the viewport below.
+    let browsed = state
+        .transcript_browse
+        .then(|| state.selected_run().map(|run| run.transcript_selected))
+        .flatten();
+    let (content_rows, browsed_span) =
+        measure_transcript(&state.runs, theme, inner_width, state.selected_run, browsed);
     let max_scroll = content_rows.saturating_sub(inner.height);
     state.transcript_max_scroll.set(max_scroll);
     let (follow, scroll) = state
@@ -1384,6 +1426,18 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     } else {
         scroll.min(max_scroll)
     };
+    // Browsing pins the view to the selection: an `Alt-↑` walk far above the
+    // tail must show the fold it lands on (and the detail an `Alt-Enter`
+    // reveals), not silently move an off-screen cursor. Only the local draw
+    // offset moves — `run.scroll`/`run.follow` are untouched, so the view
+    // returns to the tail the moment browsing ends.
+    if let Some((start, end)) = browsed_span {
+        if start < offset {
+            offset = start;
+        } else if end > offset.saturating_add(inner.height) {
+            offset = end.saturating_sub(inner.height).min(max_scroll);
+        }
+    }
     // Guard the u16 handed to `Paragraph::scroll` — the rewrite must not
     // reintroduce the overflow the old implicit coupling merely avoided.
     offset = offset.min(u16::MAX.saturating_sub(inner.height));
@@ -1395,6 +1449,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         offset,
         inner.height,
         state.selected_run,
+        browsed,
     );
 
     // A new conversation starts near the top of its reading canvas. Keeping
@@ -1708,7 +1763,7 @@ fn summarize_error(raw: &str) -> String {
 /// call starting, a thinking pause, or the run completing).
 ///
 /// Folding the caret into the same `Line` that both the transcript
-/// `Paragraph` and [`transcript_rows`]'s measurement read (see
+/// `Paragraph` and [`measure_transcript`]'s measurement read (see
 /// `render_conversation`) means the measured bottom already accounts for it —
 /// "follow latest" pins to the caret's row with no separate adjustment.
 fn model_entry_lines<'a>(
@@ -1898,12 +1953,6 @@ fn patch_lines<'a>(
         ));
     }
 }
-
-/// Notes at or under this many lines render inline, unchanged; a longer note
-/// folds (mirrors [`ToolCard`]/[`PatchSummary`] — the Chapter 07
-/// transcript-declutter fix). Applies to ANY note generically — nothing here
-/// special-cases the run-context manifest or a curated-memory note.
-const NOTE_INLINE_LINE_THRESHOLD: usize = 2;
 
 fn note_lines<'a>(
     text: &'a str,
@@ -9753,6 +9802,7 @@ mod tests {
             total.saturating_sub(height),
             height,
             0,
+            None,
         );
         assert!(
             lines.len() <= height as usize + 4,
@@ -9796,7 +9846,7 @@ mod tests {
     fn finalized_model_renders_styled_heading() {
         let s = finalized_model_state("# Heading");
         let theme = Theme::dark();
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 0, 40, 0);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 0, 40, 0, None);
         // A heading span is bold and coloured text.heading.
         let styled = lines.iter().flat_map(|l| l.spans.iter()).any(|sp| {
             sp.style.fg == Some(theme.text.heading)
@@ -9809,7 +9859,7 @@ mod tests {
     fn keyword_span_maps_to_syntax_keyword() {
         let s = finalized_model_state("```rust\nfn a() {}\n```");
         let theme = Theme::dark();
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 0, 40, 0);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 0, 40, 0, None);
         let has_kw = lines
             .iter()
             .flat_map(|l| l.spans.iter())
@@ -9848,6 +9898,7 @@ mod tests {
             total.saturating_sub(height),
             height,
             0,
+            None,
         );
         assert!(
             lines.len() <= height as usize + 4,
@@ -9878,7 +9929,7 @@ mod tests {
         let s = user_turn_state();
         let theme = Theme::dark();
         let inner_width = 40u16;
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, inner_width, 0, 40, 0);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, inner_width, 0, 40, 0, None);
         let user_line = lines
             .iter()
             .find(|l| l.spans.iter().any(|sp| sp.content.contains("my question")))
@@ -9899,7 +9950,7 @@ mod tests {
     fn ansi16_user_row_uses_an_accent_bar_not_a_bg() {
         let s = user_turn_state();
         let theme = Theme::ansi16(); // surface.user == surface.panel here
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 40, 0, 40, 0);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 40, 0, 40, 0, None);
         let user_line = lines
             .iter()
             .find(|l| l.spans.iter().any(|sp| sp.content.contains("my question")))
@@ -9927,7 +9978,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta { run_id, text: big }),
         );
         let theme = Theme::dark();
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 100, 20, 0);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 100, 20, 0, None);
         assert!(
             lines.len() <= 24,
             "build still O(viewport): {}",
@@ -9939,8 +9990,8 @@ mod tests {
     fn theme_change_re_renders_without_re_parsing() {
         let s = finalized_model_state("# H");
         crate::markdown::reset_parse_calls();
-        let (dark, _r, _h) = build_transcript_window(&s.runs, &Theme::dark(), 78, 0, 40, 0);
-        let (light, _r, _h) = build_transcript_window(&s.runs, &Theme::light(), 78, 0, 40, 0);
+        let (dark, _r, _h) = build_transcript_window(&s.runs, &Theme::dark(), 78, 0, 40, 0, None);
+        let (light, _r, _h) = build_transcript_window(&s.runs, &Theme::light(), 78, 0, 40, 0, None);
         assert_eq!(
             crate::markdown::parse_calls(),
             0,
@@ -10181,7 +10232,7 @@ mod tests {
         // The viewport at the very TOP: the `You` header and the model-named
         // assistant header are among the first virtualized rows.
         let (top_lines, _r0, _hits) =
-            build_transcript_window(&s.runs, &theme, inner_width, 0, height, 0);
+            build_transcript_window(&s.runs, &theme, inner_width, 0, height, 0, None);
         assert!(
             top_lines.len() <= height as usize + 4,
             "top-of-history build stays O(viewport), not O(history): {}",
@@ -10209,6 +10260,7 @@ mod tests {
             total.saturating_sub(height),
             height,
             0,
+            None,
         );
         assert!(
             tail_lines.len() <= height as usize + 4,
@@ -10454,11 +10506,201 @@ mod tests {
             total.saturating_sub(height),
             height,
             0,
+            None,
         );
         assert!(
             lines.len() <= height as usize + 4,
             "full pipeline must still materialize O(viewport), not O(history): {}",
             lines.len()
+        );
+    }
+
+    // --- Un-dead tool/patch expansion: click targets + browsed selection ---
+
+    /// A run whose transcript holds a tool card and a patch diff.
+    fn state_with_tool_and_patch() -> AppState {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "ship it".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc".to_owned(),
+                label: Some("cargo test".to_owned()),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::PatchProposed {
+                run_id,
+                changeset_id: ChangeSetId::new(),
+                artifact: ArtifactRef {
+                    id: ArtifactId::new(),
+                    media_type: "text/x-diff".to_owned(),
+                    byte_length: 42,
+                    sha256: "0".repeat(64),
+                    sensitivity: DataClassification::Internal,
+                },
+                files: vec!["src/lib.rs".to_owned()],
+                additions: 2,
+                deletions: 1,
+                preview: "@@ -1 +1 @@\n-old\n+new".to_owned(),
+                preview_truncated: false,
+            }),
+        );
+        s
+    }
+
+    /// The dead-feature fix: a tool card and a patch head each register a click
+    /// target, so the expanded detail and the diff renderer are reachable by
+    /// mouse — they registered nothing at all before.
+    #[test]
+    fn tool_and_patch_heads_register_click_targets() {
+        let state = state_with_tool_and_patch();
+        let _ = render_to_string(&state, 100, 30);
+        let map = state.hit_map.borrow();
+        let rows: Vec<usize> = map
+            .iter()
+            .filter_map(|(_, action)| match action {
+                Action::ActivateRow(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rows.contains(&1),
+            "the tool card's head must be clickable: {rows:?}"
+        );
+        assert!(
+            rows.contains(&2),
+            "the patch head must be clickable: {rows:?}"
+        );
+    }
+
+    /// Clicking (or `Alt-Enter`-ing) the patch fold reveals the diff renderer —
+    /// coloured +/- lines and the artifact footer — which no input could reach
+    /// before this change.
+    #[test]
+    fn expanding_a_patch_draws_the_diff_preview() {
+        let mut state = state_with_tool_and_patch();
+        let collapsed = render_to_string(&state, 100, 30);
+        assert!(
+            !collapsed.contains("+new"),
+            "a collapsed patch shows no diff body:\n{collapsed}"
+        );
+        reduce(&mut state, Action::ActivateRow(2));
+        let expanded = render_to_string(&state, 100, 30);
+        assert!(
+            expanded.contains("+new") && expanded.contains("-old"),
+            "the diff preview must render when expanded:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("full diff"),
+            "the artifact footer belongs to the expanded diff:\n{expanded}"
+        );
+    }
+
+    /// Expanding a tool card surfaces its args digest and label detail.
+    #[test]
+    fn expanding_a_tool_card_draws_its_detail() {
+        let mut state = state_with_tool_and_patch();
+        reduce(&mut state, Action::ActivateRow(1));
+        let expanded = render_to_string(&state, 100, 30);
+        assert!(
+            expanded.contains("args-digest: abc"),
+            "expanded tool detail missing:\n{expanded}"
+        );
+    }
+
+    /// The browsed fold is highlighted with the theme's selection colours, and
+    /// only while browsing — a stale `transcript_selected` left by an earlier
+    /// click must not paint a selection nobody asked for.
+    #[test]
+    fn only_the_browsed_fold_is_painted_as_selected() {
+        let mut state = state_with_tool_and_patch();
+        state.runs[0].transcript_selected = 1;
+        let theme = Theme::dark();
+
+        let idle = render_buffer(&state, 100, 30, &theme);
+        assert!(
+            !idle
+                .content()
+                .iter()
+                .any(|cell| cell.bg == theme.selection.background),
+            "nothing is selected until the transcript is browsed"
+        );
+
+        state.transcript_browse = true;
+        let browsing = render_buffer(&state, 100, 30, &theme);
+        assert!(
+            browsing
+                .content()
+                .iter()
+                .any(|cell| cell.bg == theme.selection.background),
+            "the browsed fold head must be visibly selected"
+        );
+    }
+
+    /// Browsing pins the viewport to the selection: a fold far above the tail
+    /// is scrolled into view (otherwise `Alt-Enter` would expand something the
+    /// user cannot see), without touching `run.scroll`/`run.follow`.
+    #[test]
+    fn browsing_scrolls_an_offscreen_fold_into_view() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "long".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "workspace.read_file".to_owned(),
+                args_digest: "d".to_owned(),
+                label: Some("NEEDLE-TOOL".to_owned()),
+            }),
+        );
+        // Enough prose after the tool card to push it far off the top.
+        let filler = (0..80)
+            .map(|i| format!("filler line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: filler,
+            }),
+        );
+        let tail = render_to_string(&s, 100, 20);
+        assert!(
+            !tail.contains("NEEDLE-TOOL"),
+            "the tool card starts off-screen at the tail:\n{tail}"
+        );
+
+        s.transcript_browse = true;
+        s.runs[0].transcript_selected = 1;
+        let browsed = render_to_string(&s, 100, 20);
+        assert!(
+            browsed.contains("NEEDLE-TOOL"),
+            "browsing must scroll the selected fold into view:\n{browsed}"
+        );
+        assert!(
+            s.runs[0].follow,
+            "the pin is a draw-time projection — follow mode is untouched"
         );
     }
 }

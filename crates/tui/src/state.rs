@@ -451,6 +451,34 @@ pub enum TranscriptEntry {
     Unsupported { label: String },
 }
 
+/// Notes at or under this many lines render inline; a longer note folds
+/// (mirroring [`ToolCard`]/[`PatchSummary`]). Lives here, next to
+/// [`TranscriptEntry::is_foldable`], so the renderer's click targets and the
+/// reducer's keyboard walk can never disagree about which notes fold.
+pub(crate) const NOTE_INLINE_LINE_THRESHOLD: usize = 2;
+
+impl TranscriptEntry {
+    /// Whether this entry renders a collapsible head — a tool card, a patch
+    /// diff, the backstage fold, a long note, or a failed run's raw error
+    /// chain. The single source of truth for RULE 3 parity here: the renderer
+    /// registers a click target on exactly these entries, and `Alt-↑`/`Alt-↓`
+    /// walk exactly these entries, so every fold reachable by mouse is
+    /// reachable by keyboard and vice versa.
+    #[must_use]
+    pub fn is_foldable(&self) -> bool {
+        match self {
+            TranscriptEntry::Tool(_)
+            | TranscriptEntry::Patch(_)
+            | TranscriptEntry::Backstage { .. } => true,
+            TranscriptEntry::Note { text, .. } => text.lines().count() > NOTE_INLINE_LINE_THRESHOLD,
+            TranscriptEntry::Completed { disposition, .. } => {
+                matches!(disposition, RunDisposition::Failed { .. })
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A pending approval awaiting a decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApproval {
@@ -1293,6 +1321,14 @@ pub struct AppState {
     /// `HistoryNext` walking back past the newest entry can restore it
     /// verbatim. The in-progress text is never lost.
     pub composer_stash: Option<String>,
+    /// Whether the transcript fold selection is live: the base view is
+    /// *browsing* its folds (`Alt-↑`/`Alt-↓`) rather than purely composing.
+    /// While set, the selected run's `transcript_selected` entry renders
+    /// highlighted, the viewport keeps it in sight, and `Alt-Enter` toggles it
+    /// instead of inserting a line break. Cleared by typing, scrolling, or
+    /// `Esc` — every gesture that means "I am driving the composer/view
+    /// again". Client-only view state; never on the wire.
+    pub transcript_browse: bool,
     /// Which base layout is rendered (chat single-column vs. workspace panes).
     /// Toggled with `F2`; defaults to [`LayoutMode::Chat`].
     pub layout: LayoutMode,
@@ -1382,6 +1418,7 @@ impl AppState {
             composer_history: Vec::new(),
             history_cursor: None,
             composer_stash: None,
+            transcript_browse: false,
             layout: LayoutMode::Chat,
             transcript_max_scroll: Cell::new(0),
             hit_map: RefCell::new(Vec::new()),

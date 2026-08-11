@@ -120,6 +120,14 @@ pub enum Action {
     ScrollPageDown,
     /// Open / expand the selected item (`Enter`).
     Expand,
+    /// Move the transcript fold selection to the previous foldable entry of the
+    /// selected run (`Alt-↑` in the base conversation). Entering this browse
+    /// mode is what makes tool cards and patch diffs keyboard-reachable:
+    /// `Alt-Enter` then expands the browsed fold. Client-only.
+    BrowseFoldPrev,
+    /// Move the transcript fold selection to the next foldable entry
+    /// (`Alt-↓`). Client-only.
+    BrowseFoldNext,
 
     // --- run control ---
     /// Switch the conversation to the previous run (`Ctrl-↑`).

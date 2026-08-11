@@ -101,26 +101,31 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "↑↓ + Enter",
-        description: "activate a list row / transcript fold (same as clicking it)",
+        description: "activate the selected row in a browser or the palette",
         mouse: Some("click a row"),
     },
     KeyBinding {
         keys: "Tab",
-        description: "focus a pane (same as clicking it)",
+        description: "focus the next workspace pane (same as clicking it)",
         mouse: Some("click a pane"),
     },
-    // Appended (not inserted): FOOTER_HINTS above references entries by
-    // fixed index, so new bindings go at the end to keep those indices
-    // stable.
+    // FOOTER_HINTS below references entries by fixed index (all of them under
+    // this point), so new bindings are appended here or later — never inserted
+    // above — to keep those indices stable.
     KeyBinding {
         keys: "↑ / ↓ (composer)",
         description: "recall the previous / next composer message",
         mouse: None,
     },
     KeyBinding {
+        keys: "Alt-↑ / Alt-↓",
+        description: "browse transcript folds: tool cards, diffs, long notes",
+        mouse: Some("click a fold line"),
+    },
+    KeyBinding {
         keys: "Alt-Enter",
-        description: "insert a line break instead of sending",
-        mouse: None,
+        description: "expand / collapse the browsed fold, else insert a line break",
+        mouse: Some("click a fold line"),
     },
     KeyBinding {
         keys: "Delete",
@@ -391,17 +396,27 @@ fn map_palette_key(key: &KeyEvent) -> Action {
 /// Ctrl-C detaches; Esc clears the draft.
 fn map_composer_key(key: &KeyEvent) -> Action {
     match key.code {
-        // Alt+Enter inserts a manual line break; plain Enter still submits.
+        // Alt+Enter expands the browsed transcript fold when `Alt-↑`/`Alt-↓`
+        // put one under the cursor, and otherwise inserts a manual line break
+        // — the reducer owns that choice because only it knows whether the
+        // transcript is being browsed (this mapper is pure). Plain Enter
+        // always submits.
         KeyCode::Enter if alt(key) => Action::InputNewline,
         KeyCode::Enter => Action::InputSubmit,
         KeyCode::Esc => Action::InputCancel,
         KeyCode::Backspace => Action::InputBackspace,
         KeyCode::PageUp => Action::ScrollPageUp,
         KeyCode::PageDown => Action::ScrollPageDown,
-        // Ctrl-↑/↓ switch runs; plain ↑/↓ (otherwise unbound in the composer)
-        // recall composer history, shell-style.
+        // Tab focuses the next workspace pane (the keyboard equivalent of
+        // clicking one — RULE 3); it was dead here before, which made the
+        // advertised "Tab — focus a pane" binding a lie in the base view.
+        KeyCode::Tab => Action::CyclePane,
+        // Ctrl-↑/↓ switch runs; Alt-↑/↓ walk the transcript's folds (tool
+        // cards, diffs, notes); plain ↑/↓ recall composer history, shell-style.
         KeyCode::Up if ctrl(key) => Action::PrevRun,
         KeyCode::Down if ctrl(key) => Action::NextRun,
+        KeyCode::Up if alt(key) => Action::BrowseFoldPrev,
+        KeyCode::Down if alt(key) => Action::BrowseFoldNext,
         KeyCode::Up => Action::HistoryPrev,
         KeyCode::Down => Action::HistoryNext,
         KeyCode::F(2) => Action::ToggleLayout,
@@ -830,6 +845,80 @@ mod tests {
             map_event(&key(KeyCode::PageDown), InputMode::Composer, W, &[]),
             Action::ScrollPageDown
         );
+    }
+
+    /// The keyboard path that un-deads tool cards and patch diffs: Alt-↑/↓
+    /// browse the transcript's folds, without disturbing the plain and Ctrl
+    /// arrow bindings that share those keys.
+    #[test]
+    fn alt_arrows_browse_transcript_folds_in_the_composer() {
+        let alt = |code| Event::Key(KeyEvent::new(code, KeyModifiers::ALT));
+        assert_eq!(
+            map_event(&alt(KeyCode::Up), InputMode::Composer, W, &[]),
+            Action::BrowseFoldPrev
+        );
+        assert_eq!(
+            map_event(&alt(KeyCode::Down), InputMode::Composer, W, &[]),
+            Action::BrowseFoldNext
+        );
+        // The other two arrow bindings are untouched.
+        assert_eq!(
+            map_event(&key(KeyCode::Up), InputMode::Composer, W, &[]),
+            Action::HistoryPrev
+        );
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Up), InputMode::Composer, W, &[]),
+            Action::PrevRun
+        );
+        // Alt-Enter still maps to one action; the reducer decides between
+        // expanding the browsed fold and inserting a line break.
+        assert_eq!(
+            map_event(&alt(KeyCode::Enter), InputMode::Composer, W, &[]),
+            Action::InputNewline
+        );
+    }
+
+    /// The advertised "Tab — focus a pane" binding was dead in the base view
+    /// (Composer mode), which made the help table lie. It now maps.
+    #[test]
+    fn tab_focuses_a_pane_from_the_base_view() {
+        assert_eq!(
+            map_event(&key(KeyCode::Tab), InputMode::Composer, W, &[]),
+            Action::CyclePane
+        );
+    }
+
+    /// Every binding advertising a mouse gesture must name keys that the
+    /// mapper actually produces somewhere — the help overlay renders this
+    /// table verbatim, so a stale row is a lie to the user (RULE 3).
+    #[test]
+    fn advertised_mouse_parity_bindings_are_live_in_some_mode() {
+        let modes = [
+            InputMode::Composer,
+            InputMode::Normal,
+            InputMode::Palette,
+            InputMode::Approval,
+            InputMode::Editing,
+        ];
+        let live = |event: &Event| {
+            modes
+                .iter()
+                .any(|mode| map_event(event, *mode, W, &[]) != Action::NoOp)
+        };
+        let alt = |code| Event::Key(KeyEvent::new(code, KeyModifiers::ALT));
+        for (keys, event) in [
+            ("Tab", key(KeyCode::Tab)),
+            ("↑↓ + Enter", key(KeyCode::Enter)),
+            ("Alt-↑ / Alt-↓", alt(KeyCode::Up)),
+            ("Alt-Enter", alt(KeyCode::Enter)),
+            ("PgUp / PgDn", key(KeyCode::PageUp)),
+        ] {
+            assert!(
+                KEY_BINDINGS.iter().any(|b| b.keys == keys),
+                "{keys} must be a documented binding"
+            );
+            assert!(live(&event), "{keys} is advertised but maps to nothing");
+        }
     }
 
     #[test]
