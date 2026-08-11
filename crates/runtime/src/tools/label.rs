@@ -19,7 +19,7 @@
 
 use serde_json::Value;
 
-use super::{ApplyPatch, EditFile, ReadFile, Search, Shell, WebSearch};
+use super::{ApplyPatch, ArtifactRead, EditFile, ReadFile, Search, Shell, WebSearch};
 
 /// Hard ceiling on a derived label's length, in `char`s. Longer values are
 /// truncated with a trailing `…`. Short enough to sit on one line next to the
@@ -72,6 +72,9 @@ pub fn tool_label(tool: &str, args: &Value) -> Option<String> {
         EditFile::NAME | "edit_file" => string_arg(args, &["path", "file", "filename"]),
         Shell::NAME => shell_command_label(args),
         Search::NAME | "search" => string_arg(args, &["query", "pattern"]),
+        // `artifact.read`'s only argument is the artifact id — an opaque UUID,
+        // safe to show and exactly what identifies the call.
+        ArtifactRead::NAME => string_arg(args, &["id"]),
         // `web.search` (PR C1): the query is the label, like `workspace.search`.
         WebSearch::NAME => string_arg(args, &["query"]),
         // MCP client (PR B): an `mcp.<server>.<tool>` args schema is

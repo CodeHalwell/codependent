@@ -80,10 +80,67 @@ impl SalientStream {
     }
 }
 
-/// Whether a line contains any error marker (case-insensitive).
+/// Whether a line mentions any error marker (case-insensitive) as a
+/// STANDALONE word. A bare substring test flagged every line that merely
+/// *names* something error-ish — `error.rs`, `src/error/mod.rs`,
+/// `is_error_line`, `error-chain` — so a listing of such paths/identifiers
+/// bloated the compacted view with lines that report nothing. A marker counts
+/// only when it is not glued into a larger token (see
+/// [`contains_marker_word`]); inflected suffixes still match (`errors`,
+/// `panicked`, `warnings`) because they are the marker word itself, not a
+/// different token that happens to contain it.
 fn is_error_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
-    ERROR_MARKERS.iter().any(|m| lower.contains(m))
+    ERROR_MARKERS
+        .iter()
+        .any(|marker| contains_marker_word(&lower, marker))
+}
+
+/// Characters that glue a marker into a larger token when they sit directly
+/// against it WITH a word character on their far side: `error.rs` (filename
+/// extension), `src/error/` (path segment), `error-chain` (hyphenated name).
+/// A trailing `.`/`-` with nothing word-like beyond it stays a boundary, so a
+/// sentence-ending "unexpected error." still flags.
+const WORD_JOINERS: [char; 3] = ['.', '/', '-'];
+
+/// An identifier character: glued to a marker on either side it makes the
+/// marker part of a larger name (`terror`, `is_error_line`).
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Whether already-lowercased `lower` contains ASCII `marker` outside any
+/// larger token. Before the match: no identifier char, and no joiner whose far
+/// side is an identifier char. After the match: `_` never (identifier), a
+/// joiner only when its far side is not an identifier char; a PLAIN
+/// alphanumeric suffix is allowed — that is the marker's own inflection
+/// (`panicked`), not a different word. Byte offsets from `find` are char
+/// boundaries because the markers are ASCII.
+fn contains_marker_word(lower: &str, marker: &str) -> bool {
+    let mut from = 0;
+    while let Some(found) = lower[from..].find(marker) {
+        let start = from + found;
+        let end = start + marker.len();
+        let mut before = lower[..start].chars().rev();
+        let before_ok = match before.next() {
+            None => true,
+            Some(c) if is_word_char(c) => false,
+            Some(c) if WORD_JOINERS.contains(&c) => !before.next().is_some_and(is_word_char),
+            Some(_) => true,
+        };
+        let mut after = lower[end..].chars();
+        let after_ok = match after.next() {
+            None => true,
+            Some('_') => false,
+            Some(c) if WORD_JOINERS.contains(&c) => !after.next().is_some_and(is_word_char),
+            Some(_) => true,
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 /// Clamp a single line to [`SALIENT_MAX_LINE_LEN`] bytes on a char boundary,
@@ -277,6 +334,25 @@ mod tests {
         assert!(is_error_line("warning: unused variable"));
         assert!(is_error_line("thread 'main' panicked"));
         assert!(!is_error_line("all good here"));
+    }
+
+    #[test]
+    fn error_markers_require_word_boundaries() {
+        // Standalone mentions (including inflections and sentence-ending
+        // punctuation) still flag the line...
+        assert!(is_error_line("error: expected `;`"));
+        assert!(is_error_line("error[E0308]: mismatched types"));
+        assert!(is_error_line("unexpected error."));
+        assert!(is_error_line("2 errors emitted"));
+        // ...but a token that merely CONTAINS a marker — a filename, a path
+        // segment, an identifier, a hyphenated crate name, a larger word —
+        // does not.
+        assert!(!is_error_line("   Compiling error.rs v0.1.0"));
+        assert!(!is_error_line("src/error/mod.rs:12: fn new"));
+        assert!(!is_error_line("fn is_error_line(line: &str)"));
+        assert!(!is_error_line("error-chain v0.12.4"));
+        assert!(!is_error_line("a non-fatal cleanup pass"));
+        assert!(!is_error_line("the terror of unwinding"));
     }
 
     #[test]

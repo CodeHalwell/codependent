@@ -196,6 +196,92 @@ pub enum ModelsError {
     },
 }
 
+/// Whether a model-request failure is worth retrying (the transient/permanent
+/// error taxonomy the loop's retry-with-backoff wrapper dispatches on — see
+/// `FrameworkModelDriver::next_step` in `agent.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// Environmental and time-bounded — the identical request may genuinely
+    /// succeed a moment later (connect refused/reset, timeouts, HTTP 408/429/
+    /// 5xx, provider overload). Worth a bounded retry.
+    Transient,
+    /// The request itself (or its configuration) is refused — bad credentials,
+    /// an unknown model, a 4xx contract violation, unparseable config. A retry
+    /// can only repeat the same refusal, so it is surfaced immediately.
+    Permanent,
+}
+
+impl ModelsError {
+    /// Classify this error for retry purposes. Only the genuinely
+    /// environmental variants are [`FailureClass::Transient`]:
+    /// [`ConnectionFailed`](ModelsError::ConnectionFailed) (refused/reset/
+    /// timed-out connection attempts) always is, and
+    /// [`ModelUnavailable`](ModelsError::ModelUnavailable) is when its
+    /// provider-supplied `reason` names a transient condition (an HTTP 5xx or
+    /// 429 from `/models`). Everything else — config read/parse failures,
+    /// unknown models, unsupported providers, missing credentials, exhausted
+    /// candidate lists — is [`FailureClass::Permanent`]: retrying re-reads the
+    /// same file and re-misses the same env var.
+    #[must_use]
+    pub fn failure_class(&self) -> FailureClass {
+        match self {
+            ModelsError::ConnectionFailed { .. } => FailureClass::Transient,
+            ModelsError::ModelUnavailable { reason, .. } => classify_provider_message(reason),
+            _ => FailureClass::Permanent,
+        }
+    }
+}
+
+/// Classify an OPAQUE provider/stream failure message as transient or
+/// permanent. The live driver's stream errors cross the framework seam as
+/// formatted strings (and `ModelUnavailable.reason` embeds a response body),
+/// so this is a conservative textual taxonomy: only a message that plainly
+/// names a transient condition — a connect/reset/timeout failure, provider
+/// overload, or an HTTP 408/429/5xx status — is [`FailureClass::Transient`];
+/// anything unrecognized is [`FailureClass::Permanent`], so a novel failure
+/// surfaces immediately instead of being silently retried. HTTP status codes
+/// are matched as standalone digit runs (never substrings), so a `500` inside
+/// an id like `15005` cannot misclassify a message.
+#[must_use]
+pub fn classify_provider_message(message: &str) -> FailureClass {
+    /// Phrases that name a plainly transient condition, matched
+    /// case-insensitively.
+    const TRANSIENT_PHRASES: [&str; 14] = [
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "overloaded",
+        "rate limit",
+        "too many requests",
+        "internal server error",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+    ];
+    /// Retryable HTTP status codes: request timeout, rate limited, and the
+    /// server-side 5xx family a provider surfaces during a blip.
+    const TRANSIENT_STATUS: [&str; 6] = ["408", "429", "500", "502", "503", "504"];
+    let lower = message.to_ascii_lowercase();
+    if TRANSIENT_PHRASES
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+    {
+        return FailureClass::Transient;
+    }
+    let has_status = lower
+        .split(|c: char| !c.is_ascii_digit())
+        .any(|run| TRANSIENT_STATUS.contains(&run));
+    if has_status {
+        FailureClass::Transient
+    } else {
+        FailureClass::Permanent
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -1244,6 +1330,82 @@ api_key_env = "OPENAI_API_KEY"
         assert_eq!(resolved.id, healthy);
         stale_server.await.unwrap();
         healthy_server.await.unwrap();
+    }
+
+    // -- failure taxonomy (transient vs permanent) -------------------------
+
+    #[test]
+    fn classify_provider_message_marks_connect_timeout_and_5xx_transient() {
+        for message in [
+            "connection refused (os error 111)",
+            "Connection reset by peer",
+            "operation timed out",
+            "request timeout",
+            "provider returned HTTP 429 Too Many Requests from /models",
+            "HTTP status server error (503 Service Unavailable)",
+            "upstream 502",
+            "the model is overloaded, please retry",
+        ] {
+            assert_eq!(
+                classify_provider_message(message),
+                FailureClass::Transient,
+                "expected transient: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_provider_message_marks_contract_failures_permanent() {
+        for message in [
+            "provider returned HTTP 401 Unauthorized from /models",
+            "invalid request: unknown model `nope`",
+            "provider returned HTTP 404 from /models",
+            "content policy violation",
+            // A transient-looking digit run embedded in a longer number must
+            // NOT match — status codes are standalone digit runs only.
+            "request id 15005 was rejected: bad schema",
+        ] {
+            assert_eq!(
+                classify_provider_message(message),
+                FailureClass::Permanent,
+                "expected permanent: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn models_error_failure_class_follows_the_variant_taxonomy() {
+        let transient = ModelsError::ConnectionFailed {
+            base_url: "http://localhost:11434/v1".to_string(),
+            reason: "connection refused".to_string(),
+        };
+        assert_eq!(transient.failure_class(), FailureClass::Transient);
+
+        // ModelUnavailable defers to its provider-supplied reason: a 5xx from
+        // /models is a blip worth retrying, a missing model tag is not.
+        let blip = ModelsError::ModelUnavailable {
+            model: model_id("m"),
+            provider_model: "m".to_string(),
+            reason: "provider returned HTTP 503 from /models".to_string(),
+        };
+        assert_eq!(blip.failure_class(), FailureClass::Transient);
+        let missing = ModelsError::ModelUnavailable {
+            model: model_id("m"),
+            provider_model: "m".to_string(),
+            reason: "provider did not list this model".to_string(),
+        };
+        assert_eq!(missing.failure_class(), FailureClass::Permanent);
+
+        // Config/credential failures can never be fixed by waiting.
+        let permanent = ModelsError::MissingApiKeyEnv {
+            model: model_id("m"),
+            var: "SOME_KEY".to_string(),
+        };
+        assert_eq!(permanent.failure_class(), FailureClass::Permanent);
+        assert_eq!(
+            ModelsError::UnknownModel(model_id("nope")).failure_class(),
+            FailureClass::Permanent
+        );
     }
 
     // -- authority_from_base_url -------------------------------------------

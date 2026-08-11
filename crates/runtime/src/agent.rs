@@ -78,18 +78,19 @@ pub use agent_framework_core::tools::ToolDefinition;
 use crate::blackboard::{BlackboardChannel, BlackboardChannelError, BlackboardPost};
 use crate::models::ModelRegistry;
 use crate::tools::{
-    new_pull_request, parse_blackboard_post, parse_blackboard_query, parse_create_check_run,
-    parse_create_draft_pull_request, parse_edit_file as parse_edit_file_args,
-    parse_get_pull_request, parse_list_check_runs, parse_memory_remember,
-    parse_update_pull_request, parse_web_search, parse_write_file as parse_write_file_args,
-    render_check_runs, render_pull_request, render_search_outcome, tool_label, ApplyPatch,
-    ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput,
-    BlackboardQueryTool, CommandRequest, CreateCheckRunInput, CreateCheckRunSummary,
-    CreateDraftPullRequest, CreateDraftPullRequestInput, EditFile, EditFileInput,
-    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns,
-    ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput,
-    RepositoryTest, Search, SearchInput, Shell, UpdatePullRequestInput, UpdatePullRequestTool,
-    WebSearch, WebSearchInput, WriteFile, WriteFileInput,
+    new_pull_request, parse_artifact_read, parse_blackboard_post, parse_blackboard_query,
+    parse_create_check_run, parse_create_draft_pull_request,
+    parse_edit_file as parse_edit_file_args, parse_get_pull_request, parse_list_check_runs,
+    parse_memory_remember, parse_update_pull_request, parse_web_search,
+    parse_write_file as parse_write_file_args, render_check_runs, render_pull_request,
+    render_search_outcome, tool_label, ApplyPatch, ApplyPatchInput, ArtifactRead,
+    ArtifactReadInput, ArtifactReader, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
+    BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CreateCheckRunInput,
+    CreateCheckRunSummary, CreateDraftPullRequest, CreateDraftPullRequestInput, EditFile,
+    EditFileInput, EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput,
+    ListCheckRuns, ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile,
+    ReadFileInput, RepositoryTest, Search, SearchInput, Shell, UpdatePullRequestInput,
+    UpdatePullRequestTool, WebSearch, WebSearchInput, WriteFile, WriteFileInput,
 };
 
 /// Safety valve: the maximum number of `next_step` calls a single run makes
@@ -126,6 +127,81 @@ make network calls — such actions are denied in this mode. Then finish with \
 a numbered, concrete implementation plan: the files to change, the ordered \
 steps to change them, and how to verify the result. A human will review \
 your plan and re-submit it in Build mode to execute it.";
+
+/// The Review-mode counterpart to [`PLAN_MODE_INSTRUCTION`], seeded by the
+/// same mechanism ([`mode_seed_instruction`]). Review's overlay allows reads
+/// and safe verification commands but denies writes and network, and the
+/// model needs to know what a Review run is FOR: ground every finding in
+/// evidence and end with a verdict, not a patch.
+const REVIEW_MODE_INSTRUCTION: &str = "\
+You are running in REVIEW MODE. Inspect the change or code in question \
+read-only using the available tools (read files, search the workspace, run \
+safe verification commands such as the test suite); do NOT attempt to \
+write, edit, or patch any files — such actions are denied in this mode. \
+Then finish with a structured review: what the change does, concrete \
+findings (bugs, risks, gaps) each citing file and line evidence, and a \
+clear verdict with any follow-ups you recommend.";
+
+/// The Ask-mode counterpart to [`PLAN_MODE_INSTRUCTION`], seeded by the same
+/// mechanism. Ask's overlay is strictly read-only (no commands, no network);
+/// the instruction steers the model to ground its answer in the repository
+/// instead of bouncing denied write/command calls or answering from thin air.
+const ASK_MODE_INSTRUCTION: &str = "\
+You are running in ASK MODE. Answer the question using the read-only tools \
+(read files, search the workspace) to ground your answer in the actual \
+repository; do NOT attempt to write, edit, or patch files or to run \
+commands — such actions are denied in this mode. Then finish with a \
+direct, complete answer that cites the files (and lines) it relies on.";
+
+/// The server-side instruction prepended to `mode`'s seeded objective, or
+/// `None` for a mode whose seeded bytes stay byte-identical to the raw
+/// objective (Build, Explore, and any unknown mode). One source of truth for
+/// `execute_run`'s seed derivation and the tests that pin it; the PR C2
+/// properties hold for every entry — the instruction rides the transcript
+/// SEED (never the ledger), so continuations re-derive it consistently.
+fn mode_seed_instruction(mode: AgentMode) -> Option<&'static str> {
+    match mode {
+        AgentMode::Plan => Some(PLAN_MODE_INSTRUCTION),
+        AgentMode::Review => Some(REVIEW_MODE_INSTRUCTION),
+        AgentMode::Ask => Some(ASK_MODE_INSTRUCTION),
+        _ => None,
+    }
+}
+
+/// How long the loop buffers stream deltas before journaling them as one
+/// `ModelStreamDelta` (delta-coalescing). A fast local model can emit dozens
+/// of token-sized chunks per second; journaling each one was one SQLite
+/// append + broadcast PER TOKEN, bloating the ledger and throttling the
+/// stream. Chunks are now merged until a newline arrives (flushed
+/// immediately — line granularity is what recovery and readers care about)
+/// or this window elapses, whichever is first; 50 ms is far below perceptual
+/// latency, so the live stream still reads as live. The "deltas are
+/// journaled" recovery contract holds at this coarser granularity: every
+/// journaled byte is still journaled before `RunCompleted`, only merged.
+const DELTA_COALESCE_WINDOW: Duration = Duration::from_millis(50);
+
+/// Mid-run compaction threshold: when the estimated request size crosses this
+/// percentage of the model's known context window, the loop folds the OLDEST
+/// tool results into artifact-ref stubs (see [`fold_oldest_tool_results`])
+/// until back under it. Below the 100% cliff on purpose — the provider-side
+/// failure mode is SILENT head-loss (the objective and instructions are what
+/// get clipped first), so folding must land while there is still headroom
+/// for the next request's completion.
+const COMPACTION_THRESHOLD_PCT: u64 = 80;
+
+/// How many of the NEWEST tool results mid-run compaction never folds.
+/// Compaction runs at the per-step safe point BEFORE the next model request,
+/// so the newest result has not even been SEEN by the model yet — folding it
+/// would hide an observation the model asked for and never received; the one
+/// before it is routinely what the model is still acting on. Older results
+/// have been in context for at least two requests and are the honest fold
+/// candidates.
+const COMPACTION_KEEP_RECENT_RESULTS: usize = 2;
+
+/// Sentinel prefix marking an already-folded tool result, so a later
+/// compaction pass skips it (idempotence — a fold can never fold again, and
+/// the loop can never spin re-folding the same turn).
+const FOLDED_RESULT_PREFIX: &str = "[tool result folded";
 
 /// Defense-in-depth backstop (loop-fix Task 2): the number of CONSECUTIVE,
 /// IDENTICAL tool calls (same tool + same args digest, back to back with no
@@ -260,6 +336,41 @@ pub fn estimate_context_tokens(transcript: &[TurnItem]) -> usize {
         .sum()
 }
 
+/// The system prompt `FrameworkModelDriver::to_messages` prepends to every
+/// request. Hoisted to a const so [`estimate_request_tokens`] can charge for
+/// it without a driver in hand — it is sent on EVERY request, so an estimate
+/// that ignored it (as the transcript-only estimate did) understated usage by
+/// a fixed amount every step.
+const SYSTEM_PROMPT: &str = "You are a coding agent. Use the provided tools to inspect and modify \
+     the repository, then finish with a short summary.";
+
+/// The rendered character length one advertised [`ToolDefinition`]
+/// contributes to a request: its name, description, and JSON schema — the
+/// three fields the OpenAI-wire `tools` array serializes per entry. The same
+/// conservative shape as [`turn_item_text_len`]: framing punctuation is
+/// covered by the per-item overhead the caller adds.
+fn tool_definition_text_len(def: &ToolDefinition) -> usize {
+    def.name.chars().count()
+        + def.description.chars().count()
+        + def.parameters.to_string().chars().count()
+}
+
+/// [`estimate_context_tokens`] plus the request parts the transcript alone
+/// misses: the system prompt and every advertised tool definition (name +
+/// description + schema), each charged the same [`PER_ITEM_TOKEN_OVERHEAD`]
+/// for its wire framing. The transcript-only estimate understated usage
+/// exactly when it mattered most — MCP servers ship arbitrarily large
+/// `inputSchema`s that are re-sent verbatim on every request — so the loop's
+/// budget warning and mid-run compaction both estimate with THIS function.
+pub fn estimate_request_tokens(transcript: &[TurnItem], tools: &[ToolDefinition]) -> usize {
+    let system = SYSTEM_PROMPT.chars().count() / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD;
+    let tool_tokens: usize = tools
+        .iter()
+        .map(|def| tool_definition_text_len(def) / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD)
+        .sum();
+    estimate_context_tokens(transcript) + system + tool_tokens
+}
+
 /// Decide whether the plain loop should emit a `BudgetWarning{Tokens}` event
 /// for this step (context-window protection, component C4), and build it when
 /// it should. Called ONLY when a window is known (`limit` came from
@@ -300,6 +411,90 @@ fn token_budget_event(
     ))
 }
 
+/// Mid-run compaction (context-window protection, the missing half of the
+/// advisory warning): fold the OLDEST un-folded [`TurnItem::ToolResult`]
+/// turns into short artifact-ref stubs until the estimated request size
+/// ([`estimate_request_tokens`]) drops to `budget_tokens` or no fold
+/// candidate remains, returning how many were folded.
+///
+/// Only `ToolResult` turns fold — they are the bulk of a long transcript,
+/// and (unlike objective/steering/assistant turns) their full bytes usually
+/// survive in the artifact store, so folding LOSES nothing the model cannot
+/// get back: the stub keeps the tool name and, when the result carries one,
+/// the artifact id + digest that salient views already cite, rehydratable
+/// via `artifact.read`. A result with no artifact keeps its first line as
+/// scent. The newest [`COMPACTION_KEEP_RECENT_RESULTS`] results are exempt
+/// (see that const), already-folded stubs are skipped (idempotence), and a
+/// stub is only installed when it is actually SHORTER than the output it
+/// replaces — folding can never grow the transcript.
+fn fold_oldest_tool_results(
+    transcript: &mut [TurnItem],
+    tools: &[ToolDefinition],
+    budget_tokens: usize,
+) -> usize {
+    let result_indices: Vec<usize> = transcript
+        .iter()
+        .enumerate()
+        .filter(|(_, turn)| matches!(turn, TurnItem::ToolResult { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    let foldable = result_indices
+        .len()
+        .saturating_sub(COMPACTION_KEEP_RECENT_RESULTS);
+    let mut folded = 0;
+    for &index in &result_indices[..foldable] {
+        if estimate_request_tokens(transcript, tools) <= budget_tokens {
+            break;
+        }
+        let TurnItem::ToolResult {
+            tool,
+            output,
+            artifact,
+        } = &mut transcript[index]
+        else {
+            continue;
+        };
+        if output.starts_with(FOLDED_RESULT_PREFIX) {
+            continue;
+        }
+        let stub = folded_result_stub(tool, output, artifact.as_ref());
+        if stub.chars().count() >= output.chars().count() {
+            continue;
+        }
+        *output = stub;
+        folded += 1;
+    }
+    folded
+}
+
+/// The stub a folded tool result collapses to. With an artifact reference the
+/// stub cites the id + digest prefix a salient view uses and points at
+/// `artifact.read` for rehydration; without one it keeps a bounded first line
+/// so the model can still tell WHAT the folded observation was about.
+fn folded_result_stub(tool: &str, output: &str, artifact: Option<&ArtifactRef>) -> String {
+    match artifact {
+        Some(reference) => format!(
+            "{FOLDED_RESULT_PREFIX} to reclaim context — the full {tool} output is artifact {} \
+             sha256:{} ({} bytes); reopen it with artifact.read]",
+            reference.id,
+            &reference.sha256[..reference.sha256.len().min(12)],
+            reference.byte_length,
+        ),
+        None => {
+            let first_line: String = output
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect();
+            format!(
+                "{FOLDED_RESULT_PREFIX} to reclaim context — {tool} output began: {first_line}]"
+            )
+        }
+    }
+}
+
 /// The next thing the model wants to do, as decided by a [`ModelDriver`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelStep {
@@ -317,6 +512,20 @@ pub enum ModelStep {
         /// A human-readable summary of the run.
         summary: String,
     },
+}
+
+/// One tool invocation a model response asked for: the tool name plus its raw
+/// JSON arguments. A response can carry SEVERAL function calls in one turn
+/// (parallel tool calls); the first rides [`ModelStep::CallTool`] (keeping
+/// that enum's shape stable for every existing driver and scripted test) and
+/// the rest ride [`StepOutcome::extra_calls`], which the loop executes
+/// sequentially in response order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallRequest {
+    /// The tool name, e.g. `workspace.read_file`.
+    pub tool: String,
+    /// The tool arguments as JSON, exactly as the model supplied them.
+    pub args: Value,
 }
 
 /// Provider-reported usage for one model request (Phase 7 telemetry). A driver
@@ -408,16 +617,27 @@ pub struct StepOutcome {
     /// surfaced `response.text()`). Always `None` for `Say`/`Finish` steps —
     /// their text already rides the step itself.
     pub preface: Option<String>,
+    /// Tool calls the SAME model response carried BEYOND the first
+    /// (parallel-tool-call fix). `chat_response_to_step` used to keep only
+    /// `.next()` of the response's function calls, silently dropping the rest
+    /// — the model then believed it had issued N calls while only one ran, a
+    /// desync it could never see. The loop now executes these sequentially,
+    /// in response order, right after `step`'s call, each through the full
+    /// tool middleware (policy, approval, events, transcript pairing).
+    /// Always empty for `Say`/`Finish` steps.
+    pub extra_calls: Vec<ToolCallRequest>,
 }
 
 impl StepOutcome {
-    /// A step paired with its (optional, measured) usage, with no preface text.
+    /// A step paired with its (optional, measured) usage, with no preface text
+    /// and no extra calls.
     #[must_use]
     pub fn new(step: ModelStep, usage: Option<ModelUsage>) -> Self {
         Self {
             step,
             usage,
             preface: None,
+            extra_calls: Vec::new(),
         }
     }
 
@@ -430,6 +650,7 @@ impl StepOutcome {
             step,
             usage: None,
             preface: None,
+            extra_calls: Vec::new(),
         }
     }
 
@@ -439,6 +660,15 @@ impl StepOutcome {
     #[must_use]
     pub fn with_preface(mut self, preface: Option<String>) -> Self {
         self.preface = preface;
+        self
+    }
+
+    /// Attach the tool calls the same response carried beyond the first
+    /// (parallel-tool-call fix) — builder-style, mirroring
+    /// [`with_preface`](Self::with_preface).
+    #[must_use]
+    pub fn with_extra_calls(mut self, extra_calls: Vec<ToolCallRequest>) -> Self {
+        self.extra_calls = extra_calls;
         self
     }
 }
@@ -1077,6 +1307,12 @@ pub struct FrameworkAgentRuntime {
     /// nodes; a run is offered the tools only when this is set AND the run carries a
     /// [`WorkflowContext`]. The assembly binds it over a real `BlackboardStore`.
     blackboard: Option<Arc<dyn BlackboardChannel>>,
+    /// The read side of the artifact store the `artifact.read` tool loads
+    /// through, if wired. Like `search`, it is a configured gate: without a
+    /// reader the tool is never offered, so salient views' `artifact <id>`
+    /// citations stay display-only exactly as before; with one, the model can
+    /// reopen the bulk output behind any truncated observation.
+    artifacts: Option<Arc<dyn ArtifactReader>>,
 }
 
 /// How a run terminated, before it is folded into a [`RunDisposition`].
@@ -1111,6 +1347,7 @@ impl FrameworkAgentRuntime {
             mcp: None,
             search: None,
             blackboard: None,
+            artifacts: None,
         }
     }
 
@@ -1146,6 +1383,15 @@ impl FrameworkAgentRuntime {
     /// the channel over a real `BlackboardStore` + pool + the per-run fan-out hub.
     pub fn with_blackboard(mut self, blackboard: Arc<dyn BlackboardChannel>) -> Self {
         self.blackboard = Some(blackboard);
+        self
+    }
+
+    /// Inject the artifact-store read side the `artifact.read` tool loads
+    /// through. Without it the tool is never offered (the `web.search`
+    /// configured-gate idiom); the daemon binds it over the same
+    /// `ArtifactStore` + pool its [`ArtifactSink`] closure captures.
+    pub fn with_artifact_reader(mut self, artifacts: Arc<dyn ArtifactReader>) -> Self {
+        self.artifacts = Some(artifacts);
         self
     }
 
@@ -1203,6 +1449,14 @@ impl FrameworkAgentRuntime {
         .iter()
         .map(|name| (*name).to_string())
         .collect();
+        // `artifact.read` sits with the read tools: offered whenever a reader
+        // is wired (a configured gate like `web.search`'s — there is no
+        // per-run target to resolve), and in EVERY mode — it reads only the
+        // daemon's own artifact store, so no overlay branch below removes it,
+        // exactly like `workspace.read_file`.
+        if self.artifacts.is_some() {
+            names.push(ArtifactRead::NAME.to_string());
+        }
         if self.github.is_some() && run.github_repo.is_some() {
             names.extend(
                 [
@@ -1442,15 +1696,14 @@ impl FrameworkAgentRuntime {
         // context. A plain/first run carries an empty `prior`, so the transcript
         // is exactly `[Objective]`, identical to before.
         let mut transcript = run.prior.clone();
-        // PR C2 (plan mode): a Plan run's seeded objective carries the
-        // server-side plan instruction prepended (see the const's doc
-        // comment); every other mode's objective is seeded byte-identically.
-        // The seed is derived per loop start, so continuations re-derive it
-        // and the ledger is untouched.
-        let objective = if run.mode == AgentMode::Plan {
-            format!("{PLAN_MODE_INSTRUCTION}\n\n{}", run.objective)
-        } else {
-            run.objective.clone()
+        // PR C2 (mode instructions): a Plan/Review/Ask run's seeded objective
+        // carries its server-side mode instruction prepended (see
+        // `mode_seed_instruction`); every other mode's objective is seeded
+        // byte-identically. The seed is derived per loop start, so
+        // continuations re-derive it and the ledger is untouched.
+        let objective = match mode_seed_instruction(run.mode) {
+            Some(instruction) => format!("{instruction}\n\n{}", run.objective),
+            None => run.objective.clone(),
         };
         transcript.push(TurnItem::Objective(objective));
         let mut findings: Vec<String> = Vec::new();
@@ -1523,6 +1776,14 @@ impl FrameworkAgentRuntime {
                 .await?;
             }
 
+            // The advertised definition set for this step, computed ONCE per
+            // iteration: the driver advertises it verbatim (FIX 1), and the
+            // token estimate below charges for it — the definitions are
+            // re-sent on every request, so they consume window exactly like
+            // transcript turns (the old transcript-only estimate ignored
+            // them, understating usage precisely when MCP schemas are large).
+            let tool_definitions = self.advertised_tool_definitions(&run);
+
             // Context-window protection (T3): estimate live usage against the
             // known window and emit the SAME `BudgetWarning{Tokens}` event the
             // workflow budget engine emits, at the identical per-step safe
@@ -1534,7 +1795,37 @@ impl FrameworkAgentRuntime {
             // emit when the integer percentage hasn't changed since
             // `last_token_pct`, bounding this to at most 101 events/run.
             if let Some(limit) = context_window {
-                let used = estimate_context_tokens(&transcript) as u64;
+                // Mid-run compaction: past ~80% of the window, fold the OLDEST
+                // tool results into artifact-ref stubs BEFORE the estimate
+                // drives the warning, so the emitted number reflects what the
+                // next request actually carries. Without this the loop only
+                // warned while the provider silently clipped the transcript
+                // HEAD (objective and instructions) on overflow. One
+                // `NoteAppended` per folding pass keeps the trace honest about
+                // what was compacted and how to get it back.
+                let budget_tokens = (limit.saturating_mul(COMPACTION_THRESHOLD_PCT) / 100) as usize;
+                let before = estimate_request_tokens(&transcript, &tool_definitions);
+                if before > budget_tokens {
+                    let folded =
+                        fold_oldest_tool_results(&mut transcript, &tool_definitions, budget_tokens);
+                    if folded > 0 {
+                        let after = estimate_request_tokens(&transcript, &tool_definitions);
+                        self.emit(
+                            run.session_id,
+                            run_actor.clone(),
+                            EventBody::NoteAppended {
+                                text: format!(
+                                    "compaction: folded {folded} oldest tool result(s) into \
+                                     artifact-ref stubs (≈{before} → ≈{after} of {limit} \
+                                     tokens); folded output can be reopened with artifact.read"
+                                ),
+                                run_id: Some(run.run_id),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+                let used = estimate_request_tokens(&transcript, &tool_definitions) as u64;
                 if let Some((body, pct)) =
                     token_budget_event(run.run_id, used, limit, last_token_pct)
                 {
@@ -1544,15 +1835,25 @@ impl FrameworkAgentRuntime {
             }
 
             let started = Instant::now();
-            // Live per-chunk streaming. The driver pushes each text chunk through
-            // the `ChannelSink` AS the model produces it; concurrently we drain
-            // the channel and emit one `ModelStreamDelta` per chunk, so deltas
-            // reach clients live rather than buffered until `next_step` returns.
-            // One journaled event per delta — the current "deltas are journaled"
-            // contract (ephemeral, non-journaled deltas are a deferred future
-            // option, deliberately not taken here).
+            // Live streaming with COALESCED journaling. The driver pushes each
+            // text chunk through the `ChannelSink` AS the model produces it;
+            // concurrently we drain the channel into `pending` and journal one
+            // merged `ModelStreamDelta` per newline arrival or per
+            // `DELTA_COALESCE_WINDOW`, whichever is first — one SQLite append
+            // per line-ish instead of per token-burst. The "deltas are
+            // journaled" recovery contract holds at this coarser granularity
+            // (every streamed byte is journaled, in order, before the step's
+            // effects), and persist-before-publish is untouched — a merged
+            // delta is still persisted before any client sees it.
             let (tx, mut rx) = mpsc::unbounded_channel::<String>();
             let mut sink = ChannelSink { tx };
+            let mut pending = String::new();
+            let mut flush_deadline: Option<tokio::time::Instant> = None;
+            // Whether ANY chunk arrived for this step — the loop's signal that
+            // the driver streamed the step's text itself (the live driver
+            // streams every text delta, a tool-call turn's preface included),
+            // so the preface emission below must not double-send it.
+            let mut streamed_this_step = false;
             let step_result = {
                 // `step_fut` borrows `&transcript`, `&tool_definitions`, and
                 // `&mut sink`; scoping it here releases those borrows before
@@ -1560,21 +1861,20 @@ impl FrameworkAgentRuntime {
                 // `#[async_trait]` future is boxed and `Unpin`, so `&mut
                 // step_fut` polls without `tokio::pin!`.
                 //
-                // `tool_definitions` advertises the SAME set `prepare` will
-                // accept for this run (FIX 1: advertise/execute mismatch) —
-                // recomputed each step so a live provider driver is never
-                // advertised (and so cannot be tempted to call) a tool dispatch
-                // would refuse as "unknown".
-                let tool_definitions = self.advertised_tool_definitions(&run);
+                // `tool_definitions` (hoisted above, recomputed each
+                // iteration) advertises the SAME set `prepare` will accept for
+                // this run (FIX 1: advertise/execute mismatch) — a live
+                // provider driver is never advertised (and so cannot be
+                // tempted to call) a tool dispatch would refuse as "unknown".
                 let mut step_fut = driver.next_step(&transcript, &tool_definitions, &mut sink);
                 loop {
                     tokio::select! {
                         // Poll the step future first: its completion is what ends
                         // the request. While it is pending (a real provider stream
-                        // yields between updates) the recv branch runs, emitting
-                        // each queued chunk LIVE and in order; a driver that bursts
-                        // several chunks within a single poll is caught by the
-                        // drain below.
+                        // yields between updates) the recv branch runs, buffering
+                        // each queued chunk and flushing at newline/window
+                        // boundaries; chunks still queued at completion are
+                        // caught by the drain below.
                         biased;
                         _ = cancel.cancelled() => break 'agent Terminal::Cancelled,
                         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
@@ -1583,32 +1883,70 @@ impl FrameworkAgentRuntime {
                         )) => break 'agent Terminal::Failed("wall-clock budget exhausted".to_string()),
                         res = &mut step_fut => break res,
                         Some(chunk) = rx.recv() => {
-                            self.emit(
-                                run.session_id,
-                                run_actor.clone(),
-                                EventBody::ModelStreamDelta {
-                                    run_id: run.run_id,
-                                    text: chunk,
-                                },
-                            )
-                            .await?;
+                            streamed_this_step = true;
+                            let flush_now = chunk.contains('\n');
+                            pending.push_str(&chunk);
+                            if flush_now {
+                                // A newline is a natural reader boundary —
+                                // journal the buffered line(s) immediately.
+                                flush_deadline = None;
+                                self.emit(
+                                    run.session_id,
+                                    run_actor.clone(),
+                                    EventBody::ModelStreamDelta {
+                                        run_id: run.run_id,
+                                        text: std::mem::take(&mut pending),
+                                    },
+                                )
+                                .await?;
+                            } else if flush_deadline.is_none() {
+                                flush_deadline = Some(
+                                    tokio::time::Instant::now() + DELTA_COALESCE_WINDOW,
+                                );
+                            }
+                        }
+                        // The coalescing window expired mid-line: flush what is
+                        // buffered so the live stream never lags a pause in
+                        // generation by more than the window. (The disabled-arm
+                        // expression must not panic, hence the `unwrap_or_else`;
+                        // the branch is only ever POLLED with a real deadline.)
+                        _ = tokio::time::sleep_until(
+                            flush_deadline.unwrap_or_else(tokio::time::Instant::now)
+                        ), if flush_deadline.is_some() => {
+                            flush_deadline = None;
+                            if !pending.is_empty() {
+                                self.emit(
+                                    run.session_id,
+                                    run_actor.clone(),
+                                    EventBody::ModelStreamDelta {
+                                        run_id: run.run_id,
+                                        text: std::mem::take(&mut pending),
+                                    },
+                                )
+                                .await?;
+                            }
                         }
                     }
                 }
             };
-            // Drain chunks queued but not emitted live above — a synchronous
+            // Drain chunks queued but not observed live above — a synchronous
             // burst the `select!` did not interleave, or the chunks a driver
-            // pushed just before returning `Err`. `sink` (holding the sender) is
-            // still alive, so `try_recv` reports `Empty`, not `Disconnected`, once
-            // drained. This runs on BOTH the `Ok` and `Err` paths, so chunks
-            // emitted before a mid-stream error are never lost.
+            // pushed just before returning `Err` — then flush everything still
+            // buffered as one final delta. `sink` (holding the sender) is
+            // still alive, so `try_recv` reports `Empty`, not `Disconnected`,
+            // once drained. This runs on BOTH the `Ok` and `Err` paths, so
+            // chunks streamed before a mid-stream error are never lost.
             while let Ok(chunk) = rx.try_recv() {
+                streamed_this_step = true;
+                pending.push_str(&chunk);
+            }
+            if !pending.is_empty() {
                 self.emit(
                     run.session_id,
                     run_actor.clone(),
                     EventBody::ModelStreamDelta {
                         run_id: run.run_id,
-                        text: chunk,
+                        text: std::mem::take(&mut pending),
                     },
                 )
                 .await?;
@@ -1617,6 +1955,7 @@ impl FrameworkAgentRuntime {
                 step,
                 usage: step_usage,
                 preface,
+                extra_calls,
             } = match step_result {
                 Ok(outcome) => outcome,
                 Err(e) => break Terminal::Failed(format!("model driver error: {e}")),
@@ -1672,81 +2011,147 @@ impl FrameworkAgentRuntime {
                     // dropped — record it as the model's stated intent,
                     // BEFORE the paired `ToolCall`/`ToolResult` below.
                     if let Some(text) = preface {
+                        // Rich-stream fix: a driver that did NOT stream this
+                        // step's text (a scripted/test driver returning a
+                        // preface out of band — the live driver streams every
+                        // text delta, preface included) still gets its
+                        // spoken-while-acting text rendered live instead of
+                        // recorded silently. Guarded on "nothing streamed this
+                        // step" so the live path never double-emits the text.
+                        if !streamed_this_step {
+                            self.emit(
+                                run.session_id,
+                                run_actor.clone(),
+                                EventBody::ModelStreamDelta {
+                                    run_id: run.run_id,
+                                    text: text.clone(),
+                                },
+                            )
+                            .await?;
+                        }
                         transcript.push(TurnItem::Assistant(text));
                     }
-                    // FIX 1 (transcript fidelity): record the call itself,
-                    // before running it, so a replayed transcript pairs
-                    // "asked" with "result" instead of showing only the
-                    // result with no memory of what was requested.
-                    transcript.push(TurnItem::ToolCall {
-                        tool: tool.clone(),
-                        args: args.clone(),
-                    });
+                    // Parallel-tool-call fix: execute EVERY call the response
+                    // carried, sequentially in response order — the first
+                    // rides the step, the rest ride `extra_calls`. Dropping
+                    // the extras (the old `.next()`-only mapping) desynced the
+                    // model from reality: it believed N calls ran when one
+                    // did. Each queued call gets the FULL per-call treatment —
+                    // transcript pairing, repeat guard, policy/approval
+                    // middleware, events — exactly as if it had arrived alone.
+                    let mut calls =
+                        std::collections::VecDeque::with_capacity(1 + extra_calls.len());
+                    calls.push_back(ToolCallRequest { tool, args });
+                    calls.extend(extra_calls);
+                    while let Some(ToolCallRequest { tool, args }) = calls.pop_front() {
+                        // FIX 1 (transcript fidelity): record the call itself,
+                        // before running it, so a replayed transcript pairs
+                        // "asked" with "result" instead of showing only the
+                        // result with no memory of what was requested.
+                        transcript.push(TurnItem::ToolCall {
+                            tool: tool.clone(),
+                            args: args.clone(),
+                        });
 
-                    // Repeated-identical-call guard (defense-in-depth,
-                    // loop-fix Task 2): update the consecutive-identity
-                    // counter for THIS call before deciding whether to run
-                    // it. A call whose (tool, args_digest) matches the
-                    // immediately preceding one extends the streak; any
-                    // other call — a different tool, different args, or the
-                    // first call of the run — resets it to 1.
-                    let args_digest = hash_json(&args);
-                    let consecutive = match repeated_call.take() {
-                        Some((last_tool, last_digest, count))
-                            if last_tool == tool && last_digest == args_digest =>
-                        {
-                            count + 1
-                        }
-                        _ => 1,
-                    };
-                    repeated_call = Some((tool.clone(), args_digest, consecutive));
+                        // Repeated-identical-call guard (defense-in-depth,
+                        // loop-fix Task 2): update the consecutive-identity
+                        // counter for THIS call before deciding whether to run
+                        // it. A call whose (tool, args_digest) matches the
+                        // immediately preceding one extends the streak; any
+                        // other call — a different tool, different args, or the
+                        // first call of the run — resets it to 1.
+                        let args_digest = hash_json(&args);
+                        let consecutive = match repeated_call.take() {
+                            Some((last_tool, last_digest, count))
+                                if last_tool == tool && last_digest == args_digest =>
+                            {
+                                count + 1
+                            }
+                            _ => 1,
+                        };
+                        repeated_call = Some((tool.clone(), args_digest, consecutive));
 
-                    if consecutive >= MAX_CONSECUTIVE_IDENTICAL_CALLS {
-                        // Short-circuit: do NOT run the tool again — its
-                        // result is already in the transcript above (the
-                        // ToolCall was just recorded honestly, but the
-                        // execution and its result are replaced by a
-                        // DISTINCT, truthful steer rather than a fabricated
-                        // tool result). This is the backstop that bounds a
-                        // weak model that keeps re-issuing the identical
-                        // call despite Task 1's transcript fidelity.
-                        let steer = format!(
-                            "You have already called `{tool}` with these exact arguments \
-                             {consecutive} times in a row; its result is in the transcript \
-                             above. Do not repeat this call — use the result you already \
-                             have and proceed with the task."
-                        );
-                        transcript.push(TurnItem::Steering(steer));
-                        // Safe point: same boundary a completed tool call
-                        // would drain at.
-                        self.drain_steering(&mut run, &run_actor, &mut transcript)
-                            .await?;
-                        continue;
-                    }
-
-                    match self
-                        .run_tool(&run, &run_actor, &tool, args, &mut actions, &cancel)
-                        .await?
-                    {
-                        ToolFlow::Observation(observation) => {
-                            transcript.push(TurnItem::ToolResult {
-                                tool,
-                                output: observation,
-                                // The live run loop's own transcript push has
-                                // no artifact ref threaded to it yet — only
-                                // the session_history continuation projection
-                                // (Task 2) populates this field, from the
-                                // persisted `ToolCompleted` event.
-                                artifact: None,
-                            });
-                            // Safe point: a completed tool call is a steering
-                            // boundary.
+                        if consecutive >= MAX_CONSECUTIVE_IDENTICAL_CALLS {
+                            // Short-circuit: do NOT run the tool again — the
+                            // ToolCall was just recorded honestly, but the
+                            // execution and its result are replaced by a
+                            // DISTINCT, truthful steer rather than a
+                            // fabricated tool result. This is the backstop
+                            // that bounds a weak model that keeps re-issuing
+                            // the identical call despite Task 1's transcript
+                            // fidelity. The steer tells the truth about WHAT
+                            // is in the transcript: an executed result to
+                            // reuse — or, when the duplicates were refused
+                            // (denied by policy / rejected at approval), a
+                            // refusal that repeating cannot change. The old
+                            // wording claimed "its result is in the
+                            // transcript" even on the refusal path, steering
+                            // the model to look for a result that isn't there.
+                            let last_result_was_refusal = transcript
+                                .iter()
+                                .rev()
+                                .find_map(|turn| match turn {
+                                    TurnItem::ToolResult { output, .. } => {
+                                        Some(observation_is_refusal(output))
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or(false);
+                            let steer = if last_result_was_refusal {
+                                format!(
+                                    "You have already proposed `{tool}` with these exact \
+                                     arguments {consecutive} times in a row and it was refused \
+                                     each time — the refusal and its reason are in the \
+                                     transcript above, and repeating the call cannot change \
+                                     that decision. Do not propose it again; take a different \
+                                     approach or finish with what you have."
+                                )
+                            } else {
+                                format!(
+                                    "You have already called `{tool}` with these exact arguments \
+                                     {consecutive} times in a row; its result is in the transcript \
+                                     above. Do not repeat this call — use the result you already \
+                                     have and proceed with the task."
+                                )
+                            };
+                            transcript.push(TurnItem::Steering(steer));
+                            // Safe point: same boundary a completed tool call
+                            // would drain at. `continue` moves to the NEXT
+                            // queued call (if any) — the guard suppresses one
+                            // duplicate, never silently drops the rest of the
+                            // batch.
                             self.drain_steering(&mut run, &run_actor, &mut transcript)
                                 .await?;
+                            continue;
                         }
-                        // Cancellation fired while parked on an approval: stop
-                        // without executing the tool.
-                        ToolFlow::Cancelled => break Terminal::Cancelled,
+
+                        match self
+                            .run_tool(&run, &run_actor, &tool, args, &mut actions, &cancel)
+                            .await?
+                        {
+                            ToolFlow::Observation {
+                                observation,
+                                artifact,
+                            } => {
+                                transcript.push(TurnItem::ToolResult {
+                                    tool,
+                                    output: observation,
+                                    // The SAME reference `ToolCompleted`
+                                    // carries, threaded into the live
+                                    // transcript so mid-run compaction can
+                                    // fold this result into an honest
+                                    // artifact-ref stub later.
+                                    artifact,
+                                });
+                                // Safe point: a completed tool call is a steering
+                                // boundary.
+                                self.drain_steering(&mut run, &run_actor, &mut transcript)
+                                    .await?;
+                            }
+                            // Cancellation fired while parked on an approval:
+                            // stop without executing this (or any queued) tool.
+                            ToolFlow::Cancelled => break 'agent Terminal::Cancelled,
+                        }
                     }
                 }
             }
@@ -1920,7 +2325,10 @@ impl FrameworkAgentRuntime {
                 )
                 .await?;
                 actions.push(action_digest(tool, "failed", None));
-                return Ok(ToolFlow::Observation(format!("tool error: {message}")));
+                return Ok(ToolFlow::Observation {
+                    observation: format!("tool error: {message}"),
+                    artifact: None,
+                });
             }
         };
 
@@ -1977,7 +2385,10 @@ impl FrameworkAgentRuntime {
                 )
                 .await?;
                 actions.push(action_digest(tool, "denied", None));
-                return Ok(ToolFlow::Observation(text));
+                return Ok(ToolFlow::Observation {
+                    observation: text,
+                    artifact: None,
+                });
             }
             Decision::RequireApproval => {
                 // (c) park the run in WaitingForApproval until an approver
@@ -2049,7 +2460,10 @@ impl FrameworkAgentRuntime {
                     )
                     .await?;
                     actions.push(action_digest(tool, "rejected", None));
-                    return Ok(ToolFlow::Observation("approval rejected".to_string()));
+                    return Ok(ToolFlow::Observation {
+                        observation: "approval rejected".to_string(),
+                        artifact: None,
+                    });
                 }
             }
             Decision::Allow => {}
@@ -2096,7 +2510,10 @@ impl FrameworkAgentRuntime {
             outcome_label(&outcome),
             artifact.as_ref().map(|a| a.id),
         ));
-        Ok(ToolFlow::Observation(observation))
+        Ok(ToolFlow::Observation {
+            observation,
+            artifact,
+        })
     }
 
     /// Map a tool call to its typed input and [`ProposedAction`]. Applying a
@@ -2324,6 +2741,17 @@ impl FrameworkAgentRuntime {
                 Ok(Prepared {
                     action: MemoryRemember::proposed_action(),
                     tool: PreparedTool::MemoryRemember(input),
+                })
+            }
+            // `artifact.read`: gated on a wired reader exactly as
+            // `offered_tool_names` gates the offer (the blackboard match-guard
+            // idiom) — a call with no reader falls through to the unknown-tool
+            // refusal the offering already promised.
+            ArtifactRead::NAME if self.artifacts.is_some() => {
+                let input = parse_artifact_read(args)?;
+                Ok(Prepared {
+                    action: ArtifactRead::proposed_action(),
+                    tool: PreparedTool::ArtifactRead(input),
                 })
             }
             // MCP client (PR B): an `mcp.<server>.<tool>` call. The match guard
@@ -2708,6 +3136,39 @@ impl FrameworkAgentRuntime {
             PreparedTool::MemoryRemember(input) => {
                 self.execute_memory_remember(input, run, run_actor).await
             }
+            // `artifact.read`: load the cited bytes through the pool-erased
+            // reader and return the BOUNDED rendering (64 KiB, head + tail) —
+            // the artifact was spilled precisely because it was too big for
+            // context, so rehydration must never re-admit it whole. A missing
+            // id is a legible failure the model can correct (it may have
+            // mistyped a citation), never an `Err` that fails the run.
+            PreparedTool::ArtifactRead(input) => match self.artifacts.as_ref() {
+                None => artifact_read_unavailable(),
+                Some(reader) => match reader.load(input.id).await {
+                    Ok(Some(loaded)) => (
+                        ArtifactRead::render(input.id, &loaded.media_type, &loaded.bytes),
+                        None,
+                        ToolOutcome::Succeeded,
+                    ),
+                    Ok(None) => (
+                        format!(
+                            "artifact.read: no artifact `{}` exists in the store",
+                            input.id
+                        ),
+                        None,
+                        ToolOutcome::Failed {
+                            message: "artifact.not-found".to_string(),
+                        },
+                    ),
+                    Err(error) => (
+                        format!("artifact.read error: {error}"),
+                        None,
+                        ToolOutcome::Failed {
+                            message: "artifact.load-failed".to_string(),
+                        },
+                    ),
+                },
+            },
             PreparedTool::WebSearch(input) => match self.search.as_ref() {
                 None => web_search_unconfigured(),
                 Some(client) => match client.search(&input.query, input.max_results).await {
@@ -2985,11 +3446,29 @@ impl FrameworkAgentRuntime {
 
 /// The outcome of driving one tool call through the middleware.
 enum ToolFlow {
-    /// The compacted observation to feed back to the model.
-    Observation(String),
+    /// The compacted observation to feed back to the model, plus the bulk
+    /// artifact recorded for the call when one was persisted — the SAME
+    /// reference the `ToolCompleted` event carries, threaded here so the live
+    /// transcript's `ToolResult` keeps it (mid-run compaction folds an old
+    /// result into a stub citing exactly this reference).
+    Observation {
+        observation: String,
+        artifact: Option<ArtifactRef>,
+    },
     /// The run was cancelled while parked on an approval; the loop must stop
     /// without executing the tool.
     Cancelled,
+}
+
+/// Whether a tool observation records a REFUSAL — a policy denial or a
+/// rejected approval — rather than an executed result. The repeated-call
+/// steer wordsmiths on this: telling the model "its result is in the
+/// transcript" when the "result" is a refusal invites it to hunt for output
+/// that does not exist (or to re-litigate the same call) instead of switching
+/// strategy. Matches the exact observation strings `run_tool`'s deny and
+/// reject paths produce.
+fn observation_is_refusal(output: &str) -> bool {
+    output.starts_with("policy denied") || output == "approval rejected"
 }
 
 /// A tool call resolved to its typed input plus the action policy evaluates.
@@ -3037,6 +3516,9 @@ enum PreparedTool {
     BlackboardPost(BlackboardPostInput),
     BlackboardQuery(BlackboardQueryInput),
     MemoryRemember(MemoryRememberInput),
+    /// An `artifact.read` call: the parsed artifact id to rehydrate through
+    /// the wired [`ArtifactReader`].
+    ArtifactRead(ArtifactReadInput),
     /// An MCP tool call (PR B): the dispatch pair `prepare`'s guard verified
     /// against the bridge's offered cache, plus the RAW model-supplied args
     /// (the canonical form lives on the `McpToolCall` action, for the digest).
@@ -3103,6 +3585,19 @@ fn web_search_unconfigured() -> (String, Option<ArtifactRef>, ToolOutcome) {
         None,
         ToolOutcome::Failed {
             message: "web.search.unconfigured".to_string(),
+        },
+    )
+}
+
+/// The tool-result tuple for an `artifact.read` call with no wired reader
+/// (defensive: `prepare`'s match guard already refuses such a call as an
+/// unknown tool, mirroring the blackboard arms).
+fn artifact_read_unavailable() -> (String, Option<ArtifactRef>, ToolOutcome) {
+    (
+        "artifact.read is unavailable (no artifact reader is wired)".to_string(),
+        None,
+        ToolOutcome::Failed {
+            message: "artifact.unavailable".to_string(),
         },
     )
 }
@@ -3630,25 +4125,75 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
         executor: None,
     };
     vec![
+        // Schema/parser drift fix: every parameter `parse_command_request`
+        // accepts is advertised — a model cannot use (or even discover) a
+        // longer timeout or a subdirectory cwd the schema hides.
         decl(
             Shell::NAME,
-            "Run an allow-listed program in the worktree.",
+            "Run an allow-listed program in the worktree. `cwd` defaults to the worktree \
+                 root and `timeout_secs` to 30 (both clamped by policy); pass `timeout_secs` \
+                 explicitly for a long build or test run.",
             json!({
                 "type": "object",
                 "properties": {
                     "program": {"type": "string"},
-                    "args": {"type": "array", "items": {"type": "string"}}
+                    "args": {"type": "array", "items": {"type": "string"}},
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory (defaults to the worktree root)."
+                    },
+                    "environment": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "Extra environment variables (name → value); execution-hijacking names are refused."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Wall-clock limit in seconds (default 30, clamped by policy)."
+                    }
                 },
                 "required": ["program"]
             }),
         ),
+        // Schema/parser drift fix: `range` (accepted by `parse_read_file` all
+        // along) is advertised, and the description states the 200-line
+        // default — without both, models re-issued the same default read of a
+        // big file instead of paging through it.
         decl(
             ReadFile::NAME,
-            "Read a line-numbered excerpt of a file.",
+            "Read a line-numbered excerpt of a file. Without `range` only the FIRST 200 \
+                 lines are returned — pass `range` to page through a longer file.",
             json!({
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "range": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "description": "Inclusive 1-based [start, end] line range."
+                    }
+                },
                 "required": ["path"]
+            }),
+        ),
+        // Offered only when an artifact reader is wired (the configured gate
+        // in `offered_tool_names`), like `web.search` below.
+        decl(
+            ArtifactRead::NAME,
+            "Re-open a stored artifact by id — the full output behind a truncated tool \
+                 result (observations cite `artifact <id> sha256:…`). Returns up to 64 KiB; \
+                 longer content keeps its head and tail with an omission marker.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "The artifact id cited by a tool result."
+                    }
+                },
+                "required": ["id"]
             }),
         ),
         decl(
@@ -3860,10 +4405,7 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
 impl FrameworkModelDriver {
     fn to_messages(transcript: &[TurnItem]) -> Vec<agent_framework_core::types::Message> {
         use agent_framework_core::types::Message;
-        let mut messages = vec![Message::system(
-            "You are a coding agent. Use the provided tools to inspect and modify \
-             the repository, then finish with a short summary.",
-        )];
+        let mut messages = vec![Message::system(SYSTEM_PROMPT)];
         for item in transcript {
             let message = match item {
                 TurnItem::Objective(text) => Message::user(text.clone()),
@@ -6504,9 +7046,10 @@ mod tests {
         // With `driver.context_window() == Some(limit)`, the loop's very first
         // pass through the safe point sees `transcript == [Objective(..)]`
         // (before the scripted `Say`/`Finish` steps run), so the FIRST emitted
-        // `used` must equal `estimate_context_tokens` of exactly that
-        // transcript — proving the loop feeds the estimator the real,
-        // in-flight transcript rather than some placeholder.
+        // `used` must equal `estimate_request_tokens` of exactly that
+        // transcript AND the definitions advertised for the run — proving the
+        // loop feeds the estimator the real, in-flight request rather than
+        // some placeholder, system prompt and tool schemas included.
         let objective = "say hello";
         let driver = ScriptedDriver::new(vec![
             ModelStep::Say("Hello, world.".to_string()),
@@ -6525,6 +7068,9 @@ mod tests {
             repo.path(),
             repo.path(),
         );
+        // The definitions the loop advertises for THIS run, charged by the
+        // estimate exactly as they are re-sent on every request.
+        let tools = runtime.advertised_tool_definitions(&ctx);
         runtime
             .execute_run(&driver, ctx, CancellationToken::never())
             .await
@@ -6535,9 +7081,15 @@ mod tests {
             !token_events.is_empty(),
             "a known window must emit at least one BudgetWarning{{Tokens}}"
         );
-        let expected_used =
-            estimate_context_tokens(&[TurnItem::Objective(objective.to_string())]) as u64;
+        let seed = [TurnItem::Objective(objective.to_string())];
+        let expected_used = estimate_request_tokens(&seed, &tools) as u64;
         assert_eq!(token_events[0], (expected_used, 32_768));
+        // ...and that is strictly MORE than the transcript alone: the system
+        // prompt and the advertised schemas are no longer free.
+        assert!(
+            expected_used > estimate_context_tokens(&seed) as u64,
+            "the request estimate must charge for the system prompt and tools"
+        );
     }
 
     #[tokio::test]
@@ -6735,10 +7287,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_multi_chunk_stream_emits_one_ordered_delta_per_chunk() {
-        // A streaming request that produces several chunks yields one
-        // `ModelStreamDelta` PER chunk, live and in order — not a single
-        // buffered dump — and their concatenation is the full reply.
+    async fn a_multi_chunk_stream_coalesces_mid_line_chunks_without_losing_bytes() {
+        // Delta coalescing: several sub-line chunks arriving inside one
+        // `DELTA_COALESCE_WINDOW` merge into FEWER journaled
+        // `ModelStreamDelta`s than there were chunks — that is the point, one
+        // SQLite append per line-ish instead of per token-burst — while the
+        // recovery contract holds exactly: their concatenation, in order, is
+        // still byte-for-byte the full reply.
         let driver = MultiChunkStreamingDriver::new(&["Strea", "ming ", "reply."]);
         let (runtime, mut events, session_id) = test_runtime();
         let repo = tempfile::tempdir().expect("tempdir");
@@ -6756,17 +7311,43 @@ mod tests {
             .expect("streaming run completes");
 
         let deltas = drain_deltas(&mut events);
+        assert_eq!(deltas.concat(), "Streaming reply.");
+        assert!(
+            deltas.len() < 3,
+            "sub-line chunks inside the window must coalesce, got {deltas:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_newline_boundary_flushes_the_coalesced_delta_immediately() {
+        // Coalescing must never hold a COMPLETED line back waiting for the
+        // window: a chunk carrying `\n` flushes what is buffered at once, so
+        // the live stream still lands line-by-line (the promptness half of the
+        // contract). Three chunks, two of them newline-terminated, therefore
+        // produce three deltas split on the line boundaries — not one merged
+        // blob — and still concatenate to the full reply.
+        let driver = MultiChunkStreamingDriver::new(&["first ", "line\n", "second line\n"]);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "stream two lines",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("streaming run completes");
+
+        let deltas = drain_deltas(&mut events);
         assert_eq!(
             deltas,
-            vec![
-                "Strea".to_string(),
-                "ming ".to_string(),
-                "reply.".to_string()
-            ]
+            vec!["first line\n".to_string(), "second line\n".to_string()]
         );
-        // More than one delta proves per-chunk streaming (not one buffered emit).
-        assert!(deltas.len() > 1, "expected multiple deltas, got {deltas:?}");
-        assert_eq!(deltas.concat(), "Streaming reply.");
+        assert_eq!(deltas.concat(), "first line\nsecond line\n");
     }
 
     /// A driver that pushes two chunks through the sink and THEN fails
@@ -6798,9 +7379,10 @@ mod tests {
 
     #[tokio::test]
     async fn chunks_streamed_before_a_mid_stream_error_are_still_emitted() {
-        // The run fails (the driver errored), but the chunks pushed before the
-        // error must survive as deltas — they went out as they arrived / are
-        // drained on the error path, never lost.
+        // The run fails (the driver errored), but every byte pushed before the
+        // error must survive as journaled delta text — the drain-then-flush
+        // runs on the error path too, so coalescing never turns a mid-stream
+        // failure into lost output.
         let driver = FailAfterChunksDriver {
             chunks: vec!["par".to_string(), "tial".to_string()],
         };
@@ -6825,7 +7407,7 @@ mod tests {
             outcome.disposition
         );
         let deltas = drain_deltas(&mut events);
-        assert_eq!(deltas, vec!["par".to_string(), "tial".to_string()]);
+        assert_eq!(deltas.concat(), "partial");
     }
 
     /// A text-only assistant streaming update.
