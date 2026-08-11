@@ -45,7 +45,7 @@ use codypendent_integrations::search::SearchApi;
 #[cfg(test)]
 use codypendent_integrations::search::TavilyClient;
 use codypendent_knowledge::{
-    assemble_context, chronicle_candidates, extract_candidates, Curation, ExtractionInput,
+    chronicle_candidates, extract_candidates, ContextAssembler, Curation, ExtractionInput,
     FactExtractor, MemoryStore, NoopExtractor, Revision, Scope,
 };
 use codypendent_protocol::discovery::RuntimePaths;
@@ -67,7 +67,7 @@ use crate::blackboard::WorkflowBlackboardReader;
 use crate::promotion::PromotionStoreGateway;
 use crate::routing::{estimate_input_tokens, RoutingConfig, RoutingCoordinator};
 use crate::scan;
-use crate::session_history::continuation_prior;
+use crate::session_history::{context_turn, continuation_prior, CONTEXT_PSEUDO_TOOL};
 use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor, WorkflowRunCancellations};
 use crate::workflows::{WorkflowConductorHost, WorkflowRunReader};
 
@@ -204,6 +204,13 @@ pub struct RuntimeExecutor {
     /// the run resolves a model exactly as before. Bound to the shared
     /// subscription hub so a recorded routing note reaches attached clients live.
     routing: RoutingCoordinator,
+    /// The caching context assembler (2026-08-11 review item 3): serves
+    /// [`emit_context`](Self::emit_context) the registry's derived retrieval
+    /// indexes from a registry-stamped cache instead of rebuilding dense+BM25
+    /// from scratch on every first run. `Arc` so every clone of this executor
+    /// shares ONE cache; invalidation is the stamp probe inside the assembler
+    /// (any registry write — a skill install, a builtin refresh — moves it).
+    context: Arc<ContextAssembler>,
 }
 
 impl RuntimeExecutor {
@@ -282,6 +289,7 @@ impl RuntimeExecutor {
             workflows,
             workflow_cancellations,
             routing,
+            context: Arc::new(ContextAssembler::new()),
         }
     }
 
@@ -1142,29 +1150,49 @@ impl RuntimeExecutor {
 
     /// Assemble the knowledge-fabric context (repository map + tool/skill cards +
     /// cited memories) for `objective` and note its render into the trace, so
-    /// every run opens with the three manifests.
+    /// every run opens with the three manifests. Returns the rendered manifest —
+    /// the SAME text the note carries — so the caller can also seed it into the
+    /// model-visible transcript (2026-08-11 review item 1: previously the
+    /// manifest reached only this trace note and the model started blind).
     ///
     /// Called **before** the agent loop, never concurrently with it — the note is
     /// appended and published from the worker before `execute` spawns, so it can
     /// never race the loop for a sequence. A fabric failure is warned and swallowed
-    /// (context is an aid, never a gate on running).
+    /// (context is an aid, never a gate on running); a note-append failure still
+    /// returns the manifest — the model seed must not depend on the trace write.
     async fn emit_context(
         &self,
         session_id: SessionId,
         run_id: RunId,
         repository: RepositoryId,
         objective: &str,
-    ) {
-        // System (built-ins) + this repository (harvested run memories are stored
-        // at repository visibility), so a memory a prior run curated resurfaces.
-        let scopes = [Scope::System, Scope::Repository(repository)];
-        match assemble_context(&self.pool, repository, objective, &scopes).await {
+    ) -> Option<String> {
+        // System (built-ins) + the operator's local user scope (data-dir skills
+        // installed via `codypendent skill add` / the startup scan register
+        // there) + this repository (harvested run memories are stored at
+        // repository visibility, and repo-local skills anchor here), so a memory
+        // a prior run curated — and every locally installed skill — resurfaces.
+        let scopes = [
+            Scope::System,
+            codypendent_knowledge::local_user_scope(),
+            Scope::Repository(repository),
+        ];
+        match self
+            .context
+            .assemble(&self.pool, repository, objective, &scopes)
+            .await
+        {
             Ok(manifest) => {
-                if let Err(error) = self.emit_note(session_id, run_id, manifest.render()).await {
+                let rendered = manifest.render();
+                if let Err(error) = self.emit_note(session_id, run_id, rendered.clone()).await {
                     warn!(%session_id, %run_id, %error, "could not emit run context note");
                 }
+                Some(rendered)
             }
-            Err(error) => warn!(%session_id, %error, "could not assemble run context"),
+            Err(error) => {
+                warn!(%session_id, %error, "could not assemble run context");
+                None
+            }
         }
     }
 
@@ -1283,10 +1311,12 @@ impl RuntimeExecutor {
 
     /// Open a run's trace. The FIRST run of a session (empty reconstructed
     /// `prior`) gets the full knowledge-fabric context manifest via
-    /// [`emit_context`](Self::emit_context); a CONTINUATION (non-empty prior)
-    /// gets a one-line [`CONTINUATION_CONTEXT_NOTE`] marker instead — its shared
-    /// context already rides in the seeded transcript, so re-emitting the full
-    /// `=== CONTEXT` repo-map every follow-up would only re-pay tokens for
+    /// [`emit_context`](Self::emit_context) — returned so the caller seeds it
+    /// into the model transcript too; a CONTINUATION (non-empty prior) gets a
+    /// one-line [`CONTINUATION_CONTEXT_NOTE`] marker instead and returns `None`
+    /// — its shared context already rides in the seeded transcript (the stored
+    /// manifest note projected by `continuation_prior`), so re-assembling the
+    /// full `=== CONTEXT` repo-map every follow-up would only re-pay tokens for
     /// nothing (continuous-session plan, Task 4).
     async fn emit_run_opening(
         &self,
@@ -1295,16 +1325,53 @@ impl RuntimeExecutor {
         repository: RepositoryId,
         objective: &str,
         prior: &[TurnItem],
-    ) {
+    ) -> Option<String> {
         if prior.is_empty() {
-            self.emit_context(session_id, run_id, repository, objective)
+            return self
+                .emit_context(session_id, run_id, repository, objective)
                 .await;
-        } else if let Err(error) = self
+        }
+        if let Err(error) = self
             .emit_note(session_id, run_id, CONTINUATION_CONTEXT_NOTE.to_string())
             .await
         {
             warn!(%session_id, %run_id, %error, "could not emit the continuation context marker");
         }
+        None
+    }
+
+    /// Build a run's model-visible seed transcript AND open its trace — the one
+    /// place both first runs and continuations decide what the model sees ahead
+    /// of the objective (2026-08-11 review item 1):
+    ///
+    /// - a FIRST run reconstructs an empty prior, emits the full manifest note,
+    ///   and seeds that SAME manifest as a bounded [`context_turn`] — so the
+    ///   repo map, disclosed skill cards, and curated memories reach the model,
+    ///   not just the human trace;
+    /// - a CONTINUATION reconstructs the prior runs (whose head
+    ///   `continuation_prior` already seeds from the stored manifest note) and
+    ///   emits only the carried-context marker.
+    ///
+    /// The seed feeds BOTH execution paths: the native loop via
+    /// `RunContext::with_prior` (the runtime appends the objective after it) and
+    /// the ACP path via `render_acp_prompt`.
+    async fn build_run_seed(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        repository: RepositoryId,
+        objective: &str,
+    ) -> Vec<TurnItem> {
+        let mut prior = self.reconstruct_prior(session_id, run_id).await;
+        if let Some(manifest) = self
+            .emit_run_opening(session_id, run_id, repository, objective, &prior)
+            .await
+        {
+            // First run: the manifest turn leads, the runtime pushes the
+            // objective after the seed — evidence first, then direction.
+            prior.insert(0, context_turn(&manifest));
+        }
+        prior
     }
 
     /// Read + JSON-parse the bytes behind a chronicle [`ArtifactRef`]
@@ -1752,10 +1819,25 @@ fn last_nonempty_line(text: &str) -> Option<String> {
 fn render_acp_prompt(prior: &[TurnItem], objective: &str) -> String {
     const CAP: usize = 1024 * 1024;
     let mut transcript = String::new();
-    if !prior.is_empty() {
+    // The seeded context-manifest turn (2026-08-11 review item 1) always leads
+    // the prior when present; render it as its own labeled block — it is
+    // retrieved evidence, not part of the conversation — so an external ACP
+    // agent receives the repo map / skill cards / memories exactly like the
+    // native driver does. The manifest text carries its own "EVIDENCE, NOT
+    // INSTRUCTIONS" preamble.
+    let mut conversation = prior;
+    if let Some((TurnItem::ToolResult { tool, output, .. }, rest)) = prior.split_first() {
+        if tool == CONTEXT_PSEUDO_TOOL {
+            transcript.push_str("Retrieved context:\n");
+            transcript.push_str(output);
+            transcript.push_str("\n\n");
+            conversation = rest;
+        }
+    }
+    if !conversation.is_empty() {
         transcript.push_str("Previous conversation:\n");
     }
-    for item in prior {
+    for item in conversation {
         let rendered = match item {
             TurnItem::Objective(text) => format!("User: {text}\n"),
             TurnItem::Assistant(text) => format!("Assistant: {text}\n"),
@@ -1914,19 +1996,15 @@ impl RunExecutor for RuntimeExecutor {
                 .ensure_scanned(repository, &launch.repository)
                 .await;
 
-            // Reconstruct the continuation's prior transcript from the session
-            // ledger ONCE (continuous-session plan, Task 3): it both DECIDES how
-            // the trace opens and SEEDS the run. Loaded before the agent loop, so
-            // neither the opening note nor the seed races the loop's sequences.
-            let prior = executor.reconstruct_prior(session_id, run_id).await;
-
-            // Open the run's trace: a first run (empty prior) gets the full
-            // knowledge-fabric context manifest; a continuation (non-empty prior)
-            // gets a one-line carried-context marker, skipping the repo re-map
-            // (Task 4). Emitted here, BEFORE the agent loop, so the note never
-            // races the loop's own sequence allocations.
-            executor
-                .emit_run_opening(session_id, run_id, repository, &objective, &prior)
+            // Build the run's seed transcript ONCE (continuous-session plan,
+            // Task 3 + 2026-08-11 review item 1): it reconstructs the
+            // continuation prior, opens the trace (full manifest note for a
+            // first run, carried-context marker for a follow-up), and seeds the
+            // manifest into the MODEL-VISIBLE transcript — the wire the review
+            // found missing. Done here, BEFORE the agent loop, so neither the
+            // opening note nor the seed races the loop's sequences.
+            let prior = executor
+                .build_run_seed(session_id, run_id, repository, &objective)
                 .await;
 
             // Run the work in a CHILD task so even a panic in the agent loop
@@ -2580,20 +2658,26 @@ mod tests {
         let executor =
             RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
 
-        // First run: empty prior → the full context manifest lands on the ledger.
+        // First run: empty prior → the full context manifest lands on the ledger
+        // AND is returned for the model seed (2026-08-11 review item 1).
         let first_session = SessionId::new();
         ledger::create_session(&pool, first_session, "first")
             .await
             .expect("create session");
-        executor
+        let manifest = executor
             .emit_run_opening(first_session, RunId::new(), repository, "objective", &[])
             .await;
         assert!(
             context_manifest_present(&pool, first_session).await,
             "a first run must emit the full === CONTEXT manifest"
         );
+        assert!(
+            manifest.is_some_and(|text| text.starts_with("=== CONTEXT")),
+            "the first run's opening must hand back the manifest for the model seed"
+        );
 
-        // Continuation: non-empty prior → NO manifest, the marker instead.
+        // Continuation: non-empty prior → NO manifest, the marker instead — and
+        // nothing returned (the seed already carries the stored context turn).
         let cont_session = SessionId::new();
         ledger::create_session(&pool, cont_session, "cont")
             .await
@@ -2602,12 +2686,16 @@ mod tests {
             TurnItem::Objective("earlier".to_string()),
             TurnItem::Assistant("reply".to_string()),
         ];
-        executor
+        let continuation = executor
             .emit_run_opening(cont_session, RunId::new(), repository, "follow up", &prior)
             .await;
         assert!(
             !context_manifest_present(&pool, cont_session).await,
             "a continuation must NOT emit the === CONTEXT manifest"
+        );
+        assert!(
+            continuation.is_none(),
+            "a continuation opening returns no manifest to seed"
         );
     }
 
@@ -3099,7 +3187,7 @@ mod tests {
         // separate one-line statements in the same repository-scoped context
         // manifest a later run would open with (`context.rs` `=== MEMORIES
         // ===`, capped `MAX_CONTEXT_MEMORIES`).
-        let manifest = assemble_context(
+        let manifest = codypendent_knowledge::assemble_context(
             &pool,
             repository,
             "compose check",
@@ -4256,6 +4344,365 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
                 .iter()
                 .any(|o| o.contains("beta.rs") && o.contains("fn beta")),
             "the beta.rs read must hydrate with its path header and content, got: {outputs:?}"
+        );
+    }
+
+    /// A [`codypendent_runtime::agent::ModelDriver`] that records every
+    /// transcript it is handed and immediately finishes — the probe for the
+    /// 2026-08-11 review's headline fix: what does the MODEL actually receive?
+    struct RecordingDriver {
+        transcripts: Arc<Mutex<Vec<Vec<TurnItem>>>>,
+    }
+
+    #[async_trait]
+    impl codypendent_runtime::agent::ModelDriver for RecordingDriver {
+        fn model_id(&self) -> ModelId {
+            ModelId("recording".to_string())
+        }
+
+        async fn next_step(
+            &self,
+            transcript: &[TurnItem],
+            _tools: &[codypendent_runtime::agent::ToolDefinition],
+            _sink: &mut dyn codypendent_runtime::agent::DeltaSink,
+        ) -> anyhow::Result<codypendent_runtime::agent::StepOutcome> {
+            use codypendent_runtime::agent::{ModelStep, StepOutcome};
+            self.transcripts
+                .lock()
+                .expect("recording lock")
+                .push(transcript.to_vec());
+            Ok(StepOutcome::new(
+                ModelStep::Finish {
+                    summary: "done".to_string(),
+                },
+                None,
+            ))
+        }
+    }
+
+    /// Write a minimal ACTIVE repository-scoped skill package at `dir`, with
+    /// intents matching a CI-failure objective.
+    fn write_ci_skill_package(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).expect("package dir");
+        std::fs::write(
+            dir.join("skill.toml"),
+            "schema_version = 1\n\
+             id = \"test.fix-flaky-ci\"\n\
+             name = \"Fix Flaky CI\"\n\
+             version = \"0.1.0\"\n\
+             scope = \"repository\"\n\
+             status = \"active\"\n\
+             description = \"Diagnose and repair flaky CI test failures.\"\n\
+             intents = [\"ci failure\", \"flaky test\"]\n\
+             \n\
+             [entrypoints]\n\
+             instructions = \"SKILL.md\"\n\
+             \n\
+             [trust]\n\
+             publisher = \"local-user\"\n\
+             signature_required = false\n",
+        )
+        .expect("write skill.toml");
+        std::fs::write(dir.join("SKILL.md"), "# Fix flaky CI\n").expect("write SKILL.md");
+    }
+
+    /// 2026-08-11 review item 1 (the CRITICAL "context never reaches the model"
+    /// finding), first-run side: the seed built by the REAL
+    /// [`RuntimeExecutor::build_run_seed`] — the exact code `spawn_run` runs —
+    /// must open with the context-manifest turn, and driving the REAL
+    /// [`FrameworkAgentRuntime::execute_run`] with that seed must hand the
+    /// DRIVER a transcript containing the repository map and the disclosed
+    /// skill card, ahead of the objective. Before the fix the manifest was a
+    /// `NoteAppended` trace event only and this transcript carried nothing but
+    /// the objective.
+    #[tokio::test]
+    async fn first_run_seed_reaches_the_model_driver_with_repo_map_and_skill_card() {
+        use codypendent_knowledge::{codegraph, register_builtins, GitRevision, Registry};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let repository = scan::repository_id_for(repo.path());
+        let executor =
+            RuntimeExecutor::new(pool.clone(), paths, repository, repo.path().to_path_buf());
+
+        // Seed all three manifest surfaces: builtins (tool cards), a real code
+        // graph (repository map), and an ACTIVE repository-scoped skill
+        // (skill card) registered through the real package path.
+        register_builtins(&pool).await.expect("register builtins");
+        codegraph::upsert_file_graph(
+            &pool,
+            repository,
+            &GitRevision("rev-1".to_string()),
+            "src/engine.rs",
+            "pub struct Engine;\n\nimpl Engine {\n    pub fn tick(&self) -> u32 {\n        1\n    }\n}\n",
+        )
+        .await
+        .expect("seed code graph");
+        let skill_dir = dir.path().join("skill-pkg");
+        write_ci_skill_package(&skill_dir);
+        Registry::new()
+            .register_package(&pool, &skill_dir, Scope::Repository(repository))
+            .await
+            .expect("register skill package");
+
+        // The live write path appends the run's own RunStarted BEFORE spawn.
+        let session = SessionId::new();
+        let run_id = RunId::new();
+        let objective = "the ci is failing with a flaky rust test, diagnose and fix it";
+        ledger::create_session(&pool, session, "ctx-seed")
+            .await
+            .expect("create session");
+        projections::insert_run(
+            &pool,
+            run_id,
+            session,
+            objective,
+            AgentMode::Explore,
+            "hosted",
+            "{}",
+        )
+        .await
+        .expect("insert run row");
+        let started = codypendent_protocol::SessionEvent {
+            sequence: ledger::next_sequence(&pool, session).await.expect("seq"),
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::RunStarted {
+                run_id,
+                objective: objective.to_string(),
+                mode: AgentMode::Explore,
+            },
+        };
+        ledger::append_event(&pool, session, &started)
+            .await
+            .expect("append RunStarted");
+
+        // THE SEAM UNDER TEST: the exact seed `spawn_run` builds.
+        let prior = executor
+            .build_run_seed(session, run_id, repository, objective)
+            .await;
+        match prior.first() {
+            Some(TurnItem::ToolResult { tool, output, .. }) => {
+                assert_eq!(tool, CONTEXT_PSEUDO_TOOL);
+                assert!(
+                    output.contains("=== REPOSITORY MAP ===") && output.contains("Engine"),
+                    "the seed turn must carry the repository map: {output}"
+                );
+                assert!(
+                    output.contains("test.fix-flaky-ci"),
+                    "the seed turn must carry the disclosed skill card: {output}"
+                );
+            }
+            other => panic!("a first run's seed must open with the context turn, got {other:?}"),
+        }
+
+        // Drive the REAL loop with the seed and record what the DRIVER sees —
+        // the transcript the model would receive.
+        let broker = ApprovalBroker::new();
+        let hub = SubscriptionHub::new();
+        let runtime = FrameworkAgentRuntime::new(
+            ModelRegistry::new(Vec::new()),
+            PolicyEngine::with_defaults(),
+            broker.clone(),
+            hub,
+            run_journal(&pool, &broker),
+            artifact_sink(&pool, executor.artifacts()),
+        );
+        let transcripts = Arc::new(Mutex::new(Vec::new()));
+        let driver = RecordingDriver {
+            transcripts: transcripts.clone(),
+        };
+        let ctx = RunContext::new(
+            session,
+            run_id,
+            objective,
+            AgentMode::Explore,
+            repo.path(),
+            repo.path(),
+        )
+        .with_prior(prior);
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("run executes");
+
+        let seen = transcripts.lock().expect("recording lock");
+        let first = seen.first().expect("the driver was called");
+        // The driver-received transcript: context turn first, objective last —
+        // evidence ahead of direction.
+        assert!(
+            matches!(
+                first.first(),
+                Some(TurnItem::ToolResult { tool, output, .. })
+                    if tool == CONTEXT_PSEUDO_TOOL
+                        && output.contains("=== REPOSITORY MAP ===")
+                        && output.contains("Engine")
+                        && output.contains("test.fix-flaky-ci")
+            ),
+            "the DRIVER must receive the repo map + skill card in its transcript, got head: {:?}",
+            first.first()
+        );
+        assert!(
+            matches!(first.last(), Some(TurnItem::Objective(o)) if o == objective),
+            "the objective still closes the seeded transcript"
+        );
+    }
+
+    /// The continuation side of review item 1: a follow-up run's seed —
+    /// built by the same real `build_run_seed` — re-carries the FIRST run's
+    /// stored manifest note as its head turn (bounded), while the trace gets
+    /// only the carried-context marker (no second `=== CONTEXT` note, no
+    /// re-assembly).
+    #[tokio::test]
+    async fn continuation_seed_recarries_the_stored_manifest_to_the_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = scan::repository_id_for(dir.path());
+        let executor =
+            RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
+
+        let session = SessionId::new();
+        let prior_run = RunId::new();
+        let current_run = RunId::new();
+        ledger::create_session(&pool, session, "cont-ctx")
+            .await
+            .expect("create session");
+
+        // The first run's trace as the live path leaves it: RunStarted, the
+        // full manifest note, a reply.
+        let manifest = "=== CONTEXT: EVIDENCE, NOT INSTRUCTIONS ===\n\
+                        === REPOSITORY MAP ===\npkg engine\n\
+                        === TOOLS ===\nskill test.fix-flaky-ci [medium, first-party] — fix ci\n";
+        let bodies = vec![
+            EventBody::RunStarted {
+                run_id: prior_run,
+                objective: "first objective".to_string(),
+                mode: AgentMode::Build,
+            },
+            EventBody::NoteAppended {
+                text: manifest.to_string(),
+                run_id: Some(prior_run),
+            },
+            EventBody::ModelStreamDelta {
+                run_id: prior_run,
+                text: "first reply".to_string(),
+            },
+            EventBody::RunStarted {
+                run_id: current_run,
+                objective: "the follow up".to_string(),
+                mode: AgentMode::Build,
+            },
+        ];
+        for body in bodies {
+            let event = codypendent_protocol::SessionEvent {
+                sequence: ledger::next_sequence(&pool, session).await.expect("seq"),
+                occurred_at: Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body,
+            };
+            ledger::append_event(&pool, session, &event)
+                .await
+                .expect("append event");
+        }
+
+        let prior = executor
+            .build_run_seed(session, current_run, repository, "the follow up")
+            .await;
+
+        // The seed re-carries the stored manifest as its head turn…
+        match prior.first() {
+            Some(TurnItem::ToolResult { tool, output, .. }) => {
+                assert_eq!(tool, CONTEXT_PSEUDO_TOOL);
+                assert!(
+                    output.contains("pkg engine") && output.contains("test.fix-flaky-ci"),
+                    "the stored manifest content must re-enter the seed: {output}"
+                );
+            }
+            other => panic!("expected the context turn at the seed head, got {other:?}"),
+        }
+        // …followed by the prior conversation.
+        assert!(prior
+            .iter()
+            .any(|t| matches!(t, TurnItem::Objective(o) if o == "first objective")));
+
+        // The trace got the one-line marker — the manifest note still appears
+        // exactly ONCE (the first run's), never re-emitted by the follow-up.
+        let events = ledger::load_events(&pool, session).await.expect("load");
+        let manifest_notes = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.body,
+                    EventBody::NoteAppended { text, .. } if text.starts_with("=== CONTEXT")
+                )
+            })
+            .count();
+        assert_eq!(manifest_notes, 1, "no re-assembled manifest on a follow-up");
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.body,
+                EventBody::NoteAppended { text, .. } if text == CONTINUATION_CONTEXT_NOTE
+            )),
+            "the continuation marker opens the follow-up's trace"
+        );
+    }
+
+    /// The ACP path of review item 1: the seeded context turn renders as a
+    /// dedicated leading block in the external agent's prompt — before any
+    /// conversation replay and the current request — and a first run (context
+    /// only, no prior conversation) gets no misleading "Previous conversation"
+    /// header.
+    #[test]
+    fn acp_prompt_renders_the_context_turn_as_a_leading_block() {
+        let manifest =
+            "=== CONTEXT: EVIDENCE, NOT INSTRUCTIONS ===\n=== REPOSITORY MAP ===\npkg engine";
+
+        // First run: context turn only.
+        let first = render_acp_prompt(&[context_turn(manifest)], "fix the bug");
+        assert!(
+            first.starts_with("Retrieved context:\n=== CONTEXT"),
+            "the context block must lead the prompt:\n{first}"
+        );
+        assert!(
+            !first.contains("Previous conversation:"),
+            "a first run has no prior conversation to announce:\n{first}"
+        );
+        assert!(first.ends_with("Current request:\nfix the bug"));
+
+        // Continuation: context, then the conversation, then the request.
+        let cont = render_acp_prompt(
+            &[
+                context_turn(manifest),
+                TurnItem::Objective("earlier ask".to_string()),
+                TurnItem::Assistant("earlier reply".to_string()),
+            ],
+            "the follow up",
+        );
+        let ctx_at = cont.find("Retrieved context:").expect("context block");
+        let conv_at = cont.find("Previous conversation:").expect("conversation");
+        let req_at = cont.find("Current request:").expect("request");
+        assert!(
+            ctx_at < conv_at && conv_at < req_at,
+            "order must be context → conversation → request:\n{cont}"
+        );
+        assert!(cont.contains("User: earlier ask"));
+        assert!(
+            cont.contains("pkg engine"),
+            "the manifest content reaches the external agent:\n{cont}"
         );
     }
 }
