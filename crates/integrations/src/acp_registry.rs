@@ -1,0 +1,1470 @@
+//! Official ACP agent-registry discovery and pinned launch/install support.
+//!
+//! The registry is data, never authority: Codypendent validates and caches a
+//! bounded copy, pins package versions exactly as published, and only installs
+//! binary archives after an explicit user action. Archive extraction rejects
+//! links, special files, duplicate paths, traversal, and resource bombs.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
+use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
+
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// ACP's canonical, curated registry endpoint.
+pub const ACP_REGISTRY_URL: &str =
+    "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
+
+const MAX_REGISTRY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 20_000;
+const MAX_PATH_BYTES: usize = 512;
+const MAX_ARGS: usize = 128;
+const MAX_ENV: usize = 128;
+const REGISTRY_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The current official registry document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpRegistry {
+    pub version: String,
+    pub agents: Vec<AcpRegistryAgent>,
+}
+
+/// One installable ACP agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpRegistryAgent {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub repository: String,
+    pub distribution: AcpDistribution,
+}
+
+/// Registry distributions are additive; an entry may offer more than one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AcpDistribution {
+    #[serde(default)]
+    pub npx: Option<AcpPackageDistribution>,
+    #[serde(default)]
+    pub uvx: Option<AcpPackageDistribution>,
+    #[serde(default)]
+    pub binary: BTreeMap<String, AcpBinaryDistribution>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpPackageDistribution {
+    pub package: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpBinaryDistribution {
+    pub archive: String,
+    pub cmd: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// A fully resolved, version-pinned ACP subprocess launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpLaunchSpec {
+    pub registry_id: String,
+    pub name: String,
+    pub version: String,
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AcpRegistryError {
+    #[error("could not fetch the ACP registry: {0}")]
+    Fetch(String),
+    #[error("ACP registry response exceeds {MAX_REGISTRY_BYTES} bytes")]
+    RegistryTooLarge,
+    #[error("ACP archive exceeds {MAX_ARCHIVE_BYTES} bytes")]
+    ArchiveTooLarge,
+    #[error("invalid ACP registry: {0}")]
+    Invalid(String),
+    #[error("ACP agent `{0}` is not in the cached registry; run `codypendent acp refresh`")]
+    UnknownAgent(String),
+    #[error("ACP agent `{agent}` has no distribution for platform `{platform}`")]
+    UnsupportedPlatform { agent: String, platform: String },
+    #[error("ACP agent `{agent}` is not installed; run `codypendent acp install {agent}`")]
+    NotInstalled { agent: String },
+    #[error("ACP package runner `{tool}` is unavailable; install it and retry")]
+    ToolUnavailable { tool: String },
+    #[error("ACP binary `{agent}` has no registry checksum; repeat with --allow-unverified")]
+    MissingChecksum { agent: String },
+    #[error("ACP archive checksum mismatch (expected {expected}, got {actual})")]
+    ChecksumMismatch { expected: String, actual: String },
+    #[error("ACP registry I/O error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("ACP archive is invalid: {0}")]
+    Archive(String),
+}
+
+impl AcpRegistry {
+    /// Parse and validate one bounded registry document.
+    pub fn parse(bytes: &[u8]) -> Result<Self, AcpRegistryError> {
+        if bytes.len() > MAX_REGISTRY_BYTES {
+            return Err(AcpRegistryError::RegistryTooLarge);
+        }
+        let registry: Self = serde_json::from_slice(bytes)
+            .map_err(|error| AcpRegistryError::Invalid(error.to_string()))?;
+        registry.validate()?;
+        Ok(registry)
+    }
+
+    fn validate(&self) -> Result<(), AcpRegistryError> {
+        if self.version.trim().is_empty() || self.agents.len() > 1_000 {
+            return Err(AcpRegistryError::Invalid(
+                "blank version or too many agents".to_string(),
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for agent in &self.agents {
+            if !valid_id(&agent.id) || !ids.insert(agent.id.clone()) {
+                return Err(AcpRegistryError::Invalid(format!(
+                    "invalid or duplicate agent id `{}`",
+                    agent.id
+                )));
+            }
+            if agent.name.trim().is_empty()
+                || agent.version.trim().is_empty()
+                || agent.version.len() > 128
+            {
+                return Err(AcpRegistryError::Invalid(format!(
+                    "agent `{}` has invalid identity metadata",
+                    agent.id
+                )));
+            }
+            let mut offered = 0usize;
+            for package in [&agent.distribution.npx, &agent.distribution.uvx]
+                .into_iter()
+                .flatten()
+            {
+                offered += 1;
+                validate_package(package, &agent.id)?;
+            }
+            for (platform, binary) in &agent.distribution.binary {
+                offered += 1;
+                if !valid_platform(platform) {
+                    return Err(AcpRegistryError::Invalid(format!(
+                        "agent `{}` has invalid platform `{platform}`",
+                        agent.id
+                    )));
+                }
+                validate_binary(binary, &agent.id)?;
+            }
+            if offered == 0 {
+                return Err(AcpRegistryError::Invalid(format!(
+                    "agent `{}` has no distribution",
+                    agent.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<&AcpRegistryAgent> {
+        let (id, _) = split_agent_coordinate(id);
+        self.agents.iter().find(|agent| agent.id == id)
+    }
+}
+
+/// Resolve common product names to the official registry id. The registry
+/// remains authoritative; aliases only make the human-facing CLI forgiving.
+#[must_use]
+pub fn canonical_agent_id(id: &str) -> String {
+    let normalized = id.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "claude" | "claude-code" | "claude-agent" => "claude-acp".to_string(),
+        "codex" | "openai-codex" => "codex-acp".to_string(),
+        "amp" => "amp-acp".to_string(),
+        "kimi-code" => "kimi-code".to_string(),
+        "kimi-cli" => "kimi".to_string(),
+        "vibe" | "vibe-chat" | "mistral" => "mistral-vibe".to_string(),
+        "gemini-cli" => "gemini".to_string(),
+        _ => normalized,
+    }
+}
+
+/// The immutable coordinate persisted in a connected model profile. Discovery
+/// follows `latest`, but an already-connected executable never silently changes
+/// underneath a run after the 24-hour catalogue refresh.
+#[must_use]
+pub fn agent_coordinate(id: &str, version: &str) -> String {
+    format!("{}@{version}", canonical_agent_id(id))
+}
+
+/// Extract the canonical registry id from either an alias or a pinned
+/// `id@version` model coordinate.
+#[must_use]
+pub fn agent_id_from_coordinate(coordinate: &str) -> String {
+    split_agent_coordinate(coordinate).0
+}
+
+fn split_agent_coordinate(coordinate: &str) -> (String, Option<String>) {
+    let coordinate = coordinate.trim();
+    if let Some((id, version)) = coordinate.rsplit_once('@') {
+        if !id.is_empty() && !version.is_empty() {
+            return (canonical_agent_id(id), Some(version.to_string()));
+        }
+    }
+    (canonical_agent_id(coordinate), None)
+}
+
+/// Persistent registry/install state below `<data_dir>/acp`.
+#[derive(Debug, Clone)]
+pub struct AcpRegistryStore {
+    root: PathBuf,
+}
+
+impl AcpRegistryStore {
+    #[must_use]
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            root: data_dir.into().join("acp"),
+        }
+    }
+
+    #[must_use]
+    pub fn cache_path(&self) -> PathBuf {
+        self.root.join("registry.json")
+    }
+
+    /// Load the last validated registry without network access.
+    pub fn load_cached(&self) -> Result<AcpRegistry, AcpRegistryError> {
+        let path = self.cache_path();
+        let bytes = std::fs::read(&path).map_err(|source| AcpRegistryError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        AcpRegistry::parse(&bytes)
+    }
+
+    /// Fetch, validate, and atomically cache the official registry.
+    pub async fn refresh(&self) -> Result<AcpRegistry, AcpRegistryError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|error| AcpRegistryError::Fetch(error.to_string()))?;
+        let response = client
+            .get(ACP_REGISTRY_URL)
+            .send()
+            .await
+            .map_err(|error| AcpRegistryError::Fetch(error.to_string()))?;
+        if response.url().scheme() != "https" {
+            return Err(AcpRegistryError::Fetch(
+                "registry redirect left HTTPS".to_string(),
+            ));
+        }
+        let response = response
+            .error_for_status()
+            .map_err(|error| AcpRegistryError::Fetch(error.to_string()))?;
+        let bytes = bounded_response(response, MAX_REGISTRY_BYTES).await?;
+        let registry = AcpRegistry::parse(&bytes)?;
+        atomic_write(&self.cache_path(), &bytes)?;
+        Ok(registry)
+    }
+
+    /// Load a fresh-enough cache, or refresh it automatically. If the network
+    /// is unavailable, a previously validated stale cache remains usable so an
+    /// offline TUI can still launch already-known agents.
+    pub async fn load_or_refresh(&self) -> Result<AcpRegistry, AcpRegistryError> {
+        let cached = self.load_cached();
+        let fresh = std::fs::metadata(self.cache_path())
+            .and_then(|metadata| metadata.modified())
+            .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+            .is_ok_and(|age| age <= REGISTRY_MAX_AGE);
+        if fresh {
+            if let Ok(registry) = &cached {
+                return Ok(registry.clone());
+            }
+        }
+        match self.refresh().await {
+            Ok(registry) => Ok(registry),
+            Err(refresh_error) => cached.or(Err(refresh_error)),
+        }
+    }
+
+    /// Resolve a cached agent to an executable launch. NPM/Python entries remain
+    /// version-pinned commands; binary entries must have been explicitly installed.
+    pub fn launch_spec(&self, coordinate: &str) -> Result<AcpLaunchSpec, AcpRegistryError> {
+        if let Some(spec) = resolve_local_kimi_code(coordinate)? {
+            return Ok(spec);
+        }
+        let agent = self.resolve_agent(coordinate)?;
+        self.launch_spec_for(&agent)
+    }
+
+    fn launch_spec_for(&self, agent: &AcpRegistryAgent) -> Result<AcpLaunchSpec, AcpRegistryError> {
+        if let Some(package) = &agent.distribution.npx {
+            let mut args = vec!["-y".to_string(), package.package.clone()];
+            args.extend(package.args.clone());
+            let command = resolve_tool("npx").ok_or_else(|| AcpRegistryError::ToolUnavailable {
+                tool: "npx".to_string(),
+            })?;
+            return Ok(spec(agent, command, args, package.env.clone()));
+        }
+        if let Some(package) = &agent.distribution.uvx {
+            let mut args = vec![package.package.clone()];
+            args.extend(package.args.clone());
+            let command = resolve_tool("uvx").ok_or_else(|| AcpRegistryError::ToolUnavailable {
+                tool: "uvx".to_string(),
+            })?;
+            return Ok(spec(agent, command, args, package.env.clone()));
+        }
+        let platform = current_platform();
+        let binary = agent.distribution.binary.get(platform).ok_or_else(|| {
+            AcpRegistryError::UnsupportedPlatform {
+                agent: agent.id.clone(),
+                platform: platform.to_string(),
+            }
+        })?;
+        let install = self.install_dir(agent);
+        let command = safe_join(&install, &binary.cmd)?;
+        let marker = std::fs::read_to_string(install.join(".archive.sha256")).ok();
+        let marker_matches = marker.as_deref().is_some_and(|digest| {
+            digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && binary
+                    .sha256
+                    .as_deref()
+                    .is_none_or(|expected| digest.eq_ignore_ascii_case(expected))
+        });
+        if !command.is_file() || !marker_matches {
+            return Err(AcpRegistryError::NotInstalled {
+                agent: agent.id.clone(),
+            });
+        }
+        Ok(spec(
+            agent,
+            command,
+            binary.args.clone(),
+            binary.env.clone(),
+        ))
+    }
+
+    /// Explicitly install the current platform's binary distribution. Package
+    /// manager distributions need no separate install and simply return their
+    /// pinned launch spec.
+    pub async fn install(
+        &self,
+        coordinate: &str,
+        allow_unverified: bool,
+    ) -> Result<AcpLaunchSpec, AcpRegistryError> {
+        if let Some(spec) = resolve_local_kimi_code(coordinate)? {
+            return Ok(spec);
+        }
+        let agent = self.resolve_agent(coordinate)?;
+        if agent.distribution.npx.is_some() || agent.distribution.uvx.is_some() {
+            let spec = self.launch_spec_for(&agent)?;
+            self.cache_agent_snapshot(&agent)?;
+            return Ok(spec);
+        }
+        // Binary versions are immutable registry coordinates. Reuse a complete
+        // prior installation rather than downloading it on every `connect`.
+        if let Ok(spec) = self.launch_spec_for(&agent) {
+            self.cache_agent_snapshot(&agent)?;
+            return Ok(spec);
+        }
+        let platform = current_platform();
+        let binary = agent.distribution.binary.get(platform).ok_or_else(|| {
+            AcpRegistryError::UnsupportedPlatform {
+                agent: agent.id.clone(),
+                platform: platform.to_string(),
+            }
+        })?;
+        if binary.sha256.is_none() && !allow_unverified {
+            return Err(AcpRegistryError::MissingChecksum {
+                agent: agent.id.clone(),
+            });
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|error| AcpRegistryError::Fetch(error.to_string()))?;
+        let response = client
+            .get(&binary.archive)
+            .send()
+            .await
+            .map_err(|error| AcpRegistryError::Fetch(error.to_string()))?;
+        if response.url().scheme() != "https" {
+            return Err(AcpRegistryError::Fetch(
+                "binary redirect left HTTPS".to_string(),
+            ));
+        }
+        let response = response
+            .error_for_status()
+            .map_err(|error| AcpRegistryError::Fetch(error.to_string()))?;
+        let archive = bounded_response(response, MAX_ARCHIVE_BYTES).await?;
+        let actual = hex::encode(Sha256::digest(&archive));
+        if let Some(expected) = &binary.sha256 {
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(AcpRegistryError::ChecksumMismatch {
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
+        let target = self.install_dir(&agent);
+        let archive_url = binary.archive.clone();
+        let archive_command = binary.cmd.clone();
+        let archive_digest = actual;
+        tokio::task::spawn_blocking(move || {
+            install_archive(
+                &target,
+                &archive_url,
+                &archive_command,
+                &archive_digest,
+                &archive,
+            )
+        })
+        .await
+        .map_err(|error| AcpRegistryError::Archive(error.to_string()))??;
+        self.cache_agent_snapshot(&agent)?;
+        self.launch_spec_for(&agent)
+    }
+
+    fn install_dir(&self, agent: &AcpRegistryAgent) -> PathBuf {
+        self.root
+            .join("agents")
+            .join(&agent.id)
+            .join(&agent.version)
+    }
+
+    fn resolve_agent(&self, coordinate: &str) -> Result<AcpRegistryAgent, AcpRegistryError> {
+        let (id, version) = split_agent_coordinate(coordinate);
+        if let Some(version) = version {
+            let path = self
+                .root
+                .join("agents")
+                .join(&id)
+                .join(&version)
+                .join(".registry-agent.json");
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(AcpRegistryError::NotInstalled {
+                        agent: coordinate.to_string(),
+                    });
+                }
+                Err(source) => {
+                    return Err(AcpRegistryError::Io {
+                        path: path.clone(),
+                        source,
+                    });
+                }
+            };
+            let agent: AcpRegistryAgent = serde_json::from_slice(&bytes)
+                .map_err(|error| AcpRegistryError::Invalid(error.to_string()))?;
+            let snapshot = AcpRegistry {
+                version: "snapshot".to_string(),
+                agents: vec![agent.clone()],
+            };
+            snapshot.validate()?;
+            if agent.id != id || agent.version != version {
+                return Err(AcpRegistryError::Invalid(
+                    "pinned ACP snapshot does not match its coordinate".to_string(),
+                ));
+            }
+            return Ok(agent);
+        }
+        let registry = self.load_cached()?;
+        registry
+            .get(&id)
+            .cloned()
+            .ok_or(AcpRegistryError::UnknownAgent(id))
+    }
+
+    fn cache_agent_snapshot(&self, agent: &AcpRegistryAgent) -> Result<(), AcpRegistryError> {
+        let bytes = serde_json::to_vec_pretty(agent)
+            .map_err(|error| AcpRegistryError::Invalid(error.to_string()))?;
+        atomic_write(
+            &self.install_dir(agent).join(".registry-agent.json"),
+            &bytes,
+        )
+    }
+}
+
+/// Discover Kimi Code's native ACP server when its own installer placed the
+/// executable in `~/.kimi-code/bin` (or it is the `kimi` resolved on PATH).
+/// Unlike the official registry's older `kimi`/Kimi CLI entry, this shares the
+/// `kimi login` credentials and `kimi acp` implementation the user actually
+/// installed. A pinned local coordinate refuses a later version until the user
+/// reconnects, preserving the same no-silent-upgrade behavior as registry
+/// packages.
+#[must_use]
+pub fn local_kimi_code_spec() -> Option<AcpLaunchSpec> {
+    let home_candidate = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".kimi-code").join("bin").join("kimi"));
+    let command = home_candidate
+        .filter(|candidate| candidate.is_file())
+        .or_else(|| resolve_tool("kimi"))?;
+    let metadata = command
+        .parent()?
+        .parent()?
+        .join("updates")
+        .join("install.json");
+    let version = local_tool_version(&command)
+        .or_else(|| {
+            std::fs::read(&metadata)
+                .ok()
+                .filter(|bytes| bytes.len() <= 64 * 1024)
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|value| {
+                    value
+                        .get("lastSuccess")?
+                        .get("version")?
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                })
+        })
+        .filter(|version| {
+            !version.is_empty()
+                && version.len() <= 128
+                && version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+        })
+        .unwrap_or_else(|| "local".to_string());
+    Some(AcpLaunchSpec {
+        registry_id: "kimi-code".to_string(),
+        name: "Kimi Code".to_string(),
+        version,
+        command,
+        args: vec!["acp".to_string()],
+        env: BTreeMap::new(),
+    })
+}
+
+fn local_tool_version(command: &Path) -> Option<String> {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let mut child = std::process::Command::new(command)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let output = child.wait_with_output().ok()?;
+                let version = std::str::from_utf8(&output.stdout).ok()?.trim();
+                if !version.is_empty()
+                    && version.len() <= 128
+                    && version.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+')
+                    })
+                {
+                    return Some(version.to_string());
+                }
+                return None;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+fn resolve_local_kimi_code(coordinate: &str) -> Result<Option<AcpLaunchSpec>, AcpRegistryError> {
+    let (id, pinned) = split_agent_coordinate(coordinate);
+    if id != "kimi-code" {
+        return Ok(None);
+    }
+    let spec = local_kimi_code_spec().ok_or_else(|| AcpRegistryError::ToolUnavailable {
+        tool: "kimi".into(),
+    })?;
+    if pinned
+        .as_deref()
+        .is_some_and(|version| version != spec.version)
+    {
+        return Err(AcpRegistryError::NotInstalled {
+            agent: coordinate.to_string(),
+        });
+    }
+    Ok(Some(spec))
+}
+
+fn spec(
+    agent: &AcpRegistryAgent,
+    command: PathBuf,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+) -> AcpLaunchSpec {
+    AcpLaunchSpec {
+        registry_id: agent.id.clone(),
+        name: agent.name.clone(),
+        version: agent.version.clone(),
+        command,
+        args,
+        env,
+    }
+}
+
+async fn bounded_response(
+    response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, AcpRegistryError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > cap as u64)
+    {
+        return Err(if cap == MAX_REGISTRY_BYTES {
+            AcpRegistryError::RegistryTooLarge
+        } else {
+            AcpRegistryError::ArchiveTooLarge
+        });
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| AcpRegistryError::Fetch(error.to_string()))?;
+        if bytes.len().saturating_add(chunk.len()) > cap {
+            return Err(if cap == MAX_REGISTRY_BYTES {
+                AcpRegistryError::RegistryTooLarge
+            } else {
+                AcpRegistryError::ArchiveTooLarge
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn install_archive(
+    target: &Path,
+    url: &str,
+    command: &str,
+    archive_digest: &str,
+    bytes: &[u8],
+) -> Result<(), AcpRegistryError> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| AcpRegistryError::Archive("installation path has no parent".to_string()))?;
+    std::fs::create_dir_all(parent).map_err(|source| AcpRegistryError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let stage = parent.join(format!(".install-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir(&stage).map_err(|source| AcpRegistryError::Io {
+        path: stage.clone(),
+        source,
+    })?;
+    let archive_path = reqwest::Url::parse(url)
+        .map_err(|error| AcpRegistryError::Archive(format!("invalid archive URL: {error}")))?
+        .path()
+        .to_ascii_lowercase();
+    let result = if archive_path.ends_with(".zip") {
+        extract_zip(bytes, &stage)
+    } else if archive_path.ends_with(".tar.gz") || archive_path.ends_with(".tgz") {
+        extract_tar_gz(bytes, &stage)
+    } else if archive_path.ends_with(".tar.bz2") {
+        extract_tar_bz2(bytes, &stage)
+    } else {
+        install_raw_binary(bytes, &stage, command)
+    };
+    if let Err(error) = result {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(error);
+    }
+    let staged_command = safe_join(&stage, command)?;
+    if !staged_command.is_file() {
+        let _ = std::fs::remove_dir_all(&stage);
+        return Err(AcpRegistryError::Archive(format!(
+            "archive does not contain declared command `{command}`"
+        )));
+    }
+    set_executable(&staged_command)?;
+    std::fs::write(stage.join(".archive.sha256"), archive_digest).map_err(|source| {
+        AcpRegistryError::Io {
+            path: stage.join(".archive.sha256"),
+            source,
+        }
+    })?;
+    if target.exists() {
+        std::fs::remove_dir_all(target).map_err(|source| AcpRegistryError::Io {
+            path: target.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::rename(&stage, target).map_err(|source| AcpRegistryError::Io {
+        path: target.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+fn extract_tar_gz(bytes: &[u8], target: &Path) -> Result<(), AcpRegistryError> {
+    let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+    extract_tar(decoder, target)
+}
+
+fn extract_tar_bz2(bytes: &[u8], target: &Path) -> Result<(), AcpRegistryError> {
+    let decoder = bzip2::read::BzDecoder::new(Cursor::new(bytes));
+    extract_tar(decoder, target)
+}
+
+fn extract_tar(reader: impl std::io::Read, target: &Path) -> Result<(), AcpRegistryError> {
+    #[derive(Debug)]
+    enum DeferredLinkKind {
+        Symbolic,
+        Hard,
+    }
+    #[derive(Debug)]
+    struct DeferredLink {
+        path: PathBuf,
+        target: PathBuf,
+        normalized_target: PathBuf,
+        kind: DeferredLinkKind,
+    }
+
+    let mut archive = tar::Archive::new(reader);
+    let mut seen = BTreeSet::new();
+    let mut links = Vec::new();
+    let mut total = 0u64;
+    for (index, entry) in archive
+        .entries()
+        .map_err(|error| AcpRegistryError::Archive(error.to_string()))?
+        .enumerate()
+    {
+        if index >= MAX_ARCHIVE_ENTRIES {
+            return Err(AcpRegistryError::Archive(
+                "too many archive entries".to_string(),
+            ));
+        }
+        let mut entry = entry.map_err(|error| AcpRegistryError::Archive(error.to_string()))?;
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_dir() && !kind.is_symlink() && !kind.is_hard_link() {
+            return Err(AcpRegistryError::Archive(
+                "special archive entries are forbidden".to_string(),
+            ));
+        }
+        let raw_relative = entry
+            .path()
+            .map_err(|error| AcpRegistryError::Archive(error.to_string()))?
+            .into_owned();
+        let relative = clean_relative_path(&raw_relative)?;
+        if !seen.insert(relative.clone()) {
+            return Err(AcpRegistryError::Archive(
+                "duplicate archive path".to_string(),
+            ));
+        }
+        if kind.is_symlink() || kind.is_hard_link() {
+            let link_target = entry
+                .link_name()
+                .map_err(|error| AcpRegistryError::Archive(error.to_string()))?
+                .ok_or_else(|| AcpRegistryError::Archive("link has no target".to_string()))?
+                .into_owned();
+            let base = if kind.is_symlink() {
+                relative.parent().unwrap_or_else(|| Path::new(""))
+            } else {
+                Path::new("")
+            };
+            let normalized_target = normalize_link_target(base, &link_target)?;
+            links.push(DeferredLink {
+                path: relative,
+                target: link_target,
+                normalized_target,
+                kind: if kind.is_symlink() {
+                    DeferredLinkKind::Symbolic
+                } else {
+                    DeferredLinkKind::Hard
+                },
+            });
+            continue;
+        }
+        if kind.is_file() {
+            total = total.saturating_add(entry.size());
+            if total > MAX_EXTRACTED_BYTES {
+                return Err(AcpRegistryError::Archive(
+                    "archive expands beyond the extraction limit".to_string(),
+                ));
+            }
+        }
+        let output = target.join(relative);
+        if kind.is_file() {
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent).map_err(|source| AcpRegistryError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+        }
+        entry
+            .unpack(&output)
+            .map_err(|error| AcpRegistryError::Archive(error.to_string()))?;
+    }
+
+    // Never extract through a link. Links are created only after every regular
+    // entry has landed, and an archive may not place one link beneath another.
+    for link in &links {
+        if links.iter().any(|other| {
+            other.path != link.path
+                && link.path.starts_with(&other.path)
+                && other.path.components().count() < link.path.components().count()
+        }) {
+            return Err(AcpRegistryError::Archive(
+                "nested archive links are forbidden".to_string(),
+            ));
+        }
+    }
+    for link in links {
+        let output = target.join(&link.path);
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| AcpRegistryError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        match link.kind {
+            DeferredLinkKind::Hard => {
+                let source = target.join(&link.normalized_target);
+                let size = source
+                    .metadata()
+                    .map_err(|source_error| AcpRegistryError::Io {
+                        path: source.clone(),
+                        source: source_error,
+                    })?
+                    .len();
+                total = total.saturating_add(size);
+                if total > MAX_EXTRACTED_BYTES {
+                    return Err(AcpRegistryError::Archive(
+                        "archive expands beyond the extraction limit".to_string(),
+                    ));
+                }
+                std::fs::copy(&source, &output).map_err(|source_error| AcpRegistryError::Io {
+                    path: output,
+                    source: source_error,
+                })?;
+            }
+            DeferredLinkKind::Symbolic => {
+                // A valid bundle may contain a chain such as
+                // `Python -> Versions/Current/Python` where `Current` is a
+                // second deferred symlink. Every individual target has already
+                // been lexically proven to remain beneath the extraction root;
+                // existence is intentionally checked by the launched binary,
+                // after the complete link set has been materialized.
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&link.target, &output).map_err(|source| {
+                    AcpRegistryError::Io {
+                        path: output,
+                        source,
+                    }
+                })?;
+                #[cfg(not(unix))]
+                return Err(AcpRegistryError::Archive(
+                    "symbolic links are unsupported on this platform".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn install_raw_binary(bytes: &[u8], target: &Path, command: &str) -> Result<(), AcpRegistryError> {
+    let output = safe_join(target, command)?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| AcpRegistryError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    std::fs::write(&output, bytes).map_err(|source| AcpRegistryError::Io {
+        path: output.clone(),
+        source,
+    })?;
+    set_executable(&output)
+}
+
+fn extract_zip(bytes: &[u8], target: &Path) -> Result<(), AcpRegistryError> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|error| AcpRegistryError::Archive(error.to_string()))?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(AcpRegistryError::Archive(
+            "too many archive entries".to_string(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut total = 0u64;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| AcpRegistryError::Archive(error.to_string()))?;
+        let raw_relative = entry
+            .enclosed_name()
+            .ok_or_else(|| AcpRegistryError::Archive("archive path escapes root".to_string()))?
+            .to_path_buf();
+        let relative = clean_relative_path(&raw_relative)?;
+        if !seen.insert(relative.clone()) {
+            return Err(AcpRegistryError::Archive(
+                "duplicate archive path".to_string(),
+            ));
+        }
+        if let Some(mode) = entry.unix_mode() {
+            let file_type = mode & 0o170000;
+            if file_type != 0 && file_type != 0o100000 && file_type != 0o040000 {
+                return Err(AcpRegistryError::Archive(
+                    "links and special archive entries are forbidden".to_string(),
+                ));
+            }
+        }
+        let output = target.join(&relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&output).map_err(|source| AcpRegistryError::Io {
+                path: output,
+                source,
+            })?;
+            continue;
+        }
+        total = total.saturating_add(entry.size());
+        if total > MAX_EXTRACTED_BYTES {
+            return Err(AcpRegistryError::Archive(
+                "archive expands beyond the extraction limit".to_string(),
+            ));
+        }
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| AcpRegistryError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let mut file = std::fs::File::create(&output).map_err(|source| AcpRegistryError::Io {
+            path: output.clone(),
+            source,
+        })?;
+        std::io::copy(&mut entry, &mut file)
+            .map_err(|error| AcpRegistryError::Archive(error.to_string()))?;
+        set_executable_if_declared(&output, entry.unix_mode())?;
+    }
+    Ok(())
+}
+
+fn set_executable_if_declared(path: &Path, mode: Option<u32>) -> Result<(), AcpRegistryError> {
+    #[cfg(unix)]
+    if mode.is_some_and(|mode| mode & 0o111 != 0) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+            |source| AcpRegistryError::Io {
+                path: path.to_path_buf(),
+                source,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn set_executable(path: &Path) -> Result<(), AcpRegistryError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+            |source| AcpRegistryError::Io {
+                path: path.to_path_buf(),
+                source,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_package(package: &AcpPackageDistribution, agent: &str) -> Result<(), AcpRegistryError> {
+    let coordinate = package.package.as_str();
+    let pinned = coordinate
+        .rsplit_once('@')
+        .is_some_and(|(name, version)| !name.is_empty() && !version.is_empty())
+        || coordinate
+            .split_once("==")
+            .is_some_and(|(name, version)| !name.is_empty() && !version.is_empty());
+    if coordinate.trim() != coordinate
+        || coordinate.is_empty()
+        || coordinate.len() > 512
+        || coordinate.starts_with('-')
+        || coordinate.chars().any(char::is_whitespace)
+        || !pinned
+    {
+        return Err(AcpRegistryError::Invalid(format!(
+            "agent `{agent}` has an invalid or unpinned package coordinate"
+        )));
+    }
+    validate_process_fields(&package.args, &package.env, agent)
+}
+
+fn validate_binary(binary: &AcpBinaryDistribution, agent: &str) -> Result<(), AcpRegistryError> {
+    let url = reqwest::Url::parse(&binary.archive)
+        .map_err(|error| AcpRegistryError::Invalid(format!("agent `{agent}` URL: {error}")))?;
+    if url.scheme() != "https" || url.host_str().is_none() {
+        return Err(AcpRegistryError::Invalid(format!(
+            "agent `{agent}` binary URL must be HTTPS"
+        )));
+    }
+    validate_relative_path(Path::new(&binary.cmd))?;
+    if let Some(digest) = &binary.sha256 {
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AcpRegistryError::Invalid(format!(
+                "agent `{agent}` has an invalid SHA-256"
+            )));
+        }
+    }
+    validate_process_fields(&binary.args, &binary.env, agent)
+}
+
+fn validate_process_fields(
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    agent: &str,
+) -> Result<(), AcpRegistryError> {
+    if args.len() > MAX_ARGS
+        || args
+            .iter()
+            .any(|arg| arg.len() > 16 * 1024 || arg.contains('\0'))
+        || env.len() > MAX_ENV
+        || env.iter().any(|(key, value)| {
+            key.is_empty()
+                || key.len() > 256
+                || value.len() > 64 * 1024
+                || key.contains(['=', '\0'])
+                || value.contains('\0')
+        })
+    {
+        return Err(AcpRegistryError::Invalid(format!(
+            "agent `{agent}` has invalid process arguments or environment"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_relative_path(path: &Path) -> Result<(), AcpRegistryError> {
+    if path.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(AcpRegistryError::Archive(
+            "archive path escapes root or is too long".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn clean_relative_path(path: &Path) -> Result<PathBuf, AcpRegistryError> {
+    validate_relative_path(path)?;
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => cleaned.push(part),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(AcpRegistryError::Archive(
+                    "archive path escapes root".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(cleaned)
+}
+
+fn normalize_link_target(base: &Path, target: &Path) -> Result<PathBuf, AcpRegistryError> {
+    if target.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES || target.is_absolute() {
+        return Err(AcpRegistryError::Archive(
+            "archive link target escapes root or is too long".to_string(),
+        ));
+    }
+    let mut normalized = clean_relative_path(base)?;
+    for component in target.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(AcpRegistryError::Archive(
+                        "archive link target escapes root".to_string(),
+                    ));
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(AcpRegistryError::Archive(
+                    "archive link target escapes root".to_string(),
+                ));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(AcpRegistryError::Archive(
+            "archive link target is empty".to_string(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, AcpRegistryError> {
+    let trimmed = relative
+        .strip_prefix("./")
+        .or_else(|| relative.strip_prefix(".\\"))
+        .unwrap_or(relative);
+    let relative = clean_relative_path(Path::new(trimmed))?;
+    Ok(root.join(relative))
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn valid_platform(platform: &str) -> bool {
+    matches!(
+        platform,
+        "darwin-aarch64"
+            | "darwin-x86_64"
+            | "linux-aarch64"
+            | "linux-x86_64"
+            | "windows-aarch64"
+            | "windows-x86_64"
+    )
+}
+
+#[must_use]
+pub fn current_platform() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-aarch64",
+        ("macos", "x86_64") => "darwin-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("linux", "x86_64") => "linux-x86_64",
+        ("windows", "aarch64") => "windows-aarch64",
+        ("windows", "x86_64") => "windows-x86_64",
+        _ => "unsupported",
+    }
+}
+
+fn resolve_tool(name: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin) = exe.parent() {
+            candidates.push(bin.join("node-runtime").join("bin").join(name));
+            if let Some(prefix) = bin.parent() {
+                candidates.push(
+                    prefix
+                        .join("lib")
+                        .join("codypendent")
+                        .join("node-runtime")
+                        .join("bin")
+                        .join(name),
+                );
+            }
+        }
+    }
+    if let Some(path) = candidates.into_iter().find(|candidate| candidate.is_file()) {
+        return Some(path);
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AcpRegistryError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AcpRegistryError::Invalid("cache path has no parent".to_string()))?;
+    std::fs::create_dir_all(parent).map_err(|source| AcpRegistryError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let temp = parent.join(format!(".registry-{}.tmp", uuid::Uuid::now_v7()));
+    std::fs::write(&temp, bytes).map_err(|source| AcpRegistryError::Io {
+        path: temp.clone(),
+        source,
+    })?;
+    std::fs::rename(&temp, path).map_err(|source| AcpRegistryError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |source| AcpRegistryError::Io {
+                path: path.to_path_buf(),
+                source,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const FIXTURE: &str = r#"{
+      "version":"1.0.0",
+      "agents":[
+        {"id":"codex-acp","name":"Codex","version":"1.2.3","distribution":{"npx":{"package":"@acp/codex@1.2.3","args":["--stdio"]}}},
+        {"id":"fast-agent","name":"Fast Agent","version":"2.0.0","distribution":{"uvx":{"package":"fast-agent==2.0.0"}}},
+        {"id":"native","name":"Native","version":"3.0.0","distribution":{"binary":{"linux-x86_64":{"archive":"https://example.com/native.tar.gz","cmd":"./bin/native","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}
+      ]
+    }"#;
+
+    #[test]
+    fn parses_all_distribution_kinds_and_pins_package_versions() {
+        let registry = AcpRegistry::parse(FIXTURE.as_bytes()).expect("valid registry");
+        assert_eq!(registry.agents.len(), 3);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = AcpRegistryStore::new(dir.path());
+        atomic_write(&store.cache_path(), FIXTURE.as_bytes()).expect("cache fixture");
+        match store.launch_spec("codex-acp") {
+            Ok(codex) => {
+                assert_eq!(codex.args, ["-y", "@acp/codex@1.2.3", "--stdio"])
+            }
+            Err(AcpRegistryError::ToolUnavailable { tool }) => assert_eq!(tool, "npx"),
+            Err(error) => panic!("unexpected npx launch error: {error}"),
+        }
+        match store.launch_spec("fast-agent") {
+            Ok(fast) => assert_eq!(fast.args, ["fast-agent==2.0.0"]),
+            Err(AcpRegistryError::ToolUnavailable { tool }) => assert_eq!(tool, "uvx"),
+            Err(error) => panic!("unexpected uvx launch error: {error}"),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_ids_traversal_and_insecure_urls() {
+        let duplicate = FIXTURE.replace("\"fast-agent\"", "\"codex-acp\"");
+        assert!(AcpRegistry::parse(duplicate.as_bytes()).is_err());
+        let traversal = FIXTURE.replace("./bin/native", "../native");
+        assert!(AcpRegistry::parse(traversal.as_bytes()).is_err());
+        let insecure = FIXTURE.replace("https://example.com", "http://example.com");
+        assert!(AcpRegistry::parse(insecure.as_bytes()).is_err());
+        let option_injection = FIXTURE.replace("@acp/codex@1.2.3", "--package=evil@1.0.0");
+        assert!(AcpRegistry::parse(option_injection.as_bytes()).is_err());
+        let unpinned = FIXTURE.replace("@acp/codex@1.2.3", "@acp/codex");
+        assert!(AcpRegistry::parse(unpinned.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn friendly_product_aliases_resolve_to_official_ids() {
+        assert_eq!(canonical_agent_id("claude-code"), "claude-acp");
+        assert_eq!(canonical_agent_id("codex"), "codex-acp");
+        assert_eq!(canonical_agent_id("amp"), "amp-acp");
+        assert_eq!(canonical_agent_id("kimi-code"), "kimi-code");
+        assert_eq!(canonical_agent_id("kimi-cli"), "kimi");
+        assert_eq!(canonical_agent_id("vibe-chat"), "mistral-vibe");
+        assert_eq!(canonical_agent_id(" OpenCode "), "opencode");
+        assert_eq!(
+            agent_coordinate("claude-code", "0.66.0"),
+            "claude-acp@0.66.0"
+        );
+        assert_eq!(agent_id_from_coordinate("vibe-chat@2.24.0"), "mistral-vibe");
+    }
+
+    #[test]
+    fn connected_agent_snapshot_stays_version_pinned_after_catalog_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = AcpRegistryStore::new(dir.path());
+        let registry = AcpRegistry::parse(FIXTURE.as_bytes()).expect("registry");
+        let original = registry.get("codex-acp").expect("agent").clone();
+        store
+            .cache_agent_snapshot(&original)
+            .expect("persist immutable snapshot");
+
+        let refreshed = FIXTURE
+            .replace("\"version\":\"1.2.3\"", "\"version\":\"9.9.9\"")
+            .replace("@acp/codex@1.2.3", "@acp/codex@9.9.9");
+        atomic_write(&store.cache_path(), refreshed.as_bytes()).expect("new latest cache");
+        let pinned = store
+            .resolve_agent("codex-acp@1.2.3")
+            .expect("old connected version remains resolvable");
+        assert_eq!(pinned.version, "1.2.3");
+        assert_eq!(pinned.distribution.npx.unwrap().package, "@acp/codex@1.2.3");
+        assert_eq!(store.resolve_agent("codex-acp").unwrap().version, "9.9.9");
+    }
+
+    #[test]
+    fn package_manager_entries_do_not_require_binary_install() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = AcpRegistryStore::new(dir.path());
+        atomic_write(&store.cache_path(), FIXTURE.as_bytes()).expect("cache fixture");
+        assert!(matches!(
+            store.launch_spec("codex-acp"),
+            Ok(_) | Err(AcpRegistryError::ToolUnavailable { .. })
+        ));
+        let native = store.launch_spec("native");
+        if current_platform() == "linux-x86_64" {
+            assert!(matches!(native, Err(AcpRegistryError::NotInstalled { .. })));
+        } else {
+            assert!(matches!(
+                native,
+                Err(AcpRegistryError::UnsupportedPlatform { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_discovery_reuses_a_fresh_validated_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = AcpRegistryStore::new(dir.path());
+        atomic_write(&store.cache_path(), FIXTURE.as_bytes()).expect("cache fixture");
+        let registry = store.load_or_refresh().await.expect("fresh cache");
+        assert_eq!(registry.version, "1.0.0");
+        assert_eq!(registry.agents.len(), 3);
+    }
+
+    #[test]
+    fn raw_binary_install_is_bounded_to_the_declared_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("agent");
+        install_archive(
+            &target,
+            "https://example.com/agent",
+            "./bin/agent",
+            &"a".repeat(64),
+            b"agent",
+        )
+        .expect("raw binary install");
+        assert_eq!(std::fs::read(target.join("bin/agent")).unwrap(), b"agent");
+        assert!(!dir.path().join("bin/agent").exists());
+    }
+
+    #[test]
+    fn tar_bz2_install_requires_the_declared_command() {
+        let mut tar_bytes = Vec::new();
+        {
+            let encoder = bzip2::write::BzEncoder::new(&mut tar_bytes, bzip2::Compression::best());
+            let mut archive = tar::Builder::new(encoder);
+            let payload = b"#!/bin/sh\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("bin/agent").unwrap();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive.append(&header, payload.as_slice()).unwrap();
+            let encoder = archive.into_inner().unwrap();
+            encoder.finish().unwrap();
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("agent");
+        install_archive(
+            &target,
+            "https://example.com/agent.tar.bz2",
+            "./bin/agent",
+            &"a".repeat(64),
+            &tar_bytes,
+        )
+        .expect("tar.bz2 install");
+        assert!(target.join("bin/agent").is_file());
+
+        let missing = dir.path().join("missing");
+        assert!(install_archive(
+            &missing,
+            "https://example.com/agent.tar.bz2",
+            "./bin/not-there",
+            &"a".repeat(64),
+            &tar_bytes,
+        )
+        .is_err());
+        assert!(!missing.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_allows_deferred_in_root_symlinks_but_rejects_escape_targets() {
+        fn archive_with_link(target: &str) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            {
+                let mut archive = tar::Builder::new(&mut bytes);
+                let payload = b"runtime";
+                let mut file = tar::Header::new_gnu();
+                file.set_path("lib/real").unwrap();
+                file.set_size(payload.len() as u64);
+                file.set_mode(0o600);
+                file.set_cksum();
+                archive.append(&file, payload.as_slice()).unwrap();
+
+                let mut link = tar::Header::new_gnu();
+                link.set_path("lib/current").unwrap();
+                link.set_size(0);
+                link.set_mode(0o777);
+                link.set_entry_type(tar::EntryType::Symlink);
+                link.set_link_name(target).unwrap();
+                link.set_cksum();
+                archive.append(&link, std::io::empty()).unwrap();
+                archive.finish().unwrap();
+            }
+            bytes
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        extract_tar(Cursor::new(archive_with_link("real")), dir.path()).expect("safe link");
+        assert_eq!(
+            std::fs::read(dir.path().join("lib/current")).unwrap(),
+            b"runtime"
+        );
+
+        let escaped = tempfile::tempdir().expect("tempdir");
+        assert!(extract_tar(
+            Cursor::new(archive_with_link("../../../outside")),
+            escaped.path()
+        )
+        .is_err());
+        assert!(!escaped.path().parent().unwrap().join("outside").exists());
+    }
+
+    #[test]
+    fn zip_traversal_is_rejected_without_writing_outside_the_stage() {
+        let mut zip_bytes = Cursor::new(Vec::new());
+        {
+            let mut archive = zip::ZipWriter::new(&mut zip_bytes);
+            archive
+                .start_file("../escaped", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(b"bad").unwrap();
+            archive.finish().unwrap();
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(extract_zip(zip_bytes.get_ref(), dir.path()).is_err());
+        assert!(!dir.path().parent().unwrap().join("escaped").exists());
+    }
+}

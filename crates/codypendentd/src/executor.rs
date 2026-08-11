@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use chrono::Utc;
 use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
@@ -35,6 +36,9 @@ use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::workflow_stream::{WorkflowHub, WorkflowReader};
 use codypendent_daemon::worktrees::{WorktreeError, WorktreeManager};
 use codypendent_daemon::{ledger, projections, recovery};
+use codypendent_integrations::acp::PermissionOption;
+use codypendent_integrations::acp_client::{AcpClient, AcpEventSink, AcpStopReason};
+use codypendent_integrations::acp_registry::AcpRegistryStore;
 use codypendent_integrations::github::{GitHubApi, RepoId};
 use codypendent_integrations::mcp::{McpBridge, McpRegistry};
 use codypendent_integrations::search::SearchApi;
@@ -46,8 +50,9 @@ use codypendent_knowledge::{
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    Actor, AgentMode, ArtifactRef, DataClassification, EventBody, ModelId, RepositoryId, RunId,
-    SessionId,
+    Actor, AgentId, AgentMode, ApprovalDecision, ArtifactRef, ChangeSetId, DataClassification,
+    EventBody, ModelId, ProposedAction, RepositoryId, Risk, RiskLevel, RunDisposition, RunId,
+    RunState, SessionId,
 };
 use codypendent_runtime::agent::{
     cancellation, mode_overlay, ApprovalRequest, CancellationHandle, CancellationToken,
@@ -71,6 +76,7 @@ use crate::workflows::{WorkflowConductorHost, WorkflowRunReader};
 /// (continuous-session plan). Bounds the token cost each follow-up re-pays —
 /// see [`crate::session_history::session_transcript`].
 const VERBATIM_RUNS: usize = 3;
+const MAX_ACP_PATCH_BYTES: usize = 64 * 1024 * 1024;
 
 /// The one-line marker a continuation's trace opens with, in place of the full
 /// `=== CONTEXT` repo-map manifest a first run emits: on a follow-up the shared
@@ -641,15 +647,19 @@ impl RuntimeExecutor {
                         selection.model().clone()
                     }
                     None => {
-                        resolve_model(&registry, &policy, launch.mode)
-                            .await
-                            .map_err(|e| format!("no model configured: {e}"))?
-                            .id
+                        self.resolve_run_model(&registry, &policy, launch.mode)
+                            .await?
                     }
                 }
             }
         };
         info!(run_id = %launch.run_id, model = %model_id, "resolved model; executing run");
+
+        if let Some(agent_id) = registry.acp_agent_id(&model_id) {
+            return self
+                .execute_acp(launch, &model_id, agent_id, reconstructed_prior, token)
+                .await;
+        }
 
         let driver = FrameworkModelDriver::from_registry(&registry, model_id)
             .await
@@ -753,6 +763,351 @@ impl RuntimeExecutor {
             .map_err(|e| format!("run failed: {e}"));
         guard.release().await;
         result
+    }
+
+    /// Resolve the first runnable policy candidate. ACP profiles need a
+    /// filesystem-aware launch check that the generic model registry cannot do;
+    /// keeping that check in the candidate walk preserves native fallback
+    /// semantics when (for example) `uvx` is missing or a binary is not installed.
+    async fn resolve_run_model(
+        &self,
+        registry: &ModelRegistry,
+        policy: &ModelPolicy,
+        mode: AgentMode,
+    ) -> Result<ModelId, String> {
+        let candidates = policy.candidates(mode);
+        if candidates.is_empty() {
+            return Err(format!(
+                "no model configured: no candidates configured for {mode:?}"
+            ));
+        }
+        let acp = AcpRegistryStore::new(&self.paths.data_dir);
+        // Profiles may arrive through models.toml or a restored session before
+        // this process has ever opened the provider picker. Seed/refresh the
+        // official catalogue here as well, so ACP discovery is automatic on
+        // the daemon path rather than accidentally depending on prior UI use.
+        if candidates.iter().any(|id| {
+            registry
+                .acp_agent_id(id)
+                .is_some_and(|coordinate| !coordinate.contains('@'))
+        }) {
+            // A pinned connected profile resolves from its immutable local
+            // snapshot even while offline. Best-effort discovery here only
+            // seeds unpinned/backward-compatible profiles and never blocks a
+            // previously connected agent when the registry is unreachable.
+            let _ = acp.load_or_refresh().await;
+        }
+        let mut attempts = Vec::with_capacity(candidates.len());
+        for id in candidates {
+            if registry.get(id).is_none() {
+                attempts.push(format!("{id}: model not registered"));
+                continue;
+            }
+            if let Some(agent_id) = registry.acp_agent_id(id) {
+                match acp.launch_spec(agent_id) {
+                    Ok(_) => return Ok(id.clone()),
+                    Err(error) => attempts.push(format!("{id}: {error}")),
+                }
+                continue;
+            }
+            match registry.check_model(id).await {
+                Ok(()) => return Ok(id.clone()),
+                Err(error) => attempts.push(format!("{id}: {error}")),
+            }
+        }
+        Err(format!(
+            "no model configured: every candidate failed for {mode:?}: {}",
+            attempts.join("; ")
+        ))
+    }
+
+    /// Execute a configured ACP profile as a first-class agent runtime. The
+    /// external process owns its model/tool loop; Codypendent still owns the
+    /// worktree, durable event ledger, approvals, cancellation, change review,
+    /// chronicle, and terminal state.
+    async fn execute_acp(
+        &self,
+        launch: &RunLaunch,
+        model_id: &ModelId,
+        registry_agent_id: &str,
+        reconstructed_prior: Vec<TurnItem>,
+        token: CancellationToken,
+    ) -> Result<(), String> {
+        let store = AcpRegistryStore::new(&self.paths.data_dir);
+        let launch_spec = store
+            .launch_spec(registry_agent_id)
+            .map_err(|error| format!("ACP agent `{registry_agent_id}` is unavailable: {error}"))?;
+
+        let manager = WorktreeManager::new();
+        let binding = bind_run_worktree(
+            &self.pool,
+            &manager,
+            launch.run_id,
+            run_writes_to_worktree(launch.mode),
+            &launch.repository,
+        )
+        .await?;
+        let operating_tree = binding.worktree.clone();
+        let guard =
+            WorktreeReleaseGuard::arm(self.pool.clone(), self.artifacts(), manager, binding);
+
+        if token.wait_until_running().await.is_none() {
+            self.finish_acp_run(
+                launch,
+                model_id,
+                &launch_spec,
+                AcpRunCompletion {
+                    state: RunState::Cancelled,
+                    disposition: RunDisposition::Cancelled {
+                        reason: Some("run cancelled before ACP execution".to_string()),
+                    },
+                    summary: None,
+                    changed_files: Vec::new(),
+                },
+            )
+            .await?;
+            guard.release().await;
+            return Ok(());
+        }
+        self.transition_acp(launch.session_id, launch.run_id, RunState::Preparing)
+            .await?;
+
+        let command = launch_spec.command.to_string_lossy().into_owned();
+        let mut client = AcpClient::spawn(
+            &command,
+            &launch_spec.args,
+            &launch_spec.env,
+            operating_tree.to_string_lossy().as_ref(),
+        )
+        .await
+        .map_err(|error| format!("could not start ACP agent `{registry_agent_id}`: {error}"))?;
+        self.transition_acp(launch.session_id, launch.run_id, RunState::Running)
+            .await?;
+
+        let mut prior = convert_launch_prior(&launch.prior);
+        prior.extend(reconstructed_prior);
+        let objective = render_acp_prompt(&prior, &launch.objective);
+        let mut sink = AcpRunSink {
+            pool: self.pool.clone(),
+            subscriptions: self.subscriptions.clone(),
+            approvals: self.approvals.clone(),
+            session_id: launch.session_id,
+            run_id: launch.run_id,
+            actor: Actor::Agent {
+                agent_id: AgentId::new(),
+                run_id: launch.run_id,
+                model: model_id.clone(),
+            },
+            registry_agent_id: registry_agent_id.to_string(),
+            cancellation: token.clone(),
+            assistant_text: String::new(),
+            tools: Vec::new(),
+            failure: None,
+        };
+
+        let stop = tokio::select! {
+            result = client.prompt(&objective, launch.run_id, &mut sink) => {
+                result.map_err(|error| format!("ACP prompt failed: {error}"))?
+            }
+            _ = token.cancelled() => AcpStopReason::Cancelled,
+        };
+        drop(client); // aborts the driver/process group if a cancellation won.
+        if let Some(failure) = sink.failure.take() {
+            guard.release().await;
+            return Err(failure);
+        }
+
+        // A cancelled external agent may already have produced useful edits.
+        // Snapshot them before worktree teardown just like a completed turn.
+        let changed_files = self
+            .emit_acp_changeset(launch, &operating_tree, &sink.actor)
+            .await?;
+        let (state, disposition) = match stop {
+            AcpStopReason::EndTurn => (
+                RunState::Completed,
+                RunDisposition::Completed {
+                    summary: last_nonempty_line(&sink.assistant_text),
+                },
+            ),
+            AcpStopReason::Cancelled => (
+                RunState::Cancelled,
+                RunDisposition::Cancelled {
+                    reason: Some("run cancelled".to_string()),
+                },
+            ),
+            AcpStopReason::Refusal => (
+                RunState::Failed,
+                RunDisposition::Failed {
+                    reason: "ACP agent refused the prompt".to_string(),
+                },
+            ),
+        };
+        self.finish_acp_run(
+            launch,
+            model_id,
+            &launch_spec,
+            AcpRunCompletion {
+                state,
+                disposition,
+                summary: last_nonempty_line(&sink.assistant_text),
+                changed_files,
+            },
+        )
+        .await?;
+        guard.release().await;
+        Ok(())
+    }
+
+    async fn transition_acp(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        state: RunState,
+    ) -> Result<(), String> {
+        let event = ledger::append_run_state_changed(
+            &self.pool,
+            session_id,
+            &Actor::System,
+            run_id,
+            state,
+            Utc::now(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        self.subscriptions.publish(session_id, event);
+        Ok(())
+    }
+
+    async fn finish_acp_run(
+        &self,
+        launch: &RunLaunch,
+        model_id: &ModelId,
+        agent: &codypendent_integrations::acp_registry::AcpLaunchSpec,
+        completion: AcpRunCompletion,
+    ) -> Result<(), String> {
+        let chronicle = serde_json::json!({
+            "objective": launch.objective,
+            "runtime": {
+                "protocol": "acp",
+                "agent": agent.registry_id,
+                "agentName": agent.name,
+                "agentVersion": agent.version,
+                "profile": model_id,
+            },
+            "summary": completion.summary,
+            "investigations": [],
+            "actions": [],
+            "changes": completion.changed_files,
+            "costs": {"model_requests": null, "tokens": null, "cost_micros": null},
+            "unresolved": []
+        });
+        let chronicle_ref = self
+            .artifacts()
+            .put(
+                &self.pool,
+                "application/json",
+                DataClassification::Internal,
+                Provenance::system("run-chronicle"),
+                &serde_json::to_vec_pretty(&chronicle).map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        self.transition_acp(launch.session_id, launch.run_id, completion.state)
+            .await?;
+        let event = ledger::append_next_event(
+            &self.pool,
+            launch.session_id,
+            &Actor::System,
+            &EventBody::RunCompleted {
+                run_id: launch.run_id,
+                disposition: completion.disposition,
+                chronicle: chronicle_ref,
+            },
+            Utc::now(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        self.subscriptions.publish(launch.session_id, event);
+        Ok(())
+    }
+
+    async fn emit_acp_changeset(
+        &self,
+        launch: &RunLaunch,
+        worktree: &Path,
+        actor: &Actor,
+    ) -> Result<Vec<String>, String> {
+        if !run_writes_to_worktree(launch.mode) {
+            return Ok(Vec::new());
+        }
+        // ACP agents write through their own tool loop, outside Codypendent's
+        // typed file sink. Stage the isolated worktree (never the user's shared
+        // checkout) so Git's binary diff includes new, deleted, and empty files
+        // as well as tracked modifications.
+        let staged = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["add", "--all", "--"])
+            .output()
+            .await
+            .map_err(|error| format!("could not stage ACP worktree snapshot: {error}"))?;
+        if !staged.status.success() {
+            return Err(format!(
+                "could not stage ACP worktree snapshot: {}",
+                String::from_utf8_lossy(&staged.stderr).trim()
+            ));
+        }
+        let diff = bounded_acp_git_diff(worktree).await?;
+        if diff.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .args(["diff", "--name-only", "HEAD"])
+            .output()
+            .await
+            .map_err(|error| error.to_string())?;
+        let files = String::from_utf8_lossy(&names.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .take(10_000)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let (additions, deletions) = diff_counts(worktree).await;
+        let artifact = self
+            .artifacts()
+            .put(
+                &self.pool,
+                "text/x-diff",
+                DataClassification::Internal,
+                Provenance::tool_output("acp.agent", launch.run_id),
+                &diff,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let preview_bytes = diff.len().min(64 * 1024);
+        let preview = String::from_utf8_lossy(&diff[..preview_bytes]).into_owned();
+        let event = ledger::append_next_event(
+            &self.pool,
+            launch.session_id,
+            actor,
+            &EventBody::PatchProposed {
+                run_id: launch.run_id,
+                changeset_id: ChangeSetId::new(),
+                artifact,
+                files: files.clone(),
+                additions,
+                deletions,
+                preview,
+                preview_truncated: diff.len() > preview_bytes,
+            },
+            Utc::now(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        self.subscriptions.publish(launch.session_id, event);
+        Ok(files)
     }
 
     /// Append a run-scoped `NoteAppended` event to `session_id`'s ledger and
@@ -1168,6 +1523,346 @@ fn run_transcript_excerpt(events: &[codypendent_protocol::SessionEvent], run_id:
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Durable bridge from an ACP prompt to the session ledger and approval broker.
+struct AcpRunCompletion {
+    state: RunState,
+    disposition: RunDisposition,
+    summary: Option<String>,
+    changed_files: Vec<String>,
+}
+
+struct AcpRunSink {
+    pool: SqlitePool,
+    subscriptions: SubscriptionHub,
+    approvals: ApprovalBroker,
+    session_id: SessionId,
+    run_id: RunId,
+    actor: Actor,
+    registry_agent_id: String,
+    cancellation: CancellationToken,
+    assistant_text: String,
+    tools: Vec<String>,
+    failure: Option<String>,
+}
+
+impl AcpRunSink {
+    async fn persist(&mut self, body: EventBody) -> anyhow::Result<()> {
+        let event =
+            ledger::append_next_event(&self.pool, self.session_id, &self.actor, &body, Utc::now())
+                .await?;
+        self.subscriptions.publish(self.session_id, event);
+        Ok(())
+    }
+
+    async fn transition(&mut self, state: RunState) -> anyhow::Result<()> {
+        let event = ledger::append_run_state_changed(
+            &self.pool,
+            self.session_id,
+            &Actor::System,
+            self.run_id,
+            state,
+            Utc::now(),
+        )
+        .await?;
+        self.subscriptions.publish(self.session_id, event);
+        Ok(())
+    }
+
+    fn fail(&mut self, error: impl std::fmt::Display) {
+        if self.failure.is_none() {
+            self.failure = Some(format!("could not persist ACP run event: {error}"));
+        }
+    }
+}
+
+#[async_trait]
+impl AcpEventSink for AcpRunSink {
+    async fn on_event(&mut self, event: EventBody) {
+        match &event {
+            EventBody::ModelStreamDelta { text, .. } => {
+                if self.assistant_text.len() < 2 * 1024 * 1024 {
+                    let remaining = 2 * 1024 * 1024 - self.assistant_text.len();
+                    self.assistant_text.push_str(&bounded_text(text, remaining));
+                }
+            }
+            EventBody::ToolStarted { tool, .. } if self.tools.len() < 10_000 => {
+                self.tools.push(tool.clone());
+            }
+            _ => {}
+        }
+        if let Err(error) = self.persist(event).await {
+            self.fail(error);
+        }
+    }
+
+    async fn on_permission(
+        &mut self,
+        tool_call: serde_json::Value,
+        options: Vec<PermissionOption>,
+    ) -> Option<String> {
+        if self.failure.is_some() || self.cancellation.is_cancelled() {
+            return reject_option(&options);
+        }
+        let title = tool_call
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                tool_call
+                    .get("toolCallId")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or("ACP tool call")
+            .to_string();
+        let canonical = canonical_json(tool_call);
+        let action = ProposedAction::AcpToolCall {
+            agent: self.registry_agent_id.clone(),
+            title: bounded_text(&title, 512),
+            details: bounded_text(&canonical.to_string(), 32 * 1024),
+        };
+        let risk = Risk {
+            level: RiskLevel::Medium,
+            reasons: vec!["external ACP agent requested permission to execute a tool".to_string()],
+        };
+        let approval_id = match self
+            .approvals
+            .request_with_reuse(
+                &self.pool,
+                self.session_id,
+                self.run_id,
+                action.clone(),
+                risk,
+                Vec::new(),
+                None,
+                true,
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                self.fail(error);
+                return reject_option(&options);
+            }
+        };
+        if let Err(error) = self.transition(RunState::WaitingForApproval).await {
+            self.fail(error);
+            self.approvals.forget_waiter(approval_id);
+            return reject_option(&options);
+        }
+        if let Err(error) = self
+            .persist(EventBody::ToolProposed {
+                run_id: self.run_id,
+                approval_id,
+                action,
+            })
+            .await
+        {
+            self.fail(error);
+            self.approvals.forget_waiter(approval_id);
+            return reject_option(&options);
+        }
+        let decision = tokio::select! {
+            result = self.approvals.await_decision(approval_id) => match result {
+                Ok(decision) => decision,
+                Err(error) => {
+                    self.fail(error);
+                    return reject_option(&options);
+                }
+            },
+            _ = self.cancellation.cancelled() => {
+                self.approvals.forget_waiter(approval_id);
+                return reject_option(&options);
+            }
+        };
+        if let Err(error) = self.transition(RunState::Running).await {
+            self.fail(error);
+            return reject_option(&options);
+        }
+        match decision {
+            ApprovalDecision::Approve => allow_option(&options),
+            ApprovalDecision::Reject | ApprovalDecision::Unknown => reject_option(&options),
+            _ => reject_option(&options),
+        }
+    }
+}
+
+fn allow_option(options: &[PermissionOption]) -> Option<String> {
+    options
+        .iter()
+        .find(|option| option.kind == "allow_once")
+        .or_else(|| {
+            options
+                .iter()
+                .find(|option| option.kind.starts_with("allow"))
+        })
+        .map(|option| option.option_id.clone())
+}
+
+fn reject_option(options: &[PermissionOption]) -> Option<String> {
+    options
+        .iter()
+        .find(|option| option.kind == "reject_once")
+        .or_else(|| {
+            options
+                .iter()
+                .find(|option| option.kind.starts_with("reject"))
+        })
+        .map(|option| option.option_id.clone())
+}
+
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let sorted = values
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json(value)))
+                .collect();
+            serde_json::Value::Object(sorted)
+        }
+        other => other,
+    }
+}
+
+fn bounded_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    const ELLIPSIS: &str = "…";
+    if max_bytes < ELLIPSIS.len() {
+        return ".".repeat(max_bytes);
+    }
+    let mut end = max_bytes - ELLIPSIS.len();
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}{}", &text[..end], ELLIPSIS)
+}
+
+fn last_nonempty_line(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| bounded_text(line.trim(), 2_048))
+}
+
+fn render_acp_prompt(prior: &[TurnItem], objective: &str) -> String {
+    const CAP: usize = 1024 * 1024;
+    let mut transcript = String::new();
+    if !prior.is_empty() {
+        transcript.push_str("Previous conversation:\n");
+    }
+    for item in prior {
+        let rendered = match item {
+            TurnItem::Objective(text) => format!("User: {text}\n"),
+            TurnItem::Assistant(text) => format!("Assistant: {text}\n"),
+            TurnItem::ToolCall { tool, args } => format!("Tool call {tool}: {args}\n"),
+            TurnItem::ToolResult { tool, output, .. } => {
+                format!("Tool result {tool}: {output}\n")
+            }
+            TurnItem::Steering(text) => format!("User steering: {text}\n"),
+        };
+        transcript.push_str(&rendered);
+    }
+    transcript.push_str("\nCurrent request:\n");
+    transcript.push_str(objective);
+    if transcript.len() <= CAP {
+        return transcript;
+    }
+    let suffix_start = transcript.len().saturating_sub(CAP);
+    let mut start = suffix_start;
+    while !transcript.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[earlier context truncated]\n{}", &transcript[start..])
+}
+
+async fn bounded_acp_git_diff(worktree: &Path) -> Result<Vec<u8>, String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+
+    let mut child = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--no-ext-diff", "--binary", "HEAD"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not inspect ACP worktree: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "could not capture ACP worktree diff".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "could not capture ACP worktree diagnostics".to_string())?;
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let mut diff = Vec::new();
+    stdout
+        .take((MAX_ACP_PATCH_BYTES + 1) as u64)
+        .read_to_end(&mut diff)
+        .await
+        .map_err(|error| format!("could not read ACP worktree diff: {error}"))?;
+    if diff.len() > MAX_ACP_PATCH_BYTES {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let _ = stderr_task.await;
+        return Err(format!(
+            "ACP worktree diff exceeds the {} MiB review limit",
+            MAX_ACP_PATCH_BYTES / (1024 * 1024)
+        ));
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|error| format!("could not wait for ACP worktree diff: {error}"))?;
+    let stderr = stderr_task
+        .await
+        .map_err(|error| format!("ACP worktree diagnostic task failed: {error}"))?
+        .map_err(|error| format!("could not read ACP worktree diagnostics: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "could not inspect ACP worktree: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
+    Ok(diff)
+}
+
+async fn diff_counts(worktree: &Path) -> (u64, u64) {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["diff", "--numstat", "HEAD"])
+        .output()
+        .await;
+    let Ok(output) = output else {
+        return (0, 0);
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .fold((0u64, 0u64), |(added, removed), line| {
+            let mut fields = line.split('\t');
+            let next_added = fields
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let next_removed = fields
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            (
+                added.saturating_add(next_added),
+                removed.saturating_add(next_removed),
+            )
+        })
 }
 
 impl RunExecutor for RuntimeExecutor {
@@ -2813,6 +3508,20 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "initial"]);
         repo
+    }
+
+    #[tokio::test]
+    async fn acp_diff_snapshot_includes_new_and_empty_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = init_git_repo(dir.path());
+        std::fs::write(repo.join("created.txt"), "from ACP\n").unwrap();
+        std::fs::write(repo.join("empty.txt"), "").unwrap();
+        git(&repo, &["add", "--all", "--"]);
+        let diff = bounded_acp_git_diff(&repo).await.expect("bounded diff");
+        let text = String::from_utf8_lossy(&diff);
+        assert!(text.contains("created.txt"), "new content file: {text}");
+        assert!(text.contains("empty.txt"), "new empty file: {text}");
+        assert!(text.contains("from ACP"), "new file contents: {text}");
     }
 
     /// A migrated pool plus an artifact store, both under `dir`.

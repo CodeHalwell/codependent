@@ -37,8 +37,9 @@ export interface ProtocolVersion {
 /** `version.rs::PROTOCOL_V1`. Additive Phase 1 revision; bumped to 1.2 by the
  * daemon-auto-restart feature's `ServerHello.build_id` /
  * `DaemonStatus.build_id` / `DaemonStatus.active_run_count` fields, then to 1.3
- * by its daemon-side idle-guarded shutdown (`ShutdownIfIdle` / `ShutdownRefused`). */
-export const PROTOCOL_V1: ProtocolVersion = { major: 1, minor: 3 };
+ * by its daemon-side idle-guarded shutdown (`ShutdownIfIdle` / `ShutdownRefused`),
+ * then to 1.4 by external ACP tool approval payloads. */
+export const PROTOCOL_V1: ProtocolVersion = { major: 1, minor: 4 };
 
 // ---------------------------------------------------------------------------
 // capabilities.rs
@@ -195,6 +196,7 @@ export type ProposedAction =
    * server is operator-declared in the daemon's trusted `mcp.toml`.
    */
   | { type: "McpToolCall"; server: string; tool: string; summary: string; args: string }
+  | { type: "AcpToolCall"; agent: string; title: string; details: string }
   | {
       type: "PublishDocument";
       document_id: Uuid;

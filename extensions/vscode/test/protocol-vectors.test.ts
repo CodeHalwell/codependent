@@ -437,6 +437,8 @@ function reconstructProposedAction(r: Record<string, unknown>): ProposedAction {
       return { type: "GitHubMutation", repository: str(r, "repository"), summary: str(r, "summary") };
     case "McpToolCall":
       return { type: "McpToolCall", server: str(r, "server"), tool: str(r, "tool"), summary: str(r, "summary"), args: str(r, "args") };
+    case "AcpToolCall":
+      return { type: "AcpToolCall", agent: str(r, "agent"), title: str(r, "title"), details: str(r, "details") };
     default:
       throw new Error(`unmodeled or unknown ProposedAction tag: ${str(r, "type")}`);
   }
@@ -995,6 +997,7 @@ describe("run.json against run-domain types (src/protocol/types.ts)", () => {
 
   const proposedActionKeys = keysWithPrefix(vectors, "ProposedAction");
   const modeledActions = [
+    "ProposedAction_AcpToolCall",
     "ProposedAction_ExecuteCommand",
     "ProposedAction_GitCommit",
     "ProposedAction_GitHubMutation",

@@ -5415,6 +5415,15 @@ fn describe_action(action: &ProposedAction) -> Vec<String> {
             format!("summary: {summary}"),
             format!("args: {args}"),
         ],
+        ProposedAction::AcpToolCall {
+            agent,
+            title,
+            details,
+        } => vec![
+            format!("ACP agent: {agent}"),
+            format!("tool: {title}"),
+            format!("details: {details}"),
+        ],
         _ => vec!["unsupported action".to_owned()],
     }
 }
@@ -5430,6 +5439,7 @@ fn action_kind(action: &ProposedAction) -> &'static str {
         ProposedAction::GitPush { .. } => "git push",
         ProposedAction::PublishDocument { .. } => "publish document",
         ProposedAction::McpToolCall { .. } => "mcp tool",
+        ProposedAction::AcpToolCall { .. } => "acp tool",
         _ => "unsupported",
     }
 }

@@ -301,6 +301,7 @@ async fn check_models_and_providers(report: &mut Report, paths: &RuntimePaths, d
         }
     };
     let registry = codypendent_runtime::models::ModelRegistry::new(configs.clone()).with_auth(auth);
+    let acp_store = codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir);
     let mut checked = 0usize;
     let mut healthy = 0usize;
     for config in &configs {
@@ -315,7 +316,18 @@ async fn check_models_and_providers(report: &mut Report, paths: &RuntimePaths, d
             continue;
         }
         checked += 1;
-        match registry.check_model(&config.id).await {
+        let readiness = if config.provider == "acp" {
+            acp_store
+                .launch_spec(&config.model)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        } else {
+            registry
+                .check_model(&config.id)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        match readiness {
             Ok(()) => {
                 healthy += 1;
                 report.ok("model", format!("{} ({}) — ready", config.id, config.model));

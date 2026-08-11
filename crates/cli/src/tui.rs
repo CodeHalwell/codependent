@@ -827,7 +827,7 @@ async fn boot_phase(
     state.models = load_model_cards(paths, &mut loader_warnings).await;
     // Task 8: seed the provider-catalog picker projection (the built-in
     // catalog + any user `providers.toml`), exactly like `load_model_cards`.
-    state.providers = load_provider_cards(paths, &mut loader_warnings);
+    state.providers = load_provider_cards(paths, &mut loader_warnings).await;
     // D1 (/keys): seed the API-key status projection — auth.json entries +
     // models.toml `api_key_env` declarations (the tui crate does no I/O, so
     // the harness reads the files and folds the projection as an Action, the
@@ -1150,6 +1150,7 @@ async fn event_loop<P: Presentation>(
         // folds it just after.
         let mut pending_sync: Option<Box<DocumentSync>> = None;
         let mut started_workflow: Option<String> = None;
+        let mut connected_acp: Option<(String, String, Result<String, String>)> = None;
         let selected = tokio::select! {
             signal = live.event_rx.recv() => PendingActions::One(match signal {
                 Some(ReaderSignal::Event(event)) => {
@@ -1203,6 +1204,10 @@ async fn event_loop<P: Presentation>(
                     Ok(models) => Action::ProviderModelsLoaded { provider_id, models },
                     Err(reason) => Action::ProviderModelsFailed { provider_id, reason },
                 },
+                Some(ReaderSignal::AcpConnected { display_id, provider_id, result }) => {
+                    connected_acp = Some((display_id, provider_id, result));
+                    Action::NoOp
+                }
                 Some(ReaderSignal::WorkflowRunStarted { workflow_run_id }) => {
                     started_workflow = Some(workflow_run_id);
                     Action::Notice("workflow started — attaching live view".to_owned())
@@ -1314,6 +1319,31 @@ async fn event_loop<P: Presentation>(
         for action in actions {
             reduce(state, action);
         }
+        if let Some((display_id, provider_id, result)) = connected_acp.take() {
+            match result {
+                Ok(coordinate) => {
+                    match write_add_model(paths, &display_id, &provider_id, &coordinate, None) {
+                        Ok(()) => {
+                            let mut warnings = Vec::new();
+                            state.models = load_model_cards(paths, &mut warnings).await;
+                            for warning in warnings {
+                                reduce(state, Action::Issue(warning));
+                            }
+                            reload_key_statuses(state, paths);
+                            reduce(state, Action::Notice(format!("connected {display_id}")));
+                        }
+                        Err(error) => reduce(
+                            state,
+                            Action::Notice(format!("could not save ACP profile: {error}")),
+                        ),
+                    }
+                }
+                Err(error) => reduce(
+                    state,
+                    Action::Notice(format!("could not connect ACP agent: {error}")),
+                ),
+            }
+        }
         // The steady shell has no frame-based animation. Wakeups still drive
         // repair and reducer time, but only notice expiry and the periodic
         // projection refresh need a new frame; input and daemon events redraw
@@ -1363,6 +1393,31 @@ async fn event_loop<P: Presentation>(
                 api_key,
             } = &intent
             {
+                let acp =
+                    codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir)
+                        .load_cached()
+                        .ok()
+                        .is_some_and(|registry| registry.get(provider_id).is_some());
+                if acp {
+                    let paths = paths.clone();
+                    let repository = PathBuf::from(repository);
+                    let display_id = display_id.clone();
+                    let provider_id = provider_id.clone();
+                    let tx = live.query_tx.clone();
+                    tokio::spawn(async move {
+                        let result = connect_acp_agent(&paths, &provider_id, &repository)
+                            .await
+                            .map_err(|error| error.to_string());
+                        let _ = tx
+                            .send(ReaderSignal::AcpConnected {
+                                display_id,
+                                provider_id,
+                                result,
+                            })
+                            .await;
+                    });
+                    continue;
+                }
                 apply_add_model(
                     state,
                     paths,
@@ -1802,6 +1857,14 @@ enum ReaderSignal {
     ProviderModels {
         provider_id: String,
         result: Result<Vec<String>, String>,
+    },
+    /// Completion of an off-UI-thread ACP install + handshake + typed profile
+    /// write. The loop refreshes model/key projections after success.
+    AcpConnected {
+        display_id: String,
+        provider_id: String,
+        /// Immutable `registry-id@version` persisted after a successful handshake.
+        result: Result<String, String>,
     },
     /// A newly-created durable workflow run. The loop reloads the compiled/live
     /// projection, then immediately subscribes and reads its baselines.
@@ -2347,21 +2410,44 @@ fn write_add_model(
 
     // Resolve the catalog base_url for the chosen provider (built-ins layered with
     // any user providers.toml; a load failure falls back to the built-ins).
+    let acp_store = codypendent_integrations::acp_registry::AcpRegistryStore::new(data_dir);
+    let acp_agent = acp_store
+        .load_cached()
+        .ok()
+        .and_then(|registry| registry.get(provider_id).cloned());
     let catalog = Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
         .unwrap_or_else(|_| Catalog::builtin());
-    let provider = catalog
-        .get(provider_id)
-        .ok_or_else(|| anyhow!("provider `{provider_id}` is not in the catalog"))?;
-    if !provider_runtime_supported(provider) {
-        bail!(
-            "provider `{provider_id}` uses {} and is not executable by this build",
-            protocol_label(provider.protocol)
-        );
-    }
-    let base_url = provider
-        .base_url
-        .clone()
-        .expect("runtime-supported providers have a non-blank base URL");
+    let (runtime_provider, base_url, provider_model) = if let Some(agent) = acp_agent {
+        let coordinate = if codypendent_integrations::acp_registry::agent_id_from_coordinate(model)
+            == agent.id
+        {
+            model.to_string()
+        } else {
+            agent.id.clone()
+        };
+        acp_store
+            .launch_spec(&coordinate)
+            .with_context(|| format!("ACP agent `{}` is not launchable", agent.id))?;
+        ("acp".to_string(), String::new(), coordinate)
+    } else {
+        let provider = catalog
+            .get(provider_id)
+            .ok_or_else(|| anyhow!("provider `{provider_id}` is not in the catalog"))?;
+        if !provider_runtime_supported(provider) {
+            bail!(
+                "provider `{provider_id}` uses {} and is not executable by this build",
+                protocol_label(provider.protocol)
+            );
+        }
+        (
+            "openai-compatible".to_string(),
+            provider
+                .base_url
+                .clone()
+                .expect("runtime-supported providers have a non-blank base URL"),
+            model.to_string(),
+        )
+    };
 
     // Read the existing models.toml (absent ⇒ start empty) through the real
     // loader, drop any entry sharing the new display id (update-in-place), then
@@ -2375,9 +2461,9 @@ fn write_add_model(
     configs.retain(|c| c.id.0 != display_id);
     configs.push(ModelConfig {
         id: ModelId(display_id.to_string()),
-        provider: "openai-compatible".to_string(),
+        provider: runtime_provider,
         base_url,
-        model: model.to_string(),
+        model: provider_model,
         api_key_env: String::new(),
         context_tokens: None,
     });
@@ -2408,6 +2494,33 @@ fn write_add_model(
             .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     }
     Ok(())
+}
+
+/// Install (when necessary) and handshake one official ACP agent away from the
+/// render loop. The caller writes `models.toml` only after this succeeds, so a
+/// bad archive, missing runner, or incompatible agent never leaves a broken
+/// selectable profile behind.
+async fn connect_acp_agent(
+    paths: &RuntimePaths,
+    provider_id: &str,
+    repository: &Path,
+) -> anyhow::Result<String> {
+    let store = codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir);
+    let spec = store.install(provider_id, false).await?;
+    let command = spec.command.to_string_lossy().into_owned();
+    let client = codypendent_integrations::acp_client::AcpClient::spawn(
+        &command,
+        &spec.args,
+        &spec.env,
+        repository.to_string_lossy().as_ref(),
+    )
+    .await
+    .with_context(|| format!("ACP handshake with `{provider_id}` failed"))?;
+    drop(client);
+    Ok(codypendent_integrations::acp_registry::agent_coordinate(
+        &spec.registry_id,
+        &spec.version,
+    ))
 }
 
 /// Apply the client-only `Intent::AddModel` (the event-loop drain arm,
@@ -3260,10 +3373,16 @@ async fn load_model_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> V
 
     let auth = codypendent_runtime::auth::AuthStore::load(&paths.data_dir).unwrap_or_default();
     let registry = codypendent_runtime::models::ModelRegistry::new(configs.clone()).with_auth(auth);
+    let acp_store = codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir);
     let mut cards = Vec::with_capacity(configs.len());
     for config in configs {
         let local = local_model_endpoint(&config.base_url);
-        let readiness = if config.base_url.trim().is_empty() {
+        let readiness = if config.provider == "acp" {
+            match acp_store.launch_spec(&config.model) {
+                Ok(_) => ModelReadiness::Ready,
+                Err(error) => ModelReadiness::Unavailable(error.to_string()),
+            }
+        } else if config.base_url.trim().is_empty() {
             ModelReadiness::Unavailable("base URL is missing".to_owned())
         } else if local {
             match registry.check_model(&config.id).await {
@@ -3338,7 +3457,11 @@ fn model_card(
 /// Never fails the TUI: a missing user `providers.toml` is fine (the loader
 /// treats it as absent and returns the built-ins); a *malformed* one degrades
 /// to the built-ins alone, with a diagnostic in `warnings`.
-fn load_provider_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> Vec<ProviderCard> {
+async fn load_provider_cards(
+    paths: &RuntimePaths,
+    warnings: &mut Vec<String>,
+) -> Vec<ProviderCard> {
+    use codypendent_integrations::acp_registry::AcpRegistryStore;
     use codypendent_providers::{AuthMethod, Catalog};
 
     let providers_path = paths.data_dir.join("providers.toml");
@@ -3351,6 +3474,9 @@ fn load_provider_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> Vec<
     };
     let mut cards: Vec<_> = catalog
         .providers()
+        // ACP entries come from the official live registry below. Keeping the
+        // five historical built-ins as well would show stale duplicate adapters.
+        .filter(|p| !matches!(p.protocol, codypendent_providers::Protocol::Acp))
         .map(|p| ProviderCard {
             id: p.id.clone(),
             name: p.name.clone(),
@@ -3383,6 +3509,57 @@ fn load_provider_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> Vec<
             available: provider_runtime_supported(p),
         })
         .collect();
+    let acp_store = AcpRegistryStore::new(&paths.data_dir);
+    let acp_registry = match acp_store.load_or_refresh().await {
+        Ok(registry) => Some(registry),
+        Err(error) => {
+            warnings.push(format!("official ACP registry unavailable ({error})"));
+            None
+        }
+    };
+    if let Some(registry) = acp_registry {
+        cards.extend(registry.agents.iter().map(|agent| {
+            let distribution = if agent.distribution.npx.is_some() {
+                "npx"
+            } else if agent.distribution.uvx.is_some() {
+                "uvx"
+            } else {
+                "binary"
+            };
+            let binary_installable = agent
+                .distribution
+                .binary
+                .get(codypendent_integrations::acp_registry::current_platform())
+                .is_some_and(|binary| binary.sha256.is_some());
+            ProviderCard {
+                id: agent.id.clone(),
+                name: agent.name.clone(),
+                protocol: "acp".to_string(),
+                auth: format!("acp: {distribution} · {}", agent.version),
+                local: false,
+                requires_key: false,
+                can_list_models: false,
+                // Verified platform binaries can be installed in the
+                // background when selected. Package entries are selectable
+                // only when their runner is actually present.
+                available: acp_store.launch_spec(&agent.id).is_ok() || binary_installable,
+            }
+        }));
+    }
+    if let Some(spec) = codypendent_integrations::acp_registry::local_kimi_code_spec() {
+        if !cards.iter().any(|card| card.id == spec.registry_id) {
+            cards.push(ProviderCard {
+                id: spec.registry_id,
+                name: spec.name,
+                protocol: "acp".to_string(),
+                auth: format!("acp: local · {}", spec.version),
+                local: true,
+                requires_key: false,
+                can_list_models: false,
+                available: true,
+            });
+        }
+    }
     // Put usable providers first, with local endpoints before hosted ones. The
     // complete catalog remains searchable below them as an honest preview.
     cards.sort_by(|a, b| {

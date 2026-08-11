@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -193,6 +194,10 @@ fn failure_message(update: &ToolCallUpdate) -> String {
 /// is delegated one at a time (`prompt` takes `&mut self`), so a shallow queue
 /// suffices; it only decouples the caller's `send` from the driver's `recv`.
 const PROMPT_QUEUE_DEPTH: usize = 8;
+/// Bound agent-to-host updates so a noisy external client is backpressured by
+/// durable event/approval processing instead of growing the daemon heap.
+const PROMPT_EVENT_QUEUE_DEPTH: usize = 256;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why an ACP prompt turn ended. Mirrors [`crate::acp::StopReason`] (the server
 /// role's type) but is owned by the client role so the two directions stay
@@ -225,8 +230,7 @@ pub enum AcpClientError {
 
 /// Receives the events an ACP turn produces and answers the agent's permission
 /// requests. The daemon implements this to fan mapped events into a run's ledger
-/// and to route a permission through the existing approval broker (that daemon
-/// wiring is a follow-up — this task is the client + its mock-agent test); tests
+/// and route permissions through the existing durable approval broker; tests
 /// implement it to record events and auto-answer.
 #[async_trait]
 pub trait AcpEventSink: Send {
@@ -253,7 +257,16 @@ pub struct AcpClient {
     /// The driver task owns the live `agent_client_protocol` connection. Held so
     /// it is not detached mid-handshake; it exits on its own once `commands`
     /// (its only sender) is dropped.
-    _driver: JoinHandle<Result<(), AcpClientError>>,
+    driver: JoinHandle<Result<(), AcpClientError>>,
+}
+
+impl Drop for AcpClient {
+    fn drop(&mut self) {
+        // `JoinHandle` normally detaches on drop. An ACP prompt may still be
+        // awaiting the external agent, so detaching would also retain its child
+        // process. Aborting drops the SDK transport's process-group guard.
+        self.driver.abort();
+    }
 }
 
 impl AcpClient {
@@ -289,24 +302,33 @@ impl AcpClient {
     where
         T: ConnectTo<Client> + Send + 'static,
     {
+        let cwd = std::fs::canonicalize(cwd).map_err(AcpClientError::Io)?;
+        if !cwd.is_dir() {
+            return Err(AcpClientError::Handshake(format!(
+                "session working directory is not a directory: {}",
+                cwd.display()
+            )));
+        }
         let (ready_tx, ready_rx) = oneshot::channel();
         let (commands, command_rx) = mpsc::channel(PROMPT_QUEUE_DEPTH);
-        let driver = tokio::spawn(run_connection(
-            transport,
-            PathBuf::from(cwd),
-            ready_tx,
-            command_rx,
-        ));
-        match ready_rx.await {
-            Ok(Ok(())) => Ok(AcpClient {
-                commands,
-                _driver: driver,
-            }),
+        let driver = tokio::spawn(run_connection(transport, cwd, ready_tx, command_rx));
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, ready_rx).await {
+            Err(_) => {
+                driver.abort();
+                Err(AcpClientError::Handshake(format!(
+                    "agent did not initialize within {} seconds",
+                    HANDSHAKE_TIMEOUT.as_secs()
+                )))
+            }
+            Ok(Ok(Ok(()))) => Ok(AcpClient { commands, driver }),
             // The driver reported a specific handshake failure before returning.
-            Ok(Err(error)) => Err(error),
+            Ok(Ok(Err(error))) => {
+                driver.abort();
+                Err(error)
+            }
             // The driver dropped `ready_tx` without signalling (e.g. the
             // transport itself failed before `main_fn` ran): recover its error.
-            Err(_) => match driver.await {
+            Ok(Err(_)) => match driver.await {
                 Ok(Err(error)) => Err(error),
                 Ok(Ok(())) => Err(AcpClientError::Handshake(
                     "acp connection closed before completing the handshake".to_string(),
@@ -327,7 +349,7 @@ impl AcpClient {
         run_id: RunId,
         sink: &mut dyn AcpEventSink,
     ) -> Result<AcpStopReason, AcpClientError> {
-        let (events, mut incoming) = mpsc::unbounded_channel();
+        let (events, mut incoming) = mpsc::channel(PROMPT_EVENT_QUEUE_DEPTH);
         self.commands
             .send(PromptCommand::Prompt {
                 objective: objective.to_string(),
@@ -369,7 +391,7 @@ impl AcpClient {
 #[derive(Clone)]
 struct ActivePrompt {
     run_id: RunId,
-    events: mpsc::UnboundedSender<PromptOut>,
+    events: mpsc::Sender<PromptOut>,
 }
 
 /// A command from an [`AcpClient`] handle to its connection driver.
@@ -377,7 +399,7 @@ enum PromptCommand {
     Prompt {
         objective: String,
         run_id: RunId,
-        events: mpsc::UnboundedSender<PromptOut>,
+        events: mpsc::Sender<PromptOut>,
     },
 }
 
@@ -425,7 +447,7 @@ where
                         .clone();
                     if let Some(prompt) = current {
                         for event in session_update_to_events(&notification.update, prompt.run_id) {
-                            let _ = prompt.events.send(PromptOut::Event(event));
+                            let _ = prompt.events.send(PromptOut::Event(event)).await;
                         }
                     }
                     Ok(())
@@ -496,7 +518,7 @@ where
                     Ok(response) => PromptOut::Done(map_stop_reason(response.stop_reason)),
                     Err(error) => PromptOut::Failed(format!("session/prompt failed: {error}")),
                 };
-                let _ = events.send(resolved);
+                let _ = events.send(resolved).await;
             }
             Ok(())
         })
@@ -535,6 +557,7 @@ async fn resolve_permission(
             options,
             reply,
         })
+        .await
         .is_err()
     {
         return RequestPermissionOutcome::Cancelled;
@@ -910,6 +933,11 @@ mod client_tests {
                     .await;
                 }
                 "session/new" => {
+                    let cwd = message
+                        .pointer("/params/cwd")
+                        .and_then(Value::as_str)
+                        .expect("session/new cwd");
+                    assert!(PathBuf::from(cwd).is_absolute(), "ACP cwd must be absolute");
                     write_message(
                         &mut writer,
                         &json!({
@@ -1004,7 +1032,9 @@ mod client_tests {
             script,
             Arc::clone(&permission),
         ));
-        let client = AcpClient::connect(client_reads, client_writes, "/tmp/repo")
+        // A caller-friendly relative cwd is canonicalized before session/new;
+        // real Claude rejects relative ACP working-directory URIs.
+        let client = AcpClient::connect(client_reads, client_writes, ".")
             .await
             .expect("handshake completes");
         (client, permission)

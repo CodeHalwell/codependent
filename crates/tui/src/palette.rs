@@ -45,6 +45,8 @@ pub enum PaletteCommand {
     Mode,
     /// Open the `/keys` overlay (D1): set/replace/remove API keys.
     ApiKeys,
+    /// Surface the persisted multi-provider council workflow.
+    Council,
     /// Flip between the chat and workspace layouts.
     ToggleLayout,
     /// Toggle the help overlay.
@@ -156,6 +158,13 @@ pub const COMMANDS: &[PaletteEntry] = &[
         // pickers. NOTE: the title/description deliberately avoid the words
         // "model", "provider", and "mode" so those pickers' filter queries
         // stay unambiguous.
+        key: "—",
+        group: "Models",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Council,
+        title: "/council  Agent council",
+        description: "assemble multiple provider/model profiles and a synthesis chair",
         key: "—",
         group: "Models",
     },
@@ -343,8 +352,12 @@ mod tests {
     fn filters_to_the_provider_picker_command() {
         // Task 8: "/provider" opens the catalog picker via the palette front door.
         let provider = filtered("provider");
-        assert_eq!(provider.len(), 1);
         assert_eq!(provider[0].command, PaletteCommand::Provider);
+    }
+
+    #[test]
+    fn filters_to_the_agent_council_command() {
+        assert_eq!(filtered("council")[0].command, PaletteCommand::Council);
     }
 
     #[test]

@@ -672,6 +672,8 @@ function describeAction(action: ProposedAction): string {
       return String(action.summary);
     case "McpToolCall":
       return `${String(action.summary)} args: ${String(action.args)}`;
+    case "AcpToolCall":
+      return `${String(action.agent)} · ${String(action.title)}: ${String(action.details)}`;
     case "PublishDocument": {
       const files = Array.isArray(action.changed_files)
         ? action.changed_files.map(String).join(", ")

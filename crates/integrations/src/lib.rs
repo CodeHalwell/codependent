@@ -28,6 +28,7 @@
 
 pub mod acp;
 pub mod acp_client;
+pub mod acp_registry;
 pub mod github;
 pub mod ide;
 pub mod mcp;

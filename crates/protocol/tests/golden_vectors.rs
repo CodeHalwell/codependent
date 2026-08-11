@@ -1047,6 +1047,14 @@ fn run_vectors() -> Vec<Vector> {
             },
         ),
         vec_of(
+            "ProposedAction_AcpToolCall",
+            ProposedAction::AcpToolCall {
+                agent: "claude-acp".to_string(),
+                title: "write file".to_string(),
+                details: "{\"path\":\"src/lib.rs\"}".to_string(),
+            },
+        ),
+        vec_of(
             "Risk",
             Risk {
                 level: RiskLevel::Medium,
