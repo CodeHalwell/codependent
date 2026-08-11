@@ -540,6 +540,40 @@ impl PromoteStepArg {
 
 #[derive(Subcommand)]
 enum PluginCommand {
+    /// Verify and install a Remote UI package disabled in the daemon-owned
+    /// content-addressed plugin store.
+    Install {
+        manifest: PathBuf,
+        artifact: PathBuf,
+        #[arg(long)]
+        allow_unsigned: bool,
+    },
+    /// Start the installed worker in the real sandbox, negotiate, then stop.
+    SmokeTest { id: String },
+    /// Enable a smoke-tested plugin. Non-user scopes require --session.
+    Enable {
+        id: String,
+        #[arg(long, default_value = "user")]
+        scope: String,
+        #[arg(long)]
+        session: Option<SessionId>,
+    },
+    /// List durable plugin lifecycle and pending approval state.
+    List,
+    /// Verify and apply/stage a package update.
+    Update {
+        id: String,
+        manifest: PathBuf,
+        artifact: PathBuf,
+        #[arg(long)]
+        allow_unsigned: bool,
+    },
+    /// Approve the exact sealed update candidate shown by `plugin update`.
+    ApproveUpdate { id: String, receipt: String },
+    /// Reject a sealed update candidate and restore the previous state.
+    RejectUpdate { id: String, receipt: String },
+    /// Revoke a plugin and stop all of its workers.
+    Revoke { id: String },
     /// Parse a `plugin.toml` and render its identity, the capability list it
     /// requests, its resource caps, and its trust posture (signed? sandbox
     /// profile) — the "evaluate permissions" step a user sees before enabling a
@@ -589,7 +623,8 @@ enum TrustCommand {
     },
     /// List the trusted publishers and their public keys.
     List,
-    /// Stop trusting a publisher. Exits non-zero if it was not trusted.
+    /// Stop trusting a publisher, revoke/stop its signed UI plugins, and require
+    /// a newly verified reinstall before the same ids can run under a new key.
     Remove {
         /// The publisher id to remove.
         id: String,
@@ -804,6 +839,29 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         TopCommand::Plugin { command } => match command {
+            PluginCommand::Install {
+                manifest,
+                artifact,
+                allow_unsigned,
+            } => commands::plugin_install(&paths, &manifest, &artifact, allow_unsigned).await,
+            PluginCommand::SmokeTest { id } => commands::plugin_smoke_test(&paths, id).await,
+            PluginCommand::Enable { id, scope, session } => {
+                commands::plugin_enable(&paths, id, scope, session).await
+            }
+            PluginCommand::List => commands::plugin_list(&paths).await,
+            PluginCommand::Update {
+                id,
+                manifest,
+                artifact,
+                allow_unsigned,
+            } => commands::plugin_update(&paths, id, &manifest, &artifact, allow_unsigned).await,
+            PluginCommand::ApproveUpdate { id, receipt } => {
+                commands::plugin_approve_update(&paths, id, receipt).await
+            }
+            PluginCommand::RejectUpdate { id, receipt } => {
+                commands::plugin_reject_update(&paths, id, receipt).await
+            }
+            PluginCommand::Revoke { id } => commands::plugin_revoke(&paths, id).await,
             PluginCommand::Inspect { file } => commands::plugin_inspect(&file),
             PluginCommand::Diff { installed, update } => commands::plugin_diff(&installed, &update),
             PluginCommand::Verify {
@@ -816,7 +874,7 @@ async fn main() -> anyhow::Result<()> {
                     commands::plugin_trust_add(&id, &public_key)
                 }
                 TrustCommand::List => commands::plugin_trust_list(),
-                TrustCommand::Remove { id } => commands::plugin_trust_remove(&id),
+                TrustCommand::Remove { id } => commands::plugin_trust_remove(&paths, &id).await,
             },
         },
         TopCommand::Mcp {

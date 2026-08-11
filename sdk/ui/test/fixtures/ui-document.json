@@ -1,0 +1,48 @@
+{
+  "protocolVersion": { "major": 1, "minor": 0 },
+  "documentId": "golden-ui-document",
+  "revision": 7,
+  "root": {
+    "kind": "element",
+    "id": "root",
+    "type": "Stack",
+    "props": { "gap": "sm", "accessibleLabel": "Build summary" },
+    "children": [
+      { "kind": "text", "id": "heading", "text": "Build results" },
+      {
+        "kind": "element",
+        "id": "open",
+        "type": "Button",
+        "props": { "action": "build.open", "label": "Open failures" },
+        "children": []
+      }
+    ]
+  },
+  "capabilities": {
+    "client": "terminal",
+    "protocolVersions": [{ "major": 1, "minor": 0 }],
+    "daemon": {
+      "rich_text": true,
+      "image_display": false,
+      "audio_capture": false,
+      "editor_mutations": false,
+      "diff_view": true,
+      "mouse": true,
+      "unicode": true,
+      "true_color": true
+    },
+    "primitives": ["Stack", "Text", "Button"],
+    "media": [],
+    "colorDepth": "trueColor",
+    "keyboard": true,
+    "screenReader": false,
+    "reducedMotion": false,
+    "clipboard": true,
+    "terminalGraphics": ["kitty"],
+    "viewport": { "width": 120, "height": 40 }
+  },
+  "metadata": {
+    "title": "Build summary",
+    "source": "golden-test"
+  }
+}

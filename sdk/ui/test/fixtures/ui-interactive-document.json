@@ -1,0 +1,62 @@
+{
+  "protocolVersion": { "major": 1, "minor": 0 },
+  "documentId": "golden-ui-interactive",
+  "revision": 12,
+  "root": {
+    "kind": "element",
+    "id": "root",
+    "type": "Stack",
+    "props": { "gap": "sm", "accessibleLabel": "Interactive golden" },
+    "children": [
+      {
+        "kind": "element",
+        "id": "title",
+        "type": "Text",
+        "props": { "value": "Remote UI", "role": "heading" },
+        "children": []
+      },
+      {
+        "kind": "element",
+        "id": "instructions",
+        "type": "Markdown",
+        "props": { "source": "Use **semantic** controls." },
+        "children": []
+      },
+      {
+        "kind": "element",
+        "id": "query",
+        "type": "TextInput",
+        "props": { "name": "query", "value": "status", "changeAction": "query.change", "placeholder": "Filter results", "disabled": false },
+        "children": []
+      },
+      {
+        "kind": "element",
+        "id": "results",
+        "type": "List",
+        "props": {
+          "items": [
+            { "id": "build", "label": "Build", "status": "passed", "durationMs": 1834 },
+            { "id": "test", "label": "Tests", "status": "running", "progress": 0.7 }
+          ],
+          "selectedKeys": ["test"]
+        },
+        "children": []
+      },
+      {
+        "kind": "element",
+        "id": "refresh",
+        "type": "Button",
+        "props": { "action": "results.refresh", "label": "Refresh", "disabled": true, "disabledReason": "A refresh is already running" },
+        "children": []
+      },
+      {
+        "kind": "element",
+        "id": "local-query",
+        "type": "TextInput",
+        "props": { "name": "localQuery", "value": "", "eventHandlers": ["change", "focus"] },
+        "children": []
+      }
+    ]
+  },
+  "metadata": { "title": "Interactive contract golden", "source": "sdk" }
+}

@@ -26,6 +26,7 @@ import * as vscode from "vscode";
 
 import { DaemonClient, type ConnectionStatus } from "./client.js";
 import { resolveRuntimePaths } from "./protocol/discovery.js";
+import { isMediatedRuntimeWire, isUiRuntimeMessage, runtimeToWire, wireToHost } from "./remote-ui/wire.js";
 import {
   makeNonce,
   renderPanelHtml,
@@ -41,12 +42,15 @@ import type {
   SessionEvent,
   Uuid,
 } from "./protocol/types.js";
+import type { UiCapabilities, UiRuntimeMessage } from "@codypendent/ui";
 
 const IDE_CONTEXT_DEBOUNCE_MS = 300;
 const DIFF_SCHEME = "codypendent-diff";
 
 let client: DaemonClient | undefined;
 let view: vscode.WebviewView | undefined;
+let latestWebviewCapabilities: UiCapabilities | undefined;
+const pendingRemoteUiResyncs = new Map<string, number | undefined>();
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Codypendent");
@@ -103,31 +107,56 @@ export function activate(context: vscode.ExtensionContext): void {
   const viewProvider: vscode.WebviewViewProvider = {
     resolveWebviewView(webviewView) {
       view = webviewView;
-      webviewView.webview.options = { enableScripts: true };
+      const distUri = vscode.Uri.joinPath(context.extensionUri, "dist");
+      webviewView.webview.options = { enableScripts: true, localResourceRoots: [distUri] };
       const nonce = makeNonce();
       webviewView.webview.html = renderPanelHtml({
         nonce,
         cspSource: webviewView.webview.cspSource,
+        scriptUri: webviewView.webview.asWebviewUri(vscode.Uri.joinPath(distUri, "webview.js")).toString(),
       });
-      webviewView.webview.onDidReceiveMessage((raw: WebviewCommandMessage) => {
+      webviewView.webview.onDidReceiveMessage((value: unknown) => {
         // The webview is CSP-sandboxed and only our own script posts here, but
         // validate the forwarded fields anyway: a malformed approvalId would be
         // serialized into a `Uuid` field and the daemon's deserialize failure
         // would drop the whole connection.
+        if (typeof value !== "object" || value === null || !("kind" in value) || typeof value.kind !== "string") return;
+        const raw = value as Partial<WebviewCommandMessage> & Record<string, unknown>;
         switch (raw.kind) {
           case "approve":
-            if (isUuid(raw.approvalId)) {
+            if (typeof raw.approvalId === "string" && isUuid(raw.approvalId)) {
               client?.resolveApproval(raw.approvalId, "Approve");
             }
             break;
           case "reject":
-            if (isUuid(raw.approvalId)) {
+            if (typeof raw.approvalId === "string" && isUuid(raw.approvalId)) {
               client?.resolveApproval(raw.approvalId, "Reject");
             }
             break;
           case "startRun":
-            if (raw.objective.trim().length > 0) {
+            if (typeof raw.objective === "string" && raw.objective.trim().length > 0) {
               client?.startRun(raw.objective, "Build", workspaceRepo());
+            }
+            break;
+          case "remoteUiRuntime":
+            if (isUiRuntimeMessage(raw.message)) {
+              rememberRemoteUiRuntime(raw.message);
+              client?.sendRemoteUi(runtimeToWire(raw.message));
+            }
+            break;
+          case "remoteUiWire":
+            if (isMediatedRuntimeWire(raw.message)) client?.sendRemoteUi(raw.message);
+            break;
+          case "remoteUiReady":
+            if (isUiRuntimeMessage({ type: "capabilities", capabilities: raw.capabilities }) && Array.isArray(raw.documents) && raw.documents.length <= 1_000) {
+              const capabilities = raw.capabilities as UiCapabilities;
+              latestWebviewCapabilities = capabilities;
+              client?.sendRemoteUi(runtimeToWire({ type: "capabilities", capabilities }));
+              for (const document of raw.documents) {
+                if (typeof document.documentId !== "string" || !Number.isSafeInteger(document.revision)) continue;
+                pendingRemoteUiResyncs.set(document.documentId, document.revision);
+                client?.sendRemoteUi(runtimeToWire({ type: "resync", documentId: document.documentId, knownRevision: document.revision }));
+              }
             }
             break;
         }
@@ -141,6 +170,10 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       });
       post({ kind: "status", status: client?.connectionStatus ?? "closed" });
+      post({
+        kind: "remoteUiConfigure",
+        showTerminalFallback: vscode.workspace.getConfiguration("codypendent").get<boolean>("remoteUi.terminalFallbackPreview", false),
+      });
     },
   };
   context.subscriptions.push(
@@ -171,6 +204,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     output.appendLine(`Connecting to ${socketPath} for session ${sessionId}`);
+    pendingRemoteUiResyncs.clear();
     post({ kind: "clear" });
 
     const nextClient = new DaemonClient({ socketPath, sessionId });
@@ -179,12 +213,74 @@ export function activate(context: vscode.ExtensionContext): void {
     nextClient.on("status", (status: ConnectionStatus) => {
       post({ kind: "status", status });
       output.appendLine(`status: ${status}`);
+      if (status === "attached") flushRemoteUiRuntime(nextClient);
     });
     nextClient.on("serverHello", (hello) => {
       output.appendLine(`server hello: daemon ${hello.daemon_version}, protocol ${hello.selected_protocol.major}.${hello.selected_protocol.minor}`);
     });
     nextClient.on("event", (event) => {
       handleEvent(event, post, showDiff, true, nextClient);
+    });
+    nextClient.on("remoteUi", (message) => {
+      const projection = wireToHost(message);
+      for (const hostMessage of projection.messages) {
+        const documentId = hostMessage.type === "snapshot"
+          ? hostMessage.document.documentId
+          : hostMessage.type === "patch"
+            ? hostMessage.batch.documentId
+            : hostMessage.type === "dispose" || hostMessage.type === "error"
+              ? hostMessage.documentId
+              : undefined;
+        const rawPlacement = documentId === undefined ? undefined : projection.placements.get(documentId);
+        const placement = rawPlacement === undefined
+          ? undefined
+          : {
+              point: rawPlacement.point as import("@codypendent/ui").ContributionPoint,
+              ...(rawPlacement.extensionId === undefined ? {} : { extensionId: rawPlacement.extensionId }),
+              ...(rawPlacement.ownerScope === undefined ? {} : { ownerScope: rawPlacement.ownerScope }),
+              ...(rawPlacement.publisher === undefined ? {} : { publisher: rawPlacement.publisher }),
+              ...(rawPlacement.trust === undefined ? {} : { trust: rawPlacement.trust }),
+              ...(rawPlacement.slot === undefined ? {} : { slot: rawPlacement.slot }),
+              ...(rawPlacement.priority === undefined ? {} : { priority: rawPlacement.priority }),
+            };
+        post({ kind: "remoteUi", message: hostMessage, ...(placement === undefined ? {} : { placement }) });
+        if (documentId !== undefined && hostMessage.type === "snapshot") pendingRemoteUiResyncs.delete(documentId);
+      }
+      for (const [documentId, rawPlacement] of projection.placements) {
+        post({
+          kind: "remoteUiPlacement",
+          documentId,
+          placement: {
+            point: rawPlacement.point as import("@codypendent/ui").ContributionPoint,
+            ...(rawPlacement.extensionId === undefined ? {} : { extensionId: rawPlacement.extensionId }),
+            ...(rawPlacement.ownerScope === undefined ? {} : { ownerScope: rawPlacement.ownerScope }),
+            ...(rawPlacement.publisher === undefined ? {} : { publisher: rawPlacement.publisher }),
+            ...(rawPlacement.trust === undefined ? {} : { trust: rawPlacement.trust }),
+            ...(rawPlacement.slot === undefined ? {} : { slot: rawPlacement.slot }),
+            ...(rawPlacement.priority === undefined ? {} : { priority: rawPlacement.priority }),
+          },
+        });
+      }
+      if (projection.contributionReplacement !== undefined) {
+        post({
+          kind: "remoteUiContributions",
+          owner: projection.contributionReplacement.owner,
+          registrations: projection.contributionReplacement.registrations.map((registration) => ({
+            documentId: registration.documentId,
+            placement: {
+              point: registration.point as import("@codypendent/ui").ContributionPoint,
+              extensionId: registration.extensionId,
+              ...(registration.ownerScope === undefined ? {} : { ownerScope: registration.ownerScope }),
+              ...(registration.publisher === undefined ? {} : { publisher: registration.publisher }),
+              ...(registration.trust === undefined ? {} : { trust: registration.trust }),
+              ...(registration.slot === undefined ? {} : { slot: registration.slot }),
+              ...(registration.priority === undefined ? {} : { priority: registration.priority }),
+            },
+          })),
+        });
+      }
+      for (const mediated of projection.mediated) post({ kind: "remoteUiWire", message: mediated });
+      if (projection.theme !== undefined) post({ kind: "remoteUiTheme", theme: projection.theme });
     });
     // Render the events replayed on attach/reconnect so the transcript is not
     // blank after opening or reloading an existing session. Replay is
@@ -275,6 +371,16 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration("codypendent.remoteUi.terminalFallbackPreview")) return;
+      post({
+        kind: "remoteUiConfigure",
+        showTerminalFallback: vscode.workspace.getConfiguration("codypendent").get<boolean>("remoteUi.terminalFallbackPreview", false),
+      });
+    }),
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand("codypendent.approve", async () => {
       if (!client) {
         void vscode.window.showWarningMessage("Codypendent: not attached to a session.");
@@ -350,6 +456,20 @@ export function activate(context: vscode.ExtensionContext): void {
     ?.trim();
   if (configuredSession && isUuid(configuredSession)) {
     connect(configuredSession);
+  }
+}
+
+function rememberRemoteUiRuntime(message: UiRuntimeMessage): void {
+  if (message.type === "capabilities") latestWebviewCapabilities = message.capabilities;
+  if (message.type === "resync") pendingRemoteUiResyncs.set(message.documentId, message.knownRevision);
+}
+
+function flushRemoteUiRuntime(target: DaemonClient): void {
+  if (latestWebviewCapabilities !== undefined) {
+    target.sendRemoteUi(runtimeToWire({ type: "capabilities", capabilities: latestWebviewCapabilities }));
+  }
+  for (const [documentId, knownRevision] of pendingRemoteUiResyncs) {
+    target.sendRemoteUi(runtimeToWire({ type: "resync", documentId, ...(knownRevision === undefined ? {} : { knownRevision }) }));
   }
 }
 

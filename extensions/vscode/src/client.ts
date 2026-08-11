@@ -19,6 +19,7 @@ import * as net from "node:net";
 import { randomUUID } from "node:crypto";
 
 import { encodeEnvelope, FrameDecoder } from "./protocol/frame.js";
+import { isUiWireMessage, type UiWireMessage } from "./remote-ui/wire.js";
 import {
   IDE_CAPABILITIES,
   PROTOCOL_V1,
@@ -108,6 +109,7 @@ export interface DaemonClientEvents {
   serverHello: (hello: ServerHello) => void;
   catchup: (catchup: Catchup) => void;
   event: (event: SessionEvent) => void;
+  remoteUi: (message: UiWireMessage) => void;
   commandAccepted: (info: { command_id: Uuid; sequence?: number; created_run?: Uuid }) => void;
   commandRejected: (error: CodypendentError) => void;
   protocolError: (error: ProtocolError) => void;
@@ -184,7 +186,7 @@ export class DaemonClient extends EventEmitter {
     this.sessionId = options.sessionId;
     this.clientId = options.clientId ?? randomUUID();
     this.clientName = options.clientName ?? "codypendent-vscode";
-    this.clientVersion = options.clientVersion ?? "0.1.1";
+    this.clientVersion = options.clientVersion ?? "0.2.0";
     this.subscriptions = options.subscriptions ?? [
       { type: "SessionSummary" },
       { type: "AgentActivity" },
@@ -286,6 +288,17 @@ export class DaemonClient extends EventEmitter {
       session_id: this.sessionId,
       update,
     });
+  }
+
+  /**
+   * Forward a validated semantic UI event/capability/resync message over the
+   * daemon's dedicated `Payload::RemoteUi` envelope. UI events are
+   * revision-bound and therefore intentionally never queued while detached.
+   */
+  sendRemoteUi(message: UiWireMessage): boolean {
+    if (!isUiWireMessage(message) || !this.attached || this.socket === undefined) return false;
+    this.sendEnvelope(this.buildEnvelope({ type: "RemoteUi", message }, { withSession: true }));
+    return true;
   }
 
   // --- connection loop ------------------------------------------------------
@@ -438,6 +451,15 @@ export class DaemonClient extends EventEmitter {
         };
         this.advanceCursor(sessionEvent.sequence);
         this.emit("event", sessionEvent);
+        break;
+      }
+      case "RemoteUi": {
+        const remote = payload as { type: "RemoteUi"; message: UiWireMessage };
+        if (isUiWireMessage(remote.message)) {
+          this.emit("remoteUi", remote.message);
+        } else {
+          this.emit("error", new Error("received an invalid or oversized RemoteUi envelope"));
+        }
         break;
       }
       case "CommandAccepted": {

@@ -1,0 +1,354 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`first-party semantic component catalogue > renders explicit load, empty, error, streaming, density, and width variants deterministically 1`] = `
+"{
+  "children": [
+    {
+      "children": [
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "id": "react-ui-1",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "Loading surface",
+                        "role": "heading",
+                        "value": "Loading surface",
+                        "weight": "bold"
+                      },
+                      "type": "Text"
+                    }
+                  ],
+                  "id": "react-ui-2",
+                  "kind": "element",
+                  "props": {
+                    "gap": "xs"
+                  },
+                  "type": "Stack"
+                }
+              ],
+              "id": "react-ui-3",
+              "kind": "element",
+              "props": {
+                "align": "spaceBetween",
+                "gap": "xs"
+              },
+              "type": "Row"
+            },
+            {
+              "children": [
+                {
+                  "children": [],
+                  "id": "react-ui-4",
+                  "kind": "element",
+                  "props": {
+                    "accessibleLabel": "Loading workspace",
+                    "indeterminate": true,
+                    "label": "Loading workspace"
+                  },
+                  "type": "Spinner"
+                }
+              ],
+              "id": "react-ui-5",
+              "kind": "element",
+              "props": {
+                "gap": "xs"
+              },
+              "type": "Stack"
+            }
+          ],
+          "id": "react-ui-6",
+          "kind": "element",
+          "props": {
+            "gap": "xs"
+          },
+          "type": "Stack"
+        }
+      ],
+      "id": "loading",
+      "kind": "element",
+      "props": {
+        "accessibleLabel": "Loading surface",
+        "border": "rounded",
+        "padding": "xs",
+        "width": "48ch"
+      },
+      "type": "Box"
+    },
+    {
+      "children": [
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "id": "react-ui-7",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "Empty surface",
+                        "role": "heading",
+                        "value": "Empty surface",
+                        "weight": "bold"
+                      },
+                      "type": "Text"
+                    }
+                  ],
+                  "id": "react-ui-8",
+                  "kind": "element",
+                  "props": {
+                    "gap": "xs"
+                  },
+                  "type": "Stack"
+                }
+              ],
+              "id": "react-ui-9",
+              "kind": "element",
+              "props": {
+                "align": "spaceBetween",
+                "gap": "sm"
+              },
+              "type": "Row"
+            },
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "id": "react-ui-10",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "Nothing here",
+                        "message": "Create a resource to begin",
+                        "title": "Nothing here"
+                      },
+                      "type": "EmptyState"
+                    }
+                  ],
+                  "id": "react-ui-11",
+                  "kind": "element",
+                  "props": {
+                    "gap": "sm"
+                  },
+                  "type": "Stack"
+                }
+              ],
+              "id": "react-ui-12",
+              "kind": "element",
+              "props": {
+                "gap": "sm"
+              },
+              "type": "Stack"
+            }
+          ],
+          "id": "react-ui-13",
+          "kind": "element",
+          "props": {
+            "gap": "sm"
+          },
+          "type": "Stack"
+        }
+      ],
+      "id": "empty",
+      "kind": "element",
+      "props": {
+        "accessibleLabel": "Empty surface",
+        "border": "rounded",
+        "padding": "sm",
+        "width": "80ch"
+      },
+      "type": "Box"
+    },
+    {
+      "children": [
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "id": "react-ui-14",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "Error surface",
+                        "role": "heading",
+                        "value": "Error surface",
+                        "weight": "bold"
+                      },
+                      "type": "Text"
+                    }
+                  ],
+                  "id": "react-ui-15",
+                  "kind": "element",
+                  "props": {
+                    "gap": "xs"
+                  },
+                  "type": "Stack"
+                }
+              ],
+              "id": "react-ui-16",
+              "kind": "element",
+              "props": {
+                "align": "spaceBetween",
+                "gap": "sm"
+              },
+              "type": "Row"
+            },
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "id": "react-ui-17",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "Could not load: Connection closed",
+                        "message": "Connection closed",
+                        "title": "Could not load",
+                        "tone": "critical"
+                      },
+                      "type": "Alert"
+                    }
+                  ],
+                  "id": "react-ui-18",
+                  "kind": "element",
+                  "props": {
+                    "gap": "sm"
+                  },
+                  "type": "Stack"
+                }
+              ],
+              "id": "react-ui-19",
+              "kind": "element",
+              "props": {
+                "gap": "sm"
+              },
+              "type": "Stack"
+            }
+          ],
+          "id": "react-ui-20",
+          "kind": "element",
+          "props": {
+            "gap": "sm"
+          },
+          "type": "Stack"
+        }
+      ],
+      "id": "error",
+      "kind": "element",
+      "props": {
+        "accessibleLabel": "Error surface",
+        "border": "rounded",
+        "padding": "sm",
+        "width": "80ch"
+      },
+      "type": "Box"
+    },
+    {
+      "children": [
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "id": "react-ui-21",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "Streaming surface",
+                        "role": "heading",
+                        "value": "Streaming surface",
+                        "weight": "bold"
+                      },
+                      "type": "Text"
+                    }
+                  ],
+                  "id": "react-ui-22",
+                  "kind": "element",
+                  "props": {
+                    "gap": "xs"
+                  },
+                  "type": "Stack"
+                }
+              ],
+              "id": "react-ui-23",
+              "kind": "element",
+              "props": {
+                "align": "spaceBetween",
+                "gap": "sm"
+              },
+              "type": "Row"
+            },
+            {
+              "children": [
+                {
+                  "children": [],
+                  "id": "react-ui-24",
+                  "kind": "element",
+                  "props": {
+                    "accessibleLabel": "Receiving tokens",
+                    "indeterminate": false,
+                    "label": "Receiving tokens",
+                    "maximum": 100,
+                    "value": 25
+                  },
+                  "type": "Progress"
+                },
+                {
+                  "children": [],
+                  "id": "react-ui-25",
+                  "kind": "element",
+                  "props": {
+                    "value": "Partial response"
+                  },
+                  "type": "Text"
+                }
+              ],
+              "id": "react-ui-26",
+              "kind": "element",
+              "props": {
+                "gap": "sm"
+              },
+              "type": "Stack"
+            }
+          ],
+          "id": "react-ui-27",
+          "kind": "element",
+          "props": {
+            "gap": "sm"
+          },
+          "type": "Stack"
+        }
+      ],
+      "id": "streaming",
+      "kind": "element",
+      "props": {
+        "accessibleLabel": "Streaming surface",
+        "border": "rounded",
+        "padding": "sm",
+        "width": "100%"
+      },
+      "type": "Box"
+    }
+  ],
+  "id": "states",
+  "kind": "element",
+  "props": {
+    "gap": "sm"
+  },
+  "type": "Stack"
+}"
+`;

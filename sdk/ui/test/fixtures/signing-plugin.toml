@@ -1,0 +1,40 @@
+schema_version = 1
+id = "sdk-signing-golden"
+name = "SDK Signing Golden"
+version = "1.2.3"
+kind = "ui-component"
+publisher = "codypendent-test"
+scopes = ["user", "repository"]
+
+[ui]
+schema_version = 1
+requested_capabilities = ["artifact-read", "command-invoke"]
+
+[ui.compatibility]
+protocol = ">=1.0,<2.0"
+sdk = "^1.0"
+
+[ui.entrypoints]
+shared = "dist/worker.mjs"
+web = "dist/web.mjs"
+
+[[ui.contributions]]
+id = "sdk-signing-golden.panel"
+point = "panel"
+renderer = "sdk.SigningGolden"
+targets = ["shared"]
+
+[resources]
+memory_mb = 256
+cpu_seconds = 300
+wall_seconds = 3600
+maximum_output_mb = 32
+
+[security]
+checksum = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+signature = "set-during-packaging"
+sandbox_profile = "ui-component"
+
+[update]
+channel = "stable"
+permission_change_requires_approval = true

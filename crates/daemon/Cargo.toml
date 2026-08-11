@@ -14,6 +14,8 @@ license.workspace = true
 
 [dependencies]
 codypendent-protocol = { workspace = true }
+codypendent-ui-host = { workspace = true }
+codypendent-sandbox = { workspace = true }
 # The Phase-7 routing engine's `ModelProfile` is the value this crate's
 # `ModelProfileStore` (migration 0014) persists — the daemon owns the durable
 # profile store the router reads. `codypendent-routing` is a leaf crate
@@ -39,11 +41,15 @@ directories = { workspace = true }
 # Webhook-style HMAC is already a workspace dep (Phase 3); here it signs resume
 # tokens (`server::mint_resume_token`) instead of the ad-hoc sha2 sandwich.
 hmac = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 codypendent-test-support = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [lints]
 workspace = true

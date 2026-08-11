@@ -1,0 +1,14 @@
+[package]
+name = "codypendent-ui-worker-launcher"
+description = "Tiny pre-exec resource-limit launcher for sandboxed Codypendent UI workers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+nix = { version = "0.30", features = ["resource"] }
+
+[lints]
+workspace = true

@@ -15,6 +15,7 @@ use ratatui::layout::Rect;
 use codypendent_protocol::ApprovalScope;
 
 use crate::action::Action;
+use crate::remote_ui::RemoteKey;
 use crate::state::{InputMode, Pane};
 
 /// One documented key binding. Feeds both the help overlay and the
@@ -223,6 +224,7 @@ pub fn map_event(event: &Event, mode: InputMode, width: u16, hit_map: &[(Rect, A
         Event::Mouse(mouse) => map_mouse(mouse, mode, width, hit_map),
         // Bracketed paste lands in whichever text buffer is capturing: the
         // composer, a prompt, or the palette filter.
+        Event::Paste(text) if mode == InputMode::RemoteUi => Action::RemoteUiPaste(text.clone()),
         Event::Paste(text)
             if matches!(
                 mode,
@@ -231,9 +233,11 @@ pub fn map_event(event: &Event, mode: InputMode, width: u16, hit_map: &[(Rect, A
         {
             Action::InputPaste(text.clone())
         }
-        Event::Paste(_) | Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {
-            Action::NoOp
-        }
+        Event::Resize(width, height) => Action::RemoteUiViewport {
+            width: *width,
+            height: *height,
+        },
+        Event::Paste(_) | Event::FocusGained | Event::FocusLost => Action::NoOp,
     }
 }
 
@@ -249,8 +253,35 @@ fn map_key(key: &KeyEvent, mode: InputMode) -> Action {
         InputMode::Palette => map_palette_key(key),
         InputMode::Composer => map_composer_key(key),
         InputMode::Approval => map_approval_key(key),
+        InputMode::RemoteUi => map_remote_ui_key(key),
         InputMode::Normal => map_normal_key(key),
     }
+}
+
+fn map_remote_ui_key(key: &KeyEvent) -> Action {
+    if ctrl(key) && key.code == KeyCode::Char('c') {
+        return Action::Detach;
+    }
+    let (key, character) = match key.code {
+        KeyCode::Esc => return Action::RemoteUiSetActive(false),
+        KeyCode::Tab => (RemoteKey::Tab, None),
+        KeyCode::BackTab => (RemoteKey::ShiftTab, None),
+        KeyCode::Enter => (RemoteKey::Enter, None),
+        KeyCode::Up => (RemoteKey::Up, None),
+        KeyCode::Down => (RemoteKey::Down, None),
+        KeyCode::Left => (RemoteKey::Left, None),
+        KeyCode::Right => (RemoteKey::Right, None),
+        KeyCode::Home => (RemoteKey::Home, None),
+        KeyCode::End => (RemoteKey::End, None),
+        KeyCode::PageUp => (RemoteKey::PageUp, None),
+        KeyCode::PageDown => (RemoteKey::PageDown, None),
+        KeyCode::Backspace => (RemoteKey::Backspace, None),
+        KeyCode::Delete => (RemoteKey::Delete, None),
+        KeyCode::Char(' ') => (RemoteKey::Space, Some(' ')),
+        KeyCode::Char(character) if !ctrl(key) => (RemoteKey::Character, Some(character)),
+        _ => return Action::NoOp,
+    };
+    Action::RemoteUiKey { key, character }
 }
 
 fn ctrl(key: &KeyEvent) -> bool {
@@ -302,6 +333,12 @@ fn map_normal_char(c: char) -> Action {
         'G' => Action::OpenEdges,
         'W' => Action::OpenWorkflow,
         'B' => Action::OpenBlackboard,
+        // Host-owned Remote UI plugin lifecycle controls. They are meaningful
+        // only while the `/plugins` surface is open; the reducer ignores them
+        // elsewhere.
+        't' => Action::EnableUiPluginSession,
+        'u' => Action::EnableUiPluginUser,
+        'x' => Action::RevokeUiPlugin,
         '/' => Action::OpenPalette,
         _ => Action::NoOp,
     }
@@ -359,6 +396,7 @@ fn map_composer_key(key: &KeyEvent) -> Action {
         KeyCode::Up => Action::HistoryPrev,
         KeyCode::Down => Action::HistoryNext,
         KeyCode::F(2) => Action::ToggleLayout,
+        KeyCode::F(6) => Action::RemoteUiSetActive(true),
         KeyCode::Char('c') if ctrl(key) => Action::Detach,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
         _ => Action::NoOp,
@@ -402,6 +440,20 @@ fn map_mouse(
     match mode {
         // A text prompt / confirm captures nothing from the mouse.
         InputMode::Editing | InputMode::Confirm => Action::NoOp,
+        InputMode::RemoteUi => match mouse.kind {
+            MouseEventKind::ScrollUp => Action::RemoteUiKey {
+                key: RemoteKey::PageUp,
+                character: None,
+            },
+            MouseEventKind::ScrollDown => Action::RemoteUiKey {
+                key: RemoteKey::PageDown,
+                character: None,
+            },
+            MouseEventKind::Down(MouseButton::Left) => {
+                hit_test(hit_map, mouse.column, mouse.row).unwrap_or(Action::NoOp)
+            }
+            _ => Action::NoOp,
+        },
         // The conversation scrolls its transcript on the wheel; a left click
         // resolves through the hit-test map (a registered fold line, footer chip,
         // etc.), falling back to inert when nothing is registered there.

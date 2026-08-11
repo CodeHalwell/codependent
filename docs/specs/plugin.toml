@@ -5,6 +5,10 @@ version = "0.1.0"
 kind = "native-process"
 publisher = "codypendent-project"
 
+# UI-only packages use `kind = "ui-component"`, declare `[ui]`, and omit both
+# `[runtime]` and top-level `[capabilities]`; their code runs only in the governed
+# UI worker. Data-only themes use `kind = "theme-pack"` and must omit all three.
+
 scopes = ["user", "organization", "repository"]
 
 [runtime]
@@ -18,6 +22,34 @@ filesystem_write = []
 network = ["api.github.com:443", "uploads.github.com:443"]
 secrets = ["github-token"]
 subprocess = false
+
+# Optional, signature-bound embedded TypeScript/React UI declaration. UI workers
+# receive only these requested host APIs and never bypass daemon policy.
+[ui]
+schema_version = 1
+requested_capabilities = ["artifact-read", "run-read", "command-invoke"]
+
+[ui.compatibility]
+protocol = ">=1.0,<2.0"
+sdk = "^1.0"
+
+# Every path is relative to the package root. Absolute paths, `..`, backslashes,
+# URL/drive prefixes, percent escapes, and empty components are rejected.
+[ui.entrypoints]
+shared = "dist/ui/shared.js"
+terminal = "dist/ui/terminal.js"
+web = "dist/ui/web.js"
+
+[[ui.contributions]]
+id = "github.checks"
+point = "artifact-renderer"
+renderer = "github.ChecksRenderer"
+targets = ["shared"]
+
+# A contribution targeting only `web` must also name a terminal-safe renderer:
+# fallback_renderer = "acme.ArtifactSummaryTerminal" # renderer of a separately declared same-point terminal/shared contribution
+# Host-owned slots such as `approval-frame`, `approval-actions`, `secret-entry`,
+# `policy-state`, and `terminal-lifecycle` are always rejected.
 
 [resources]
 memory_mb = 256

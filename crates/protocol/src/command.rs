@@ -26,6 +26,23 @@ pub struct Command {
     pub body: CommandBody,
 }
 
+/// Durable Remote UI plugin lifecycle status returned by daemon management
+/// commands. Trust and execution authority remain daemon-owned; this is a
+/// display-only projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiPluginLifecycleStatus {
+    pub id: String,
+    pub version: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_approval_receipt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_permission_diff: Option<String>,
+}
+
 /// The specific change a command requests. A wire enum: internally tagged with
 /// an [`CommandBody::Unknown`] fallback so a command from a newer client
 /// deserializes and is rejected structurally rather than crashing the peer.
@@ -33,6 +50,48 @@ pub struct Command {
 #[serde(tag = "type")]
 #[non_exhaustive]
 pub enum CommandBody {
+    /// Verify and durably install a `.cody-ui.tgz` package disabled. The
+    /// archive is base64 because JSON framing has no byte-string scalar and is
+    /// bounded by the ordinary 16 MiB daemon frame limit.
+    InstallUiPlugin {
+        manifest_toml: String,
+        artifact_base64: String,
+        #[serde(default)]
+        allow_unsigned: bool,
+    },
+    SmokeTestUiPlugin {
+        plugin_id: String,
+    },
+    EnableUiPlugin {
+        plugin_id: String,
+        scope: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+    },
+    ListUiPlugins,
+    UpdateUiPlugin {
+        plugin_id: String,
+        manifest_toml: String,
+        artifact_base64: String,
+        #[serde(default)]
+        allow_unsigned: bool,
+    },
+    ApproveUiPluginUpdate {
+        plugin_id: String,
+        approval_receipt: String,
+    },
+    RejectUiPluginUpdate {
+        plugin_id: String,
+        approval_receipt: String,
+    },
+    RevokeUiPlugin {
+        plugin_id: String,
+    },
+    /// Incident-response operation: atomically remove publisher trust, revoke
+    /// all signed Remote UI records from that publisher, and stop their workers.
+    RemoveTrustedUiPublisher {
+        publisher_id: String,
+    },
     CreateSession {
         workspace: WorkspaceId,
         title: String,

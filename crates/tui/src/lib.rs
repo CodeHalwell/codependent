@@ -31,6 +31,8 @@ pub mod input;
 pub mod markdown;
 pub mod palette;
 pub mod reduce;
+pub mod remote_ui;
+pub mod remote_ui_host;
 pub mod render;
 pub mod state;
 pub mod terminal;
@@ -41,6 +43,13 @@ pub use action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, WorkflowN
 pub use input::{map_event, pane_at, KeyBinding, KEY_BINDINGS};
 pub use markdown::{RichLine, RichSpan, SpanRole, SyntaxRole};
 pub use reduce::reduce;
+pub use remote_ui::{
+    project_accessibility, render_remote_ui, AccessibilityNode, AccessibilityProjection,
+    DiagnosticSeverity, FocusDescriptor, FormFieldDescriptor, HitRegion, KeyboardAction, RemoteKey,
+    RemoteUiRenderOptions, RemoteUiRenderOutput, RemoteUiViewState, RenderDiagnostic,
+    TerminalUiCapabilities, ALL_NATIVE_PRIMITIVES,
+};
+pub use remote_ui_host::{terminal_capabilities_message, RemoteUiHostState};
 pub use render::{render, render_splash};
 pub use state::{
     AppState, BlackboardItemCard, DocBlockView, DocCard, DocEdit, DocFocus, DocLeaseState,

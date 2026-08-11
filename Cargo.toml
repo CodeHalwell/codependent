@@ -15,6 +15,8 @@ members = [
     "crates/providers",
     "crates/eval",
     "crates/test-support",
+    "crates/ui-host",
+    "crates/ui-worker-launcher",
 ]
 # The CRDT selection benchmark (Phase 4, STEP 4.1) is its own standalone
 # workspace so Automerge/Yrs — pulled in only for the comparison — never enter
@@ -23,7 +25,7 @@ members = [
 exclude = ["benches/crdt-bench"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 # 1.88 is the effective MSRV: the `agent-client-protocol` dep (ACP client) is
 # edition-2024 / requires Rust 1.88. The pinned toolchain (rust-toolchain.toml)
@@ -47,6 +49,7 @@ codypendent-routing = { path = "crates/routing" }
 codypendent-providers = { path = "crates/providers" }
 codypendent-eval = { path = "crates/eval" }
 codypendent-test-support = { path = "crates/test-support" }
+codypendent-ui-host = { path = "crates/ui-host" }
 
 # agent-framework-rs is pinned here in Phase 0 (roadmap requirement) and first
 # consumed by the runtime layer in Phase 1. The runtime crate selects providers
@@ -58,10 +61,16 @@ agent-framework-anthropic = "0.1.1"
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
 
 # Hashing (content-addressed artifact store)
 sha2 = "0.10"
 hex = "0.4"
+# Deterministic `.cody-ui.tgz` packages are re-opened by the trusted UI host at
+# launch so the extracted tree can be matched to the artifact that was signed.
+flate2 = "1"
+tar = "0.4"
 
 # Plugin signature verification (Phase 6, STEP 6.1). `ed25519-dalek` verifies a
 # publisher signature over the canonical `codypendent-plugin-signature-v1` digest

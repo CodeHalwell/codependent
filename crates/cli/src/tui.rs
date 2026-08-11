@@ -46,10 +46,11 @@ use codypendent_protocol::{
     SessionEvent, SessionId, Subscription, WorkspaceId,
 };
 use codypendent_tui::{
-    map_event, reduce, render, render_splash, Action, AppState, BlackboardItemCard, DocBlockView,
-    DocCard, DocSuggestionView, GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard,
-    ModelLocationLabel, ModelReadiness, ProjectionKind, ProviderCard, SkillCard, TerminalGuard,
-    Theme, WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
+    map_event, reduce, render, render_splash, terminal_capabilities_message, Action, AppState,
+    BlackboardItemCard, ColorDepth, DocBlockView, DocCard, DocSuggestionView, GraphEdgeCard,
+    Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard, ModelLocationLabel, ModelReadiness,
+    ProjectionKind, ProviderCard, SkillCard, TerminalGuard, Theme, WorkflowNodeCard,
+    WorkflowNodeUpdate, EDGE_PAGE_SIZE,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -882,6 +883,22 @@ async fn event_loop(
     store: &mut SessionStore,
     paths: &RuntimePaths,
 ) -> anyhow::Result<()> {
+    let (_, terminal_height) = crossterm::terminal::size().unwrap_or((*width, 24));
+    let depth = match ColorDepth::detect() {
+        ColorDepth::TrueColor => 24,
+        ColorDepth::Ansi256 => 8,
+        ColorDepth::Ansi16 => 4,
+        ColorDepth::Monochrome => 1,
+    };
+    let capabilities = terminal_capabilities_message(*width, terminal_height, depth);
+    if live
+        .out_tx
+        .send(remote_ui_envelope(live.client_id, session_id, capabilities))
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
     guard
         .terminal_mut()
         .draw(|frame| render(frame, state, theme))?;
@@ -940,6 +957,8 @@ async fn event_loop(
                 Some(ReaderSignal::Rejected { code, message }) => {
                     Action::Notice(format!("command rejected: {message} ({code})"))
                 }
+                Some(ReaderSignal::RemoteUi(message)) => Action::RemoteUiMessage(message),
+                Some(ReaderSignal::UiPlugins(plugins)) => Action::UiPluginsLoaded(plugins),
                 // Phase 4 STEP 4.3 live document editing. A sync is merged after the
                 // select (it needs an async replica merge + suggestion re-read); the
                 // lease replies fold directly.
@@ -1024,7 +1043,10 @@ async fn event_loop(
             input = input_rx.recv() => match input {
                 // Track width for mouse-column → pane mapping; the draw below
                 // re-reads the real size, so a resize just needs a redraw.
-                Some(CrosstermEvent::Resize(w, _)) => { *width = w; Action::NoOp }
+                Some(CrosstermEvent::Resize(w, h)) => {
+                    *width = w;
+                    Action::RemoteUiViewport { width: w, height: h }
+                }
                 Some(event) => map_event(&event, state.input_mode(), *width, &state.hit_map.borrow()),
                 None => return Ok(()), // input bridge ended
             },
@@ -1085,6 +1107,17 @@ async fn event_loop(
         }
 
         for intent in state.drain_outbox() {
+            if let Intent::RemoteUiMessage(message) = intent {
+                if live
+                    .out_tx
+                    .send(remote_ui_envelope(live.client_id, session_id, *message))
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                continue;
+            }
             // `AddModel` is the one client-only intent: apply it locally (models.toml
             // + auth.json) and skip the daemon-command mapping entirely.
             if let Intent::AddModel {
@@ -1203,6 +1236,14 @@ async fn event_loop(
                         let old_live = std::mem::replace(live, fresh.live);
                         old_live.shutdown();
                         session_id = fresh.session_id;
+                        let (_, terminal_height) =
+                            crossterm::terminal::size().unwrap_or((*width, 24));
+                        let capabilities =
+                            terminal_capabilities_message(*width, terminal_height, depth);
+                        let _ = live
+                            .out_tx
+                            .send(remote_ui_envelope(live.client_id, session_id, capabilities))
+                            .await;
                         tracker = GapTracker::new(watermark);
                         subscriptions = next_subscriptions;
                         replicas.clear();
@@ -1483,6 +1524,10 @@ async fn event_loop(
 
 /// What the reader task forwards to the loop.
 enum ReaderSignal {
+    /// A validated Remote UI frame for the reducer-owned host session.
+    RemoteUi(Box<codypendent_protocol::UiWireMessage>),
+    /// Host-owned lifecycle projection for `/plugins`.
+    UiPlugins(Vec<codypendent_protocol::UiPluginLifecycleStatus>),
     /// A live session event to fold into state (boxed: it is a large payload and
     /// every other message here is tiny).
     Event(Box<SessionEvent>),
@@ -1662,6 +1707,24 @@ async fn read_loop(
                         break;
                     }
                 }
+                Payload::RemoteUi { message } => {
+                    if event_tx
+                        .send(ReaderSignal::RemoteUi(message))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Payload::UiPluginLifecycle { plugins, .. } => {
+                    if event_tx
+                        .send(ReaderSignal::UiPlugins(plugins))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Payload::CommandRejected(error) => {
                     // A refused edit lease drives the presence-lite "blocked"
                     // indicator; every other rejection is a transient notice.
@@ -1823,6 +1886,31 @@ fn spawn_input_thread(tx: mpsc::Sender<CrosstermEvent>, running: Arc<AtomicBool>
 /// become protocol.
 fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) -> CommandBody {
     match intent {
+        Intent::RemoteUiMessage(_) => unreachable!(
+            "RemoteUiMessage is framed directly by the harness, never mapped to a CommandBody"
+        ),
+        Intent::ListUiPlugins => CommandBody::ListUiPlugins,
+        Intent::SmokeTestUiPlugin { plugin_id } => {
+            CommandBody::SmokeTestUiPlugin { plugin_id }
+        }
+        Intent::EnableUiPlugin { plugin_id, scope } => CommandBody::EnableUiPlugin {
+            plugin_id,
+            session_id: (scope != "user").then_some(session_id),
+            scope,
+        },
+        Intent::ApproveUiPluginUpdate { plugin_id, receipt } => {
+            CommandBody::ApproveUiPluginUpdate {
+                plugin_id,
+                approval_receipt: receipt,
+            }
+        }
+        Intent::RejectUiPluginUpdate { plugin_id, receipt } => {
+            CommandBody::RejectUiPluginUpdate {
+                plugin_id,
+                approval_receipt: receipt,
+            }
+        }
+        Intent::RevokeUiPlugin { plugin_id } => CommandBody::RevokeUiPlugin { plugin_id },
         Intent::StartRun {
             objective,
             mode,
@@ -2502,6 +2590,21 @@ fn command_envelope(client_id: ClientId, body: CommandBody) -> Envelope {
             body,
         }),
     )
+}
+
+fn remote_ui_envelope(
+    client_id: ClientId,
+    session_id: SessionId,
+    message: codypendent_protocol::UiWireMessage,
+) -> Envelope {
+    let mut envelope = Envelope::request(
+        client_id,
+        Payload::RemoteUi {
+            message: Box::new(message),
+        },
+    );
+    envelope.session_id = Some(session_id);
+    envelope
 }
 
 /// A replacement transport prepared for an in-place fresh conversation. The

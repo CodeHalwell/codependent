@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
+use base64::Engine as _;
 use codypendent_daemon::policy::{ApprovalAction, MergedPolicy, PolicyEngine};
 use codypendent_integrations::mcp::{load_mcp_config, McpConfig};
 use codypendent_knowledge::{
@@ -16,8 +17,8 @@ use codypendent_knowledge::{
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    AgentMode, ApprovalDecision, ApprovalScope, ClientRole, CommandBody, DaemonStatus, DocumentId,
-    Payload, PromotionAction, SessionId, Subscription, WorkflowEvent, WorkflowNodeView,
+    AgentMode, ApprovalDecision, ApprovalScope, ClientRole, CommandBody, CommandId, DaemonStatus,
+    DocumentId, Payload, PromotionAction, SessionId, Subscription, WorkflowEvent, WorkflowNodeView,
     WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceId,
 };
 
@@ -1850,6 +1851,26 @@ fn plugin_report(manifest: &codypendent_sandbox::PluginManifest) -> String {
             let _ = writeln!(out, "    {cap}");
         }
     }
+    if let Some(ui) = &manifest.ui {
+        if ui.requested_capabilities.is_empty() {
+            let _ = writeln!(out, "  UI host capabilities: none");
+        } else {
+            let _ = writeln!(out, "  UI host capabilities (approval required):");
+            for capability in &ui.requested_capabilities {
+                let _ = writeln!(out, "    {}", capability.as_str());
+            }
+        }
+        let _ = writeln!(out, "  UI contributions:");
+        for contribution in &ui.contributions {
+            let _ = writeln!(
+                out,
+                "    {} -> {} ({})",
+                contribution.id,
+                contribution.point.as_str(),
+                contribution.renderer
+            );
+        }
+    }
 
     let r = &manifest.resources;
     let _ = writeln!(
@@ -1941,17 +1962,19 @@ pub fn plugin_trust_list() -> anyhow::Result<()> {
 
 /// `codypendent plugin trust remove <ID>` (Phase 6 STEP 6.2): stop trusting a
 /// publisher. Exits non-zero if the publisher was not present.
-pub fn plugin_trust_remove(id: &str) -> anyhow::Result<()> {
-    let path = trusted_publishers_path()?;
-    let mut store = codypendent_sandbox::TrustedPublishers::load(&path)
-        .with_context(|| format!("loading trusted-publisher store {}", path.display()))?;
-    if !store.remove(id) {
-        anyhow::bail!("publisher `{id}` was not trusted");
-    }
-    store
-        .save(&path)
-        .with_context(|| format!("writing trusted-publisher store {}", path.display()))?;
-    println!("Trusted publisher `{id}` removed.");
+pub async fn plugin_trust_remove(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
+    let revoked = ui_plugin_command(
+        paths,
+        CommandBody::RemoveTrustedUiPublisher {
+            publisher_id: id.to_owned(),
+        },
+    )
+    .await?;
+    println!(
+        "Trusted publisher `{id}` removed; {} signed Remote UI plugin(s) revoked and stopped.",
+        revoked.len()
+    );
+    print_ui_plugin_result(revoked);
     Ok(())
 }
 
@@ -1987,18 +2010,24 @@ pub fn plugin_verify(
 
     // Full grant at install: the profile is derived from what the manifest requests.
     let granted = codypendent_sandbox::CapabilitySet::from_spec(&manifest.capabilities);
+    let granted_ui = manifest
+        .ui
+        .as_ref()
+        .map(|ui| ui.requested_capabilities.iter().copied().collect())
+        .unwrap_or_default();
     let installed = codypendent_sandbox::InstalledPlugin::install_disabled(
         manifest.clone(),
         &artifact,
         publisher_key.map(|k| k.as_slice()),
         unsigned,
         granted,
+        granted_ui,
     )
     .map_err(|error| {
         anyhow::anyhow!("{} @ {}: refused — {error}", manifest.id, manifest.version)
     })?;
 
-    let trust = if installed.signed {
+    let trust = if installed.is_signed() {
         format!("signed by trusted publisher `{}`", manifest.publisher)
     } else {
         "unsigned (allowed by --allow-unsigned)".to_string()
@@ -2008,6 +2037,218 @@ pub fn plugin_verify(
         manifest.id, manifest.version,
     );
     Ok(())
+}
+
+pub async fn plugin_install(
+    paths: &RuntimePaths,
+    manifest: &std::path::Path,
+    artifact: &std::path::Path,
+    allow_unsigned: bool,
+) -> anyhow::Result<()> {
+    let (manifest_toml, artifact_base64) = read_ui_plugin_candidate(manifest, artifact)?;
+    print_ui_plugin_result(
+        ui_plugin_command(
+            paths,
+            CommandBody::InstallUiPlugin {
+                manifest_toml,
+                artifact_base64,
+                allow_unsigned,
+            },
+        )
+        .await?,
+    );
+    Ok(())
+}
+
+pub async fn plugin_smoke_test(paths: &RuntimePaths, plugin_id: String) -> anyhow::Result<()> {
+    print_ui_plugin_result(
+        ui_plugin_command(paths, CommandBody::SmokeTestUiPlugin { plugin_id }).await?,
+    );
+    Ok(())
+}
+
+pub async fn plugin_enable(
+    paths: &RuntimePaths,
+    plugin_id: String,
+    scope: String,
+    session_id: Option<SessionId>,
+) -> anyhow::Result<()> {
+    print_ui_plugin_result(
+        ui_plugin_command(
+            paths,
+            CommandBody::EnableUiPlugin {
+                plugin_id,
+                scope,
+                session_id,
+            },
+        )
+        .await?,
+    );
+    Ok(())
+}
+
+pub async fn plugin_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let plugins = ui_plugin_command(paths, CommandBody::ListUiPlugins).await?;
+    if plugins.is_empty() {
+        println!("No Remote UI plugins installed.");
+    } else {
+        print_ui_plugin_result(plugins);
+    }
+    Ok(())
+}
+
+pub async fn plugin_update(
+    paths: &RuntimePaths,
+    plugin_id: String,
+    manifest: &std::path::Path,
+    artifact: &std::path::Path,
+    allow_unsigned: bool,
+) -> anyhow::Result<()> {
+    let (manifest_toml, artifact_base64) = read_ui_plugin_candidate(manifest, artifact)?;
+    print_ui_plugin_result(
+        ui_plugin_command(
+            paths,
+            CommandBody::UpdateUiPlugin {
+                plugin_id,
+                manifest_toml,
+                artifact_base64,
+                allow_unsigned,
+            },
+        )
+        .await?,
+    );
+    Ok(())
+}
+
+pub async fn plugin_approve_update(
+    paths: &RuntimePaths,
+    plugin_id: String,
+    approval_receipt: String,
+) -> anyhow::Result<()> {
+    print_ui_plugin_result(
+        ui_plugin_command(
+            paths,
+            CommandBody::ApproveUiPluginUpdate {
+                plugin_id,
+                approval_receipt,
+            },
+        )
+        .await?,
+    );
+    Ok(())
+}
+
+pub async fn plugin_reject_update(
+    paths: &RuntimePaths,
+    plugin_id: String,
+    approval_receipt: String,
+) -> anyhow::Result<()> {
+    print_ui_plugin_result(
+        ui_plugin_command(
+            paths,
+            CommandBody::RejectUiPluginUpdate {
+                plugin_id,
+                approval_receipt,
+            },
+        )
+        .await?,
+    );
+    Ok(())
+}
+
+pub async fn plugin_revoke(paths: &RuntimePaths, plugin_id: String) -> anyhow::Result<()> {
+    print_ui_plugin_result(
+        ui_plugin_command(paths, CommandBody::RevokeUiPlugin { plugin_id }).await?,
+    );
+    Ok(())
+}
+
+fn read_ui_plugin_candidate(
+    manifest: &std::path::Path,
+    artifact: &std::path::Path,
+) -> anyhow::Result<(String, String)> {
+    let manifest_toml = std::fs::read_to_string(manifest)
+        .with_context(|| format!("reading plugin manifest {}", manifest.display()))?;
+    // Parse locally for an immediate human-legible schema error; the daemon
+    // independently parses and verifies the same bytes at the trust boundary.
+    codypendent_sandbox::parse_manifest(&manifest_toml)?;
+    let artifact = std::fs::read(artifact)
+        .with_context(|| format!("reading plugin archive {}", artifact.display()))?;
+    if artifact.len() > 10 * 1024 * 1024 {
+        anyhow::bail!("plugin archive exceeds the 10 MiB management-frame bound");
+    }
+    Ok((
+        manifest_toml,
+        base64::engine::general_purpose::STANDARD.encode(artifact),
+    ))
+}
+
+async fn ui_plugin_command(
+    paths: &RuntimePaths,
+    body: CommandBody,
+) -> anyhow::Result<Vec<codypendent_protocol::UiPluginLifecycleStatus>> {
+    ensure_daemon(paths).await?;
+    let command_id = CommandId::new();
+    let operation_id = format!("ui-plugin:{command_id}");
+    let mut last_error = None;
+    let reply = loop {
+        let result = async {
+            let mut connection = Connection::connect(&paths.socket_path).await?;
+            connection
+                .handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+                .await?;
+            bind_control_role(&mut connection).await?;
+            connection
+                .send_command_with_idempotency(body.clone(), command_id, operation_id.clone())
+                .await
+        }
+        .await;
+        match result {
+            Ok(reply) => break reply,
+            Err(error) if last_error.is_none() => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                return Err(error).context(format!(
+                    "plugin lifecycle retry also failed after: {}",
+                    last_error.expect("first attempt error recorded")
+                ))
+            }
+        }
+    };
+    match reply.payload {
+        Payload::UiPluginLifecycle { plugins, .. } => Ok(plugins),
+        Payload::CommandRejected(error) => anyhow::bail!(
+            "plugin lifecycle command rejected: {} ({})",
+            error.message,
+            error.code
+        ),
+        other => anyhow::bail!("unexpected plugin lifecycle reply: {other:?}"),
+    }
+}
+
+fn print_ui_plugin_result(plugins: Vec<codypendent_protocol::UiPluginLifecycleStatus>) {
+    for plugin in plugins {
+        println!("{} v{} — {}", plugin.id, plugin.version, plugin.state);
+        if let Some(scope) = plugin.enabled_scope {
+            println!("  scope: {scope}");
+        }
+        if let Some(diff) = plugin.update_permission_diff {
+            println!("  permission update:\n{}", indent_lines(&diff, "    "));
+        }
+        if let Some(receipt) = plugin.update_approval_receipt {
+            println!("  approval receipt: {receipt}");
+        }
+    }
+}
+
+fn indent_lines(value: &str, prefix: &str) -> String {
+    value
+        .lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The handoff instructions printed by [`open`]. Pure (no I/O) so it is testable.

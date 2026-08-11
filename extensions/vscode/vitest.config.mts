@@ -6,6 +6,6 @@ export default defineConfig({
     // runtime. Tests import them directly; `src/extension.ts` (the only module
     // that imports `vscode`) is never touched by the suite.
     environment: "node",
-    include: ["test/**/*.test.ts"],
+    include: ["test/**/*.test.{ts,tsx}"],
   },
 });

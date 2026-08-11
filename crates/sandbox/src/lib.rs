@@ -45,14 +45,21 @@ pub mod verify;
 pub use executor::{
     bwrap_argv, enforcing_executor, seatbelt_profile, CapabilityReport, RefusingSandbox,
     SandboxBackend, SandboxCommand, SandboxError, SandboxExecutor, SandboxOutcome,
+    SandboxProcessSpec,
 };
-pub use lifecycle::{InstalledPlugin, LifecycleError, LifecycleState, TrustTier};
+pub use lifecycle::{
+    InstalledPlugin, LifecycleError, LifecycleState, PendingUpdateApproval, TrustTier,
+};
 pub use manifest::{
     parse_manifest, CapabilitiesSpec, ManifestError, PluginKind, PluginManifest, ResourcesSpec,
-    RuntimeSpec, SecuritySpec, UpdateSpec, SUPPORTED_PLUGIN_SCHEMA_VERSION,
+    RuntimeSpec, SecuritySpec, UiCapability, UiCompatibilitySpec, UiContributionPoint,
+    UiContributionSpec, UiEntrypointsSpec, UiSpec, UiTarget, UpdateSpec,
+    SUPPORTED_PLUGIN_SCHEMA_VERSION, SUPPORTED_UI_PROTOCOL_VERSION, SUPPORTED_UI_SCHEMA_VERSION,
+    SUPPORTED_UI_SDK_VERSION,
 };
 pub use permission::{
     diff_manifests, diff_resources, Capability, CapabilitySet, PermissionDiff, ResourceChange,
+    UiPermission,
 };
 pub use profile::{SandboxProfile, ENV_ALLOWLIST};
 pub use sanitize::{sanitize_untrusted, Sanitized};

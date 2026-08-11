@@ -130,8 +130,16 @@ jobs:
           # @types/node ^22.5.0.
           node-version: "22"
           cache: npm
-          cache-dependency-path: extensions/vscode/package-lock.json
-      - name: Install dependencies
+          cache-dependency-path: |
+            sdk/ui/package-lock.json
+            extensions/vscode/package-lock.json
+      - name: Install UI SDK dependencies
+        working-directory: sdk/ui
+        run: npm ci
+      - name: Build UI SDK
+        working-directory: sdk/ui
+        run: npm run build
+      - name: Install extension dependencies
         run: npm ci
       - name: Typecheck
         run: npm run typecheck

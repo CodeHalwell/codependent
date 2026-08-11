@@ -2,7 +2,7 @@
   "name": "codypendent",
   "displayName": "Codypendent",
   "description": "Editor-aware client for the Codypendent daemon: attach to a session, watch the transcript and run state, resolve approvals, and push IDE context. The extension never executes tools locally.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "codypendent",
   "license": "MIT",
   "engines": {
@@ -64,6 +64,11 @@
           "type": "string",
           "default": "",
           "description": "Override the daemon Unix socket path. Leave empty to resolve it exactly as the daemon does (CODYPENDENT_SOCKET / CODYPENDENT_DATA_DIR / XDG_RUNTIME_DIR / platform data dir)."
+        },
+        "codypendent.remoteUi.terminalFallbackPreview": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the deterministic terminal fallback below graphical Remote UI contributions for extension development and accessibility QA."
         }
       }
     }
@@ -71,19 +76,25 @@
   "scripts": {
     "build": "node esbuild.config.mjs",
     "watch": "node esbuild.config.mjs --watch",
-    "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\"",
+    "lint": "eslint \"src/**/*.{ts,tsx}\" \"test/**/*.{ts,tsx}\"",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "vscode:prepublish": "node esbuild.config.mjs --production"
   },
   "devDependencies": {
+    "@codypendent/ui": "file:../../sdk/ui",
     "@types/node": "^22.5.0",
+    "@types/react": "19.0.12",
+    "@types/react-dom": "19.0.4",
     "@types/vscode": "^1.90.0",
     "@typescript-eslint/eslint-plugin": "^7.18.0",
     "@typescript-eslint/parser": "^7.18.0",
-    "esbuild": "^0.23.1",
+    "esbuild": "^0.28.2",
     "eslint": "^8.57.1",
+    "jsdom": "^26.0.0",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
     "typescript": "^5.5.4",
-    "vitest": "^2.1.9"
+    "vitest": "^4.1.10"
   }
 }

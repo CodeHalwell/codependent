@@ -1,0 +1,276 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codypendent.dev/schema/remote-ui/v1.json",
+  "title": "Codypendent Remote UI Protocol v1",
+  "description": "Canonical semantic UI contract shared by Rust hosts and TypeScript component workers.",
+  "oneOf": [
+    { "$ref": "#/$defs/document" },
+    { "$ref": "#/$defs/patchBatch" },
+    { "$ref": "#/$defs/event" },
+    { "$ref": "#/$defs/wireMessage" }
+  ],
+  "$defs": {
+    "jsonValue": {
+      "oneOf": [
+        { "type": "null" }, { "type": "boolean" }, { "type": "number" }, { "type": "string" },
+        { "type": "array", "items": { "$ref": "#/$defs/jsonValue" } },
+        { "type": "object", "additionalProperties": { "$ref": "#/$defs/jsonValue" } }
+      ]
+    },
+    "id": { "type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^\\u0000-\\u001f]+$" },
+    "version": {
+      "type": "object", "additionalProperties": false, "required": ["major", "minor"],
+      "properties": { "major": { "type": "integer", "minimum": 1, "maximum": 65535 }, "minor": { "type": "integer", "minimum": 0, "maximum": 65535 } }
+    },
+    "viewport": {
+      "type": "object", "additionalProperties": false, "required": ["width", "height"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 }, "height": { "type": "integer", "minimum": 1 },
+        "pixelWidth": { "type": "integer", "minimum": 1 }, "pixelHeight": { "type": "integer", "minimum": 1 },
+        "density": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "hardLimits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["maxTreeDepth", "maxNodes", "maxTextBytes", "maxPropertiesPerNode", "maxActionsPerNode", "maxJsonDepth", "maxJsonValues", "maxPatchesPerBatch", "maxPatchBytes", "maxContributions"],
+      "properties": {
+        "maxTreeDepth": { "type": "integer", "minimum": 1 }, "maxNodes": { "type": "integer", "minimum": 1 },
+        "maxTextBytes": { "type": "integer", "minimum": 1 }, "maxPropertiesPerNode": { "type": "integer", "minimum": 1 },
+        "maxActionsPerNode": { "type": "integer", "minimum": 1 }, "maxJsonDepth": { "type": "integer", "minimum": 1 },
+        "maxJsonValues": { "type": "integer", "minimum": 1 }, "maxPatchesPerBatch": { "type": "integer", "minimum": 1 },
+        "maxPatchBytes": { "type": "integer", "minimum": 1 }, "maxContributions": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "daemonCapabilities": {
+      "type": "object", "additionalProperties": false,
+      "required": ["rich_text", "image_display", "audio_capture", "editor_mutations", "diff_view", "mouse", "unicode", "true_color"],
+      "properties": {
+        "rich_text": { "type": "boolean" }, "image_display": { "type": "boolean" }, "audio_capture": { "type": "boolean" },
+        "editor_mutations": { "type": "boolean" }, "diff_view": { "type": "boolean" }, "mouse": { "type": "boolean" },
+        "unicode": { "type": "boolean" }, "true_color": { "type": "boolean" }
+      }
+    },
+    "capabilities": {
+      "type": "object", "additionalProperties": false,
+      "required": ["client", "protocolVersions", "daemon", "primitives", "media", "colorDepth", "keyboard", "screenReader", "reducedMotion", "clipboard", "viewport"],
+      "properties": {
+        "client": { "$ref": "#/$defs/id" },
+        "protocolVersions": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/version" } },
+        "daemon": { "$ref": "#/$defs/daemonCapabilities" },
+        "primitives": { "oneOf": [{ "const": "*" }, { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } }] },
+        "media": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "colorDepth": { "enum": ["monochrome", "ansi16", "ansi256", "trueColor"] },
+        "keyboard": { "type": "boolean" }, "screenReader": { "type": "boolean" }, "reducedMotion": { "type": "boolean" }, "clipboard": { "type": "boolean" },
+        "terminalGraphics": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "viewport": { "$ref": "#/$defs/viewport" },
+        "capabilities": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "contributionPoints": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "limits": { "$ref": "#/$defs/hardLimits" }
+      }
+    },
+    "selection": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocolVersion", "primitives", "capabilities", "contributionPoints", "imageProtocols", "colorDepth", "unicode", "mouse", "screenReader", "limits"],
+      "properties": {
+        "protocolVersion": { "$ref": "#/$defs/version" },
+        "primitives": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "capabilities": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "contributionPoints": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "imageProtocols": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "colorDepth": { "type": "integer", "enum": [1, 4, 8, 24] },
+        "unicode": { "type": "boolean" }, "mouse": { "type": "boolean" }, "screenReader": { "type": "boolean" },
+        "viewport": { "$ref": "#/$defs/viewport" }, "limits": { "$ref": "#/$defs/hardLimits" }
+      }
+    },
+    "requirement": {
+      "type": "object", "additionalProperties": false, "required": ["feature"],
+      "properties": { "feature": { "$ref": "#/$defs/id" }, "optional": { "type": "boolean" } }
+    },
+    "fallback": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "plainText": { "type": "string" }, "replacement": { "$ref": "#/$defs/node" }, "behavior": { "type": "string" } }
+    },
+    "compatibility": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "minimumProtocol": { "$ref": "#/$defs/version" },
+        "requiredPrimitives": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "requiredCapabilities": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "fallback": { "$ref": "#/$defs/fallback" }
+      }
+    },
+    "textNode": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "id", "text"],
+      "properties": { "kind": { "const": "text" }, "id": { "$ref": "#/$defs/id" }, "text": { "type": "string" } }
+    },
+    "elementNode": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "id", "type", "props", "children"],
+      "properties": {
+        "kind": { "const": "element" }, "id": { "$ref": "#/$defs/id" }, "type": { "$ref": "#/$defs/id" },
+        "props": {
+          "type": "object",
+          "properties": {
+            "eventHandlers": {
+              "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true,
+              "items": { "enum": ["action", "press", "change", "submit", "focus", "blur", "select", "expand", "collapse", "navigate", "scroll", "key", "custom"] }
+            },
+            "inputType": { "enum": ["text", "email", "url", "search", "number", "tel"] },
+            "secret": false, "secretName": false, "secretValue": false,
+            "password": false, "credential": false, "sensitive": false
+          },
+          "additionalProperties": { "$ref": "#/$defs/jsonValue" }
+        },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/node" } },
+        "fallback": { "$ref": "#/$defs/node" },
+        "requires": { "type": "array", "items": { "$ref": "#/$defs/requirement" } }
+      }
+    },
+    "node": { "oneOf": [{ "$ref": "#/$defs/textNode" }, { "$ref": "#/$defs/elementNode" }] },
+    "document": {
+      "type": "object", "additionalProperties": false, "required": ["protocolVersion", "documentId", "revision", "root"],
+      "properties": {
+        "protocolVersion": { "$ref": "#/$defs/version" }, "documentId": { "$ref": "#/$defs/id" },
+        "revision": { "type": "integer", "minimum": 0 }, "root": { "$ref": "#/$defs/node" },
+        "capabilities": { "$ref": "#/$defs/capabilities" },
+        "metadata": { "type": "object", "additionalProperties": { "$ref": "#/$defs/jsonValue" } },
+        "compatibility": { "$ref": "#/$defs/compatibility" }
+      }
+    },
+    "patch": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["op", "node"], "properties": { "op": { "const": "replaceRoot" }, "node": { "$ref": "#/$defs/node" }, "payload": { "$ref": "#/$defs/jsonValue" } } },
+        { "type": "object", "additionalProperties": false, "required": ["op", "parentId", "index", "node"], "properties": { "op": { "const": "insert" }, "parentId": { "$ref": "#/$defs/id" }, "index": { "type": "integer", "minimum": 0 }, "node": { "$ref": "#/$defs/node" }, "payload": { "$ref": "#/$defs/jsonValue" } } },
+        { "type": "object", "additionalProperties": false, "required": ["op", "nodeId"], "properties": { "op": { "const": "remove" }, "nodeId": { "$ref": "#/$defs/id" }, "payload": { "$ref": "#/$defs/jsonValue" } } },
+        { "type": "object", "additionalProperties": false, "required": ["op", "nodeId", "node"], "properties": { "op": { "const": "replace" }, "nodeId": { "$ref": "#/$defs/id" }, "node": { "$ref": "#/$defs/node" }, "payload": { "$ref": "#/$defs/jsonValue" } } },
+        { "type": "object", "additionalProperties": false, "required": ["op", "nodeId", "set"], "properties": { "op": { "const": "updateProps" }, "nodeId": { "$ref": "#/$defs/id" }, "set": { "type": "object", "additionalProperties": { "$ref": "#/$defs/jsonValue" } }, "unset": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } }, "payload": { "$ref": "#/$defs/jsonValue" } } },
+        { "type": "object", "additionalProperties": false, "required": ["op", "nodeId", "text"], "properties": { "op": { "const": "setText" }, "nodeId": { "$ref": "#/$defs/id" }, "text": { "type": "string" }, "payload": { "$ref": "#/$defs/jsonValue" } } },
+        { "type": "object", "additionalProperties": false, "required": ["op", "nodeId", "parentId", "index"], "properties": { "op": { "const": "move" }, "nodeId": { "$ref": "#/$defs/id" }, "parentId": { "$ref": "#/$defs/id" }, "index": { "type": "integer", "minimum": 0 }, "payload": { "$ref": "#/$defs/jsonValue" } } },
+        { "type": "object", "additionalProperties": false, "required": ["op"], "properties": {
+          "op": { "type": "string", "minLength": 1, "not": { "enum": ["replaceRoot", "insert", "remove", "replace", "updateProps", "setText", "move"] } },
+          "nodeId": { "$ref": "#/$defs/id" }, "parentId": { "$ref": "#/$defs/id" }, "index": { "type": "integer", "minimum": 0 },
+          "node": { "$ref": "#/$defs/node" }, "set": { "type": "object", "additionalProperties": { "$ref": "#/$defs/jsonValue" } },
+          "unset": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } }, "text": { "type": "string" }, "payload": { "$ref": "#/$defs/jsonValue" }
+        } }
+      ]
+    },
+    "patchBatch": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocolVersion", "documentId", "baseRevision", "revision", "patches", "atomic"],
+      "properties": {
+        "protocolVersion": { "$ref": "#/$defs/version" }, "documentId": { "$ref": "#/$defs/id" },
+        "baseRevision": { "type": "integer", "minimum": 0 }, "revision": { "type": "integer", "minimum": 1 },
+        "patches": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/patch" } }, "issuedAt": { "type": "string" },
+        "atomic": { "const": true }, "fallback": { "$ref": "#/$defs/fallback" }
+      }
+    },
+    "event": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocolVersion", "eventId", "documentId", "revision", "targetId", "type"],
+      "properties": {
+        "protocolVersion": { "$ref": "#/$defs/version" }, "eventId": { "$ref": "#/$defs/id" }, "documentId": { "$ref": "#/$defs/id" },
+        "revision": { "type": "integer", "minimum": 0 }, "targetId": { "$ref": "#/$defs/id" }, "type": { "$ref": "#/$defs/id" },
+        "payload": { "$ref": "#/$defs/jsonValue" }, "modifiers": { "type": "object", "additionalProperties": { "type": "boolean" } }, "timestamp": { "type": "string" },
+        "interactionToken": { "$ref": "#/$defs/id" }
+      }
+    },
+    "action": {
+      "type": "object", "additionalProperties": false, "required": ["invocationId", "documentId", "revision", "sourceNodeId", "actionId"],
+      "properties": {
+        "invocationId": { "$ref": "#/$defs/id" }, "documentId": { "$ref": "#/$defs/id" }, "revision": { "type": "integer", "minimum": 0 },
+        "sourceNodeId": { "$ref": "#/$defs/id" }, "actionId": { "$ref": "#/$defs/id" }, "payload": { "$ref": "#/$defs/jsonValue" },
+        "formData": { "type": "object", "additionalProperties": { "$ref": "#/$defs/jsonValue" } },
+        "interactionToken": { "$ref": "#/$defs/id" }, "interactionEventType": { "$ref": "#/$defs/id" }
+      }
+    },
+    "subscription": {
+      "type": "object", "additionalProperties": false, "required": ["subscriptionId", "kind"],
+      "properties": { "subscriptionId": { "$ref": "#/$defs/id" }, "kind": { "$ref": "#/$defs/id" }, "resourceId": { "$ref": "#/$defs/id" }, "parameters": { "type": "object", "additionalProperties": { "$ref": "#/$defs/jsonValue" } } }
+    },
+    "unsubscription": {
+      "type": "object", "additionalProperties": false, "required": ["subscriptionId"],
+      "properties": { "subscriptionId": { "$ref": "#/$defs/id" } }
+    },
+    "projection": {
+      "type": "object", "additionalProperties": false, "required": ["subscriptionId"],
+      "properties": { "subscriptionId": { "$ref": "#/$defs/id" }, "revision": { "type": "integer", "minimum": 0 }, "removed": { "type": "boolean" }, "value": { "$ref": "#/$defs/jsonValue" } },
+      "allOf": [{ "if": { "properties": { "removed": { "const": true } }, "required": ["removed"] }, "then": { "properties": { "value": { "type": "null" } } } }]
+    },
+    "remoteError": {
+      "type": "object", "additionalProperties": false, "required": ["code", "message"],
+      "properties": {
+        "code": { "$ref": "#/$defs/id" }, "message": { "type": "string", "minLength": 1 }, "recoverable": { "type": "boolean" },
+        "documentId": { "$ref": "#/$defs/id" }, "nodeId": { "$ref": "#/$defs/id" }, "patchIndex": { "type": "integer", "minimum": 0 },
+        "recovery": { "type": "string" }, "details": { "$ref": "#/$defs/jsonValue" }, "fallback": { "$ref": "#/$defs/fallback" }
+      }
+    },
+    "actionResult": {
+      "type": "object", "additionalProperties": false, "required": ["invocationId", "status"],
+      "properties": { "invocationId": { "$ref": "#/$defs/id" }, "status": { "$ref": "#/$defs/id" }, "value": { "$ref": "#/$defs/jsonValue" }, "error": { "$ref": "#/$defs/remoteError" } },
+      "allOf": [
+        { "if": { "properties": { "status": { "const": "failed" } }, "required": ["status"] }, "then": { "properties": { "error": { "$ref": "#/$defs/remoteError" } }, "required": ["error"] } },
+        { "if": { "properties": { "status": { "const": "succeeded" } }, "required": ["status"] }, "then": { "not": { "required": ["error"] } } }
+      ]
+    },
+    "extensions": { "type": "object", "additionalProperties": { "$ref": "#/$defs/jsonValue" } },
+    "theme": {
+      "type": "object", "additionalProperties": false, "required": ["id", "name", "revision"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" }, "name": { "type": "string", "minLength": 1 }, "revision": { "type": "integer", "minimum": 0 },
+        "colorScheme": { "type": "string" }, "highContrast": { "type": "boolean" }, "reducedMotion": { "type": "boolean" },
+        "tokens": { "type": "object", "additionalProperties": { "$ref": "#/$defs/jsonValue" } }
+      }
+    },
+    "contribution": {
+      "type": "object", "additionalProperties": false, "required": ["id", "extensionId", "point", "slot", "documentId"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" }, "extensionId": { "$ref": "#/$defs/id" }, "point": { "$ref": "#/$defs/id" },
+        "slot": { "$ref": "#/$defs/id" }, "documentId": { "$ref": "#/$defs/id" }, "priority": { "type": "integer" }, "when": { "type": "string" },
+        "requires": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "metadata": { "type": "object", "additionalProperties": { "$ref": "#/$defs/jsonValue" } }
+      }
+    },
+    "control": {
+      "type": "object", "additionalProperties": false, "required": ["type", "messageId", "extensions"],
+      "properties": { "type": { "type": "string", "pattern": "^(host|worker)\\.[A-Za-z0-9._-]+$" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "type": "object", "minProperties": 1, "additionalProperties": { "$ref": "#/$defs/jsonValue" } } }
+    },
+    "wireMessage": {
+      "oneOf": [
+        { "$ref": "#/$defs/control" },
+        { "$ref": "#/$defs/snapshotMessage" }, { "$ref": "#/$defs/patchMessage" }, { "$ref": "#/$defs/eventMessage" },
+        { "$ref": "#/$defs/actionMessage" }, { "$ref": "#/$defs/subscriptionMessage" }, { "$ref": "#/$defs/unsubscribeMessage" }, { "$ref": "#/$defs/projectionMessage" },
+        { "$ref": "#/$defs/actionResultMessage" }, { "$ref": "#/$defs/cancelMessage" }, { "$ref": "#/$defs/capabilitiesMessage" },
+        { "$ref": "#/$defs/selectionMessage" }, { "$ref": "#/$defs/contributionsMessage" }, { "$ref": "#/$defs/disposeMessage" }, { "$ref": "#/$defs/viewportMessage" },
+        { "$ref": "#/$defs/resyncMessage" }, { "$ref": "#/$defs/hotReloadMessage" }, { "$ref": "#/$defs/themeMessage" }, { "$ref": "#/$defs/errorMessage" }
+      ]
+    },
+    "snapshotMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "snapshot"], "properties": { "type": { "const": "snapshot" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "snapshot": { "type": "object", "additionalProperties": false, "required": ["document"], "properties": { "document": { "$ref": "#/$defs/document" }, "reason": { "type": "string" } } } } },
+    "patchMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "patchBatch"], "properties": { "type": { "const": "patchBatch" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "patchBatch": { "$ref": "#/$defs/patchBatch" } } },
+    "eventMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "event"], "properties": { "type": { "const": "event" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "event": { "$ref": "#/$defs/event" } } },
+    "actionMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "action"], "properties": { "type": { "const": "action" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "action": { "$ref": "#/$defs/action" } } },
+    "subscriptionMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "subscription"], "properties": { "type": { "const": "subscription" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "subscription": { "$ref": "#/$defs/subscription" } } },
+    "unsubscribeMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "unsubscription"], "properties": { "type": { "const": "unsubscribe" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "unsubscription": { "$ref": "#/$defs/unsubscription" } } },
+    "projectionMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "projection"], "properties": { "type": { "const": "projection" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "projection": { "$ref": "#/$defs/projection" } } },
+    "actionResultMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "actionResult"], "properties": { "type": { "const": "actionResult" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "actionResult": { "$ref": "#/$defs/actionResult" } } },
+    "cancelMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "cancellation"], "properties": { "type": { "const": "cancelAction" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "cancellation": { "type": "object", "additionalProperties": false, "required": ["invocationId"], "properties": { "invocationId": { "$ref": "#/$defs/id" } } } } },
+    "capabilitiesMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "capabilities"], "properties": { "type": { "const": "capabilities" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "capabilities": { "$ref": "#/$defs/capabilities" } } },
+    "selectionMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "selection"], "properties": { "type": { "const": "capabilitySelection" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "selection": { "$ref": "#/$defs/selection" } } },
+    "contributionsMessage": {
+      "type": "object", "additionalProperties": false, "required": ["type", "messageId", "contributions", "extensions"],
+      "properties": {
+        "type": { "const": "contributions" }, "messageId": { "$ref": "#/$defs/id" },
+        "extensions": {
+          "type": "object", "required": ["contributionOwner"],
+          "properties": { "contributionOwner": { "$ref": "#/$defs/id" } },
+          "additionalProperties": { "$ref": "#/$defs/jsonValue" }
+        },
+        "contributions": { "type": "array", "items": { "$ref": "#/$defs/contribution" } }
+      }
+    },
+    "disposeMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "dispose"], "properties": { "type": { "const": "dispose" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "dispose": { "type": "object", "additionalProperties": false, "required": ["documentId", "revision"], "properties": { "documentId": { "$ref": "#/$defs/id" }, "revision": { "type": "integer", "minimum": 0 } } } } },
+    "viewportMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "viewport"], "properties": { "type": { "const": "viewport" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "viewport": { "$ref": "#/$defs/viewport" } } },
+    "resyncMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "resync"], "properties": { "type": { "const": "resync" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "resync": { "type": "object", "additionalProperties": false, "required": ["documentId"], "properties": { "documentId": { "$ref": "#/$defs/id" }, "knownRevision": { "type": "integer", "minimum": 0 } } } } },
+    "hotReloadMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "hotReload"], "properties": { "type": { "const": "hotReload" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "hotReload": { "type": "object", "additionalProperties": false, "required": ["generation", "changedModules"], "properties": { "generation": { "type": "integer", "minimum": 0 }, "changedModules": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } } } } } },
+    "themeMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "theme"], "properties": { "type": { "const": "theme" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "theme": { "$ref": "#/$defs/theme" } } },
+    "errorMessage": { "type": "object", "additionalProperties": false, "required": ["type", "messageId", "error"], "properties": { "type": { "const": "error" }, "messageId": { "$ref": "#/$defs/id" }, "extensions": { "$ref": "#/$defs/extensions" }, "error": { "$ref": "#/$defs/remoteError" } } }
+  }
+}

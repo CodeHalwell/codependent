@@ -15,6 +15,7 @@ use codypendent_protocol::{
 };
 
 use crate::action::{Action, Intent, KeyTarget, SecretKey};
+use crate::remote_ui_host::RemoteUiHostState;
 
 /// Maximum code-graph rows held in UI state at once. Shared by the renderer,
 /// reducer paging logic, and the CLI's SQLite query so range labels and page
@@ -89,6 +90,8 @@ pub enum InputMode {
     /// A pending approval owns the screen: only the decision keys (`a`/`A`/`r`)
     /// and selection arrows are live, so an approval is never typed past.
     Approval,
+    /// A mounted public Remote UI surface owns focus.
+    RemoteUi,
 }
 
 /// The top-most modal / overlay, if any. Text prompts carry their buffer inline.
@@ -142,6 +145,16 @@ pub enum Overlay {
     /// item — its kind, author, confidence, evidence, revision, and payload
     /// summary. The focused workflow run is subscribed while this view is open.
     Blackboard,
+    /// Host-owned management surface for verified Remote UI plugins. Plugin
+    /// code can never draw or intercept its own trust or revocation controls.
+    UiPlugins,
+    /// Confirm the exact daemon-issued update receipt after its permission diff
+    /// has been shown in the plugin detail rail.
+    ConfirmUiPluginApprove { plugin_id: String, receipt: String },
+    /// Reject the exact pending update receipt.
+    ConfirmUiPluginReject { plugin_id: String, receipt: String },
+    /// Revoke the selected plugin and tear down its workers.
+    ConfirmUiPluginRevoke { plugin_id: String },
     /// Confirm cancellation of a durable workflow run.
     ConfirmWorkflowCancel { workflow_run_id: String },
     /// JSON inputs for a new durable workflow run. Blank means `{}`.
@@ -1056,6 +1069,13 @@ pub struct StatusProjection {
 /// The whole application state. Read by the renderer, mutated only by `reduce`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppState {
+    /// Validated renderer-independent documents and terminal-local view state.
+    pub remote_ui: RemoteUiHostState,
+    /// Daemon-owned installed-plugin lifecycle projection. It carries display
+    /// metadata only, never executable or trust authority.
+    pub ui_plugins: Vec<codypendent_protocol::UiPluginLifecycleStatus>,
+    /// Focused installed plugin in the host-owned lifecycle surface.
+    pub selected_ui_plugin: usize,
     /// The attached session's title, once known.
     pub session_title: Option<String>,
     /// The running daemon's build id (D3), captured from the handshake by the
@@ -1237,6 +1257,9 @@ impl AppState {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            remote_ui: RemoteUiHostState::default(),
+            ui_plugins: Vec::new(),
+            selected_ui_plugin: 0,
             session_title: None,
             daemon_build_id: None,
             session_closed: false,
@@ -1305,7 +1328,10 @@ impl AppState {
             | Overlay::ApiKeySet { .. } => InputMode::Editing,
             Overlay::ConfirmCancel
             | Overlay::ConfirmWorkflowCancel { .. }
-            | Overlay::ApiKeyRemoveConfirm { .. } => InputMode::Confirm,
+            | Overlay::ApiKeyRemoveConfirm { .. }
+            | Overlay::ConfirmUiPluginApprove { .. }
+            | Overlay::ConfirmUiPluginReject { .. }
+            | Overlay::ConfirmUiPluginRevoke { .. } => InputMode::Confirm,
             // The palette, the model picker, the provider picker, the mode
             // picker, the `/keys` overlay, and the add-model pick-list all
             // filter on printable keys while staying arrow-navigable, so they
@@ -1328,12 +1354,15 @@ impl AppState {
             | Overlay::Edges
             | Overlay::Workflow
             | Overlay::Blackboard
+            | Overlay::UiPlugins
             | Overlay::AddModelQuerying { .. } => InputMode::Normal,
             // The base conversation view: an unresolved approval owns the screen
             // (decision keys only); otherwise the composer captures typed text.
             Overlay::None => {
                 if self.show_approval_modal() {
                     InputMode::Approval
+                } else if self.remote_ui.active && !self.remote_ui.mounted_documents().is_empty() {
+                    InputMode::RemoteUi
                 } else {
                     InputMode::Composer
                 }
@@ -1424,6 +1453,12 @@ impl AppState {
         self.blackboard.get(self.selected_item)
     }
 
+    /// The focused host-managed Remote UI plugin, if one is installed.
+    #[must_use]
+    pub fn focused_ui_plugin(&self) -> Option<&codypendent_protocol::UiPluginLifecycleStatus> {
+        self.ui_plugins.get(self.selected_ui_plugin)
+    }
+
     /// The focused model-picker card, if any.
     #[must_use]
     pub fn focused_model(&self) -> Option<&ModelCard> {
@@ -1461,6 +1496,7 @@ impl AppState {
     /// session. Workspace projections, model/provider setup, diagnostics,
     /// preferences, and composer history remain available in place.
     pub fn begin_new_session(&mut self) {
+        self.remote_ui = RemoteUiHostState::default();
         self.session_title = None;
         self.session_closed = false;
         self.runs.clear();

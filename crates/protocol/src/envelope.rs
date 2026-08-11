@@ -17,6 +17,7 @@ use crate::handshake::{ClientHello, ServerHello};
 use crate::ids::{
     ApprovalId, ClientId, CommandId, DaemonInstanceId, MessageId, RunId, SessionId, WorkspaceId,
 };
+use crate::remote_ui::UiWireMessage;
 use crate::version::{ProtocolVersion, PROTOCOL_V1};
 use crate::workflow::{WorkflowEvent, WorkflowRunSnapshot};
 
@@ -158,6 +159,11 @@ pub enum Payload {
         command_id: CommandId,
         candidate_id: String,
     },
+    /// Result of a daemon-owned Remote UI plugin lifecycle command.
+    UiPluginLifecycle {
+        command_id: CommandId,
+        plugins: Vec<crate::command::UiPluginLifecycleStatus>,
+    },
     /// A `ReadBlackboard` command's reply (Phase 5 STEP 5.3): the matching typed
     /// artifacts on the workflow run's board. A distinct reply from
     /// `CommandAccepted` because the client needs the items back, not just an
@@ -203,6 +209,15 @@ pub enum Payload {
     /// field so its internal `type` tag never collides with the payload tag.
     Catchup {
         catchup: Catchup,
+    },
+
+    /// Renderer-independent component traffic. The nested message has its own
+    /// kind and revision semantics; keeping it inside one envelope variant lets
+    /// terminal, VS Code, and future graphical clients share the ordinary
+    /// authenticated connection without granting component code direct access
+    /// to the daemon command channel.
+    RemoteUi {
+        message: Box<UiWireMessage>,
     },
 
     /// Forward-compatibility fallback: a payload tag this build does not know
@@ -630,6 +645,26 @@ mod tests {
                 assert_eq!(delivered.update, vec![1, 2, 3, 255]);
             }
             other => panic!("expected DocumentSync, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_ui_payload_round_trips_without_flattening_nested_tags() {
+        let message: UiWireMessage = serde_json::from_value(serde_json::json!({
+            "kind": "error",
+            "messageId": "ui-message-1",
+            "error": {
+                "code": "ui.test",
+                "message": "safe diagnostic",
+                "recoverable": true
+            }
+        }))
+        .expect("remote UI message");
+        match round_trip_payload(Payload::RemoteUi {
+            message: Box::new(message.clone()),
+        }) {
+            Payload::RemoteUi { message: delivered } => assert_eq!(*delivered, message),
+            other => panic!("expected RemoteUi, got {other:?}"),
         }
     }
 }

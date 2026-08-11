@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Codypendent installer — downloads the latest release tarball for this machine
 # and installs `codypendent` onto your PATH (self-sufficient — it runs the
-# daemon from itself; the optional standalone `codypendentd` is installed too if
-# the tarball carries it).
+# daemon from itself; the mandatory UI worker resource launcher, pinned Node
+# runtime, and optional standalone `codypendentd` are installed with it).
 #
 # One-liner (uses your existing `gh` auth, so it works for a private repo):
 #
@@ -20,6 +20,7 @@ set -euo pipefail
 
 REPO="CodeHalwell/codypendent"
 BINDIR="${CODYPENDENT_BIN:-/usr/local/bin}"
+LIBDIR="${CODYPENDENT_LIB:-$(dirname "$BINDIR")/lib/codypendent}"
 
 command -v gh  >/dev/null || { echo "error: GitHub CLI (gh) is required — https://cli.github.com" >&2; exit 1; }
 command -v tar >/dev/null || { echo "error: tar is required" >&2; exit 1; }
@@ -50,6 +51,8 @@ gh release download "$tag" -R "$REPO" -p "$asset" -D "$tmp" --clobber
 tar -xzf "$tmp/$asset" -C "$tmp"
 src="$tmp/codypendent-$target"
 [ -x "$src/codypendent" ] || { echo "error: codypendent binary missing in $asset" >&2; exit 1; }
+[ -x "$src/codypendent-ui-worker-launcher" ] || { echo "error: UI worker launcher missing in $asset" >&2; exit 1; }
+[ -x "$src/node-runtime/bin/node" ] || { echo "error: pinned Remote UI Node runtime missing in $asset" >&2; exit 1; }
 
 # 4. macOS: clear the Gatekeeper quarantine on the unsigned binaries so they run
 #    without the "developer cannot be verified" block.
@@ -61,20 +64,35 @@ fi
 #    via `codypendent __daemon`). Also install the OPTIONAL standalone
 #    `codypendentd` if the tarball carried it. Use sudo only if the target dir
 #    is not writable.
-bins=("$src/codypendent")
+bins=("$src/codypendent" "$src/codypendent-ui-worker-launcher")
 [ -x "$src/codypendentd" ] && bins+=("$src/codypendentd")
 mkdir -p "$BINDIR" 2>/dev/null || true
-if [ -w "$BINDIR" ]; then
+mkdir -p "$LIBDIR" 2>/dev/null || true
+if [ -w "$BINDIR" ] && [ -w "$LIBDIR" ]; then
   install -m 0755 "${bins[@]}" "$BINDIR"/
+  mkdir -p "$LIBDIR"
+  runtime_stage="$LIBDIR/node-runtime.new.$$"
+  runtime_old="$LIBDIR/node-runtime.old.$$"
+  cp -R "$src/node-runtime" "$runtime_stage"
+  [ ! -e "$LIBDIR/node-runtime" ] || mv "$LIBDIR/node-runtime" "$runtime_old"
+  mv "$runtime_stage" "$LIBDIR/node-runtime"
+  [ ! -e "$runtime_old" ] || rm -rf "$runtime_old"
 else
   echo "codypendent: $BINDIR is not writable — using sudo"
   sudo install -m 0755 "${bins[@]}" "$BINDIR"/
+  sudo mkdir -p "$LIBDIR"
+  runtime_stage="$LIBDIR/node-runtime.new.$$"
+  runtime_old="$LIBDIR/node-runtime.old.$$"
+  sudo cp -R "$src/node-runtime" "$runtime_stage"
+  [ ! -e "$LIBDIR/node-runtime" ] || sudo mv "$LIBDIR/node-runtime" "$runtime_old"
+  sudo mv "$runtime_stage" "$LIBDIR/node-runtime"
+  [ ! -e "$runtime_old" ] || sudo rm -rf "$runtime_old"
 fi
 
 if [ -x "$src/codypendentd" ]; then
-  echo "codypendent: installed $BINDIR/codypendent and $BINDIR/codypendentd"
+  echo "codypendent: installed codypendent, codypendent-ui-worker-launcher, pinned UI runtime, and codypendentd"
 else
-  echo "codypendent: installed $BINDIR/codypendent"
+  echo "codypendent: installed codypendent, codypendent-ui-worker-launcher, and pinned UI runtime"
 fi
 case ":$PATH:" in
   *":$BINDIR:"*) echo "codypendent: run  codypendent" ;;

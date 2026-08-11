@@ -23,11 +23,15 @@ This repository is a design and implementation manual for Codypendent. It includ
 - model routing, local models, and compaction;
 - GitHub and IDE integration;
 - plugin security and policy governance;
+- the universal TypeScript/React Remote UI component platform;
 - `agent-framework-rs` integration;
 - data contracts, implementation phases, and testing strategy;
 - example manifests for skills, plugins, workflows, and policy.
 
 Start with [the documentation index](docs/00-index.md).
+
+The cross-client component runtime and its Ratatui/React security boundary are
+specified in [Universal Remote UI architecture](architecture/remote-ui.md).
 
 Two consolidated entry points:
 

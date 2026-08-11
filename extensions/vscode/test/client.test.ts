@@ -258,6 +258,59 @@ describe("DaemonClient handshake + attach", () => {
   });
 });
 
+describe("DaemonClient Remote UI transport", () => {
+  it("forwards dedicated RemoteUi envelopes only after attachment", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/ui.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      wait: () => Promise.resolve(),
+    });
+    const message = { type: "resync", messageId: "ui-message-1", resync: { documentId: "doc" } };
+    expect(client.sendRemoteUi(message)).toBe(false);
+    client.start();
+    await flush();
+    const socket = sockets[0];
+    socket.emit("connect");
+    socket.deliver(serverHelloPayload());
+    socket.deliver(catchupPayload());
+    expect(client.sendRemoteUi(message)).toBe(true);
+    expect(socket.sent().at(-1)?.payload).toEqual({ type: "RemoteUi", message });
+    client.stop();
+  });
+
+  it("emits RemoteUi envelopes received from the daemon", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/ui.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      wait: () => Promise.resolve(),
+    });
+    const received: unknown[] = [];
+    client.on("remoteUi", (message) => received.push(message));
+    client.start();
+    await flush();
+    const socket = sockets[0];
+    socket.emit("connect");
+    socket.deliver(serverHelloPayload());
+    socket.deliver(catchupPayload());
+    const message = { type: "error", messageId: "ui-message-2", error: { code: "ui.test", message: "test error" } };
+    socket.deliver({ type: "RemoteUi", message });
+    expect(received).toEqual([message]);
+    client.stop();
+  });
+});
+
 describe("DaemonClient reconnect with resume", () => {
   it("reconnects with backoff and re-attaches with last_seen_sequence", async () => {
     const sockets: FakeSocket[] = [];

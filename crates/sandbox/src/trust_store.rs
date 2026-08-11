@@ -18,6 +18,7 @@
 //! the safe default.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::Path;
 
 use base64::Engine;
@@ -154,10 +155,35 @@ impl TrustedPublishers {
                 })?;
             }
         }
-        std::fs::write(path, text).map_err(|source| TrustStoreError::Write {
-            path: path.display().to_string(),
-            source,
-        })
+        let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
+        let write = (|| -> std::io::Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)?;
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        if let Err(source) = write {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(TrustStoreError::Write {
+                path: path.display().to_string(),
+                source,
+            });
+        }
+        Ok(())
     }
 
     /// Trust a publisher: add its id and base64 ed25519 public key. The key is

@@ -91,6 +91,19 @@ impl Connection {
     /// when the daemon supplies one).
     pub async fn send_command(&mut self, body: CommandBody) -> anyhow::Result<Envelope> {
         let command_id = CommandId::new();
+        self.send_command_with_idempotency(body, command_id, command_id.to_string())
+            .await
+    }
+
+    /// Send a command with a caller-stable operation identity. Lifecycle flows
+    /// use this to reconnect after a dropped reply without applying the effect
+    /// twice; ordinary commands continue to use [`Self::send_command`].
+    pub async fn send_command_with_idempotency(
+        &mut self,
+        body: CommandBody,
+        command_id: CommandId,
+        idempotency_key: String,
+    ) -> anyhow::Result<Envelope> {
         let command = Command {
             command_id,
             // A fresh v7 UUID is already unique per call; using its own string
@@ -98,7 +111,7 @@ impl Connection {
             // this exact command would reuse the same `command_id` (and hence
             // the same key) too — exactly the idempotent-retry contract
             // (Chapter 03 / STEP 1.3), without inventing a second identifier.
-            idempotency_key: command_id.to_string(),
+            idempotency_key,
             expected_revision: None,
             body,
         };
