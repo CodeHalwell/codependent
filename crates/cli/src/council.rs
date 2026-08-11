@@ -119,6 +119,27 @@ pub fn create(
     rounds: u8,
     description: Option<String>,
 ) -> anyhow::Result<()> {
+    let definition = create_definition(paths, name, members, chair, rounds, description)?;
+    println!(
+        "created council `{}` with {} members; chair `{}`; {} round(s)",
+        definition.name,
+        definition.members.len(),
+        definition.chair,
+        definition.rounds
+    );
+    Ok(())
+}
+
+/// Parse CLI member arguments, then validate and persist without writing to
+/// stdout. The ordinary CLI wrapper above retains its human confirmation.
+pub fn create_definition(
+    paths: &RuntimePaths,
+    name: String,
+    members: Vec<String>,
+    chair: String,
+    rounds: u8,
+    description: Option<String>,
+) -> anyhow::Result<CouncilDefinition> {
     let members = members
         .iter()
         .map(|value| parse_member(value))
@@ -130,6 +151,16 @@ pub fn create(
         rounds,
         members,
     };
+    persist_definition(paths, definition)
+}
+
+/// Validate and atomically persist an already typed definition. The interactive
+/// TUI harness uses this path so model/role values never take a lossy trip
+/// through the CLI's `MODEL=ROLE` syntax and alternate-screen output stays clean.
+pub fn persist_definition(
+    paths: &RuntimePaths,
+    definition: CouncilDefinition,
+) -> anyhow::Result<CouncilDefinition> {
     validate_definition(paths, &definition)?;
 
     let path = council_path(paths);
@@ -150,14 +181,7 @@ pub fn create(
     file.councils.push(definition.clone());
     file.councils.sort_by(|a, b| a.name.cmp(&b.name));
     save_file(&path, &file)?;
-    println!(
-        "created council `{}` with {} members; chair `{}`; {} round(s)",
-        definition.name,
-        definition.members.len(),
-        definition.chair,
-        definition.rounds
-    );
-    Ok(())
+    Ok(definition)
 }
 
 pub fn list(paths: &RuntimePaths, json: bool) -> anyhow::Result<()> {
@@ -747,6 +771,37 @@ model = "chair-model"
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn tui_typed_definition_uses_the_same_private_store_without_cli_reparsing() {
+        let (_directory, paths) = paths();
+        let created = persist_definition(
+            &paths,
+            CouncilDefinition {
+                name: "tui-board".to_owned(),
+                description: "Created interactively".to_owned(),
+                chair: "chair".to_owned(),
+                rounds: 3,
+                members: vec![
+                    CouncilMember {
+                        model: "claude".to_owned(),
+                        role: "security = risk".to_owned(),
+                    },
+                    CouncilMember {
+                        model: "codex".to_owned(),
+                        role: "delivery critic".to_owned(),
+                    },
+                ],
+            },
+        )
+        .expect("persist typed TUI definition");
+        assert_eq!(created.rounds, 3);
+        assert_eq!(
+            find(&paths, "tui-board").expect("restore").members[0].role,
+            "security = risk",
+            "typed TUI roles must not be split through MODEL=ROLE parsing"
+        );
     }
 
     #[test]

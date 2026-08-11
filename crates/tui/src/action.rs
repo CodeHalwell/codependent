@@ -82,6 +82,15 @@ pub enum Action {
     RemoteUiViewport { width: u16, height: u16 },
     /// Authoritative lifecycle rows returned by a host-owned plugin command.
     UiPluginsLoaded(Vec<codypendent_protocol::UiPluginLifecycleStatus>),
+    /// The CLI host successfully persisted the reviewed council draft.
+    CouncilCreated {
+        name: String,
+        members: usize,
+        rounds: u8,
+    },
+    /// Council persistence failed. The reducer keeps the reviewed draft open so
+    /// the operator can go back, correct it, and retry without starting over.
+    CouncilCreateFailed { name: String, error: String },
 
     // --- navigation (from keys / mouse) ---
     /// Move keyboard focus to the next pane (`Tab`).
@@ -576,6 +585,16 @@ pub enum Intent {
     /// mapped to a `CommandBody`.
     RemoveApiKey {
         target: KeyTarget,
+    },
+    /// Persist a council assembled by the host-owned TUI wizard. Client-only:
+    /// the CLI harness validates the configured model profiles and atomically
+    /// writes private `councils.toml`; it is never a daemon command.
+    CreateCouncil {
+        name: String,
+        description: String,
+        members: Vec<(String, String)>,
+        chair: String,
+        rounds: u8,
     },
     /// Create and attach to a fresh session without leaving the TUI. Client-only:
     /// the harness creates the session, swaps this connection's attachment, and

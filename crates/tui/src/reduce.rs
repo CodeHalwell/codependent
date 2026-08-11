@@ -20,8 +20,9 @@ use crate::action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, Workfl
 use crate::remote_ui::{RemoteKey, RemoteUiRenderOutput};
 use crate::remote_ui_host::{empty_message, terminal_viewport_message};
 use crate::state::{
-    filter_key_rows, filter_model_names, filter_models, filter_modes, filter_providers,
-    key_row_target, AppState, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView,
+    filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
+    filter_providers, key_row_target, AppState, CouncilBuilderState, CouncilBuilderStep,
+    CouncilMemberDraft, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView,
     KeyStatus, ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView,
     ToolCard, ToolStatus, TranscriptEntry, EDGE_PAGE_SIZE,
 };
@@ -147,6 +148,28 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
             state.ui_plugins.sort_by(|a, b| a.id.cmp(&b.id));
             clamp(&mut state.selected_ui_plugin, state.ui_plugins.len());
+        }
+        Action::CouncilCreated {
+            name,
+            members,
+            rounds,
+        } => {
+            if matches!(
+                &state.overlay,
+                Overlay::CouncilBuilder(builder) if builder.name == name
+            ) {
+                state.overlay = Overlay::None;
+            }
+            state.notice = Some((
+                format!("created council `{name}` · {members} members · {rounds} round(s)"),
+                state.tick + 50,
+            ));
+        }
+        Action::CouncilCreateFailed { name, error } => {
+            state.notice = Some((
+                format!("could not create council `{name}`: {error}"),
+                state.tick + 80,
+            ));
         }
         Action::RemoteUiActivate {
             document_id,
@@ -1582,6 +1605,35 @@ fn nav(state: &mut AppState, delta: i32) {
             step(selected, indices.len(), delta);
             return;
         }
+        Overlay::CouncilBuilder(ref mut builder) => {
+            let count = match builder.step {
+                CouncilBuilderStep::MemberModel => {
+                    let continue_row =
+                        usize::from(builder.members.len() >= 2 && builder.query.trim().is_empty());
+                    let remove_row =
+                        usize::from(!builder.members.is_empty() && builder.query.trim().is_empty());
+                    let available = if builder.members.len() >= 8 {
+                        0
+                    } else {
+                        filter_council_member_models(
+                            &state.models,
+                            &builder.query,
+                            &builder.members,
+                        )
+                        .len()
+                    };
+                    continue_row + available + remove_row
+                }
+                CouncilBuilderStep::Chair => filter_models(&state.models, &builder.query).len(),
+                CouncilBuilderStep::Rounds => 3,
+                _ => 0,
+            };
+            step(&mut builder.selected, count, delta);
+            if builder.step == CouncilBuilderStep::Rounds {
+                builder.rounds = u8::try_from(builder.selected + 1).unwrap_or(3).clamp(1, 3);
+            }
+            return;
+        }
         // The add-model pick-list (model-discovery): the same shape as the
         // model/provider pickers, over the overlay's own `models` field rather
         // than an `AppState` list.
@@ -2155,6 +2207,16 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
             edit(query);
             *selected = 0;
         }
+        Overlay::CouncilBuilder(builder) => match builder.step {
+            CouncilBuilderStep::Name => edit(&mut builder.name),
+            CouncilBuilderStep::Description => edit(&mut builder.description),
+            CouncilBuilderStep::MemberModel | CouncilBuilderStep::Chair => {
+                edit(&mut builder.query);
+                builder.selected = 0;
+            }
+            CouncilBuilderStep::MemberRole => edit(&mut builder.role),
+            CouncilBuilderStep::Rounds | CouncilBuilderStep::Review => {}
+        },
         // The base view: text lands in the persistent composer draft.
         Overlay::None => edit(&mut state.composer),
         _ => {}
@@ -2266,6 +2328,39 @@ fn history_next(state: &mut AppState) {
 /// `Esc`: clear the composer draft in the base view, return the block-edit prompt
 /// to the Docs browser it opened from, or close whatever other overlay is active.
 fn input_cancel(state: &mut AppState) {
+    if let Overlay::CouncilBuilder(builder) = &mut state.overlay {
+        match builder.step {
+            CouncilBuilderStep::Name => state.overlay = Overlay::None,
+            CouncilBuilderStep::Description => builder.step = CouncilBuilderStep::Name,
+            CouncilBuilderStep::MemberModel => {
+                builder.step = CouncilBuilderStep::Description;
+                builder.query.clear();
+                builder.selected = 0;
+            }
+            CouncilBuilderStep::MemberRole => {
+                builder.step = CouncilBuilderStep::MemberModel;
+                builder.pending_member_model = None;
+                builder.role.clear();
+                builder.query.clear();
+                builder.selected = 0;
+            }
+            CouncilBuilderStep::Chair => {
+                builder.step = CouncilBuilderStep::MemberModel;
+                builder.query.clear();
+                builder.selected = 0;
+            }
+            CouncilBuilderStep::Rounds => {
+                builder.step = CouncilBuilderStep::Chair;
+                builder.query.clear();
+                builder.selected = 0;
+            }
+            CouncilBuilderStep::Review => {
+                builder.step = CouncilBuilderStep::Rounds;
+                builder.selected = usize::from(builder.rounds.saturating_sub(1));
+            }
+        }
+        return;
+    }
     match state.overlay {
         Overlay::None => state.composer.clear(),
         // Abandoning the block-edit prompt returns to the browser, not the base
@@ -2326,6 +2421,12 @@ fn set_overlay_selected(state: &mut AppState, n: usize) {
         } => {
             *selected = n;
         }
+        Overlay::CouncilBuilder(ref mut builder) => {
+            builder.selected = n;
+            if builder.step == CouncilBuilderStep::Rounds {
+                builder.rounds = u8::try_from(n + 1).unwrap_or(3).clamp(1, 3);
+            }
+        }
         _ => {}
     }
 }
@@ -2378,7 +2479,8 @@ fn activate_row(state: &mut AppState, n: usize) {
         | Overlay::ProviderPicker { .. }
         | Overlay::ModePicker { .. }
         | Overlay::ApiKeys { .. }
-        | Overlay::AddModelPick { .. } => {
+        | Overlay::AddModelPick { .. }
+        | Overlay::CouncilBuilder(_) => {
             set_overlay_selected(state, n);
             submit_prompt(state);
         }
@@ -2520,6 +2622,167 @@ fn submit_prompt(state: &mut AppState) {
                 run_palette_command(state, entry.command);
             }
         }
+        Overlay::CouncilBuilder(mut builder) => match builder.step {
+            CouncilBuilderStep::Name => {
+                let name = builder.name.trim();
+                if name.is_empty()
+                    || name.len() > 64
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+                {
+                    state.notice = Some((
+                        "council name: use 1–64 letters, numbers, dot, dash, or underscore"
+                            .to_owned(),
+                        state.tick + 40,
+                    ));
+                } else {
+                    builder.name = name.to_owned();
+                    builder.step = CouncilBuilderStep::Description;
+                }
+                state.overlay = Overlay::CouncilBuilder(builder);
+            }
+            CouncilBuilderStep::Description => {
+                let description = builder.description.trim();
+                if description.len() > 1024 || description.chars().any(char::is_control) {
+                    state.notice = Some((
+                        "purpose must be at most 1024 characters on one line".to_owned(),
+                        state.tick + 40,
+                    ));
+                } else if state.models.len() < 2 {
+                    state.notice = Some((
+                        "configure at least two model profiles before creating a council"
+                            .to_owned(),
+                        state.tick + 50,
+                    ));
+                } else {
+                    builder.description = description.to_owned();
+                    builder.step = CouncilBuilderStep::MemberModel;
+                    builder.query.clear();
+                    builder.selected = 0;
+                }
+                state.overlay = Overlay::CouncilBuilder(builder);
+            }
+            CouncilBuilderStep::MemberModel => {
+                let continue_row = builder.members.len() >= 2 && builder.query.trim().is_empty();
+                let remove_row = !builder.members.is_empty() && builder.query.trim().is_empty();
+                let indices = if builder.members.len() >= 8 {
+                    Vec::new()
+                } else {
+                    filter_council_member_models(&state.models, &builder.query, &builder.members)
+                };
+                if continue_row && builder.selected == 0 {
+                    builder.step = CouncilBuilderStep::Chair;
+                    builder.query.clear();
+                    builder.selected = 0;
+                } else if remove_row
+                    && builder.selected == usize::from(continue_row).saturating_add(indices.len())
+                {
+                    if let Some(removed) = builder.members.pop() {
+                        state.notice = Some((
+                            format!("removed {} from the draft council", removed.model),
+                            state.tick + 25,
+                        ));
+                    }
+                    builder.selected = 0;
+                } else if builder.members.len() < 8 {
+                    let row = builder.selected.saturating_sub(usize::from(continue_row));
+                    if let Some(card) = indices.get(row).and_then(|idx| state.models.get(*idx)) {
+                        if let ModelReadiness::Unavailable(reason) = &card.readiness {
+                            state.notice =
+                                Some((format!("model unavailable — {reason}"), state.tick + 40));
+                        } else {
+                            builder.pending_member_model = Some(card.id.0.clone());
+                            builder.role.clear();
+                            builder.step = CouncilBuilderStep::MemberRole;
+                        }
+                    }
+                }
+                state.overlay = Overlay::CouncilBuilder(builder);
+            }
+            CouncilBuilderStep::MemberRole => {
+                let role = builder.role.trim();
+                let role = if role.is_empty() { "member" } else { role };
+                if role.len() > 80 || role.chars().any(char::is_control) {
+                    state.notice = Some((
+                        "member role must be at most 80 safe characters".to_owned(),
+                        state.tick + 40,
+                    ));
+                } else if let Some(model) = builder.pending_member_model.take() {
+                    builder.members.push(CouncilMemberDraft {
+                        model,
+                        role: role.to_owned(),
+                    });
+                    builder.role.clear();
+                    builder.query.clear();
+                    builder.selected = 0;
+                    builder.step = CouncilBuilderStep::MemberModel;
+                }
+                state.overlay = Overlay::CouncilBuilder(builder);
+            }
+            CouncilBuilderStep::Chair => {
+                let indices = filter_models(&state.models, &builder.query);
+                if let Some(card) = indices
+                    .get(builder.selected)
+                    .and_then(|idx| state.models.get(*idx))
+                {
+                    if let ModelReadiness::Unavailable(reason) = &card.readiness {
+                        state.notice = Some((
+                            format!("chair model unavailable — {reason}"),
+                            state.tick + 40,
+                        ));
+                    } else {
+                        builder.chair = Some(card.id.0.clone());
+                        builder.query.clear();
+                        builder.selected = usize::from(builder.rounds.saturating_sub(1));
+                        builder.step = CouncilBuilderStep::Rounds;
+                    }
+                }
+                state.overlay = Overlay::CouncilBuilder(builder);
+            }
+            CouncilBuilderStep::Rounds => {
+                builder.rounds = u8::try_from(builder.selected + 1).unwrap_or(3).clamp(1, 3);
+                builder.step = CouncilBuilderStep::Review;
+                state.overlay = Overlay::CouncilBuilder(builder);
+            }
+            CouncilBuilderStep::Review => {
+                let Some(chair) = builder.chair.clone() else {
+                    state.notice = Some(("select a chair model".to_owned(), state.tick + 30));
+                    builder.step = CouncilBuilderStep::Chair;
+                    state.overlay = Overlay::CouncilBuilder(builder);
+                    return;
+                };
+                if !(2..=8).contains(&builder.members.len()) {
+                    state.notice = Some(("select 2–8 council members".to_owned(), state.tick + 30));
+                    builder.step = CouncilBuilderStep::MemberModel;
+                    state.overlay = Overlay::CouncilBuilder(builder);
+                    return;
+                }
+                let member_count = builder.members.len();
+                state.outbox.push(Intent::CreateCouncil {
+                    name: builder.name.clone(),
+                    description: builder.description.clone(),
+                    members: builder
+                        .members
+                        .iter()
+                        .map(|member| (member.model.clone(), member.role.clone()))
+                        .collect(),
+                    chair,
+                    rounds: builder.rounds,
+                });
+                state.notice = Some((
+                    format!(
+                        "creating council `{}` with {member_count} members…",
+                        builder.name
+                    ),
+                    state.tick + 50,
+                ));
+                // Keep the reviewed draft visible until the host confirms the
+                // private atomic write. A filesystem/duplicate-name failure is
+                // therefore correctable without re-entering every member.
+                state.overlay = Overlay::CouncilBuilder(builder);
+            }
+        },
         // Enter stages the focused model on `pending_model` and emits a status
         // notice. `pending_model` now PINS the model for the run(s) the operator
         // starts (STEP MP2 wired it through `Intent::StartRun` → the `StartRun`
@@ -3062,11 +3325,7 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
             };
         }
         PaletteCommand::Council => {
-            state.notice = Some((
-                "Use `codypendent council create --help`, then `codypendent council run`"
-                    .to_owned(),
-                state.tick + 60,
-            ));
+            state.overlay = Overlay::CouncilBuilder(CouncilBuilderState::default());
         }
         PaletteCommand::ToggleLayout => {
             state.layout = state.layout.toggled();
@@ -6200,6 +6459,170 @@ mod tests {
             reduce(s, Action::InputChar(c));
         }
         reduce(s, Action::InputSubmit);
+    }
+
+    fn open_council_builder(s: &mut AppState) {
+        reduce(s, Action::OpenPalette);
+        for c in "council".chars() {
+            reduce(s, Action::InputChar(c));
+        }
+        reduce(s, Action::InputSubmit);
+    }
+
+    #[test]
+    fn council_builder_creates_a_typed_multi_model_intent() {
+        let mut s = AppState::new();
+        s.models = vec![
+            model_card("claude-reviewer", "acp"),
+            model_card("kimi-architect", "acp"),
+            model_card("amp-chair", "acp"),
+        ];
+        open_council_builder(&mut s);
+        assert!(matches!(
+            s.overlay,
+            Overlay::CouncilBuilder(CouncilBuilderState {
+                step: CouncilBuilderStep::Name,
+                ..
+            })
+        ));
+
+        for c in "design-council".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit); // name -> description
+        for c in "Challenge an architecture from independent perspectives".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit); // description -> first member
+
+        reduce(&mut s, Action::InputSubmit); // claude model -> role
+        for c in "security reviewer".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit); // add claude
+        reduce(&mut s, Action::InputSubmit); // kimi model -> role
+        for c in "systems architect".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit); // add kimi
+
+        // With two members the first row is the explicit Continue action.
+        reduce(&mut s, Action::InputSubmit); // members -> chair
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::InputSubmit); // amp chair -> rounds
+        reduce(&mut s, Action::SelectNext); // two rounds
+        reduce(&mut s, Action::InputSubmit); // rounds -> review
+        reduce(&mut s, Action::InputSubmit); // create
+
+        let intents = s.drain_outbox();
+        assert_eq!(
+            intents,
+            vec![Intent::CreateCouncil {
+                name: "design-council".to_owned(),
+                description: "Challenge an architecture from independent perspectives".to_owned(),
+                members: vec![
+                    ("claude-reviewer".to_owned(), "security reviewer".to_owned()),
+                    ("kimi-architect".to_owned(), "systems architect".to_owned()),
+                ],
+                chair: "amp-chair".to_owned(),
+                rounds: 2,
+            }]
+        );
+        assert!(matches!(
+            s.overlay,
+            Overlay::CouncilBuilder(CouncilBuilderState {
+                step: CouncilBuilderStep::Review,
+                ..
+            })
+        ));
+        reduce(
+            &mut s,
+            Action::CouncilCreated {
+                name: "design-council".to_owned(),
+                members: 2,
+                rounds: 2,
+            },
+        );
+        assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn council_persistence_failure_keeps_the_reviewed_draft_open() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::CouncilBuilder(CouncilBuilderState {
+            step: CouncilBuilderStep::Review,
+            name: "existing".to_owned(),
+            description: String::new(),
+            members: vec![
+                CouncilMemberDraft {
+                    model: "claude".to_owned(),
+                    role: "reviewer".to_owned(),
+                },
+                CouncilMemberDraft {
+                    model: "kimi".to_owned(),
+                    role: "architect".to_owned(),
+                },
+            ],
+            chair: Some("amp".to_owned()),
+            rounds: 1,
+            query: String::new(),
+            selected: 0,
+            pending_member_model: None,
+            role: String::new(),
+        });
+        reduce(
+            &mut s,
+            Action::CouncilCreateFailed {
+                name: "existing".to_owned(),
+                error: "already exists".to_owned(),
+            },
+        );
+        assert!(matches!(
+            s.overlay,
+            Overlay::CouncilBuilder(CouncilBuilderState {
+                step: CouncilBuilderStep::Review,
+                ..
+            })
+        ));
+        assert!(s
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("already exists")));
+    }
+
+    #[test]
+    fn council_builder_requires_two_profiles_and_supports_back_navigation() {
+        let mut s = AppState::new();
+        s.models = vec![model_card("only-model", "acp")];
+        open_council_builder(&mut s);
+        for c in "small".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        reduce(&mut s, Action::InputSubmit);
+        assert!(matches!(
+            s.overlay,
+            Overlay::CouncilBuilder(CouncilBuilderState {
+                step: CouncilBuilderStep::Description,
+                ..
+            })
+        ));
+        assert!(s
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("at least two")));
+
+        reduce(&mut s, Action::InputCancel);
+        assert!(matches!(
+            s.overlay,
+            Overlay::CouncilBuilder(CouncilBuilderState {
+                step: CouncilBuilderStep::Name,
+                ..
+            })
+        ));
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.overlay, Overlay::None);
     }
 
     #[test]
