@@ -44,6 +44,12 @@
   "BudgetDimension_WallClock": {
     "type": "WallClock"
   },
+  "ProposedAction_AcpToolCall": {
+    "agent": "claude-acp",
+    "details": "{\"path\":\"src/lib.rs\"}",
+    "title": "write file",
+    "type": "AcpToolCall"
+  },
   "ProposedAction_BlackboardPost": {
     "kind": "finding",
     "type": "BlackboardPost",

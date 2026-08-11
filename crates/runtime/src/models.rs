@@ -64,15 +64,14 @@ pub struct ModelConfig {
     /// The [`ModelId`] this profile is selected by (from a [`ModelPolicy`]
     /// candidate list, or directly).
     pub id: ModelId,
-    /// The wire protocol adapter to use. Phase 1 supports exactly one value:
-    /// `"openai-compatible"` (any OpenAI Chat Completions-wire endpoint —
-    /// OpenAI itself, Azure OpenAI, Ollama, together.ai, ...).
+    /// The runtime adapter: `"openai-compatible"` for chat-completions models,
+    /// or `"acp"` for an external agent from the official ACP registry. ACP
+    /// agents own their model and tool loop; [`Self::model`] is their registry id.
     pub provider: String,
-    /// The OpenAI-compatible base URL, e.g. `https://api.openai.com/v1` or
-    /// `http://localhost:11434/v1`.
+    /// The OpenAI-compatible base URL. Empty for ACP profiles.
+    #[serde(default)]
     pub base_url: String,
-    /// The provider-side model name sent in each request, e.g.
-    /// `gpt-5.1-codex` or `qwen2.5-coder:14b`.
+    /// Provider-side model name, or the pinned ACP `agent-id@version` coordinate.
     pub model: String,
     /// The NAME of the environment variable holding the API key, read at
     /// call time. Empty string means no key is needed (e.g. a local Ollama
@@ -144,10 +143,9 @@ pub enum ModelsError {
     #[error("model `{0}` is not registered")]
     UnknownModel(ModelId),
 
-    /// A model's `provider` field named something other than
-    /// `"openai-compatible"` — the only provider Phase 1 supports.
+    /// A model's `provider` field names no installed runtime adapter.
     #[error(
-        "model `{model}` uses unsupported provider `{provider}` (Phase 1 supports only \"openai-compatible\")"
+        "model `{model}` uses unsupported provider `{provider}` (supported: \"openai-compatible\", \"acp\")"
     )]
     UnsupportedProvider { model: ModelId, provider: String },
 
@@ -248,15 +246,38 @@ impl ModelRegistry {
     pub fn ids(&self) -> impl Iterator<Item = &ModelId> {
         self.configs.keys()
     }
+
+    /// Whether this profile delegates the run to an ACP agent.
+    #[must_use]
+    pub fn is_acp(&self, id: &ModelId) -> bool {
+        self.get(id).is_some_and(|config| config.provider == "acp")
+    }
+
+    /// The official registry id for an ACP profile.
+    #[must_use]
+    pub fn acp_agent_id(&self, id: &ModelId) -> Option<&str> {
+        self.get(id)
+            .filter(|config| config.provider == "acp")
+            .map(|config| config.model.as_str())
+    }
 }
 
-/// Map a legacy [`ModelConfig`] onto the new provider abstraction: today's only
-/// supported `provider = "openai-compatible"` becomes `(OpenAiChat, ApiKey|None)`.
-/// An empty `api_key_env` means no key (local endpoints) → `AuthMethod::None`.
-/// This is the backward-compatible bridge that lets every existing
-/// `models.toml` keep resolving through the generalized [`ModelRegistry::client_for`].
+/// Map a persisted [`ModelConfig`] onto the provider abstraction. Chat profiles
+/// become `(OpenAiChat, ApiKey|None)`; ACP profiles are marked so the assembly
+/// executor can route them to the full-agent runtime instead of a chat client.
+/// This remains the backward-compatible bridge for existing `models.toml` files.
 #[cfg(feature = "provider-openai")]
 fn config_to_protocol_auth(cfg: &ModelConfig) -> Result<(Protocol, AuthMethod)> {
+    if cfg.provider == "acp" {
+        return Ok((
+            Protocol::Acp,
+            AuthMethod::Acp {
+                command: String::new(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+        ));
+    }
     if cfg.provider != "openai-compatible" {
         return Err(ModelsError::UnsupportedProvider {
             model: cfg.id.clone(),
@@ -310,6 +331,19 @@ impl ModelRegistry {
         let cfg = self
             .get(id)
             .ok_or_else(|| ModelsError::UnknownModel(id.clone()))?;
+        if cfg.provider == "acp" {
+            if cfg.model.trim().is_empty() {
+                return Err(ModelsError::ModelUnavailable {
+                    model: id.clone(),
+                    provider_model: cfg.model.clone(),
+                    reason: "ACP registry id is blank".to_string(),
+                });
+            }
+            // The assembly executor performs the real cached-registry,
+            // executable, and ACP-handshake readiness check because it owns the
+            // RuntimePaths needed to resolve the installed agent.
+            return Ok(());
+        }
         let (protocol, _) = config_to_protocol_auth(cfg)?;
         if !matches!(protocol, Protocol::OpenAiChat) {
             return Err(ModelsError::ProtocolNotWired {
@@ -419,6 +453,10 @@ impl ModelRegistry {
                     .with_base_url(cfg.base_url.clone());
                 Ok(Arc::new(client))
             }
+            Protocol::Acp => Err(ModelsError::ProtocolNotWired {
+                model: id.clone(),
+                protocol: "acp (full-agent executor, not ChatClient)".to_string(),
+            }),
             other => Err(ModelsError::ProtocolNotWired {
                 model: id.clone(),
                 protocol: format!("{other:?}"),
@@ -707,6 +745,47 @@ api_key_env = ""
         assert!(registry.get(&model_id("hosted-default")).is_some());
         assert!(registry.get(&model_id("local-default")).is_some());
         assert_eq!(registry.ids().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn acp_profile_is_selectable_but_not_exposed_as_a_chat_client() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("models.toml");
+        std::fs::write(
+            &path,
+            r#"[[model]]
+id = "acp/codex-acp"
+provider = "acp"
+model = "codex-acp"
+"#,
+        )
+        .expect("write minimal ACP config");
+        let parsed = load_models(&path).expect("ACP does not need base_url/api_key_env");
+        assert_eq!(parsed[0].base_url, "");
+        assert_eq!(parsed[0].api_key_env, "");
+
+        let config = ModelConfig {
+            id: model_id("acp/codex-acp"),
+            provider: "acp".to_string(),
+            base_url: String::new(),
+            model: "codex-acp".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+        };
+        let registry = ModelRegistry::new(vec![config]);
+        assert!(registry.is_acp(&model_id("acp/codex-acp")));
+        assert_eq!(
+            registry.acp_agent_id(&model_id("acp/codex-acp")),
+            Some("codex-acp")
+        );
+        registry
+            .check_model(&model_id("acp/codex-acp"))
+            .await
+            .expect("assembly executor owns ACP readiness");
+        assert!(matches!(
+            registry.client_for(&model_id("acp/codex-acp")).await,
+            Err(ModelsError::ProtocolNotWired { .. })
+        ));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Codypendent CLI & TUI User Guide
 
 > **Product:** Codypendent — The local-first agentic developer environment
-> **Version:** 0.3.0
+> **Version:** 0.3.1
 > **Documentation Target:** CLI reference, Ratatui TUI shortcuts, environment setup, and workflow operations.
 
 ---
@@ -263,7 +263,7 @@ codypendent promote approve <CANDIDATE_ID> # Requires human operator approval
 codypendent promote rollback <CANDIDATE_ID> # Roll back to predecessor version
 ```
 
-### 4.6 IDE Integration & Handoff (`codypendent open` / `acp`)
+### 4.6 IDE Integration, ACP Agents & Handoff (`codypendent open` / `acp`)
 
 ```bash
 # Open an ongoing TUI session inside VS Code, Cursor, or Zed
@@ -271,9 +271,105 @@ codypendent open <SESSION_ID> --in vscode
 codypendent open <SESSION_ID> --in cursor
 codypendent open <SESSION_ID> --in zed
 
-# Serve Zed ACP (Agent Communication Protocol) over stdio (used by editor settings)
+# Discover all agents in the curated official ACP registry
+codypendent acp list --refresh
+
+# Install, handshake, and add Claude Code or Codex to the model picker
+codypendent acp connect claude-acp
+codypendent acp connect codex-acp
+# Friendly product names are accepted too:
+codypendent acp connect claude-code
+codypendent acp connect codex
+
+# Other registry agents work through the same flow (Gemini, OpenCode, Goose,
+# GitHub Copilot CLI, Cursor, Cline, Qwen Code, and the complete registry)
+codypendent acp connect gemini
+codypendent acp connect kimi-code
+codypendent acp connect amp
+codypendent acp connect vibe-chat       # official id: mistral-vibe
+codypendent acp status
+
+# Send a real session/prompt compatibility check; every tool request is denied
+codypendent acp probe codex
+
+# Remove a selectable profile without deleting the shared download cache
+codypendent acp disconnect acp/codex-acp
+
+# Serve Codypendent itself as an ACP (Agent Client Protocol) agent for Zed
 codypendent acp --repo /path/to/repo
+# Equivalent explicit spelling:
+codypendent acp serve --repo /path/to/repo
 ```
+
+The registry is discovered from ACP's curated v1 endpoint on first use, cached
+under the Codypendent data directory, and refreshed automatically after 24
+hours (with a validated stale-cache fallback when offline). NPM and Python
+distributions are launched at the exact version in the registry. Platform
+archives are installed only on an
+explicit `install`/`connect`, are SHA-256 verified when the registry supplies a
+digest, and are extracted with traversal, link, duplicate-path, entry-count,
+and size limits. An entry without a digest requires the explicit
+`--allow-unverified` acknowledgement.
+
+Known native ACP servers are also detected without replacing the curated
+catalog. In particular, `~/.kimi-code/bin/kimi` (or a `kimi` on `PATH`) appears
+as `kimi-code`, launches `kimi acp`, shares the credentials created by
+`kimi login`, and pins the executable's bounded `--version` result. The older
+official `kimi` registry entry remains separately addressable as `kimi-cli`.
+
+Discovery tracks the latest catalogue, but connecting snapshots an immutable
+`agent-id@version` coordinate into the model profile. A daily registry refresh
+can reveal a newer client without silently upgrading an agent used by an
+existing run; reconnect explicitly when you want to adopt the new version.
+
+Each agent keeps its own normal authentication flow. Sign in to Claude Code,
+Codex, Kimi, Amp, Mistral Vibe, or the relevant vendor CLI as required; the ACP
+handshake verifies protocol compatibility but does not copy or persist vendor
+credentials in Codypendent.
+
+ACP profiles appear in `/model` alongside native model endpoints. During a run,
+the external agent owns its model and tool loop; Codypendent still owns the
+worktree allocation, durable transcript, approval UI, cancellation, diff
+review, chronicle, and terminal state. Build-mode runs receive an isolated
+worktree; read-only modes use the selected repository without granting
+Codypendent write authority. The process remains a trusted local vendor
+executable with the normal OS authority of your user account. ACP permission
+requests are therefore resolved through the same host-owned approval queue as
+native tools, but that cooperative protocol boundary is not an OS sandbox.
+
+### 4.6.1 Multi-provider agent councils
+
+Councils let native models and connected ACP agents deliberate together. A
+definition contains 2-8 distinct configured model profiles, a role for each,
+one configured chair profile, and 1-3 rounds. Round one produces independent
+reports in parallel. Later rounds receive the bounded, attributed prior dossier
+and are explicitly asked to challenge it. The chair then reconciles evidence,
+uncertainty, and dissent into the final answer.
+
+```bash
+# MODEL=ROLE; repeat --member for every participant.
+codypendent council create release-board \
+  --member acp/claude-acp=maintainer \
+  --member acp/codex-acp=security-critic \
+  --member acp/kimi-code=researcher \
+  --chair acp/amp-acp \
+  --rounds 2 \
+  --description "Independent release review"
+
+codypendent council list
+codypendent council show release-board
+codypendent council run release-board \
+  --objective "Should this change ship, and what must be fixed first?"
+codypendent council run release-board --objective "..." --json
+codypendent council remove release-board
+```
+
+Council runs use `Ask` policy, tell members not to invoke tools or modify files,
+and require at least two successful member reports in every round. Each member
+and the chair receives its own durable session/run, with the selected profile
+pinned explicitly. A failed participant is reported; a surviving quorum may
+continue. Responses, dossiers, concurrency, rounds, and time are bounded.
+`councils.toml` is written atomically with user-only permissions.
 
 ### 4.7 Knowledge Index Maintenance (`codypendent index`)
 

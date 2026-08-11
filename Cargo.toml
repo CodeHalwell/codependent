@@ -25,7 +25,7 @@ members = [
 exclude = ["benches/crdt-bench"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 # 1.88 is the effective MSRV: the `agent-client-protocol` dep (ACP client) is
 # edition-2024 / requires Rust 1.88. The pinned toolchain (rust-toolchain.toml)
@@ -70,7 +70,9 @@ hex = "0.4"
 # Deterministic `.cody-ui.tgz` packages are re-opened by the trusted UI host at
 # launch so the extracted tree can be matched to the artifact that was signed.
 flate2 = "1"
+bzip2 = "0.5"
 tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Plugin signature verification (Phase 6, STEP 6.1). `ed25519-dalek` verifies a
 # publisher signature over the canonical `codypendent-plugin-signature-v1` digest
@@ -85,7 +87,7 @@ base64 = "0.22"
 # GitHub & IDE integrations (Phase 3). `reqwest` is the typed GitHub client's
 # HTTP transport (rustls, no system OpenSSL); `hmac` verifies webhook
 # `X-Hub-Signature-256`. `wiremock` (dev) is the mock GitHub server.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 hmac = "0.12"
 wiremock = "0.6"
 

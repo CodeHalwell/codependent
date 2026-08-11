@@ -6,9 +6,11 @@
 //! `codypendent` binary itself.
 
 pub mod acp;
+pub mod acp_clients;
 pub mod client;
 pub mod commands;
 pub mod connection;
+pub mod council;
 pub mod doctor;
 pub mod eval;
 pub mod restart;

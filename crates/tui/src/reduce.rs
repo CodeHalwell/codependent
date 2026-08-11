@@ -2562,11 +2562,18 @@ fn submit_prompt(state: &mut AppState) {
             if let Some(&idx) = filter_providers(&state.providers, &query).get(selected) {
                 if let Some(card) = state.providers.get(idx) {
                     let provider_id = card.id.clone();
+                    let protocol = card.protocol.clone();
                     let requires_key = card.requires_key;
                     let can_list_models = card.can_list_models;
                     let available = card.available;
                     if available {
-                        enter_add_model_flow(state, provider_id, requires_key, can_list_models);
+                        enter_add_model_flow(
+                            state,
+                            provider_id,
+                            protocol,
+                            requires_key,
+                            can_list_models,
+                        );
                     } else {
                         state.notice = Some((
                             format!(
@@ -2837,9 +2844,22 @@ fn valid_publish_path(path: &str) -> bool {
 fn enter_add_model_flow(
     state: &mut AppState,
     provider_id: String,
+    protocol: String,
     requires_key: bool,
     can_list_models: bool,
 ) {
+    if protocol == "acp" {
+        let display_id = format!("acp/{provider_id}");
+        state.outbox.push(Intent::AddModel {
+            display_id: display_id.clone(),
+            model: provider_id.clone(),
+            provider_id,
+            api_key: None,
+        });
+        state.notice = Some((format!("connecting {display_id}"), state.tick + 25));
+        state.overlay = Overlay::None;
+        return;
+    }
     state.overlay = if can_list_models && requires_key {
         Overlay::AddModelProviderKey {
             provider_id,
@@ -2895,7 +2915,7 @@ fn begin_add_model(state: &mut AppState) {
         ));
         return;
     }
-    enter_add_model_flow(state, provider_id, requires_key, can_list_models);
+    enter_add_model_flow(state, provider_id, protocol, requires_key, can_list_models);
 }
 
 /// Fold a fetched provider model list into the in-flight query overlay
@@ -3040,6 +3060,13 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
                 query: String::new(),
                 selected: 0,
             };
+        }
+        PaletteCommand::Council => {
+            state.notice = Some((
+                "Use `codypendent council create --help`, then `codypendent council run`"
+                    .to_owned(),
+                state.tick + 60,
+            ));
         }
         PaletteCommand::ToggleLayout => {
             state.layout = state.layout.toggled();
@@ -7051,6 +7078,33 @@ mod tests {
         reduce(&mut s, Action::BeginAddModel);
         assert!(matches!(s.overlay, Overlay::ProviderPicker { .. }));
         assert!(s.outbox.is_empty());
+    }
+
+    #[test]
+    fn available_acp_provider_connects_without_asking_for_a_model_or_key() {
+        let mut s = AppState::new();
+        s.providers = vec![provider_card(
+            "mistral-vibe",
+            "Mistral Vibe",
+            "acp",
+            "acp: binary",
+            false,
+        )];
+        // The shared helper derives runtime availability for native chat
+        // providers; this fixture represents the CLI's verified ACP install.
+        s.providers[0].available = true;
+        open_provider_picker(&mut s);
+        reduce(&mut s, Action::BeginAddModel);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::AddModel {
+                display_id: "acp/mistral-vibe".to_string(),
+                provider_id: "mistral-vibe".to_string(),
+                model: "mistral-vibe".to_string(),
+                api_key: None,
+            }]
+        );
+        assert!(matches!(s.overlay, Overlay::None));
     }
 
     #[test]

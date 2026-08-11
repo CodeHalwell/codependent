@@ -25,7 +25,10 @@ pub struct ProtocolVersion {
 /// payload variants — additive again (old peers never emit them, and a client
 /// only sends `ShutdownIfIdle` to a daemon whose negotiated minor is ≥ 3), so
 /// `major` stays `1` and `minor` advances to `3`.
-pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
+///
+/// External ACP agents add the `ProposedAction::AcpToolCall` approval payload.
+/// It is additive, so `major` remains `1` and `minor` advances to `4`.
+pub const PROTOCOL_V1: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
 
 impl ProtocolVersion {
     /// Two versions are compatible when their major versions match.

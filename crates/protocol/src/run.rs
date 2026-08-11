@@ -186,6 +186,18 @@ pub enum ProposedAction {
         /// a `Value`, so the enum stays `Eq` and the digest is stable).
         args: String,
     },
+    /// A permission request made by an external ACP agent. The agent owns its
+    /// tool implementation, so Codypendent cannot truthfully coerce the call
+    /// into one of its native command/filesystem variants. `details` is bounded,
+    /// canonical JSON suitable for the approval card and stable action digest.
+    AcpToolCall {
+        /// Official registry id of the connected agent.
+        agent: String,
+        /// Human-readable tool/call title reported by ACP.
+        title: String,
+        /// Canonical, bounded ACP tool-call description.
+        details: String,
+    },
     /// Record a memory proposal note (the `memory.remember` core tool, smarter-memory
     /// M2). Appends a `NoteAppended` to the run's own ledger — no filesystem, command,
     /// network, or remote effect. Always policy-`Allow`ed (see the daemon policy
@@ -316,6 +328,11 @@ mod tests {
         round_trip(ProposedAction::GitHubMutation {
             repository: "octocat/hello-world".to_string(),
             summary: "create draft PR on octocat/hello-world".to_string(),
+        });
+        round_trip(ProposedAction::AcpToolCall {
+            agent: "claude-acp".to_string(),
+            title: "write file".to_string(),
+            details: "{\"path\":\"src/lib.rs\"}".to_string(),
         });
         round_trip(ProposedAction::PublishDocument {
             document_id: DocumentId::new(),

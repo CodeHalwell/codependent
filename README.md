@@ -190,6 +190,57 @@ Rehydrate from artifact links when compacted context becomes relevant.
 
 Treat local models as first-class providers (Ollama, vLLM, llama.cpp server, OpenAI-compatible local/LAN services, managed subprocess models) with measured profiles and policy-aware routing.
 
+## External ACP Agents
+
+Codypendent discovers the official Agent Client Protocol registry automatically,
+plus known native ACP clients already installed locally (currently Kimi Code),
+and can run any compatible agent as a first-class session runtime. Claude Code,
+Codex, Gemini, Kimi Code, Amp, Mistral Vibe, OpenCode, and the rest of the live
+catalog appear in the TUI provider picker.
+
+```bash
+codypendent acp list
+codypendent acp connect claude-code
+codypendent acp connect codex
+codypendent acp connect kimi-code
+codypendent acp connect amp
+codypendent acp connect vibe-chat
+```
+
+Registry packages are version-pinned; binary downloads are checksum-verified
+when the registry supplies a digest. ACP tool permissions still use
+Codypendent's durable approval UI, cancellation, and diff review. Build-mode
+runs start in an isolated worktree; read-only modes use the selected repository
+without granting Codypendent write authority. The connected agent is still a
+trusted local vendor executable with the normal OS authority of your user
+account; ACP permission requests are a cooperative protocol boundary, not an
+OS sandbox.
+
+### Agent councils
+
+Persist a council from any configured mix of native model and ACP profiles,
+give each member a role, and choose a separate chair. Members deliberate in
+parallel in independent durable read-only sessions; optional later rounds
+critique the prior dossier, then the chair produces an attributed synthesis
+that preserves material dissent.
+
+```bash
+codypendent council create architecture \
+  --member acp/claude-acp=architect \
+  --member acp/codex-acp=adversarial-reviewer \
+  --member acp/kimi-code=researcher \
+  --chair acp/amp-acp \
+  --rounds 2
+
+codypendent council run architecture \
+  --objective "Choose the safest migration plan for this repository"
+```
+
+Council membership is stored in private `councils.toml` configuration. Every
+participant is pinned by its configured model-profile id, responses and the
+chair run remain ordinary durable Codypendent sessions, and `--json` returns
+the full member/session/run attribution for automation.
+
 ## Agentic Setup & Personalization
 
 Setup agent proposes environment configuration from discovered tooling and hardware, but must never silently install executable plugins, broaden permissions, exfiltrate secrets, weaken privacy routing, or alter org policy.

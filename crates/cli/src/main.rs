@@ -170,13 +170,18 @@ enum TopCommand {
         #[command(subcommand)]
         command: McpCommand,
     },
-    /// Expose the daemon as a Zed ACP agent over stdio (STEP 3.6). Zed's
-    /// `agent_servers` config points at this; it is not meant to be run by hand.
+    /// Connect external ACP agents, or expose Codypendent itself as an ACP agent.
     Acp {
-        /// Repository the ACP-driven runs operate in. Defaults to the current
-        /// directory.
+        #[command(subcommand)]
+        command: Option<AcpCommand>,
+        /// Backward-compatible repository for `codypendent acp` (serve mode).
         #[arg(long)]
         repo: Option<PathBuf>,
+    },
+    /// Create and run durable multi-provider agent councils.
+    Council {
+        #[command(subcommand)]
+        command: CouncilCommand,
     },
     /// Hand a session off to an IDE (STEP 3.7): print how to attach, and launch
     /// the editor if it is on `PATH`. The IDE attaches as a contributor to the
@@ -257,6 +262,117 @@ enum McpCommand {
     /// env key names (never values), and the effective policy disposition.
     /// Config-level only — no server is spawned.
     List,
+}
+
+#[derive(Subcommand)]
+enum AcpCommand {
+    /// Refresh the curated official ACP agent registry.
+    Refresh,
+    /// List every agent in the official registry.
+    List {
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download/install a registry agent without adding a model profile.
+    Install {
+        /// Registry id or alias (for example claude-code, codex, kimi-code, amp, vibe-chat).
+        agent: String,
+        #[arg(long)]
+        refresh: bool,
+        /// Permit a curated binary URL whose registry entry has no SHA-256.
+        #[arg(long)]
+        allow_unverified: bool,
+    },
+    /// Install, handshake, and add an ACP agent to the model picker.
+    Connect {
+        /// Registry id or alias (for example claude-code, codex, kimi-code, amp, vibe-chat).
+        agent: String,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        allow_unverified: bool,
+        /// Repository used for the handshake smoke test.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Send one real, tool-denied prompt without saving a model profile.
+    Probe {
+        /// Registry id or alias (for example claude-code, codex, kimi-code, amp, vibe-chat).
+        agent: String,
+        /// Harmless prompt used to verify a live vendor response.
+        #[arg(
+            long,
+            default_value = "Reply with exactly: ACP LIVE OK. Do not inspect files or use tools."
+        )]
+        prompt: String,
+        #[arg(long)]
+        refresh: bool,
+        #[arg(long)]
+        allow_unverified: bool,
+        /// Repository passed as the ACP session working directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Remove an ACP model profile (downloaded agent bytes remain cached).
+    Disconnect { profile: String },
+    /// Show readiness of configured ACP profiles.
+    Status,
+    /// Expose Codypendent as an ACP agent over stdio for Zed and other clients.
+    Serve {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CouncilCommand {
+    /// Persist a named council assembled from configured model profiles.
+    Create {
+        /// Stable council name (`A-Za-z0-9._-`).
+        name: String,
+        /// Member model and role, repeated: `--member MODEL=ROLE`.
+        #[arg(long, required = true)]
+        member: Vec<String>,
+        /// Configured model profile that synthesizes the council result.
+        #[arg(long)]
+        chair: String,
+        /// Deliberation rounds (1-3). Later rounds critique the prior dossier.
+        #[arg(long, default_value_t = 1)]
+        rounds: u8,
+        /// Human-readable purpose for this council.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// List configured councils.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one council's exact members, roles, chair, and rounds.
+    Show {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a council definition. Its prior durable sessions remain.
+    Remove { name: String },
+    /// Run member deliberation in parallel, then ask the chair to synthesize.
+    Run {
+        name: String,
+        /// Question or decision the council should deliberate.
+        #[arg(long)]
+        objective: String,
+        /// Repository context. Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Emit the complete attributed result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -891,13 +1007,91 @@ async fn main() -> anyhow::Result<()> {
         TopCommand::Mcp {
             command: McpCommand::List,
         } => commands::mcp_list(&paths).await,
-        TopCommand::Acp { repo } => {
-            let repo = match repo {
-                Some(repo) => repo,
-                None => std::env::current_dir()?,
-            };
-            codypendent_cli::acp::serve(&paths, repo).await
-        }
+        TopCommand::Acp { command, repo } => match command {
+            None => {
+                let repo = repo.unwrap_or(std::env::current_dir()?);
+                codypendent_cli::acp::serve(&paths, repo).await
+            }
+            Some(AcpCommand::Serve { repo: serve_repo }) => {
+                let repo = serve_repo.or(repo).unwrap_or(std::env::current_dir()?);
+                codypendent_cli::acp::serve(&paths, repo).await
+            }
+            Some(AcpCommand::Refresh) => codypendent_cli::acp_clients::refresh(&paths).await,
+            Some(AcpCommand::List { refresh, json }) => {
+                codypendent_cli::acp_clients::list(&paths, refresh, json).await
+            }
+            Some(AcpCommand::Install {
+                agent,
+                refresh,
+                allow_unverified,
+            }) => {
+                codypendent_cli::acp_clients::install(&paths, &agent, refresh, allow_unverified)
+                    .await
+            }
+            Some(AcpCommand::Connect {
+                agent,
+                profile,
+                refresh,
+                allow_unverified,
+                repo: connect_repo,
+            }) => {
+                let repository = connect_repo.or(repo).unwrap_or(std::env::current_dir()?);
+                codypendent_cli::acp_clients::connect(
+                    &paths,
+                    &agent,
+                    profile.as_deref(),
+                    refresh,
+                    allow_unverified,
+                    &repository,
+                )
+                .await
+            }
+            Some(AcpCommand::Probe {
+                agent,
+                prompt,
+                refresh,
+                allow_unverified,
+                repo: probe_repo,
+            }) => {
+                let repository = probe_repo.or(repo).unwrap_or(std::env::current_dir()?);
+                codypendent_cli::acp_clients::probe(
+                    &paths,
+                    &agent,
+                    &prompt,
+                    refresh,
+                    allow_unverified,
+                    &repository,
+                )
+                .await
+            }
+            Some(AcpCommand::Disconnect { profile }) => {
+                codypendent_cli::acp_clients::disconnect(&paths, &profile)
+            }
+            Some(AcpCommand::Status) => codypendent_cli::acp_clients::status(&paths).await,
+        },
+        TopCommand::Council { command } => match command {
+            CouncilCommand::Create {
+                name,
+                member,
+                chair,
+                rounds,
+                description,
+            } => codypendent_cli::council::create(&paths, name, member, chair, rounds, description),
+            CouncilCommand::List { json } => codypendent_cli::council::list(&paths, json),
+            CouncilCommand::Show { name, json } => {
+                codypendent_cli::council::show(&paths, &name, json)
+            }
+            CouncilCommand::Remove { name } => codypendent_cli::council::remove(&paths, &name),
+            CouncilCommand::Run {
+                name,
+                objective,
+                repo,
+                json,
+            } => {
+                let repository = repo.unwrap_or(std::env::current_dir()?);
+                codypendent_cli::council::run(&paths, &name, objective, repository, json).await
+            }
+        },
         TopCommand::Open {
             session_id,
             ide,
@@ -975,5 +1169,84 @@ mod tests {
         let help = command.render_long_help().to_string();
         assert!(help.contains("--accessible"));
         assert!(help.contains("--plain"));
+    }
+
+    #[test]
+    fn acp_management_and_legacy_serve_forms_parse() {
+        let connect = Cli::try_parse_from([
+            "codypendent",
+            "acp",
+            "connect",
+            "vibe-chat",
+            "--profile",
+            "agents/vibe",
+        ])
+        .expect("ACP connect must parse");
+        assert!(matches!(
+            connect.command,
+            Some(TopCommand::Acp {
+                command: Some(AcpCommand::Connect { agent, profile, .. }),
+                ..
+            }) if agent == "vibe-chat" && profile.as_deref() == Some("agents/vibe")
+        ));
+
+        let probe = Cli::try_parse_from(["codypendent", "acp", "probe", "kimi-code"])
+            .expect("ACP live probe must parse");
+        assert!(matches!(
+            probe.command,
+            Some(TopCommand::Acp {
+                command: Some(AcpCommand::Probe { agent, .. }),
+                ..
+            }) if agent == "kimi-code"
+        ));
+
+        let legacy = Cli::try_parse_from(["codypendent", "acp", "--repo", "."])
+            .expect("legacy ACP serve must parse");
+        assert!(matches!(
+            legacy.command,
+            Some(TopCommand::Acp { command: None, .. })
+        ));
+    }
+
+    #[test]
+    fn council_create_and_run_forms_parse() {
+        let create = Cli::try_parse_from([
+            "codypendent",
+            "council",
+            "create",
+            "design-board",
+            "--member",
+            "acp/claude=architect",
+            "--member",
+            "acp/codex=critic",
+            "--chair",
+            "acp/amp",
+            "--rounds",
+            "2",
+        ])
+        .expect("council create must parse");
+        assert!(matches!(
+            create.command,
+            Some(TopCommand::Council {
+                command: CouncilCommand::Create { rounds: 2, .. }
+            })
+        ));
+
+        let run = Cli::try_parse_from([
+            "codypendent",
+            "council",
+            "run",
+            "design-board",
+            "--objective",
+            "Choose an architecture",
+            "--json",
+        ])
+        .expect("council run must parse");
+        assert!(matches!(
+            run.command,
+            Some(TopCommand::Council {
+                command: CouncilCommand::Run { json: true, .. }
+            })
+        ));
     }
 }
