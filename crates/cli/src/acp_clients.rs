@@ -332,6 +332,7 @@ fn upsert_profile(paths: &RuntimePaths, profile: &str, agent: &str) -> anyhow::R
         model: agent.to_string(),
         api_key_env: String::new(),
         context_tokens: None,
+        provider_id: None,
     });
     write_models(&path, &configs)
 }

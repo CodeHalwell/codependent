@@ -2573,6 +2573,7 @@ fn write_add_model(
         model: provider_model,
         api_key_env: String::new(),
         context_tokens: None,
+        provider_id: None,
     });
 
     // Serialize back to `[[model]]` tables and write atomically.
@@ -4995,6 +4996,7 @@ mod tests {
             model: "gpt-5.1-codex".to_owned(),
             api_key_env: "OPENAI_API_KEY".to_owned(),
             context_tokens: None,
+            provider_id: None,
         };
         // Same id, but the profile below is measured against a DIFFERENT
         // endpoint — must not match (proves the lookup keys on the pair, not
@@ -5006,6 +5008,7 @@ mod tests {
             model: "gpt-5.1-codex".to_owned(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         };
         let unprofiled = codypendent_runtime::models::ModelConfig {
             id: ModelId("local-default".into()),
@@ -5014,6 +5017,7 @@ mod tests {
             model: "qwen2.5-coder:14b".to_owned(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         };
 
         let profile = ModelProfile {
