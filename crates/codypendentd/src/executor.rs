@@ -46,7 +46,7 @@ use codypendent_integrations::search::SearchApi;
 use codypendent_integrations::search::TavilyClient;
 use codypendent_knowledge::{
     chronicle_candidates, extract_candidates, ContextAssembler, Curation, ExtractionInput,
-    FactExtractor, MemoryStore, NoopExtractor, Revision, Scope,
+    FactExtractor, GitRevision, MemoryStore, NoopExtractor, Revision, Scope,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
@@ -123,13 +123,19 @@ pub struct RuntimeExecutor {
     startup_repository_root: PathBuf,
     subscriptions: SubscriptionHub,
     approvals: ApprovalBroker,
-    /// Repositories already folded into the code graph this process's lifetime.
-    /// A per-user daemon can serve several checkouts over one socket, so each run
-    /// derives its OWN repository identity from its repository root and the first
-    /// run for a repository warms it here (issue #6 item 1). Seeded with the
-    /// startup repository `main` already scanned, so the primary checkout is never
-    /// re-scanned. `Arc<Mutex<…>>` so every clone shares one set.
-    scanned: Arc<Mutex<HashSet<RepositoryId>>>,
+    /// The revision each repository's code graph was last folded at, this
+    /// process's lifetime. A per-user daemon can serve several checkouts over one
+    /// socket, so each run derives its OWN repository identity from its
+    /// repository root and the first run for a repository warms it here (issue #6
+    /// item 1).
+    ///
+    /// Keyed by revision, not a bare "seen" flag (2026-08-11 review): a
+    /// once-per-boot gate left a long-lived daemon serving a graph from whatever
+    /// the checkout looked like at its first run — a branch switch, pull, or
+    /// commit silently kept the stale map for days. A run whose `HEAD` no longer
+    /// matches the folded revision re-scans; a run at the same revision reuses
+    /// the graph exactly as before. `Arc<Mutex<…>>` so every clone shares one map.
+    scanned: Arc<Mutex<HashMap<RepositoryId, GitRevision>>>,
     /// Live per-run cancellation handles, keyed by `RunId`. `spawn_run` registers
     /// a run's handle before its loop starts and removes it once the loop is
     /// terminal; [`cancel_run`](RunExecutor::cancel_run) fires the matching handle
@@ -219,7 +225,7 @@ impl RuntimeExecutor {
     /// `startup_repository` identifies the daemon's fallback checkout.
     /// `startup_repository_root` is that directory's path — the fallback
     /// repository a workflow run that recorded none is driven against (Phase 5
-    /// T5). The scanned set starts empty because startup no longer blocks on a
+    /// T5). The scanned map starts empty because startup no longer blocks on a
     /// code-graph walk; the first session or run warms a valid Git checkout in
     /// the background.
     pub fn new(
@@ -233,7 +239,7 @@ impl RuntimeExecutor {
         // `ApprovalRequested` raised by the agent loop reaches attached clients
         // live (not only on re-attach catch-up).
         let approvals = ApprovalBroker::new().with_subscriptions(subscriptions.clone());
-        let scanned = HashSet::new();
+        let scanned = HashMap::new();
         // The per-run blackboard fan-out, shared with every workflow agent node so
         // an agent's posts reach the server's subscribers (Phase 5 STEP 5.3).
         let blackboards = BlackboardHub::new();
@@ -423,25 +429,35 @@ impl RuntimeExecutor {
         self
     }
 
-    /// Warm `repository`'s code graph the first time this daemon serves a run for
-    /// it, so [`emit_context`](Self::emit_context) opens with the right repository
-    /// map. The lock is released before the (async) scan — a `std` mutex is never
-    /// held across an await — and only the first caller for a repository scans;
-    /// later runs reuse the graph.
+    /// Warm `repository`'s code graph when this daemon has no fold of its
+    /// CURRENT revision, so [`emit_context`](Self::emit_context) opens with the
+    /// right repository map.
+    ///
+    /// The gate is the checkout's `HEAD`, not a once-per-boot flag: a daemon
+    /// lives for days across branch switches and pulls, and a bare flag pinned
+    /// its repository map to whatever the tree looked like at the first run
+    /// (2026-08-11 review). A run at an already-folded revision still costs
+    /// nothing but the `rev-parse` the run's identity derivation already pays.
+    /// A checkout with no resolvable `HEAD` reports the same `"workdir"`
+    /// placeholder every time, so it scans exactly once, as before.
+    ///
+    /// The lock is released before the (async) scan — a `std` mutex is never held
+    /// across an await.
     async fn ensure_scanned(&self, repository: RepositoryId, root: &Path) {
-        let already_scanned = {
-            let seen = self.scanned.lock().expect("scanned set lock");
-            seen.contains(&repository)
+        let revision = scan::head_revision(root);
+        let folded_current = {
+            let seen = self.scanned.lock().expect("scanned map lock");
+            seen.get(&repository) == Some(&revision)
         };
-        if already_scanned {
+        if folded_current {
             return;
         }
         match scan::scan_repository(&self.pool, repository, root).await {
             Ok(()) => {
                 self.scanned
                     .lock()
-                    .expect("scanned set lock")
-                    .insert(repository);
+                    .expect("scanned map lock")
+                    .insert(repository, revision);
             }
             Err(error) => {
                 warn!(%repository, %error, "code-graph scan failed; a later run will retry");
@@ -2639,6 +2655,98 @@ mod tests {
                     EventBody::NoteAppended { text, .. } if text.starts_with("=== CONTEXT")
                 )
             })
+    }
+
+    /// 2026-08-11 review, "graph staleness": `ensure_scanned` gated on a bare
+    /// per-process "seen" flag, so a daemon that outlived a branch switch or a
+    /// pull kept serving the repository map from its FIRST run forever. The gate
+    /// is now the checkout's revision: a moved `HEAD` re-folds the graph, and a
+    /// run at an already-folded revision still does not re-scan.
+    #[tokio::test]
+    async fn a_moved_head_re_scans_the_code_graph_and_an_unchanged_one_does_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().expect("directories");
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .expect("open db");
+
+        let parent = tempfile::tempdir().expect("repo parent");
+        let repo = init_git_repo(parent.path());
+        std::fs::write(repo.join("alpha.rs"), "pub struct Alpha;\n").expect("write alpha");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "alpha"]);
+
+        let repository = scan::repository_id_for(&repo);
+        let executor = RuntimeExecutor::new(pool.clone(), paths, repository, repo.clone());
+
+        executor.ensure_scanned(repository, &repo).await;
+        let first_revision = scan::head_revision(&repo);
+        assert_eq!(
+            executor
+                .scanned
+                .lock()
+                .expect("scanned map lock")
+                .get(&repository),
+            Some(&first_revision),
+            "the fold is recorded against the revision it was taken at"
+        );
+        let names = |nodes: Vec<codypendent_knowledge::CodeNode>| -> Vec<String> {
+            nodes
+                .into_iter()
+                .map(|node| node.key.qualified_name)
+                .collect()
+        };
+        let after_first = names(
+            codypendent_knowledge::codegraph::nodes(&pool, repository)
+                .await
+                .expect("nodes"),
+        );
+        assert!(
+            after_first.iter().any(|name| name.contains("Alpha")),
+            "the first fold carries the committed symbol: {after_first:?}"
+        );
+
+        // A second run at the SAME revision must not re-scan: clearing the graph
+        // behind the executor's back is only repaired if it re-folds.
+        codypendent_knowledge::codegraph::clear_repository(&pool, repository)
+            .await
+            .expect("clear graph");
+        executor.ensure_scanned(repository, &repo).await;
+        assert!(
+            codypendent_knowledge::codegraph::nodes(&pool, repository)
+                .await
+                .expect("nodes")
+                .is_empty(),
+            "an unchanged HEAD must reuse the fold, not re-scan"
+        );
+
+        // A commit moves HEAD, so the next run re-folds and picks the new symbol up.
+        std::fs::write(repo.join("beta.rs"), "pub struct Beta;\n").expect("write beta");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "beta"]);
+        let second_revision = scan::head_revision(&repo);
+        assert_ne!(first_revision, second_revision, "HEAD moved");
+
+        executor.ensure_scanned(repository, &repo).await;
+        let after_second = names(
+            codypendent_knowledge::codegraph::nodes(&pool, repository)
+                .await
+                .expect("nodes"),
+        );
+        assert!(
+            after_second.iter().any(|name| name.contains("Beta")),
+            "a moved HEAD must re-fold the graph: {after_second:?}"
+        );
+        assert_eq!(
+            executor
+                .scanned
+                .lock()
+                .expect("scanned map lock")
+                .get(&repository),
+            Some(&second_revision),
+            "the recorded revision advances with the fold"
+        );
     }
 
     #[tokio::test]
