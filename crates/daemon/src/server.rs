@@ -3835,6 +3835,7 @@ mod tests {
             text: "x".to_string(),
             mode: AgentMode::Build,
             model: None,
+            envelope: None,
         }));
         // A run-state transition mutates an existing run — it never admits a
         // new one, so it stays allowed even mid-shutdown.

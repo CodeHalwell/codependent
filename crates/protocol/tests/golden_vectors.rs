@@ -269,6 +269,11 @@ fn command_vectors() -> Vec<Vector> {
                 text: "try again".to_string(),
                 mode: AgentMode::Build,
                 model: Some(ModelId("claude-sonnet-5".to_string())),
+                // `envelope: None` is skipped on the wire, so this vector's
+                // committed bytes are IDENTICAL to before the field existed —
+                // the additive-compatibility proof. The `Some` shape lives in
+                // `voice.json` (`voice_vectors`), a NEW vector file.
+                envelope: None,
             },
         ),
         vec_of(
@@ -1777,6 +1782,89 @@ fn input_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------
+// Voice v1 (rubric 8): the audio-input wire shapes, in their OWN vector file so
+// the pre-existing files' committed bytes never change (additive-only rule).
+// ---------------------------------------------------------------------------
+
+fn voice_vectors() -> Vec<Vector> {
+    // The stored-audio ref a `PutArtifact` minted and a voice envelope cites.
+    let audio_ref = ArtifactRef {
+        id: artifact_id(),
+        media_type: "audio/wav".to_string(),
+        byte_length: 64_000,
+        sha256: "4".repeat(64),
+        sensitivity: DataClassification::Confidential,
+    };
+    vec![
+        vec_of(
+            "CommandBody_PutArtifact",
+            CommandBody::PutArtifact {
+                media_type: "audio/wav".to_string(),
+                bytes_base64: "UklGRiQAAABXQVZF".to_string(),
+                sensitivity: DataClassification::Confidential,
+            },
+        ),
+        // The un-transcribed submission a push-to-talk client sends: the daemon
+        // produces the transcript server-side, so the block carries none yet.
+        vec_of(
+            "CommandBody_SubmitUserInput_with_audio_envelope",
+            CommandBody::SubmitUserInput {
+                session_id: session_id(),
+                text: String::new(),
+                mode: AgentMode::Build,
+                model: None,
+                envelope: Some(InputEnvelope {
+                    source: InputSource::Voice,
+                    blocks: vec![InputBlock::Audio(AudioArtifact {
+                        original: audio_ref.clone(),
+                        transcript: None,
+                        duration_ms: Some(4_000),
+                        sample_rate_hz: Some(16_000),
+                    })],
+                    scope: ScopeLevel::Session,
+                    attachments: vec![],
+                }),
+            },
+        ),
+        // The transcribed shape the daemon persists: original + transcript
+        // linked (the original-is-never-replaced invariant on the wire).
+        vec_of(
+            "CommandBody_SubmitUserInput_with_transcribed_envelope",
+            CommandBody::SubmitUserInput {
+                session_id: session_id(),
+                text: "fix the flaky test".to_string(),
+                mode: AgentMode::Build,
+                model: None,
+                envelope: Some(InputEnvelope {
+                    source: InputSource::Voice,
+                    blocks: vec![InputBlock::Audio(AudioArtifact {
+                        original: audio_ref.clone(),
+                        transcript: Some(Transcript {
+                            text: "fix the flaky test".to_string(),
+                            mode: TranscriptionMode::Remote,
+                            model: Some(ModelId("whisper-large-v3-turbo".to_string())),
+                            reviewed: false,
+                            source_audio: artifact_id(),
+                        }),
+                        duration_ms: Some(4_000),
+                        sample_rate_hz: Some(16_000),
+                    })],
+                    scope: ScopeLevel::Session,
+                    attachments: vec![],
+                }),
+            },
+        ),
+        vec_of(
+            "Payload_ArtifactStored",
+            Payload::ArtifactStored {
+                command_id: command_id(),
+                artifact: audio_ref,
+            },
+        ),
+    ]
+}
+
+// ---------------------------------------------------------------------------
 // The single source of truth both the regenerator and the checks iterate.
 // ---------------------------------------------------------------------------
 
@@ -1796,6 +1884,9 @@ fn all_files() -> Vec<(&'static str, Vec<Vector>)> {
         ("workflow.json", workflow_vectors()),
         ("capabilities.json", capabilities_vectors()),
         ("input.json", input_vectors()),
+        // Voice v1 additions live in their own file so every pre-existing
+        // vector file's committed bytes stay untouched (additive-only rule).
+        ("voice.json", voice_vectors()),
     ]
 }
 

@@ -1,0 +1,96 @@
+{
+  "CommandBody_PutArtifact": {
+    "bytes_base64": "UklGRiQAAABXQVZF",
+    "media_type": "audio/wav",
+    "sensitivity": {
+      "type": "Confidential"
+    },
+    "type": "PutArtifact"
+  },
+  "CommandBody_SubmitUserInput_with_audio_envelope": {
+    "envelope": {
+      "blocks": [
+        {
+          "block": "audio",
+          "duration_ms": 4000,
+          "original": {
+            "byte_length": 64000,
+            "id": "80000000-0000-0000-0000-000000000001",
+            "media_type": "audio/wav",
+            "sensitivity": {
+              "type": "Confidential"
+            },
+            "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+          },
+          "sample_rate_hz": 16000
+        }
+      ],
+      "scope": {
+        "type": "session"
+      },
+      "source": {
+        "type": "voice"
+      }
+    },
+    "mode": {
+      "type": "Build"
+    },
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "text": "",
+    "type": "SubmitUserInput"
+  },
+  "CommandBody_SubmitUserInput_with_transcribed_envelope": {
+    "envelope": {
+      "blocks": [
+        {
+          "block": "audio",
+          "duration_ms": 4000,
+          "original": {
+            "byte_length": 64000,
+            "id": "80000000-0000-0000-0000-000000000001",
+            "media_type": "audio/wav",
+            "sensitivity": {
+              "type": "Confidential"
+            },
+            "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+          },
+          "sample_rate_hz": 16000,
+          "transcript": {
+            "mode": {
+              "type": "remote"
+            },
+            "model": "whisper-large-v3-turbo",
+            "reviewed": false,
+            "source_audio": "80000000-0000-0000-0000-000000000001",
+            "text": "fix the flaky test"
+          }
+        }
+      ],
+      "scope": {
+        "type": "session"
+      },
+      "source": {
+        "type": "voice"
+      }
+    },
+    "mode": {
+      "type": "Build"
+    },
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "text": "fix the flaky test",
+    "type": "SubmitUserInput"
+  },
+  "Payload_ArtifactStored": {
+    "artifact": {
+      "byte_length": 64000,
+      "id": "80000000-0000-0000-0000-000000000001",
+      "media_type": "audio/wav",
+      "sensitivity": {
+        "type": "Confidential"
+      },
+      "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "type": "ArtifactStored"
+  }
+}

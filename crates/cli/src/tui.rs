@@ -2344,6 +2344,10 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             text,
             mode,
             model,
+            // The composer path submits plain text; the voice host builds its
+            // audio-envelope submission directly (see `crate::voice`), never
+            // through this intent mapping.
+            envelope: None,
         },
         Intent::ResolveApproval {
             approval_id,
@@ -4860,6 +4864,7 @@ mod tests {
                 text: "also add tests".into(),
                 mode: AgentMode::Build,
                 model: Some(codypendent_protocol::ModelId("pinned-model-x".into())),
+                envelope: None,
             }
         );
         // And an unpinned follow-up carries no model on the wire (inherit).
@@ -4878,6 +4883,7 @@ mod tests {
                 text: "keep going".into(),
                 mode: AgentMode::Build,
                 model: None,
+                envelope: None,
             }
         );
 

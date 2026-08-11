@@ -571,6 +571,7 @@ async fn create_attach_and_two_clients_observe_one_event() {
                     text: "focus on the parser".to_string(),
                     mode: AgentMode::Build,
                     model: None,
+                    envelope: None,
                 },
                 "input-1",
             )),
@@ -715,6 +716,7 @@ async fn a_follow_up_launches_a_new_run_after_a_prior_run() {
             text: "the follow up".to_string(),
             mode: AgentMode::Build,
             model: None,
+            envelope: None,
         },
         "input",
     )
@@ -823,6 +825,7 @@ async fn a_continuation_inherits_the_session_repository_and_pinned_model() {
             text: "the follow up".to_string(),
             mode: AgentMode::Build,
             model: None,
+            envelope: None,
         },
         "cont-input",
     )
@@ -955,6 +958,7 @@ async fn a_mid_conversation_repin_applies_instantly() {
             text: "switch to X".to_string(),
             mode: AgentMode::Build,
             model: Some(repin_x.clone()),
+            envelope: None,
         },
         "repin-input",
     )

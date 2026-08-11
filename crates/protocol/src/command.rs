@@ -7,10 +7,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::DataClassification;
 use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
 use crate::ids::{ApprovalId, CommandId, DocumentId, ModelId, RunId, SessionId, WorkspaceId};
+use crate::input::InputEnvelope;
 use crate::run::{AgentMode, ApprovalDecision, ApprovalScope};
 
 /// An idempotent, optionally revision-guarded request.
@@ -133,6 +135,21 @@ pub enum CommandBody {
         /// resolves the model exactly as before this field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<ModelId>,
+        /// The full multimodal input this submission normalizes (voice v1,
+        /// rubric 8): a typed [`InputEnvelope`] whose blocks may reference
+        /// artifacts previously stored via
+        /// [`PutArtifact`](CommandBody::PutArtifact) — e.g. an
+        /// [`InputBlock::Audio`](crate::input::InputBlock::Audio) carrying a
+        /// recorded voice note. When the envelope carries audio without a
+        /// transcript, the daemon transcribes it (through its transcription
+        /// seam, gated by the [`transcription_allowed`](crate::input::transcription_allowed)
+        /// classification math) and the transcript text becomes the run input;
+        /// the original audio stays linked to its transcript (the
+        /// original-is-never-replaced invariant). Additive
+        /// (`#[serde(default)]`): an older client omits it and `text` alone
+        /// drives the run, exactly as before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        envelope: Option<InputEnvelope>,
     },
     StartRun {
         session_id: SessionId,
@@ -417,6 +434,28 @@ pub enum CommandBody {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         include_superseded: bool,
     },
+    /// Upload client-captured bytes into the daemon's content-addressed
+    /// artifact store (voice v1, rubric 8): the client→daemon half of the
+    /// multimodal input path. `bytes_base64` is base64 because JSON framing
+    /// has no byte-string scalar (the `InstallUiPlugin` precedent) and is
+    /// bounded by the ordinary 16 MiB daemon frame limit — comfortably enough
+    /// for ~1 minute of 16 kHz mono WAV (~2 MB). `sensitivity` classifies the
+    /// stored bytes (captured media should default to
+    /// [`DEFAULT_MEDIA_CLASSIFICATION`](crate::input::DEFAULT_MEDIA_CLASSIFICATION),
+    /// i.e. `Confidential`, so audio never leaves the device by accident);
+    /// classification checks downstream always read the ref returned in
+    /// [`ArtifactStored`](crate::envelope::Payload::ArtifactStored). Handled
+    /// at the connection level (artifacts live outside the session ledger) and
+    /// gated to the [`Controller`](crate::handshake::ClientRole::Controller)
+    /// role — an upload is operator-supplied input, not an observer surface.
+    PutArtifact {
+        /// IANA media type of the bytes, e.g. `audio/wav`.
+        media_type: String,
+        /// The raw bytes, base64-encoded (standard alphabet, with padding).
+        bytes_base64: String,
+        /// The stored occurrence's data classification.
+        sensitivity: DataClassification,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -549,6 +588,7 @@ mod tests {
             text: "switch to the big model".to_string(),
             mode: AgentMode::Build,
             model: Some(ModelId("claude-sonnet-5".to_string())),
+            envelope: None,
         };
         let json = serde_json::to_string(&pinned).expect("serialize");
         assert!(
@@ -565,16 +605,90 @@ mod tests {
             text: "keep going".to_string(),
             mode: AgentMode::Build,
             model: None,
+            envelope: None,
         };
         let json = serde_json::to_string(&unpinned).expect("serialize");
         assert!(
             !json.contains("model"),
             "an absent pinned model is skipped on the wire: {json}"
         );
+        assert!(
+            !json.contains("envelope"),
+            "an absent envelope is skipped on the wire (an older client's exact bytes): {json}"
+        );
         assert_eq!(
             serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
             unpinned,
             "a payload without the key defaults to None (an older client's shape)"
+        );
+    }
+
+    #[test]
+    fn submit_user_input_carries_an_audio_envelope_when_present() {
+        // Voice v1 (rubric 8): a follow-up may normalize its input as a full
+        // InputEnvelope. Here the common voice shape — one Audio block
+        // referencing a stored artifact, no transcript yet (the daemon
+        // produces it) — round-trips exactly, and an older payload without
+        // the key still parses to None (covered by the test above).
+        use crate::artifact::{ArtifactRef, DataClassification};
+        use crate::input::{AudioArtifact, InputBlock, InputSource, ScopeLevel};
+
+        let audio = AudioArtifact {
+            original: ArtifactRef {
+                id: crate::ids::ArtifactId::new(),
+                media_type: "audio/wav".to_string(),
+                byte_length: 64_000,
+                sha256: "b".repeat(64),
+                sensitivity: DataClassification::Confidential,
+            },
+            transcript: None,
+            duration_ms: Some(2_000),
+            sample_rate_hz: Some(16_000),
+        };
+        let body = CommandBody::SubmitUserInput {
+            session_id: SessionId::new(),
+            text: String::new(),
+            mode: AgentMode::Build,
+            model: None,
+            envelope: Some(InputEnvelope {
+                source: crate::input::InputSource::Voice,
+                blocks: vec![InputBlock::Audio(audio)],
+                scope: ScopeLevel::Session,
+                attachments: vec![],
+            }),
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(json.contains("envelope"), "envelope on the wire: {json}");
+        assert_eq!(
+            serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
+            body
+        );
+        // The source survives verbatim (voice capture is attributed as such).
+        let CommandBody::SubmitUserInput {
+            envelope: Some(envelope),
+            ..
+        } = serde_json::from_str::<CommandBody>(&json).expect("deserialize")
+        else {
+            panic!("expected SubmitUserInput with an envelope");
+        };
+        assert_eq!(envelope.source, InputSource::Voice);
+    }
+
+    #[test]
+    fn put_artifact_round_trips_and_classification_is_explicit() {
+        // Voice v1 (rubric 8): the upload command carries its classification
+        // explicitly — nothing downstream may guess it from the bytes.
+        let body = CommandBody::PutArtifact {
+            media_type: "audio/wav".to_string(),
+            bytes_base64: "UklGRg==".to_string(),
+            sensitivity: DataClassification::Confidential,
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(json.contains("audio/wav"));
+        assert!(json.contains("Confidential"));
+        assert_eq!(
+            serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
+            body
         );
     }
 
@@ -597,6 +711,7 @@ mod tests {
             text: "try again".to_string(),
             mode: AgentMode::Build,
             model: Some(ModelId("claude-sonnet-5".to_string())),
+            envelope: None,
         });
         // Also round-trip the unpinned continuation (no mid-conversation switch):
         // the field is absent on the wire and reparses to None.
@@ -605,6 +720,13 @@ mod tests {
             text: "try again".to_string(),
             mode: AgentMode::Build,
             model: None,
+            envelope: None,
+        });
+        // Voice v1 (rubric 8): the upload half of the multimodal input path.
+        round_trip(CommandBody::PutArtifact {
+            media_type: "audio/wav".to_string(),
+            bytes_base64: "UklGRg==".to_string(),
+            sensitivity: DataClassification::Confidential,
         });
         round_trip(CommandBody::StartRun {
             session_id: SessionId::new(),
