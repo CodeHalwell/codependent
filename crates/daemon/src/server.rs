@@ -21,9 +21,10 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    read_envelope, write_envelope, Catchup, ClientId, ClientRole, CommandBody, DaemonStatus,
-    Envelope, FrameError, Payload, ProtocolError, ServerHello, SessionEvent, SessionId,
-    Subscription, BUILD_ID, PROTOCOL_V1,
+    read_envelope, write_envelope, Actor, Catchup, ClientId, ClientRole, Command, CommandBody,
+    CommandId, DaemonStatus, DataClassification, Envelope, EventBody, FrameError, InputBlock,
+    Payload, ProtocolError, ServerHello, SessionEvent, SessionId, Subscription, BUILD_ID,
+    PROTOCOL_V1,
 };
 use codypendent_sandbox::{LifecycleState, UiTarget};
 use sqlx::SqlitePool;
@@ -57,6 +58,7 @@ use crate::remote_ui::{
 use crate::remote_ui_plugins::{system_remote_ui_runtime, RemoteUiPluginStore};
 use crate::remote_ui_workers::{RemoteUiWorkerService, UiWorkerRequest};
 use crate::subscriptions::SubscriptionHub;
+use crate::transcription::Transcriber;
 use crate::workflow_stream::{ReadWorkflowRunRequest, WorkflowHub, WorkflowReader};
 use crate::workflows::{
     CancelWorkflowRequest, PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest,
@@ -165,6 +167,13 @@ pub struct ServerState {
     /// `promotion.transport-unavailable`); the assembly injects a
     /// `codypendent-eval`-backed implementation over the pool.
     pub promotion: Option<Arc<dyn PromotionGateway>>,
+    /// Turns a `SubmitUserInput`'s stored audio into text (voice v1, rubric 8).
+    /// `None` in a lib-only / test embedding (an un-transcribed audio envelope is
+    /// then rejected `voice.transport-unavailable`); the assembly injects an
+    /// implementation over an OpenAI-compatible `/audio/transcriptions` endpoint
+    /// (dependency inversion — see [`crate::transcription`]). The classification
+    /// gate itself lives in the daemon, never in the implementation.
+    pub transcriber: Option<Arc<dyn Transcriber>>,
     /// Serializes run admission against an idle-guarded shutdown
     /// (`Payload::ShutdownIfIdle`), closing the auto-restart TOCTOU window. Every
     /// write-path command apply is held under a `read()` guard; the idle-guarded
@@ -300,6 +309,11 @@ pub async fn run_with_executor_on(
         .as_ref()
         .and_then(|e| e.workflow_hub())
         .unwrap_or_default();
+    // The speech-to-text seam (voice v1, rubric 8), bundled with the executor by
+    // the assembly exactly like the document/workflow seams. Absent, an audio
+    // `InputEnvelope` is refused `voice.transport-unavailable`; plain-text
+    // `SubmitUserInput` is untouched.
+    let transcriber = executor.as_ref().and_then(|e| e.transcriber());
 
     // Drive approval expiry: without a periodic caller, `expires_at` deadlines
     // are dead machinery — an approval with a deadline would simply never
@@ -395,6 +409,7 @@ pub async fn run_with_executor_on(
         blackboard_reader,
         workflows,
         workflow_reader,
+        transcriber,
         run_admission: Arc::new(tokio::sync::RwLock::new(())),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         scanned_repos: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -701,6 +716,199 @@ async fn maybe_scan_repository(state: &Arc<ServerState>, repository: Option<Stri
 fn resolve_run_repository(repository: Option<&str>) -> std::path::PathBuf {
     repository.map(std::path::PathBuf::from).unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Voice v1 (rubric 8): client-uploaded artifacts + the transcription seam.
+// ---------------------------------------------------------------------------
+
+/// Cap on one `PutArtifact` upload's DECODED bytes.
+///
+/// The transport already bounds a frame at
+/// [`MAX_FRAME_BYTES`](codypendent_protocol::MAX_FRAME_BYTES) (16 MiB), which is
+/// ample for the target case — roughly a minute of 16 kHz mono PCM WAV is ~2 MB.
+/// This lower decoded cap leaves headroom for base64's 4/3 expansion plus the
+/// enclosing JSON, so an upload that would not survive framing is refused with a
+/// legible error instead of tearing the connection down. Mirrors the
+/// `InstallUiPlugin` precedent, which bounds its own base64 payload the same way.
+const MAX_PUT_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Store one client-uploaded blob in the content-addressed artifact store and
+/// reply with the minted [`ArtifactRef`](codypendent_protocol::ArtifactRef).
+///
+/// Controller-gated: an upload is operator-supplied *input*, so an Observer (or
+/// a connection that never asserted a role) must not be able to write bytes into
+/// the daemon's store. The classification travels on the command and is recorded
+/// verbatim on the occurrence row — the store never guesses it from the bytes,
+/// and a later occurrence of the same bytes never inherits an earlier row's
+/// (lower) classification.
+async fn handle_put_artifact(
+    state: &Arc<ServerState>,
+    role: ClientRole,
+    command_id: CommandId,
+    media_type: &str,
+    bytes_base64: &str,
+    sensitivity: DataClassification,
+) -> Payload {
+    if role != ClientRole::Controller {
+        return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "artifact.role-denied",
+            "storing an artifact requires the Controller role",
+            false,
+        ));
+    }
+    // Refuse on the ENCODED length first: decoding a hostile payload to learn it
+    // is too big would allocate the very memory the cap exists to bound.
+    if bytes_base64.len() > MAX_PUT_ARTIFACT_BYTES / 3 * 4 + 4 {
+        return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "artifact.too-large",
+            format!("an uploaded artifact may not exceed {MAX_PUT_ARTIFACT_BYTES} bytes"),
+            false,
+        ));
+    }
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(bytes_base64) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "artifact.malformed-base64",
+                format!("uploaded bytes are not valid base64: {error}"),
+                false,
+            ));
+        }
+    };
+    if bytes.len() > MAX_PUT_ARTIFACT_BYTES {
+        return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "artifact.too-large",
+            format!("an uploaded artifact may not exceed {MAX_PUT_ARTIFACT_BYTES} bytes"),
+            false,
+        ));
+    }
+    match state
+        .artifacts
+        .put(
+            &state.pool,
+            media_type,
+            sensitivity,
+            crate::artifacts::Provenance::user_upload(),
+            &bytes,
+        )
+        .await
+    {
+        Ok(artifact) => Payload::ArtifactStored {
+            command_id,
+            artifact,
+        },
+        Err(error) => Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "artifact.store-failed",
+            format!("could not store the uploaded artifact: {error}"),
+            true,
+        )),
+    }
+}
+
+/// What [`resolve_voice_input`] decided about one command.
+#[derive(Default)]
+struct ResolvedVoiceInput {
+    /// The command to apply INSTEAD of the client's, when transcription (or an
+    /// envelope-derived objective) changed it. `None` — the overwhelmingly
+    /// common case — means "apply exactly what the client sent".
+    rewritten: Option<Command>,
+    /// What was transcribed, for the note the server appends after the apply.
+    transcribed: Option<crate::transcription::TranscribedAudio>,
+}
+
+/// Resolve a `SubmitUserInput`'s [`InputEnvelope`](codypendent_protocol::InputEnvelope)
+/// into the text the run will actually execute (voice v1, rubric 8).
+///
+/// Runs BEFORE the write path so the ledger records the transcript as the run's
+/// objective: a run recovered after a crash re-executes text, never silent
+/// audio. Un-transcribed [`InputBlock::Audio`] blocks are sent through the
+/// daemon's [`transcription`](crate::transcription) seam, whose classification
+/// gate refuses off-device transcription of media above the operator's ceiling;
+/// that refusal surfaces to the client as an ordinary `CommandRejected`.
+///
+/// Everything else — every non-`SubmitUserInput` command, and a plain-text
+/// submission with no envelope — returns [`ResolvedVoiceInput::default`] and is
+/// applied byte-for-byte as the client sent it.
+///
+/// A duplicate delivery of a voice submission re-transcribes before the write
+/// path's idempotency check replays the recorded outcome, so the second delivery
+/// pays a redundant transcription. That is deliberate: the alternative (peeking
+/// at the idempotency table from out here) would duplicate the write path's
+/// claim logic for a case that costs one wasted request on an already-rare retry.
+async fn resolve_voice_input(
+    state: &Arc<ServerState>,
+    command: &Command,
+) -> Result<ResolvedVoiceInput, codypendent_protocol::CodypendentError> {
+    let CommandBody::SubmitUserInput {
+        session_id,
+        text,
+        mode,
+        model,
+        envelope: Some(envelope),
+    } = &command.body
+    else {
+        return Ok(ResolvedVoiceInput::default());
+    };
+
+    let untranscribed = envelope
+        .blocks
+        .iter()
+        .any(|block| matches!(block, InputBlock::Audio(audio) if audio.transcript.is_none()));
+    let mut envelope = envelope.clone();
+    let transcribed = if untranscribed {
+        let Some(transcriber) = state.transcriber.as_ref() else {
+            return Err(codypendent_protocol::CodypendentError::new(
+                "voice.transport-unavailable",
+                "this daemon has no transcriber configured; \
+                 add a [transcription] entry to models.toml and restart it",
+                true,
+            ));
+        };
+        crate::transcription::transcribe_envelope(
+            &state.artifacts,
+            &state.pool,
+            transcriber.as_ref(),
+            &mut envelope,
+        )
+        .await?
+    } else {
+        None
+    };
+
+    // The objective: whatever the client typed, else everything the (now
+    // resolved) envelope says. A client that sends BOTH keeps its own text as
+    // the objective — the transcript still rides along on the envelope, linked
+    // to its original audio.
+    let objective = if text.trim().is_empty() {
+        crate::transcription::envelope_text(&envelope)
+    } else {
+        text.clone()
+    };
+    if objective.trim().is_empty() {
+        return Err(codypendent_protocol::CodypendentError::new(
+            "voice.empty-transcript",
+            "the submitted input produced no text to run",
+            false,
+        ));
+    }
+    if transcribed.is_none() && objective == *text {
+        // Nothing changed — leave the client's command exactly as it was.
+        return Ok(ResolvedVoiceInput::default());
+    }
+    Ok(ResolvedVoiceInput {
+        rewritten: Some(Command {
+            body: CommandBody::SubmitUserInput {
+                session_id: *session_id,
+                text: objective,
+                mode: *mode,
+                model: model.clone(),
+                envelope: Some(envelope),
+            },
+            ..command.clone()
+        }),
+        transcribed,
     })
 }
 
@@ -1737,6 +1945,29 @@ async fn handle_request(
                     };
                     send(writer, &reply).await?;
                 }
+                // Uploading client-captured bytes (voice v1, rubric 8) is a
+                // connection-level concern, intercepted here like `AttachSession`:
+                // artifacts live in the content-addressed store OUTSIDE the
+                // session ledger, so there is no session to append to and no
+                // sequence to allocate. The reply carries the minted
+                // `ArtifactRef` because the client needs it back — it is what the
+                // next `SubmitUserInput`'s audio block references.
+                CommandBody::PutArtifact {
+                    media_type,
+                    bytes_base64,
+                    sensitivity,
+                } => {
+                    let reply = handle_put_artifact(
+                        state,
+                        conn.role,
+                        command.command_id,
+                        media_type,
+                        bytes_base64,
+                        *sensitivity,
+                    )
+                    .await;
+                    send(writer, &Envelope::reply_to(&request, reply)).await?;
+                }
                 // Every other command flows through the crash-consistent write
                 // path under the role recorded at attach (role enforcement is
                 // inherited from the pipeline).
@@ -1768,12 +1999,70 @@ async fn handle_request(
                         send(writer, &reply).await?;
                         return Ok(false);
                     }
+                    // Voice v1 (rubric 8): a `SubmitUserInput` carrying an audio
+                    // `InputEnvelope` is RESOLVED before it is applied. The
+                    // transcript has to be what the ledger records as the run's
+                    // objective — otherwise a recovered/replayed run would re-run
+                    // silent audio — so transcription happens on this side of the
+                    // write path and its refusals are ordinary `CommandRejected`s.
+                    // Every non-voice command falls straight through untouched.
+                    let resolved = match resolve_voice_input(state, command).await {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            send(
+                                writer,
+                                &Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                            )
+                            .await?;
+                            return Ok(false);
+                        }
+                    };
+                    let transcribed = resolved.transcribed;
+                    // The rewritten body (transcript as objective, envelope with
+                    // its transcript attached) is what gets persisted and applied;
+                    // absent a voice envelope this is the client's exact command.
+                    let command = resolved.rewritten.as_ref().unwrap_or(command);
                     let reply_envelope = match state
                         .commands
                         .apply(&state.pool, ctx, command.clone())
                         .await
                     {
                         Ok(outcome) => {
+                            // Voice v1: surface the transcription on the session
+                            // ledger, so a reader of the transcript sees that this
+                            // turn's text came from audio and which model produced
+                            // it. Appended BEFORE the executor dispatch below so it
+                            // lands immediately after the run's `RunStarted`, and
+                            // gated on `newly_applied` so a duplicate delivery does
+                            // not double-note. Best-effort: a ledger hiccup must
+                            // never fail a run that was already accepted.
+                            if let (true, Some(note)) =
+                                (outcome.newly_applied, transcribed.as_ref())
+                            {
+                                if let CommandBody::SubmitUserInput { session_id, .. } =
+                                    &command.body
+                                {
+                                    match ledger::append_next_event(
+                                        &state.pool,
+                                        *session_id,
+                                        &Actor::System,
+                                        &EventBody::NoteAppended {
+                                            text: note.note(),
+                                            run_id: outcome.created_run,
+                                        },
+                                        Utc::now(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(event) => {
+                                            state.subscriptions.publish(*session_id, event)
+                                        }
+                                        Err(error) => {
+                                            warn!(%error, "could not record the transcription note")
+                                        }
+                                    }
+                                }
+                            }
                             // A freshly accepted `StartRun` is handed to the
                             // executor so the run actually EXECUTES rather than
                             // sitting `Queued` forever. Fire-and-forget: the
@@ -1846,11 +2135,16 @@ async fn handle_request(
                                     // persisted command ledger; a load failure (or
                                     // a session with no `StartRun`) degrades to the
                                     // legacy `current_dir()` / unpinned fallback.
+                                    // `envelope` is deliberately ignored here: by
+                                    // this point `resolve_voice_input` has already
+                                    // folded any transcript into `text`, which is
+                                    // what the run's objective must be.
                                     CommandBody::SubmitUserInput {
                                         session_id,
                                         text,
                                         mode,
                                         model,
+                                        ..
                                     } => {
                                         let provenance = crate::commands::session_run_provenance(
                                             &state.pool,
@@ -2922,7 +3216,7 @@ async fn authorize_workflow_resource(
     .bind(workflow_run_id)
     .fetch_optional(pool)
     .await?;
-    if !owner.is_some_and(|(owner,)| owner == session_id.to_string()) {
+    if owner.is_none_or(|(owner,)| owner != session_id.to_string()) {
         anyhow::bail!("workflow resource does not belong to the broker session");
     }
     Ok(())
