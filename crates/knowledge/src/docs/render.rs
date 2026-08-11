@@ -42,7 +42,15 @@ fn render_block(content: &BlockContent, out: &mut String) {
             let hashes = "#".repeat((*level).clamp(1, 6) as usize);
             out.push_str(&hashes);
             out.push(' ');
-            out.push_str(text);
+            // A heading is one Markdown line by definition: an embedded newline
+            // would end the heading early and leak the remainder as body text,
+            // so it is folded to a space (deterministic, still one line).
+            for (i, line) in text.split('\n').enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                out.push_str(line);
+            }
             out.push('\n');
         }
         BlockContent::Paragraph { text } => {
@@ -72,11 +80,16 @@ fn render_block(content: &BlockContent, out: &mut String) {
         BlockContent::Table { rows } => render_table(rows, out),
         BlockContent::Callout { kind, text } => {
             // GitHub-style alert blockquote — deterministic, uppercased kind.
+            // EVERY line of the text is quoted: an unquoted second line would
+            // fall out of the blockquote in the published Markdown.
             out.push_str("> [!");
             out.push_str(&kind.to_uppercase());
-            out.push_str("]\n> ");
-            out.push_str(text);
-            out.push('\n');
+            out.push_str("]\n");
+            for line in text.split('\n') {
+                out.push_str("> ");
+                out.push_str(line);
+                out.push('\n');
+            }
         }
         BlockContent::Checklist { items } => {
             for item in items {
@@ -116,17 +129,31 @@ fn render_block(content: &BlockContent, out: &mut String) {
     }
 }
 
-/// Render a table with the first row as the header (GitHub Markdown).
+/// Render a table with the first row as the header (GitHub Markdown). Cell
+/// text is escaped so a literal `|` cannot open a phantom column (and the
+/// escaping backslash itself is escaped first, keeping the mapping invertible);
+/// a newline inside a cell is folded to a space — a Markdown table row is one
+/// line by definition.
 fn render_table(rows: &[Vec<String>], out: &mut String) {
     if rows.is_empty() {
         return;
     }
     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let escape_cell = |cell: &str| {
+        cell.replace('\\', "\\\\")
+            .replace('|', "\\|")
+            .replace('\n', " ")
+    };
     let write_row = |out: &mut String, row: &[String]| {
         out.push('|');
         for c in 0..columns {
             out.push(' ');
-            out.push_str(row.get(c).map(String::as_str).unwrap_or(""));
+            out.push_str(
+                &row.get(c)
+                    .map(String::as_str)
+                    .map(escape_cell)
+                    .unwrap_or_default(),
+            );
             out.push_str(" |");
         }
         out.push('\n');
@@ -290,4 +317,70 @@ pub async fn publications(
             rendered_hash: row.get("rendered_hash"),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(content: BlockContent) -> DocumentBlock {
+        DocumentBlock::with_id("b", content)
+    }
+
+    /// Every line of a multi-line callout is quoted — an unquoted second line
+    /// would fall out of the blockquote in published Markdown. This changes the
+    /// published bytes for multi-line callouts INTENTIONALLY (the old render
+    /// quoted only the first line); the output stays deterministic.
+    #[test]
+    fn multi_line_callout_quotes_every_line() {
+        let callout = || {
+            block(BlockContent::Callout {
+                kind: "warning".into(),
+                text: "first line\nsecond line".into(),
+            })
+        };
+        let md = render_document("Doc", &[callout()]);
+        assert!(md.contains("> [!WARNING]\n> first line\n> second line\n"));
+        // Deterministic: a second render is byte-identical.
+        assert_eq!(md, render_document("Doc", &[callout()]));
+    }
+
+    /// A literal `|` in a table cell is escaped so it cannot open a phantom
+    /// column, the escaping backslash is itself escaped (invertible), and a
+    /// newline inside a cell folds to a space (a table row is one line).
+    #[test]
+    fn table_cells_escape_pipes_and_backslashes() {
+        let md = render_document(
+            "Doc",
+            &[block(BlockContent::Table {
+                rows: vec![
+                    vec!["Name".into(), "Pattern".into()],
+                    vec!["or".into(), "a|b".into()],
+                    vec!["esc".into(), "a\\b".into()],
+                    vec!["nl".into(), "a\nb".into()],
+                ],
+            })],
+        );
+        assert!(md.contains("| or | a\\|b |"), "pipe escaped: {md}");
+        assert!(md.contains("| esc | a\\\\b |"), "backslash escaped: {md}");
+        assert!(md.contains("| nl | a b |"), "newline folded: {md}");
+    }
+
+    /// A newline inside a heading folds to a space — the heading stays one
+    /// Markdown line rather than leaking its tail as body text.
+    #[test]
+    fn heading_newline_is_guarded() {
+        let md = render_document(
+            "Doc",
+            &[block(BlockContent::Heading {
+                level: 2,
+                text: "Payments\nService".into(),
+            })],
+        );
+        assert!(md.contains("## Payments Service\n"), "folded: {md}");
+        assert!(
+            !md.contains("## Payments\nService"),
+            "no split heading: {md}"
+        );
+    }
 }

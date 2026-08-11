@@ -15,7 +15,8 @@ use crate::error::CodypendentError;
 use crate::events::SessionEvent;
 use crate::handshake::{ClientHello, ServerHello};
 use crate::ids::{
-    ApprovalId, ClientId, CommandId, DaemonInstanceId, MessageId, RunId, SessionId, WorkspaceId,
+    ApprovalId, ClientId, CommandId, DaemonInstanceId, DocumentId, MessageId, RunId, SessionId,
+    WorkspaceId,
 };
 use crate::remote_ui::UiWireMessage;
 use crate::version::{ProtocolVersion, PROTOCOL_V1};
@@ -127,6 +128,30 @@ pub enum Payload {
     DocumentLeaseGranted {
         command_id: CommandId,
         grant: DocumentLeaseGrant,
+    },
+    /// A `CreateDocument` command was accepted; carries the new document's id
+    /// (Docs Studio creation). A distinct reply from `CommandAccepted` for the
+    /// same reason as `WorkflowRunStarted`: the client needs the id back to
+    /// select, subscribe to, and edit the document it just created.
+    DocumentCreated {
+        command_id: CommandId,
+        document_id: DocumentId,
+    },
+    /// A `CheckDocuments` command's reply: the staleness sweep's counts
+    /// (`/update-docs` glue over the Phase 4 STEP 4.6 engine). A distinct
+    /// reply from `CommandAccepted` because the client reports the counts to
+    /// the operator, not just an acknowledgement.
+    DocsCheckCompleted {
+        command_id: CommandId,
+        /// Documents the sweep examined.
+        documents_checked: u64,
+        /// Symbol links resolved (and persisted) against the code graph.
+        links_resolved: u64,
+        /// Staleness findings (signature changed / symbol disappeared).
+        stale_findings: u64,
+        /// Maintain-mode suggestions filed from those findings (never direct
+        /// edits; each still needs a human accept).
+        suggestions_filed: u64,
     },
     /// A `StartWorkflow` command was accepted; carries the new durable workflow-run
     /// id (Phase 5 STEP 5.2). A distinct reply from `CommandAccepted` because the
@@ -466,6 +491,52 @@ mod tests {
                 assert_eq!(grant.block_id.as_deref(), Some("b3"));
             }
             other => panic!("expected DocumentLeaseGranted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn document_created_payload_round_trips() {
+        let command_id = CommandId::new();
+        let document_id = DocumentId::new();
+        match round_trip_payload(Payload::DocumentCreated {
+            command_id,
+            document_id,
+        }) {
+            Payload::DocumentCreated {
+                command_id: id,
+                document_id: doc,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(doc, document_id);
+            }
+            other => panic!("expected DocumentCreated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn docs_check_completed_payload_round_trips() {
+        let command_id = CommandId::new();
+        match round_trip_payload(Payload::DocsCheckCompleted {
+            command_id,
+            documents_checked: 4,
+            links_resolved: 9,
+            stale_findings: 2,
+            suggestions_filed: 2,
+        }) {
+            Payload::DocsCheckCompleted {
+                command_id: id,
+                documents_checked,
+                links_resolved,
+                stale_findings,
+                suggestions_filed,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(documents_checked, 4);
+                assert_eq!(links_resolved, 9);
+                assert_eq!(stale_findings, 2);
+                assert_eq!(suggestions_filed, 2);
+            }
+            other => panic!("expected DocsCheckCompleted, got {other:?}"),
         }
     }
 

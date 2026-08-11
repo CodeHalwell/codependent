@@ -204,6 +204,24 @@ pub enum ProposedAction {
     /// engine's explicit arm); never serialized into a `ToolProposed` (never gated by
     /// approval), so it needs no golden wire vector.
     RecordMemory,
+    /// An agent `docs.*` tool call touching a collaborative document (rubric #4
+    /// doc-writer). Targets only the knowledge fabric's document store — not the
+    /// filesystem, a command, the network, or any remote — and every content
+    /// edit is still gated by the document's collaboration mode (organization
+    /// docs default to Suggest, so an agent edit lands as a reviewable
+    /// suggestion), while publishing to Git stays behind the separate
+    /// approval-gated `PublishDocument` pipeline. Always policy-`Allow`ed like
+    /// [`RecordMemory`](Self::RecordMemory) and recorded purely so the access
+    /// is traced; never serialized into a `ToolProposed`, so it needs no golden
+    /// wire vector.
+    DocumentEdit {
+        /// The document the tool call targets; empty for `docs.create` (the
+        /// document does not exist yet) and `docs.read` listings.
+        document_id: String,
+        /// A short human description of the access (e.g. `docs.edit block p`),
+        /// for the trace.
+        summary: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -333,6 +351,10 @@ mod tests {
             agent: "claude-acp".to_string(),
             title: "write file".to_string(),
             details: "{\"path\":\"src/lib.rs\"}".to_string(),
+        });
+        round_trip(ProposedAction::DocumentEdit {
+            document_id: "70000000-0000-0000-0000-000000000001".to_string(),
+            summary: "docs.edit block p".to_string(),
         });
         round_trip(ProposedAction::PublishDocument {
             document_id: DocumentId::new(),
