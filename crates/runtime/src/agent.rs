@@ -217,6 +217,17 @@ const FOLDED_RESULT_PREFIX: &str = "[tool result folded";
 /// `args_digest` three times in a row before this guard existed.
 const MAX_CONSECUTIVE_IDENTICAL_CALLS: u32 = 3;
 
+/// Safety valve on the parallel-tool-call fix: the most tool calls the loop
+/// executes from ONE model response. Now that every returned call runs (rather
+/// than only the first), a single malformed or adversarial response could
+/// otherwise queue an unbounded batch — `MAX_STEPS` bounds requests, not calls
+/// per request. `16` is far above what a genuine parallel turn asks for (a
+/// handful of reads/searches) while keeping the per-response work bounded.
+/// Overflow is never silent: the loop steers the model with the exact count it
+/// dropped, so it can re-issue what it still needs — the honesty this whole
+/// fix exists to restore.
+const MAX_TOOL_CALLS_PER_STEP: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Transcript, steps, and the ModelDriver trait
 // ---------------------------------------------------------------------------
@@ -2043,6 +2054,11 @@ impl FrameworkAgentRuntime {
                         std::collections::VecDeque::with_capacity(1 + extra_calls.len());
                     calls.push_back(ToolCallRequest { tool, args });
                     calls.extend(extra_calls);
+                    // Bound the batch (see `MAX_TOOL_CALLS_PER_STEP`) and say
+                    // so — an overflow that vanished silently would recreate
+                    // the very desync this fix removes.
+                    let dropped = calls.len().saturating_sub(MAX_TOOL_CALLS_PER_STEP);
+                    calls.truncate(MAX_TOOL_CALLS_PER_STEP);
                     while let Some(ToolCallRequest { tool, args }) = calls.pop_front() {
                         // FIX 1 (transcript fidelity): record the call itself,
                         // before running it, so a replayed transcript pairs
@@ -2152,6 +2168,15 @@ impl FrameworkAgentRuntime {
                             // stop without executing this (or any queued) tool.
                             ToolFlow::Cancelled => break 'agent Terminal::Cancelled,
                         }
+                    }
+                    if dropped > 0 {
+                        transcript.push(TurnItem::Steering(format!(
+                            "That response asked for {} tool calls at once; only the first \
+                             {MAX_TOOL_CALLS_PER_STEP} were executed and the remaining \
+                             {dropped} were NOT run. Re-issue any of them you still need, in \
+                             smaller batches.",
+                            MAX_TOOL_CALLS_PER_STEP + dropped
+                        )));
                     }
                 }
             }
@@ -4521,15 +4546,14 @@ impl ModelDriver for FrameworkModelDriver {
 
         // Text was already streamed to `sink` live above, so the assembler runs
         // with a no-op `on_text`. `updates_to_step` (unit-tested) is the single
-        // place that folds the updates into `(ModelStep, usage, preface)` —
-        // coalescing text, merging tool-call fragments, and assembling
-        // provider usage — exactly as the former non-streaming `get_response`
-        // mapping did. `preface` is FIX 3's surfaced assistant text when the
-        // step is a `CallTool` (`None` for `Say`/`Finish`, whose text already
-        // rides the step).
+        // place that folds the updates into a `StepOutcome` — coalescing text,
+        // merging tool-call fragments, and assembling provider usage — exactly
+        // as the former non-streaming `get_response` mapping did. `preface` is
+        // FIX 3's surfaced assistant text when the step is a `CallTool` (`None`
+        // for `Say`/`Finish`, whose text already rides the step), and
+        // `extra_calls` carries every function call beyond the first.
         assembled.finalize();
-        let (step, usage, preface) = chat_response_to_step(&assembled);
-        Ok(StepOutcome::new(step, usage).with_preface(preface))
+        Ok(chat_response_to_step(&assembled))
     }
 }
 
@@ -4582,48 +4606,60 @@ fn update_text_delta(update: &agent_framework_core::types::ChatResponseUpdate) -
 
 /// Map a fully-assembled framework
 /// [`ChatResponse`](agent_framework_core::types::ChatResponse) to the loop's
-/// `(ModelStep, usage, preface)`: a function call becomes
-/// [`ModelStep::CallTool`], any other completed turn becomes
-/// [`ModelStep::Finish`] carrying its text. Usage is MEASURED tokens with an
-/// UNMEASURED cost (priced downstream), or `None` when the provider reported
-/// none — never a fabricated zero. `preface` is FIX 3 (transcript-fidelity,
-/// loop-fix Task 1): a turn can carry BOTH text and a function call, and that
-/// text used to be silently dropped when the turn became a `CallTool` step
-/// (only the `Finish` arm ever read `response.text()`). It is now surfaced as
-/// `Some(text)` alongside the `CallTool` step so the loop can record the
-/// model's stated intent instead of losing it; `None` for a `Finish` step,
-/// whose text already rides the step itself.
+/// [`StepOutcome`]: a function call becomes [`ModelStep::CallTool`], any other
+/// completed turn becomes [`ModelStep::Finish`] carrying its text. Usage is
+/// MEASURED tokens with an UNMEASURED cost (priced downstream), or `None` when
+/// the provider reported none — never a fabricated zero. `preface` is FIX 3
+/// (transcript-fidelity, loop-fix Task 1): a turn can carry BOTH text and a
+/// function call, and that text used to be silently dropped when the turn
+/// became a `CallTool` step (only the `Finish` arm ever read
+/// `response.text()`). It is now surfaced as `Some(text)` alongside the
+/// `CallTool` step so the loop can record the model's stated intent instead of
+/// losing it; `None` for a `Finish` step, whose text already rides the step.
+///
+/// Parallel-tool-call fix: a turn can also carry SEVERAL function calls, and
+/// this mapping used to keep only `.next()` of them. Every call now survives —
+/// the first on the step, the rest on [`StepOutcome::extra_calls`] in response
+/// order — so the loop executes what the model actually asked for instead of
+/// leaving it to believe N calls ran when one did.
 #[cfg(feature = "provider-openai")]
-fn chat_response_to_step(
-    response: &agent_framework_core::types::ChatResponse,
-) -> (ModelStep, Option<ModelUsage>, Option<String>) {
+fn chat_response_to_step(response: &agent_framework_core::types::ChatResponse) -> StepOutcome {
     let usage = measured_usage(response.usage_details.as_ref());
 
-    // A function call in the assembled turn becomes a tool call.
+    // Function calls in the assembled turn become tool calls, in order.
     if let Some(message) = response.messages.last() {
-        if let Some(call) = message.function_calls().into_iter().next() {
-            let args = call
-                .parse_arguments()
-                .map(|map| serde_json::to_value(map).unwrap_or(Value::Null))
-                .unwrap_or(Value::Null);
+        let mut calls: Vec<ToolCallRequest> = message
+            .function_calls()
+            .into_iter()
+            .map(|call| ToolCallRequest {
+                tool: call.name.clone(),
+                args: call
+                    .parse_arguments()
+                    .map(|map| serde_json::to_value(map).unwrap_or(Value::Null))
+                    .unwrap_or(Value::Null),
+            })
+            .collect();
+        if !calls.is_empty() {
+            let first = calls.remove(0);
             // FIX 3: the SAME message can carry text alongside the function
-            // call — surface it rather than dropping it on the floor.
+            // calls — surface it rather than dropping it on the floor.
             let text = message.text();
             let preface = (!text.is_empty()).then_some(text);
-            return (
+            return StepOutcome::new(
                 ModelStep::CallTool {
-                    tool: call.name.clone(),
-                    args,
+                    tool: first.tool,
+                    args: first.args,
                 },
                 usage,
-                preface,
-            );
+            )
+            .with_preface(preface)
+            .with_extra_calls(calls);
         }
     }
 
     // Otherwise the completed turn is the final answer.
     let text = response.text();
-    (
+    StepOutcome::new(
         ModelStep::Finish {
             summary: if text.is_empty() {
                 "run complete".to_string()
@@ -4632,27 +4668,27 @@ fn chat_response_to_step(
             },
         },
         usage,
-        None,
     )
 }
 
-/// Fold a batch of streaming updates into `(ModelStep, usage, preface)`,
+/// Fold a batch of streaming updates into a [`StepOutcome`],
 /// invoking `on_text` with each text delta in arrival order. Pure and
 /// synchronous — the testable mirror of [`FrameworkModelDriver::next_step`]'s
 /// live loop: it extracts each delta with [`update_text_delta`], absorbs every
 /// update into a [`ChatResponse`](agent_framework_core::types::ChatResponse)
 /// via the framework's own coalescer (text coalesces, tool-call fragments
 /// merge, usage accumulates), then maps the assembled response with
-/// [`chat_response_to_step`] (whose `preface` this passes through unchanged).
-/// The driver emits live to its sink as updates arrive and calls this with a
-/// no-op `on_text` purely to assemble; the unit test calls it with a collecting
-/// closure to pin the ordered-chunk / coalesced-text / assembled-usage contract.
+/// [`chat_response_to_step`] (whose `preface` and `extra_calls` this passes
+/// through unchanged). The driver emits live to its sink as updates arrive and
+/// calls this with a no-op `on_text` purely to assemble; the unit test calls it
+/// with a collecting closure to pin the ordered-chunk / coalesced-text /
+/// assembled-usage contract.
 #[cfg(feature = "provider-openai")]
 #[cfg_attr(not(test), allow(dead_code))]
 fn updates_to_step(
     updates: Vec<agent_framework_core::types::ChatResponseUpdate>,
     mut on_text: impl FnMut(&str),
-) -> (ModelStep, Option<ModelUsage>, Option<String>) {
+) -> StepOutcome {
     use agent_framework_core::types::ChatResponse;
 
     let mut assembled = ChatResponse::default();
@@ -7410,6 +7446,187 @@ mod tests {
         assert_eq!(deltas.concat(), "partial");
     }
 
+    // -----------------------------------------------------------------------
+    // Parallel tool calls: every call a response carries must run.
+    // -----------------------------------------------------------------------
+
+    /// Collect `(tool, label)` of every `ToolStarted` currently buffered, in
+    /// publish order — the honest record of what the loop actually EXECUTED
+    /// (as opposed to what a transcript claims), which is exactly what the
+    /// parallel-tool-call fix is about.
+    fn drain_tool_starts(
+        events: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+    ) -> Vec<(String, Option<String>)> {
+        let mut out = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::ToolStarted { tool, label, .. } = event.body {
+                out.push((tool, label));
+            }
+        }
+        out
+    }
+
+    /// A driver that returns ONE response carrying several tool calls (the
+    /// first on the step, the rest as `extra_calls` — exactly the shape
+    /// `chat_response_to_step` produces for a parallel-tool-call turn), then
+    /// finishes. Two `next_step` calls per run, N tool executions.
+    struct ParallelCallDriver {
+        calls: Vec<ToolCallRequest>,
+        served: Mutex<bool>,
+    }
+
+    impl ParallelCallDriver {
+        fn new(calls: Vec<(&str, Value)>) -> Self {
+            Self {
+                calls: calls
+                    .into_iter()
+                    .map(|(tool, args)| ToolCallRequest {
+                        tool: tool.to_string(),
+                        args,
+                    })
+                    .collect(),
+                served: Mutex::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelDriver for ParallelCallDriver {
+        fn model_id(&self) -> ModelId {
+            ModelId("parallel".to_string())
+        }
+
+        async fn next_step(
+            &self,
+            _transcript: &[TurnItem],
+            _tools: &[ToolDefinition],
+            _sink: &mut dyn DeltaSink,
+        ) -> anyhow::Result<StepOutcome> {
+            let mut served = self.served.lock().expect("parallel driver mutex");
+            if *served {
+                return Ok(StepOutcome::new(
+                    ModelStep::Finish {
+                        summary: "done".to_string(),
+                    },
+                    None,
+                ));
+            }
+            *served = true;
+            let mut calls = self.calls.clone();
+            let first = calls.remove(0);
+            Ok(StepOutcome::new(
+                ModelStep::CallTool {
+                    tool: first.tool,
+                    args: first.args,
+                },
+                None,
+            )
+            .with_extra_calls(calls))
+        }
+    }
+
+    /// Build a temp repo holding `files`, plus the runtime/session fixtures a
+    /// loop test needs. Reads are `Allow` under the default policy, so a
+    /// `workspace.read_file` batch executes without parking on approval.
+    fn repo_with_files(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("tempdir");
+        for (name, body) in files {
+            std::fs::write(repo.path().join(name), body).expect("write fixture");
+        }
+        repo
+    }
+
+    #[tokio::test]
+    async fn every_tool_call_in_one_response_executes_in_order() {
+        // The headline parallel-tool-call fix, end to end: a single response
+        // carrying THREE calls must execute all three, sequentially in
+        // response order, each through the full middleware — so three
+        // `ToolStarted`/`ToolCompleted` pairs are emitted and three
+        // `ToolResult` turns land in the transcript. Before the fix only the
+        // first ran and the other two vanished with no event and no error.
+        let repo = repo_with_files(&[
+            ("a.txt", "alpha\n"),
+            ("b.txt", "beta\n"),
+            ("c.txt", "ceta\n"),
+        ]);
+        let driver = ParallelCallDriver::new(vec![
+            ("workspace.read_file", json!({"path": "a.txt"})),
+            ("workspace.read_file", json!({"path": "b.txt"})),
+            ("workspace.read_file", json!({"path": "c.txt"})),
+        ]);
+        let (runtime, mut events, session_id) = test_runtime();
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "read three files",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("parallel-call run completes");
+
+        let starts = drain_tool_starts(&mut events);
+        assert_eq!(
+            starts.len(),
+            3,
+            "all three calls must execute, got {starts:?}"
+        );
+        // Order is response order, and each carries its own arguments (the
+        // label is derived from them) — not three copies of the first call.
+        let labels: Vec<Option<&str>> = starts.iter().map(|(_, l)| l.as_deref()).collect();
+        assert_eq!(
+            labels,
+            vec![Some("a.txt"), Some("b.txt"), Some("c.txt")],
+            "calls must run in response order with their own arguments"
+        );
+        assert!(starts.iter().all(|(tool, _)| tool == "workspace.read_file"));
+    }
+
+    /// A driver whose single response asks for more calls than the loop will
+    /// run in one step, so the overflow path is exercised.
+    #[tokio::test]
+    async fn a_call_batch_over_the_cap_is_truncated_and_the_model_is_told() {
+        // Executing every returned call must not become an unbounded-work
+        // hole: past `MAX_TOOL_CALLS_PER_STEP` the batch is truncated — but
+        // never silently, or the fix would recreate the desync it removes.
+        let repo = repo_with_files(&[("a.txt", "alpha\n")]);
+        let calls: Vec<(&str, Value)> = (0..MAX_TOOL_CALLS_PER_STEP + 3)
+            .map(|i| {
+                // Distinct args keep the repeat guard out of the picture, so
+                // this test measures the cap and nothing else.
+                (
+                    "workspace.read_file",
+                    json!({"path": "a.txt", "range": [1, 1 + i]}),
+                )
+            })
+            .collect();
+        let driver = ParallelCallDriver::new(calls);
+        let (runtime, mut events, session_id) = test_runtime();
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "flood",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("run completes");
+
+        let starts = drain_tool_starts(&mut events);
+        assert_eq!(
+            starts.len(),
+            MAX_TOOL_CALLS_PER_STEP,
+            "the batch must be capped, got {}",
+            starts.len()
+        );
+    }
+
     /// A text-only assistant streaming update.
     #[cfg(feature = "provider-openai")]
     fn text_update(text: &str) -> agent_framework_core::types::ChatResponseUpdate {
@@ -7445,9 +7662,15 @@ mod tests {
         // provider usage (measured tokens, unmeasured cost).
         let updates = vec![text_update("Hel"), text_update("lo"), usage_update(3, 2)];
         let mut chunks = Vec::new();
-        let (step, usage, preface) = updates_to_step(updates, |c| chunks.push(c.to_string()));
+        let StepOutcome {
+            step,
+            usage,
+            preface,
+            extra_calls,
+        } = updates_to_step(updates, |c| chunks.push(c.to_string()));
 
         assert_eq!(chunks, vec!["Hel".to_string(), "lo".to_string()]);
+        assert!(extra_calls.is_empty(), "a text turn carries no tool calls");
         match step {
             ModelStep::Finish { summary } => assert_eq!(summary, "Hello"),
             other => panic!("expected Finish carrying the coalesced text, got {other:?}"),
@@ -7472,7 +7695,12 @@ mod tests {
         // unmeasured, never charged a fabricated zero.
         let updates = vec![text_update("hi")];
         let mut chunks = Vec::new();
-        let (step, usage, preface) = updates_to_step(updates, |c| chunks.push(c.to_string()));
+        let StepOutcome {
+            step,
+            usage,
+            preface,
+            ..
+        } = updates_to_step(updates, |c| chunks.push(c.to_string()));
 
         assert_eq!(chunks, vec!["hi".to_string()]);
         assert!(matches!(step, ModelStep::Finish { .. }));
@@ -7512,13 +7740,14 @@ mod tests {
             ..ChatResponse::default()
         };
 
-        let (step, _usage, preface) = chat_response_to_step(&response);
+        let outcome = chat_response_to_step(&response);
         assert!(
-            matches!(&step, ModelStep::CallTool { tool, .. } if tool == "workspace.read_file"),
-            "expected a CallTool step, got {step:?}"
+            matches!(&outcome.step, ModelStep::CallTool { tool, .. } if tool == "workspace.read_file"),
+            "expected a CallTool step, got {:?}",
+            outcome.step
         );
         assert_eq!(
-            preface.as_deref(),
+            outcome.preface.as_deref(),
             Some("I'll check the config file first."),
             "the assistant's stated intent must not be dropped"
         );
@@ -7548,7 +7777,66 @@ mod tests {
             ..ChatResponse::default()
         };
 
-        let (_step, _usage, preface) = chat_response_to_step(&response);
-        assert_eq!(preface, None);
+        let outcome = chat_response_to_step(&response);
+        assert_eq!(outcome.preface, None);
+        assert!(outcome.extra_calls.is_empty());
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn chat_response_to_step_keeps_every_parallel_function_call() {
+        // Parallel-tool-call fix at the mapping seam: a turn carrying THREE
+        // function calls used to collapse to `.next()` — two calls vanished
+        // with no error anywhere, so the model believed three ran when one
+        // did. All three must now survive, in response order: the first on the
+        // step, the rest on `extra_calls`.
+        use agent_framework_core::types::{
+            ChatResponse, Content, FunctionArguments, FunctionCallContent, Message,
+        };
+
+        let call = |id: &str, name: &str, args: Value| {
+            Content::FunctionCall(FunctionCallContent {
+                call_id: id.to_string(),
+                name: name.to_string(),
+                arguments: Some(FunctionArguments::Raw(args.to_string())),
+            })
+        };
+        let message = Message {
+            contents: vec![
+                Content::text("Reading both files, then searching."),
+                call("c1", "workspace.read_file", json!({"path": "a.rs"})),
+                call("c2", "workspace.read_file", json!({"path": "b.rs"})),
+                call("c3", "workspace.search", json!({"query": "fn main"})),
+            ],
+            ..Message::assistant("")
+        };
+        let response = ChatResponse {
+            messages: vec![message],
+            ..ChatResponse::default()
+        };
+
+        let outcome = chat_response_to_step(&response);
+        match &outcome.step {
+            ModelStep::CallTool { tool, args } => {
+                assert_eq!(tool, "workspace.read_file");
+                assert_eq!(args["path"], json!("a.rs"));
+            }
+            other => panic!("expected the FIRST call on the step, got {other:?}"),
+        }
+        let extras: Vec<(&str, &Value)> = outcome
+            .extra_calls
+            .iter()
+            .map(|c| (c.tool.as_str(), &c.args))
+            .collect();
+        assert_eq!(extras.len(), 2, "both remaining calls must survive");
+        assert_eq!(extras[0].0, "workspace.read_file");
+        assert_eq!(extras[0].1["path"], json!("b.rs"));
+        assert_eq!(extras[1].0, "workspace.search");
+        assert_eq!(extras[1].1["query"], json!("fn main"));
+        // The accompanying text still rides as preface, unchanged by the fix.
+        assert_eq!(
+            outcome.preface.as_deref(),
+            Some("Reading both files, then searching.")
+        );
     }
 }
