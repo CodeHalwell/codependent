@@ -187,6 +187,43 @@ async fn retrieval_beats_full_injection_recall_and_forbidden_exclusion() {
     );
 }
 
+/// Skill activation gate (2026-08-11 review): a CI-failure query MUST disclose
+/// the shipped `rust.fix-ci` skill card.
+///
+/// Before the reference package's `status` flipped to `active`, the funnel's
+/// non-Active hard filter (`retrieval/mod.rs`) dropped it from every selection,
+/// and the 0.8 *mean*-recall gate above quietly absorbed the per-case misses —
+/// the suite passed while skill disclosure was dead product-wide. This test
+/// asserts the disclosure DIRECTLY, per skill, so a regression to a
+/// never-selectable shipped skill turns the suite red instead of shaving the
+/// mean.
+#[tokio::test]
+async fn a_ci_failure_query_discloses_the_shipped_fix_ci_skill_card() {
+    let (_tmp, items, repo) = seed().await;
+    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new()).unwrap();
+
+    // The same shape the executor's `emit_context` queries under: System + the
+    // run's repository, a Medium risk ceiling (the skill is Medium — writes +
+    // commands + network, no secret — so the ceiling admits it).
+    let query = RetrievalQuery::new(
+        "the github actions ci is failing on the rust tests, diagnose and fix it",
+        vec![Scope::System, Scope::Repository(repo)],
+        RiskClass::Medium,
+    );
+    let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default()).unwrap();
+
+    assert!(
+        result.skills.iter().any(|card| card.name == "rust.fix-ci"),
+        "the shipped rust.fix-ci skill must be disclosed for a CI-failure query; \
+         disclosed skills: {:?} (is the package still status = \"active\"?)",
+        result
+            .skills
+            .iter()
+            .map(|card| card.name.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// The risk ceiling — not mere absence — is what excludes the destructive
 /// decoys. A query that names one directly ranks it top on exact overlap; it is
 /// disclosed under a High ceiling, yet vanishes the instant the ceiling drops to

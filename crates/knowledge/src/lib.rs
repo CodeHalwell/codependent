@@ -27,6 +27,7 @@ pub mod registry;
 pub mod repomap;
 pub mod retrieval;
 pub mod skill_exec;
+pub mod skills;
 pub mod types;
 
 pub use types::{
@@ -47,6 +48,10 @@ pub use manifest::{
 };
 pub use registry::{resolve_shadowed, Registry, RegistryError};
 pub use skill_exec::{profile_for_permissions, run_script, SkillExecError};
+pub use skills::{
+    anchor_repository_id, install_package, is_retrievable_status, local_user_scope,
+    repository_skills_root, scan_skill_root, user_skills_root, SkillInstallError, SkillScanOutcome,
+};
 
 pub use retrieval::{
     embedding_text, retrieve, Bm25Error, Bm25Index, Embedder, HashingEmbedder, RerankWeights,
@@ -73,7 +78,9 @@ pub use memory::{
 };
 pub use observer::{chronicle_candidates, extract_candidates};
 
-pub use context::{assemble_context, ContextCard, ContextError, ContextManifest, ContextMemory};
+pub use context::{
+    assemble_context, ContextAssembler, ContextCard, ContextError, ContextManifest, ContextMemory,
+};
 
 pub use docs::apply::{apply_mutation, ApplyError, MutationEffect, MutationOutcome};
 pub use docs::collab::{

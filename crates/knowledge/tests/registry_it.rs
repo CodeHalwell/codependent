@@ -71,7 +71,10 @@ fn package_parse_round_trip() {
         item.intents,
         vec!["ci failure", "rust tests", "github actions", "clippy"]
     );
-    assert_eq!(item.status, RegistryStatus::Draft);
+    // Active, not Draft: retrieval hard-filters non-Active items, so the shipped
+    // reference skill must carry the status that lets it actually be disclosed
+    // (2026-08-11 review — the draft status left the only real skill dead).
+    assert_eq!(item.status, RegistryStatus::Active);
 
     // [permissions] flattens to 1 read + 1 write + 2 commands + 1 network = 5.
     assert_eq!(item.permissions.len(), 5);
