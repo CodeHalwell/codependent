@@ -217,15 +217,41 @@ pub fn agent_coordinate(id: &str, version: &str) -> String {
     format!("{}@{version}", canonical_agent_id(id))
 }
 
-/// Extract the canonical registry id from either an alias or a pinned
-/// `id@version` model coordinate.
+/// A connected profile pinned to one of the agent's own models (discovered
+/// over the ACP session-config handshake) extends the coordinate additively:
+/// `id@version#model`. The `#model` part selects a model *inside* the session
+/// (`session/set_config_option`), never a different launch.
+#[must_use]
+pub fn agent_coordinate_with_model(id: &str, version: &str, model: &str) -> String {
+    format!("{}#{model}", agent_coordinate(id, version))
+}
+
+/// Extract the canonical registry id from an alias, a pinned `id@version`
+/// coordinate, or a model-pinned `id@version#model` coordinate.
 #[must_use]
 pub fn agent_id_from_coordinate(coordinate: &str) -> String {
     split_agent_coordinate(coordinate).0
 }
 
+/// The agent-model id pinned by an `…#model` coordinate, if any. Additive:
+/// coordinates written before model pinning existed have no `#` and yield
+/// `None`.
+#[must_use]
+pub fn agent_model_from_coordinate(coordinate: &str) -> Option<&str> {
+    coordinate
+        .trim()
+        .split_once('#')
+        .map(|(_, model)| model)
+        .filter(|model| !model.is_empty())
+}
+
 fn split_agent_coordinate(coordinate: &str) -> (String, Option<String>) {
     let coordinate = coordinate.trim();
+    // A pinned agent model (`…#model`) never affects which agent launches:
+    // strip it before resolving the id/version.
+    let coordinate = coordinate
+        .split_once('#')
+        .map_or(coordinate, |(agent, _)| agent);
     if let Some((id, version)) = coordinate.rsplit_once('@') {
         if !id.is_empty() && !version.is_empty() {
             return (canonical_agent_id(id), Some(version.to_string()));
@@ -1298,6 +1324,38 @@ mod tests {
             "claude-acp@0.66.0"
         );
         assert_eq!(agent_id_from_coordinate("vibe-chat@2.24.0"), "mistral-vibe");
+    }
+
+    #[test]
+    fn model_pinned_coordinates_split_additively() {
+        // `#model` extends `id@version` without changing which agent resolves —
+        // including through the alias table.
+        assert_eq!(
+            agent_coordinate_with_model("demo-acp", "1.2.3", "agent-model-1"),
+            "demo-acp@1.2.3#agent-model-1"
+        );
+        assert_eq!(
+            agent_coordinate_with_model("vibe-chat", "2.24.0", "agent-model-1"),
+            "mistral-vibe@2.24.0#agent-model-1"
+        );
+        assert_eq!(
+            agent_id_from_coordinate("demo-acp@1.2.3#agent-model-1"),
+            "demo-acp"
+        );
+        assert_eq!(
+            split_agent_coordinate("demo-acp@1.2.3#agent-model-1"),
+            ("demo-acp".to_string(), Some("1.2.3".to_string()))
+        );
+        assert_eq!(
+            agent_model_from_coordinate("demo-acp@1.2.3#agent-model-1"),
+            Some("agent-model-1")
+        );
+        // Pre-pinning coordinates keep splitting exactly as before.
+        assert_eq!(agent_model_from_coordinate("demo-acp@1.2.3"), None);
+        assert_eq!(agent_model_from_coordinate("demo-acp"), None);
+        // A dangling `#` pins nothing.
+        assert_eq!(agent_model_from_coordinate("demo-acp@1.2.3#"), None);
+        assert_eq!(agent_id_from_coordinate("demo-acp@1.2.3#"), "demo-acp");
     }
 
     #[test]
