@@ -12,8 +12,10 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use codypendent_protocol::{
     AgentMode, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition, RunState, BUILD_ID,
@@ -25,8 +27,7 @@ use crate::remote_ui_host::{TERMINAL_CENTRAL_SLOTS, TERMINAL_OVERLAY_SLOTS};
 use crate::state::{
     filter_key_rows, filter_model_names, filter_models, filter_modes, filter_providers, AppState,
     DocFocus, DocLeaseState, KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, ModelReadiness,
-    Overlay, Pane, PatchSummary, ProviderCard, RunActivity, RunView, ToolCard, ToolStatus,
-    TranscriptEntry,
+    Overlay, Pane, PatchSummary, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 use crate::{render_remote_ui, RemoteUiRenderOptions};
@@ -50,7 +51,7 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // The box grows past its 3-row minimum when the draft holds more than one
     // line (a manual `Alt+Enter` break, or a multi-line paste), capped at
     // `COMPOSER_MAX_HEIGHT` — see `composer_box_height`.
-    let composer_height = composer_box_height(&state.composer);
+    let composer_height = composer_box_height(&state.composer, area.width);
     let has_composer_accessory = !state
         .remote_ui
         .mounted_documents_for_points(&["composer-accessory"])
@@ -94,6 +95,12 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
 }
 
 fn render_remote_surfaces(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> bool {
+    // Central contributions are focusable alternate content, not passive
+    // decoration. Keep the native conversation visible until the operator
+    // explicitly enters Remote UI focus (F6).
+    if !central_remote_ui_is_active(state) {
+        return false;
+    }
     let documents = state
         .remote_ui
         .mounted_documents_for_points(TERMINAL_CENTRAL_SLOTS);
@@ -102,6 +109,24 @@ fn render_remote_surfaces(frame: &mut Frame, area: Rect, state: &AppState, theme
     }
     render_remote_documents(frame, area, state, theme, documents);
     true
+}
+
+fn central_remote_ui_is_active(state: &AppState) -> bool {
+    state.remote_ui.active
+        && state
+            .remote_ui
+            .focused_document
+            .as_ref()
+            .and_then(|document_id| {
+                state
+                    .remote_ui
+                    .host
+                    .registry()
+                    .registration_for_document(document_id.as_str())
+            })
+            .is_some_and(|registration| {
+                TERMINAL_CENTRAL_SLOTS.contains(&registration.point.as_str())
+            })
 }
 
 fn render_remote_documents(
@@ -141,15 +166,39 @@ fn render_remote_documents(
             .unwrap_or("panel");
         let chrome = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme.surface.border))
+            .border_style(Style::default().fg(
+                if state.remote_ui.active
+                    && state.remote_ui.focused_document.as_ref() == Some(&document.document_id)
+                {
+                    theme.focus.active
+                } else {
+                    theme.surface.border
+                },
+            ))
             .title(Span::styled(
-                format!(" {point} · Extension: {identity} "),
+                format!(
+                    " {point} · Extension: {identity} · {} ",
+                    if state.remote_ui.active
+                        && state.remote_ui.focused_document.as_ref() == Some(&document.document_id)
+                    {
+                        "focused · Tab controls · Shift-F6 next · Esc return"
+                    } else {
+                        "F6 focus"
+                    }
+                ),
                 Style::default()
                     .fg(theme.text.muted)
                     .add_modifier(Modifier::BOLD),
             ));
         let content_region = chrome.inner(region);
         frame.render_widget(chrome, region);
+        // Host-owned, non-activating document focus target. Component hit
+        // regions are registered below and therefore win the reverse-order hit
+        // test when the pointer is over an actual control.
+        state.register_hit(
+            region,
+            Action::RemoteUiFocusDocument(document.document_id.clone()),
+        );
         let output = render_remote_ui(
             frame.buffer_mut(),
             content_region,
@@ -222,70 +271,98 @@ fn render_remote_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme
 fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let status = state.status();
     let mid = area.width >= 64;
-    let sep = || Span::styled(" · ", Style::default().fg(theme.text.muted));
-
-    let mut left: Vec<Span> = vec![
-        Span::raw("  "),
-        Span::styled("✦", Style::default().fg(theme.focus.active)),
-        Span::styled(
-            " codypendent",
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if let Some(title) = state
+    let title = state
         .session_title
         .as_deref()
         .filter(|title| !title.eq_ignore_ascii_case("codypendent"))
-    {
-        left.push(Span::styled("  /  ", Style::default().fg(theme.text.muted)));
-        left.push(Span::styled(
-            truncate(title, 30),
-            Style::default().fg(theme.text.secondary),
-        ));
-    }
+        .map(|title| truncate(title, 30));
+    let model = status.model.as_ref().map(|model| truncate(&model.0, 22));
+    let mut show_title = title.is_some();
+    let mut show_model = mid && model.is_some();
+    let mut show_mode = mid;
+    let mut show_context = status.context_percent.is_some();
+    let mut show_cost = status.cost_minor.is_some();
 
-    let mut right: Vec<Span> = Vec::new();
-    if mid {
-        if let Some(model) = &status.model {
-            right.push(Span::styled(
-                truncate(&model.0, 22),
+    // Pack by semantic priority rather than relying on saturating padding,
+    // which merely lets the left group overwrite the right. The brand always
+    // survives; lower-value telemetry progressively drops on narrow screens.
+    let (left, right) = loop {
+        let mut left: Vec<Span<'static>> = vec![
+            Span::raw("  "),
+            Span::styled("✦", Style::default().fg(theme.focus.active)),
+            Span::styled(
+                " codypendent",
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if show_title {
+            left.push(Span::styled("  /  ", Style::default().fg(theme.text.muted)));
+            left.push(Span::styled(
+                title.clone().unwrap_or_default(),
                 Style::default().fg(theme.text.secondary),
             ));
-            right.push(sep());
         }
-        right.push(Span::styled(
-            mode_label(state.default_mode).to_owned(),
-            Style::default()
-                .fg(theme.focus.active)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    if let Some(percent) = status.context_percent {
-        if !right.is_empty() {
-            right.push(sep());
-        }
-        right.push(Span::styled(
-            format!("ctx {percent}%"),
-            Style::default().fg(theme.text.muted),
-        ));
-    }
-    if let Some(cost) = status.cost_minor {
-        if !right.is_empty() {
-            right.push(sep());
-        }
-        right.push(Span::styled(
-            format_cost(Some(cost)),
-            Style::default().fg(theme.status.warning),
-        ));
-    }
 
-    // Right-align ctx/cost by padding between the two groups (the status
-    // line's approach: measure the spans directly rather than re-rendering).
+        let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
+        if show_model {
+            groups.push(vec![Span::styled(
+                model.clone().unwrap_or_default(),
+                Style::default().fg(theme.text.secondary),
+            )]);
+        }
+        if show_mode {
+            groups.push(vec![Span::styled(
+                mode_label(state.default_mode).to_owned(),
+                Style::default()
+                    .fg(theme.focus.active)
+                    .add_modifier(Modifier::BOLD),
+            )]);
+        }
+        if show_context {
+            groups.push(vec![Span::styled(
+                format!("ctx {}%", status.context_percent.unwrap_or_default()),
+                Style::default().fg(theme.text.muted),
+            )]);
+        }
+        if show_cost {
+            groups.push(vec![Span::styled(
+                format_cost(status.cost_minor),
+                Style::default().fg(theme.status.warning),
+            )]);
+        }
+        let mut right = Vec::new();
+        for (index, group) in groups.into_iter().enumerate() {
+            if index > 0 {
+                right.push(Span::styled(" · ", Style::default().fg(theme.text.muted)));
+            }
+            right.extend(group);
+        }
+        let used = left.iter().map(Span::width).sum::<usize>()
+            + right.iter().map(Span::width).sum::<usize>()
+            + 3;
+        if used <= usize::from(area.width) {
+            break (left, right);
+        }
+        if show_cost {
+            show_cost = false;
+        } else if show_context {
+            show_context = false;
+        } else if show_model {
+            show_model = false;
+        } else if show_title {
+            show_title = false;
+        } else if show_mode {
+            show_mode = false;
+        } else {
+            break (left, right);
+        }
+    };
+
     let left_width: usize = left.iter().map(|span| span.width()).sum();
     let right_width: usize = right.iter().map(|span| span.width()).sum();
-    let pad = (area.width as usize).saturating_sub(left_width + right_width + 1);
+    let pad = usize::from(area.width).saturating_sub(left_width + right_width + 2);
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(pad)));
     spans.extend(right);
@@ -434,6 +511,24 @@ fn wordmark_rows(text: &str) -> Vec<String> {
 /// detail pane. The panes are at-a-glance context — interaction stays the same
 /// (composer, palette, approval modal), so no pane needs its own input focus.
 fn render_workspace(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    const MULTI_PANE_MIN_WIDTH: u16 = 110;
+    if area.width < MULTI_PANE_MIN_WIDTH {
+        match state.focus {
+            Pane::Sessions => {
+                state.register_hit(area, Action::FocusPane(Pane::Sessions));
+                render_runs_pane(frame, area, state, theme);
+            }
+            Pane::Transcript => {
+                state.register_hit(area, Action::FocusPane(Pane::Transcript));
+                render_workspace_transcript(frame, area, state, theme, true);
+            }
+            Pane::Approvals => {
+                state.register_hit(area, Action::FocusPane(Pane::Approvals));
+                render_context_pane(frame, area, state, theme);
+            }
+        }
+        return;
+    }
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -448,14 +543,37 @@ fn render_workspace(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
     state.register_hit(cols[1], Action::FocusPane(Pane::Transcript));
     state.register_hit(cols[2], Action::FocusPane(Pane::Approvals));
     render_runs_pane(frame, cols[0], state, theme);
-    render_conversation(frame, cols[1], state, theme);
+    render_workspace_transcript(
+        frame,
+        cols[1],
+        state,
+        theme,
+        state.focus == Pane::Transcript,
+    );
     render_context_pane(frame, cols[2], state, theme);
+}
+
+fn render_workspace_transcript(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    focused: bool,
+) {
+    let block = pane_block("Conversation", focused, theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    render_conversation(frame, inner, state, theme);
 }
 
 /// The runs pane (workspace layout): every run with its state and objective, the
 /// selected one marked. Read-only — switch runs with Ctrl-↑/↓.
 fn render_runs_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let block = pane_block(&format!("Runs ({})", state.runs.len()), false, theme);
+    let block = pane_block(
+        &format!("Runs ({})", state.runs.len()),
+        state.focus == Pane::Sessions,
+        theme,
+    );
     let mut items: Vec<ListItem> = Vec::new();
     if state.runs.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -467,15 +585,21 @@ fn render_runs_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
         let selected = idx == state.selected_run;
         let marker = if selected { "› " } else { "  " };
         let line = Line::from(vec![
-            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                marker,
+                theme.selection_aware_text_style(selected, theme.focus.active),
+            ),
             Span::styled(
                 run_state_dot(run.state),
-                Style::default().fg(run_state_color(run.state, theme)),
+                theme.selection_aware_text_style(selected, run_state_color(run.state, theme)),
             ),
-            Span::raw(" "),
+            Span::styled(
+                " ",
+                theme.selection_aware_text_style(selected, theme.text.primary),
+            ),
             Span::styled(
                 truncate(&run.objective, 18),
-                Style::default().fg(theme.text.primary),
+                theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
         let item = ListItem::new(line);
@@ -511,7 +635,7 @@ fn render_runs_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
 fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let block = pane_block(
         &format!("Approvals ({})", state.pending_approvals.len()),
-        false,
+        state.focus == Pane::Approvals,
         theme,
     );
     let mut lines: Vec<Line> = Vec::new();
@@ -608,12 +732,31 @@ const COMPOSER_HEIGHT: u16 = 2;
 /// in view.
 const COMPOSER_MAX_HEIGHT: u16 = 8;
 
-/// How tall the composer should be this frame: `COMPOSER_HEIGHT` for a
-/// single-line draft — including empty — growing by one row per extra
-/// `\n`-separated line, up to `COMPOSER_MAX_HEIGHT`.
-fn composer_box_height(composer: &str) -> u16 {
-    let lines = composer.split('\n').count() as u16;
-    (lines + 1).clamp(COMPOSER_HEIGHT, COMPOSER_MAX_HEIGHT)
+/// How tall the composer should be this frame. Both explicit newlines and soft
+/// wraps consume rows; the latter is essential on narrow terminals where a
+/// long one-line draft would otherwise be clipped behind the footer.
+fn composer_box_height(composer: &str, terminal_width: u16) -> u16 {
+    let horizontal_margin = if terminal_width >= 72 { 2 } else { 1 };
+    let content_width = terminal_width.saturating_sub(horizontal_margin * 2).max(1);
+    let rows = composer_rendered_rows(composer, content_width);
+    rows.saturating_add(1)
+        .clamp(COMPOSER_HEIGHT, COMPOSER_MAX_HEIGHT)
+}
+
+fn composer_rendered_rows(composer: &str, width: u16) -> u16 {
+    if composer.is_empty() {
+        return 1;
+    }
+    let segments = composer.split('\n').collect::<Vec<_>>();
+    let last = segments.len().saturating_sub(1);
+    segments
+        .iter()
+        .enumerate()
+        .fold(0_u16, |rows, (index, segment)| {
+            let columns = 2 + UnicodeWidthStr::width(*segment) + usize::from(index == last);
+            rows.saturating_add(line_rows(columns, usize::from(width.max(1))))
+        })
+        .max(1)
 }
 
 /// Wrapped-row height of a line `columns` display-columns wide in an
@@ -987,10 +1130,20 @@ fn build_transcript_window<'a>(
 /// model, mode, and cost live in the project header; this surface is reserved
 /// for the task, agent activity, and results.
 fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let inner = area.inner(Margin {
+    let available = area.inner(Margin {
         horizontal: if area.width >= 72 { 3 } else { 1 },
         vertical: 0,
     });
+    // Prose is easier to scan on a stable reading measure. Keep the timeline
+    // centred on wide terminals instead of stretching messages from rail to
+    // rail; compact terminals still use every available column.
+    let reading_width = available.width.min(118);
+    let inner = Rect {
+        x: available.x + available.width.saturating_sub(reading_width) / 2,
+        y: available.y,
+        width: reading_width,
+        height: available.height,
+    };
 
     if state.runs.is_empty() {
         state.transcript_max_scroll.set(0);
@@ -1076,10 +1229,15 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         state.selected_run,
     );
 
-    // Bottom-anchor: when the transcript is shorter than the viewport, pool the
-    // quiet space at the TOP so content sits flush above the composer. `top_pad`
-    // is 0 whenever content overflows, so the follow/scroll path is untouched.
-    let top_pad = inner.height.saturating_sub(content_rows);
+    // A new conversation starts near the top of its reading canvas. Keeping
+    // hundreds of empty rows above the first exchange made the timeline feel
+    // detached from the project header and hid its message hierarchy.
+    // Overflowing transcripts still follow/scroll exactly as before.
+    let top_pad = if content_rows < inner.height {
+        inner.height.saturating_sub(content_rows).min(2)
+    } else {
+        0
+    };
     if top_pad > 0 {
         let mut padded = Vec::with_capacity(top_pad as usize + lines.len());
         padded.resize(top_pad as usize, Line::raw(""));
@@ -1174,7 +1332,9 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     // than the box shows — the box already grew toward `COMPOSER_MAX_HEIGHT`
     // (see `composer_box_height`); this only matters once it's capped there.
     let visible_rows = area.height.saturating_sub(1).max(1);
-    let total_rows = lines.len() as u16;
+    let total_rows = lines.iter().fold(0_u16, |rows, line| {
+        rows.saturating_add(line_rows(line.width(), usize::from(area.width.max(1))))
+    });
     let scroll_y = total_rows.saturating_sub(visible_rows);
 
     frame.render_widget(
@@ -1731,6 +1891,24 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                 hint(" clear"),
             ],
         )
+    } else if !central_remote_ui_is_active(state)
+        && !state
+            .remote_ui
+            .mounted_documents_for_points(TERMINAL_CENTRAL_SLOTS)
+            .is_empty()
+    {
+        state.register_hit(area, Action::RemoteUiSetActive(true));
+        (
+            vec![
+                Span::raw("  "),
+                Span::styled("◇ ", Style::default().fg(theme.focus.active)),
+                Span::styled(
+                    "Extension UI ready",
+                    Style::default().fg(theme.text.secondary),
+                ),
+            ],
+            vec![key("F6"), hint(" focus")],
+        )
     } else if state.selected_run().is_some_and(|run| !run.follow) {
         (
             vec![
@@ -1784,36 +1962,58 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     };
 
     let left_width: usize = left.iter().map(|span| span.width()).sum();
-    let right_width: usize = right.iter().map(|span| span.width()).sum();
-    let pad = (area.width as usize).saturating_sub(left_width + right_width + 2);
+    // Footer hints are emitted as key/description pairs in priority order.
+    // Keep only complete pairs that fit; clipping half a shortcut is noisier
+    // than omitting its lower-priority hint on a compact terminal.
+    let mut packed_right = Vec::new();
+    let mut packed_width = 0_usize;
+    for pair in right.chunks(2) {
+        let pair_width = pair.iter().map(Span::width).sum::<usize>();
+        if left_width + packed_width + pair_width + 2 > usize::from(area.width) {
+            break;
+        }
+        packed_right.extend(pair.iter().cloned());
+        packed_width += pair_width;
+    }
+    let pad = usize::from(area.width).saturating_sub(left_width + packed_width + 2);
     let mut spans = left;
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.extend(right);
+    spans.extend(packed_right);
     spans.push(Span::raw("  "));
 
     frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
 }
 
 fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let has_modal = !matches!(state.overlay, Overlay::None) || state.show_approval_modal();
+    if has_modal {
+        // Apply a real visual scrim to the already-painted base. Every modal
+        // clears/repaints its own rectangle afterward, so foreground content
+        // remains crisp while the conversation recedes.
+        frame
+            .buffer_mut()
+            .set_style(area, Style::default().add_modifier(Modifier::DIM));
+    }
     // The modal scrim: registered FIRST (bottom of the overlay z-order) so it
     // sits beneath every overlay's own rows, registered by the arms below —
     // `hit_test` resolves to the topmost (last-registered) rect, so a click
     // inside the overlay still resolves to its row, not the scrim. The
-    // approval modal (the `Overlay::None` + pending-approval branch) gets no
-    // scrim — it is a decision the operator must make explicitly.
+    // approval modal (the `Overlay::None` + pending-approval branch) gets the
+    // visual dimming above but no dismiss action: the operator must decide it.
     if !matches!(state.overlay, Overlay::None) {
         state.register_hit(area, Action::Dismiss);
     }
     match &state.overlay {
-        Overlay::Help => render_help(frame, area, theme),
+        Overlay::Help => render_help(frame, area, state, theme),
         Overlay::Issues => render_issues(frame, area, state, theme),
         Overlay::NewRun(buffer) => {
-            render_prompt(frame, area, theme, "New run objective", buffer);
+            render_prompt(frame, area, state, theme, "New run objective", buffer);
         }
         Overlay::Steering(buffer) => {
             render_prompt(
                 frame,
                 area,
+                state,
                 theme,
                 "Steer the run (queued for a safe point)",
                 buffer,
@@ -1825,14 +2025,16 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         } => render_prompt(
             frame,
             area,
+            state,
             theme,
             &format!("Inputs for {workflow_id} (JSON object; blank = {{}})"),
             buffer,
         ),
-        Overlay::ConfirmCancel => render_confirm(frame, area, theme),
+        Overlay::ConfirmCancel => render_confirm(frame, area, state, theme),
         Overlay::ConfirmWorkflowCancel { workflow_run_id } => render_confirm_box(
             frame,
             area,
+            state,
             theme,
             "Cancel this workflow run?",
             &format!(
@@ -1851,6 +2053,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             render_prompt(
                 frame,
                 area,
+                state,
                 theme,
                 "Search code-graph symbols / relations (blank = all)",
                 buffer,
@@ -1862,6 +2065,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::ConfirmUiPluginApprove { plugin_id, receipt } => render_confirm_box(
             frame,
             area,
+            state,
             theme,
             "Approve this verified permission update?",
             &format!("plugin {plugin_id} · exact receipt {receipt}"),
@@ -1869,6 +2073,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::ConfirmUiPluginReject { plugin_id, receipt } => render_confirm_box(
             frame,
             area,
+            state,
             theme,
             "Reject this verified permission update?",
             &format!("plugin {plugin_id} · exact receipt {receipt}"),
@@ -1876,6 +2081,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::ConfirmUiPluginRevoke { plugin_id } => render_confirm_box(
             frame,
             area,
+            state,
             theme,
             "Revoke this Remote UI plugin?",
             &format!("Stops every active worker for {plugin_id}"),
@@ -1908,7 +2114,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                         .to_owned()
                 }
             };
-            render_masked_prompt(frame, area, theme, &title, &buffer.0);
+            render_masked_prompt(frame, area, state, theme, &title, &buffer.0);
         }
         Overlay::ApiKeyRemoveConfirm { target } => {
             let (what, effect) = match target {
@@ -1921,7 +2127,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                     "web.search stops using it immediately (env fallback may remain).",
                 ),
             };
-            render_confirm_box(frame, area, theme, &what, effect);
+            render_confirm_box(frame, area, state, theme, &what, effect);
         }
         // The block-edit prompt floats over the Docs browser it opened from, so the
         // editor stays in view while the writer types the insertion.
@@ -1930,6 +2136,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             render_prompt(
                 frame,
                 area,
+                state,
                 theme,
                 "Insert text into the focused block",
                 buffer,
@@ -1940,18 +2147,27 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             render_prompt(
                 frame,
                 area,
+                state,
                 theme,
                 "Publish to repository Markdown path (approval required)",
                 buffer,
             );
         }
         Overlay::AddModelId { buffer, .. } => {
-            render_prompt(frame, area, theme, "Model name (provider-side id)", buffer);
+            render_prompt(
+                frame,
+                area,
+                state,
+                theme,
+                "Model name (provider-side id)",
+                buffer,
+            );
         }
         Overlay::AddModelKey { buffer, .. } => {
             render_masked_prompt(
                 frame,
                 area,
+                state,
                 theme,
                 "API key (stored locally, mode 0600)",
                 &buffer.0,
@@ -1964,6 +2180,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             render_masked_prompt(
                 frame,
                 area,
+                state,
                 theme,
                 &format!(
                     "API key for {provider_id} (used to list its models; stored locally 0600)"
@@ -1972,7 +2189,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             );
         }
         Overlay::AddModelQuerying { provider_id, .. } => {
-            render_querying(frame, area, theme, provider_id);
+            render_querying(frame, area, state, theme, provider_id);
         }
         Overlay::AddModelPick {
             provider_id,
@@ -2005,6 +2222,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
 /// failures without trying to parse errors into control flow.
 fn render_issues(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rect = centered_rect_min(82, 76, 60, 14, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -2049,12 +2267,15 @@ fn render_issues(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         let item = ListItem::new(Line::from(vec![
             Span::styled(
                 if selected { "› " } else { "  " },
-                Style::default().fg(theme.focus.active),
+                theme.selection_aware_text_style(selected, theme.focus.active),
             ),
-            Span::styled("! ", Style::default().fg(theme.status.warning)),
+            Span::styled(
+                "! ",
+                theme.selection_aware_text_style(selected, theme.status.warning),
+            ),
             Span::styled(
                 truncate(issue, cols[0].width.saturating_sub(5) as usize),
-                Style::default().fg(theme.text.primary),
+                theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]));
         items.push(if selected {
@@ -2150,6 +2371,7 @@ fn issue_guidance(issue: &str) -> &'static str {
 /// spoofed by the extension whose authority they govern.
 fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rect = centered_rect(90, 86, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -2206,11 +2428,11 @@ fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         let head = Line::from(vec![
             Span::styled(
                 if selected { "› " } else { "  " },
-                Style::default().fg(theme.focus.active),
+                theme.selection_aware_text_style(selected, theme.focus.active),
             ),
             Span::styled(
                 format!("{} v{}", truncate(&plugin.id, 24), plugin.version),
-                Style::default().fg(theme.text.primary),
+                theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
         let meta = Line::styled(
@@ -2222,7 +2444,7 @@ fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
                     .as_ref()
                     .map_or_else(String::new, |scope| format!(" · {scope}"))
             ),
-            Style::default().fg(theme.text.muted),
+            theme.selection_aware_text_style(selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, meta]);
         items.push(if selected {
@@ -2236,15 +2458,9 @@ fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         cols[0],
     );
     for (screen_row, index) in (first..state.ui_plugins.len()).take(visible).enumerate() {
-        state.register_hit(
-            Rect {
-                x: cols[0].x,
-                y: cols[0].y + screen_row as u16 * ROW_LINES as u16,
-                width: cols[0].width,
-                height: ROW_LINES as u16,
-            },
-            Action::ActivateRow(index),
-        );
+        if let Some(hit) = visible_row_hit(cols[0], screen_row, ROW_LINES as u16) {
+            state.register_hit(hit, Action::ActivateRow(index));
+        }
     }
 
     let detail = Block::default()
@@ -2316,6 +2532,7 @@ fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
 /// **permissions verbatim**. Colors are Theme tokens only (RULE 7).
 fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rect = centered_rect(84, 84, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
 
     let outer = Block::default()
@@ -2369,15 +2586,18 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         let selected = idx == state.selected_skill;
         let marker = if selected { "› " } else { "  " };
         let head = Line::from(vec![
-            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                marker,
+                theme.selection_aware_text_style(selected, theme.focus.active),
+            ),
             Span::styled(
                 truncate(&skill.name, 26),
-                Style::default().fg(theme.text.primary),
+                theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
         let meta = Line::styled(
             format!("    {} · {} · {}", skill.scope, skill.trust, skill.status),
-            Style::default().fg(theme.text.muted),
+            theme.selection_aware_text_style(selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, meta]);
         items.push(if selected {
@@ -2391,15 +2611,9 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         list_area,
     );
     for (screen_row, idx) in (first..state.skills.len()).take(visible_rows).enumerate() {
-        state.register_hit(
-            Rect {
-                x: list_area.x,
-                y: list_area.y + screen_row as u16 * ROW_LINES as u16,
-                width: list_area.width,
-                height: ROW_LINES as u16,
-            },
-            Action::ActivateRow(idx),
-        );
+        if let Some(hit) = visible_row_hit(list_area, screen_row, ROW_LINES as u16) {
+            state.register_hit(hit, Action::ActivateRow(idx));
+        }
     }
 
     // Right: the detail panel for the focused skill.
@@ -2522,47 +2736,27 @@ fn render_model_picker(
     query: &str,
     selected: usize,
 ) {
-    let rect = centered_rect(84, 84, area);
-    frame.render_widget(Clear, rect);
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" Model picker ({}) ", state.models.len()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
+    let matches = filter_models(&state.models, query);
+    let rect = centered_modal(area, 124, 34);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!(
+            "Model picker  ·  {} of {} available",
+            matches.len(),
+            state.models.len()
+        ),
+        state,
+        theme,
+    );
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(inner);
+    render_modal_search(frame, rows[0], query, theme);
 
-    // The filter line, with a block cursor so it reads as an input (the
-    // command palette's shape).
-    let filter = Line::from(vec![
-        Span::styled("› ", Style::default().fg(theme.focus.active)),
-        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
-        Span::styled("▏", Style::default().fg(theme.focus.active)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(filter).style(Style::default().bg(theme.surface.overlay)),
-        rows[0],
-    );
-
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(rows[1]);
+    let (list_region, detail_region) = picker_regions(rows[1]);
 
     // The active run's serving model, if any — marks the current row/detail.
     let current = state.selected_run().and_then(|run| run.model.as_ref());
@@ -2570,8 +2764,9 @@ fn render_model_picker(
     // Left: the filtered model list (id, current marker, provider + badges).
     // Each row is 3 lines tall; window the list around `selected` so it scrolls.
     const ROW_LINES: usize = 3;
-    let list_area = cols[0];
-    let matches = filter_models(&state.models, query);
+    let list_block = modal_panel("Models", theme);
+    let list_area = list_block.inner(list_region);
+    frame.render_widget(list_block, list_region);
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(selected, matches.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
@@ -2597,17 +2792,20 @@ fn render_model_picker(
         };
         let head = Line::from(vec![
             Span::styled(
-                if is_selected { "› " } else { "  " },
-                Style::default().fg(theme.focus.active),
+                if is_selected { "▎ " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.focus.active),
             ),
             Span::styled(
                 if is_current { "● " } else { "  " },
-                Style::default().fg(theme.status.success),
+                theme.selection_aware_text_style(is_selected, theme.status.success),
             ),
-            Span::styled(readiness, Style::default().fg(readiness_color)),
             Span::styled(
-                truncate(&card.id.0, 24),
-                Style::default().fg(theme.text.primary),
+                readiness,
+                theme.selection_aware_text_style(is_selected, readiness_color),
+            ),
+            Span::styled(
+                truncate_display_width(&card.id.0, usize::from(list_area.width.saturating_sub(6))),
+                theme.selection_aware_text_style(is_selected, theme.text.primary),
             ),
         ]);
         // Provider and badges each get their own line (rather than one long
@@ -2615,11 +2813,11 @@ fn render_model_picker(
         // truncating the trailing badges off a narrow terminal.
         let provider_line = Line::styled(
             format!("      {}", card.provider),
-            Style::default().fg(theme.text.muted),
+            theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
         let badges_line = Line::styled(
             format!("      {}", model_badges(card)),
-            Style::default().fg(theme.text.muted),
+            theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, provider_line, badges_line]);
         items.push(if is_selected {
@@ -2629,33 +2827,21 @@ fn render_model_picker(
         });
     }
     frame.render_widget(
-        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
         list_area,
     );
     // Each visible row is a fixed 3 lines tall (head/provider/badges) — register
     // a rect of that height per rendered row (offset by the scroll window) so a
     // click maps to the right index even after the list has scrolled.
     for (row, _) in matches.iter().enumerate().skip(first) {
-        let y = list_area.y + ((row - first) as u16) * ROW_LINES as u16;
-        if y >= list_area.y + list_area.height {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
             break;
-        }
-        state.register_hit(
-            Rect {
-                x: list_area.x,
-                y,
-                width: list_area.width,
-                height: ROW_LINES as u16,
-            },
-            Action::ActivateRow(row),
-        );
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
     }
 
     // Right: the detail panel for the focused model.
-    let detail_block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(Style::default().fg(theme.focus.inactive))
-        .style(Style::default().bg(theme.surface.overlay));
+    let detail_block = modal_panel("Model details", theme);
     let mut lines: Vec<Line> = Vec::new();
     if let Some(card) = state.focused_model() {
         let is_current = current == Some(&card.id);
@@ -2732,12 +2918,14 @@ fn render_model_picker(
         "  ↑/↓ select · Enter stage · Esc close",
         Style::default().fg(theme.text.muted),
     ));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(detail_block)
-            .wrap(Wrap { trim: false }),
-        cols[1],
-    );
+    if let Some(detail_area) = detail_region {
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(detail_block)
+                .wrap(Wrap { trim: false }),
+            detail_area,
+        );
+    }
 }
 
 /// A model card's badges, space-joined: `local ✓` / `hosted` (or nothing when
@@ -2788,53 +2976,35 @@ fn render_provider_picker(
     query: &str,
     selected: usize,
 ) {
-    let rect = centered_rect(84, 84, area);
-    frame.render_widget(Clear, rect);
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" Provider catalog ({}) ", state.providers.len()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
+    let matches = filter_providers(&state.providers, query);
+    let rect = centered_modal(area, 124, 36);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!(
+            "Provider catalog  ·  {} of {} adapters",
+            matches.len(),
+            state.providers.len()
+        ),
+        state,
+        theme,
+    );
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(inner);
+    render_modal_search(frame, rows[0], query, theme);
 
-    // The filter line, with a block cursor so it reads as an input (the
-    // command palette's shape).
-    let filter = Line::from(vec![
-        Span::styled("› ", Style::default().fg(theme.focus.active)),
-        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
-        Span::styled("▏", Style::default().fg(theme.focus.active)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(filter).style(Style::default().bg(theme.surface.overlay)),
-        rows[0],
-    );
+    let (list_region, detail_region) = picker_regions(rows[1]);
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(rows[1]);
-
-    // Left: the filtered provider list (id, name + badges). Each row is 4 lines
+    // Left: the filtered provider list (id, name + protocol, location + auth).
+    // Each row is 3 lines
     // tall; window the list around `selected` so a long catalog scrolls.
-    const ROW_LINES: usize = 4;
-    let list_area = cols[0];
-    let matches = filter_providers(&state.providers, query);
+    const ROW_LINES: usize = 3;
+    let list_block = modal_panel("Providers", theme);
+    let list_area = list_block.inner(list_region);
+    frame.render_widget(list_block, list_region);
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(selected, matches.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
@@ -2854,39 +3024,41 @@ fn render_provider_picker(
         let is_selected = row == selected;
         let head = Line::from(vec![
             Span::styled(
-                if is_selected { "› " } else { "  " },
-                Style::default().fg(theme.focus.active),
+                if is_selected { "▎ " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.focus.active),
             ),
             Span::styled(
                 if card.available { "✓ " } else { "○ " },
-                Style::default().fg(if card.available {
-                    theme.status.success
-                } else {
-                    theme.text.muted
-                }),
+                theme.selection_aware_text_style(
+                    is_selected,
+                    if card.available {
+                        theme.status.success
+                    } else {
+                        theme.text.muted
+                    },
+                ),
             ),
             Span::styled(
-                truncate(&card.id, 26),
-                Style::default().fg(theme.text.primary),
+                truncate_display_width(&card.id, usize::from(list_area.width.saturating_sub(4))),
+                theme.selection_aware_text_style(is_selected, theme.text.primary),
             ),
         ]);
-        // The name, the protocol/location badges, and the auth summary each
-        // get their own line (rather than one long joined line), mirroring
-        // the model picker's list rows, so they survive the fixed-width
-        // column without truncating trailing detail off a narrow terminal.
+        // Keep the catalog dense enough to browse: availability is encoded by
+        // the leading glyph, while the two supporting rows retain the provider
+        // name, protocol, location, and auth requirement.
         let name_line = Line::styled(
-            format!("      {}", card.name),
-            Style::default().fg(theme.text.muted),
+            format!("      {} · {}", card.name, card.protocol),
+            theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
-        let badges_line = Line::styled(
-            format!("      {}", provider_badges(card)),
-            Style::default().fg(theme.text.muted),
+        let metadata_line = Line::styled(
+            format!(
+                "      {} · {}",
+                provider_location_label(card.local),
+                card.auth
+            ),
+            theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
-        let auth_line = Line::styled(
-            format!("      {}", card.auth),
-            Style::default().fg(theme.text.muted),
-        );
-        let item = ListItem::new(vec![head, name_line, badges_line, auth_line]);
+        let item = ListItem::new(vec![head, name_line, metadata_line]);
         items.push(if is_selected {
             item.style(theme.selection_style())
         } else {
@@ -2894,33 +3066,21 @@ fn render_provider_picker(
         });
     }
     frame.render_widget(
-        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
         list_area,
     );
-    // Each visible row is a fixed 4 lines tall (head/name/badges/auth) —
+    // Each visible row is a fixed 3 lines tall (head/name+protocol/metadata) —
     // register a rect of that height per rendered row (offset by the scroll
     // window) so a click maps to the right index even after the list scrolled.
     for (row, _) in matches.iter().enumerate().skip(first) {
-        let y = list_area.y + ((row - first) as u16) * ROW_LINES as u16;
-        if y >= list_area.y + list_area.height {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
             break;
-        }
-        state.register_hit(
-            Rect {
-                x: list_area.x,
-                y,
-                width: list_area.width,
-                height: ROW_LINES as u16,
-            },
-            Action::ActivateRow(row),
-        );
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
     }
 
     // Right: the detail panel for the focused provider.
-    let detail_block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(Style::default().fg(theme.focus.inactive))
-        .style(Style::default().bg(theme.surface.overlay));
+    let detail_block = modal_panel("Provider details", theme);
     let mut lines: Vec<Line> = Vec::new();
     if let Some(card) = state.focused_provider() {
         lines.push(Line::from(vec![Span::styled(
@@ -2984,12 +3144,14 @@ fn render_provider_picker(
         "  ↑/↓ select · Enter/Tab add model · Esc close",
         Style::default().fg(theme.text.muted),
     ));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(detail_block)
-            .wrap(Wrap { trim: false }),
-        cols[1],
-    );
+    if let Some(detail_area) = detail_region {
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(detail_block)
+                .wrap(Wrap { trim: false }),
+            detail_area,
+        );
+    }
 }
 
 /// The mode picker (PR C2 — plan mode): the same filter-line + list shape as
@@ -3006,49 +3168,46 @@ fn render_mode_picker(
     query: &str,
     selected: usize,
 ) {
-    let rect = centered_rect_min(60, 50, 52, 15, area);
-    frame.render_widget(Clear, rect);
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" Mode picker ({}) ", crate::state::MODE_CARDS.len()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
+    let matches = filter_modes(query);
+    let rect = centered_modal(area, 72, 18);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!(
+            "Mode picker  ·  {} of {} modes",
+            matches.len(),
+            crate::state::MODE_CARDS.len()
+        ),
+        state,
+        theme,
+    );
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(inner);
-
-    // The filter line, with a block cursor so it reads as an input (the
-    // command palette's shape).
-    let filter = Line::from(vec![
-        Span::styled("› ", Style::default().fg(theme.focus.active)),
-        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
-        Span::styled("▏", Style::default().fg(theme.focus.active)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(filter).style(Style::default().bg(theme.surface.overlay)),
-        rows[0],
-    );
+    render_modal_search(frame, rows[0], query, theme);
 
     // The filtered mode list: each row is 2 lines tall (label, summary), the
     // current default marked ●. The modal has an absolute minimum height so all
     // five rows fit on an ordinary 80x24 terminal.
     const ROW_LINES: usize = 2;
-    let list_area = rows[1];
-    let matches = filter_modes(query);
+    let list_block = modal_panel(
+        format!(
+            "Modes  ·  {} of {}",
+            matches.len(),
+            crate::state::MODE_CARDS.len()
+        ),
+        theme,
+    );
+    let list_area = list_block.inner(rows[1]);
+    frame.render_widget(list_block, rows[1]);
+    let visible_rows = (usize::from(list_area.height) / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if matches.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -3056,24 +3215,27 @@ fn render_mode_picker(
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (row, &idx) in matches.iter().enumerate() {
+    for (row, &idx) in matches.iter().enumerate().skip(first) {
         let card = &crate::state::MODE_CARDS[idx];
         let is_selected = row == selected;
         let is_current = card.mode == state.default_mode;
         let head = Line::from(vec![
             Span::styled(
-                if is_selected { "› " } else { "  " },
-                Style::default().fg(theme.focus.active),
+                if is_selected { "▎ " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.focus.active),
             ),
             Span::styled(
                 if is_current { "● " } else { "  " },
-                Style::default().fg(theme.status.success),
+                theme.selection_aware_text_style(is_selected, theme.status.success),
             ),
-            Span::styled(card.label, Style::default().fg(theme.text.primary)),
+            Span::styled(
+                card.label,
+                theme.selection_aware_text_style(is_selected, theme.text.primary),
+            ),
         ]);
         let summary_line = Line::styled(
             format!("      {}", card.summary),
-            Style::default().fg(theme.text.muted),
+            theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, summary_line]);
         items.push(if is_selected {
@@ -3083,26 +3245,25 @@ fn render_mode_picker(
         });
     }
     frame.render_widget(
-        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
         list_area,
     );
     // Each visible row is a fixed 2 lines tall (label/summary) — register a
     // rect of that height per row so a click maps to the right index.
-    for (row, _) in matches.iter().enumerate() {
-        let y = list_area.y + (row as u16) * ROW_LINES as u16;
-        if y >= list_area.y + list_area.height {
+    for (row, _) in matches.iter().enumerate().skip(first) {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
             break;
-        }
-        state.register_hit(
-            Rect {
-                x: list_area.x,
-                y,
-                width: list_area.width,
-                height: ROW_LINES as u16,
-            },
-            Action::ActivateRow(row),
-        );
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
     }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ select  ·  Enter use  ·  Esc close",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
 }
 
 /// The `/keys` overlay (D1): the same filter-line + list shape as
@@ -3121,53 +3282,37 @@ fn render_api_keys(
     query: &str,
     selected: usize,
 ) {
-    let rect = centered_rect_min(60, 50, 52, 12, area);
-    frame.render_widget(Clear, rect);
-
     let matches = filter_key_rows(&state.models, query);
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" API keys ({}) ", matches.len()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
+    let total = state.models.len().saturating_add(1);
+    let rect = centered_modal(area, 84, 24);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!("API keys  ·  {} of {} entries", matches.len(), total),
+        state,
+        theme,
+    );
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(inner);
-
-    // The filter line, with a block cursor so it reads as an input (the
-    // command palette's shape).
-    let filter = Line::from(vec![
-        Span::styled("› ", Style::default().fg(theme.focus.active)),
-        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
-        Span::styled("▏", Style::default().fg(theme.focus.active)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(filter).style(Style::default().bg(theme.surface.overlay)),
-        rows[0],
-    );
+    render_modal_search(frame, rows[0], query, theme);
 
     // The filtered row list: each row is 2 lines tall (glyph + id, provider ·
     // status detail), windowed around the selection so a long model list
     // scrolls (the model picker's shape).
     const ROW_LINES: usize = 2;
-    let list_area = rows[1];
+    let list_block = modal_panel(
+        format!("Credentials  ·  {} of {}", matches.len(), total),
+        theme,
+    );
+    let list_area = list_block.inner(rows[1]);
+    frame.render_widget(list_block, rows[1]);
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(selected, matches.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
@@ -3200,15 +3345,21 @@ fn render_api_keys(
         let is_selected = row == selected;
         let head = Line::from(vec![
             Span::styled(
-                if is_selected { "› " } else { "  " },
-                Style::default().fg(theme.focus.active),
+                if is_selected { "▎ " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.focus.active),
             ),
-            Span::styled(format!("{glyph} "), Style::default().fg(glyph_color)),
-            Span::styled(label, Style::default().fg(theme.text.primary)),
+            Span::styled(
+                format!("{glyph} "),
+                theme.selection_aware_text_style(is_selected, glyph_color),
+            ),
+            Span::styled(
+                truncate_display_width(&label, usize::from(list_area.width.saturating_sub(4))),
+                theme.selection_aware_text_style(is_selected, theme.text.primary),
+            ),
         ]);
         let detail_line = Line::styled(
             format!("      {provider} · {detail}"),
-            Style::default().fg(theme.text.muted),
+            theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, detail_line]);
         items.push(if is_selected {
@@ -3218,32 +3369,24 @@ fn render_api_keys(
         });
     }
     frame.render_widget(
-        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
         list_area,
     );
     // Each visible row is a fixed 2 lines tall (head/detail) — register a rect
     // of that height per rendered row (offset by the scroll window) so a click
     // maps to the right index even after the list scrolled.
     for (row, _) in matches.iter().enumerate().skip(first) {
-        let y = list_area.y + ((row - first) as u16) * ROW_LINES as u16;
-        if y >= list_area.y + list_area.height {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
             break;
-        }
-        state.register_hit(
-            Rect {
-                x: list_area.x,
-                y,
-                width: list_area.width,
-                height: ROW_LINES as u16,
-            },
-            Action::ActivateRow(row),
-        );
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
     }
 
     let hint = Line::styled(
-        "  ↑/↓ select · Enter set/replace · Delete remove · Esc close",
+        "↑/↓ select · Enter set/replace · Delete remove · Esc close",
         Style::default().fg(theme.text.muted),
-    );
+    )
+    .alignment(Alignment::Center);
     frame.render_widget(
         Paragraph::new(hint).style(Style::default().bg(theme.surface.overlay)),
         rows[2],
@@ -3268,8 +3411,16 @@ fn key_status_render(status: &KeyStatus, theme: &Theme) -> (&'static str, Color,
 /// A small yes/no confirm box in the [`render_confirm`] shape, parameterized
 /// so run/workflow cancellation and `/keys` removal share a compact, responsive
 /// shape. Text is key-free by construction (it names a target, never a value).
-fn render_confirm_box(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, detail: &str) {
+fn render_confirm_box(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    title: &str,
+    detail: &str,
+) {
     let rect = centered_rect_min(60, 20, 48, 7, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
     let lines = vec![
         Line::styled(
@@ -3301,22 +3452,6 @@ fn render_confirm_box(frame: &mut Frame, area: Rect, theme: &Theme, title: &str,
     );
 }
 
-/// A provider card's badges, space-joined: its protocol and local/hosted
-/// location — mirrors [`model_badges`], adapted to [`ProviderCard`] fields
-/// (a provider has no measured cost/context, so those columns are omitted).
-fn provider_badges(card: &ProviderCard) -> String {
-    format!(
-        "{} · {} · {}",
-        card.protocol,
-        provider_location_label(card.local),
-        if card.available {
-            "supported"
-        } else {
-            "preview"
-        }
-    )
-}
-
 fn provider_location_label(local: bool) -> &'static str {
     if local {
         "local ✓"
@@ -3338,6 +3473,7 @@ fn render_memory(
     source_open: bool,
 ) {
     let rect = centered_rect(84, 84, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
 
     let outer = Block::default()
@@ -3391,15 +3527,18 @@ fn render_memory(
         let selected = idx == state.selected_memory;
         let marker = if selected { "› " } else { "  " };
         let head = Line::from(vec![
-            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                marker,
+                theme.selection_aware_text_style(selected, theme.focus.active),
+            ),
             Span::styled(
                 truncate(&memory.statement, 26),
-                Style::default().fg(theme.text.primary),
+                theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
         let meta = Line::styled(
             format!("    {} · {}", memory.class, memory.scope),
-            Style::default().fg(theme.text.muted),
+            theme.selection_aware_text_style(selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, meta]);
         items.push(if selected {
@@ -3413,15 +3552,9 @@ fn render_memory(
         list_area,
     );
     for (screen_row, idx) in (first..state.memories.len()).take(visible_rows).enumerate() {
-        state.register_hit(
-            Rect {
-                x: list_area.x,
-                y: list_area.y + screen_row as u16 * ROW_LINES as u16,
-                width: list_area.width,
-                height: ROW_LINES as u16,
-            },
-            Action::ActivateRow(idx),
-        );
+        if let Some(hit) = visible_row_hit(list_area, screen_row, ROW_LINES as u16) {
+            state.register_hit(hit, Action::ActivateRow(idx));
+        }
     }
 
     // Right: the provenance card for the focused memory.
@@ -3530,6 +3663,7 @@ fn render_memory(
 /// this surface. Colors are Theme tokens only (RULE 7).
 fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rect = centered_rect(86, 86, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
 
     let outer = Block::default()
@@ -3578,15 +3712,18 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let selected = idx == state.selected_doc;
         let marker = if selected { "› " } else { "  " };
         let head = Line::from(vec![
-            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                marker,
+                theme.selection_aware_text_style(selected, theme.focus.active),
+            ),
             Span::styled(
                 truncate(&doc.title, 28),
-                Style::default().fg(theme.text.primary),
+                theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
         let meta = Line::styled(
             format!("    {} · {} · {}", doc.scope, doc.status, doc.mode),
-            Style::default().fg(theme.text.muted),
+            theme.selection_aware_text_style(selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, meta]);
         items.push(if selected {
@@ -3600,15 +3737,9 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         list_area,
     );
     for (screen_row, idx) in (first..state.docs.len()).take(visible_rows).enumerate() {
-        state.register_hit(
-            Rect {
-                x: list_area.x,
-                y: list_area.y + screen_row as u16 * ROW_LINES as u16,
-                width: list_area.width,
-                height: ROW_LINES as u16,
-            },
-            Action::SelectDocument(idx),
-        );
+        if let Some(hit) = visible_row_hit(list_area, screen_row, ROW_LINES as u16) {
+            state.register_hit(hit, Action::SelectDocument(idx));
+        }
     }
 
     // Right: the editor rail (blocks) over the review rail (suggestions).
@@ -3838,7 +3969,17 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 /// evidence kind + source, and revision on the right — the evidence-and-revision
 /// payload the criterion calls for. Colors are Theme tokens only (RULE 7).
 fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let rect = centered_rect(86, 86, area);
+    if state.edge_loading && state.edges.is_empty() && state.edge_total == 0 {
+        render_loading_edges(frame, area, state, theme);
+        return;
+    }
+    if state.edges.is_empty() && state.edge_total == 0 {
+        render_empty_edges(frame, area, state, theme);
+        return;
+    }
+
+    let rect = centered_modal(area, 132, 36);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
 
     let first_match = if state.edge_total == 0 {
@@ -3901,10 +4042,13 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         let selected = idx == state.selected_edge;
         let marker = if selected { "› " } else { "  " };
         let head = Line::from(vec![
-            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                marker,
+                theme.selection_aware_text_style(selected, theme.focus.active),
+            ),
             Span::styled(
                 truncate(&edge.relation, 14),
-                Style::default().fg(theme.text.secondary),
+                theme.selection_aware_text_style(selected, theme.text.secondary),
             ),
         ]);
         let meta = Line::styled(
@@ -3913,7 +4057,7 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
                 truncate(&edge.from, 16),
                 truncate(&edge.to, 16)
             ),
-            Style::default().fg(theme.text.muted),
+            theme.selection_aware_text_style(selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, meta]);
         items.push(if selected {
@@ -3927,15 +4071,9 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         cols[0],
     );
     for (screen_row, idx) in (first..state.edges.len()).take(visible_rows).enumerate() {
-        state.register_hit(
-            Rect {
-                x: list_area.x,
-                y: list_area.y + screen_row as u16 * ROW_LINES as u16,
-                width: list_area.width,
-                height: ROW_LINES as u16,
-            },
-            Action::ActivateRow(idx),
-        );
+        if let Some(hit) = visible_row_hit(list_area, screen_row, ROW_LINES as u16) {
+            state.register_hit(hit, Action::ActivateRow(idx));
+        }
     }
 
     // Right: the detail for the focused edge — relation, confidence, and the
@@ -4030,6 +4168,105 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     }
 }
 
+fn render_loading_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let rect = centered_modal(area, 64, 11);
+    let inner = modal_surface(frame, rect, "Code graph", state, theme);
+    let spinner = SPINNER[(state.tick as usize) % SPINNER.len()];
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(spinner.to_string(), Style::default().fg(theme.agent.tool)),
+            Line::raw(""),
+            Line::styled(
+                "Loading code graph…",
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::styled(
+                if state.edge_query.is_empty() {
+                    "Reading indexed repository relationships"
+                } else {
+                    "Applying the current graph filter"
+                },
+                Style::default().fg(theme.text.muted),
+            ),
+        ])
+        .alignment(Alignment::Center),
+        inner,
+    );
+}
+
+fn render_empty_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_modal(area, 78, 15);
+    let inner = modal_surface(frame, rect, "Code graph", state, theme);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let (title, description) = if state.edge_query.is_empty() {
+        (
+            "No relationships indexed yet",
+            "Edges appear here as Codypendent gathers evidence across the repository.",
+        )
+    } else {
+        (
+            "No matching relationships",
+            "Try a symbol, file, or relation with a broader search.",
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled("◇", Style::default().fg(theme.focus.active)),
+            Line::raw(""),
+            Line::styled(
+                title,
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::styled(description, Style::default().fg(theme.text.secondary)),
+        ])
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true }),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "/ search  ·  Esc close",
+            Style::default().fg(theme.focus.active),
+        ))
+        .alignment(Alignment::Center),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "Search by symbol, file, or relation",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
+
+    state.register_hit(rows[1], Action::OpenPalette);
+    state.register_hit(
+        Rect {
+            x: rows[1].x + rows[1].width / 2,
+            y: rows[1].y,
+            width: rows[1].width / 2,
+            height: 1,
+        },
+        Action::Dismiss,
+    );
+}
+
 /// The workflow-graph view (Phase 5 STEP 5.2, exit criterion 3): a list of the
 /// compiled workflow's nodes on the left — grouped by workflow, in topological
 /// order — and, for the focused node, its action, state, agent, workspace,
@@ -4038,6 +4275,7 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
 /// retried from the selected node, or cancelled. Colors are Theme tokens only.
 fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rect = centered_rect(86, 86, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
 
     let outer = Block::default()
@@ -4093,25 +4331,31 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         let marker = if selected { "› " } else { "  " };
         let mut lines = vec![Line::styled(
             truncate(&node.workflow, 36),
-            Style::default()
-                .fg(theme.text.heading)
+            theme
+                .selection_aware_text_style(selected, theme.text.heading)
                 .add_modifier(Modifier::BOLD),
         )];
         lines.push(Line::from(vec![
-            Span::styled(marker, Style::default().fg(theme.focus.active)),
+            Span::styled(
+                marker,
+                theme.selection_aware_text_style(selected, theme.focus.active),
+            ),
             Span::styled(
                 truncate(&node.id, 20),
-                Style::default().fg(theme.text.primary),
+                theme.selection_aware_text_style(selected, theme.text.primary),
             ),
-            Span::raw("  "),
+            Span::styled(
+                "  ",
+                theme.selection_aware_text_style(selected, theme.text.primary),
+            ),
             Span::styled(
                 node.state.clone(),
-                Style::default().fg(node_state_color(&node.state, theme)),
+                theme.selection_aware_text_style(selected, node_state_color(&node.state, theme)),
             ),
         ]));
         lines.push(Line::styled(
             format!("    {}", truncate(&node.action, 34)),
-            Style::default().fg(theme.text.muted),
+            theme.selection_aware_text_style(selected, theme.text.muted),
         ));
         let item = ListItem::new(lines);
         items.push(if selected {
@@ -4125,15 +4369,9 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         list_area,
     );
     for (screen_row, idx) in (first..state.workflow.len()).take(visible_rows).enumerate() {
-        state.register_hit(
-            Rect {
-                x: list_area.x,
-                y: list_area.y + screen_row as u16 * ROW_LINES as u16,
-                width: list_area.width,
-                height: ROW_LINES as u16,
-            },
-            Action::ActivateRow(idx),
-        );
+        if let Some(hit) = visible_row_hit(list_area, screen_row, ROW_LINES as u16) {
+            state.register_hit(hit, Action::ActivateRow(idx));
+        }
     }
 
     // Right: the detail for the focused node — the exit-criterion payload
@@ -4268,6 +4506,7 @@ fn node_state_color(state: &str, theme: &Theme) -> Color {
 /// summary on the right. Read-only. Colors are Theme tokens only (RULE 7).
 fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rect = centered_rect(86, 86, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
 
     let outer = Block::default()
@@ -4322,8 +4561,8 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         let marker = if selected { "› " } else { "  " };
         let mut lines = vec![Line::styled(
             truncate(&card.run, 36),
-            Style::default()
-                .fg(theme.text.heading)
+            theme
+                .selection_aware_text_style(selected, theme.text.heading)
                 .add_modifier(Modifier::BOLD),
         )];
         // A superseded artifact is dimmed; the live one reads normally.
@@ -4333,17 +4572,29 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
             theme.status.info
         };
         lines.push(Line::from(vec![
-            Span::styled(marker, Style::default().fg(theme.focus.active)),
-            Span::styled(truncate(&card.kind, 16), Style::default().fg(kind_color)),
+            Span::styled(
+                marker,
+                theme.selection_aware_text_style(selected, theme.focus.active),
+            ),
+            Span::styled(
+                truncate(&card.kind, 16),
+                theme.selection_aware_text_style(selected, kind_color),
+            ),
             if card.superseded {
-                Span::styled(" (superseded)", Style::default().fg(theme.text.muted))
+                Span::styled(
+                    " (superseded)",
+                    theme.selection_aware_text_style(selected, theme.text.muted),
+                )
             } else {
-                Span::raw("")
+                Span::styled(
+                    "",
+                    theme.selection_aware_text_style(selected, theme.text.primary),
+                )
             },
         ]));
         lines.push(Line::styled(
             format!("    {}", truncate(&card.summary, 34)),
-            Style::default().fg(theme.text.muted),
+            theme.selection_aware_text_style(selected, theme.text.muted),
         ));
         let item = ListItem::new(lines);
         items.push(if selected {
@@ -4360,15 +4611,9 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         .take(visible_rows)
         .enumerate()
     {
-        state.register_hit(
-            Rect {
-                x: list_area.x,
-                y: list_area.y + screen_row as u16 * ROW_LINES as u16,
-                width: list_area.width,
-                height: ROW_LINES as u16,
-            },
-            Action::ActivateRow(idx),
-        );
+        if let Some(hit) = visible_row_hit(list_area, screen_row, ROW_LINES as u16) {
+            state.register_hit(hit, Action::ActivateRow(idx));
+        }
     }
 
     // Right: the detail for the focused artifact — kind, author, confidence, the
@@ -4497,55 +4742,35 @@ fn render_palette(
     query: &str,
     selected: usize,
 ) {
-    let rect = centered_rect(72, 70, area);
-    frame.render_widget(Clear, rect);
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " Command palette ",
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
+    let matches = crate::palette::filtered(query);
+    let rect = centered_modal(area, 112, 30);
+    let inner = modal_surface(frame, rect, "Command palette", state, theme);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
-        .split(inner);
-
-    // The filter line, with a block cursor so it reads as an input.
-    let filter = Line::from(vec![
-        Span::styled("› ", Style::default().fg(theme.focus.active)),
-        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
-        Span::styled("▏", Style::default().fg(theme.focus.active)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(vec![
-            filter,
-            Line::styled(
-                "  ↑/↓ select · Enter run · Esc close · click a row",
-                Style::default().fg(theme.text.muted),
-            ),
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
         ])
-        .style(Style::default().bg(theme.surface.overlay)),
-        rows[0],
-    );
+        .split(inner);
+    render_modal_search(frame, rows[0], query, theme);
 
     // The filtered command list: name / description / shortcut columns,
     // grouped into contiguous sections (a dim label row per group) when the
     // query is empty — filtering flattens the groups away since matches can
     // straddle them.
-    let matches = crate::palette::filtered(query);
-    let inner_w = rows[1].width as usize;
+    let results_block = modal_panel(
+        format!(
+            "Commands  ·  {} of {} results",
+            matches.len(),
+            crate::palette::COMMANDS.len()
+        ),
+        theme,
+    );
+    let list_area = results_block.inner(rows[1]);
+    frame.render_widget(results_block, rows[1]);
+    let inner_w = list_area.width as usize;
     let title_w = 20usize;
     let key_w = 4usize;
     // marker(2) + title + space + description(fill) + key
@@ -4560,7 +4785,6 @@ fn render_palette(
         Command(usize, &'a crate::palette::PaletteEntry),
     }
 
-    let list_area = rows[1];
     let mut visual_rows = Vec::with_capacity(matches.len() + 4);
     let mut last_group: Option<&str> = None;
     for (idx, entry) in matches.iter().enumerate() {
@@ -4595,7 +4819,7 @@ fn render_palette(
             ))),
             PaletteVisualRow::Command(idx, entry) => {
                 let is_selected = *idx == selected;
-                let marker = if is_selected { "› " } else { "  " };
+                let marker = if is_selected { "▎ " } else { "  " };
                 // Unbound commands (`key == "—"`) show nothing in the shortcut
                 // column — never a fake `[—]` marker.
                 let key = if entry.key == "—" {
@@ -4604,21 +4828,34 @@ fn render_palette(
                     format!("{:>width$}", entry.key, width = key_w)
                 };
                 let head = Line::from(vec![
-                    Span::styled(marker, Style::default().fg(theme.focus.active)),
                     Span::styled(
-                        format!("{:<width$}", entry.title, width = title_w),
-                        Style::default().fg(theme.text.primary),
+                        marker,
+                        theme.selection_aware_text_style(is_selected, theme.focus.active),
                     ),
-                    Span::raw(" "),
+                    Span::styled(
+                        format!(
+                            "{:<width$}",
+                            truncate_display_width(entry.title, title_w),
+                            width = title_w
+                        ),
+                        theme.selection_aware_text_style(is_selected, theme.text.primary),
+                    ),
+                    Span::styled(
+                        " ",
+                        theme.selection_aware_text_style(is_selected, theme.text.primary),
+                    ),
                     Span::styled(
                         format!(
                             "{:<width$}",
                             truncate(entry.description, desc_w),
                             width = desc_w
                         ),
-                        Style::default().fg(theme.text.muted),
+                        theme.selection_aware_text_style(is_selected, theme.text.muted),
                     ),
-                    Span::styled(key, Style::default().fg(theme.status.info)),
+                    Span::styled(
+                        key,
+                        theme.selection_aware_text_style(is_selected, theme.status.info),
+                    ),
                 ]);
                 let item = ListItem::new(head);
                 items.push(if is_selected {
@@ -4630,22 +4867,24 @@ fn render_palette(
         }
     }
     frame.render_widget(
-        List::new(items).style(Style::default().bg(theme.surface.overlay)),
-        rows[1],
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
+        list_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ select  ·  Enter run  ·  Esc close  ·  click a row",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
     );
 
     // Register only the command rows in the exact visual slice rendered above.
     for (screen_row, row) in visual_rows[first..last].iter().enumerate() {
         if let PaletteVisualRow::Command(command_index, _) = row {
-            state.register_hit(
-                Rect {
-                    x: list_area.x,
-                    y: list_area.y + screen_row as u16,
-                    width: list_area.width,
-                    height: 1,
-                },
-                Action::ActivateRow(*command_index),
-            );
+            if let Some(hit) = visible_row_hit(list_area, screen_row, 1) {
+                state.register_hit(hit, Action::ActivateRow(*command_index));
+            }
         }
     }
 }
@@ -4677,6 +4916,7 @@ fn render_approval_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
         return;
     };
     let rect = centered_rect(70, 60, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -4737,8 +4977,9 @@ fn render_approval_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
     );
 }
 
-fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
+fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rect = centered_rect(70, 80, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::styled(
@@ -4792,8 +5033,16 @@ fn render_help(frame: &mut Frame, area: Rect, theme: &Theme) {
     );
 }
 
-fn render_prompt(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, buffer: &str) {
+fn render_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    title: &str,
+    buffer: &str,
+) {
     let rect = centered_rect_min(70, 20, 48, 7, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
     let lines = vec![
         Line::styled(title, Style::default().fg(theme.text.heading)),
@@ -4826,8 +5075,16 @@ fn render_prompt(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, buff
 /// Like [`render_prompt`] but renders the buffer MASKED (one `•` per character),
 /// so a secret (an API key) is never shown on screen. The buffer is itself a
 /// redacting newtype, so it also cannot leak through `Debug`.
-fn render_masked_prompt(frame: &mut Frame, area: Rect, theme: &Theme, title: &str, buffer: &str) {
+fn render_masked_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    title: &str,
+    buffer: &str,
+) {
     let rect = centered_rect_min(70, 20, 48, 7, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
     let masked: String = "•".repeat(buffer.chars().count());
     let lines = vec![
@@ -4862,7 +5119,13 @@ fn render_masked_prompt(frame: &mut Frame, area: Rect, theme: &Theme, title: &st
 /// GETs the provider's `/models` list (model-discovery). Non-interactive except
 /// `Esc`, which cancels the wait. Colors are Theme tokens only (RULE 7). The key
 /// is NOT in scope here (the overlay's `api_key` field is dropped via `..`).
-fn render_querying(frame: &mut Frame, area: Rect, theme: &Theme, provider_id: &str) {
+fn render_querying(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    provider_id: &str,
+) {
     // Compact two-line progress state; the absolute minimum keeps the content
     // visible on short terminals.
     let lines = vec![
@@ -4873,6 +5136,7 @@ fn render_querying(frame: &mut Frame, area: Rect, theme: &Theme, provider_id: &s
         Line::styled("Esc to cancel", Style::default().fg(theme.text.muted)),
     ];
     let rect = centered_rect_min(70, 20, 44, 5, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4905,42 +5169,39 @@ fn render_add_model_pick(
     query: &str,
     selected: usize,
 ) {
-    let rect = centered_rect(84, 84, area);
-    frame.render_widget(Clear, rect);
-
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" Add a model from {provider_id} ({}) ", models.len()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
+    let matches = filter_model_names(models, query);
+    let rect = centered_modal(area, 84, 24);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!(
+            "Add model · {}  ·  {} of {} results",
+            truncate_display_width(provider_id, 24),
+            matches.len(),
+            models.len()
+        ),
+        state,
+        theme,
+    );
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(inner);
+    render_modal_search(frame, rows[0], query, theme);
 
-    let filter = Line::from(vec![
-        Span::styled("› ", Style::default().fg(theme.focus.active)),
-        Span::styled(query.to_owned(), Style::default().fg(theme.text.primary)),
-        Span::styled("▏", Style::default().fg(theme.focus.active)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(filter).style(Style::default().bg(theme.surface.overlay)),
-        rows[0],
+    let list_block = modal_panel(
+        format!("Models  ·  {} of {}", matches.len(), models.len()),
+        theme,
     );
-
-    let matches = filter_model_names(models, query);
+    let list_area = list_block.inner(rows[1]);
+    frame.render_widget(list_block, rows[1]);
+    let visible_rows = usize::from(list_area.height).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if models.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -4953,16 +5214,19 @@ fn render_add_model_pick(
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (row, &idx) in matches.iter().enumerate() {
+    for (row, &idx) in matches.iter().enumerate().skip(first) {
         let is_selected = row == selected;
         let head = Line::from(vec![
             Span::styled(
-                if is_selected { "› " } else { "  " },
-                Style::default().fg(theme.focus.active),
+                if is_selected { "▎ " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.focus.active),
             ),
             Span::styled(
-                truncate(&models[idx], 40),
-                Style::default().fg(theme.text.primary),
+                truncate_display_width(
+                    &models[idx],
+                    usize::from(list_area.width.saturating_sub(2)),
+                ),
+                theme.selection_aware_text_style(is_selected, theme.text.primary),
             ),
         ]);
         let item = ListItem::new(vec![head]);
@@ -4973,30 +5237,29 @@ fn render_add_model_pick(
         });
     }
     frame.render_widget(
-        List::new(items).style(Style::default().bg(theme.surface.overlay)),
-        rows[1],
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
+        list_area,
     );
     // Each row is a single line — register a 1-row rect per filtered row.
-    let list_area = rows[1];
-    for (row, _) in matches.iter().enumerate() {
-        let y = list_area.y + row as u16;
-        if y >= list_area.y + list_area.height {
+    for (row, _) in matches.iter().enumerate().skip(first) {
+        let Some(hit) = visible_row_hit(list_area, row - first, 1) else {
             break;
-        }
-        state.register_hit(
-            Rect {
-                x: list_area.x,
-                y,
-                width: list_area.width,
-                height: 1,
-            },
-            Action::ActivateRow(row),
-        );
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
     }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ select  ·  Enter add  ·  Esc close",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
 }
 
-fn render_confirm(frame: &mut Frame, area: Rect, theme: &Theme) {
+fn render_confirm(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rect = centered_rect_min(60, 20, 48, 7, area);
+    shield_modal(state, rect);
     frame.render_widget(Clear, rect);
     let lines = vec![
         Line::styled(
@@ -5190,6 +5453,210 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
+/// A centered modal with a stable reading width and height. Percentage-sized
+/// overlays grow into nearly full-screen debug panes on wide terminals; a
+/// character cap keeps them feeling like focused tools while still shrinking
+/// safely to an 80x24 terminal.
+fn centered_modal(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
+    let width = preferred_width.min(area.width.saturating_sub(4)).max(1);
+    let height = preferred_height.min(area.height.saturating_sub(2)).max(1);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Paint the common modal surface and return its content rectangle. The solid
+/// body, rounded outline, and one-cell shadow give every picker the same visual
+/// depth without relying on terminal transparency or per-screen decoration.
+fn modal_surface(
+    frame: &mut Frame,
+    rect: Rect,
+    title: impl Into<String>,
+    state: &AppState,
+    theme: &Theme,
+) -> Rect {
+    shield_modal(state, rect);
+    if rect.width > 1 && rect.height > 1 {
+        let shadow = Rect {
+            x: rect.x.saturating_add(1),
+            y: rect.y.saturating_add(1),
+            width: rect.width,
+            height: rect.height,
+        }
+        .intersection(frame.area());
+        frame.render_widget(Clear, shadow);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(theme.surface.background)),
+            shadow,
+        );
+    }
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            format!(" {} ", title.into()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    inner
+}
+
+fn modal_panel<'a>(title: impl Into<String>, theme: &Theme) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            format!(" {} ", title.into()),
+            Style::default()
+                .fg(theme.text.secondary)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.surface.border))
+        .style(Style::default().bg(theme.surface.panel))
+}
+
+fn render_modal_search(frame: &mut Frame, area: Rect, query: &str, theme: &Theme) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            " Search ",
+            Style::default().fg(theme.text.muted),
+        ))
+        .border_style(Style::default().fg(theme.surface.border))
+        .style(Style::default().bg(theme.surface.panel));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let value_width = usize::from(inner.width.saturating_sub(6));
+    let value = if query.is_empty() {
+        Span::styled(
+            truncate_display_width("Type to filter…", value_width),
+            Style::default().fg(theme.text.muted),
+        )
+    } else {
+        Span::styled(
+            tail_window(query, value_width),
+            Style::default().fg(theme.text.primary),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  ⌕  ", Style::default().fg(theme.focus.active)),
+            value,
+            Span::styled("▏", Style::default().fg(theme.focus.active)),
+        ])),
+        inner,
+    );
+}
+
+fn shield_modal(state: &AppState, rect: Rect) {
+    if rect.width > 0 && rect.height > 0 {
+        state.register_hit(rect, Action::NoOp);
+    }
+}
+
+fn visible_row_hit(area: Rect, screen_row: usize, row_lines: u16) -> Option<Rect> {
+    let offset = u16::try_from(screen_row)
+        .unwrap_or(u16::MAX)
+        .saturating_mul(row_lines);
+    let y = area.y.saturating_add(offset);
+    if area.width == 0 || y >= area.bottom() {
+        return None;
+    }
+    Some(Rect {
+        x: area.x,
+        y,
+        width: area.width,
+        height: row_lines.min(area.bottom().saturating_sub(y)),
+    })
+}
+
+fn picker_regions(area: Rect) -> (Rect, Option<Rect>) {
+    const TWO_COLUMN_MIN_WIDTH: u16 = 88;
+    if area.width >= TWO_COLUMN_MIN_WIDTH {
+        let cols = Layout::horizontal([
+            Constraint::Percentage(40),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(area);
+        return (cols[0], Some(cols[2]));
+    }
+    if area.height >= 12 {
+        let detail_height = area.height.saturating_div(3).clamp(5, 7);
+        let rows = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(detail_height),
+        ])
+        .split(area);
+        (rows[0], Some(rows[2]))
+    } else {
+        (area, None)
+    }
+}
+
+fn truncate_display_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width == 1 {
+        return "…".to_owned();
+    }
+    let mut width = 0;
+    let mut value = String::new();
+    for grapheme in UnicodeSegmentation::graphemes(text, true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > max_width - 1 {
+            break;
+        }
+        value.push_str(grapheme);
+        width += grapheme_width;
+    }
+    value.push('…');
+    value
+}
+
+fn tail_window(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width == 1 {
+        return "…".to_owned();
+    }
+    let mut tail = Vec::new();
+    let mut width = 0;
+    for grapheme in UnicodeSegmentation::graphemes(text, true).rev() {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > max_width - 1 {
+            break;
+        }
+        tail.push(grapheme);
+        width += grapheme_width;
+    }
+    tail.reverse();
+    format!("…{}", tail.concat())
+}
+
 /// A centered percentage rectangle with an absolute content-driven minimum,
 /// capped to the available terminal. Percentage-only modals collapse to four
 /// rows at 80x24 (20% of 24), clipping prompts and confirmation buttons.
@@ -5351,7 +5818,59 @@ mod tests {
         assert_eq!(first_visible_row(20, 40, 10), 15); // centered (20 - 10/2)
         assert_eq!(first_visible_row(39, 40, 10), 30); // pinned to last window
     }
-    use crate::state::{MemoryCard, ModelCard, ModelLocationLabel, Pane, SkillCard};
+
+    #[test]
+    fn compact_picker_regions_stack_detail_below_the_list() {
+        let compact = Rect::new(0, 0, 70, 15);
+        let (list, detail) = picker_regions(compact);
+        let detail = detail.expect("compact picker retains a short detail panel");
+        assert_eq!(list.x, detail.x);
+        assert!(detail.y > list.y, "detail must stack below the list");
+        assert!(list.bottom() <= detail.y);
+
+        let wide = Rect::new(0, 0, 100, 20);
+        let (list, detail) = picker_regions(wide);
+        let detail = detail.expect("wide picker has a detail rail");
+        assert_eq!(list.y, detail.y);
+        assert!(detail.x > list.x, "wide detail must sit beside the list");
+    }
+
+    #[test]
+    fn visible_row_hits_never_escape_the_painted_list() {
+        let list = Rect::new(4, 8, 20, 5);
+        assert_eq!(visible_row_hit(list, 0, 3), Some(Rect::new(4, 8, 20, 3)));
+        assert_eq!(
+            visible_row_hit(list, 1, 3),
+            Some(Rect::new(4, 11, 20, 2)),
+            "the partially visible final row is clamped to the list bottom"
+        );
+        assert_eq!(visible_row_hit(list, 2, 3), None);
+    }
+
+    #[test]
+    fn long_search_values_keep_the_tail_and_cursor_side_visible() {
+        let query = "provider/very-long-model-name-with-a-useful-tail";
+        let window = tail_window(query, 18);
+        assert!(window.starts_with('…'));
+        assert!(window.ends_with("useful-tail"));
+        assert!(UnicodeWidthStr::width(window.as_str()) <= 18);
+
+        let emoji = tail_window("prefix-👩🏽‍💻-selected", 12);
+        assert!(UnicodeWidthStr::width(emoji.as_str()) <= 12);
+        assert!(emoji.ends_with("selected"));
+    }
+
+    #[test]
+    fn composer_height_accounts_for_soft_wraps() {
+        let draft = "x".repeat(100);
+        assert_eq!(composer_box_height(&draft, 120), COMPOSER_HEIGHT);
+        assert!(composer_box_height(&draft, 40) >= 4);
+        assert_eq!(
+            composer_box_height(&"x".repeat(1_000), 40),
+            COMPOSER_MAX_HEIGHT
+        );
+    }
+    use crate::state::{MemoryCard, ModelCard, ModelLocationLabel, Pane, ProviderCard, SkillCard};
     use chrono::Utc;
     use codypendent_protocol::{
         Actor, ApprovalId, ArtifactId, ArtifactRef, ChangeSetId, DataClassification, EventBody,
@@ -5386,10 +5905,163 @@ mod tests {
 
     fn render_to_string(state: &AppState, w: u16, h: u16) -> String {
         let theme = Theme::dark();
+        buffer_text(&render_buffer(state, w, h, &theme))
+    }
+
+    fn render_buffer(state: &AppState, w: u16, h: u16, theme: &Theme) -> Buffer {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| render(f, state, &theme)).expect("draw");
-        buffer_text(terminal.backend().buffer())
+        terminal.draw(|f| render(f, state, theme)).expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn selected_picker_children_use_the_selection_foreground_in_every_theme() {
+        let mut state = AppState::new();
+        state.models = vec![ModelCard {
+            id: ModelId("provider/a-model-with-supporting-metadata".to_owned()),
+            provider: "Example Provider".to_owned(),
+            readiness: ModelReadiness::Ready,
+            location: Some(ModelLocationLabel::Hosted),
+            cost_per_1k_usd: Some(0.03),
+            context_tokens: Some(128_000),
+        }];
+        state.overlay = Overlay::ModelPicker {
+            query: String::new(),
+            selected: 0,
+        };
+
+        for theme in [
+            Theme::dark(),
+            Theme::light(),
+            Theme::high_contrast(),
+            Theme::color_blind_safe(),
+            Theme::ansi256(),
+            Theme::ansi16(),
+            Theme::monochrome(),
+        ] {
+            let buffer = render_buffer(&state, 100, 30, &theme);
+            let mut selected_cells = 0;
+            for cell in buffer.content() {
+                if cell.bg == theme.selection.background && !cell.symbol().trim().is_empty() {
+                    selected_cells += 1;
+                    assert_eq!(
+                        cell.fg,
+                        theme.selection.foreground,
+                        "selected child {:?} kept an unsafe foreground in theme {theme:?}",
+                        cell.symbol()
+                    );
+                }
+            }
+            assert!(
+                selected_cells >= 12,
+                "expected head and two supporting lines to be selected in {theme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rendered_modal_muted_cells_meet_wcag_contrast_in_dark_and_light_themes() {
+        fn luminance(color: Color) -> f64 {
+            let Color::Rgb(r, g, b) = color else {
+                panic!("this regression test uses true-color themes")
+            };
+            let linear = |channel: u8| {
+                let value = f64::from(channel) / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+        }
+        fn contrast(foreground: Color, background: Color) -> f64 {
+            let foreground = luminance(foreground);
+            let background = luminance(background);
+            (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+        }
+
+        let mut state = AppState::new();
+        state.overlay = Overlay::ModePicker {
+            query: String::new(),
+            selected: 0,
+        };
+        for theme in [Theme::dark(), Theme::light()] {
+            let buffer = render_buffer(&state, 100, 30, &theme);
+            let mut checked = 0;
+            for cell in buffer.content() {
+                if cell.fg == theme.text.muted
+                    && (cell.bg == theme.surface.panel || cell.bg == theme.surface.overlay)
+                    && !cell.symbol().trim().is_empty()
+                {
+                    checked += 1;
+                    let ratio = contrast(cell.fg, cell.bg);
+                    assert!(
+                        ratio >= 4.5,
+                        "rendered {:?} has only {ratio:.2}:1 contrast in {theme:?}",
+                        cell.symbol()
+                    );
+                }
+            }
+            assert!(
+                checked >= 10,
+                "expected actual muted modal cells in {theme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modal_scrim_dims_the_base_and_the_interior_shields_click_through() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::ModePicker {
+            query: String::new(),
+            selected: 0,
+        };
+        let theme = Theme::dark();
+        let buffer = render_buffer(&state, 100, 30, &theme);
+        let rect = centered_modal(Rect::new(0, 0, 100, 30), 72, 18);
+        assert!(
+            buffer[(0, 2)].modifier.contains(Modifier::DIM),
+            "the native surface outside the modal must be visibly dimmed"
+        );
+        assert!(
+            !buffer[(rect.x + 2, rect.y + 2)]
+                .modifier
+                .contains(Modifier::DIM),
+            "the repainted modal interior must stay crisp"
+        );
+
+        let resolve = |x, y| {
+            state
+                .hit_map
+                .borrow()
+                .iter()
+                .rev()
+                .find(|(hit, _)| x >= hit.x && x < hit.right() && y >= hit.y && y < hit.bottom())
+                .map(|(_, action)| action.clone())
+        };
+        assert_eq!(
+            resolve(rect.right() - 2, rect.bottom() - 2),
+            Some(Action::NoOp),
+            "unused modal interior must not dismiss or activate the base"
+        );
+        assert_eq!(resolve(0, 2), Some(Action::Dismiss));
+    }
+
+    #[test]
+    fn a_soft_wrapped_composer_keeps_its_cursor_visible() {
+        let mut state = AppState::new();
+        state.composer = "a long narrow draft ".repeat(12);
+        let text = render_to_string(&state, 40, 18);
+        assert!(
+            text.contains('▏'),
+            "composer cursor scrolled out of view:\n{text}"
+        );
+        assert_eq!(
+            composer_box_height(&state.composer, 40),
+            COMPOSER_MAX_HEIGHT
+        );
     }
 
     fn running_build_state() -> AppState {
@@ -5483,6 +6155,30 @@ mod tests {
         assert!(
             !text.contains("approval"),
             "zero approvals should stay out of the primary shell:\n{text}"
+        );
+    }
+
+    #[test]
+    fn wide_conversation_uses_a_centered_reading_measure() {
+        let state = running_build_state();
+        let wide = render_to_string(&state, 160, 40);
+        let wide_user = wide
+            .lines()
+            .find(|line| line.trim_start().starts_with("You"))
+            .expect("user turn rendered");
+        assert!(
+            wide_user.len() - wide_user.trim_start().len() >= 20,
+            "wide prose should be centred instead of spanning the terminal:\n{wide}"
+        );
+
+        let compact = render_to_string(&state, 80, 24);
+        let compact_user = compact
+            .lines()
+            .find(|line| line.trim_start().starts_with("You"))
+            .expect("compact user turn rendered");
+        assert!(
+            compact_user.len() - compact_user.trim_start().len() <= 4,
+            "compact terminals should retain nearly all available width:\n{compact}"
         );
     }
 
@@ -5686,6 +6382,35 @@ mod tests {
         assert!(
             !text.contains("0.9.0+abc1234"),
             "workspace uses the same quiet project header:\n{text}"
+        );
+    }
+
+    #[test]
+    fn workspace_collapses_to_the_focused_pane_below_110_columns() {
+        let mut state = running_build_state();
+        state.layout = LayoutMode::Workspace;
+        state.focus = Pane::Transcript;
+        let transcript = render_to_string(&state, 100, 28);
+        assert!(transcript.contains("Conversation"));
+        assert!(!transcript.contains("Runs (1)"));
+        assert!(!transcript.contains("Approvals (0)"));
+
+        state.focus = Pane::Sessions;
+        let sessions = render_to_string(&state, 100, 28);
+        assert!(sessions.contains("Runs (1)"));
+        assert!(!sessions.contains("Conversation"));
+
+        state.focus = Pane::Transcript;
+        let wide = render_buffer(&state, 140, 32, &Theme::dark());
+        let text = buffer_text(&wide);
+        assert!(text.contains("Runs (1)"));
+        assert!(text.contains("Conversation"));
+        assert!(text.contains("Approvals (0)"));
+        let transcript_x = 140 * 26 / 100;
+        assert_eq!(
+            wide[(transcript_x, 1)].fg,
+            Theme::dark().focus.active,
+            "the focused transcript border should be visually active"
         );
     }
 
@@ -7417,9 +8142,6 @@ mod tests {
 
     #[test]
     fn provider_picker_snapshot_shows_rows_and_badges() {
-        // `ProviderCard` is already in scope via the module's own `use
-        // crate::state::{..., ProviderCard, ...}` (unlike `GraphEdgeCard`
-        // below, which needs its own local import).
         let mut state = running_build_state();
         state.providers = vec![
             ProviderCard {
@@ -7554,7 +8276,7 @@ mod tests {
             "the selected final row must scroll into view:\n{text}"
         );
         assert!(
-            text.contains("› New conversation"),
+            text.contains("▎ New conversation"),
             "the visible final row must remain selected:\n{text}"
         );
     }
@@ -7572,7 +8294,7 @@ mod tests {
             assert!(text.contains(label), "the {label} row is clipped:\n{text}");
         }
         assert!(
-            text.contains("›   Review"),
+            text.contains("▎   Review"),
             "Review stays selected:\n{text}"
         );
     }
@@ -7819,7 +8541,7 @@ mod tests {
         };
         let text = render_to_string(&state, 100, 30);
         assert!(
-            text.contains("Add a model from groq"),
+            text.contains("Add model · groq"),
             "the pick-list title:\n{text}"
         );
         assert!(
@@ -7890,6 +8612,60 @@ mod tests {
             Action::ScrollPageDown,
             Action::Dismiss,
         ] {
+            assert!(
+                hits.iter()
+                    .any(|(rect, registered)| registered == &action && rect.width > 0),
+                "{action:?} needs a non-empty mouse hit target"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_code_graph_is_a_compact_actionable_state() {
+        let mut state = running_build_state();
+        reduce(&mut state, Action::OpenEdges);
+
+        let loading = render_to_string(&state, 160, 50);
+        assert!(
+            loading.contains("Loading code graph…"),
+            "the asynchronous request needs an honest loading state:\n{loading}"
+        );
+        assert!(!loading.contains("No relationships indexed yet"));
+
+        reduce(
+            &mut state,
+            Action::EdgesLoaded {
+                edges: Vec::new(),
+                total: 0,
+                query: String::new(),
+                page: 0,
+            },
+        );
+
+        let text = render_to_string(&state, 160, 50);
+        assert!(
+            text.contains("No relationships indexed yet"),
+            "purposeful empty-state title:\n{text}"
+        );
+        assert!(
+            text.contains("Edges appear here as Codypendent gathers evidence"),
+            "empty-state explanation:\n{text}"
+        );
+        assert!(
+            text.contains("/ search  ·  Esc close"),
+            "empty-state controls:\n{text}"
+        );
+        assert!(
+            !text.contains("no edges in this repository"),
+            "the old debug-style placeholder must be gone:\n{text}"
+        );
+        assert_eq!(
+            centered_modal(Rect::new(0, 0, 160, 50), 78, 15),
+            Rect::new(41, 17, 78, 15),
+            "the empty state stays a focused card on wide terminals"
+        );
+        let hits = state.hit_map.borrow();
+        for action in [Action::OpenPalette, Action::Dismiss] {
             assert!(
                 hits.iter()
                     .any(|(rect, registered)| registered == &action && rect.width > 0),
@@ -8048,12 +8824,12 @@ mod tests {
         );
     }
 
-    // --- Task 1: transcript virtualization + bottom-anchor + scroll clamp ---
+    // --- Task 1: transcript virtualization + reading flow + scroll clamp ---
 
     #[test]
-    fn a_short_transcript_is_anchored_to_the_bottom() {
-        // One brief turn in a tall viewport: quiet space pools at the TOP, content
-        // sits flush above the composer.
+    fn a_short_transcript_starts_near_the_top() {
+        // One brief turn in a tall viewport: the exchange remains visually tied
+        // to the project header instead of floating just above the composer.
         let mut s = AppState::new();
         let run_id = RunId::new();
         reduce(
@@ -8073,22 +8849,18 @@ mod tests {
         );
         let out = render_to_string(&s, 80, 24);
         let rows: Vec<&str> = out.lines().collect();
-        // The transcript pane is rows[1..] under the 1-row border; its first content
-        // row (row index 1) is blank (top padding), and the reply is in the lower
-        // rows just above the composer. Each row is the pane's full width, so the
-        // pane's own left/right border glyph brackets the content; strip it before
-        // checking for blank padding.
+        // Keep a small breath of space below the header, then begin the turn.
         assert!(
             rows[2].trim_matches('│').trim().is_empty(),
-            "quiet space at the top:\n{out}"
+            "small top inset:\n{out}"
         );
         let reply_row = rows
             .iter()
             .position(|r| r.contains("one short reply"))
             .expect("reply rendered");
         assert!(
-            reply_row > 12,
-            "content anchored toward the bottom (row {reply_row}):\n{out}"
+            reply_row < 10,
+            "content starts near the top (row {reply_row}):\n{out}"
         );
     }
 

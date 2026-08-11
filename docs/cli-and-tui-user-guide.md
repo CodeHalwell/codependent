@@ -1,7 +1,7 @@
 # Codypendent CLI & TUI User Guide
 
 > **Product:** Codypendent — The local-first agentic developer environment
-> **Version:** 0.2.0
+> **Version:** 0.3.0
 > **Documentation Target:** CLI reference, Ratatui TUI shortcuts, environment setup, and workflow operations.
 
 ---
@@ -20,6 +20,9 @@
 ```bash
 # Start an interactive TUI session in the current repository
 codypendent
+
+# Use the cooked, line-oriented accessibility client
+codypendent --accessible # --plain is an equivalent alias
 
 # Run a headless agent run with JSONL event streaming
 codypendent run --objective "Fix failing unit tests in crates/runtime" --mode build --jsonl
@@ -92,6 +95,11 @@ graph LR
 | | `↑` / `↓` or `k` / `j` | Move selection in list / browser / palette | Scroll Wheel |
 | | `PgUp` / `PgDn` | Scroll chat conversation history | Scroll Wheel on Chat |
 | | `Ctrl-↑` / `Ctrl-↓` | Switch to previous / next active run | - |
+| **Remote UI** | `F6` | Enter the mounted extension document without activating a control | Click extension chrome / the "Extension UI ready" footer |
+| | `Shift-F6` | Focus the next mounted extension document | - |
+| | `Tab` / `Shift-Tab` | Move through controls across all mounted documents | Click a control |
+| | `Enter` / `Space` | Activate the focused extension control | Click the control |
+| | `Esc` | Return to the conversation composer | - |
 | **Run Control** | `n` | Start a new run | Click "+ New Run" |
 | | `p` | Pause current run | Click "Pause" |
 | | `c` | Cancel active run | Click "Cancel" |
@@ -110,6 +118,34 @@ graph LR
 | | `B` | Open Agent Blackboard / Claims View | Click Blackboard Tab |
 | | `?` | Toggle Help Overlay | Click Help Button |
 | | `Esc` | Clear draft, exit prompt, or close overlay | - |
+
+---
+
+### 3.3 Cooked accessibility mode (`--accessible` / `--plain`)
+
+Use `codypendent --accessible` (or `codypendent --plain`) with a screen reader,
+a limited terminal, or redirected stdin/stdout. It stays in ordinary cooked
+terminal mode: no alternate screen, raw input, mouse capture, colour escapes,
+Unicode chrome, or cursor-addressed redraws. Each change prints a complete,
+stable, linear snapshot, including extension-provided accessibility text,
+semantic controls, keyboard hints, disabled state, and live-region metadata.
+
+Input is one command per line:
+
+| Command | Effect |
+| :--- | :--- |
+| Any ordinary line | Send it from the conversation composer |
+| `type TEXT` / `send TEXT` | Insert text / insert and submit in the current input surface |
+| `help` or `?` | Show the complete command and key reference |
+| `f6` / `shift-f6` / `esc` | Enter Remote UI / next document / return |
+| `tab` / `backtab` | Move semantic focus forward / backward |
+| `enter` / `space` | Activate the focused control |
+| `up`, `down`, `pageup`, `pagedown` | Navigate the current list or document |
+| `approve`, `approve-run`, `reject` | Resolve the selected approval |
+| `quit` | Detach; the daemon keeps active runs alive |
+
+`COLUMNS` and `LINES` set the viewport advertised to extension components;
+defaults are `80` by `24`.
 
 ---
 

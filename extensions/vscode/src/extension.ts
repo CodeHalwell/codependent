@@ -147,6 +147,30 @@ export function activate(context: vscode.ExtensionContext): void {
           case "remoteUiWire":
             if (isMediatedRuntimeWire(raw.message)) client?.sendRemoteUi(raw.message);
             break;
+          case "remoteUiRecovery": {
+            const action = raw.action;
+            const documentId = raw.documentId;
+            const extensionId = raw.extensionId;
+            const message = raw.message;
+            if ((action !== "disable" && action !== "report")
+              || typeof documentId !== "string" || documentId.length === 0 || documentId.length > 256
+              || typeof message !== "string" || message.length === 0 || message.length > 8_192
+              || (extensionId !== undefined && (typeof extensionId !== "string" || extensionId.length === 0 || extensionId.length > 256))) break;
+            output.appendLine(`[Remote UI ${action}] document=${documentId}${typeof extensionId === "string" ? ` plugin=${extensionId}` : ""}\n${message}`);
+            if (action === "report") {
+              output.show(true);
+              void vscode.window.showInformationMessage("Remote UI diagnostics were written to the Codypendent output channel.");
+            } else if (typeof extensionId === "string") {
+              void vscode.window.showWarningMessage(
+                `Disable Remote UI from ${extensionId}?`,
+                { modal: true, detail: "This revokes the plugin and removes every surface it owns. You can reinstall and approve it later." },
+                "Disable Surface",
+              ).then((choice) => {
+                if (choice === "Disable Surface") client?.revokeUiPlugin(extensionId);
+              });
+            }
+            break;
+          }
           case "remoteUiReady":
             if (isUiRuntimeMessage({ type: "capabilities", capabilities: raw.capabilities }) && Array.isArray(raw.documents) && raw.documents.length <= 1_000) {
               const capabilities = raw.capabilities as UiCapabilities;

@@ -1132,6 +1132,9 @@ pub struct AppState {
     pub edge_page: usize,
     /// Current graph filter query.
     pub edge_query: String,
+    /// Whether an edge page request is in flight. This distinguishes the
+    /// first asynchronous load from a genuinely empty repository/query.
+    pub edge_loading: bool,
     /// Index into `edges` of the focused edge.
     pub selected_edge: usize,
     /// The workflow-graph projection (Phase 5 STEP 5.2): the nodes of the
@@ -1281,6 +1284,7 @@ impl AppState {
             edge_total: 0,
             edge_page: 0,
             edge_query: String::new(),
+            edge_loading: false,
             selected_edge: 0,
             workflow: Vec::new(),
             selected_node: 0,
@@ -1508,6 +1512,7 @@ impl AppState {
         self.history_cursor = None;
         self.doc_edit = None;
         self.overlay = Overlay::None;
+        self.edge_loading = false;
         self.transcript_max_scroll.set(0);
         self.should_detach = false;
     }

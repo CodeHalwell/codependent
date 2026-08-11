@@ -186,7 +186,7 @@ export class DaemonClient extends EventEmitter {
     this.sessionId = options.sessionId;
     this.clientId = options.clientId ?? randomUUID();
     this.clientName = options.clientName ?? "codypendent-vscode";
-    this.clientVersion = options.clientVersion ?? "0.2.0";
+    this.clientVersion = options.clientVersion ?? "0.3.0";
     this.subscriptions = options.subscriptions ?? [
       { type: "SessionSummary" },
       { type: "AgentActivity" },
@@ -288,6 +288,12 @@ export class DaemonClient extends EventEmitter {
       session_id: this.sessionId,
       update,
     });
+  }
+
+  /** Disable a verified Remote UI plugin after explicit host confirmation. */
+  revokeUiPlugin(pluginId: string): void {
+    if (pluginId.length === 0 || pluginId.length > 256) return;
+    this.sendCommand({ type: "RevokeUiPlugin", plugin_id: pluginId }, { queueIfOffline: true });
   }
 
   /**

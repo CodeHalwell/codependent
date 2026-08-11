@@ -1,6 +1,15 @@
 # Remote UI debugging
 
-`codypendent-ui dev` watches source fingerprints, rebuilds the deterministic bundle, starts it under Node permission controls, performs capability negotiation, exercises `hotReload`/`worker.reloaded`, prints the semantic tree, and shuts down cleanly. `inspect --json` prints every decoded inbound and outbound envelope; secrets and environment variables are never supplied to the worker.
+`codypendent-ui dev` (also exposed as `workbench`) keeps a last-valid component report alive while it watches source fingerprints. Each rebuild is an untrusted candidate: it starts under Node permission controls, negotiates the selected target/point/viewport/theme/colour depth, receives inert fixtures, exercises `hotReload`/`worker.reloaded`, validates snapshots and patches, runs `auditAccessibility`, and commits only after clean disposal. Candidate failure prints the rollback reason and preserves the last committed JSON-safe hot-reload state. `inspect --json` prints every decoded inbound and outbound envelope; the only environment supplied to the worker is bounded workbench generation/state data.
+
+For example:
+
+```sh
+codypendent-ui workbench . --target vscode --point workflow-inspector --viewport 72x32 --theme dark --fixture story.json
+codypendent-ui inspect dist/worker.mjs --target terminal --point panel --viewport 80x24 --theme monochrome
+```
+
+The report identifies ignored dimensions/tokens instead of silently pretending every host applied them. It also shows requirements/fallback trees, actual contribution placement, subscription/action fixture traffic, patch revisions, accessibility issues and the ordered protocol trace. Use `--fixture conformance` to compare against the SDK/VS shared structural story.
 
 Common failures:
 
@@ -14,5 +23,8 @@ Common failures:
 - `contributionOwner`: every atomic contribution replacement is owned by `pluginId`; each `extensionId` must match it. Shutdown uses the same owner with an empty list.
 - `heartbeat timeout` or rate failure: coalesce render state, virtualize large lists, avoid handler-only commits, and keep logs on bounded stderr.
 - inspector permission error: bundle dependencies and assets under the package root. The inspector intentionally denies network, writes, child processes, worker threads, and native addons.
+- `point-not-mounted`: the worker declared a different contribution point than the selected workbench. Re-run with the reported `--point`; the tool does not fold every contribution into a generic panel.
+- `ignored-dimension`, `ignored-spacing`, or `unknown-theme-token`: the selected host intentionally fell back to its native layout/theme default. Prefer portable semantic variants or inspect the concrete target that owns the specialization.
+- candidate rolled back: the previous generation remains the reference output. Fix the first build, protocol, validation, initial-render, patch, or accessibility error; state will be offered again to the next candidate.
 
-Validate a captured frame or document with `codypendent-ui validate-json capture.json`. Export the exact installed schema with `codypendent-ui schema`. For visual problems, inspect semantic IDs/props first, then compare terminal, VS Code, and web capability projections; renderers own layout, focus, clipping, Unicode width, and input routing.
+Validate a captured frame or document with `codypendent-ui validate-json capture.json --target vscode`; document validation automatically includes the accessibility and target-DX audit. Export the exact installed schema with `codypendent-ui schema`. For visual problems, inspect semantic IDs/props first, then compare terminal, VS Code, and web capability projections; renderers own layout, focus, clipping, Unicode width, and input routing. In VS Code each document has an independent host error boundary with Retry, confirmed Disable, and Report actions, so one extension surface should fail without replacing healthy siblings.

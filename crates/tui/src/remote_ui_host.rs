@@ -108,7 +108,7 @@ impl Default for RemoteUiHostState {
 impl RemoteUiHostState {
     pub fn new() -> Result<Self, UiSessionError> {
         let limits = UiHardLimits::default();
-        let mut host = UiHostSession::new(terminal_offer(80, 24, 24), limits)?;
+        let mut host = UiHostSession::new(terminal_offer(80, 24, 24, false), limits)?;
         for (slot, trusted_only) in TERMINAL_PUBLIC_SLOTS
             .iter()
             .map(|slot| (*slot, false))
@@ -240,7 +240,18 @@ impl RemoteUiHostState {
 #[must_use]
 pub fn terminal_capabilities_message(width: u16, height: u16, color_depth: u16) -> UiWireMessage {
     let mut message = empty_message("capabilities", format!("capabilities:{}", MessageId::new()));
-    message.capabilities = Some(terminal_offer(width, height, color_depth));
+    message.capabilities = Some(terminal_offer(width, height, color_depth, false));
+    message
+}
+
+/// Capabilities for the cooked `--accessible` shell. It has keyboard input and
+/// the full semantic primitive renderer, but deliberately advertises no mouse,
+/// colour, Unicode chrome, clipboard, or terminal graphics. `screen_reader` is
+/// true so producers can choose their accessible fallback intentionally.
+#[must_use]
+pub fn accessible_terminal_capabilities_message(width: u16, height: u16) -> UiWireMessage {
+    let mut message = empty_message("capabilities", format!("capabilities:{}", MessageId::new()));
+    message.capabilities = Some(terminal_offer(width, height, 1, true));
     message
 }
 
@@ -284,7 +295,7 @@ pub fn empty_message(kind: impl Into<String>, message_id: impl Into<String>) -> 
     }
 }
 
-fn terminal_offer(width: u16, height: u16, color_depth: u16) -> UiCapabilities {
+fn terminal_offer(width: u16, height: u16, color_depth: u16, accessible: bool) -> UiCapabilities {
     let color_depth = match color_depth {
         0..=1 => "monochrome",
         2..=4 => "ansi16",
@@ -300,8 +311,8 @@ fn terminal_offer(width: u16, height: u16, color_depth: u16) -> UiCapabilities {
             audio_capture: false,
             editor_mutations: false,
             diff_view: true,
-            mouse: true,
-            unicode: true,
+            mouse: !accessible,
+            unicode: !accessible,
             true_color: color_depth == "trueColor",
         },
         primitives: advertised_primitive_names()
@@ -311,9 +322,9 @@ fn terminal_offer(width: u16, height: u16, color_depth: u16) -> UiCapabilities {
         media: Vec::<UiMediaCapability>::new(),
         color_depth: UiColorDepth::from(color_depth),
         keyboard: true,
-        screen_reader: false,
-        reduced_motion: false,
-        clipboard: true,
+        screen_reader: accessible,
+        reduced_motion: accessible,
+        clipboard: !accessible,
         terminal_graphics: Vec::new(),
         viewport: UiViewport {
             width: u32::from(width),
@@ -361,7 +372,7 @@ mod tests {
 
     #[test]
     fn terminal_offer_advertises_only_real_public_slot_adapters() {
-        let offer = terminal_offer(120, 40, 24);
+        let offer = terminal_offer(120, 40, 24, false);
         let points: Vec<_> = offer
             .contribution_points
             .iter()
@@ -407,5 +418,22 @@ mod tests {
         let primitives = advertised_primitive_names();
         assert!(!primitives.contains("ApprovalCard"));
         assert!(!primitives.contains("PermissionDiff"));
+    }
+
+    #[test]
+    fn accessible_offer_is_screen_reader_first_and_has_no_terminal_only_input() {
+        let message = accessible_terminal_capabilities_message(72, 20);
+        let offer = message.capabilities.expect("capabilities payload");
+        assert_eq!(offer.viewport.width, 72);
+        assert_eq!(offer.viewport.height, 20);
+        assert_eq!(offer.color_depth.as_str(), "monochrome");
+        assert!(offer.keyboard);
+        assert!(offer.screen_reader);
+        assert!(offer.reduced_motion);
+        assert!(!offer.daemon.mouse);
+        assert!(!offer.daemon.unicode);
+        assert!(!offer.daemon.true_color);
+        assert!(!offer.clipboard);
+        assert!(offer.terminal_graphics.is_empty());
     }
 }

@@ -137,7 +137,7 @@ impl Theme {
             text: TextTokens {
                 primary: Color::Rgb(0xe8, 0xec, 0xf4),
                 secondary: Color::Rgb(0xb2, 0xb9, 0xc8),
-                muted: Color::Rgb(0x70, 0x78, 0x89),
+                muted: Color::Rgb(0x85, 0x8d, 0x9d),
                 heading: Color::Rgb(0xf8, 0xfa, 0xfc),
             },
             status: StatusTokens {
@@ -175,8 +175,8 @@ impl Theme {
                 inactive: Color::Rgb(0x2a, 0x2f, 0x3a),
             },
             selection: SelectionTokens {
-                foreground: Color::Rgb(0x0b, 0x0d, 0x12),
-                background: Color::Rgb(0xa7, 0x8b, 0xfa),
+                foreground: Color::Rgb(0xf8, 0xfa, 0xfc),
+                background: Color::Rgb(0x30, 0x29, 0x4a),
             },
         }
     }
@@ -196,7 +196,7 @@ impl Theme {
             text: TextTokens {
                 primary: Color::Rgb(0x1f, 0x23, 0x28),
                 secondary: Color::Rgb(0x4a, 0x52, 0x5e),
-                muted: Color::Rgb(0x7a, 0x82, 0x91),
+                muted: Color::Rgb(0x62, 0x6b, 0x78),
                 heading: Color::Rgb(0x0d, 0x11, 0x17),
             },
             status: StatusTokens {
@@ -234,8 +234,8 @@ impl Theme {
                 inactive: Color::Rgb(0xd0, 0xd7, 0xde),
             },
             selection: SelectionTokens {
-                foreground: Color::Rgb(0xff, 0xff, 0xff),
-                background: Color::Rgb(0x0a, 0x5a, 0xd0),
+                foreground: Color::Rgb(0x0d, 0x11, 0x17),
+                background: Color::Rgb(0xdd, 0xe9, 0xfb),
             },
         }
     }
@@ -357,8 +357,8 @@ impl Theme {
                 inactive: Color::Rgb(0x3a, 0x40, 0x4a),
             },
             selection: SelectionTokens {
-                foreground: Color::Rgb(0x11, 0x13, 0x17),
-                background: Color::Rgb(0x56, 0xb4, 0xe9),
+                foreground: Color::Rgb(0xf8, 0xfa, 0xfc),
+                background: Color::Rgb(0x20, 0x3c, 0x4f),
             },
         }
     }
@@ -378,7 +378,7 @@ impl Theme {
             text: TextTokens {
                 primary: Color::Indexed(253),
                 secondary: Color::Indexed(250),
-                muted: Color::Indexed(244),
+                muted: Color::Indexed(248),
                 heading: Color::Indexed(255),
             },
             status: StatusTokens {
@@ -416,8 +416,8 @@ impl Theme {
                 inactive: Color::Indexed(240),
             },
             selection: SelectionTokens {
-                foreground: Color::Indexed(234),
-                background: Color::Indexed(75),
+                foreground: Color::Indexed(255),
+                background: Color::Indexed(60),
             },
         }
     }
@@ -477,7 +477,7 @@ impl Theme {
             },
             selection: SelectionTokens {
                 foreground: Color::Black,
-                background: Color::LightBlue,
+                background: Color::Gray,
             },
         }
     }
@@ -616,6 +616,26 @@ impl Theme {
             .bg(self.selection.background)
             .add_modifier(Modifier::BOLD)
     }
+
+    /// Foreground style for content inside a selectable row. Ratatui merges a
+    /// `ListItem` style with each child span, and an explicit child foreground
+    /// wins over the parent. Every selected child therefore has to opt into the
+    /// selection foreground or muted/status text can become indistinguishable
+    /// from a tonal selection background (the original ANSI16 mapping exposed
+    /// this as DarkGray-on-DarkGray).
+    #[must_use]
+    pub fn selection_aware_text_style(&self, selected: bool, foreground: Color) -> Style {
+        let style = Style::default().fg(if selected {
+            self.selection.foreground
+        } else {
+            foreground
+        });
+        if selected {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
+    }
 }
 
 impl Default for Theme {
@@ -707,6 +727,112 @@ pub struct ThemePreferences {
 mod tests {
     use super::*;
 
+    fn color_rgb(color: Color) -> Option<(u8, u8, u8)> {
+        let named = match color {
+            Color::Reset => return None,
+            Color::Black => (0, 0, 0),
+            Color::Red => (128, 0, 0),
+            Color::Green => (0, 128, 0),
+            Color::Yellow => (128, 128, 0),
+            Color::Blue => (0, 0, 128),
+            Color::Magenta => (128, 0, 128),
+            Color::Cyan => (0, 128, 128),
+            Color::Gray => (192, 192, 192),
+            Color::DarkGray => (128, 128, 128),
+            Color::LightRed => (255, 0, 0),
+            Color::LightGreen => (0, 255, 0),
+            Color::LightYellow => (255, 255, 0),
+            Color::LightBlue => (0, 0, 255),
+            Color::LightMagenta => (255, 0, 255),
+            Color::LightCyan => (0, 255, 255),
+            Color::White => (255, 255, 255),
+            Color::Rgb(r, g, b) => (r, g, b),
+            Color::Indexed(index) if index < 16 => {
+                const ANSI: [(u8, u8, u8); 16] = [
+                    (0, 0, 0),
+                    (128, 0, 0),
+                    (0, 128, 0),
+                    (128, 128, 0),
+                    (0, 0, 128),
+                    (128, 0, 128),
+                    (0, 128, 128),
+                    (192, 192, 192),
+                    (128, 128, 128),
+                    (255, 0, 0),
+                    (0, 255, 0),
+                    (255, 255, 0),
+                    (0, 0, 255),
+                    (255, 0, 255),
+                    (0, 255, 255),
+                    (255, 255, 255),
+                ];
+                ANSI[usize::from(index)]
+            }
+            Color::Indexed(index) if index < 232 => {
+                const CUBE: [u8; 6] = [0, 95, 135, 175, 215, 255];
+                let offset = index - 16;
+                (
+                    CUBE[usize::from(offset / 36)],
+                    CUBE[usize::from((offset % 36) / 6)],
+                    CUBE[usize::from(offset % 6)],
+                )
+            }
+            Color::Indexed(index) => {
+                let gray = 8_u8.saturating_add((index - 232).saturating_mul(10));
+                (gray, gray, gray)
+            }
+        };
+        Some(named)
+    }
+
+    fn relative_luminance(color: Color) -> f64 {
+        let (r, g, b) = color_rgb(color).expect("theme colors are explicit");
+        let linear = |channel: u8| {
+            let value = f64::from(channel) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+    }
+
+    fn contrast_ratio(foreground: Color, background: Color) -> f64 {
+        let foreground = relative_luminance(foreground);
+        let background = relative_luminance(background);
+        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    }
+
+    #[test]
+    fn normal_muted_and_selection_text_meet_wcag_aa_in_every_builtin_theme() {
+        for variant in [
+            ThemeVariant::Dark,
+            ThemeVariant::Light,
+            ThemeVariant::HighContrast,
+            ThemeVariant::ColorBlindSafe,
+            ThemeVariant::Ansi256,
+            ThemeVariant::Ansi16,
+            ThemeVariant::Monochrome,
+        ] {
+            let theme = Theme::variant(variant);
+            for background in [theme.surface.panel, theme.surface.overlay] {
+                let ratio = contrast_ratio(theme.text.muted, background);
+                assert!(
+                    ratio >= 4.5,
+                    "{variant:?}: muted text contrast {ratio:.2} against {background:?}"
+                );
+            }
+            let ratio = contrast_ratio(theme.selection.foreground, theme.selection.background);
+            assert!(ratio >= 4.5, "{variant:?}: selection contrast {ratio:.2}");
+            assert_eq!(
+                theme.selection_aware_text_style(true, theme.text.muted).fg,
+                Some(theme.selection.foreground),
+                "{variant:?}: selected child spans must override their normal token"
+            );
+        }
+    }
+
     /// Every variant used by real terminals must keep body text visible against
     /// the panel background, or the UI is unreadable — the core legibility
     /// invariant behind "every variant renders every widget legibly".
@@ -736,6 +862,22 @@ mod tests {
             );
             // A focused pane must be distinguishable from an unfocused one.
             assert_ne!(t.focus.active, t.focus.inactive, "{v:?}: focus indistinct");
+        }
+    }
+
+    #[test]
+    fn everyday_selection_is_tonal_not_the_focus_accent() {
+        for theme in [
+            Theme::dark(),
+            Theme::light(),
+            Theme::color_blind_safe(),
+            Theme::ansi256(),
+            Theme::ansi16(),
+        ] {
+            assert_ne!(
+                theme.selection.background, theme.focus.active,
+                "ordinary list selection must not become a full-strength focus bar"
+            );
         }
     }
 

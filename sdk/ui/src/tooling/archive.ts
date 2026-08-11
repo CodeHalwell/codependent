@@ -21,16 +21,27 @@ function tarHeader(name: string, size: number): Uint8Array {
 
 const EXCLUDED = new Set([".git", "node_modules", ".DS_Store", "plugin.toml"]);
 const MAX_PACKAGE_FILES = 10_000;
+const MAX_PACKAGE_ENTRIES = 20_000;
+const MAX_PACKAGE_DIRECTORIES = 10_000;
 const MAX_PACKAGE_BYTES = 256 * 1024 * 1024;
+const MAX_PACKAGE_ARCHIVE_BYTES = 10 * 1024 * 1024;
 
-async function files(root: string, directory = root): Promise<string[]> {
+interface WalkState { entries: number; directories: number; }
+
+async function files(root: string, directory = root, state: WalkState = { entries: 0, directories: 0 }): Promise<string[]> {
   const result: string[] = [];
   for (const entry of (await readdir(directory, { withFileTypes: true })).sort((left, right) => left.name.localeCompare(right.name))) {
     if (EXCLUDED.has(entry.name) || entry.name.endsWith(".pem") || entry.name.endsWith(".key") || entry.name.endsWith(".cody-ui.tgz")) continue;
     const path = join(directory, entry.name);
     if (directory === root && !["dist", "assets", "package.json", "README.md", "LICENSE", "LICENSE.md"].includes(entry.name)) continue;
+    state.entries += 1;
+    if (state.entries > MAX_PACKAGE_ENTRIES) throw new Error(`package exceeds ${MAX_PACKAGE_ENTRIES} entries`);
     if (entry.isSymbolicLink()) throw new Error(`package cannot contain symlink: ${relative(root, path)}`);
-    if (entry.isDirectory()) result.push(...await files(root, path));
+    if (entry.isDirectory()) {
+      state.directories += 1;
+      if (state.directories > MAX_PACKAGE_DIRECTORIES) throw new Error(`package exceeds ${MAX_PACKAGE_DIRECTORIES} directories`);
+      result.push(...await files(root, path, state));
+    }
     else if (entry.isFile()) result.push(path);
   }
   return result;
@@ -54,7 +65,9 @@ export async function createDeterministicArchive(root: string): Promise<Uint8Arr
     if (padding > 0) chunks.push(new Uint8Array(padding));
   }
   chunks.push(new Uint8Array(1024));
-  return gzipSync(Buffer.concat(chunks), { level: 9 });
+  const archive = gzipSync(Buffer.concat(chunks), { level: 9 });
+  if (archive.byteLength > MAX_PACKAGE_ARCHIVE_BYTES) throw new Error(`compressed package exceeds ${MAX_PACKAGE_ARCHIVE_BYTES} bytes`);
+  return archive;
 }
 
 export function artifactChecksum(artifact: Uint8Array): string {

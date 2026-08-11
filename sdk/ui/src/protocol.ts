@@ -10,22 +10,12 @@ export type UiClientKind = "terminal" | "web" | "vscode" | "desktop" | "test";
 export type ColorDepth = "monochrome" | "ansi16" | "ansi256" | "trueColor";
 export type MediaCapability = "image" | "audio" | "video";
 
-export type UiHostCapability =
-  | "artifact-read" | "context-read" | "run-read" | "workflow-read" | "command-invoke"
-  | (string & {});
-
 /** Host services with complete policy and mediation support in public UI v1. */
 export const UI_HOST_CAPABILITIES = [
   "artifact-read", "context-read", "run-read", "workflow-read", "command-invoke",
-] as const satisfies readonly UiHostCapability[];
+] as const;
 
-export type UiContributionPoint =
-  | "sidebar" | "panel" | "status-item" | "command" | "command-palette"
-  | "composer-accessory" | "message-renderer" | "tool-renderer" | "artifact-renderer"
-  | "workflow-inspector" | "blackboard-renderer" | "document-block" | "code-graph-node"
-  | "settings-section" | "setup-step" | "form" | "wizard" | "dashboard-card"
-  | "trace-span-renderer" | "context-menu" | "quick-pick" | "notification"
-  | (string & {});
+export type UiHostCapability = (typeof UI_HOST_CAPABILITIES)[number] | (string & {});
 
 /** Governed public slots. Security-sensitive host-only slots are intentionally absent. */
 export const UI_CONTRIBUTION_POINTS = [
@@ -34,7 +24,9 @@ export const UI_CONTRIBUTION_POINTS = [
   "workflow-inspector", "blackboard-renderer", "document-block", "code-graph-node",
   "settings-section", "setup-step", "form", "wizard", "dashboard-card",
   "trace-span-renderer", "context-menu", "quick-pick", "notification",
-] as const satisfies readonly UiContributionPoint[];
+] as const;
+
+export type UiContributionPoint = (typeof UI_CONTRIBUTION_POINTS)[number] | (string & {});
 
 /** Cross-process ceilings negotiated with the trusted worker host. */
 export interface UiHardLimits {
@@ -116,17 +108,21 @@ export interface UiViewport {
   density?: number;
 }
 
-export type UiPrimitive =
-  | "Box" | "Stack" | "Row" | "Grid" | "Split" | "Spacer" | "ScrollArea" | "VirtualList"
-  | "Text" | "Markdown" | "Code" | "Diff" | "Image" | "Audio" | "JsonTree" | "LogViewer"
-  | "List" | "Table" | "Tree" | "KeyValue" | "Timeline" | "Graph" | "Chart" | "Sparkline"
-  | "Badge" | "Progress" | "Spinner" | "Alert" | "Toast" | "EmptyState" | "ErrorBoundary"
-  | "Tabs" | "Breadcrumb" | "Menu" | "CommandList" | "Pagination" | "Link" | "Details"
-  | "TextInput" | "TextArea" | "Select" | "MultiSelect" | "Checkbox" | "Radio" | "Form"
-  | "Button" | "ActionMenu" | "Toolbar" | "ContextMenu"
-  | "ToolCard" | "ArtifactCard" | "ApprovalCard" | "AgentCard" | "WorkflowNode"
-  | "PatchCard" | "TestReport" | "PermissionDiff" | "TraceView" | "CostView"
-  | "TerminalOnly" | "WebOnly";
+/** Single-source built-in primitive catalogue used by types, hosts, and tooling. */
+export const UI_PRIMITIVES = [
+  "Box", "Stack", "Row", "Grid", "Split", "Spacer", "ScrollArea", "VirtualList",
+  "Text", "Markdown", "Code", "Diff", "Image", "Audio", "JsonTree", "LogViewer",
+  "List", "Table", "Tree", "KeyValue", "Timeline", "Graph", "Chart", "Sparkline",
+  "Badge", "Progress", "Spinner", "Alert", "Toast", "EmptyState", "ErrorBoundary",
+  "Tabs", "Breadcrumb", "Menu", "CommandList", "Pagination", "Link", "Details",
+  "TextInput", "TextArea", "Select", "MultiSelect", "Checkbox", "Radio", "Form",
+  "Button", "ActionMenu", "Toolbar", "ContextMenu",
+  "ToolCard", "ArtifactCard", "ApprovalCard", "AgentCard", "WorkflowNode",
+  "PatchCard", "TestReport", "PermissionDiff", "TraceView", "CostView",
+  "TerminalOnly", "WebOnly",
+] as const;
+
+export type UiPrimitive = (typeof UI_PRIMITIVES)[number];
 
 export type UiJsonPrimitive = string | number | boolean | null;
 export type UiJsonValue = UiJsonPrimitive | UiJsonValue[] | { readonly [key: string]: UiJsonValue };
@@ -217,14 +213,12 @@ export interface UiPatchBatch {
   fallback?: UiFallback;
 }
 
-export type UiEventType =
-  | "action" | "press" | "change" | "submit" | "focus" | "blur" | "select"
-  | "expand" | "collapse" | "navigate" | "scroll" | "key" | "custom";
-
 export const UI_EVENT_TYPES = [
   "action", "press", "change", "submit", "focus", "blur", "select",
   "expand", "collapse", "navigate", "scroll", "key", "custom",
-] as const satisfies readonly UiEventType[];
+] as const;
+
+export type UiEventType = (typeof UI_EVENT_TYPES)[number];
 
 export interface UiEventModifiers {
   alt?: boolean;

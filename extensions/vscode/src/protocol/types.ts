@@ -414,7 +414,8 @@ export type CommandBody =
   | { type: "PauseRun"; run_id: Uuid }
   | { type: "ResumeRun"; run_id: Uuid }
   | { type: "QueueSteering"; run_id: Uuid; text: string }
-  | { type: "UpdateIdeContext"; session_id: Uuid; update: IdeContextUpdate };
+  | { type: "UpdateIdeContext"; session_id: Uuid; update: IdeContextUpdate }
+  | { type: "RevokeUiPlugin"; plugin_id: string };
 
 export interface Command {
   command_id: Uuid;

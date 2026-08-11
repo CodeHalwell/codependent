@@ -8,6 +8,14 @@ const UI_CAPABILITIES = new Set<string>(UI_HOST_CAPABILITIES);
 const PUBLIC_POINTS = new Set<string>(UI_CONTRIBUTION_POINTS);
 const CORE_POINTS = new Set(["approval-frame", "approval-actions", "secret-entry", "policy-state", "terminal-lifecycle"]);
 
+/** Install-time Remote UI ceilings mirrored from the daemon lifecycle store. */
+export const UI_PLUGIN_RESOURCE_LIMITS = {
+  memory_mb: 2_048,
+  cpu_seconds: 300,
+  wall_seconds: 3_600,
+  maximum_output_mb: 64,
+} as const;
+
 function object(value: unknown, name: string): Data {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be a table`);
   return value as Data;
@@ -111,13 +119,23 @@ export function validateUiManifest(source: string): Data {
   const manifest = parseCanonicalManifest(source);
   if (manifest.schema_version !== 1) throw new Error("schema_version must be 1");
   for (const field of ["id", "name", "version", "publisher"] as const) if (manifest[field] === "") throw new Error(`${field} must not be empty`);
-  if (manifest.kind !== "ui-component") throw new Error("UI package kind must be ui-component");
+  if (manifest.kind !== "ui-component" && manifest.kind !== "native-process") {
+    throw new Error("a package with [ui] must use kind ui-component or native-process");
+  }
   const runtime = manifest.runtime as Data;
   const daemonCapabilities = manifest.capabilities as Data;
-  if (Object.values(runtime).some((value) => value !== "")) throw new Error("ui-component packages cannot declare [runtime]");
-  if (Object.entries(daemonCapabilities).some(([key, value]) => key === "subprocess" ? value === true : (value as unknown[]).length > 0)) throw new Error("ui-component packages cannot declare daemon [capabilities]");
+  if (manifest.kind === "ui-component") {
+    if (Object.values(runtime).some((value) => value !== "")) throw new Error("ui-component packages cannot declare [runtime]");
+    if (Object.entries(daemonCapabilities).some(([key, value]) => key === "subprocess" ? value === true : (value as unknown[]).length > 0)) throw new Error("ui-component packages cannot declare daemon [capabilities]");
+  } else {
+    if (runtime.command === "" || runtime.protocol === "") throw new Error("native-process packages require runtime.command and runtime.protocol");
+  }
   const resources = manifest.resources as Data;
-  for (const [key, value] of Object.entries(resources)) if ((value as number) <= 0) throw new Error(`resources.${key} must be greater than zero`);
+  for (const [key, maximum] of Object.entries(UI_PLUGIN_RESOURCE_LIMITS)) {
+    const value = resources[key] as number;
+    if (value <= 0) throw new Error(`resources.${key} must be greater than zero`);
+    if (value > maximum) throw new Error(`resources.${key} exceeds the Remote UI host maximum ${maximum}`);
+  }
   const ui = object(manifest.ui, "ui");
   if (ui.schema_version !== 1) throw new Error("ui.schema_version must be 1");
   const entrypoints = object(ui.entrypoints, "ui.entrypoints");

@@ -26,4 +26,5 @@ export type WebviewCommandMessage =
   | { kind: "startRun"; objective: string }
   | { kind: "remoteUiRuntime"; message: UiRuntimeMessage }
   | { kind: "remoteUiWire"; message: UiWireMessage }
+  | { kind: "remoteUiRecovery"; action: "disable" | "report"; documentId: string; extensionId?: string; message: string }
   | { kind: "remoteUiReady"; capabilities: UiCapabilities; documents: { documentId: string; revision: number }[] };

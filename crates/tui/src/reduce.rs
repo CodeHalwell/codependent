@@ -123,8 +123,12 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.remote_ui.active = active && !state.remote_ui.mounted_documents().is_empty();
             if state.remote_ui.active {
                 state.remote_ui.repair_focus();
-                focus_remote_ui(state, 0);
+                focus_remote_document(state, None);
             }
+        }
+        Action::RemoteUiNextDocument => focus_next_remote_document(state),
+        Action::RemoteUiFocusDocument(document_id) => {
+            focus_remote_document(state, Some(document_id));
         }
         Action::RemoteUiViewport { width, height } => {
             state.outbox.push(Intent::RemoteUiMessage(Box::new(
@@ -341,6 +345,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.edge_total = total;
             state.edge_query = query;
             state.edge_page = page;
+            state.edge_loading = false;
             state.selected_edge = 0;
         }
         Action::OpenWorkflow => {
@@ -389,7 +394,12 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::BeginAddModel => begin_add_model(state),
-        Action::ToggleLayout => state.layout = state.layout.toggled(),
+        Action::ToggleLayout => {
+            state.layout = state.layout.toggled();
+            if matches!(state.layout, crate::state::LayoutMode::Workspace) {
+                state.focus = Pane::Transcript;
+            }
+        }
 
         Action::Help => {
             state.overlay = match state.overlay {
@@ -559,35 +569,118 @@ fn current_remote_output(
     Some((document_id, revision, output))
 }
 
-fn focus_remote_ui(state: &mut AppState, delta: i32) {
-    let Some((_, _, output)) = current_remote_output(state) else {
+fn remote_focus_order(state: &AppState) -> Vec<(UiDocumentId, UiNodeId)> {
+    let outputs = state.remote_ui.last_render.borrow();
+    state
+        .remote_ui
+        .mounted_documents()
+        .into_iter()
+        .flat_map(|document| {
+            outputs
+                .get(&document.document_id)
+                .into_iter()
+                .flat_map(move |output| {
+                    output
+                        .focus_order
+                        .iter()
+                        .filter(|descriptor| !descriptor.disabled)
+                        .map(move |descriptor| {
+                            (document.document_id.clone(), descriptor.node_id.clone())
+                        })
+                })
+        })
+        .collect()
+}
+
+/// Focus a document as a host operation only. This never emits an extension
+/// event: entering a component must be distinct from activating its first
+/// control. When render metadata is available, focus begins at the first enabled
+/// node in that document; otherwise the document remains focused and the next
+/// render/Tab repairs node focus.
+fn focus_remote_document(state: &mut AppState, document_id: Option<UiDocumentId>) {
+    let document_id = document_id.or_else(|| state.remote_ui.focused_document.clone());
+    let Some(document_id) = document_id.or_else(|| {
+        state
+            .remote_ui
+            .mounted_documents()
+            .first()
+            .map(|document| document.document_id.clone())
+    }) else {
+        state.remote_ui.active = false;
+        state.remote_ui.focused_document = None;
+        state.remote_ui.view.focused_node = None;
         return;
     };
-    let focusable: Vec<_> = output
-        .focus_order
+    if !state
+        .remote_ui
+        .mounted_documents()
         .iter()
-        .filter(|descriptor| !descriptor.disabled)
-        .map(|descriptor| descriptor.node_id.clone())
+        .any(|document| document.document_id == document_id)
+    {
+        return;
+    }
+    state.remote_ui.active = true;
+    state.remote_ui.focused_document = Some(document_id.clone());
+    state.remote_ui.view.focused_node =
+        remote_focus_order(state)
+            .into_iter()
+            .find_map(|(candidate_document, node_id)| {
+                (candidate_document == document_id).then_some(node_id)
+            });
+}
+
+fn focus_next_remote_document(state: &mut AppState) {
+    let documents: Vec<_> = state
+        .remote_ui
+        .mounted_documents()
+        .into_iter()
+        .map(|document| document.document_id.clone())
         .collect();
+    if documents.is_empty() {
+        state.remote_ui.active = false;
+        return;
+    }
+    let current = state
+        .remote_ui
+        .focused_document
+        .as_ref()
+        .and_then(|document_id| {
+            documents
+                .iter()
+                .position(|candidate| candidate == document_id)
+        });
+    let next = current.map_or(0, |index| (index + 1) % documents.len());
+    focus_remote_document(state, Some(documents[next].clone()));
+}
+
+fn focus_remote_ui(state: &mut AppState, delta: i32) {
+    let focusable = remote_focus_order(state);
     if focusable.is_empty() {
         state.remote_ui.view.focused_node = None;
         return;
     }
     let current = state
         .remote_ui
-        .view
-        .focused_node
+        .focused_document
         .as_ref()
-        .and_then(|node_id| focusable.iter().position(|candidate| candidate == node_id))
-        .unwrap_or(0);
-    let next = if delta < 0 {
-        current.checked_sub(1).unwrap_or(focusable.len() - 1)
-    } else if delta > 0 {
-        (current + 1) % focusable.len()
-    } else {
-        current
+        .zip(state.remote_ui.view.focused_node.as_ref())
+        .and_then(|(document_id, node_id)| {
+            focusable
+                .iter()
+                .position(|(candidate_document, candidate_node)| {
+                    candidate_document == document_id && candidate_node == node_id
+                })
+        });
+    let next = match current {
+        Some(current) if delta < 0 => current.checked_sub(1).unwrap_or(focusable.len() - 1),
+        Some(current) if delta > 0 => (current + 1) % focusable.len(),
+        Some(current) => current,
+        None if delta < 0 => focusable.len() - 1,
+        None => 0,
     };
-    state.remote_ui.view.focused_node = Some(focusable[next].clone());
+    let (document_id, node_id) = focusable[next].clone();
+    state.remote_ui.focused_document = Some(document_id);
+    state.remote_ui.view.focused_node = Some(node_id);
 }
 
 fn apply_remote_ui_key(state: &mut AppState, key: RemoteKey, character: Option<char>) {
@@ -1567,6 +1660,7 @@ fn scroll_page(state: &mut AppState, up: bool) {
 }
 
 fn request_edge_page(state: &mut AppState, page: usize) {
+    state.edge_loading = true;
     state.outbox.push(Intent::SearchEdges {
         query: state.edge_query.clone(),
         page,
@@ -2947,7 +3041,12 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
                 selected: 0,
             };
         }
-        PaletteCommand::ToggleLayout => state.layout = state.layout.toggled(),
+        PaletteCommand::ToggleLayout => {
+            state.layout = state.layout.toggled();
+            if matches!(state.layout, crate::state::LayoutMode::Workspace) {
+                state.focus = Pane::Transcript;
+            }
+        }
         PaletteCommand::Help => state.overlay = Overlay::Help,
         PaletteCommand::Detach => state.should_detach = true,
         PaletteCommand::NewConversation => {
@@ -3068,7 +3167,9 @@ mod tests {
     use chrono::Utc;
     use codypendent_protocol::{
         AgentMode, ApprovalId, ArtifactId, ArtifactRef, ChangeSetId, DataClassification, ModelId,
-        Risk, RiskLevel, RunId, ToolOutcome, UiActionId, UiDocument, UiNode, UiPrimitive,
+        Risk, RiskLevel, RunId, ToolOutcome, UiActionId, UiContributionId, UiContributionPoint,
+        UiContributionRegistration, UiDocument, UiExtensionId, UiNode, UiPrimitive, UiSemanticRole,
+        UiSlotId,
     };
 
     fn agent_actor(run_id: RunId) -> Actor {
@@ -3102,6 +3203,210 @@ mod tests {
             sha256: "0".repeat(64),
             sensitivity: DataClassification::Internal,
         }
+    }
+
+    fn mount_focus_document(state: &mut AppState, document_id: &str, nodes: &[&str]) {
+        let id = UiDocumentId::from(document_id);
+        let document = UiDocument {
+            protocol_version: UiProtocolVersion::V1,
+            document_id: id.clone(),
+            revision: UiRevision(1),
+            root: UiNode::element("root", UiPrimitive::from("Stack")),
+            capabilities: None,
+            metadata: Default::default(),
+            compatibility: None,
+        };
+        let mut snapshot = empty_message("snapshot", format!("{document_id}-snapshot"));
+        snapshot.snapshot = Some(codypendent_protocol::UiSnapshot {
+            document,
+            reason: None,
+        });
+        reduce(state, Action::RemoteUiMessage(Box::new(snapshot)));
+
+        let mut contributions =
+            empty_message("contributions", format!("{document_id}-contribution"));
+        contributions
+            .contributions
+            .push(UiContributionRegistration {
+                id: UiContributionId::from(format!("{document_id}-registration")),
+                extension_id: UiExtensionId::from(format!("{document_id}-extension")),
+                point: UiContributionPoint::from("panel"),
+                slot: UiSlotId::from("panel"),
+                document_id: id.clone(),
+                priority: 0,
+                when: None,
+                requires: Vec::new(),
+                metadata: Default::default(),
+            });
+        reduce(state, Action::RemoteUiMessage(Box::new(contributions)));
+
+        let output = RemoteUiRenderOutput {
+            focus_order: nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| crate::remote_ui::FocusDescriptor {
+                    node_id: UiNodeId::from(*node),
+                    area: ratatui::layout::Rect::new(0, index as u16, 10, 1),
+                    order: index as i32,
+                    role: UiSemanticRole::from("button"),
+                    label: (*node).to_owned(),
+                    keyboard_hint: Some("Enter".to_owned()),
+                    disabled: false,
+                    keyboard_actions: Vec::new(),
+                })
+                .collect(),
+            ..RemoteUiRenderOutput::default()
+        };
+        state.remote_ui.last_render.borrow_mut().insert(id, output);
+    }
+
+    #[test]
+    fn remote_focus_traverses_nodes_across_documents_without_activating() {
+        let mut state = AppState::new();
+        reduce(
+            &mut state,
+            Action::RemoteUiMessage(Box::new(
+                crate::remote_ui_host::terminal_capabilities_message(80, 24, 24),
+            )),
+        );
+        mount_focus_document(&mut state, "alpha", &["alpha-one", "alpha-two"]);
+        mount_focus_document(&mut state, "beta", &["beta-one"]);
+        let outbox_before = state.outbox.len();
+
+        reduce(&mut state, Action::RemoteUiSetActive(true));
+        assert_eq!(
+            state
+                .remote_ui
+                .focused_document
+                .as_ref()
+                .map(UiDocumentId::as_str),
+            Some("alpha")
+        );
+        assert_eq!(
+            state
+                .remote_ui
+                .view
+                .focused_node
+                .as_ref()
+                .map(UiNodeId::as_str),
+            Some("alpha-one")
+        );
+        assert_eq!(state.outbox.len(), outbox_before, "focus is not activation");
+
+        reduce(
+            &mut state,
+            Action::RemoteUiKey {
+                key: RemoteKey::Tab,
+                character: None,
+            },
+        );
+        assert_eq!(
+            state
+                .remote_ui
+                .view
+                .focused_node
+                .as_ref()
+                .map(UiNodeId::as_str),
+            Some("alpha-two")
+        );
+        reduce(
+            &mut state,
+            Action::RemoteUiKey {
+                key: RemoteKey::Tab,
+                character: None,
+            },
+        );
+        assert_eq!(
+            state
+                .remote_ui
+                .focused_document
+                .as_ref()
+                .map(UiDocumentId::as_str),
+            Some("beta")
+        );
+        assert_eq!(
+            state
+                .remote_ui
+                .view
+                .focused_node
+                .as_ref()
+                .map(UiNodeId::as_str),
+            Some("beta-one")
+        );
+
+        reduce(
+            &mut state,
+            Action::RemoteUiKey {
+                key: RemoteKey::ShiftTab,
+                character: None,
+            },
+        );
+        assert_eq!(
+            state
+                .remote_ui
+                .focused_document
+                .as_ref()
+                .map(UiDocumentId::as_str),
+            Some("alpha")
+        );
+        assert_eq!(
+            state
+                .remote_ui
+                .view
+                .focused_node
+                .as_ref()
+                .map(UiNodeId::as_str),
+            Some("alpha-two")
+        );
+        assert_eq!(
+            state.outbox.len(),
+            outbox_before,
+            "traversal is not activation"
+        );
+    }
+
+    #[test]
+    fn shift_f6_cycles_mounted_documents_and_escape_returns_to_composer() {
+        let mut state = AppState::new();
+        reduce(
+            &mut state,
+            Action::RemoteUiMessage(Box::new(
+                crate::remote_ui_host::terminal_capabilities_message(80, 24, 24),
+            )),
+        );
+        mount_focus_document(&mut state, "alpha", &["alpha-one"]);
+        mount_focus_document(&mut state, "beta", &["beta-one"]);
+
+        reduce(&mut state, Action::RemoteUiSetActive(true));
+        reduce(&mut state, Action::RemoteUiNextDocument);
+        assert_eq!(
+            state
+                .remote_ui
+                .focused_document
+                .as_ref()
+                .map(UiDocumentId::as_str),
+            Some("beta")
+        );
+        assert_eq!(
+            state
+                .remote_ui
+                .view
+                .focused_node
+                .as_ref()
+                .map(UiNodeId::as_str),
+            Some("beta-one")
+        );
+        reduce(&mut state, Action::RemoteUiNextDocument);
+        assert_eq!(
+            state
+                .remote_ui
+                .focused_document
+                .as_ref()
+                .map(UiDocumentId::as_str),
+            Some("alpha")
+        );
+        reduce(&mut state, Action::RemoteUiSetActive(false));
+        assert!(!state.remote_ui.active);
     }
 
     #[test]
@@ -4958,6 +5263,7 @@ mod tests {
     fn edge_search_and_paging_request_bounded_database_pages() {
         let mut s = AppState::new();
         reduce(&mut s, Action::OpenEdges);
+        assert!(s.edge_loading);
         assert_eq!(
             s.drain_outbox(),
             vec![Intent::SearchEdges {
@@ -4990,7 +5296,9 @@ mod tests {
                 page: 0,
             },
         );
+        assert!(!s.edge_loading);
         reduce(&mut s, Action::ScrollPageDown);
+        assert!(s.edge_loading);
         assert_eq!(
             s.drain_outbox(),
             vec![Intent::SearchEdges {

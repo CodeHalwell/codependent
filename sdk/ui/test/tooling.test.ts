@@ -19,7 +19,10 @@ describe("package-author tooling", () => {
       const manifest = validateUiManifest(source);
       expect((manifest.resources as { wall_seconds: number }).wall_seconds).toBe(3600);
       expect(((manifest.ui as { entrypoints: { shared: string } }).entrypoints.shared)).toBe("dist/worker.mjs");
-      expect(await readFile(join(target, "src/worker.tsx"), "utf8")).toContain("runStdioUiWorker");
+      const worker = await readFile(join(target, "src/worker.tsx"), "utf8");
+      expect(worker).toContain("runStdioUiWorker");
+      expect(worker).toContain("hotReloadState: workbenchHotReloadState");
+      expect(JSON.parse(await readFile(join(target, "package.json"), "utf8"))).toMatchObject({ engines: { node: ">=22.13" } });
       await expect(validateProject(target)).rejects.toThrow("entrypoints are missing");
     }
   });
@@ -28,6 +31,14 @@ describe("package-author tooling", () => {
     const source = await readFile(signingFixture, "utf8");
     const digest = Buffer.from(rustSigningDigest(parseCanonicalManifest(source))).toString("hex");
     expect(digest).toBe("87571e872de61f5317cae66468aadb16b993b92b31a273c0704cd27ab6167717");
+  });
+
+  it("fails author validation at the daemon's Remote UI resource ceiling", async () => {
+    const source = await readFile(signingFixture, "utf8");
+    expect(() => validateUiManifest(source.replace("memory_mb = 256", "memory_mb = 2049"))).toThrow("host maximum 2048");
+    expect(() => validateUiManifest(source.replace("cpu_seconds = 300", "cpu_seconds = 301"))).toThrow("host maximum 300");
+    expect(() => validateUiManifest(source.replace("wall_seconds = 3600", "wall_seconds = 3601"))).toThrow("host maximum 3600");
+    expect(() => validateUiManifest(source.replace("maximum_output_mb = 32", "maximum_output_mb = 65"))).toThrow("host maximum 64");
   });
 
   it("rejects contribution target lists that combine shared and concrete workers", () => {
@@ -65,6 +76,46 @@ channel = "stable"
 permission_change_requires_approval = true
 `;
     expect(() => validateUiManifest(source)).toThrow("cannot combine shared");
+  });
+
+  it("accepts a native process with an independently declared UI worker", () => {
+    const source = `schema_version = 1
+id = "acme.native-ui"
+name = "Native plus UI"
+version = "1.0.0"
+kind = "native-process"
+publisher = "acme"
+scopes = ["user"]
+[runtime]
+command = "bin/native-agent"
+protocol = "json-rpc-v1"
+[ui]
+schema_version = 1
+requested_capabilities = []
+[ui.compatibility]
+protocol = ">=1.0,<2.0"
+sdk = "^1.0"
+[ui.entrypoints]
+shared = "dist/worker.mjs"
+[[ui.contributions]]
+id = "acme.native-ui.panel"
+point = "panel"
+renderer = "acme.NativePanel"
+targets = ["shared"]
+[resources]
+memory_mb = 128
+cpu_seconds = 60
+wall_seconds = 300
+maximum_output_mb = 8
+[security]
+checksum = "sha256:${"0".repeat(64)}"
+signature = "replace"
+sandbox_profile = "native-process"
+[update]
+channel = "stable"
+permission_change_requires_approval = true
+`;
+    expect(validateUiManifest(source)).toMatchObject({ kind: "native-process", ui: { schema_version: 1 } });
   });
 
   it("creates byte-identical archives and excludes source, manifests, and keys", async () => {

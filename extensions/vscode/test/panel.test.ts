@@ -15,6 +15,12 @@ describe("webview panel security", () => {
     expect(html).not.toContain("'unsafe-eval'");
     expect(html).not.toContain("'unsafe-inline'");
     expect(html).not.toContain("https:;");
+    expect(html).toContain("button:focus-visible");
+    expect(html).toContain("overflow-wrap: anywhere");
+    expect(html).toContain("prefers-reduced-motion: reduce");
+    expect(html).toContain("overscroll-behavior: contain");
+    expect(html).toContain("grid-template-areas:");
+    expect(html).toContain("ui-host-region-overlay");
   });
 
   it("generates strong unique CSP nonces", () => {

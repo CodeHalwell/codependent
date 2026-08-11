@@ -155,6 +155,29 @@ describe("computeBackoff", () => {
   });
 });
 
+describe("Remote UI lifecycle commands", () => {
+  it("queues a confirmed plugin revoke with a stable command envelope", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new DaemonClient({
+      socketPath: "/tmp/x.sock",
+      sessionId: SESSION_ID,
+      createConnection: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      wait: () => Promise.resolve(),
+    });
+    client.revokeUiPlugin("acme.failed-surface");
+    const commands = await connectAttachAndCollect(client, sockets);
+    expect(commands.find((command) => command.body.type === "RevokeUiPlugin")?.body).toEqual({
+      type: "RevokeUiPlugin",
+      plugin_id: "acme.failed-surface",
+    });
+    client.stop();
+  });
+});
+
 describe("DaemonClient handshake + attach", () => {
   it("sends ClientHello on connect, then attaches as Approver with no resume cursor", async () => {
     const sockets: FakeSocket[] = [];

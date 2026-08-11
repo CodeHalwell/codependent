@@ -11,6 +11,7 @@ import {
   type UiWireMessage,
 } from "../protocol.js";
 import { createDocument, diffDocuments } from "../document.js";
+import type { HotReloadStateStore } from "../hot-reload.js";
 import { MediatedUiBridge, type UiActionContext, type UiWorkerSend } from "./bridge.js";
 import { assertUiWireMessage, protocolMatchesSelection } from "./wire.js";
 
@@ -116,6 +117,8 @@ export interface UiWorkerRuntimeOptions {
   messagesPerSecond?: number;
   messageBurst?: number;
   actionTimeoutMs?: number;
+  /** Opt-in JSON state transferred by the development workbench. */
+  hotReloadState?: HotReloadStateStore;
   onHotReload?(generation: number, changedModules: readonly string[]): void | Promise<void>;
   onDiagnostic?(event: { direction: "in" | "out"; message: UiWireMessage }): void;
   onError?(cause: unknown): void;
@@ -239,7 +242,12 @@ export class UiWorkerRuntime {
           if (document !== undefined) await this.#send({ type: "snapshot", messageId: this.#messageId("resync-snapshot"), snapshot: { document, reason: "host-request" } });
         } else if (message.type === "hotReload") {
           await this.options.onHotReload?.(message.hotReload.generation, message.hotReload.changedModules);
-          await this.#sendControl("worker.reloaded", { generation: message.hotReload.generation });
+          await this.#sendControl("worker.reloaded", {
+            generation: message.hotReload.generation,
+            ...(this.options.hotReloadState === undefined
+              ? {}
+              : { states: this.options.hotReloadState.exportStates() }),
+          });
           for (const surface of this.#surfaces.values()) surface.render();
           for (const surface of this.#surfaces.values()) {
             const document = surface.getDocument();

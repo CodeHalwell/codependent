@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { PassThrough } from "node:stream";
 import { DEFAULT_UI_HARD_LIMITS, MINIMAL_TERMINAL_CAPABILITIES, type UiWireMessage } from "../src/protocol.js";
 import { Button, Stack, Text } from "../src/primitives.js";
+import { HotReloadStateStore } from "../src/hot-reload.js";
 import { createPureUiSurface, UiWorkerRuntime, type UiWorkerTransport } from "../src/worker/runtime.js";
 import { decodeUiFrames, UiFrameWriter } from "../src/worker/framing.js";
 import { createNodeStreamUiTransport } from "../src/worker/stdio.js";
@@ -61,8 +62,10 @@ describe("worker runtime", () => {
       capabilities: ["context-read", "command-invoke"] as const, contributionPoints: ["panel"] as const,
       limits: DEFAULT_UI_HARD_LIMITS,
     };
+    const hotReloadState = new HotReloadStateStore({ count: 3 }, 1);
     const runtime = new UiWorkerRuntime(transport, {
       capabilityOffer: offer,
+      hotReloadState,
       surfaces: [createPureUiSurface({ documentId: "main", render: () => Text({ id: "root", children: "Hello" }) })],
     });
     const running = runtime.run();
@@ -86,7 +89,8 @@ describe("worker runtime", () => {
     const resync = await waitFor(transport, "snapshot", 2);
     expect(resync.type === "snapshot" && resync.snapshot.reason).toBe("host-request");
     transport.push({ type: "hotReload", messageId: "reload", hotReload: { generation: 2, changedModules: ["component.js"] } });
-    await waitFor(transport, "worker.reloaded");
+    const reloaded = await waitFor(transport, "worker.reloaded");
+    expect(reloaded.extensions).toMatchObject({ control: { generation: 2, states: { count: 3 } } });
     await waitFor(transport, "snapshot", 3);
     transport.push({ type: "host.dispose", messageId: "dispose", extensions: { control: {} } });
     await waitFor(transport, "worker.disposed");

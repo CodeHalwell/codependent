@@ -143,6 +143,8 @@ Available hooks include `useSession`, `useRun`, `useArtifact`, `useCommand`, `us
 
 `HotReloadStateStore` and `useHotReloadState` preserve JSON-safe local state across module replacement. The `HotReloadMessage` prepare/state/apply/rollback protocol supports coordinated reload and rollback.
 
+Generated workers use the opt-in `workbenchHotReloadState` singleton. The persistent `codypendent-ui workbench` starts every rebuild as a separate permission-restricted candidate and commits it only after handshake, initial contribution/snapshot validation, target diagnostics, automatic accessibility audit, hot-reload acknowledgement, and clean teardown. Failed candidates leave the previous report and state intact. Workbench controls include host target, public point, viewport, theme, colour depth, inert projection/action fixtures, and JSON protocol tracing.
+
 ## Contributions
 
 Contributions are registered by both contribution point and renderer discriminator:
@@ -191,6 +193,8 @@ expect(view.toJSON()).toMatchSnapshot();
 ```
 
 It also applies patch batches with stale-revision checks, records deterministic event IDs, and exposes stable canonical JSON for snapshots.
+
+`@codypendent/ui/tooling` exports `UI_CONFORMANCE_STORY`, workbench option/capability helpers, combined development diagnostics, and the transactional reload coordinator. The shared story covers loading, empty, error, action, long-content, viewport, and theme states so host-native and embedded renderers can test the same semantic source instead of maintaining visually similar but behaviorally different fixtures.
 
 ## Trust boundary
 

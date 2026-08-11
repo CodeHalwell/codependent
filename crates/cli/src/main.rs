@@ -58,6 +58,11 @@ struct Cli {
     /// themed UI.
     #[arg(long)]
     theme: Option<String>,
+    /// Use the cooked, line-oriented accessible client for the bare invocation.
+    /// No raw mode, alternate screen, mouse capture, colour, or Unicode chrome
+    /// is emitted. `--plain` is an alias for scripts and limited terminals.
+    #[arg(long, visible_alias = "plain")]
+    accessible: bool,
     /// With no subcommand, `codypendent` opens the interactive TUI attached to
     /// the current repository's session (STEP 1.12).
     #[command(subcommand)]
@@ -701,7 +706,13 @@ async fn main() -> anyhow::Result<()> {
         theme_select::resolve_theme_override(cli.theme, std::env::var("CODYPENDENT_THEME").ok());
     let Some(command) = cli.command else {
         // Bare `codypendent`: open the TUI for the current directory's repo.
-        return tui::run(&paths, std::env::current_dir()?, theme_override).await;
+        return tui::run(
+            &paths,
+            std::env::current_dir()?,
+            theme_override,
+            cli.accessible,
+        )
+        .await;
     };
     match command {
         // Dispatched before the match (see the early return in `main`); a
@@ -947,5 +958,22 @@ mod tests {
             !help.contains("__daemon"),
             "the __daemon subcommand must be hidden from --help, got:\n{help}"
         );
+    }
+
+    #[test]
+    fn accessible_and_plain_flags_select_the_cooked_client() {
+        let accessible =
+            Cli::try_parse_from(["codypendent", "--accessible"]).expect("accessible must parse");
+        assert!(accessible.accessible);
+        assert!(accessible.command.is_none());
+
+        let plain = Cli::try_parse_from(["codypendent", "--plain"]).expect("plain must parse");
+        assert!(plain.accessible);
+        assert!(plain.command.is_none());
+
+        let mut command = Cli::command();
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("--accessible"));
+        assert!(help.contains("--plain"));
     }
 }

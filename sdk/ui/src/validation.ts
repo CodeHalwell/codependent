@@ -1,4 +1,12 @@
-import { UI_EVENT_HANDLERS_PROP, UI_EVENT_TYPES, type UiDocument, type UiJsonValue, type UiNode, type UiPatchBatch } from "./protocol.js";
+import {
+  DEFAULT_UI_HARD_LIMITS,
+  UI_EVENT_HANDLERS_PROP,
+  UI_EVENT_TYPES,
+  type UiDocument,
+  type UiJsonValue,
+  type UiNode,
+  type UiPatchBatch,
+} from "./protocol.js";
 
 export interface UiLimits {
   maxDepth: number;
@@ -16,17 +24,20 @@ export interface UiLimits {
 }
 
 export const DEFAULT_UI_LIMITS: UiLimits = {
-  maxDepth: 64,
-  maxNodes: 10_000,
+  // Derive the overlapping limits from the negotiated wire contract. Local
+  // tests, workbench inspection, workers, and production hosts must never
+  // disagree about whether the same semantic document is admissible.
+  maxDepth: DEFAULT_UI_HARD_LIMITS.maxTreeDepth,
+  maxNodes: DEFAULT_UI_HARD_LIMITS.maxNodes,
   maxChildrenPerNode: 2_000,
-  maxTextBytes: 1_000_000,
-  maxPropsBytes: 2_000_000,
-  maxPropertiesPerNode: 256,
-  maxActionsPerNode: 64,
-  maxJsonDepth: 32,
-  maxJsonValues: 100_000,
-  maxPatchCount: 5_000,
-  maxDocumentBytes: 8_000_000,
+  maxTextBytes: DEFAULT_UI_HARD_LIMITS.maxTextBytes,
+  maxPropsBytes: DEFAULT_UI_HARD_LIMITS.maxPatchBytes,
+  maxPropertiesPerNode: DEFAULT_UI_HARD_LIMITS.maxPropertiesPerNode,
+  maxActionsPerNode: DEFAULT_UI_HARD_LIMITS.maxActionsPerNode,
+  maxJsonDepth: DEFAULT_UI_HARD_LIMITS.maxJsonDepth,
+  maxJsonValues: DEFAULT_UI_HARD_LIMITS.maxJsonValues,
+  maxPatchCount: DEFAULT_UI_HARD_LIMITS.maxPatchesPerBatch,
+  maxDocumentBytes: DEFAULT_UI_HARD_LIMITS.maxPatchBytes * 2,
   maxIdLength: 256,
 };
 

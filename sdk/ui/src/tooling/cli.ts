@@ -5,15 +5,32 @@ import { copyFile, mkdir, readFile, readdir, rename, stat, writeFile } from "nod
 import { realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_UI_HARD_LIMITS, MINIMAL_TERMINAL_CAPABILITIES, UI_CONTRIBUTION_POINTS, UI_HOST_CAPABILITIES, type UiCapabilities, type UiCapabilitySelection, type UiWireMessage } from "../protocol.js";
+import { DEFAULT_UI_HARD_LIMITS, type UiCapabilities, type UiCapabilitySelection, type UiDocument, type UiJsonValue, type UiWireMessage } from "../protocol.js";
 import { REMOTE_UI_SCHEMA_URL } from "../schema.js";
-import { validateDocument, validatePatchBatch } from "../validation.js";
+import { validatePatchBatch } from "../validation.js";
 import { negotiateCapabilities } from "../capabilities.js";
+import { TransactionalHotReload } from "../hot-reload.js";
+import { applyPatchBatch } from "../testing.js";
 import { decodeUiFrames, UiFrameWriter } from "../worker/framing.js";
 import { assertUiWireMessage } from "../worker/wire.js";
 import { artifactChecksum, createDeterministicArchive } from "./archive.js";
+import { diagnoseDocument, formatDevelopmentDiagnostic, jsonRecord, type DevelopmentDiagnostic, type WorkbenchTarget } from "./diagnostics.js";
 import { parseCanonicalManifest, rustSigningDigest, updateSecurityFields, validateUiManifest } from "./manifest.js";
 import { createScaffold, type ScaffoldTemplate } from "./scaffold.js";
+import { UI_CONFORMANCE_STORY } from "./stories.js";
+import {
+  DEFAULT_WORKBENCH_OPTIONS,
+  actionFixture,
+  colorDepth,
+  createWorkbenchCapabilities,
+  formatNodeTree,
+  loadWorkbenchFixture,
+  projectionFixture,
+  viewport,
+  workbenchTheme,
+  type WorkbenchOptions,
+  type WorkbenchReport,
+} from "./workbench.js";
 
 function option(args: string[], name: string): string | undefined {
   const index = args.indexOf(name);
@@ -85,13 +102,6 @@ function selection(host: UiCapabilities, worker: UiCapabilities): UiCapabilitySe
   };
 }
 
-function printTree(node: unknown, indent = ""): void {
-  if (node === null || typeof node !== "object") return;
-  const value = node as { kind?: string; type?: string; id?: string; text?: string; children?: unknown[] };
-  process.stdout.write(value.kind === "text" ? `${indent}text#${value.id ?? "?"} ${JSON.stringify(value.text)}\n` : `${indent}${value.type ?? value.kind}#${value.id ?? "?"}\n`);
-  value.children?.forEach((child) => printTree(child, `${indent}  `));
-}
-
 export function inspectorNodeArguments(entrypoint: string): string[] {
   const candidate = resolve(entrypoint);
   let resolved = candidate;
@@ -105,47 +115,188 @@ export function inspectorNodeArguments(entrypoint: string): string[] {
   ];
 }
 
-export async function inspectWorker(entrypoint: string, json: boolean, hotReloadGeneration?: number): Promise<void> {
+function controlStates(message: Extract<UiWireMessage, { type: `host.${string}` | `worker.${string}` }>): Readonly<Record<string, UiJsonValue>> | undefined {
+  const control = jsonRecord(message.extensions?.control);
+  return jsonRecord(control?.states);
+}
+
+function workbenchDiagnostic(
+  code: string,
+  message: string,
+  severity: DevelopmentDiagnostic["severity"] = "warning",
+): DevelopmentDiagnostic {
+  return { kind: "validation", severity, code, path: "worker", message };
+}
+
+/**
+ * Runs a worker against a configurable host workbench and returns its complete
+ * protocol/placement/a11y report. The candidate is always isolated in a fresh
+ * permission-restricted process; callers commit it only after this resolves.
+ */
+export async function inspectWorker(
+  entrypoint: string,
+  json: boolean,
+  hotReloadGeneration?: number,
+  options: WorkbenchOptions = DEFAULT_WORKBENCH_OPTIONS,
+  hotReloadState: Readonly<Record<string, UiJsonValue>> = options.fixture?.hotReloadState ?? {},
+): Promise<WorkbenchReport> {
   const args = inspectorNodeArguments(entrypoint);
   const resolved = args[args.length - 1] as string;
   const packageRoot = basename(dirname(resolved)) === "dist" ? dirname(dirname(resolved)) : dirname(resolved);
-  const child = spawn(process.execPath, args, { stdio: ["pipe", "pipe", "inherit"], env: {}, cwd: packageRoot });
+  const encodedHotReloadState = JSON.stringify(hotReloadState);
+  if (Buffer.byteLength(encodedHotReloadState, "utf8") > 256 * 1024) throw new Error("workbench hot-reload state exceeds 256 KiB");
+  const child = spawn(process.execPath, args, {
+    stdio: ["pipe", "pipe", "inherit"],
+    env: {
+      CODYPENDENT_UI_HMR_GENERATION: String(hotReloadGeneration ?? 0),
+      CODYPENDENT_UI_HMR_STATE: encodedHotReloadState,
+    },
+    cwd: packageRoot,
+  });
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
   if (child.stdin === null || child.stdout === null) throw new Error("failed to open worker stdio");
   const writer = new UiFrameWriter(async (frame) => await new Promise<void>((resolvePromise, reject) => child.stdin?.write(frame, (error) => error === null || error === undefined ? resolvePromise() : reject(error))));
   let sequence = 0;
-  const send = async (message: UiWireMessage): Promise<void> => { if (json) process.stdout.write(`> ${JSON.stringify(message)}\n`); await writer.write(message); };
-  const host: UiCapabilities = {
-    ...MINIMAL_TERMINAL_CAPABILITIES, client: "test", primitives: "*", colorDepth: "trueColor", media: ["image", "audio", "video"],
-    capabilities: UI_HOST_CAPABILITIES,
-    contributionPoints: UI_CONTRIBUTION_POINTS, limits: DEFAULT_UI_HARD_LIMITS,
-    daemon: { rich_text: true, image_display: true, audio_capture: false, editor_mutations: false, diff_view: true, mouse: true, unicode: true, true_color: true },
+  const trace: WorkbenchReport["trace"][number][] = [];
+  const send = async (message: UiWireMessage): Promise<void> => {
+    trace.push({ direction: "host→worker", type: message.type, detail: message.messageId });
+    if (json) process.stdout.write(`> ${JSON.stringify(message)}\n`);
+    await writer.write(message);
   };
+  const host = createWorkbenchCapabilities(options);
   await send({ type: "capabilities", messageId: `inspector-${++sequence}`, capabilities: host });
   let ready = false;
   let sawSnapshot = false;
+  let sawContributions = false;
   let disposed = false;
   let reloadAcknowledged = hotReloadGeneration === undefined;
+  let reloadRequested = false;
+  let fixtureEventsSent = false;
+  const documents = new Map<string, UiDocument>();
+  const contributions: WorkbenchReport["contributions"][number][] = [];
+  const workerDiagnostics: DevelopmentDiagnostic[] = [];
+  const subscriptions: string[] = [];
+  const actions: string[] = [];
+  const patches: string[] = [];
+  const events: string[] = [];
+  let exportedState = structuredClone(hotReloadState);
+  const maybeAdvance = async (): Promise<void> => {
+    if (!sawSnapshot || !sawContributions || disposed) return;
+    if (!fixtureEventsSent) {
+      fixtureEventsSent = true;
+      for (const [index, fixture] of (options.fixture?.events ?? []).entries()) {
+        const document = fixture.documentId === undefined
+          ? documents.values().next().value as UiDocument | undefined
+          : documents.get(fixture.documentId);
+        if (document === undefined) {
+          workerDiagnostics.push(workbenchDiagnostic("event-document-missing", `Fixture event ${index} targets an unknown document`, "error"));
+          continue;
+        }
+        events.push(`${fixture.type}:${fixture.targetId}`);
+        await send({
+          type: "event",
+          messageId: `inspector-${++sequence}`,
+          event: {
+            protocolVersion: document.protocolVersion,
+            eventId: `workbench-event-${index + 1}`,
+            documentId: document.documentId,
+            revision: fixture.revision ?? document.revision,
+            targetId: fixture.targetId,
+            type: fixture.type,
+            ...(fixture.payload === undefined ? {} : { payload: fixture.payload }),
+            ...(fixture.modifiers === undefined ? {} : { modifiers: fixture.modifiers }),
+            timestamp: new Date(0).toISOString(),
+          },
+        });
+      }
+    }
+    if (hotReloadGeneration !== undefined && !reloadRequested) {
+      reloadRequested = true;
+      await send({
+        type: "hotReload",
+        messageId: `inspector-${++sequence}`,
+        hotReload: { generation: hotReloadGeneration, changedModules: ["dist/worker.mjs"] },
+      });
+      return;
+    }
+    if (reloadAcknowledged) {
+      await send({ type: "host.dispose", messageId: `inspector-${++sequence}`, extensions: { control: {} } });
+    }
+  };
   const timeout = setTimeout(() => child.kill("SIGKILL"), 10_000);
   try {
     for await (const value of decodeUiFrames(child.stdout as unknown as AsyncIterable<Uint8Array>)) {
       assertUiWireMessage(value, ready ? "worker-to-host" : "handshake");
+      trace.push({ direction: "worker→host", type: value.type, detail: value.messageId });
       if (json) process.stdout.write(`< ${JSON.stringify(value)}\n`);
       if (value.type === "capabilities") await send({ type: "capabilitySelection", messageId: `inspector-${++sequence}`, selection: selection(host, value.capabilities) });
-      else if (value.type === "worker.ready") ready = true;
+      else if (value.type === "worker.ready") {
+        ready = true;
+        await send({ type: "theme", messageId: `inspector-${++sequence}`, theme: options.theme });
+      }
       else if (value.type === "snapshot") {
-        const firstSnapshot = !sawSnapshot;
         sawSnapshot = true;
-        if (!json) printTree(value.snapshot.document.root);
-        if (firstSnapshot && hotReloadGeneration !== undefined) {
-          await send({ type: "hotReload", messageId: `inspector-${++sequence}`, hotReload: { generation: hotReloadGeneration, changedModules: ["dist/worker.mjs"] } });
-        } else if (reloadAcknowledged) {
-          await send({ type: "host.dispose", messageId: `inspector-${++sequence}`, extensions: { control: {} } });
+        documents.set(value.snapshot.document.documentId, value.snapshot.document);
+        if (!json) {
+          process.stdout.write(`\n[${options.target}:${options.point} ${options.viewport.width}x${options.viewport.height} ${options.theme.id}] ${value.snapshot.document.documentId}@${value.snapshot.document.revision}\n`);
+          process.stdout.write(`${formatNodeTree(value.snapshot.document.root).join("\n")}\n`);
+        }
+        await maybeAdvance();
+      }
+      else if (value.type === "patchBatch") {
+        patches.push(`${value.patchBatch.documentId}:${value.patchBatch.baseRevision}→${value.patchBatch.revision}`);
+        const current = documents.get(value.patchBatch.documentId);
+        if (current === undefined) {
+          workerDiagnostics.push(workbenchDiagnostic("patch-without-snapshot", `Patch received for unknown document ${value.patchBatch.documentId}`));
+          await send({ type: "resync", messageId: `inspector-${++sequence}`, resync: { documentId: value.patchBatch.documentId } });
+        } else {
+          try { documents.set(current.documentId, applyPatchBatch(current, value.patchBatch)); }
+          catch (cause) {
+            workerDiagnostics.push(workbenchDiagnostic("invalid-patch", cause instanceof Error ? cause.message : String(cause), "error"));
+            await send({ type: "resync", messageId: `inspector-${++sequence}`, resync: { documentId: value.patchBatch.documentId, knownRevision: current.revision } });
+          }
         }
       }
-      else if (value.type === "worker.reloaded") { reloadAcknowledged = true; }
-      else if (value.type === "subscription") await send({ type: "projection", messageId: `inspector-${++sequence}`, projection: { subscriptionId: value.subscription.subscriptionId, removed: true } });
-      else if (value.type === "action") await send({ type: "actionResult", messageId: `inspector-${++sequence}`, actionResult: { invocationId: value.action.invocationId, status: "cancelled" } });
+      else if (value.type === "contributions") {
+        sawContributions = true;
+        contributions.splice(0, contributions.length, ...value.contributions);
+        for (const contribution of value.contributions) {
+          if (contribution.point !== options.point) {
+            workerDiagnostics.push({
+              kind: "fallback", severity: "info", code: "point-not-mounted", path: contribution.id,
+              message: `${contribution.point} is not mounted in the selected ${options.point} workbench point`,
+              suggestion: `Pass --point ${contribution.point} to inspect this placement.`,
+            });
+          }
+        }
+        await maybeAdvance();
+      }
+      else if (value.type === "worker.reloaded") {
+        reloadAcknowledged = true;
+        exportedState = controlStates(value) ?? exportedState;
+      }
+      else if (value.type === "subscription") {
+        subscriptions.push(`${value.subscription.kind}:${value.subscription.resourceId ?? ""}`);
+        const fixture = projectionFixture(options.fixture, value);
+        await send({
+          type: "projection",
+          messageId: `inspector-${++sequence}`,
+          projection: { subscriptionId: value.subscription.subscriptionId, ...(fixture ?? { removed: true }) },
+        });
+      }
+      else if (value.type === "unsubscribe") subscriptions.push(`unsubscribe:${value.unsubscription.subscriptionId}`);
+      else if (value.type === "action") {
+        actions.push(value.action.actionId);
+        const fixture = actionFixture(options.fixture, value);
+        await send({
+          type: "actionResult",
+          messageId: `inspector-${++sequence}`,
+          actionResult: { invocationId: value.action.invocationId, ...(fixture ?? { status: "cancelled" }) },
+        });
+      }
+      else if (value.type === "cancelAction") actions.push(`cancel:${value.cancellation.invocationId}`);
+      else if (value.type === "event") events.push(`${value.event.type}:${value.event.targetId}`);
+      else if (value.type === "error") workerDiagnostics.push(workbenchDiagnostic(value.error.code, value.error.message, value.error.recoverable === false ? "error" : "warning"));
       else if (value.type === "worker.disposed") { disposed = true; break; }
     }
   } finally {
@@ -166,7 +317,32 @@ export async function inspectWorker(entrypoint: string, json: boolean, hotReload
     if (exitTimer !== undefined) clearTimeout(exitTimer);
     if (status.code !== 0) throw new Error(`worker exited unsuccessfully (${status.code ?? status.signal ?? "unknown"}) after disposal`);
   }
+  if (!disposed) throw new Error("worker did not acknowledge clean workbench disposal");
   if (!ready || !sawSnapshot) throw new Error("worker did not complete handshake and emit a snapshot");
+  if (!sawContributions) throw new Error("worker did not advertise its contribution placement");
+  const finalDocuments = [...documents.values()];
+  const diagnostics = [...workerDiagnostics, ...finalDocuments.flatMap((document) => diagnoseDocument(document, options.target))];
+  if (!json) {
+    process.stdout.write(`\nWorkbench diagnostics (${diagnostics.length}):\n`);
+    diagnostics.forEach((diagnostic) => process.stdout.write(`  ${formatDevelopmentDiagnostic(diagnostic)}\n`));
+    process.stdout.write(`Protocol: ${trace.length} messages; ${patches.length} patches; ${subscriptions.length} subscriptions; ${actions.length} actions.\n`);
+  }
+  if (diagnostics.some((diagnostic) => diagnostic.severity === "error")) {
+    throw new Error(`workbench rejected ${diagnostics.filter((diagnostic) => diagnostic.severity === "error").length} error diagnostic(s)`);
+  }
+  return {
+    target: options.target,
+    point: options.point,
+    documents: finalDocuments,
+    contributions,
+    diagnostics,
+    trace,
+    subscriptions,
+    actions,
+    patches,
+    events,
+    hotReloadState: exportedState,
+  };
 }
 
 async function fingerprint(directory: string): Promise<string> {
@@ -182,28 +358,76 @@ async function fingerprint(directory: string): Promise<string> {
   return hash.digest("hex");
 }
 
-async function dev(root: string, once: boolean): Promise<void> {
+function workbenchTarget(value: string | undefined): WorkbenchTarget {
+  if (value === undefined) return DEFAULT_WORKBENCH_OPTIONS.target;
+  if (["terminal", "vscode", "web", "test"].includes(value)) return value as WorkbenchTarget;
+  throw new Error("--target must be terminal, vscode, web, or test");
+}
+
+async function workbenchOptions(args: string[]): Promise<WorkbenchOptions> {
+  const fixturePath = option(args, "--fixture");
+  const fixture = fixturePath === "conformance"
+    ? UI_CONFORMANCE_STORY
+    : fixturePath === undefined ? undefined : await loadWorkbenchFixture(fixturePath);
+  const target = option(args, "--target") === undefined && fixture !== undefined
+    ? fixture.target
+    : workbenchTarget(option(args, "--target"));
+  const point = option(args, "--point") ?? fixture?.point ?? DEFAULT_WORKBENCH_OPTIONS.point;
+  return {
+    target,
+    point,
+    viewport: viewport(option(args, "--viewport")),
+    colorDepth: colorDepth(option(args, "--color-depth")),
+    theme: workbenchTheme(option(args, "--theme")),
+    ...(fixture === undefined ? {} : { fixture }),
+  };
+}
+
+async function dev(root: string, once: boolean, options: WorkbenchOptions): Promise<void> {
   let previous = "";
-  let generation = 0;
+  let active: TransactionalHotReload<WorkbenchReport> | undefined;
   do {
     const current = await fingerprint(join(root, "src"));
     if (current !== previous) {
       previous = current;
-      generation += 1;
-      await runCommand("npm", ["run", "build"], root);
-      await validateProject(root);
-      await inspectWorker(join(root, "dist/worker.mjs"), false, generation);
-      process.stdout.write("UI worker rebuilt, validated, and inspected.\n");
+      const prepare = async (state: Readonly<Record<string, UiJsonValue>>, generation: number): Promise<WorkbenchReport> => {
+        await runCommand("npm", ["run", "build"], root);
+        await validateProject(root);
+        return await inspectWorker(join(root, "dist/worker.mjs"), false, generation, options, state);
+      };
+      if (active === undefined) {
+        const generation = 1;
+        try {
+          const report = await prepare(options.fixture?.hotReloadState ?? {}, generation);
+          active = new TransactionalHotReload({ value: report, states: report.hotReloadState }, generation);
+          process.stdout.write(`Workbench committed generation ${generation}. Watching for changes…\n`);
+        } catch (cause) {
+          if (once) throw cause;
+          process.stderr.write(`Workbench candidate ${generation} rejected: ${cause instanceof Error ? cause.message : String(cause)}\n`);
+        }
+      } else {
+        const result = await active.reload(async ({ generation, states }) => {
+          const report = await prepare(states, generation);
+          return { value: report, states: report.hotReloadState };
+        });
+        if (result.committed) process.stdout.write(`Workbench committed generation ${result.generation}. Watching for changes…\n`);
+        else process.stderr.write(`Workbench rolled back generation ${result.generation}: ${result.reason}. Last-valid generation ${active.generation} remains active.\n`);
+        if (once && !result.committed) throw new Error(result.reason);
+      }
     }
     if (!once) await new Promise((resolvePromise) => setTimeout(resolvePromise, 350));
   } while (!once);
 }
 
-async function validateJson(path: string): Promise<void> {
+async function validateJson(path: string, target: WorkbenchTarget): Promise<void> {
   const value = JSON.parse(await readFile(resolve(path), "utf8")) as unknown;
   if (value !== null && typeof value === "object" && "type" in value) assertUiWireMessage(value, "handshake");
   else if (value !== null && typeof value === "object" && "root" in value) {
-    const result = validateDocument(value as never); if (!result.valid) throw new Error(result.issues.map((issue) => `${issue.path}: ${issue.message}`).join("\n"));
+    const diagnostics = diagnoseDocument(value as UiDocument, target);
+    diagnostics.forEach((diagnostic) => process.stdout.write(`${formatDevelopmentDiagnostic(diagnostic)}\n`));
+    if (diagnostics.some((diagnostic) => diagnostic.severity === "error")) {
+      throw new Error(`document has ${diagnostics.filter((diagnostic) => diagnostic.severity === "error").length} error diagnostic(s)`);
+    }
   } else if (value !== null && typeof value === "object" && "patches" in value) {
     const result = validatePatchBatch(value as never); if (!result.valid) throw new Error(result.issues.map((issue) => `${issue.path}: ${issue.message}`).join("\n"));
   } else if (value !== null && typeof value === "object" && "eventId" in value) {
@@ -212,7 +436,7 @@ async function validateJson(path: string): Promise<void> {
 }
 
 function usage(): never {
-  throw new Error("usage: codypendent-ui <create|validate|validate-json|build|test|dev|inspect|schema|package|sign> [path] [--template pure|react] [--key publisher.pem] [--json]");
+  throw new Error("usage: codypendent-ui <create|validate|validate-json|build|test|dev|workbench|inspect|schema|package|sign> [path] [--template pure|react] [--target terminal|vscode|web|test] [--point point] [--viewport WIDTHxHEIGHT] [--theme dark|light|highContrast|monochrome] [--color-depth monochrome|ansi16|ansi256|trueColor] [--fixture fixture.json|conformance] [--key publisher.pem] [--json]");
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
@@ -227,11 +451,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       process.stdout.write(`Created ${await createScaffold(values[0] ?? "codypendent-ui", template as ScaffoldTemplate)}\n`); break;
     }
     case "validate": await validateProject(root); process.stdout.write("Manifest and package are valid.\n"); break;
-    case "validate-json": await validateJson(values[0] ?? usage()); process.stdout.write("Remote UI JSON is valid.\n"); break;
+    case "validate-json": await validateJson(values[0] ?? usage(), workbenchTarget(option(args, "--target"))); process.stdout.write("Remote UI JSON is valid.\n"); break;
     case "build": await runCommand("npm", ["run", "build"], root); await validateProject(root); break;
     case "test": await runCommand("npm", ["test"], root); break;
-    case "dev": await dev(root, has(args, "--once")); break;
-    case "inspect": await inspectWorker(values[0] ?? join(process.cwd(), "dist/worker.mjs"), has(args, "--json")); break;
+    case "dev":
+    case "workbench": await dev(root, has(args, "--once"), await workbenchOptions(args)); break;
+    case "inspect": await inspectWorker(values[0] ?? join(process.cwd(), "dist/worker.mjs"), has(args, "--json"), undefined, await workbenchOptions(args)); break;
     case "schema": {
       const output = resolve(option(args, "--output") ?? values[0] ?? "remote-ui.schema.json");
       await mkdir(dirname(output), { recursive: true }); await copyFile(fileURLToPath(REMOTE_UI_SCHEMA_URL), output); process.stdout.write(`${output}\n`); break;

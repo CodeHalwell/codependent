@@ -26,6 +26,7 @@
 //! a keyboard equivalent (RULE 3, see [`input::KEY_BINDINGS`]); colors come only
 //! from [`Theme`] tokens (RULE 7).
 
+pub mod accessible;
 pub mod action;
 pub mod input;
 pub mod markdown;
@@ -39,6 +40,7 @@ pub mod terminal;
 pub mod theme;
 pub mod theme_pack;
 
+pub use accessible::{accessible_snapshot, map_accessible_input, sanitize_accessible_text};
 pub use action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, WorkflowNodeUpdate};
 pub use input::{map_event, pane_at, KeyBinding, KEY_BINDINGS};
 pub use markdown::{RichLine, RichSpan, SpanRole, SyntaxRole};
@@ -49,7 +51,9 @@ pub use remote_ui::{
     RemoteUiRenderOptions, RemoteUiRenderOutput, RemoteUiViewState, RenderDiagnostic,
     TerminalUiCapabilities, ALL_NATIVE_PRIMITIVES,
 };
-pub use remote_ui_host::{terminal_capabilities_message, RemoteUiHostState};
+pub use remote_ui_host::{
+    accessible_terminal_capabilities_message, terminal_capabilities_message, RemoteUiHostState,
+};
 pub use render::{render, render_splash};
 pub use state::{
     AppState, BlackboardItemCard, DocBlockView, DocCard, DocEdit, DocFocus, DocLeaseState,

@@ -2,12 +2,14 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { UI_PROTOCOL_VERSION, type UiDocument, type UiElementNode, type UiEvent, type UiPrimitive } from "@codypendent/ui";
+import { UI_CONTRIBUTION_POINTS, UI_PROTOCOL_VERSION, type UiDocument, type UiElementNode, type UiEvent, type UiPrimitive } from "@codypendent/ui";
+import { UI_CONFORMANCE_STORY } from "@codypendent/ui/tooling";
 
 import { createWebviewCapabilities, WEB_PRIMITIVES } from "../src/webview/remote-ui/capabilities.js";
-import { RemoteUiRenderer } from "../src/webview/remote-ui/renderer.js";
+import { RemoteUiRenderer, type RemoteUiRecoveryRequest } from "../src/webview/remote-ui/renderer.js";
+import { WEB_CONTRIBUTION_POINTS, WEB_SLOT_DEFINITIONS } from "../src/webview/remote-ui/slot-registry.js";
 import { RemoteUiStore } from "../src/webview/remote-ui/store.js";
-import { applyWireTheme } from "../src/webview/remote-ui/theme.js";
+import { applyThemeTokens, applyWireTheme } from "../src/webview/remote-ui/theme.js";
 
 const ATTESTED_PLACEMENT = { point: "panel", extensionId: "test.plugin" } as const;
 
@@ -53,6 +55,7 @@ describe("RemoteUiRenderer DOM", () => {
   let root: Root;
   let store: RemoteUiStore;
   let events: UiEvent[];
+  let recoveries: RemoteUiRecoveryRequest[];
   const capabilities = createWebviewCapabilities({ width: 1024, height: 768 });
 
   beforeEach(() => {
@@ -62,6 +65,7 @@ describe("RemoteUiRenderer DOM", () => {
     root = createRoot(container);
     store = new RemoteUiStore(capabilities);
     events = [];
+    recoveries = [];
   });
 
   afterEach(() => {
@@ -70,7 +74,7 @@ describe("RemoteUiRenderer DOM", () => {
   });
 
   function render(): void {
-    act(() => root.render(<RemoteUiRenderer store={store} capabilities={capabilities} dispatch={(event) => events.push(event)} showTerminalFallback />));
+    act(() => root.render(<RemoteUiRenderer store={store} capabilities={capabilities} dispatch={(event) => events.push(event)} recover={(request) => recoveries.push(request)} showTerminalFallback />));
   }
 
   it("renders every built-in primitive without falling into unknown handling", () => {
@@ -148,6 +152,63 @@ describe("RemoteUiRenderer DOM", () => {
     expect(container.querySelector('[data-ui-slot-adapter="form"]')?.getAttribute("role")).toBe("form");
     expect(container.querySelector('[data-ui-slot-adapter="wizard"]')?.getAttribute("role")).toBe("dialog");
     expect(container.querySelector('[data-ui-slot-adapter="context-menu"]')?.getAttribute("role")).toBe("menu");
+    expect(container.querySelector('[data-ui-slot-adapter="command-palette"]')?.hasAttribute("inert")).toBe(true);
+    expect(container.querySelector('[data-ui-slot-adapter="context-menu"]')?.getAttribute("aria-hidden")).toBe("true");
+    expect(container.querySelector('[data-ui-slot-adapter="wizard"]')?.hasAttribute("inert")).toBe(false);
+    expect(container.querySelector('[data-ui-slot-adapter="notification"]')?.hasAttribute("inert")).toBe(false);
+    expect(WEB_CONTRIBUTION_POINTS).toEqual(UI_CONTRIBUTION_POINTS);
+    expect(WEB_SLOT_DEFINITIONS).toHaveLength(UI_CONTRIBUTION_POINTS.length);
+    expect(new Set(WEB_SLOT_DEFINITIONS.map((definition) => definition.region))).toEqual(new Set([
+      "sidebar", "navigation", "primary", "transcript", "composer", "setup", "status", "overlay",
+    ]));
+    for (const definition of WEB_SLOT_DEFINITIONS) {
+      const adapter = container.querySelector(`[data-ui-slot-adapter="${definition.point}"]`);
+      expect(adapter?.closest(`[data-ui-host-region="${definition.region}"]`), definition.point).not.toBeNull();
+      expect(adapter?.getAttribute("aria-label"), definition.point).toBe(definition.label);
+    }
+  });
+
+  it("renders the shared story across host structure, long content, and overlays", () => {
+    if (UI_CONFORMANCE_STORY.document === undefined) throw new Error("conformance story must include a document");
+    store.apply({ type: "snapshot", document: UI_CONFORMANCE_STORY.document }, { point: "panel", extensionId: "conformance.story" });
+    render();
+    expect(container.querySelector('[data-ui-host-region="primary"] [data-ui-slot-adapter="panel"]')).not.toBeNull();
+    expect(container.querySelector('[data-ui-document-id="conformance-surface-states"]')?.textContent).toContain("A-very-long-unbroken-extension-value");
+    expect(container.querySelector('[data-ui-node-id="long"]')).not.toBeNull();
+    for (const theme of UI_CONFORMANCE_STORY.themes ?? []) {
+      applyWireTheme(container, {
+        id: theme.id, name: theme.id, revision: 1,
+        colorScheme: theme.mode === "light" ? "light" : "dark",
+        highContrast: theme.mode === "highContrast",
+        reducedMotion: false,
+        tokens: theme.colors,
+      });
+      expect(container.dataset.uiTheme).toBe(theme.id);
+    }
+    for (const viewport of UI_CONFORMANCE_STORY.viewports ?? []) {
+      container.style.width = `${viewport.width}ch`;
+      container.style.height = `${viewport.height}rem`;
+      expect(container.scrollWidth).toBeGreaterThanOrEqual(0);
+    }
+
+    store.apply({ type: "snapshot", document: documentWith(primitive("Button", 999), 1) }, { point: "command-palette", extensionId: "overlay.story" });
+    render();
+    expect(container.querySelector('[data-ui-host-region="overlay"] [role="dialog"]')).not.toBeNull();
+    expect(document.activeElement?.tagName).toBe("BUTTON");
+  });
+
+  it("offers document-scoped retry, disable, and report recovery actions", () => {
+    store.apply({ type: "snapshot", document: documentWith(primitive("Button", 1)) }, { point: "panel", extensionId: "acme.recovery" });
+    store.apply({ type: "error", documentId: "dom-document", code: "render.failed", message: "Could not render this document" });
+    render();
+    const card = container.querySelector('[data-ui-error-document="dom-document"]');
+    expect(card?.getAttribute("role")).toBe("alert");
+    expect(card?.getAttribute("aria-live")).toBe("polite");
+    const buttons = [...(card?.querySelectorAll("button") ?? [])];
+    expect(buttons.map((button) => button.textContent)).toEqual(["Retry", "Disable extension surface", "Report details"]);
+    buttons.forEach((button) => act(() => button.click()));
+    expect(recoveries.map((request) => request.action)).toEqual(["retry", "disable", "report"]);
+    expect(recoveries.every((request) => request.documentId === "dom-document" && request.extensionId === "acme.recovery")).toBe(true);
   });
 
   it("submits normalized form data and applies patches without remounting the host", () => {
@@ -208,6 +269,15 @@ describe("RemoteUiRenderer DOM", () => {
     expect(container.style.getPropertyValue("--cody-ui-accent")).toBe("#4ea1ff");
     expect(container.style.getPropertyValue("--cody-ui-unsafe")).toBe("");
     expect(container.style.getPropertyValue("--cody-ui-escape")).toBe("");
+    applyThemeTokens(container, {
+      id: "semantic",
+      mode: "dark",
+      colors: { "text.primary": "#eeeeee", "surface.background": "#111111" },
+      spacing: { md: 8 },
+    });
+    expect(container.style.getPropertyValue("--cody-ui-text-primary")).toBe("#eeeeee");
+    expect(container.style.getPropertyValue("--cody-ui-surface-background")).toBe("#111111");
+    expect(container.style.getPropertyValue("--cody-ui-spacing-md")).toBe("8px");
   });
 
   it("windows large virtual lists while preserving list position metadata", () => {
