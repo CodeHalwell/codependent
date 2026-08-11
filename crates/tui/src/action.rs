@@ -9,8 +9,10 @@
 
 use codypendent_protocol::{
     ApprovalScope, DocumentId, DocumentMutation, PendingApprovalProjection, RunId, SessionEvent,
+    UiActionBinding, UiDocumentId, UiNodeId, UiRevision, UiWireMessage,
 };
 
+use crate::remote_ui::RemoteKey;
 use crate::state::{BlackboardItemCard, DocBlockView, DocSuggestionView, KeyStatus, Pane};
 
 /// One live workflow-node projection carried from the socket-owning harness to
@@ -50,6 +52,28 @@ pub enum Action {
     /// A persistent setup/runtime diagnostic from the harness. De-duplicated by
     /// the reducer and available in the Issues overlay until explicitly cleared.
     Issue(String),
+    /// One validated Remote UI frame delivered by the daemon.
+    RemoteUiMessage(Box<UiWireMessage>),
+    /// Enter or leave keyboard focus for the mounted Remote UI surface.
+    RemoteUiSetActive(bool),
+    /// A key interpreted by the focused semantic component.
+    RemoteUiKey {
+        key: RemoteKey,
+        character: Option<char>,
+    },
+    /// Bracketed paste for a focused semantic form field.
+    RemoteUiPaste(String),
+    /// Activate one revision-bound renderer hit region.
+    RemoteUiActivate {
+        document_id: UiDocumentId,
+        revision: UiRevision,
+        target_id: UiNodeId,
+        binding: Box<UiActionBinding>,
+    },
+    /// Advertise a changed terminal viewport.
+    RemoteUiViewport { width: u16, height: u16 },
+    /// Authoritative lifecycle rows returned by a host-owned plugin command.
+    UiPluginsLoaded(Vec<codypendent_protocol::UiPluginLifecycleStatus>),
 
     // --- navigation (from keys / mouse) ---
     /// Move keyboard focus to the next pane (`Tab`).
@@ -156,6 +180,16 @@ pub enum Action {
     /// Toggle the blackboard view (`B`): the typed artifacts agents share within
     /// a workflow run, with author, confidence, evidence, and payload summary.
     OpenBlackboard,
+    /// Open the host-owned Remote UI plugin lifecycle surface.
+    OpenUiPlugins,
+    /// Smoke-test the selected plugin in the daemon sandbox.
+    SmokeTestUiPlugin,
+    /// Enable the selected plugin for only the attached session.
+    EnableUiPluginSession,
+    /// Enable the selected plugin for the current user across sessions.
+    EnableUiPluginUser,
+    /// Begin revocation confirmation for the selected plugin.
+    RevokeUiPlugin,
 
     // --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
     /// Begin editing the focused block in the Docs editor rail (`e`): opens the
@@ -346,6 +380,28 @@ pub enum ProjectionKind {
 /// intents produced, never on a socket.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
+    /// Send a renderer-originated Remote UI frame on the attached session.
+    RemoteUiMessage(Box<UiWireMessage>),
+    /// Read daemon-owned installed-plugin lifecycle state.
+    ListUiPlugins,
+    SmokeTestUiPlugin {
+        plugin_id: String,
+    },
+    EnableUiPlugin {
+        plugin_id: String,
+        scope: String,
+    },
+    ApproveUiPluginUpdate {
+        plugin_id: String,
+        receipt: String,
+    },
+    RejectUiPluginUpdate {
+        plugin_id: String,
+        receipt: String,
+    },
+    RevokeUiPlugin {
+        plugin_id: String,
+    },
     /// Start a new run in the attached session.
     StartRun {
         objective: String,

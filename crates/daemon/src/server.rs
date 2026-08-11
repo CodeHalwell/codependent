@@ -13,9 +13,11 @@
 //! (`Command`, including `AttachSession`) requires a prior `ClientHello`.
 
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
@@ -23,10 +25,12 @@ use codypendent_protocol::{
     Envelope, FrameError, Payload, ProtocolError, ServerHello, SessionEvent, SessionId,
     Subscription, BUILD_ID, PROTOCOL_V1,
 };
+use codypendent_sandbox::{LifecycleState, UiTarget};
 use sqlx::SqlitePool;
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -46,6 +50,12 @@ use crate::promotion::{
     AdvancePromotionRequest, ApprovePromotionRequest, PromotionGateway, ProposePromotionRequest,
     RollbackPromotionRequest,
 };
+use crate::remote_ui::{
+    broker_error, RemoteUiBroker, UiBrokerFrame, UiBrokerTarget, UiMediatedAction,
+    UiMediatedSubscription, UiProducerHandle,
+};
+use crate::remote_ui_plugins::{system_remote_ui_runtime, RemoteUiPluginStore};
+use crate::remote_ui_workers::{RemoteUiWorkerService, UiWorkerRequest};
 use crate::subscriptions::SubscriptionHub;
 use crate::workflow_stream::{ReadWorkflowRunRequest, WorkflowHub, WorkflowReader};
 use crate::workflows::{
@@ -61,6 +71,16 @@ const HEARTBEAT_MISS_LIMIT: u32 = 3;
 /// The catch-up cutover: a client at most this many events behind is replayed
 /// event-by-event; further behind, it receives a projection snapshot instead.
 const CATCHUP_EVENT_LIMIT: u64 = 500;
+type RemoteUiRunRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// A write half shared between a connection's request/reply path and its
 /// per-session event forwarders, so both can frame envelopes onto one socket.
@@ -168,6 +188,18 @@ pub struct ServerState {
     /// opened — guarded by this set so a session repeatedly created or
     /// re-attached against the same repository fires at most one scan.
     pub scanned_repos: Arc<Mutex<std::collections::HashSet<std::path::PathBuf>>>,
+    /// Session-scoped validated Remote UI documents, fan-out, and replay.
+    pub remote_ui: RemoteUiBroker,
+    /// Durable verified UI packages. `None` means the host runtime or enforcing
+    /// sandbox was unavailable; workers then fail closed while normal clients
+    /// and core TUI surfaces continue to operate.
+    pub remote_ui_plugins: Option<Arc<RemoteUiPluginStore>>,
+    /// Supervised verified worker processes, started lazily by session attach.
+    pub remote_ui_workers: Option<RemoteUiWorkerService>,
+    /// Bounded path from workers into daemon action/projection mediation.
+    pub remote_ui_worker_requests: mpsc::Sender<UiWorkerRequest>,
+    /// Coalesced invalidation stream for latest-wins IDE context projections.
+    pub remote_ui_context_updates: broadcast::Sender<SessionId>,
 }
 
 /// Bind the socket, write the pidfile, and serve until Shutdown or SIGTERM /
@@ -302,6 +334,44 @@ pub async fn run_with_executor_on(
     let commands = CommandProcessor::new(subscriptions.clone(), approvals);
     let artifacts = ArtifactStore::new(paths.data_dir.join("artifacts"));
     let secret = load_or_create_secret(&paths.data_dir)?;
+    let (remote_ui_worker_requests, remote_ui_request_rx) = mpsc::channel(256);
+    let (remote_ui_context_updates, _) = broadcast::channel(256);
+    // A process crash can leave a lifecycle idempotency claim without a reply.
+    // Store operations are themselves exact-input idempotent, so expired NULL
+    // claims may be reclaimed and safely replayed instead of stranding forever.
+    let stale_plugin_claim = (Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+    sqlx::query("DELETE FROM ui_plugin_commands WHERE result_json IS NULL AND created_at < ?")
+        .bind(stale_plugin_claim)
+        .execute(&pool)
+        .await?;
+    let (remote_ui_plugins, remote_ui_workers) = match system_remote_ui_runtime() {
+        Ok((runtime, supervisor)) => {
+            match RemoteUiPluginStore::open(
+                &paths.data_dir,
+                &paths.config_dir,
+                runtime,
+                secret.clone(),
+            ) {
+                Ok(store) => {
+                    let store = Arc::new(store);
+                    let source: Arc<dyn crate::remote_ui_workers::VerifiedUiLaunchSource> =
+                        store.clone();
+                    (
+                        Some(store),
+                        Some(RemoteUiWorkerService::new(supervisor, source)),
+                    )
+                }
+                Err(error) => {
+                    warn!(%error, "Remote UI plugin persistence unavailable; component workers fail closed");
+                    (None, None)
+                }
+            }
+        }
+        Err(error) => {
+            warn!(%error, "Remote UI worker runtime unavailable; component workers fail closed");
+            (None, None)
+        }
+    };
 
     let state = Arc::new(ServerState {
         pool,
@@ -328,7 +398,16 @@ pub async fn run_with_executor_on(
         run_admission: Arc::new(tokio::sync::RwLock::new(())),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         scanned_repos: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        remote_ui: RemoteUiBroker::default(),
+        remote_ui_plugins,
+        remote_ui_workers,
+        remote_ui_worker_requests,
+        remote_ui_context_updates,
     });
+    let remote_ui_request_task = tokio::spawn(consume_remote_ui_worker_requests(
+        Arc::clone(&state),
+        remote_ui_request_rx,
+    ));
 
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -362,6 +441,11 @@ pub async fn run_with_executor_on(
             }
         }
     }
+
+    if let Some(workers) = &state.remote_ui_workers {
+        workers.shutdown();
+    }
+    remote_ui_request_task.abort();
 
     expiry_task.abort();
     let _ = std::fs::remove_file(&paths.socket_path);
@@ -455,6 +539,8 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
     // while another session's document forwarders are left untouched.
     let mut doc_forwarders: std::collections::HashMap<SessionId, Vec<JoinHandle<()>>> =
         std::collections::HashMap::new();
+    let mut ui_forwarders: std::collections::HashMap<SessionId, JoinHandle<()>> =
+        std::collections::HashMap::new();
 
     // The read loop stamps this on every frame; the heartbeat task reads it to
     // decide when the client has gone silent. Locked only for the instant swap,
@@ -490,6 +576,7 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
                     &mut conn,
                     &mut forwarders,
                     &mut doc_forwarders,
+                    &mut ui_forwarders,
                     request,
                 )
                 .await
@@ -516,10 +603,23 @@ async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyho
             handle.abort();
         }
     }
+    for forwarder in ui_forwarders.values() {
+        forwarder.abort();
+    }
     // Announce this client's departure from every session it was attached to, so
     // the remaining clients see it leave (STEP 3.7).
     if let Some(client_id) = conn.client_id {
         for (session_id, role) in &conn.attached {
+            let disconnected = state.remote_ui.disconnect_renderer(*session_id, client_id);
+            if disconnected.remaining_total == 0 {
+                if let Some(workers) = &state.remote_ui_workers {
+                    workers.stop_session(*session_id);
+                }
+            } else if let Some(workers) = &state.remote_ui_workers {
+                for target in disconnected.departed_targets {
+                    workers.stop_session_target(*session_id, target);
+                }
+            }
             publish_presence(&state, *session_id, client_id, *role, false).await;
         }
     }
@@ -626,6 +726,7 @@ async fn handle_request(
     conn: &mut ConnState,
     forwarders: &mut std::collections::HashMap<SessionId, JoinHandle<()>>,
     doc_forwarders: &mut std::collections::HashMap<SessionId, Vec<JoinHandle<()>>>,
+    ui_forwarders: &mut std::collections::HashMap<SessionId, JoinHandle<()>>,
     request: Envelope,
 ) -> anyhow::Result<bool> {
     // Major-version incompatibility is refused structurally; the connection
@@ -782,6 +883,26 @@ async fn handle_request(
             }
 
             match &command.body {
+                body @ (CommandBody::InstallUiPlugin { .. }
+                | CommandBody::SmokeTestUiPlugin { .. }
+                | CommandBody::EnableUiPlugin { .. }
+                | CommandBody::ListUiPlugins
+                | CommandBody::UpdateUiPlugin { .. }
+                | CommandBody::ApproveUiPluginUpdate { .. }
+                | CommandBody::RejectUiPluginUpdate { .. }
+                | CommandBody::RevokeUiPlugin { .. }
+                | CommandBody::RemoveTrustedUiPublisher { .. }) => {
+                    let reply = handle_ui_plugin_lifecycle(
+                        state,
+                        conn.client_id.expect("handshaken connection has client id"),
+                        command.command_id,
+                        &command.idempotency_key,
+                        conn.role,
+                        body,
+                    )
+                    .await;
+                    send(writer, &Envelope::reply_to(&request, reply)).await?;
+                }
                 // Attach is a connection-level concern the write path
                 // deliberately rejects; intercept it here.
                 CommandBody::AttachSession {
@@ -817,6 +938,16 @@ async fn handle_request(
                     if attached && !conn.attached.iter().any(|(s, _)| s == session_id) {
                         conn.attached.push((*session_id, *requested_role));
                     }
+                    if attached {
+                        attach_remote_ui(
+                            state,
+                            writer,
+                            conn.client_id.expect("handshaken connection has client id"),
+                            *session_id,
+                            ui_forwarders,
+                        )
+                        .await?;
+                    }
                 }
                 // IDE context is latest-wins, high-frequency projection state, not
                 // a ledger command — upsert it directly and acknowledge, mirroring
@@ -844,14 +975,17 @@ async fn handle_request(
                     )
                     .await
                     {
-                        Ok(()) => Envelope::reply_to(
-                            &request,
-                            Payload::CommandAccepted {
-                                command_id: command.command_id,
-                                sequence: None,
-                                created_run: None,
-                            },
-                        ),
+                        Ok(()) => {
+                            let _ = state.remote_ui_context_updates.send(*session_id);
+                            Envelope::reply_to(
+                                &request,
+                                Payload::CommandAccepted {
+                                    command_id: command.command_id,
+                                    sequence: None,
+                                    created_run: None,
+                                },
+                            )
+                        }
                         Err(error) => Envelope::reply_to(
                             &request,
                             Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
@@ -1809,6 +1943,116 @@ async fn handle_request(
 
         // Anything else (including a future `Unknown` payload) is refused
         // structurally; the connection survives.
+        Payload::RemoteUi { message } => {
+            if !conn.handshaken {
+                send(
+                    writer,
+                    &Envelope::reply_to(
+                        &request,
+                        Payload::Error(ProtocolError {
+                            code: "protocol.handshake-required".to_owned(),
+                            message: "send a ClientHello before Remote UI traffic".to_owned(),
+                            retryable: false,
+                        }),
+                    ),
+                )
+                .await?;
+                return Ok(false);
+            }
+            let Some(session_id) = request.session_id else {
+                send(
+                    writer,
+                    &Envelope::reply_to(
+                        &request,
+                        Payload::RemoteUi {
+                            message: Box::new(broker_error(
+                                "Remote UI envelope requires a sessionId",
+                            )),
+                        },
+                    ),
+                )
+                .await?;
+                return Ok(false);
+            };
+            let Some((_, role)) = conn
+                .attached
+                .iter()
+                .find(|(attached, _)| *attached == session_id)
+            else {
+                send(
+                    writer,
+                    &Envelope::reply_to(
+                        &request,
+                        Payload::RemoteUi {
+                            message: Box::new(broker_error(
+                                "attach to the session before Remote UI traffic",
+                            )),
+                        },
+                    ),
+                )
+                .await?;
+                return Ok(false);
+            };
+            let client_id = conn.client_id.expect("handshaken connection has client id");
+            match state
+                .remote_ui
+                .handle_renderer(session_id, client_id, *role, (**message).clone())
+            {
+                Ok(dispatch) => {
+                    if dispatch.renderer_negotiated {
+                        let target =
+                            message.capabilities.as_ref().and_then(
+                                |capabilities| match capabilities.client.as_str() {
+                                    "terminal" | "tui" => Some(UiTarget::Terminal),
+                                    "web" | "browser" | "vscode" | "desktop" => Some(UiTarget::Web),
+                                    _ => None,
+                                },
+                            );
+                        if let (Some(workers), Some(target)) = (&state.remote_ui_workers, target) {
+                            workers.ensure_session_target(
+                                session_id,
+                                target,
+                                state.remote_ui.clone(),
+                                state.remote_ui_worker_requests.clone(),
+                            );
+                        }
+                    }
+                    for direct in dispatch.direct {
+                        send(
+                            writer,
+                            &Envelope::reply_to(
+                                &request,
+                                Payload::RemoteUi {
+                                    message: Box::new(direct),
+                                },
+                            ),
+                        )
+                        .await?;
+                    }
+                    for action in dispatch.actions {
+                        mediate_remote_ui_action(state, session_id, action).await;
+                    }
+                    if !dispatch.subscriptions.is_empty() {
+                        warn!(
+                            count = dispatch.subscriptions.len(),
+                            "renderer attempted worker-only Remote UI subscriptions"
+                        );
+                    }
+                }
+                Err(error) => {
+                    send(
+                        writer,
+                        &Envelope::reply_to(
+                            &request,
+                            Payload::RemoteUi {
+                                message: Box::new(broker_error(error)),
+                            },
+                        ),
+                    )
+                    .await?;
+                }
+            }
+        }
         other => {
             let reply = Envelope::reply_to(
                 &request,
@@ -1822,6 +2066,1206 @@ async fn handle_request(
         }
     }
     Ok(false)
+}
+
+async fn handle_ui_plugin_lifecycle(
+    state: &Arc<ServerState>,
+    client_id: ClientId,
+    command_id: codypendent_protocol::CommandId,
+    idempotency_key: &str,
+    role: ClientRole,
+    body: &CommandBody,
+) -> Payload {
+    let read_only = matches!(body, CommandBody::ListUiPlugins);
+    if (!read_only && !matches!(role, ClientRole::Controller | ClientRole::Approver))
+        || role == ClientRole::Unknown
+    {
+        return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "plugin.role-denied",
+            "Remote UI plugin lifecycle changes require the Controller or Approver role",
+            false,
+        ));
+    }
+    let Some(store) = state.remote_ui_plugins.as_ref() else {
+        return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "plugin.runtime-unavailable",
+            "the enforcing Remote UI worker runtime is unavailable; plugin management fails closed",
+            true,
+        ));
+    };
+    let body_hash = {
+        use sha2::{Digest as _, Sha256};
+        hex::encode(Sha256::digest(serde_json::to_vec(body).unwrap_or_default()))
+    };
+    match claim_ui_plugin_command(&state.pool, client_id, idempotency_key, &body_hash).await {
+        Ok(Some(reply)) => return reply,
+        Ok(None) => {}
+        Err(error) => return Payload::CommandRejected(error),
+    }
+    let result = match body {
+        CommandBody::InstallUiPlugin {
+            manifest_toml,
+            artifact_base64,
+            allow_unsigned,
+        } => decode_ui_plugin_candidate(manifest_toml, artifact_base64).and_then(
+            |(manifest, artifact)| {
+                let granted = codypendent_sandbox::CapabilitySet::from_spec(&manifest.capabilities);
+                let granted_ui = manifest
+                    .ui
+                    .as_ref()
+                    .map(|ui| ui.requested_capabilities.iter().copied().collect())
+                    .unwrap_or_default();
+                store
+                    .install_disabled(manifest, &artifact, *allow_unsigned, granted, granted_ui)
+                    .map(|status| vec![status])
+                    .map_err(anyhow::Error::from)
+            },
+        ),
+        CommandBody::SmokeTestUiPlugin { plugin_id } => {
+            let Some(workers) = state.remote_ui_workers.as_ref() else {
+                return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                    "plugin.runtime-unavailable",
+                    "the enforcing Remote UI worker supervisor is unavailable",
+                    true,
+                ));
+            };
+            store
+                .smoke_test(
+                    plugin_id,
+                    workers.supervisor(),
+                    state.remote_ui.producer_offer(),
+                )
+                .await
+                .map(|status| vec![status])
+                .map_err(anyhow::Error::from)
+        }
+        CommandBody::EnableUiPlugin {
+            plugin_id,
+            scope,
+            session_id,
+        } => store
+            .enable(plugin_id, scope, *session_id)
+            .map(|status| vec![status])
+            .map_err(anyhow::Error::from),
+        CommandBody::ListUiPlugins => store.list().map_err(anyhow::Error::from),
+        CommandBody::UpdateUiPlugin {
+            plugin_id,
+            manifest_toml,
+            artifact_base64,
+            allow_unsigned,
+        } => match decode_ui_plugin_candidate(manifest_toml, artifact_base64) {
+            Err(error) => Err(error),
+            Ok((manifest, artifact)) => match state.remote_ui_workers.as_ref() {
+                None => Err(anyhow::anyhow!(
+                    "the enforcing Remote UI worker supervisor is unavailable"
+                )),
+                Some(workers) => {
+                    match store.update(plugin_id, manifest, &artifact, *allow_unsigned) {
+                        Err(error) => Err(anyhow::Error::from(error)),
+                        Ok(staged)
+                            if staged
+                                .update_permission_diff
+                                .as_ref()
+                                .is_some_and(|diff| !diff.is_empty()) =>
+                        {
+                            // Permission/resource expansion remains inert until
+                            // the exact human approval receipt is supplied.
+                            Ok(vec![staged])
+                        }
+                        Ok(staged) => match staged.update_approval_receipt {
+                            None => Err(anyhow::anyhow!(
+                                "safe staged update has no internal receipt"
+                            )),
+                            Some(receipt) => match store
+                                .preflight_pending_update(
+                                    plugin_id,
+                                    &receipt,
+                                    workers.supervisor(),
+                                    state.remote_ui.producer_offer(),
+                                )
+                                .await
+                            {
+                                Ok(()) => store
+                                    .commit_safe_update(plugin_id, &receipt)
+                                    .map(|status| vec![status])
+                                    .map_err(anyhow::Error::from),
+                                Err(error) => {
+                                    let _ = store.reject_update(plugin_id, &receipt);
+                                    Err(anyhow::Error::from(error))
+                                }
+                            },
+                        },
+                    }
+                }
+            },
+        },
+        CommandBody::ApproveUiPluginUpdate {
+            plugin_id,
+            approval_receipt,
+        } => match state.remote_ui_workers.as_ref() {
+            None => Err(anyhow::anyhow!(
+                "the enforcing Remote UI worker supervisor is unavailable"
+            )),
+            Some(workers) => store
+                .preflight_pending_update(
+                    plugin_id,
+                    approval_receipt,
+                    workers.supervisor(),
+                    state.remote_ui.producer_offer(),
+                )
+                .await
+                .and_then(|()| store.approve_update(plugin_id, approval_receipt))
+                .map(|status| vec![status])
+                .map_err(anyhow::Error::from),
+        },
+        CommandBody::RejectUiPluginUpdate {
+            plugin_id,
+            approval_receipt,
+        } => store
+            .reject_update(plugin_id, approval_receipt)
+            .map(|status| vec![status])
+            .map_err(anyhow::Error::from),
+        CommandBody::RevokeUiPlugin { plugin_id } => store
+            .revoke(plugin_id)
+            .map(|status| vec![status])
+            .map_err(anyhow::Error::from),
+        CommandBody::RemoveTrustedUiPublisher { publisher_id } => {
+            match store.remove_trusted_publisher(publisher_id) {
+                Err(error) => Err(anyhow::Error::from(error)),
+                Ok(removal) if removal.failures.is_empty() => Ok(removal.plugins),
+                Ok(removal) => {
+                    // Trust is already durably gone. Revoke broker authority and
+                    // cancel every pre-resolved worker even if a secondary
+                    // record rewrite failed, then report the repair failures.
+                    for status in &removal.plugins {
+                        if let Err(error) = state.remote_ui.revoke_plugin(&status.id) {
+                            tracing::error!(
+                                plugin = status.id,
+                                %error,
+                                "failed to synchronously revoke Remote UI broker authority"
+                            );
+                        }
+                        if let Some(workers) = state.remote_ui_workers.as_ref() {
+                            workers.stop_plugin(&status.id);
+                        }
+                    }
+                    let affected = removal
+                        .plugins
+                        .iter()
+                        .map(|status| status.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Err(anyhow::anyhow!(
+                        "publisher trust was removed and workers were revoked for [{affected}], but lifecycle record repair failed: {}",
+                        removal.failures.join("; ")
+                    ))
+                }
+            }
+        }
+        _ => unreachable!("caller filters plugin lifecycle variants"),
+    };
+    let reply = match result {
+        Ok(statuses) => {
+            if !read_only {
+                for status in &statuses {
+                    if status.state != LifecycleState::UpdateBlocked {
+                        if let Err(error) = state.remote_ui.revoke_plugin(&status.id) {
+                            tracing::error!(
+                                plugin = status.id,
+                                %error,
+                                "failed to synchronously revoke Remote UI broker authority"
+                            );
+                        }
+                    }
+                }
+                if let Some(workers) = state.remote_ui_workers.as_ref() {
+                    for status in &statuses {
+                        if status.state != LifecycleState::UpdateBlocked {
+                            workers.stop_plugin(&status.id);
+                        }
+                    }
+                    if statuses
+                        .iter()
+                        .any(|status| status.state == LifecycleState::Enabled)
+                    {
+                        for (session_id, target) in state.remote_ui.renderer_session_targets() {
+                            workers.ensure_session_target(
+                                session_id,
+                                target,
+                                state.remote_ui.clone(),
+                                state.remote_ui_worker_requests.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+            Payload::UiPluginLifecycle {
+                command_id,
+                plugins: statuses.into_iter().map(ui_plugin_status_wire).collect(),
+            }
+        }
+        Err(error) => Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "plugin.lifecycle-refused",
+            error.to_string(),
+            false,
+        )),
+    };
+    if let Err(error) =
+        persist_ui_plugin_command_result(&state.pool, idempotency_key, &body_hash, &reply).await
+    {
+        error!(%error, "could not persist Remote UI plugin command outcome");
+        return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "plugin.result-persistence-failed",
+            "the lifecycle effect completed but its retry record could not be persisted; inspect plugin list before retrying",
+            true,
+        ));
+    }
+    reply
+}
+
+async fn claim_ui_plugin_command(
+    pool: &SqlitePool,
+    client_id: ClientId,
+    idempotency_key: &str,
+    body_hash: &str,
+) -> Result<Option<Payload>, codypendent_protocol::CodypendentError> {
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO ui_plugin_commands \
+         (client_id, idempotency_key, body_hash, result_json, created_at) VALUES (?, ?, ?, NULL, ?)",
+    )
+    .bind(client_id.to_string())
+    .bind(idempotency_key)
+    .bind(body_hash)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .map_err(|error| {
+        codypendent_protocol::CodypendentError::new(
+            "plugin.idempotency-store-failed",
+            error.to_string(),
+            true,
+        )
+    })?
+    .rows_affected();
+    if inserted == 1 {
+        return Ok(None);
+    }
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT body_hash, result_json FROM ui_plugin_commands WHERE idempotency_key = ?",
+    )
+    .bind(idempotency_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| {
+        codypendent_protocol::CodypendentError::new(
+            "plugin.idempotency-store-failed",
+            error.to_string(),
+            true,
+        )
+    })?;
+    let Some((stored_hash, result)) = row else {
+        return Err(codypendent_protocol::CodypendentError::new(
+            "plugin.idempotency-race",
+            "plugin lifecycle retry record disappeared",
+            true,
+        ));
+    };
+    if stored_hash != body_hash {
+        return Err(codypendent_protocol::CodypendentError::new(
+            "plugin.idempotency-conflict",
+            "idempotency key was already used for a different plugin lifecycle command",
+            false,
+        ));
+    }
+    match result {
+        Some(result) => serde_json::from_str(&result).map(Some).map_err(|error| {
+            codypendent_protocol::CodypendentError::new(
+                "plugin.idempotency-corrupt",
+                error.to_string(),
+                false,
+            )
+        }),
+        // Every lifecycle effect below is serialized by the per-plugin store
+        // transaction and exact-input idempotent. Re-drive an identical NULL
+        // claim so a daemon crash after the durable effect but before recording
+        // its reply can reconcile immediately after reconnect. Concurrent live
+        // duplicates are harmless: one effect wins and the journal's first
+        // persisted result remains authoritative.
+        None => Ok(None),
+    }
+}
+
+async fn persist_ui_plugin_command_result(
+    pool: &SqlitePool,
+    idempotency_key: &str,
+    body_hash: &str,
+    reply: &Payload,
+) -> anyhow::Result<()> {
+    let result = serde_json::to_string(reply)?;
+    let changed = sqlx::query(
+        "UPDATE ui_plugin_commands SET result_json = ? \
+         WHERE idempotency_key = ? AND body_hash = ? AND result_json IS NULL",
+    )
+    .bind(result)
+    .bind(idempotency_key)
+    .bind(body_hash)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if changed != 1 {
+        anyhow::bail!("plugin lifecycle command result lost its idempotency claim");
+    }
+    Ok(())
+}
+
+fn decode_ui_plugin_candidate(
+    manifest_toml: &str,
+    artifact_base64: &str,
+) -> anyhow::Result<(codypendent_sandbox::PluginManifest, Vec<u8>)> {
+    if manifest_toml.len() > 1024 * 1024 || artifact_base64.len() > 14 * 1024 * 1024 {
+        anyhow::bail!("plugin management payload exceeds host bounds");
+    }
+    let manifest = codypendent_sandbox::parse_manifest(manifest_toml)?;
+    let artifact = base64::engine::general_purpose::STANDARD
+        .decode(artifact_base64)
+        .map_err(|error| anyhow::anyhow!("plugin artifact is not valid base64: {error}"))?;
+    Ok((manifest, artifact))
+}
+
+fn ui_plugin_status_wire(
+    status: crate::remote_ui_plugins::RemoteUiPluginStatus,
+) -> codypendent_protocol::UiPluginLifecycleStatus {
+    let state = match status.state {
+        LifecycleState::InstalledDisabled => "installed-disabled",
+        LifecycleState::SmokeTested => "smoke-tested",
+        LifecycleState::Enabled => "enabled",
+        LifecycleState::UpdateBlocked => "update-blocked",
+        LifecycleState::Revoked => "revoked",
+    };
+    codypendent_protocol::UiPluginLifecycleStatus {
+        id: status.id,
+        version: status.version,
+        state: state.into(),
+        enabled_scope: status.enabled_scope,
+        update_approval_receipt: status.update_approval_receipt,
+        update_permission_diff: status.update_permission_diff,
+    }
+}
+
+async fn consume_remote_ui_worker_requests(
+    state: Arc<ServerState>,
+    mut receiver: mpsc::Receiver<UiWorkerRequest>,
+) {
+    let mut projections =
+        std::collections::HashMap::<(SessionId, UiProducerHandle, String), JoinHandle<()>>::new();
+    let mut actions = std::collections::HashMap::<
+        (SessionId, UiProducerHandle, codypendent_protocol::UiEventId),
+        JoinHandle<()>,
+    >::new();
+    while let Some(request) = receiver.recv().await {
+        actions.retain(|_, handle| !handle.is_finished());
+        match request {
+            UiWorkerRequest::Action { session_id, action } => {
+                let key = (
+                    session_id,
+                    action.producer.clone(),
+                    action.invocation.invocation_id.clone(),
+                );
+                let state = Arc::clone(&state);
+                let handle = tokio::spawn(async move {
+                    mediate_remote_ui_action(&state, session_id, action).await;
+                });
+                if let Some(stale) = actions.insert(key, handle) {
+                    stale.abort();
+                }
+            }
+            UiWorkerRequest::Subscription {
+                session_id,
+                subscription,
+            } => {
+                let key = (
+                    session_id,
+                    subscription.producer.clone(),
+                    subscription.request.subscription_id.clone(),
+                );
+                let state = Arc::clone(&state);
+                let handle = tokio::spawn(async move {
+                    if let Err(error) =
+                        run_remote_ui_projection(state, session_id, subscription).await
+                    {
+                        warn!(%session_id, %error, "Remote UI projection mediator stopped");
+                    }
+                });
+                if let Some(stale) = projections.insert(key, handle) {
+                    stale.abort();
+                }
+            }
+            UiWorkerRequest::Unsubscription {
+                session_id,
+                unsubscription,
+            } => {
+                let key = (
+                    session_id,
+                    unsubscription.producer,
+                    unsubscription.request.subscription_id,
+                );
+                if let Some(handle) = projections.remove(&key) {
+                    handle.abort();
+                }
+            }
+            UiWorkerRequest::Cancellation {
+                session_id,
+                cancellation,
+            } => {
+                let key = (
+                    session_id,
+                    cancellation.producer,
+                    cancellation.cancellation.invocation_id,
+                );
+                if let Some(handle) = actions.remove(&key) {
+                    handle.abort();
+                }
+            }
+            UiWorkerRequest::ProducerStopped {
+                session_id,
+                producer,
+            } => {
+                let keys = projections
+                    .keys()
+                    .filter(|(owned_session, owned_producer, _)| {
+                        *owned_session == session_id && owned_producer == &producer
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in keys {
+                    if let Some(handle) = projections.remove(&key) {
+                        handle.abort();
+                    }
+                }
+                let action_keys = actions
+                    .keys()
+                    .filter(|(owned_session, owned_producer, _)| {
+                        *owned_session == session_id && owned_producer == &producer
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in action_keys {
+                    if let Some(handle) = actions.remove(&key) {
+                        handle.abort();
+                    }
+                }
+            }
+        }
+    }
+    for handle in projections.into_values() {
+        handle.abort();
+    }
+    for handle in actions.into_values() {
+        handle.abort();
+    }
+}
+
+async fn run_remote_ui_projection(
+    state: Arc<ServerState>,
+    session_id: SessionId,
+    subscription: UiMediatedSubscription,
+) -> anyhow::Result<()> {
+    let request = subscription.request.clone();
+    match request.kind.as_str() {
+        "workflow" => {
+            let resource = request
+                .resource_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("workflow subscription requires resourceId"))?;
+            authorize_workflow_resource(&state.pool, session_id, resource).await?;
+            let mut live = state.workflows.subscribe(resource);
+            let mut revision = 1_u64;
+            deliver_remote_ui_projection(
+                &state,
+                session_id,
+                &subscription.producer,
+                &request.subscription_id,
+                Some(revision),
+                read_remote_ui_projection(&state, session_id, &request).await?,
+            )?;
+            loop {
+                match live.recv().await {
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        revision = revision.saturating_add(1);
+                        let value = read_remote_ui_projection(&state, session_id, &request).await?;
+                        deliver_remote_ui_projection(
+                            &state,
+                            session_id,
+                            &subscription.producer,
+                            &request.subscription_id,
+                            Some(revision),
+                            value,
+                        )?;
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+                revision = revision.saturating_add(1);
+                let value = read_remote_ui_projection(&state, session_id, &request).await?;
+                deliver_remote_ui_projection(
+                    &state,
+                    session_id,
+                    &subscription.producer,
+                    &request.subscription_id,
+                    Some(revision),
+                    value,
+                )?;
+            }
+        }
+        "session" | "run" | "artifact" => {
+            // Subscribe before reading the baseline: a persisted event racing
+            // the read is either reflected by it or delivered afterward.
+            let mut live = state.subscriptions.subscribe(session_id);
+            let initial = read_remote_ui_projection(&state, session_id, &request).await?;
+            deliver_remote_ui_projection(
+                &state,
+                session_id,
+                &subscription.producer,
+                &request.subscription_id,
+                None,
+                initial,
+            )?;
+            loop {
+                let event = match live.recv().await {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let value = read_remote_ui_projection(&state, session_id, &request).await?;
+                        deliver_remote_ui_projection(
+                            &state,
+                            session_id,
+                            &subscription.producer,
+                            &request.subscription_id,
+                            None,
+                            value,
+                        )?;
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                };
+                let value = read_remote_ui_projection(&state, session_id, &request).await?;
+                deliver_remote_ui_projection(
+                    &state,
+                    session_id,
+                    &subscription.producer,
+                    &request.subscription_id,
+                    Some(event.sequence),
+                    value,
+                )?;
+            }
+        }
+        "context" => {
+            let mut invalidations = state.remote_ui_context_updates.subscribe();
+            let mut revision = 1_u64;
+            let value = read_remote_ui_projection(&state, session_id, &request).await?;
+            deliver_remote_ui_projection(
+                &state,
+                session_id,
+                &subscription.producer,
+                &request.subscription_id,
+                Some(revision),
+                value,
+            )?;
+            loop {
+                match invalidations.recv().await {
+                    Ok(changed) if changed != session_id => continue,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+                revision = revision.saturating_add(1);
+                let value = read_remote_ui_projection(&state, session_id, &request).await?;
+                deliver_remote_ui_projection(
+                    &state,
+                    session_id,
+                    &subscription.producer,
+                    &request.subscription_id,
+                    Some(revision),
+                    value,
+                )?;
+            }
+        }
+        "command" => {
+            let value = read_remote_ui_projection(&state, session_id, &request).await?;
+            deliver_remote_ui_projection(
+                &state,
+                session_id,
+                &subscription.producer,
+                &request.subscription_id,
+                Some(1),
+                value,
+            )
+        }
+        kind => anyhow::bail!("unsupported Remote UI projection kind {kind:?}"),
+    }
+}
+
+fn deliver_remote_ui_projection(
+    state: &ServerState,
+    session_id: SessionId,
+    producer: &UiProducerHandle,
+    subscription_id: &str,
+    revision: Option<u64>,
+    (removed, value): (bool, serde_json::Value),
+) -> anyhow::Result<()> {
+    state.remote_ui.deliver_projection(
+        session_id,
+        producer,
+        codypendent_protocol::UiProjectionUpdate {
+            subscription_id: subscription_id.to_owned(),
+            revision: revision.map(codypendent_protocol::UiRevision),
+            removed,
+            value: if removed {
+                serde_json::Value::Null
+            } else {
+                value
+            },
+        },
+    )?;
+    Ok(())
+}
+
+async fn read_remote_ui_projection(
+    state: &ServerState,
+    session_id: SessionId,
+    request: &codypendent_protocol::UiProjectionSubscription,
+) -> anyhow::Result<(bool, serde_json::Value)> {
+    match request.kind.as_str() {
+        "session" => {
+            authorize_session_resource(session_id, request.resource_id.as_deref())?;
+            let value = projections::session_projection(&state.pool, session_id).await?;
+            let updated_at: Option<(String,)> =
+                sqlx::query_as("SELECT updated_at FROM sessions WHERE id = ?")
+                    .bind(session_id.to_string())
+                    .fetch_optional(&state.pool)
+                    .await?;
+            Ok((
+                false,
+                serde_json::to_value(codypendent_protocol::UiSessionProjection {
+                    id: value.session_id.to_string(),
+                    title: Some(value.title),
+                    state: if value.closed { "closed" } else { "open" }.into(),
+                    active_run_id: value.active_runs.first().map(ToString::to_string),
+                    updated_at: updated_at.map(|(value,)| value),
+                })?,
+            ))
+        }
+        "context" => {
+            authorize_session_resource(session_id, request.resource_id.as_deref())?;
+            match projections::load_ide_context(&state.pool, session_id).await? {
+                Some(value) => Ok((
+                    false,
+                    serde_json::to_value(codypendent_protocol::UiContextProjection {
+                        active_file: value.active_file,
+                        selection: value.selection.map(serde_json::to_value).transpose()?,
+                        open_files: value.open_files,
+                        dirty_buffers: value
+                            .dirty_buffers
+                            .into_iter()
+                            .map(serde_json::to_value)
+                            .collect::<Result<Vec<_>, _>>()?,
+                        diagnostics_revision: value.diagnostics_revision,
+                    })?,
+                )),
+                None => Ok((true, serde_json::Value::Null)),
+            }
+        }
+        "run" => {
+            let resource = request
+                .resource_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("run subscription requires resourceId"))?;
+            let run_id = codypendent_protocol::RunId::from_str(resource)?;
+            if projections::run_session(&state.pool, run_id).await? != Some(session_id) {
+                anyhow::bail!("run resource does not belong to the broker session");
+            }
+            let row: Option<RemoteUiRunRow> = sqlx::query_as(
+                    "SELECT objective, state, mode, model_policy, budget_json, workspace_lease_id, started_at, ended_at \
+                     FROM runs WHERE id = ? AND session_id = ?",
+                )
+                .bind(resource)
+                .bind(session_id.to_string())
+                .fetch_optional(&state.pool)
+                .await?;
+            let Some((
+                objective,
+                state_name,
+                mode,
+                model_policy,
+                budget_json,
+                workspace_lease_id,
+                started_at,
+                completed_at,
+            )) = row
+            else {
+                return Ok((true, serde_json::Value::Null));
+            };
+            Ok((
+                false,
+                serde_json::to_value(codypendent_protocol::UiRunProjection {
+                    id: resource.to_owned(),
+                    session_id: session_id.to_string(),
+                    state: state_name,
+                    agent_mode: Some(mode),
+                    progress: None,
+                    cost: None,
+                    started_at,
+                    completed_at,
+                    data: Some(serde_json::json!({
+                        "objective": objective,
+                        "modelPolicy": model_policy,
+                        "budget": serde_json::from_str::<serde_json::Value>(&budget_json)
+                            .unwrap_or(serde_json::Value::Null),
+                        "workspaceLeaseId": workspace_lease_id,
+                    })),
+                })?,
+            ))
+        }
+        "artifact" => read_remote_ui_artifact(state, session_id, request).await,
+        "workflow" => {
+            let resource = request
+                .resource_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("workflow subscription requires resourceId"))?;
+            authorize_workflow_resource(&state.pool, session_id, resource).await?;
+            let Some(reader) = &state.workflow_reader else {
+                anyhow::bail!("workflow projection transport is unavailable");
+            };
+            let snapshot = reader
+                .read(ReadWorkflowRunRequest {
+                    workflow_run_id: resource.to_owned(),
+                    client_id: ClientId::new(),
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+            let phase = serde_json::to_value(snapshot.phase)?
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("workflow phase is not a wire string"))?
+                .to_owned();
+            let nodes = snapshot
+                .nodes
+                .into_iter()
+                .map(|node| {
+                    let state = serde_json::to_value(node.state)?
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("workflow node state is not a wire string"))?
+                        .to_owned();
+                    Ok(codypendent_protocol::UiWorkflowNodeProjection {
+                        workflow_run_id: node.workflow_run_id,
+                        node_id: node.node_id,
+                        state,
+                        attempt: node.attempt,
+                        cost: node.cost,
+                        error: node.error,
+                        warnings: node.warnings,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok((
+                false,
+                serde_json::to_value(codypendent_protocol::UiWorkflowProjection {
+                    workflow_run_id: snapshot.workflow_run_id,
+                    phase,
+                    nodes,
+                })?,
+            ))
+        }
+        "command" => {
+            let command_id = request
+                .resource_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("command subscription requires resourceId"))?;
+            let title = match command_id {
+                "core.run.pause" => Some("Pause run"),
+                "core.run.resume" => Some("Resume run"),
+                "core.run.cancel" => Some("Cancel run"),
+                _ => None,
+            };
+            match title {
+                Some(title) => Ok((
+                    false,
+                    serde_json::json!({
+                        "id": command_id,
+                        "title": title,
+                        "enabled": true,
+                    }),
+                )),
+                None => Ok((true, serde_json::Value::Null)),
+            }
+        }
+        kind => anyhow::bail!("unsupported Remote UI projection kind {kind:?}"),
+    }
+}
+
+fn authorize_session_resource(
+    session_id: SessionId,
+    resource_id: Option<&str>,
+) -> anyhow::Result<()> {
+    if resource_id.is_some_and(|resource| resource != session_id.to_string().as_str()) {
+        anyhow::bail!("projection resource does not belong to the broker session");
+    }
+    Ok(())
+}
+
+async fn authorize_workflow_resource(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    workflow_run_id: &str,
+) -> anyhow::Result<()> {
+    let owner: Option<(String,)> = sqlx::query_as(
+        "SELECT r.session_id FROM workflow_runs w JOIN runs r ON r.id = w.run_id WHERE w.id = ?",
+    )
+    .bind(workflow_run_id)
+    .fetch_optional(pool)
+    .await?;
+    if !owner.is_some_and(|(owner,)| owner == session_id.to_string()) {
+        anyhow::bail!("workflow resource does not belong to the broker session");
+    }
+    Ok(())
+}
+
+async fn read_remote_ui_artifact(
+    state: &ServerState,
+    session_id: SessionId,
+    request: &codypendent_protocol::UiProjectionSubscription,
+) -> anyhow::Result<(bool, serde_json::Value)> {
+    let resource = request
+        .resource_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("artifact subscription requires resourceId"))?;
+    let artifact_id = codypendent_protocol::ArtifactId::from_str(resource)?;
+    let row: Option<(String, String, i64, String, String)> = sqlx::query_as(
+        "SELECT sha256, media_type, byte_length, classification, provenance_json FROM artifacts WHERE id = ?",
+    )
+    .bind(resource)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some((sha256, media_type, byte_length, classification, provenance_json)) = row else {
+        return Ok((true, serde_json::Value::Null));
+    };
+    let provenance: crate::artifacts::Provenance = serde_json::from_str(&provenance_json)?;
+    let crate::artifacts::ProvenanceSource::ToolOutput { run_id, .. } = &provenance.source else {
+        anyhow::bail!("artifact has no session-bound provenance");
+    };
+    if projections::run_session(&state.pool, *run_id).await? != Some(session_id) {
+        anyhow::bail!("artifact resource does not belong to the broker session");
+    }
+    let range = remote_ui_artifact_range(&request.parameters, byte_length.max(0) as u64)?;
+    let include_content = request
+        .parameters
+        .get("includeContent")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let content = if include_content {
+        let mut file = state.artifacts.open(&state.pool, artifact_id).await?;
+        file.seek(std::io::SeekFrom::Start(range.offset)).await?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(range.length)
+            .read_to_end(&mut bytes)
+            .await?;
+        Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+    } else {
+        None
+    };
+    Ok((
+        false,
+        serde_json::to_value(codypendent_protocol::UiArtifactProjection {
+            id: resource.to_owned(),
+            media_type,
+            revision: 1,
+            value: serde_json::json!({
+                "sha256": sha256,
+                "byteLength": byte_length,
+                "classification": classification,
+                "provenance": provenance,
+                "contentBase64": content,
+                "range": range,
+            }),
+            schema: None,
+            title: None,
+        })?,
+    ))
+}
+
+fn remote_ui_artifact_range(
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+    total: u64,
+) -> anyhow::Result<codypendent_protocol::UiArtifactProjectionRange> {
+    const MAX_BYTES: u64 = 1024 * 1024;
+    let max_bytes = parameters
+        .get("maxBytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(MAX_BYTES)
+        .min(MAX_BYTES);
+    if max_bytes == 0 {
+        anyhow::bail!("artifact maxBytes must be greater than zero");
+    }
+    let has_page = parameters.contains_key("page") || parameters.contains_key("pageSize");
+    let has_range = parameters.contains_key("offset") || parameters.contains_key("length");
+    if has_page && has_range {
+        anyhow::bail!("artifact projection cannot mix page and range addressing");
+    }
+    let (offset, requested, page, page_size) = if has_page {
+        let page = parameters
+            .get("page")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let page_size = parameters
+            .get("pageSize")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(max_bytes)
+            .min(max_bytes);
+        if page_size == 0 {
+            anyhow::bail!("artifact pageSize must be greater than zero");
+        }
+        let offset = page
+            .checked_mul(page_size)
+            .ok_or_else(|| anyhow::anyhow!("artifact page offset overflow"))?;
+        (offset, page_size, Some(page), Some(page_size))
+    } else {
+        let offset = parameters
+            .get("offset")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let length = parameters
+            .get("length")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(max_bytes)
+            .min(max_bytes);
+        (offset, length, None, None)
+    };
+    if offset > total {
+        anyhow::bail!("artifact projection offset exceeds artifact length");
+    }
+    let length = requested.min(total.saturating_sub(offset));
+    Ok(codypendent_protocol::UiArtifactProjectionRange {
+        offset,
+        length,
+        total,
+        page,
+        page_size,
+    })
+}
+
+async fn mediate_remote_ui_action(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    action: UiMediatedAction,
+) {
+    let invocation_id = action.invocation.invocation_id.clone();
+    let result = match remote_ui_command(&action.invocation) {
+        Ok(body) => match ensure_remote_ui_command_session(&state.pool, session_id, &body).await {
+            Err(error) => Err(error),
+            Ok(()) => match action.requester {
+                None => Err(codypendent_protocol::CodypendentError::new(
+                    "ui.action.user-context-required",
+                    "component commands require an attached user renderer",
+                    false,
+                )),
+                Some((client_id, role)) => {
+                    let command_id = codypendent_protocol::CommandId::new();
+                    let body_digest = {
+                        use sha2::{Digest as _, Sha256};
+                        hex::encode(Sha256::digest(
+                            serde_json::to_vec(&body).unwrap_or_default(),
+                        ))
+                    };
+                    let command = codypendent_protocol::Command {
+                        command_id,
+                        idempotency_key: format!(
+                            "remote-ui:{session_id}:{}:{}:{}:{body_digest}",
+                            action.producer.plugin_id(),
+                            action.producer.instance_id(),
+                            invocation_id
+                        ),
+                        expected_revision: None,
+                        body: body.clone(),
+                    };
+                    let outcome = state
+                        .commands
+                        .apply(&state.pool, ApplyContext { client_id, role }, command)
+                        .await;
+                    if outcome.is_ok() {
+                        if let (Some(executor), CommandBody::CancelRun { run_id }) =
+                            (state.executor.as_ref(), &body)
+                        {
+                            executor.cancel_run(*run_id);
+                        }
+                        if let Some(executor) = state.executor.as_ref() {
+                            match body {
+                                CommandBody::PauseRun { run_id } => executor.pause_run(run_id),
+                                CommandBody::ResumeRun { run_id } => executor.resume_run(run_id),
+                                _ => {}
+                            }
+                        }
+                    }
+                    outcome
+                }
+            },
+        },
+        Err(error) => Err(error),
+    };
+    let action_result = match result {
+        Ok(outcome) => codypendent_protocol::UiActionResult {
+            invocation_id,
+            status: "succeeded".to_owned(),
+            value: serde_json::to_value(outcome).unwrap_or(serde_json::Value::Null),
+            error: None,
+        },
+        Err(error) => codypendent_protocol::UiActionResult {
+            invocation_id,
+            status: "failed".to_owned(),
+            value: serde_json::Value::Null,
+            error: Some(codypendent_protocol::UiRemoteError {
+                code: error.code,
+                message: error.message,
+                recoverable: error.retryable,
+                document_id: Some(action.invocation.document_id),
+                node_id: Some(action.invocation.source_node_id),
+                patch_index: None,
+                recovery: None,
+                fallback: None,
+                details: error.details,
+            }),
+        },
+    };
+    if let Err(error) = state
+        .remote_ui
+        .settle_action(session_id, &action.producer, action_result)
+    {
+        warn!(%error, "could not settle Remote UI action");
+    }
+}
+
+async fn ensure_remote_ui_command_session(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    body: &CommandBody,
+) -> Result<(), codypendent_protocol::CodypendentError> {
+    let run_id = match body {
+        CommandBody::PauseRun { run_id }
+        | CommandBody::ResumeRun { run_id }
+        | CommandBody::CancelRun { run_id } => *run_id,
+        _ => return Ok(()),
+    };
+    match projections::run_session(pool, run_id).await {
+        Ok(Some(owner)) if owner == session_id => Ok(()),
+        Ok(_) => Err(codypendent_protocol::CodypendentError::new(
+            "ui.action.cross-session",
+            "the requested run does not belong to the Remote UI broker session",
+            false,
+        )),
+        Err(error) => Err(codypendent_protocol::CodypendentError::new(
+            "ui.action.lookup-failed",
+            error.to_string(),
+            true,
+        )),
+    }
+}
+
+fn remote_ui_command(
+    invocation: &codypendent_protocol::UiActionInvocation,
+) -> Result<CommandBody, codypendent_protocol::CodypendentError> {
+    let run_id = || {
+        invocation
+            .payload
+            .get("runId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                codypendent_protocol::CodypendentError::new(
+                    "ui.action.invalid-payload",
+                    "run command requires a runId",
+                    false,
+                )
+            })?
+            .parse::<codypendent_protocol::RunId>()
+            .map_err(|_| {
+                codypendent_protocol::CodypendentError::new(
+                    "ui.action.invalid-payload",
+                    "runId is not a valid run identifier",
+                    false,
+                )
+            })
+    };
+    match invocation.action_id.as_str() {
+        "run.pause" | "core.run.pause" => Ok(CommandBody::PauseRun { run_id: run_id()? }),
+        "run.resume" | "core.run.resume" => Ok(CommandBody::ResumeRun { run_id: run_id()? }),
+        "run.cancel" | "core.run.cancel" => Ok(CommandBody::CancelRun { run_id: run_id()? }),
+        action_id => Err(codypendent_protocol::CodypendentError::new(
+            "ui.action.not-authorized",
+            format!("Remote UI action {action_id:?} is not a mediated daemon command"),
+            false,
+        )),
+    }
+}
+
+async fn attach_remote_ui(
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    client_id: ClientId,
+    session_id: SessionId,
+    forwarders: &mut std::collections::HashMap<SessionId, JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    if let Some(previous) = forwarders.remove(&session_id) {
+        previous.abort();
+    }
+    let subscription = state.remote_ui.subscribe_renderer(session_id, client_id)?;
+    let writer = Arc::clone(writer);
+    let handle = tokio::spawn(forward_remote_ui(
+        writer,
+        client_id,
+        session_id,
+        subscription.receiver,
+    ));
+    forwarders.insert(session_id, handle);
+    Ok(())
+}
+
+async fn forward_remote_ui(
+    writer: SharedWriter,
+    client_id: ClientId,
+    session_id: SessionId,
+    mut receiver: broadcast::Receiver<UiBrokerFrame>,
+) {
+    loop {
+        let message = match receiver.recv().await {
+            Ok(frame) => match frame.target {
+                UiBrokerTarget::AllRenderers => frame.message,
+                UiBrokerTarget::Renderer(target) if target == client_id => frame.message,
+                UiBrokerTarget::Renderer(_) | UiBrokerTarget::Producer(_) => continue,
+            },
+            Err(broadcast::error::RecvError::Lagged(skipped)) => broker_error(format!(
+                "Remote UI fan-out dropped {skipped} messages; request a resync"
+            )),
+            Err(broadcast::error::RecvError::Closed) => break,
+        };
+        if send(&writer, &remote_ui_envelope(client_id, session_id, message))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn remote_ui_envelope(
+    client_id: ClientId,
+    session_id: SessionId,
+    message: codypendent_protocol::UiWireMessage,
+) -> Envelope {
+    let mut envelope = Envelope::request(
+        client_id,
+        Payload::RemoteUi {
+            message: Box::new(message),
+        },
+    );
+    envelope.session_id = Some(session_id);
+    envelope
 }
 
 /// Register a connection's interest in a session: subscribe to its live stream,
@@ -2364,9 +3808,14 @@ mod resume {
 
 #[cfg(test)]
 mod tests {
-    use super::{admits_run, resume};
+    use super::{
+        admits_run, claim_ui_plugin_command, persist_ui_plugin_command_result,
+        remote_ui_artifact_range, resume,
+    };
     use chrono::Utc;
-    use codypendent_protocol::{AgentMode, ClientId, CommandBody, RunId, SessionId};
+    use codypendent_protocol::{
+        AgentMode, ClientId, CommandBody, CommandId, Payload, RunId, SessionId,
+    };
 
     const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 
@@ -2437,5 +3886,88 @@ mod tests {
             resume::sign(SECRET, &payload)
         );
         assert!(resume::verify_resume_token(SECRET, &token).is_none());
+    }
+
+    #[test]
+    fn artifact_projection_supports_bounded_range_and_page_addressing() {
+        let range = std::collections::BTreeMap::from([
+            ("offset".to_owned(), serde_json::json!(7)),
+            ("length".to_owned(), serde_json::json!(11)),
+        ]);
+        let range = remote_ui_artifact_range(&range, 100).unwrap();
+        assert_eq!((range.offset, range.length, range.total), (7, 11, 100));
+        assert_eq!(range.page, None);
+
+        let page = std::collections::BTreeMap::from([
+            ("maxBytes".to_owned(), serde_json::json!(64)),
+            ("page".to_owned(), serde_json::json!(2)),
+            ("pageSize".to_owned(), serde_json::json!(16)),
+        ]);
+        let page = remote_ui_artifact_range(&page, 40).unwrap();
+        assert_eq!((page.offset, page.length), (32, 8));
+        assert_eq!((page.page, page.page_size), (Some(2), Some(16)));
+
+        let mixed = std::collections::BTreeMap::from([
+            ("page".to_owned(), serde_json::json!(1)),
+            ("offset".to_owned(), serde_json::json!(1)),
+        ]);
+        assert!(remote_ui_artifact_range(&mixed, 100).is_err());
+        let huge =
+            std::collections::BTreeMap::from([("length".to_owned(), serde_json::json!(u64::MAX))]);
+        assert_eq!(
+            remote_ui_artifact_range(&huge, u64::MAX).unwrap().length,
+            1024 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_lifecycle_journal_reconciles_crash_and_replays_across_clients() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE ui_plugin_commands (\
+             client_id TEXT NOT NULL, idempotency_key TEXT PRIMARY KEY NOT NULL, \
+             body_hash TEXT NOT NULL, result_json TEXT, created_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let first_client = ClientId::new();
+        let second_client = ClientId::new();
+        let key = "ui-plugin:stable-operation";
+        let hash = "body-sha256";
+        assert!(claim_ui_plugin_command(&pool, first_client, key, hash)
+            .await
+            .unwrap()
+            .is_none());
+        // Simulate a crash before result persistence: an exact reconnect is
+        // allowed to re-drive the store's idempotent transition immediately.
+        assert!(claim_ui_plugin_command(&pool, second_client, key, hash)
+            .await
+            .unwrap()
+            .is_none());
+
+        let command_id = CommandId::new();
+        let reply = Payload::UiPluginLifecycle {
+            command_id,
+            plugins: Vec::new(),
+        };
+        persist_ui_plugin_command_result(&pool, key, hash, &reply)
+            .await
+            .unwrap();
+        assert!(matches!(
+            claim_ui_plugin_command(&pool, second_client, key, hash)
+                .await
+                .unwrap(),
+            Some(Payload::UiPluginLifecycle { command_id: replayed, .. }) if replayed == command_id
+        ));
+        let conflict = claim_ui_plugin_command(&pool, second_client, key, "different-body")
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code, "plugin.idempotency-conflict");
     }
 }

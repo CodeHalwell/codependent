@@ -1,3 +1,5 @@
+import type { UiWireMessage } from "../remote-ui/wire.js";
+
 /**
  * TypeScript wire types for the Codypendent protocol.
  *
@@ -438,6 +440,7 @@ export type Payload =
   | { type: "CommandAccepted"; command_id: Uuid; sequence?: number; created_run?: Uuid }
   | ({ type: "CommandRejected" } & CodypendentError)
   | ({ type: "Event" } & SessionEvent)
+  | { type: "RemoteUi"; message: UiWireMessage }
   | { type: "Catchup"; catchup: Catchup }
   | ({ type: "Error" } & ProtocolError)
   | { type: "Ping" }

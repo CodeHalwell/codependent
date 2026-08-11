@@ -10,7 +10,7 @@ const watch = process.argv.includes("--watch");
 const production = process.argv.includes("--production");
 
 /** @type {import('esbuild').BuildOptions} */
-const options = {
+const extensionOptions = {
   entryPoints: ["src/extension.ts"],
   bundle: true,
   outfile: "dist/extension.js",
@@ -23,10 +23,26 @@ const options = {
   logLevel: "info",
 };
 
+/** @type {import('esbuild').BuildOptions} */
+const webviewOptions = {
+  entryPoints: ["src/webview/remote-ui/main.tsx"],
+  bundle: true,
+  outfile: "dist/webview.js",
+  format: "iife",
+  platform: "browser",
+  target: "es2022",
+  sourcemap: !production,
+  minify: production,
+  logLevel: "info",
+};
+
 if (watch) {
-  const ctx = await context(options);
-  await ctx.watch();
+  const [extensionContext, webviewContext] = await Promise.all([
+    context(extensionOptions),
+    context(webviewOptions),
+  ]);
+  await Promise.all([extensionContext.watch(), webviewContext.watch()]);
   console.log("esbuild: watching for changes...");
 } else {
-  await build(options);
+  await Promise.all([build(extensionOptions), build(webviewOptions)]);
 }

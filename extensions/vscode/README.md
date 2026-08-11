@@ -22,6 +22,10 @@ The wire protocol is reproduced from the Rust `codypendent-protocol` crate:
 | Connect / handshake / attach-resume / reconnect | — | `src/client.ts` |
 | Editor wiring (webview, approvals, context push, diff) | — | `src/extension.ts` |
 | Transcript webview | — | `src/webview/panel.ts` |
+| Semantic Remote UI envelope bridge | `remote_ui.rs::UiWireMessage` | `src/remote-ui/wire.ts` |
+| Atomic document/patch projection | — | `src/webview/remote-ui/store.ts` |
+| Accessible React/DOM renderer | — | `src/webview/remote-ui/renderer.tsx` |
+| Webview capability/theme runtime | — | `src/webview/remote-ui/capabilities.ts`, `theme.ts`, `main.tsx` |
 
 **The only module that imports `vscode` is `src/extension.ts`.** Everything under
 `src/protocol/` and `src/client.ts` is pure and runs under Node, so the test
@@ -46,6 +50,51 @@ suite exercises the protocol/transport logic with no VS Code runtime.
   sequence seen. On disconnect it reconnects with exponential backoff and
   re-attaches with `last_seen_sequence`, so a kill/reload recovers purely via
   attach-resume.
+
+### Semantic Remote UI
+
+The panel also hosts extension-provided surfaces produced with `@codypendent/ui`.
+React executes in a confined producer runtime and emits a data-only semantic
+tree; plugin JavaScript is never evaluated inside the VS Code webview. The
+dedicated `Payload::RemoteUi { message: UiWireMessage }` daemon envelope is
+translated at the extension-host boundary into SDK `UiHostMessage` snapshots
+and patches. User input travels back as revision-bound SDK `UiRuntimeMessage`
+events.
+
+The same narrow bridge preserves the SDK's mediated state/command channel:
+`subscription`, `projection`, `action`, `actionResult`, and `cancelAction` wire
+messages are bounded and shape-checked independently of DOM events. A trusted
+SDK adapter can use `subscribeMediatedWire` / `sendMediatedWire`; the outbound
+side permits only subscription, action, and cancellation requests, while
+projection updates and action results remain host-to-runtime only. This backs
+`useSession`, `useRun`, `useArtifact`, and `useCommand` without exposing raw host
+I/O or allowing a semantic node to manufacture a daemon command.
+
+The graphical client implements the complete built-in primitive catalog:
+layout, rich content and diffs, media fallbacks, tables/trees/graphs/charts,
+feedback, navigation, forms, action surfaces, and Codypendent domain cards.
+Native DOM controls provide keyboard and screen-reader semantics; focus is
+restored across patch revisions and shortcut handling is centralized. Unsupported
+capabilities resolve through the SDK fallback tree before rendering.
+
+Security and recovery boundaries are deliberately narrow:
+
+- snapshots and patches are schema/size checked and applied atomically;
+- stale or invalid updates keep the last good revision visible and request a
+  full resync;
+- props remain inert JSON data, Markdown never injects HTML, external media is
+  blocked, and links use an explicit protocol allowlist;
+- the webview CSP is `default-src 'none'` with nonce-bound scripts and styles;
+- webview view state caches bounded last-good snapshots only as a reload aid;
+  the daemon remains authoritative and receives resync requests after restore;
+- theme tokens are validated before becoming CSS custom properties;
+- contribution documents are mounted deterministically by point, slot, and
+  priority without replacing the existing transcript/approval experience.
+
+Set `codypendent.remoteUi.terminalFallbackPreview` to show the deterministic
+minimal-terminal projection below graphical contributions. This is useful for
+extension development, accessibility review, and checking graphical/terminal
+parity.
 
 ## Commands
 
@@ -81,7 +130,7 @@ npm install
 npm run typecheck   # tsc --noEmit (strict)
 npm run lint        # eslint
 npm test            # vitest (pure protocol + client, no VS Code runtime)
-npm run build       # esbuild bundle -> dist/extension.js
+npm run build       # esbuild bundles -> dist/extension.js + dist/webview.js
 ```
 
 Press `F5` in VS Code (or Cursor) to launch an Extension Development Host.
@@ -115,3 +164,7 @@ creates or executes anything — it attaches to a session id).
    transcript is recovered from catch-up — the extension keeps no session state
    of its own.
 8. **Cursor.** Repeat steps 1–7 in Cursor; behaviour should be identical.
+9. **Remote UI.** Mount a semantic contribution and verify its snapshot,
+   incremental patches, form/keyboard events, theme, and terminal fallback.
+   Reload the webview and verify it displays the last-good tree while requesting
+   an authoritative resync.

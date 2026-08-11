@@ -1,0 +1,97 @@
+{
+  "name": "@codypendent/ui",
+  "version": "1.0.0",
+  "description": "Typed semantic UI protocol, TSX runtime, and React renderer for Codypendent clients",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "docs",
+    "schema",
+    "README.md"
+  ],
+  "bin": {
+    "codypendent-ui": "./dist/tooling/cli.js",
+    "create-codypendent-ui": "./dist/tooling/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./jsx-runtime": {
+      "types": "./dist/jsx-runtime.d.ts",
+      "import": "./dist/jsx-runtime.js"
+    },
+    "./jsx-dev-runtime": {
+      "types": "./dist/jsx-dev-runtime.d.ts",
+      "import": "./dist/jsx-dev-runtime.js"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js"
+    },
+    "./first-party": {
+      "types": "./dist/first-party/index.d.ts",
+      "import": "./dist/first-party/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "import": "./dist/schema.js"
+    },
+    "./schema.json": "./schema/remote-ui.schema.json",
+    "./worker": {
+      "types": "./dist/worker/index.d.ts",
+      "import": "./dist/worker/index.js"
+    },
+    "./worker/react": {
+      "types": "./dist/worker/react.d.ts",
+      "import": "./dist/worker/react.js"
+    },
+    "./tooling": {
+      "types": "./dist/tooling/index.d.ts",
+      "import": "./dist/tooling/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test && npm run build"
+  },
+  "peerDependencies": {
+    "react": ">=19.0.0 <19.1.0",
+    "react-reconciler": ">=0.31.0 <0.32.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "react-reconciler": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "@types/react": "19.0.12",
+    "@types/react-reconciler": "0.28.9",
+    "ajv": "^8.18.0",
+    "react": "19.0.0",
+    "react-reconciler": "0.31.0",
+    "typescript": "5.7.3",
+    "vitest": "4.1.10"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "smol-toml": "^1.7.1"
+  }
+}

@@ -13,7 +13,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::manifest::{CapabilitiesSpec, PluginManifest, ResourcesSpec};
+use crate::manifest::{
+    CapabilitiesSpec, PluginManifest, ResourcesSpec, UiCapability, UiContributionPoint, UiTarget,
+};
 
 /// A single, comparable capability a plugin holds. Each variant carries the
 /// concrete grant (a path, a `host:port`, a secret name) so two sets diff at the
@@ -129,8 +131,129 @@ impl CapabilitySet {
             added,
             removed,
             resource_changes: Vec::new(),
+            ui_added: Vec::new(),
+            ui_removed: Vec::new(),
         }
     }
+}
+
+/// A privilege-relevant embedded-UI declaration. UI code cannot gain OS sandbox
+/// capabilities through this type; these are the distinct host surfaces users
+/// must be shown when installing or updating component code.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UiPermission {
+    Capability(UiCapability),
+    Compatibility {
+        contract: &'static str,
+        requirement: String,
+    },
+    Entrypoint {
+        target: UiTarget,
+        path: String,
+    },
+    Contribution {
+        id: String,
+        point: UiContributionPoint,
+        renderer: String,
+        targets: Vec<UiTarget>,
+        fallback_renderer: Option<String>,
+    },
+}
+
+impl fmt::Display for UiPermission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Capability(capability) => {
+                write!(f, "ui.capability: {}", capability.as_str())
+            }
+            Self::Compatibility {
+                contract,
+                requirement,
+            } => write!(f, "ui.compatibility.{contract}: {requirement}"),
+            Self::Entrypoint { target, path } => {
+                write!(f, "ui.entrypoint.{}: {path}", target.as_str())
+            }
+            Self::Contribution {
+                id,
+                point,
+                renderer,
+                targets,
+                fallback_renderer,
+            } => {
+                let targets = targets
+                    .iter()
+                    .map(|target| target.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                write!(
+                    f,
+                    "ui.contribution.{}: {id} (renderer={renderer}, targets={targets}",
+                    point.as_str()
+                )?;
+                if let Some(fallback) = fallback_renderer {
+                    write!(f, ", fallback={fallback}")?;
+                }
+                write!(f, ")")
+            }
+        }
+    }
+}
+
+fn ui_permission_set(manifest: &PluginManifest) -> BTreeSet<UiPermission> {
+    let Some(ui) = &manifest.ui else {
+        return BTreeSet::new();
+    };
+    let mut permissions = BTreeSet::new();
+    for capability in &ui.requested_capabilities {
+        permissions.insert(UiPermission::Capability(*capability));
+    }
+    permissions.insert(UiPermission::Compatibility {
+        contract: "protocol",
+        requirement: ui.compatibility.protocol.clone(),
+    });
+    permissions.insert(UiPermission::Compatibility {
+        contract: "sdk",
+        requirement: ui.compatibility.sdk.clone(),
+    });
+    for (target, path) in [
+        (UiTarget::Shared, &ui.entrypoints.shared),
+        (UiTarget::Terminal, &ui.entrypoints.terminal),
+        (UiTarget::Web, &ui.entrypoints.web),
+    ] {
+        if let Some(path) = path {
+            permissions.insert(UiPermission::Entrypoint {
+                target,
+                path: path.clone(),
+            });
+        }
+    }
+    for contribution in &ui.contributions {
+        let mut targets = contribution.targets.clone();
+        targets.sort_unstable();
+        targets.dedup();
+        permissions.insert(UiPermission::Contribution {
+            id: contribution.id.clone(),
+            point: contribution.point,
+            renderer: contribution.renderer.clone(),
+            targets,
+            fallback_renderer: contribution.fallback_renderer.clone(),
+        });
+    }
+    permissions
+}
+
+/// Fold privilege-relevant embedded-UI changes into an existing permission
+/// diff. Kept as the shared implementation for both the CLI manifest diff and
+/// the live install/update lifecycle.
+pub(crate) fn include_ui_permissions(
+    diff: &mut PermissionDiff,
+    old: &PluginManifest,
+    next: &PluginManifest,
+) {
+    let old_ui = ui_permission_set(old);
+    let next_ui = ui_permission_set(next);
+    diff.ui_added = next_ui.difference(&old_ui).cloned().collect();
+    diff.ui_removed = old_ui.difference(&next_ui).cloned().collect();
 }
 
 /// A change in one resource cap (memory/cpu/wall/output) between an installed
@@ -225,6 +348,7 @@ pub fn diff_manifests(old: &PluginManifest, next: &PluginManifest) -> Permission
     let next_set = CapabilitySet::from_spec(&next.capabilities);
     let mut diff = old_set.diff_to(&next_set);
     diff.resource_changes = diff_resources(&old.resources, &next.resources);
+    include_ui_permissions(&mut diff, old, next);
     diff
 }
 
@@ -243,6 +367,11 @@ pub struct PermissionDiff {
     /// [`CapabilitySet::diff_to`] never populates this (it has no resource
     /// data to compare) — [`crate::lifecycle`] folds it in from the manifests.
     pub resource_changes: Vec<ResourceChange>,
+    /// Newly requested host-facing UI privileges. Any addition gates update
+    /// re-approval just like a filesystem/network capability addition.
+    pub ui_added: Vec<UiPermission>,
+    /// UI privileges or executable surfaces removed by the update.
+    pub ui_removed: Vec<UiPermission>,
 }
 
 impl PermissionDiff {
@@ -253,6 +382,7 @@ impl PermissionDiff {
     #[must_use]
     pub fn expands_permissions(&self) -> bool {
         !self.added.is_empty()
+            || !self.ui_added.is_empty()
             || self
                 .resource_changes
                 .iter()
@@ -263,7 +393,11 @@ impl PermissionDiff {
     /// caps.
     #[must_use]
     pub fn is_identical(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && self.resource_changes.is_empty()
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && self.resource_changes.is_empty()
+            && self.ui_added.is_empty()
+            && self.ui_removed.is_empty()
     }
 
     /// Render the diff the way the TUI displays it — one `+`/`-` line per
@@ -277,10 +411,17 @@ impl PermissionDiff {
     /// ```
     #[must_use]
     pub fn render(&self) -> String {
-        let mut plus = Vec::with_capacity(self.added.len() + self.resource_changes.len());
-        let mut minus = Vec::with_capacity(self.removed.len() + self.resource_changes.len());
+        let mut plus = Vec::with_capacity(
+            self.added.len() + self.resource_changes.len() + self.ui_added.len(),
+        );
+        let mut minus = Vec::with_capacity(
+            self.removed.len() + self.resource_changes.len() + self.ui_removed.len(),
+        );
         for cap in &self.added {
             plus.push(format!("+ {cap}"));
+        }
+        for permission in &self.ui_added {
+            plus.push(format!("+ {permission}"));
         }
         for change in &self.resource_changes {
             if change.is_increase() {
@@ -291,6 +432,9 @@ impl PermissionDiff {
         }
         for cap in &self.removed {
             minus.push(format!("- {cap}"));
+        }
+        for permission in &self.ui_removed {
+            minus.push(format!("- {permission}"));
         }
         plus.into_iter().chain(minus).collect::<Vec<_>>().join("\n")
     }
@@ -564,5 +708,100 @@ signature = "set-during-packaging"
         let diff = diff_manifests(&installed, &update);
         assert!(diff.expands_permissions());
         assert_eq!(diff.render(), "+ network: uploads.github.com:443");
+    }
+
+    fn manifest_with_ui(ui_capabilities: &str, targets: &str) -> PluginManifest {
+        let toml = format!(
+            r#"
+schema_version = 1
+id = "ui-test"
+name = "UI Test"
+version = "0.1.0"
+kind = "ui-component"
+publisher = "me"
+[ui]
+schema_version = 1
+requested_capabilities = [{ui_capabilities}]
+[ui.compatibility]
+protocol = ">=1.0,<2.0"
+sdk = "^1.0"
+[ui.entrypoints]
+shared = "dist/shared.js"
+[[ui.contributions]]
+id = "test.report"
+point = "artifact-renderer"
+renderer = "test.Report"
+targets = [{targets}]
+"#
+        );
+        crate::manifest::parse_manifest(&toml).expect("UI manifest parses")
+    }
+
+    #[test]
+    fn ui_capability_addition_is_a_visible_permission_expansion() {
+        let installed = manifest_with_ui("\"artifact-read\"", "\"shared\"");
+        let update = manifest_with_ui(
+            "\"artifact-read\", \"run-read\", \"command-invoke\"",
+            "\"shared\"",
+        );
+        let diff = diff_manifests(&installed, &update);
+        assert!(diff.expands_permissions());
+        assert_eq!(diff.ui_added.len(), 2);
+        let rendered = diff.render();
+        assert!(rendered.contains("+ ui.capability: run-read"));
+        assert!(rendered.contains("+ ui.capability: command-invoke"));
+    }
+
+    #[test]
+    fn adding_or_changing_an_executable_ui_surface_requires_reapproval() {
+        let installed = manifest_with_ui("", "\"shared\"");
+        let mut update = installed.clone();
+        let ui = update.ui.as_mut().expect("UI exists");
+        ui.entrypoints.terminal = Some("dist/terminal.js".into());
+        ui.contributions[0].renderer = "test.NewReport".into();
+        let diff = diff_manifests(&installed, &update);
+        assert!(diff.expands_permissions());
+        assert!(diff
+            .render()
+            .contains("+ ui.entrypoint.terminal: dist/terminal.js"));
+        assert!(diff.render().contains("renderer=test.NewReport"));
+        assert!(diff
+            .render()
+            .contains("- ui.contribution.artifact-renderer"));
+    }
+
+    #[test]
+    fn removing_ui_authority_is_a_narrowing() {
+        let installed = manifest_with_ui("\"artifact-read\", \"run-read\"", "\"shared\"");
+        let update = manifest_with_ui("\"artifact-read\"", "\"shared\"");
+        let diff = diff_manifests(&installed, &update);
+        assert!(!diff.expands_permissions());
+        assert_eq!(
+            diff.render(),
+            "- ui.capability: run-read",
+            "removed UI host authority is visible but auto-applicable"
+        );
+    }
+
+    #[test]
+    fn target_order_and_duplicate_capabilities_do_not_create_phantom_ui_diffs() {
+        let installed = manifest_with_ui(
+            "\"artifact-read\", \"artifact-read\"",
+            "\"terminal\", \"web\"",
+        );
+        let update = manifest_with_ui("\"artifact-read\"", "\"web\", \"terminal\"");
+        let diff = diff_manifests(&installed, &update);
+        assert!(diff.is_identical());
+    }
+
+    #[test]
+    fn compatibility_range_changes_are_reviewed_before_new_hosts_execute_code() {
+        let installed = manifest_with_ui("", "\"shared\"");
+        let mut update = installed.clone();
+        update.ui.as_mut().unwrap().compatibility.sdk = ">=1.0,<2.0".into();
+        let diff = diff_manifests(&installed, &update);
+        assert!(diff.expands_permissions());
+        assert!(diff.render().contains("+ ui.compatibility.sdk: >=1.0,<2.0"));
+        assert!(diff.render().contains("- ui.compatibility.sdk: ^1.0"));
     }
 }

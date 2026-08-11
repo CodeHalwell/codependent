@@ -233,6 +233,36 @@ signature = "unset"
         parse_manifest(&toml).expect("manifest parses")
     }
 
+    fn manifest_with_ui(checksum: &str) -> PluginManifest {
+        let toml = format!(
+            r#"
+schema_version = 1
+id = "ui-test"
+name = "UI Test"
+version = "0.1.0"
+kind = "ui-component"
+publisher = "me"
+[ui]
+schema_version = 1
+requested_capabilities = ["artifact-read"]
+[ui.compatibility]
+protocol = ">=1.0,<2.0"
+sdk = "^1.0"
+[ui.entrypoints]
+shared = "dist/shared.js"
+[[ui.contributions]]
+id = "test.report"
+point = "artifact-renderer"
+renderer = "test.Report"
+targets = ["shared"]
+[security]
+checksum = "{checksum}"
+signature = "unset"
+"#
+        );
+        parse_manifest(&toml).expect("UI manifest parses")
+    }
+
     /// Sign a manifest's [`signing_digest`] with `key` and set its signature field
     /// — the packaging step, so the signature covers the manifest's real
     /// checksum + identity + capabilities.
@@ -282,6 +312,16 @@ signature = "unset"
         let v = verify_artifact(&m, artifact, Some(key.as_bytes()), UnsignedPolicy::Deny)
             .expect("signature verifies");
         assert!(v.signed);
+    }
+
+    #[test]
+    fn typescript_packager_signing_digest_matches() {
+        let source = include_str!("../../../sdk/ui/test/fixtures/signing-plugin.toml");
+        let manifest = parse_manifest(source).expect("TypeScript signing golden parses in Rust");
+        assert_eq!(
+            hex::encode(signing_digest(&manifest)),
+            "87571e872de61f5317cae66468aadb16b993b92b31a273c0704cd27ab6167717"
+        );
     }
 
     #[test]
@@ -340,6 +380,57 @@ signature = "unset"
             VerifyError::SignatureMismatch,
             "widened capabilities break the signature"
         );
+    }
+
+    #[test]
+    fn tampering_with_ui_metadata_after_signing_breaks_the_signature() {
+        let artifact = b"signed UI plugin bytes";
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let mut manifest = manifest_with_ui(&checksum_of(artifact));
+        sign(&mut manifest, &signing);
+        let key = signing.verifying_key();
+        assert!(verify_artifact(
+            &manifest,
+            artifact,
+            Some(key.as_bytes()),
+            UnsignedPolicy::Deny
+        )
+        .is_ok());
+
+        let signed = manifest.security.signature.clone();
+        let mutations: [fn(&mut PluginManifest); 4] = [
+            |manifest| {
+                manifest
+                    .ui
+                    .as_mut()
+                    .unwrap()
+                    .requested_capabilities
+                    .push(crate::manifest::UiCapability::ClipboardRead);
+            },
+            |manifest| {
+                manifest.ui.as_mut().unwrap().entrypoints.web = Some("dist/web.js".to_string());
+            },
+            |manifest| {
+                manifest.ui.as_mut().unwrap().contributions[0].renderer =
+                    "attacker.Spoof".to_string();
+            },
+            |manifest| {
+                manifest.ui.as_mut().unwrap().compatibility.sdk = ">=1.0,<3.0".to_string();
+            },
+        ];
+        for mutate in mutations {
+            let mut tampered = manifest.clone();
+            mutate(&mut tampered);
+            tampered.security.signature.clone_from(&signed);
+            let err = verify_artifact(
+                &tampered,
+                artifact,
+                Some(key.as_bytes()),
+                UnsignedPolicy::Deny,
+            )
+            .unwrap_err();
+            assert_eq!(err, VerifyError::SignatureMismatch);
+        }
     }
 
     #[test]

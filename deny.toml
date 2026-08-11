@@ -16,12 +16,15 @@ version = 2
 # Dated exceptions — each an unmaintained-crate advisory on a transitive dependency
 # we do not control and for which no safe upgrade exists. A real vulnerability (or a
 # yanked crate) still fails the gate; these are the "with dated exceptions" half of
-# the release checklist. Reviewed 2026-07-21; revisit when the upstream crate drops
+# the release checklist. Reviewed 2026-08-11; revisit when the upstream crate drops
 # the dependency.
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitive via ratatui; no safe upgrade available" },
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained — transitive dependency; no safe upgrade available" },
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained — transitive via heapless; no safe upgrade available" },
+    { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained — transitive via loro/im; no safe upgrade available" },
+    { id = "RUSTSEC-2026-0248", reason = "im unmaintained — transitive via loro; no safe upgrade available" },
+    { id = "RUSTSEC-2026-0251", reason = "sized-chunks unmaintained — transitive via loro/im; no safe upgrade available" },
 ]
 
 [licenses]

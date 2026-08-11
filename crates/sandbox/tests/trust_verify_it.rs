@@ -86,10 +86,11 @@ fn an_unknown_publisher_is_refused_but_a_trusted_one_verifies() {
         store.key_for(&manifest.publisher).map(|k| k.as_slice()),
         UnsignedPolicy::Deny,
         granted,
+        std::collections::BTreeSet::new(),
     )
     .expect("install verifies against the trusted key");
-    assert_eq!(installed.trust, TrustTier::Trusted);
-    assert!(installed.signed);
+    assert_eq!(installed.trust(), TrustTier::Trusted);
+    assert!(installed.is_signed());
 }
 
 #[test]

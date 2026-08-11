@@ -137,7 +137,9 @@ pub async fn run(paths: &RuntimePaths, json: bool, deep: bool) -> anyhow::Result
 }
 
 fn check_binary(report: &mut Report) {
-    let exe = std::env::current_exe()
+    let resolved = std::env::current_exe();
+    let exe = resolved
+        .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
     report.ok(
@@ -147,6 +149,40 @@ fn check_binary(report: &mut Report) {
             env!("CARGO_PKG_VERSION")
         ),
     );
+    let launcher = resolved.ok().and_then(|binary| {
+        binary
+            .parent()
+            .map(|directory| directory.join("codypendent-ui-worker-launcher"))
+    });
+    if launcher
+        .as_ref()
+        .is_some_and(|path| trusted_ui_launcher(path))
+    {
+        report.ok(
+            "UI worker launcher",
+            launcher.expect("checked launcher").display().to_string(),
+        );
+    } else {
+        report.fail(
+            "UI worker launcher",
+            "missing beside codypendent; embedded plugin UIs will fail closed",
+            "reinstall the complete release bundle",
+        );
+    }
+}
+
+fn trusted_ui_launcher(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        path.metadata().is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata.permissions().mode() & 0o111 != 0
+                && metadata.permissions().mode() & 0o022 == 0
+        })
+    }
+    #[cfg(not(unix))]
+    path.is_file()
 }
 
 async fn check_daemon(report: &mut Report, paths: &RuntimePaths) {

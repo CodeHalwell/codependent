@@ -26,6 +26,7 @@ codypendent-workflow = { workspace = true }
 # The plugin security boundary, exposed via `codypendent plugin inspect`/`diff`
 # (Phase 6 STEP 6.1) so a user sees a plugin's capabilities + permission diff.
 codypendent-sandbox = { workspace = true }
+base64 = { workspace = true }
 # The EvalCase/Assertion harness, exposed via `codypendent eval run` (Phase 7
 # STEP 7.1) so a suite scores against the objective RunObservation this client
 # builds from a headless run's own wire event stream.

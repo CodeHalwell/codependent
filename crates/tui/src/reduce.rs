@@ -10,9 +10,15 @@
 use codypendent_protocol::{
     Actor, ApprovalDecision, ApprovalScope, BudgetDimension, DocumentId, DocumentMutation,
     EventBody, ProposedAction, RunDisposition, RunState, SessionEvent, ToolOutcome,
+    UiActionBinding, UiDocumentId, UiEvent, UiEventId, UiEventModifiers, UiEventType, UiNodeId,
+    UiProtocolVersion, UiResyncRequest, UiRevision, UiWireMessage,
 };
+use codypendent_ui_host::UiSessionUpdate;
+use serde_json::{Map, Value};
 
 use crate::action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, WorkflowNodeUpdate};
+use crate::remote_ui::{RemoteKey, RemoteUiRenderOutput};
+use crate::remote_ui_host::{empty_message, terminal_viewport_message};
 use crate::state::{
     filter_key_rows, filter_model_names, filter_models, filter_modes, filter_providers,
     key_row_target, AppState, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView,
@@ -112,6 +118,47 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 state.tick + 40,
             ));
         }
+        Action::RemoteUiMessage(message) => apply_remote_ui_message(state, *message),
+        Action::RemoteUiSetActive(active) => {
+            state.remote_ui.active = active && !state.remote_ui.mounted_documents().is_empty();
+            if state.remote_ui.active {
+                state.remote_ui.repair_focus();
+                focus_remote_ui(state, 0);
+            }
+        }
+        Action::RemoteUiViewport { width, height } => {
+            state.outbox.push(Intent::RemoteUiMessage(Box::new(
+                terminal_viewport_message(width, height),
+            )));
+        }
+        Action::UiPluginsLoaded(plugins) => {
+            // Mutation replies contain one row; list replies contain the full
+            // projection. Merge by id so either shape preserves selection.
+            for plugin in plugins {
+                if let Some(current) = state.ui_plugins.iter_mut().find(|p| p.id == plugin.id) {
+                    *current = plugin;
+                } else {
+                    state.ui_plugins.push(plugin);
+                }
+            }
+            state.ui_plugins.sort_by(|a, b| a.id.cmp(&b.id));
+            clamp(&mut state.selected_ui_plugin, state.ui_plugins.len());
+        }
+        Action::RemoteUiActivate {
+            document_id,
+            revision,
+            target_id,
+            binding,
+        } => {
+            state.remote_ui.active = true;
+            state.remote_ui.focused_document = Some(document_id.clone());
+            state.remote_ui.view.focused_node = Some(target_id.clone());
+            emit_remote_ui_event(state, document_id, revision, target_id, *binding, None);
+        }
+        Action::RemoteUiKey { key, character } => {
+            apply_remote_ui_key(state, key, character);
+        }
+        Action::RemoteUiPaste(text) => edit_remote_ui_field(state, |value| value.push_str(&text)),
 
         // In the Docs overlay `Tab` cycles the tree / editor / review rail focus;
         // elsewhere it cycles the (vestigial) pane focus.
@@ -192,14 +239,22 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::ConfirmCancel => confirm_top(state),
-        Action::Steer => begin_steering(state),
+        Action::Steer => {
+            if matches!(state.overlay, Overlay::UiPlugins) {
+                smoke_test_ui_plugin(state);
+            } else {
+                begin_steering(state);
+            }
+        }
 
         // `a`/`r` resolve a document suggestion when the Docs review rail is
         // focused (going through the same `MutateDocument` accept/reject the daemon
         // gates on the Approver/Controller role); otherwise they resolve a pending
         // approval, exactly as before.
         Action::Approve(scope) => {
-            if matches!(state.overlay, Overlay::Docs) {
+            if matches!(state.overlay, Overlay::UiPlugins) {
+                begin_approve_ui_plugin(state);
+            } else if matches!(state.overlay, Overlay::Docs) {
                 resolve_focused_suggestion(state, true);
             } else {
                 resolve_focused(state, ApprovalDecision::Approve, scope);
@@ -208,6 +263,8 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::Reject => {
             if matches!(state.overlay, Overlay::Workflow) {
                 retry_focused_workflow_node(state);
+            } else if matches!(state.overlay, Overlay::UiPlugins) {
+                begin_reject_ui_plugin(state);
             } else if matches!(state.overlay, Overlay::Docs) {
                 resolve_focused_suggestion(state, false);
             } else {
@@ -303,6 +360,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 watch_focused_blackboard_run(state);
             }
         }
+        Action::OpenUiPlugins => open_ui_plugins(state),
+        Action::SmokeTestUiPlugin => smoke_test_ui_plugin(state),
+        Action::EnableUiPluginSession => enable_ui_plugin(state, "session"),
+        Action::EnableUiPluginUser => enable_ui_plugin(state, "user"),
+        Action::RevokeUiPlugin => begin_revoke_ui_plugin(state),
         Action::OpenIssues => {
             state.overlay = match state.overlay {
                 Overlay::Issues => Overlay::None,
@@ -341,10 +403,12 @@ pub fn reduce(state: &mut AppState, action: Action) {
             if matches!(state.overlay, Overlay::Docs) {
                 release_doc_lease(state);
             }
-            state.overlay = if matches!(state.overlay, Overlay::ConfirmWorkflowCancel { .. }) {
-                Overlay::Workflow
-            } else {
-                Overlay::None
+            state.overlay = match state.overlay {
+                Overlay::ConfirmWorkflowCancel { .. } => Overlay::Workflow,
+                Overlay::ConfirmUiPluginApprove { .. }
+                | Overlay::ConfirmUiPluginReject { .. }
+                | Overlay::ConfirmUiPluginRevoke { .. } => Overlay::UiPlugins,
+                _ => Overlay::None,
             };
         }
 
@@ -414,6 +478,346 @@ pub fn reduce(state: &mut AppState, action: Action) {
     {
         release_doc_lease(state);
     }
+}
+
+fn apply_remote_ui_message(state: &mut AppState, message: UiWireMessage) {
+    let document_id = message
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.document.document_id.clone())
+        .or_else(|| {
+            message
+                .patch_batch
+                .as_ref()
+                .map(|batch| batch.document_id.clone())
+        })
+        .or_else(|| {
+            message
+                .error
+                .as_ref()
+                .and_then(|error| error.document_id.clone())
+        });
+    match state.remote_ui.handle(message) {
+        Ok(UiSessionUpdate::RemoteError(error)) => {
+            state.notice = Some((error.message, state.tick + 40));
+            if error.recoverable {
+                if let Some(document_id) = error.document_id {
+                    request_remote_ui_resync(state, document_id);
+                }
+            }
+        }
+        Ok(UiSessionUpdate::Action(_)) => {
+            state.issues.push(
+                "Remote UI daemon sent a raw action to the renderer; it was not executed"
+                    .to_owned(),
+            );
+        }
+        Ok(_) => state.remote_ui.repair_focus(),
+        Err(error) => {
+            state.notice = Some((format!("Remote UI rejected: {error}"), state.tick + 40));
+            if let Some(document_id) = document_id {
+                request_remote_ui_resync(state, document_id);
+            }
+        }
+    }
+}
+
+fn request_remote_ui_resync(state: &mut AppState, document_id: UiDocumentId) {
+    let known_revision = state
+        .remote_ui
+        .host
+        .documents()
+        .document(&document_id)
+        .map(|document| document.revision);
+    let id = state.remote_ui.next_message_id("resync");
+    let mut message = empty_message("resync", id);
+    message.resync = Some(UiResyncRequest {
+        document_id,
+        known_revision,
+    });
+    state
+        .outbox
+        .push(Intent::RemoteUiMessage(Box::new(message)));
+}
+
+fn current_remote_output(
+    state: &AppState,
+) -> Option<(UiDocumentId, UiRevision, RemoteUiRenderOutput)> {
+    let document_id = state.remote_ui.focused_document.clone()?;
+    let revision = state
+        .remote_ui
+        .host
+        .documents()
+        .document(&document_id)?
+        .revision;
+    let output = state
+        .remote_ui
+        .last_render
+        .borrow()
+        .get(&document_id)?
+        .clone();
+    Some((document_id, revision, output))
+}
+
+fn focus_remote_ui(state: &mut AppState, delta: i32) {
+    let Some((_, _, output)) = current_remote_output(state) else {
+        return;
+    };
+    let focusable: Vec<_> = output
+        .focus_order
+        .iter()
+        .filter(|descriptor| !descriptor.disabled)
+        .map(|descriptor| descriptor.node_id.clone())
+        .collect();
+    if focusable.is_empty() {
+        state.remote_ui.view.focused_node = None;
+        return;
+    }
+    let current = state
+        .remote_ui
+        .view
+        .focused_node
+        .as_ref()
+        .and_then(|node_id| focusable.iter().position(|candidate| candidate == node_id))
+        .unwrap_or(0);
+    let next = if delta < 0 {
+        current.checked_sub(1).unwrap_or(focusable.len() - 1)
+    } else if delta > 0 {
+        (current + 1) % focusable.len()
+    } else {
+        current
+    };
+    state.remote_ui.view.focused_node = Some(focusable[next].clone());
+}
+
+fn apply_remote_ui_key(state: &mut AppState, key: RemoteKey, character: Option<char>) {
+    match key {
+        RemoteKey::Tab | RemoteKey::Down | RemoteKey::Right => focus_remote_ui(state, 1),
+        RemoteKey::ShiftTab | RemoteKey::Up | RemoteKey::Left => focus_remote_ui(state, -1),
+        RemoteKey::Character => {
+            if let Some(character) = character {
+                edit_remote_ui_field(state, |value| value.push(character));
+            }
+        }
+        RemoteKey::Backspace => edit_remote_ui_field(state, |value| {
+            value.pop();
+        }),
+        RemoteKey::Delete => edit_remote_ui_field(state, String::clear),
+        RemoteKey::PageUp | RemoteKey::PageDown => {
+            if let Some(node_id) = state.remote_ui.view.focused_node.clone() {
+                let offset = state
+                    .remote_ui
+                    .view
+                    .scroll_offsets
+                    .entry(node_id)
+                    .or_default();
+                if key == RemoteKey::PageUp {
+                    *offset = offset.saturating_sub(10);
+                } else {
+                    *offset = offset.saturating_add(10);
+                }
+            }
+        }
+        RemoteKey::Enter | RemoteKey::Space => {
+            let Some((document_id, revision, output)) = current_remote_output(state) else {
+                return;
+            };
+            let Some(target_id) = state.remote_ui.view.focused_node.clone() else {
+                return;
+            };
+            let binding = output
+                .focus_order
+                .iter()
+                .find(|descriptor| descriptor.node_id == target_id)
+                .and_then(|descriptor| {
+                    descriptor
+                        .keyboard_actions
+                        .iter()
+                        .find(|action| action.key == key)
+                })
+                .map(|action| action.binding.clone());
+            if let Some(binding) = binding {
+                emit_remote_ui_event(state, document_id, revision, target_id, binding, None);
+            }
+        }
+        RemoteKey::Escape | RemoteKey::Home | RemoteKey::End => {}
+    }
+}
+
+fn edit_remote_ui_field(state: &mut AppState, edit: impl FnOnce(&mut String)) {
+    let Some((document_id, revision, output)) = current_remote_output(state) else {
+        return;
+    };
+    let Some(node_id) = state.remote_ui.view.focused_node.clone() else {
+        return;
+    };
+    let Some(field) = output
+        .form_fields
+        .iter()
+        .find(|field| field.node_id == node_id && !field.disabled && !field.read_only)
+    else {
+        return;
+    };
+    let current = state
+        .remote_ui
+        .view
+        .input_values
+        .get(&node_id)
+        .unwrap_or(&field.value);
+    let mut value = current.as_str().unwrap_or_default().to_owned();
+    edit(&mut value);
+    state
+        .remote_ui
+        .view
+        .input_values
+        .insert(node_id.clone(), Value::String(value.clone()));
+    let change_binding = output
+        .focus_order
+        .iter()
+        .find(|descriptor| descriptor.node_id == node_id)
+        .and_then(|descriptor| {
+            descriptor
+                .keyboard_actions
+                .iter()
+                .map(|action| &action.binding)
+                .find(|binding| matches!(binding.event.as_str(), "change" | "input"))
+        })
+        .cloned();
+    if let Some(binding) = change_binding {
+        emit_remote_ui_event(
+            state,
+            document_id,
+            revision,
+            node_id,
+            binding,
+            Some(serde_json::json!({"value": value})),
+        );
+    }
+}
+
+fn emit_remote_ui_event(
+    state: &mut AppState,
+    document_id: UiDocumentId,
+    revision: UiRevision,
+    target_id: UiNodeId,
+    binding: UiActionBinding,
+    user_payload: Option<Value>,
+) {
+    if binding.confirmation.is_some() {
+        let key = (
+            document_id.clone(),
+            revision,
+            target_id.clone(),
+            binding.action_id.clone(),
+        );
+        if state.remote_ui.pending_confirmation.as_ref() == Some(&key) {
+            state.remote_ui.pending_confirmation = None;
+        } else {
+            state.remote_ui.pending_confirmation = Some(key);
+            state.notice = Some((
+                binding
+                    .confirmation
+                    .clone()
+                    .unwrap_or_else(|| "Confirm action".to_owned()),
+                state.tick + 10,
+            ));
+            return;
+        }
+    } else {
+        state.remote_ui.pending_confirmation = None;
+    }
+    let event_type = binding.event.as_str().to_owned();
+    // Producer-declared binding payload is resolved again from the live daemon
+    // document. The renderer sends user data only and cannot overwrite those
+    // constants.
+    let mut payload = user_payload
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if event_type == "submit" {
+        let form_nodes = state
+            .remote_ui
+            .host
+            .documents()
+            .document(&document_id)
+            .and_then(|document| form_subtree_ids(&document.root, &target_id));
+        if let (Some((_, _, output)), Some(form_nodes)) = (current_remote_output(state), form_nodes)
+        {
+            let mut form_data = Map::new();
+            for field in output
+                .form_fields
+                .into_iter()
+                .filter(|field| form_nodes.contains(&field.node_id))
+            {
+                let value = state
+                    .remote_ui
+                    .view
+                    .input_values
+                    .get(&field.node_id)
+                    .cloned()
+                    .unwrap_or(field.value);
+                form_data.insert(field.name, value);
+            }
+            payload = form_data;
+        }
+    }
+    let event_id = state.remote_ui.next_message_id("event");
+    let mut message = empty_message("event", event_id.clone());
+    message.event = Some(UiEvent {
+        protocol_version: UiProtocolVersion::V1,
+        event_id: UiEventId::from(event_id),
+        document_id,
+        revision,
+        target_id,
+        event_type: UiEventType::from(event_type),
+        payload: Value::Object(payload),
+        modifiers: Some(UiEventModifiers::default()),
+        timestamp: None,
+        interaction_token: None,
+    });
+    state
+        .outbox
+        .push(Intent::RemoteUiMessage(Box::new(message)));
+}
+
+fn form_subtree_ids(
+    node: &codypendent_protocol::UiNode,
+    target: &UiNodeId,
+) -> Option<std::collections::HashSet<UiNodeId>> {
+    fn contains(node: &codypendent_protocol::UiNode, target: &UiNodeId) -> bool {
+        node.id.as_ref() == Some(target)
+            || node.children.iter().any(|child| contains(child, target))
+            || node
+                .fallback
+                .as_ref()
+                .is_some_and(|fallback| contains(fallback, target))
+    }
+    fn collect(node: &codypendent_protocol::UiNode, ids: &mut std::collections::HashSet<UiNodeId>) {
+        if let Some(id) = &node.id {
+            ids.insert(id.clone());
+        }
+        for child in &node.children {
+            collect(child, ids);
+        }
+        if let Some(fallback) = &node.fallback {
+            collect(fallback, ids);
+        }
+    }
+    for child in &node.children {
+        if let Some(ids) = form_subtree_ids(child, target) {
+            return Some(ids);
+        }
+    }
+    if node
+        .node_type
+        .as_ref()
+        .is_some_and(|kind| kind.as_str() == "Form")
+        && contains(node, target)
+    {
+        let mut ids = std::collections::HashSet::new();
+        collect(node, &mut ids);
+        return Some(ids);
+    }
+    None
 }
 
 /// Overlay a live workflow node transition onto the graph-view cards (Phase 5 T9):
@@ -1029,6 +1433,10 @@ fn nav(state: &mut AppState, delta: i32) {
             watch_focused_blackboard_run(state);
             return;
         }
+        Overlay::UiPlugins => {
+            step(&mut state.selected_ui_plugin, state.ui_plugins.len(), delta);
+            return;
+        }
         Overlay::Palette {
             ref query,
             ref mut selected,
@@ -1320,7 +1728,100 @@ fn confirm_top(state: &mut AppState) {
                 state.outbox.push(Intent::RemoveApiKey { target });
             }
         }
+        Overlay::ConfirmUiPluginApprove { .. } => {
+            if let Overlay::ConfirmUiPluginApprove { plugin_id, receipt } =
+                std::mem::take(&mut state.overlay)
+            {
+                state
+                    .outbox
+                    .push(Intent::ApproveUiPluginUpdate { plugin_id, receipt });
+                state.overlay = Overlay::UiPlugins;
+            }
+        }
+        Overlay::ConfirmUiPluginReject { .. } => {
+            if let Overlay::ConfirmUiPluginReject { plugin_id, receipt } =
+                std::mem::take(&mut state.overlay)
+            {
+                state
+                    .outbox
+                    .push(Intent::RejectUiPluginUpdate { plugin_id, receipt });
+                state.overlay = Overlay::UiPlugins;
+            }
+        }
+        Overlay::ConfirmUiPluginRevoke { .. } => {
+            if let Overlay::ConfirmUiPluginRevoke { plugin_id } = std::mem::take(&mut state.overlay)
+            {
+                state.outbox.push(Intent::RevokeUiPlugin { plugin_id });
+                state.overlay = Overlay::UiPlugins;
+            }
+        }
         _ => {}
+    }
+}
+
+fn open_ui_plugins(state: &mut AppState) {
+    state.overlay = Overlay::UiPlugins;
+    state.outbox.push(Intent::ListUiPlugins);
+}
+
+fn smoke_test_ui_plugin(state: &mut AppState) {
+    if !matches!(state.overlay, Overlay::UiPlugins) {
+        return;
+    }
+    if let Some(plugin_id) = state.focused_ui_plugin().map(|p| p.id.clone()) {
+        state.outbox.push(Intent::SmokeTestUiPlugin { plugin_id });
+        state.notice = Some(("smoke-testing plugin…".to_owned(), state.tick + 40));
+    }
+}
+
+fn enable_ui_plugin(state: &mut AppState, scope: &str) {
+    if !matches!(state.overlay, Overlay::UiPlugins) {
+        return;
+    }
+    if let Some(plugin_id) = state.focused_ui_plugin().map(|p| p.id.clone()) {
+        state.outbox.push(Intent::EnableUiPlugin {
+            plugin_id,
+            scope: scope.to_owned(),
+        });
+        state.notice = Some((format!("enabling plugin for {scope}…"), state.tick + 40));
+    }
+}
+
+fn begin_approve_ui_plugin(state: &mut AppState) {
+    let Some((plugin_id, receipt)) = state.focused_ui_plugin().and_then(|plugin| {
+        plugin
+            .update_approval_receipt
+            .as_ref()
+            .map(|receipt| (plugin.id.clone(), receipt.clone()))
+    }) else {
+        state.notice = Some((
+            "selected plugin has no pending update".to_owned(),
+            state.tick + 25,
+        ));
+        return;
+    };
+    state.overlay = Overlay::ConfirmUiPluginApprove { plugin_id, receipt };
+}
+
+fn begin_reject_ui_plugin(state: &mut AppState) {
+    let Some((plugin_id, receipt)) = state.focused_ui_plugin().and_then(|plugin| {
+        plugin
+            .update_approval_receipt
+            .as_ref()
+            .map(|receipt| (plugin.id.clone(), receipt.clone()))
+    }) else {
+        state.notice = Some((
+            "selected plugin has no pending update".to_owned(),
+            state.tick + 25,
+        ));
+        return;
+    };
+    state.overlay = Overlay::ConfirmUiPluginReject { plugin_id, receipt };
+}
+
+fn begin_revoke_ui_plugin(state: &mut AppState) {
+    if let Some(plugin_id) = state.focused_ui_plugin().map(|p| p.id.clone()) {
+        state.overlay = Overlay::ConfirmUiPluginRevoke { plugin_id };
     }
 }
 
@@ -1772,6 +2273,11 @@ fn activate_row(state: &mut AppState, n: usize) {
             clamp(&mut selected, state.blackboard.len());
             state.selected_item = selected;
             watch_focused_blackboard_run(state);
+        }
+        Overlay::UiPlugins => {
+            let mut selected = n;
+            clamp(&mut selected, state.ui_plugins.len());
+            state.selected_ui_plugin = selected;
         }
         Overlay::Palette { .. }
         | Overlay::ModelPicker { .. }
@@ -2406,6 +2912,7 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
             state.overlay = Overlay::Blackboard;
             watch_focused_blackboard_run(state);
         }
+        PaletteCommand::UiPlugins => open_ui_plugins(state),
         PaletteCommand::Model => {
             state.selected_model = 0;
             state.overlay = Overlay::ModelPicker {
@@ -2464,6 +2971,10 @@ fn request_projection(state: &mut AppState, kind: ProjectionKind) {
 }
 
 fn refresh_open_projection(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::UiPlugins) {
+        state.outbox.push(Intent::ListUiPlugins);
+        return;
+    }
     let kind = match state.overlay {
         Overlay::Skills => Some(ProjectionKind::Skills),
         Overlay::Memory { .. } => Some(ProjectionKind::Memory),
@@ -2557,7 +3068,7 @@ mod tests {
     use chrono::Utc;
     use codypendent_protocol::{
         AgentMode, ApprovalId, ArtifactId, ArtifactRef, ChangeSetId, DataClassification, ModelId,
-        Risk, RiskLevel, RunId, ToolOutcome,
+        Risk, RiskLevel, RunId, ToolOutcome, UiActionId, UiDocument, UiNode, UiPrimitive,
     };
 
     fn agent_actor(run_id: RunId) -> Actor {
@@ -2591,6 +3102,157 @@ mod tests {
             sha256: "0".repeat(64),
             sensitivity: DataClassification::Internal,
         }
+    }
+
+    #[test]
+    fn remote_submit_scopes_form_data_to_the_owning_form() {
+        use crate::remote_ui::FormFieldDescriptor;
+
+        let mut state = AppState::new();
+        reduce(
+            &mut state,
+            Action::RemoteUiMessage(Box::new(
+                crate::remote_ui_host::terminal_capabilities_message(80, 24, 24),
+            )),
+        );
+        let mut first = UiNode::element("form-a", UiPrimitive::from("Form"));
+        first
+            .children
+            .push(UiNode::element("field-a", UiPrimitive::from("TextInput")));
+        first
+            .children
+            .push(UiNode::element("submit-a", UiPrimitive::from("Button")));
+        let mut second = UiNode::element("form-b", UiPrimitive::from("Form"));
+        second
+            .children
+            .push(UiNode::element("field-b", UiPrimitive::from("TextInput")));
+        let mut root = UiNode::element("root", UiPrimitive::from("Stack"));
+        root.children = vec![first, second];
+        let document = UiDocument {
+            protocol_version: UiProtocolVersion::V1,
+            document_id: UiDocumentId::from("forms"),
+            revision: UiRevision(1),
+            root,
+            capabilities: None,
+            metadata: Default::default(),
+            compatibility: None,
+        };
+        let mut snapshot = empty_message("snapshot", "forms-snapshot");
+        snapshot.snapshot = Some(codypendent_protocol::UiSnapshot {
+            document,
+            reason: None,
+        });
+        reduce(&mut state, Action::RemoteUiMessage(Box::new(snapshot)));
+        state.remote_ui.focused_document = Some(UiDocumentId::from("forms"));
+        let mut output = RemoteUiRenderOutput::default();
+        for (node, name, value) in [("field-a", "first", "one"), ("field-b", "second", "two")] {
+            output.form_fields.push(FormFieldDescriptor {
+                node_id: UiNodeId::from(node),
+                name: name.to_owned(),
+                input_type: "TextInput".to_owned(),
+                value: Value::String(value.to_owned()),
+                required: false,
+                read_only: false,
+                disabled: false,
+                validation_message: None,
+            });
+        }
+        state
+            .remote_ui
+            .last_render
+            .borrow_mut()
+            .insert(UiDocumentId::from("forms"), output);
+        emit_remote_ui_event(
+            &mut state,
+            UiDocumentId::from("forms"),
+            UiRevision(1),
+            UiNodeId::from("submit-a"),
+            UiActionBinding {
+                event: UiEventType::from("submit"),
+                action_id: UiActionId::from("save"),
+                payload: serde_json::json!({"trusted": true}),
+                requires: Vec::new(),
+                disabled: false,
+                confirmation: None,
+            },
+            None,
+        );
+        let event = match state.outbox.last().expect("event intent") {
+            Intent::RemoteUiMessage(message) => message.event.as_ref().expect("event"),
+            other => panic!("expected remote UI event, got {other:?}"),
+        };
+        assert_eq!(event.payload, serde_json::json!({"first": "one"}));
+        assert!(event.payload.get("trusted").is_none());
+    }
+
+    #[test]
+    fn sdk_handler_only_text_input_emits_revision_bound_change_event() {
+        let mut state = AppState::new();
+        reduce(
+            &mut state,
+            Action::RemoteUiMessage(Box::new(
+                crate::remote_ui_host::terminal_capabilities_message(80, 24, 24),
+            )),
+        );
+        let document: UiDocument = serde_json::from_value(serde_json::json!({
+            "protocolVersion": {"major": 1, "minor": 0},
+            "documentId": "stateful-input",
+            "revision": 3,
+            "root": {
+                "kind": "element", "id": "query", "type": "TextInput",
+                "props": {"name": "query", "value": "", "eventHandlers": ["change"]},
+                "children": []
+            }
+        }))
+        .expect("SDK-shaped input");
+        let mut snapshot = empty_message("snapshot", "stateful-snapshot");
+        snapshot.snapshot = Some(codypendent_protocol::UiSnapshot {
+            document,
+            reason: None,
+        });
+        reduce(&mut state, Action::RemoteUiMessage(Box::new(snapshot)));
+        let document_id = UiDocumentId::from("stateful-input");
+        let output = {
+            let document = state
+                .remote_ui
+                .host
+                .documents()
+                .document(&document_id)
+                .expect("mounted document");
+            let area = ratatui::layout::Rect::new(0, 0, 40, 4);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            crate::render_remote_ui(
+                &mut buffer,
+                area,
+                document,
+                &crate::Theme::dark(),
+                &state.remote_ui.capabilities,
+                &state.remote_ui.view,
+                crate::RemoteUiRenderOptions::default(),
+            )
+        };
+        state.remote_ui.focused_document = Some(document_id.clone());
+        state.remote_ui.view.focused_node = Some(UiNodeId::from("query"));
+        state
+            .remote_ui
+            .last_render
+            .borrow_mut()
+            .insert(document_id, output);
+        reduce(
+            &mut state,
+            Action::RemoteUiKey {
+                key: RemoteKey::Character,
+                character: Some('x'),
+            },
+        );
+        let event = match state.outbox.last().expect("change event") {
+            Intent::RemoteUiMessage(message) => message.event.as_ref().expect("event"),
+            other => panic!("expected remote UI event, got {other:?}"),
+        };
+        assert_eq!(event.revision, UiRevision(3));
+        assert_eq!(event.target_id.as_str(), "query");
+        assert_eq!(event.event_type.as_str(), "change");
+        assert_eq!(event.payload, serde_json::json!({"value": "x"}));
     }
 
     #[test]

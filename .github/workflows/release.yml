@@ -1,4 +1,4 @@
-# Build downloadable `codypendent` + `codypendentd` executables for Linux and
+# Build downloadable `codypendent` + `codypendentd` + hardened UI worker launcher for Linux and
 # macOS, and publish a GitHub Release. Three triggers:
 #   - a version tag (`v1.2.3`)      → a normal release attached to that tag;
 #   - every push to `main`          → a rolling prerelease `v<ver>-build.<run>`,
@@ -53,7 +53,7 @@ jobs:
         run: >
           cargo build --release --locked
           --target ${{ matrix.target }}
-          --bin codypendent --bin codypendentd
+          --bin codypendent --bin codypendentd --bin codypendent-ui-worker-launcher
 
       - name: Resolve the workspace version
         id: version
@@ -74,9 +74,49 @@ jobs:
           # binary (it runs the daemon from itself via `codypendent __daemon`).
           # It MUST be present.
           cp "target/${{ matrix.target }}/release/codypendent" "$dist/"
+          # Mandatory pre-exec rlimit boundary for embedded TypeScript/React UI workers.
+          cp "target/${{ matrix.target }}/release/codypendent-ui-worker-launcher" "$dist/"
           # `codypendentd` stays as an OPTIONAL standalone daemon for advanced
           # use; ship it if this build produced it, but never fail if absent.
           cp "target/${{ matrix.target }}/release/codypendentd" "$dist/" 2>/dev/null || true
+          # Remote UI executes only on a pinned, self-contained runtime tree.
+          # Release binaries deliberately do not fall back to PATH/system Node.
+          node_version="22.13.1"
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              node_platform="linux-x64"
+              node_sha256="666148b9fe0c7e1301cc1b029e33a45e9e4a893f68d2d2bb1cc88a931a88a004"
+              ;;
+            x86_64-apple-darwin)
+              node_platform="darwin-x64"
+              node_sha256="6fdcc8412d434664238b0651ebd5ad55d15a08598ff42dcb6d9cf1d434a6c4be"
+              ;;
+            aarch64-apple-darwin)
+              node_platform="darwin-arm64"
+              node_sha256="97483ff4361d239a56d038c6335767a56a291e78c10f07446f463f05d9d19b89"
+              ;;
+          esac
+          node_archive="node-v${node_version}-${node_platform}.tar.gz"
+          node_base="https://nodejs.org/dist/v${node_version}"
+          curl --fail --silent --show-error --location --remote-name "$node_base/$node_archive"
+          echo "$node_sha256  $node_archive" | shasum -a 256 -c -
+          mkdir -p "$dist/node-runtime"
+          tar -xzf "$node_archive" --strip-components=1 -C "$dist/node-runtime"
+          python3 - "$dist/node-runtime" <<'PY'
+          import hashlib, json, os, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          entries = []
+          for path in sorted(root.rglob("*")):
+              relative = path.relative_to(root).as_posix()
+              if path.is_symlink():
+                  entries.append({"kind": "link", "path": relative, "digest": os.readlink(path)})
+              elif path.is_file():
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  entries.append({"kind": "file", "path": relative, "digest": digest})
+          (root / ".codypendent-runtime-seal.json").write_text(
+              json.dumps(entries, separators=(",", ":")), encoding="utf-8"
+          )
+          PY
           cp README.md ROADMAP.md "$dist/" 2>/dev/null || true
           tar -czf "$dist.tar.gz" "$dist"
           echo "artifact=$dist.tar.gz" >> "$GITHUB_OUTPUT"

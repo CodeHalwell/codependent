@@ -7,6 +7,9 @@
 pub mod db;
 pub mod instance;
 pub mod ledger;
+pub mod remote_ui;
+pub mod remote_ui_plugins;
+pub mod remote_ui_workers;
 pub mod replay;
 pub mod server;
 

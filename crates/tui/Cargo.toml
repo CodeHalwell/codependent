@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 codypendent-protocol = { workspace = true }
+codypendent-ui-host = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 chrono = { workspace = true }
@@ -24,6 +25,8 @@ thiserror = { workspace = true }
 pulldown-cmark = { workspace = true }
 # Per-language fenced-code syntax highlighting (client-only; see markdown.rs).
 synoptic = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
 
 [lints]
 workspace = true

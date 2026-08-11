@@ -35,6 +35,8 @@ pub enum PaletteCommand {
     Workflow,
     /// Open the blackboard view.
     Blackboard,
+    /// Open host-owned installed Remote UI plugin management.
+    UiPlugins,
     /// Open the model picker (MP1).
     Model,
     /// Open the provider catalog picker (Task 8).
@@ -198,6 +200,13 @@ pub const COMMANDS: &[PaletteEntry] = &[
         title: "/memory  Memory",
         description: "browse curated memories and their provenance",
         key: "M",
+        group: "Workspace",
+    },
+    PaletteEntry {
+        command: PaletteCommand::UiPlugins,
+        title: "/plugins  Remote UI plugins",
+        description: "inspect, smoke-test, scope, approve, reject, or revoke verified UI plugins",
+        key: "—",
         group: "Workspace",
     },
     // --- Session: client-level and housekeeping commands. ---

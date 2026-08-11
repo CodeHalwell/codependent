@@ -164,6 +164,77 @@ pub struct SandboxCommand {
     /// Origin label the captured output is tagged with (e.g. `skill:rust.fix-ci`,
     /// `plugin:github`) so sanitized output enters context as labeled evidence.
     pub origin: String,
+    /// True only when a trusted host runtime independently denies process
+    /// creation (for example Node's stable `--permission` model without
+    /// `--allow-child-process`). This lets Linux admit that specific runtime
+    /// while continuing to reject generic no-subprocess commands whose bound
+    /// system binaries would otherwise remain executable inside bubblewrap.
+    runtime_denies_subprocess: bool,
+}
+
+/// A fully lowered command line for a long-lived, stdio-connected sandboxed
+/// process. The argv always starts with the enforcing backend
+/// (`sandbox-exec`/`bwrap`, optionally `prlimit`), never the untrusted program
+/// directly. Consumers use this for protocols that cannot be expressed as the
+/// capture-to-completion [`SandboxExecutor::run`] call.
+///
+/// The fields are private so callers cannot accidentally widen the profile
+/// after policy has been lowered. In particular, the clean environment and
+/// sandbox working directory are frozen at preparation time.
+#[derive(Debug, Clone)]
+pub struct SandboxProcessSpec {
+    backend: SandboxBackend,
+    argv: Vec<String>,
+    cwd: std::path::PathBuf,
+    environment: Vec<(String, std::ffi::OsString)>,
+    origin: String,
+    wall_clock: Duration,
+    output_cap_bytes: usize,
+}
+
+impl SandboxProcessSpec {
+    /// The OS boundary wrapped around the process.
+    #[must_use]
+    pub fn backend(&self) -> SandboxBackend {
+        self.backend
+    }
+
+    /// Complete structured argv, including the sandbox frontend as argv[0].
+    #[must_use]
+    pub fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    /// Isolated working directory selected by the host.
+    #[must_use]
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    /// Frozen clean environment. No parent variable outside this sequence may
+    /// be inherited when the process is spawned.
+    #[must_use]
+    pub fn environment(&self) -> &[(String, std::ffi::OsString)] {
+        &self.environment
+    }
+
+    /// Untrusted-origin label for diagnostics and audit records.
+    #[must_use]
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// Maximum lifetime granted by the sandbox profile.
+    #[must_use]
+    pub fn wall_clock(&self) -> Duration {
+        self.wall_clock
+    }
+
+    /// Maximum retained diagnostic bytes across process output streams.
+    #[must_use]
+    pub fn output_cap_bytes(&self) -> usize {
+        self.output_cap_bytes
+    }
 }
 
 impl SandboxCommand {
@@ -179,7 +250,55 @@ impl SandboxCommand {
             args,
             cwd: cwd.into(),
             origin: origin.into(),
+            runtime_denies_subprocess: false,
         }
+    }
+
+    /// Construct the sealed Node worker form understood by the Linux executor.
+    /// The ordinary constructor cannot set the isolation marker: this validates
+    /// that the stable permission model is mandatory and that no process,
+    /// worker, native-addon, FFI, WASI, inspector, or network grant reopens it.
+    pub fn node_permission_runtime(
+        program: impl Into<std::path::PathBuf>,
+        args: Vec<String>,
+        cwd: impl Into<std::path::PathBuf>,
+        origin: impl Into<String>,
+    ) -> Result<Self, SandboxError> {
+        let program = program.into();
+        let permission = args.iter().any(|argument| argument == "--permission");
+        let no_addons = args.iter().any(|argument| argument == "--no-addons");
+        let forbidden = args.iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "--allow-child-process"
+                    | "--allow-worker"
+                    | "--allow-addons"
+                    | "--allow-wasi"
+                    | "--allow-ffi"
+                    | "--allow-net"
+                    | "--inspect"
+                    | "--inspect-brk"
+            ) || argument.starts_with("--inspect=")
+                || argument.starts_with("--inspect-brk=")
+        });
+        if !program.is_absolute() || !permission || !no_addons || forbidden {
+            return Err(SandboxError::InvalidCommand(
+                "sealed Node UI runtime requires an absolute program, --permission and --no-addons, with no process/worker/native/network/inspector allowances"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            program,
+            args,
+            cwd: cwd.into(),
+            origin: origin.into(),
+            runtime_denies_subprocess: true,
+        })
+    }
+
+    #[must_use]
+    fn runtime_denies_subprocess(&self) -> bool {
+        self.runtime_denies_subprocess
     }
 }
 
@@ -270,7 +389,7 @@ pub enum SandboxError {
 }
 
 /// The enforcement seam: consume a [`SandboxProfile`] and run a command confined.
-pub trait SandboxExecutor {
+pub trait SandboxExecutor: Send + Sync {
     /// What this executor actually enforces on this host (STEP 6.2.1).
     fn capability_report(&self) -> CapabilityReport;
 
@@ -282,6 +401,15 @@ pub trait SandboxExecutor {
         profile: &SandboxProfile,
         command: &SandboxCommand,
     ) -> Result<SandboxOutcome, SandboxError>;
+
+    /// Lower a command into an enforcing, stdio-capable process specification.
+    /// This is the only supported launch path for long-lived plugin protocols.
+    /// It applies the same validation and backend policy as [`Self::run`].
+    fn prepare_interactive(
+        &self,
+        profile: &SandboxProfile,
+        command: &SandboxCommand,
+    ) -> Result<SandboxProcessSpec, SandboxError>;
 }
 
 /// Resolve the enforcing executor for the current platform, or fail closed.
@@ -334,6 +462,16 @@ impl SandboxExecutor for RefusingSandbox {
         _profile: &SandboxProfile,
         _command: &SandboxCommand,
     ) -> Result<SandboxOutcome, SandboxError> {
+        Err(SandboxError::UnsupportedPlatform {
+            platform: std::env::consts::OS,
+        })
+    }
+
+    fn prepare_interactive(
+        &self,
+        _profile: &SandboxProfile,
+        _command: &SandboxCommand,
+    ) -> Result<SandboxProcessSpec, SandboxError> {
         Err(SandboxError::UnsupportedPlatform {
             platform: std::env::consts::OS,
         })
@@ -501,18 +639,26 @@ pub fn bwrap_argv(profile: &SandboxProfile, command: &SandboxCommand) -> Vec<Str
         }
     }
 
-    // Base filesystem: a private /proc, /dev, and /tmp, plus read-only system dirs
-    // the program needs to run. Nothing under the user's home is bound.
+    // Base filesystem: a private /proc, /dev, and /tmp. Generic processes get
+    // the traditional read-only system tree. A pinned host runtime that
+    // independently denies process creation receives only shared-library roots,
+    // not /bin, /sbin, /usr/bin, or all of /etc; this keeps ordinary executable
+    // payloads absent from its mount namespace as an OS-level second layer.
     argv.push("--proc".into());
     argv.push("/proc".into());
     argv.push("--dev".into());
     argv.push("/dev".into());
     argv.push("--tmpfs".into());
     argv.push("/tmp".into());
-    for sysdir in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"] {
+    let system_roots: &[&str] = if command.runtime_denies_subprocess() {
+        &["/lib", "/lib64", "/usr/lib", "/usr/lib64"]
+    } else {
+        &["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"]
+    };
+    for sysdir in system_roots {
         argv.push("--ro-bind-try".into());
-        argv.push(sysdir.into());
-        argv.push(sysdir.into());
+        argv.push((*sysdir).into());
+        argv.push((*sysdir).into());
     }
 
     // Granted paths.
@@ -658,6 +804,13 @@ fn spawn_capture_kill(
         stderr,
         output_truncated,
     })
+}
+
+fn frozen_environment(env_allowlist: &[String]) -> Vec<(String, std::ffi::OsString)> {
+    env_allowlist
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (name.clone(), value)))
+        .collect()
 }
 
 /// Read a pipe fully, retaining at most `cap` bytes and draining the rest to the
@@ -869,6 +1022,50 @@ impl SandboxExecutor for MacosSandbox {
             SandboxBackend::Seatbelt,
         )
     }
+
+    fn prepare_interactive(
+        &self,
+        profile: &SandboxProfile,
+        command: &SandboxCommand,
+    ) -> Result<SandboxProcessSpec, SandboxError> {
+        if !command.program.is_absolute() {
+            return Err(SandboxError::InvalidCommand(format!(
+                "program must be an absolute path, got `{}`",
+                command.program.display()
+            )));
+        }
+        validate_enforceable_profile(profile)?;
+        let program = canonicalize_grant(&command.program.to_string_lossy());
+        let cwd = std::path::PathBuf::from(canonicalize_grant(&command.cwd.to_string_lossy()));
+        let mut resolved = profile.clone();
+        resolved.read_paths = profile
+            .read_paths
+            .iter()
+            .map(|path| canonicalize_grant(path))
+            .collect();
+        resolved.write_paths = profile
+            .write_paths
+            .iter()
+            .map(|path| canonicalize_grant(path))
+            .collect();
+        let sandbox = seatbelt_profile(&resolved, Path::new(&program));
+        let mut argv = vec![
+            self.tool.to_string_lossy().into_owned(),
+            "-p".into(),
+            sandbox,
+            program,
+        ];
+        argv.extend(command.args.iter().cloned());
+        Ok(SandboxProcessSpec {
+            backend: SandboxBackend::Seatbelt,
+            argv,
+            cwd,
+            environment: frozen_environment(&profile.env_allowlist),
+            origin: command.origin.clone(),
+            wall_clock: Duration::from_secs(profile.wall_seconds),
+            output_cap_bytes: output_cap_bytes(profile),
+        })
+    }
 }
 
 /// Resolve `path` to its canonical (symlink-free) form so a Seatbelt `(subpath …)`
@@ -962,7 +1159,7 @@ impl SandboxExecutor for LinuxSandbox {
             )));
         }
         validate_enforceable_profile(profile)?;
-        if !profile.allow_subprocess {
+        if !profile.allow_subprocess && !command.runtime_denies_subprocess() {
             return Err(SandboxError::UnsupportedCapability(
                 "Linux bubblewrap cannot prevent exec of bound system binaries when subprocess=false"
                     .into(),
@@ -992,6 +1189,48 @@ impl SandboxExecutor for LinuxSandbox {
             &command.origin,
             SandboxBackend::Bubblewrap,
         )
+    }
+
+    fn prepare_interactive(
+        &self,
+        profile: &SandboxProfile,
+        command: &SandboxCommand,
+    ) -> Result<SandboxProcessSpec, SandboxError> {
+        if !command.program.is_absolute() {
+            return Err(SandboxError::InvalidCommand(format!(
+                "program must be an absolute path, got `{}`",
+                command.program.display()
+            )));
+        }
+        validate_enforceable_profile(profile)?;
+        if !profile.allow_subprocess && !command.runtime_denies_subprocess() {
+            return Err(SandboxError::UnsupportedCapability(
+                "Linux bubblewrap cannot prevent exec of bound system binaries when subprocess=false"
+                    .into(),
+            ));
+        }
+        let mut argv = bwrap_argv(profile, command);
+        if let Some(first) = argv.iter_mut().find(|value| value.as_str() == "bwrap") {
+            *first = self.tool.to_string_lossy().into_owned();
+        }
+        if let Some(first) = argv.iter_mut().find(|value| value.as_str() == "prlimit") {
+            *first = locate_on_path("prlimit")
+                .ok_or_else(|| SandboxError::ToolUnavailable {
+                    tool: "prlimit".into(),
+                    diagnostic: "memory/CPU caps require an absolute prlimit executable".into(),
+                })?
+                .to_string_lossy()
+                .into_owned();
+        }
+        Ok(SandboxProcessSpec {
+            backend: SandboxBackend::Bubblewrap,
+            argv,
+            cwd: command.cwd.clone(),
+            environment: frozen_environment(&profile.env_allowlist),
+            origin: command.origin.clone(),
+            wall_clock: Duration::from_secs(profile.wall_seconds),
+            output_cap_bytes: output_cap_bytes(profile),
+        })
     }
 }
 
@@ -1190,6 +1429,36 @@ maximum_output_mb = 8
         assert!(argv
             .windows(3)
             .any(|w| w == ["--bind", "/workspace/repo/target", "/workspace/repo/target"]));
+    }
+
+    #[test]
+    fn host_runtime_without_subprocess_excludes_system_binary_trees() {
+        let p = sample_profile();
+        let cmd = SandboxCommand::node_permission_runtime(
+            "/opt/codypendent/node/bin/node",
+            vec![
+                "--permission".into(),
+                "--no-addons".into(),
+                "/package/worker.mjs".into(),
+            ],
+            "/package",
+            "ui-component:test",
+        )
+        .unwrap();
+        let argv = bwrap_argv(&p, &cmd);
+        for executable_root in ["/bin", "/sbin", "/usr"] {
+            assert!(
+                !argv.windows(3).any(|window| {
+                    window[0] == "--ro-bind-try"
+                        && window[1] == executable_root
+                        && window[2] == executable_root
+                }),
+                "{executable_root} must be absent from the UI worker namespace"
+            );
+        }
+        assert!(argv.windows(3).any(|window| {
+            window[0] == "--ro-bind-try" && window[1] == "/usr/lib" && window[2] == "/usr/lib"
+        }));
     }
 
     // --- fail-closed posture (runs on every platform) ---

@@ -1,0 +1,23 @@
+[package]
+name = "codypendent-ui-host"
+description = "Validated Remote UI document store, contribution registry, and component transport host."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+codypendent-protocol = { workspace = true }
+codypendent-sandbox = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

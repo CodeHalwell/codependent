@@ -9,7 +9,7 @@ node_modules/**
 .eslintrc.cjs
 .gitignore
 esbuild.config.mjs
-vitest.config.ts
+vitest.config.mts
 tsconfig.json
 **/tsconfig.json
 **/.eslintrc*

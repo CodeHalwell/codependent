@@ -21,6 +21,7 @@ use codypendent_protocol::{
 
 use crate::action::{Action, KeyTarget};
 use crate::reduce::capability_label;
+use crate::remote_ui_host::{TERMINAL_CENTRAL_SLOTS, TERMINAL_OVERLAY_SLOTS};
 use crate::state::{
     filter_key_rows, filter_model_names, filter_models, filter_modes, filter_providers, AppState,
     DocFocus, DocLeaseState, KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, ModelReadiness,
@@ -28,6 +29,7 @@ use crate::state::{
     TranscriptEntry,
 };
 use crate::theme::Theme;
+use crate::{render_remote_ui, RemoteUiRenderOptions};
 
 /// Draw the whole UI for the current frame.
 pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
@@ -35,6 +37,7 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // Rebuilt fresh every frame (mirrors `transcript_max_scroll`): a stale hit
     // from a previous layout must never survive to resolve this frame's clicks.
     state.hit_map.borrow_mut().clear();
+    state.remote_ui.last_render.borrow_mut().clear();
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.surface.background)),
         area,
@@ -48,27 +51,168 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // line (a manual `Alt+Enter` break, or a multi-line paste), capped at
     // `COMPOSER_MAX_HEIGHT` — see `composer_box_height`.
     let composer_height = composer_box_height(&state.composer);
+    let has_composer_accessory = !state
+        .remote_ui
+        .mounted_documents_for_points(&["composer-accessory"])
+        .is_empty();
+    let has_status_items = !state
+        .remote_ui
+        .mounted_documents_for_points(&["status-item"])
+        .is_empty();
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),               // project header
-            Constraint::Min(3),                  // conversation transcript
+            Constraint::Length(1), // project header
+            Constraint::Min(3),    // conversation transcript
+            Constraint::Length(if has_composer_accessory { 3 } else { 0 }),
             Constraint::Length(composer_height), // inline composer
-            Constraint::Length(1),               // contextual footer
+            Constraint::Length(if has_status_items { 4 } else { 1 }),
         ])
         .split(area);
 
     render_header(frame, rows[0], state, theme);
     // The region between header and composer depends on the layout; the
     // header, composer, and contextual footer are identical in both.
-    match state.layout {
-        LayoutMode::Chat => render_conversation(frame, rows[1], state, theme),
-        LayoutMode::Workspace => render_workspace(frame, rows[1], state, theme),
+    if !render_remote_surfaces(frame, rows[1], state, theme) {
+        match state.layout {
+            LayoutMode::Chat => render_conversation(frame, rows[1], state, theme),
+            LayoutMode::Workspace => render_workspace(frame, rows[1], state, theme),
+        }
     }
-    render_composer(frame, rows[2], state, theme);
-    render_status_line(frame, rows[3], state, theme);
+    if has_composer_accessory {
+        let documents = state
+            .remote_ui
+            .mounted_documents_for_points(&["composer-accessory"]);
+        render_remote_documents(frame, rows[2], state, theme, documents);
+    }
+    render_composer(frame, rows[3], state, theme);
+    render_status_slot(frame, rows[4], state, theme);
+
+    render_remote_overlays(frame, area, state, theme);
 
     render_overlays(frame, area, state, theme);
+}
+
+fn render_remote_surfaces(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> bool {
+    let documents = state
+        .remote_ui
+        .mounted_documents_for_points(TERMINAL_CENTRAL_SLOTS);
+    if documents.is_empty() || area.width == 0 || area.height == 0 {
+        return false;
+    }
+    render_remote_documents(frame, area, state, theme, documents);
+    true
+}
+
+fn render_remote_documents(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    documents: Vec<&codypendent_protocol::UiDocument>,
+) {
+    if documents.is_empty() || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let count = u16::try_from(documents.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height.max(1));
+    let constraints = (0..count)
+        .map(|_| Constraint::Ratio(1, u32::from(count)))
+        .collect::<Vec<_>>();
+    let regions = Layout::vertical(constraints).split(area);
+    for (document, region) in documents.into_iter().zip(regions.iter().copied()) {
+        let (extension, publisher, trust) = state
+            .remote_ui
+            .extension_identity_for_document(&document.document_id)
+            .unwrap_or(("unknown extension", None, None));
+        let identity = match (publisher, trust) {
+            (Some(publisher), Some(trust)) => format!("{extension} · {publisher} · {trust}"),
+            (Some(publisher), None) => format!("{extension} · {publisher}"),
+            (None, Some(trust)) => format!("{extension} · {trust}"),
+            (None, None) => format!("{extension} · sandboxed"),
+        };
+        let point = state
+            .remote_ui
+            .host
+            .registry()
+            .registration_for_document(document.document_id.as_str())
+            .map(|registration| registration.point.as_str())
+            .unwrap_or("panel");
+        let chrome = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.surface.border))
+            .title(Span::styled(
+                format!(" {point} · Extension: {identity} "),
+                Style::default()
+                    .fg(theme.text.muted)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let content_region = chrome.inner(region);
+        frame.render_widget(chrome, region);
+        let output = render_remote_ui(
+            frame.buffer_mut(),
+            content_region,
+            document,
+            theme,
+            &state.remote_ui.capabilities,
+            &state.remote_ui.view,
+            RemoteUiRenderOptions::default(),
+        );
+        for hit in &output.hit_regions {
+            state.hit_map.borrow_mut().push((
+                hit.area,
+                Action::RemoteUiActivate {
+                    document_id: document.document_id.clone(),
+                    revision: document.revision,
+                    target_id: hit.node_id.clone(),
+                    binding: Box::new(hit.binding.clone()),
+                },
+            ));
+        }
+        state
+            .remote_ui
+            .last_render
+            .borrow_mut()
+            .insert(document.document_id.clone(), output);
+    }
+}
+
+fn render_status_slot(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let documents = state
+        .remote_ui
+        .mounted_documents_for_points(&["status-item"]);
+    if documents.is_empty() || area.width < 24 || area.height < 4 {
+        render_status_line(frame, area, state, theme);
+        return;
+    }
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).split(area);
+    render_status_line(frame, rows[0], state, theme);
+    render_remote_documents(frame, rows[1], state, theme, documents);
+}
+
+fn render_remote_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let documents = state
+        .remote_ui
+        .mounted_documents_for_points(TERMINAL_OVERLAY_SLOTS);
+    if documents.is_empty() || area.width < 20 || area.height < 5 {
+        return;
+    }
+    let width = area.width.min(48);
+    let height = area.height.saturating_sub(2).min(
+        u16::try_from(documents.len())
+            .unwrap_or(u16::MAX)
+            .saturating_mul(5)
+            .max(5),
+    );
+    let region = Rect::new(
+        area.right().saturating_sub(width),
+        area.y.saturating_add(1),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, region);
+    render_remote_documents(frame, region, state, theme, documents);
 }
 
 /// The one-row project header. Brand and conversation identity live on the
@@ -1714,6 +1858,28 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         }
         Overlay::Workflow => render_workflow(frame, area, state, theme),
         Overlay::Blackboard => render_blackboard(frame, area, state, theme),
+        Overlay::UiPlugins => render_ui_plugins(frame, area, state, theme),
+        Overlay::ConfirmUiPluginApprove { plugin_id, receipt } => render_confirm_box(
+            frame,
+            area,
+            theme,
+            "Approve this verified permission update?",
+            &format!("plugin {plugin_id} · exact receipt {receipt}"),
+        ),
+        Overlay::ConfirmUiPluginReject { plugin_id, receipt } => render_confirm_box(
+            frame,
+            area,
+            theme,
+            "Reject this verified permission update?",
+            &format!("plugin {plugin_id} · exact receipt {receipt}"),
+        ),
+        Overlay::ConfirmUiPluginRevoke { plugin_id } => render_confirm_box(
+            frame,
+            area,
+            theme,
+            "Revoke this Remote UI plugin?",
+            &format!("Stops every active worker for {plugin_id}"),
+        ),
         Overlay::Palette { query, selected } => {
             render_palette(frame, area, state, theme, query, *selected);
         }
@@ -1976,6 +2142,172 @@ fn issue_guidance(issue: &str) -> &'static str {
     } else {
         "Review the message above; resolve the underlying configuration, then clear this diagnostic."
     }
+}
+
+/// Core-owned lifecycle UI for installed Remote UI plugins. This surface is
+/// rendered by the trusted host, never by plugin code, so permission diffs,
+/// approval receipts, enablement scope, and revocation controls cannot be
+/// spoofed by the extension whose authority they govern.
+fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(90, 86, area);
+    frame.render_widget(Clear, rect);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(
+                " Remote UI plugins ({}) · host-owned ",
+                state.ui_plugins.len()
+            ),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(rows[0]);
+
+    const ROW_LINES: usize = 2;
+    let visible = (cols[0].height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(state.selected_ui_plugin, state.ui_plugins.len(), visible);
+    let mut items = Vec::new();
+    if state.ui_plugins.is_empty() {
+        items.push(ListItem::new(vec![
+            Line::styled(
+                "  No installed Remote UI plugins",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  Install one with `codypendent plugin install`",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
+    }
+    for (index, plugin) in state
+        .ui_plugins
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible)
+    {
+        let selected = index == state.selected_ui_plugin;
+        let head = Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(theme.focus.active),
+            ),
+            Span::styled(
+                format!("{} v{}", truncate(&plugin.id, 24), plugin.version),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]);
+        let meta = Line::styled(
+            format!(
+                "    {}{}",
+                plugin.state,
+                plugin
+                    .enabled_scope
+                    .as_ref()
+                    .map_or_else(String::new, |scope| format!(" · {scope}"))
+            ),
+            Style::default().fg(theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, meta]);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+    for (screen_row, index) in (first..state.ui_plugins.len()).take(visible).enumerate() {
+        state.register_hit(
+            Rect {
+                x: cols[0].x,
+                y: cols[0].y + screen_row as u16 * ROW_LINES as u16,
+                width: cols[0].width,
+                height: ROW_LINES as u16,
+            },
+            Action::ActivateRow(index),
+        );
+    }
+
+    let detail = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive));
+    let detail_inner = detail.inner(cols[1]);
+    frame.render_widget(detail, cols[1]);
+    let mut lines = Vec::new();
+    if let Some(plugin) = state.focused_ui_plugin() {
+        lines.push(Line::styled(
+            format!("{} v{}", plugin.id, plugin.version),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::from(format!("  state: {}", plugin.state)));
+        lines.push(Line::from(format!(
+            "  scope: {}",
+            plugin.enabled_scope.as_deref().unwrap_or("disabled")
+        )));
+        lines.push(Line::default());
+        if let Some(diff) = &plugin.update_permission_diff {
+            lines.push(Line::styled(
+                "Permission update (host verified):",
+                Style::default()
+                    .fg(theme.status.warning)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.extend(diff.lines().map(|line| Line::from(format!("  {line}"))));
+        } else {
+            lines.push(Line::styled(
+                "No permission-expanding update is pending.",
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        if let Some(receipt) = &plugin.update_approval_receipt {
+            lines.push(Line::default());
+            lines.push(Line::styled(
+                "Exact approval receipt:",
+                Style::default().fg(theme.text.secondary),
+            ));
+            // Never truncate the receipt: the exact daemon-issued value is the
+            // capability the approval/rejection command consumes.
+            lines.push(Line::from(receipt.clone()));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        detail_inner,
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "  ↑/↓ select · s smoke-test · t enable session · u enable user",
+                Style::default().fg(theme.text.muted),
+            ),
+            Line::styled(
+                "  a approve exact receipt · r reject · x revoke · Esc close",
+                Style::default().fg(theme.focus.active),
+            ),
+        ]),
+        rows[1],
+    );
 }
 
 /// The Skill Studio browser (STEP 2.6): a scrollable list of registered items on

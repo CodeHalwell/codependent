@@ -9,25 +9,12 @@
  * attach-resume, so nothing here is authoritative.
  */
 import { randomBytes } from "node:crypto";
-
-/** Messages posted from the extension host into the webview. */
-export type TranscriptMessage =
-  | { kind: "status"; status: string }
-  | { kind: "event"; sequence: number; label: string; detail: string }
-  | { kind: "runState"; runId: string; state: string }
-  | { kind: "approval"; approvalId: string; summary: string; risk: string }
-  | { kind: "approvalResolved"; approvalId: string; decision: string }
-  | { kind: "clear" };
-
-/** Messages posted from the webview back to the extension host. */
-export type WebviewCommandMessage =
-  | { kind: "approve"; approvalId: string }
-  | { kind: "reject"; approvalId: string }
-  | { kind: "startRun"; objective: string };
+export type { TranscriptMessage, WebviewCommandMessage } from "./messages.js";
 
 export interface PanelHtmlOptions {
   nonce: string;
   cspSource: string;
+  scriptUri?: string;
 }
 
 /**
@@ -35,11 +22,14 @@ export interface PanelHtmlOptions {
  * script and styles from `cspSource`; there are no external resources.
  */
 export function renderPanelHtml(options: PanelHtmlOptions): string {
-  const { nonce, cspSource } = options;
+  const { nonce, cspSource, scriptUri } = options;
   const csp = [
     "default-src 'none'",
-    `style-src ${cspSource} 'unsafe-inline'`,
-    `script-src 'nonce-${nonce}'`,
+    `style-src ${cspSource} 'nonce-${nonce}'`,
+    `script-src ${cspSource} 'nonce-${nonce}'`,
+    `img-src ${cspSource} data: blob:`,
+    `media-src ${cspSource} data: blob:`,
+    "font-src data:",
   ].join("; ");
 
   return `<!DOCTYPE html>
@@ -49,7 +39,7 @@ export function renderPanelHtml(options: PanelHtmlOptions): string {
 <meta http-equiv="Content-Security-Policy" content="${csp}" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Codypendent Session</title>
-<style>
+<style nonce="${nonce}">
   :root { color-scheme: light dark; }
   body {
     font-family: var(--vscode-font-family, sans-serif);
@@ -74,12 +64,67 @@ export function renderPanelHtml(options: PanelHtmlOptions): string {
   button {
     font-family: inherit; font-size: 12px; border: none; border-radius: 3px;
     padding: 3px 10px; cursor: pointer;
-    color: var(--vscode-button-foreground); background: var(--vscode-button-background);
+    color: var(--cody-ui-color-accentforeground, var(--vscode-button-foreground));
+    background: var(--cody-ui-color-accent, var(--vscode-button-background));
   }
   button.reject { background: var(--vscode-button-secondaryBackground);
     color: var(--vscode-button-secondaryForeground); }
   button:hover { background: var(--vscode-button-hoverBackground); }
   .resolved { opacity: 0.6; font-size: 11px; }
+  #remote-ui { display: contents; }
+  .remote-ui-root { display: flex; flex-direction: column; gap: var(--cody-ui-spacing-md, .5rem); margin-bottom: .75rem;
+    color: var(--cody-ui-color-foreground, var(--vscode-foreground));
+    background: var(--cody-ui-color-background, transparent); }
+  .ui-contribution-group, .ui-document { display: flex; flex-direction: column; gap: .5rem; }
+  .ui-extension-chrome { display: flex; align-items: center; justify-content: space-between; gap: .75rem;
+    padding: .25rem .5rem; border: 1px solid var(--vscode-panel-border); border-radius: 4px;
+    color: var(--vscode-descriptionForeground); background: var(--vscode-sideBar-background); font-size: 11px; }
+  .ui-extension-chrome strong { color: var(--vscode-foreground); font-family: var(--vscode-editor-font-family); }
+  [data-ui-node-id] { min-width: 0; }
+  .ui-layout { box-sizing: border-box; min-width: 0; }
+  .ui-bordered, .ui-domain-card, .ui-feedback { border: 1px solid var(--cody-ui-color-border, var(--vscode-panel-border)); border-radius: 4px; padding: var(--cody-ui-spacing-md, .5rem); }
+  .ui-split { min-width: 0; min-height: 0; }
+  .ui-muted { color: var(--vscode-descriptionForeground); }
+  .ui-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .ui-markdown p { margin: .35rem 0; }
+  .ui-markdown h1, .ui-markdown h2, .ui-markdown h3, .ui-markdown h4 { margin: .7rem 0 .35rem; }
+  .ui-markdown-bullet { padding-inline-start: 1rem; }
+  .ui-code, .ui-diff pre, .ui-terminal-preview pre { overflow: auto; margin: .25rem 0; padding: .5rem; background: var(--vscode-textCodeBlock-background); }
+  .ui-diff span { display: block; min-height: 1em; }
+  .diff-add { color: var(--vscode-gitDecoration-addedResourceForeground); background: color-mix(in srgb, var(--vscode-gitDecoration-addedResourceForeground) 12%, transparent); }
+  .diff-remove { color: var(--vscode-gitDecoration-deletedResourceForeground); background: color-mix(in srgb, var(--vscode-gitDecoration-deletedResourceForeground) 12%, transparent); }
+  .ui-image { display: block; max-width: 100%; max-height: 32rem; object-fit: contain; }
+  .ui-media-fallback, .ui-unsupported { border: 1px dashed var(--vscode-panel-border); padding: .5rem; }
+  .ui-list { margin: .25rem 0; padding-inline-start: 1.5rem; }
+  .ui-table-scroll { max-width: 100%; overflow: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { border-bottom: 1px solid var(--vscode-panel-border); padding: .3rem .4rem; text-align: start; vertical-align: top; }
+  .ui-key-value, .ui-json dl { display: grid; grid-template-columns: minmax(6rem, max-content) 1fr; gap: .2rem .5rem; }
+  .ui-key-value dt, .ui-json dt { font-weight: 600; }
+  .ui-key-value dd, .ui-json dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+  .ui-tree [role=group] { padding-inline-start: 1rem; border-inline-start: 1px solid var(--vscode-tree-indentGuidesStroke); }
+  .ui-chart svg { width: 100%; height: 5rem; color: var(--vscode-charts-blue); stroke: currentColor; }
+  .ui-badge { display: inline-flex; border-radius: 999px; padding: .1rem .45rem; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
+  .ui-progress { display: grid; gap: .2rem; }
+  .ui-progress progress { width: 100%; }
+  .ui-spinner { display: inline-block; animation: ui-spin 1s linear infinite; }
+  .ui-navigation, .ui-tabs [role=tablist], .ui-pagination, .ui-domain-card > header { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; }
+  .ui-tabs [aria-selected=true] { outline: 1px solid var(--cody-ui-color-focus, var(--vscode-focusBorder)); }
+  .ui-form { display: flex; flex-direction: column; gap: .5rem; }
+  .ui-field { display: grid; gap: .2rem; }
+  .ui-field input, .ui-field textarea, .ui-field select { box-sizing: border-box; width: 100%; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, transparent); padding: .35rem .45rem; font: inherit; }
+  .ui-field input:focus, .ui-field textarea:focus, .ui-field select:focus { outline: 1px solid var(--vscode-focusBorder); }
+  .ui-choice { display: flex; gap: .4rem; align-items: center; }
+  .ui-link-button { color: var(--vscode-textLink-foreground); background: none; padding: 0; }
+  .ui-domain-card > header { justify-content: space-between; }
+  .ui-host-error { display: grid; gap: .2rem; border: 1px solid var(--vscode-inputValidation-errorBorder); padding: .5rem; }
+  .tone-positive { color: var(--cody-ui-color-positive, var(--vscode-testing-iconPassed)); }
+  .tone-warning { color: var(--cody-ui-color-warning, var(--vscode-editorWarning-foreground)); }
+  .tone-critical { color: var(--cody-ui-color-critical, var(--vscode-errorForeground)); }
+  .tone-info { color: var(--cody-ui-color-info, var(--vscode-textLink-foreground)); }
+  @keyframes ui-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .ui-spinner { animation: none; } }
+  @media (forced-colors: active) { .ui-bordered, .ui-domain-card, .ui-feedback { border-color: CanvasText; } }
 </style>
 </head>
 <body>
@@ -88,6 +133,7 @@ export function renderPanelHtml(options: PanelHtmlOptions): string {
   <span class="run-state" id="run-state"></span>
 </header>
 <div id="approvals"></div>
+<div id="remote-ui"></div>
 <div id="transcript"></div>
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
@@ -181,6 +227,7 @@ export function renderPanelHtml(options: PanelHtmlOptions): string {
     }
   });
 </script>
+${scriptUri === undefined ? "" : `<script nonce="${nonce}" src="${scriptUri}"></script>`}
 </body>
 </html>`;
 }
