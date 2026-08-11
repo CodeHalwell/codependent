@@ -7,7 +7,10 @@ publisher = "codypendent-project"
 
 # UI-only packages use `kind = "ui-component"`, declare `[ui]`, and omit both
 # `[runtime]` and top-level `[capabilities]`; their code runs only in the governed
-# UI worker. Data-only themes use `kind = "theme-pack"` and must omit all three.
+# UI worker. A `native-process` may include `[ui]`, but its UI worker is launched
+# under the UI declaration's independently narrowed authority and never inherits
+# native filesystem/network/secret/subprocess grants. Data-only themes use
+# `kind = "theme-pack"` and must omit all three.
 
 scopes = ["user", "organization", "repository"]
 

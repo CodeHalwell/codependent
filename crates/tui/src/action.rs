@@ -56,6 +56,14 @@ pub enum Action {
     RemoteUiMessage(Box<UiWireMessage>),
     /// Enter or leave keyboard focus for the mounted Remote UI surface.
     RemoteUiSetActive(bool),
+    /// Move host focus to the next mounted Remote UI document without invoking
+    /// any extension action. `Shift-F6` uses this path so every mounted
+    /// document remains keyboard-reachable.
+    RemoteUiNextDocument,
+    /// Focus one mounted Remote UI document without activating a component.
+    /// Registered beneath component hit regions so clicking chrome or inert
+    /// content moves focus, while clicking an actual control still invokes it.
+    RemoteUiFocusDocument(UiDocumentId),
     /// A key interpreted by the focused semantic component.
     RemoteUiKey {
         key: RemoteKey,

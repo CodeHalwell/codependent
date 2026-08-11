@@ -26,7 +26,7 @@
 //! input into the async loop.
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,17 +46,19 @@ use codypendent_protocol::{
     SessionEvent, SessionId, Subscription, WorkspaceId,
 };
 use codypendent_tui::{
-    map_event, reduce, render, render_splash, terminal_capabilities_message, Action, AppState,
-    BlackboardItemCard, ColorDepth, DocBlockView, DocCard, DocSuggestionView, GraphEdgeCard,
-    Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard, ModelLocationLabel, ModelReadiness,
-    ProjectionKind, ProviderCard, SkillCard, TerminalGuard, Theme, WorkflowNodeCard,
-    WorkflowNodeUpdate, EDGE_PAGE_SIZE,
+    accessible_snapshot, accessible_terminal_capabilities_message, map_accessible_input, map_event,
+    reduce, render, render_splash, sanitize_accessible_text, terminal_capabilities_message, Action,
+    AppState, BlackboardItemCard, ColorDepth, DocBlockView, DocCard, DocSuggestionView,
+    GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard, ModelLocationLabel,
+    ModelReadiness, ProjectionKind, ProviderCard, SkillCard, TerminalGuard, Theme,
+    WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, watch};
+use tokio::{io::AsyncBufReadExt, task::JoinHandle};
 
 use crate::commands;
 use crate::connection::Connection;
@@ -74,6 +76,11 @@ const SPLASH_TICK: Duration = Duration::from_millis(80);
 /// boot faster than the first [`SPLASH_TICK`] never shows it at all, but a
 /// shown splash never flashes away instantly.
 const SPLASH_MIN_HOLD: Duration = Duration::from_millis(600);
+
+/// Full linear snapshots intentionally run slower than graphical frames.
+/// Streaming token events would otherwise replay the whole document fast
+/// enough to overwhelm a screen reader or redirected output.
+const ACCESSIBLE_REFRESH: Duration = Duration::from_secs(1);
 
 /// The most live events [`GapTracker`] will buffer while a gap repair is in
 /// flight before giving up on the incremental replay and re-attaching for a
@@ -227,6 +234,7 @@ pub async fn run(
     paths: &RuntimePaths,
     repo: PathBuf,
     theme_override: Option<String>,
+    accessible: bool,
 ) -> anyhow::Result<()> {
     // Crash logger, installed FIRST — before repo validation, the terminal
     // guard, and the daemon connection — so a panic anywhere in this
@@ -240,6 +248,10 @@ pub async fn run(
         .with_context(|| format!("{}: not a valid, accessible directory", repo.display()))?;
     if !repo.is_dir() {
         bail!("{}: not a directory", repo.display());
+    }
+
+    if accessible {
+        return run_accessible(paths, repo).await;
     }
 
     // STEP 6.6 wiring: terminal color-depth detection (NO_COLOR/COLORTERM/TERM)
@@ -332,7 +344,7 @@ pub async fn run(
         mut live,
     } = booted;
 
-    let (input_tx, mut input_rx) = mpsc::channel::<CrosstermEvent>(256);
+    let (input_tx, mut input_rx) = mpsc::channel::<ClientInput>(256);
     let input_running = Arc::new(AtomicBool::new(true));
     spawn_input_thread(input_tx, Arc::clone(&input_running));
 
@@ -342,9 +354,93 @@ pub async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let repository = repo.to_string_lossy().into_owned();
+    let result = {
+        let mut presentation = InteractivePresentation {
+            guard: &mut guard,
+            theme: &theme,
+        };
+        event_loop(
+            &mut presentation,
+            &mut state,
+            &mut width,
+            &mut live,
+            &mut input_rx,
+            &mut ticker,
+            session_id,
+            workspace_id,
+            &repository,
+            attach_watermark,
+            docs_pool.clone(),
+            &mut store,
+            paths,
+        )
+        .await
+    };
+
+    // Teardown: stop the input thread, restore the terminal *before* any trailing
+    // error text reaches the (now cooked) screen, then wind down the socket tasks.
+    input_running.store(false, Ordering::Relaxed);
+    drop(guard);
+    live.shutdown();
+    if let Some(pool) = docs_pool {
+        pool.close().await;
+    }
+    result
+}
+
+/// Run the full client over ordinary cooked stdin/stdout. Unlike the Ratatui
+/// path this never constructs [`TerminalGuard`], so it cannot emit alternate
+/// screen, raw-mode, mouse-capture, or bracketed-paste control sequences.
+async fn run_accessible(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
+    let mut stdout = io::stdout();
+    writeln!(stdout, "Codypendent accessible mode")?;
+    writeln!(stdout, "Starting daemon and restoring the session.")?;
+    stdout.flush()?;
+
+    let mut state = AppState::new();
+    let mut store = SessionStore::load(paths);
+    let (stage_tx, mut stage_rx) = watch::channel(SplashStage::StartingDaemon);
+    let boot_warnings: BootWarnings = BootWarnings::default();
+    let booted = {
+        let boot = boot_phase(
+            paths,
+            &repo,
+            &mut state,
+            &mut store,
+            &stage_tx,
+            &boot_warnings,
+        );
+        tokio::pin!(boot);
+        loop {
+            tokio::select! {
+                outcome = &mut boot => break outcome?,
+                changed = stage_rx.changed() => {
+                    if changed.is_ok() {
+                        writeln!(stdout, "Boot: {}", ascii_stage(&stage_rx.borrow().text()))?;
+                        stdout.flush()?;
+                    }
+                }
+            }
+        }
+    };
+    drain_boot_warnings(&mut state, &boot_warnings);
+    let Booted {
+        session_id,
+        workspace_id,
+        attach_watermark,
+        docs_pool,
+        mut live,
+    } = booted;
+
+    let (input_tx, mut input_rx) = mpsc::channel::<ClientInput>(256);
+    let input_task = spawn_accessible_input(input_tx);
+    let (mut width, _) = accessible_viewport();
+    let mut ticker = tokio::time::interval(TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let repository = repo.to_string_lossy().into_owned();
+    let mut presentation = AccessiblePresentation::new(stdout);
     let result = event_loop(
-        &mut guard,
-        &theme,
+        &mut presentation,
         &mut state,
         &mut width,
         &mut live,
@@ -360,15 +456,147 @@ pub async fn run(
     )
     .await;
 
-    // Teardown: stop the input thread, restore the terminal *before* any trailing
-    // error text reaches the (now cooked) screen, then wind down the socket tasks.
-    input_running.store(false, Ordering::Relaxed);
-    drop(guard);
+    input_task.abort();
     live.shutdown();
     if let Some(pool) = docs_pool {
         pool.close().await;
     }
     result
+}
+
+fn ascii_stage(stage: &str) -> String {
+    sanitize_accessible_text(stage)
+        .replace('…', "...")
+        .replace('·', "-")
+}
+
+fn accessible_viewport() -> (u16, u16) {
+    let parse = |name: &str, fallback: u16| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(fallback)
+    };
+    (parse("COLUMNS", 80), parse("LINES", 24))
+}
+
+/// Input from either presentation. Keeping cooked lines distinct from
+/// crossterm events means accessible mode never has to synthesize key events
+/// (or initialize crossterm at all).
+enum ClientInput {
+    Terminal(CrosstermEvent),
+    AccessibleLine(String),
+}
+
+/// The terminal-specific edge of the otherwise shared client loop.
+trait Presentation {
+    fn viewport(&self) -> (u16, u16);
+    fn capabilities_message(&self) -> codypendent_protocol::UiWireMessage;
+    fn draw(&mut self, state: &AppState, force_prompt: bool) -> io::Result<()>;
+    fn wants_periodic_draw(&self) -> bool {
+        false
+    }
+}
+
+struct InteractivePresentation<'a> {
+    guard: &'a mut TerminalGuard,
+    theme: &'a Theme,
+}
+
+impl Presentation for InteractivePresentation<'_> {
+    fn viewport(&self) -> (u16, u16) {
+        crossterm::terminal::size().unwrap_or((80, 24))
+    }
+
+    fn capabilities_message(&self) -> codypendent_protocol::UiWireMessage {
+        let (width, height) = self.viewport();
+        let depth = match ColorDepth::detect() {
+            ColorDepth::TrueColor => 24,
+            ColorDepth::Ansi256 => 8,
+            ColorDepth::Ansi16 => 4,
+            ColorDepth::Monochrome => 1,
+        };
+        terminal_capabilities_message(width, height, depth)
+    }
+
+    fn draw(&mut self, state: &AppState, _force_prompt: bool) -> io::Result<()> {
+        self.guard
+            .terminal_mut()
+            .draw(|frame| render(frame, state, self.theme))
+            .map(|_| ())
+    }
+}
+
+/// A stable, append-only cooked presentation. A state transition prints one
+/// complete linear snapshot, so redirected output and screen readers receive
+/// the same ordering and never need cursor-addressing escape sequences.
+struct AccessiblePresentation<W: Write> {
+    output: W,
+    last_snapshot: Option<String>,
+    last_emitted_at: Option<Instant>,
+}
+
+impl<W: Write> AccessiblePresentation<W> {
+    fn new(output: W) -> Self {
+        Self {
+            output,
+            last_snapshot: None,
+            last_emitted_at: None,
+        }
+    }
+}
+
+impl<W: Write> Presentation for AccessiblePresentation<W> {
+    fn viewport(&self) -> (u16, u16) {
+        accessible_viewport()
+    }
+
+    fn capabilities_message(&self) -> codypendent_protocol::UiWireMessage {
+        let (width, height) = self.viewport();
+        accessible_terminal_capabilities_message(width, height)
+    }
+
+    fn draw(&mut self, state: &AppState, force_prompt: bool) -> io::Result<()> {
+        let snapshot = accessible_snapshot(state);
+        if self.last_snapshot.as_deref() == Some(snapshot.as_str()) {
+            if force_prompt {
+                writeln!(self.output)?;
+                write!(self.output, "command> ")?;
+                self.output.flush()?;
+            }
+            return Ok(());
+        }
+        if !force_prompt
+            && self
+                .last_emitted_at
+                .is_some_and(|emitted| emitted.elapsed() < ACCESSIBLE_REFRESH)
+        {
+            return Ok(());
+        }
+        writeln!(self.output, "\n--- accessible update ---")?;
+        writeln!(self.output, "{snapshot}")?;
+        write!(self.output, "command> ")?;
+        self.output.flush()?;
+        self.last_snapshot = Some(snapshot);
+        self.last_emitted_at = Some(Instant::now());
+        Ok(())
+    }
+
+    fn wants_periodic_draw(&self) -> bool {
+        true
+    }
+}
+
+fn spawn_accessible_input(tx: mpsc::Sender<ClientInput>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if tx.send(ClientInput::AccessibleLine(line)).await.is_err() {
+                break;
+            }
+        }
+    })
 }
 
 /// The boot stages the D2 splash narrates, published by [`boot_phase`] over a
@@ -865,13 +1093,12 @@ async fn send_reattach(
 /// The render/reduce/dispatch loop. Broken out from [`run`] so the setup and
 /// teardown read linearly and the borrow of every loop input is explicit.
 #[allow(clippy::too_many_arguments)]
-async fn event_loop(
-    guard: &mut TerminalGuard,
-    theme: &Theme,
+async fn event_loop<P: Presentation>(
+    presentation: &mut P,
     state: &mut AppState,
     width: &mut u16,
     live: &mut LiveIo,
-    input_rx: &mut mpsc::Receiver<CrosstermEvent>,
+    input_rx: &mut mpsc::Receiver<ClientInput>,
     ticker: &mut tokio::time::Interval,
     mut session_id: SessionId,
     workspace_id: WorkspaceId,
@@ -883,14 +1110,7 @@ async fn event_loop(
     store: &mut SessionStore,
     paths: &RuntimePaths,
 ) -> anyhow::Result<()> {
-    let (_, terminal_height) = crossterm::terminal::size().unwrap_or((*width, 24));
-    let depth = match ColorDepth::detect() {
-        ColorDepth::TrueColor => 24,
-        ColorDepth::Ansi256 => 8,
-        ColorDepth::Ansi16 => 4,
-        ColorDepth::Monochrome => 1,
-    };
-    let capabilities = terminal_capabilities_message(*width, terminal_height, depth);
+    let capabilities = presentation.capabilities_message();
     if live
         .out_tx
         .send(remote_ui_envelope(live.client_id, session_id, capabilities))
@@ -899,9 +1119,7 @@ async fn event_loop(
     {
         return Ok(());
     }
-    guard
-        .terminal_mut()
-        .draw(|frame| render(frame, state, theme))?;
+    presentation.draw(state, false)?;
 
     // Tracks live-fan-out sequence continuity and drives gap repair. Live
     // fan-out is lossy for a slow client (the daemon skips `Lagged` spans), so a
@@ -932,8 +1150,8 @@ async fn event_loop(
         // folds it just after.
         let mut pending_sync: Option<Box<DocumentSync>> = None;
         let mut started_workflow: Option<String> = None;
-        let action = tokio::select! {
-            signal = live.event_rx.recv() => match signal {
+        let selected = tokio::select! {
+            signal = live.event_rx.recv() => PendingActions::One(match signal {
                 Some(ReaderSignal::Event(event)) => {
                     match tracker.on_event(*event, Instant::now()) {
                         GapAction::Ignore => Action::NoOp,
@@ -1039,18 +1257,26 @@ async fn event_loop(
                 // The daemon closed the stream (shutdown / dropped client). The
                 // run is unaffected; we simply leave the TUI.
                 Some(ReaderSignal::Closed) | None => return Ok(()),
-            },
+            }),
             input = input_rx.recv() => match input {
                 // Track width for mouse-column → pane mapping; the draw below
                 // re-reads the real size, so a resize just needs a redraw.
-                Some(CrosstermEvent::Resize(w, h)) => {
+                Some(ClientInput::Terminal(CrosstermEvent::Resize(w, h))) => {
                     *width = w;
-                    Action::RemoteUiViewport { width: w, height: h }
+                    PendingActions::One(Action::RemoteUiViewport { width: w, height: h })
                 }
-                Some(event) => map_event(&event, state.input_mode(), *width, &state.hit_map.borrow()),
+                Some(ClientInput::Terminal(event)) => PendingActions::One(map_event(
+                    &event,
+                    state.input_mode(),
+                    *width,
+                    &state.hit_map.borrow(),
+                )),
+                Some(ClientInput::AccessibleLine(line)) => {
+                    PendingActions::Many(map_accessible_input(&line, state.input_mode()))
+                }
                 None => return Ok(()), // input bridge ended
             },
-            _ = ticker.tick() => {
+            _ = ticker.tick() => PendingActions::One({
                 // FP-2b: a repair whose catch-up reply never arrived (the
                 // daemon's fan-out drops spans under lag) must not wedge the
                 // client in `repairing` forever — once the deadline passes,
@@ -1066,9 +1292,14 @@ async fn event_loop(
                     .await;
                 }
                 Action::Tick
-            }
+            })
         };
-        let tick_action = matches!(&action, Action::Tick);
+        let force_prompt = matches!(&selected, PendingActions::Many(_));
+        let actions = match selected {
+            PendingActions::One(action) => vec![action],
+            PendingActions::Many(actions) => actions,
+        };
+        let tick_action = actions.len() == 1 && matches!(&actions[0], Action::Tick);
         let notice_before = state.notice.clone();
 
         // Fold a merged document sync (its async merge could not run in the arm).
@@ -1080,12 +1311,17 @@ async fn event_loop(
             }
         }
 
-        reduce(state, action);
+        for action in actions {
+            reduce(state, action);
+        }
         // The steady shell has no frame-based animation. Wakeups still drive
         // repair and reducer time, but only notice expiry and the periodic
         // projection refresh need a new frame; input and daemon events redraw
         // immediately through the non-tick path.
-        let redraw = !tick_action || state.notice != notice_before || state.tick.is_multiple_of(25);
+        let redraw = !tick_action
+            || state.notice != notice_before
+            || state.tick.is_multiple_of(25)
+            || presentation.wants_periodic_draw();
 
         // `StartWorkflow` replies with the new run id after the durable rows are
         // committed. Reload once so the manifest cards bind to that exact run,
@@ -1236,10 +1472,7 @@ async fn event_loop(
                         let old_live = std::mem::replace(live, fresh.live);
                         old_live.shutdown();
                         session_id = fresh.session_id;
-                        let (_, terminal_height) =
-                            crossterm::terminal::size().unwrap_or((*width, 24));
-                        let capabilities =
-                            terminal_capabilities_message(*width, terminal_height, depth);
+                        let capabilities = presentation.capabilities_message();
                         let _ = live
                             .out_tx
                             .send(remote_ui_envelope(live.client_id, session_id, capabilities))
@@ -1515,11 +1748,14 @@ async fn event_loop(
         }
 
         if redraw {
-            guard
-                .terminal_mut()
-                .draw(|frame| render(frame, state, theme))?;
+            presentation.draw(state, force_prompt)?;
         }
     }
+}
+
+enum PendingActions {
+    One(Action),
+    Many(Vec<Action>),
 }
 
 /// What the reader task forwards to the loop.
@@ -1861,13 +2097,13 @@ async fn write_loop(mut write_half: OwnedWriteHalf, mut out_rx: mpsc::Receiver<E
 /// Bridge blocking `crossterm` input into the async loop on a dedicated OS
 /// thread. Polls with a short timeout so it observes `running` going false
 /// promptly; sends each event over `tx` until the loop drops the receiver.
-fn spawn_input_thread(tx: mpsc::Sender<CrosstermEvent>, running: Arc<AtomicBool>) {
+fn spawn_input_thread(tx: mpsc::Sender<ClientInput>, running: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         while running.load(Ordering::Relaxed) {
             match crossterm::event::poll(Duration::from_millis(100)) {
                 Ok(true) => match crossterm::event::read() {
                     Ok(event) => {
-                        if tx.blocking_send(event).is_err() {
+                        if tx.blocking_send(ClientInput::Terminal(event)).is_err() {
                             break; // loop ended
                         }
                     }
@@ -4129,6 +4365,48 @@ mod tests {
     use codypendent_protocol::{
         AgentMode, ApprovalDecision, ApprovalId, ApprovalScope, ModelId, RunId,
     };
+
+    #[test]
+    fn accessible_presentation_is_stable_and_emits_no_terminal_escapes() {
+        let mut state = AppState::new();
+        reduce(
+            &mut state,
+            Action::Notice("ready \u{1b}[31m safely".to_owned()),
+        );
+        let mut presentation = AccessiblePresentation::new(Vec::<u8>::new());
+        presentation
+            .draw(&state, false)
+            .expect("first cooked snapshot");
+        let first_len = presentation.output.len();
+        presentation
+            .draw(&state, false)
+            .expect("unchanged state is not repeated");
+        assert_eq!(presentation.output.len(), first_len);
+
+        let output = String::from_utf8(presentation.output).expect("UTF-8 output");
+        assert!(output.contains("--- accessible update ---"));
+        assert!(output.contains("Notice: ready  safely"));
+        assert!(!output.as_bytes().contains(&0x1b));
+        assert!(
+            !output.contains("[?1049h"),
+            "must not enter alternate screen"
+        );
+        assert!(!output.contains("[?1000h"), "must not enable mouse capture");
+    }
+
+    #[test]
+    fn accessible_script_maps_lines_without_synthetic_terminal_events() {
+        let mut state = AppState::new();
+        for line in ["type hello", "enter"] {
+            for action in map_accessible_input(line, state.input_mode()) {
+                reduce(&mut state, action);
+            }
+        }
+        assert!(state.composer.is_empty());
+        assert!(state.drain_outbox().iter().any(
+            |intent| matches!(intent, Intent::StartRun { objective, .. } if objective == "hello")
+        ));
+    }
 
     #[tokio::test]
     async fn graph_loader_pages_and_filters_without_materializing_the_full_graph() {

@@ -135,6 +135,13 @@ Image ingestion preserves source image plus extracted/OCR interpretation.
 Real event model includes key, mouse, paste, resize, backend, IDE, voice, and tick events.
 All mouse actions must have keyboard equivalents.
 
+Run `codypendent` for the full TUI. Press `F6` to enter mounted extension UI,
+`Shift-F6` to move to the next extension document, and `Esc` to return. For a
+cooked, line-oriented screen-reader or plain-terminal client with no alternate
+screen or mouse escapes, run `codypendent --accessible` (alias: `--plain`). See
+the [CLI & TUI user guide](docs/cli-and-tui-user-guide.md)
+for line commands and the complete key reference.
+
 ## Themes
 
 Use semantic tokens (surface/text/status/syntax/diff/agent/focus/selection) rather than hard-coded widget colors.

@@ -46,12 +46,12 @@ export function applyThemeTokens(element: HTMLElement, theme: ThemeTokens): void
   element.dataset.uiColorScheme = theme.mode;
   for (const [name, value] of Object.entries(theme.colors)) {
     if (SAFE_TOKEN.test(name) && SAFE_COLOR.test(value)) {
-      element.style.setProperty(cssTokenName(`color-${name}`), value);
+      element.style.setProperty(cssTokenName(name), value);
     }
   }
   for (const [name, value] of Object.entries(theme.spacing)) {
     if (SAFE_TOKEN.test(name) && Number.isFinite(value) && value >= 0 && value <= 256) {
-      element.style.setProperty(cssTokenName(`space-${name}`), `${value}px`);
+      element.style.setProperty(cssTokenName(`spacing.${name}`), `${value}px`);
     }
   }
 }

@@ -142,6 +142,11 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         description: "search graph edges · previous/next result page",
         mouse: None,
     },
+    KeyBinding {
+        keys: "F6 / Shift-F6 / Esc",
+        description: "enter Remote UI · next extension document · return to composer",
+        mouse: Some("click extension chrome"),
+    },
 ];
 
 /// One footer chip: a compact display label paired with the real `KEY_BINDINGS`
@@ -264,6 +269,10 @@ fn map_remote_ui_key(key: &KeyEvent) -> Action {
     }
     let (key, character) = match key.code {
         KeyCode::Esc => return Action::RemoteUiSetActive(false),
+        KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            return Action::RemoteUiNextDocument;
+        }
+        KeyCode::F(6) => return Action::RemoteUiSetActive(true),
         KeyCode::Tab => (RemoteKey::Tab, None),
         KeyCode::BackTab => (RemoteKey::ShiftTab, None),
         KeyCode::Enter => (RemoteKey::Enter, None),
@@ -396,6 +405,9 @@ fn map_composer_key(key: &KeyEvent) -> Action {
         KeyCode::Up => Action::HistoryPrev,
         KeyCode::Down => Action::HistoryNext,
         KeyCode::F(2) => Action::ToggleLayout,
+        KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            Action::RemoteUiNextDocument
+        }
         KeyCode::F(6) => Action::RemoteUiSetActive(true),
         KeyCode::Char('c') if ctrl(key) => Action::Detach,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
@@ -744,6 +756,26 @@ mod tests {
         assert_eq!(
             map_event(&key(KeyCode::F(2)), InputMode::Composer, W, &[]),
             Action::ToggleLayout
+        );
+    }
+
+    #[test]
+    fn remote_ui_focus_contract_is_reachable_from_composer_and_component() {
+        let f6 = key(KeyCode::F(6));
+        let shift_f6 = Event::Key(KeyEvent::new(KeyCode::F(6), KeyModifiers::SHIFT));
+        for mode in [InputMode::Composer, InputMode::RemoteUi] {
+            assert_eq!(
+                map_event(&f6, mode, W, &[]),
+                Action::RemoteUiSetActive(true)
+            );
+            assert_eq!(
+                map_event(&shift_f6, mode, W, &[]),
+                Action::RemoteUiNextDocument
+            );
+        }
+        assert_eq!(
+            map_event(&key(KeyCode::Esc), InputMode::RemoteUi, W, &[]),
+            Action::RemoteUiSetActive(false)
         );
     }
 

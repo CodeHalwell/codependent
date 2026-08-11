@@ -63,26 +63,53 @@ export function renderPanelHtml(options: PanelHtmlOptions): string {
   .approval .actions { display: flex; gap: 6px; margin-top: 6px; }
   button {
     font-family: inherit; font-size: 12px; border: none; border-radius: 3px;
-    padding: 3px 10px; cursor: pointer;
-    color: var(--cody-ui-color-accentforeground, var(--vscode-button-foreground));
-    background: var(--cody-ui-color-accent, var(--vscode-button-background));
+    padding: 3px 10px; cursor: pointer; touch-action: manipulation;
+    color: var(--cody-ui-text-on-accent, var(--cody-ui-color-accentforeground, var(--vscode-button-foreground)));
+    background: var(--cody-ui-action-primary, var(--cody-ui-color-accent, var(--vscode-button-background)));
   }
   button.reject { background: var(--vscode-button-secondaryBackground);
     color: var(--vscode-button-secondaryForeground); }
   button:hover { background: var(--vscode-button-hoverBackground); }
+  button:focus-visible, a:focus-visible, summary:focus-visible, [tabindex]:focus-visible {
+    outline: 2px solid var(--cody-ui-focus-active, var(--cody-ui-color-focus, var(--vscode-focusBorder))); outline-offset: 2px;
+  }
+  button:disabled { cursor: not-allowed; opacity: .55; }
   .resolved { opacity: 0.6; font-size: 11px; }
   #remote-ui { display: contents; }
-  .remote-ui-root { display: flex; flex-direction: column; gap: var(--cody-ui-spacing-md, .5rem); margin-bottom: .75rem;
-    color: var(--cody-ui-color-foreground, var(--vscode-foreground));
-    background: var(--cody-ui-color-background, transparent); }
+  .remote-ui-root { display: flex; flex-direction: column; gap: var(--cody-ui-spacing-md, .5rem); margin-bottom: .75rem; min-width: 0;
+    color: var(--cody-ui-text-primary, var(--cody-ui-color-foreground, var(--vscode-foreground)));
+    background: var(--cody-ui-surface-background, var(--cody-ui-color-background, transparent)); }
+  .ui-host-shell { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-areas:
+    "navigation" "sidebar" "primary" "transcript" "composer" "setup" "status"; gap: .625rem; min-width: 0; }
+  .ui-host-region { display: grid; gap: .5rem; min-width: 0; }
+  .ui-host-region-sidebar { grid-area: sidebar; }
+  .ui-host-region-navigation { grid-area: navigation; }
+  .ui-host-region-primary { grid-area: primary; }
+  .ui-host-region-transcript { grid-area: transcript; }
+  .ui-host-region-composer { grid-area: composer; position: sticky; bottom: 0; z-index: 4;
+    background: var(--cody-ui-surface-background, var(--cody-ui-color-background, var(--vscode-sideBar-background))); }
+  .ui-host-region-setup { grid-area: setup; }
+  .ui-host-region-status { grid-area: status; position: sticky; bottom: 0; z-index: 3; }
+  .ui-host-region-overlay { position: fixed; inset: 2.5rem .5rem .5rem; z-index: 100; pointer-events: none;
+    display: grid; align-content: start; justify-items: stretch; gap: .5rem; }
+  .ui-host-region-overlay > .ui-contribution-group { pointer-events: auto; max-height: min(70vh, 40rem); overflow: auto;
+    overscroll-behavior: contain;
+    grid-area: 1 / 1;
+    border: 1px solid var(--cody-ui-surface-border, var(--cody-ui-color-border, var(--vscode-panel-border))); border-radius: 6px; padding: .625rem;
+    background: var(--cody-ui-surface-overlay, var(--cody-ui-surface-background, var(--cody-ui-color-background, var(--vscode-editorWidget-background))));
+    box-shadow: 0 8px 28px var(--vscode-widget-shadow); }
+  .ui-host-region-overlay > .ui-contribution-group[inert] { visibility: hidden; pointer-events: none; }
+  .ui-host-region-overlay > .ui-slot-notification { justify-self: end; align-self: start; width: min(24rem, calc(100vw - 1rem)); z-index: 3; }
+  .ui-host-region-overlay > .ui-contribution-group:not([inert]):not(.ui-slot-notification) { z-index: 2; }
   .ui-contribution-group, .ui-document { display: flex; flex-direction: column; gap: .5rem; }
+  .ui-contribution-group { min-width: 0; overflow-wrap: anywhere; }
   .ui-extension-chrome { display: flex; align-items: center; justify-content: space-between; gap: .75rem;
     padding: .25rem .5rem; border: 1px solid var(--vscode-panel-border); border-radius: 4px;
     color: var(--vscode-descriptionForeground); background: var(--vscode-sideBar-background); font-size: 11px; }
   .ui-extension-chrome strong { color: var(--vscode-foreground); font-family: var(--vscode-editor-font-family); }
-  [data-ui-node-id] { min-width: 0; }
+  [data-ui-node-id] { min-width: 0; overflow-wrap: anywhere; }
   .ui-layout { box-sizing: border-box; min-width: 0; }
-  .ui-bordered, .ui-domain-card, .ui-feedback { border: 1px solid var(--cody-ui-color-border, var(--vscode-panel-border)); border-radius: 4px; padding: var(--cody-ui-spacing-md, .5rem); }
+  .ui-bordered, .ui-domain-card, .ui-feedback { border: 1px solid var(--cody-ui-surface-border, var(--cody-ui-color-border, var(--vscode-panel-border))); border-radius: 4px; padding: var(--cody-ui-spacing-md, .5rem); }
   .ui-split { min-width: 0; min-height: 0; }
   .ui-muted { color: var(--vscode-descriptionForeground); }
   .ui-text { white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -117,20 +144,29 @@ export function renderPanelHtml(options: PanelHtmlOptions): string {
   .ui-choice { display: flex; gap: .4rem; align-items: center; }
   .ui-link-button { color: var(--vscode-textLink-foreground); background: none; padding: 0; }
   .ui-domain-card > header { justify-content: space-between; }
-  .ui-host-error { display: grid; gap: .2rem; border: 1px solid var(--vscode-inputValidation-errorBorder); padding: .5rem; }
-  .tone-positive { color: var(--cody-ui-color-positive, var(--vscode-testing-iconPassed)); }
-  .tone-warning { color: var(--cody-ui-color-warning, var(--vscode-editorWarning-foreground)); }
-  .tone-critical { color: var(--cody-ui-color-critical, var(--vscode-errorForeground)); }
-  .tone-info { color: var(--cody-ui-color-info, var(--vscode-textLink-foreground)); }
+  .ui-host-errors { display: grid; gap: .5rem; }
+  .ui-host-error { display: grid; gap: .35rem; min-width: 0; border: 1px solid var(--vscode-inputValidation-errorBorder); padding: .5rem; overflow-wrap: anywhere; }
+  .ui-host-error code { overflow-wrap: anywhere; white-space: pre-wrap; }
+  .ui-host-error-message { white-space: pre-wrap; }
+  .ui-host-error-actions { display: flex; flex-wrap: wrap; gap: .35rem; }
+  .ui-secondary-button { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+  .tone-positive { color: var(--cody-ui-status-success, var(--cody-ui-color-positive, var(--vscode-testing-iconPassed))); }
+  .tone-warning { color: var(--cody-ui-status-warning, var(--cody-ui-color-warning, var(--vscode-editorWarning-foreground))); }
+  .tone-critical { color: var(--cody-ui-status-error, var(--cody-ui-color-critical, var(--vscode-errorForeground))); }
+  .tone-info { color: var(--cody-ui-status-info, var(--cody-ui-color-info, var(--vscode-textLink-foreground))); }
   @keyframes ui-spin { to { transform: rotate(360deg); } }
-  @media (prefers-reduced-motion: reduce) { .ui-spinner { animation: none; } }
+  @media (min-width: 48rem) {
+    .ui-host-shell { grid-template-columns: minmax(12rem, .32fr) minmax(0, 1fr); grid-template-areas:
+      "navigation navigation" "sidebar primary" "sidebar transcript" "composer composer" "setup setup" "status status"; }
+  }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; } .ui-spinner { animation: none; } }
   @media (forced-colors: active) { .ui-bordered, .ui-domain-card, .ui-feedback { border-color: CanvasText; } }
 </style>
 </head>
 <body>
 <header>
-  <span class="status" id="status">closed</span>
-  <span class="run-state" id="run-state"></span>
+  <span class="status" id="status" role="status" aria-live="polite">closed</span>
+  <span class="run-state" id="run-state" role="status" aria-live="polite"></span>
 </header>
 <div id="approvals"></div>
 <div id="remote-ui"></div>
@@ -180,6 +216,8 @@ export function renderPanelHtml(options: PanelHtmlOptions): string {
     if (approvalNodes.has(approvalId)) return;
     const card = document.createElement('div');
     card.className = 'approval';
+    card.setAttribute('role', 'region');
+    card.setAttribute('aria-label', 'Approval request');
     const title = document.createElement('div');
     title.textContent = summary;
     const riskEl = document.createElement('div');
@@ -188,9 +226,11 @@ export function renderPanelHtml(options: PanelHtmlOptions): string {
     const actions = document.createElement('div');
     actions.className = 'actions';
     const approve = document.createElement('button');
+    approve.type = 'button';
     approve.textContent = 'Approve';
     approve.onclick = () => vscode.postMessage({ kind: 'approve', approvalId });
     const reject = document.createElement('button');
+    reject.type = 'button';
     reject.className = 'reject';
     reject.textContent = 'Reject';
     reject.onclick = () => vscode.postMessage({ kind: 'reject', approvalId });

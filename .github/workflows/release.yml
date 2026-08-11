@@ -24,8 +24,38 @@ permissions:
   contents: write # create releases + attach assets (tag builds and rolling main builds)
 
 jobs:
+  frontend-quality:
+    name: frontend quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.13.1"
+          cache: npm
+          cache-dependency-path: |
+            sdk/ui/package-lock.json
+            extensions/vscode/package-lock.json
+      - name: Install and check UI SDK
+        working-directory: sdk/ui
+        run: |
+          npm ci
+          npm run check
+          npm audit --audit-level=high
+      - name: Install and check VS Code client
+        working-directory: extensions/vscode
+        run: |
+          npm ci
+          npm run typecheck
+          npm run lint
+          npm test
+          npm run build
+          npm run vscode:prepublish
+          npm audit --audit-level=high
+
   build:
     name: build ${{ matrix.target }}
+    needs: frontend-quality
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

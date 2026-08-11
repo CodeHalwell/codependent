@@ -4,7 +4,7 @@ import type { UiEvent, UiRuntimeMessage } from "@codypendent/ui";
 import type { TranscriptMessage, WebviewCommandMessage } from "../messages.js";
 import { isMediatedRuntimeWire, isUiWireMessage } from "../../remote-ui/wire.js";
 import { createWebviewCapabilities, supportedContributionPoint, viewportFromWindow } from "./capabilities.js";
-import { RemoteUiRenderer } from "./renderer.js";
+import { RemoteUiRenderer, type RemoteUiRecoveryRequest } from "./renderer.js";
 import { RemoteUiStore, type RemoteUiPlacement } from "./store.js";
 import { applyWireTheme } from "./theme.js";
 import { publishMediatedWire, REMOTE_UI_WIRE_SEND_EVENT } from "./mediated.js";
@@ -49,8 +49,27 @@ function start(element: HTMLElement): void {
     postRuntime({ type: "event", event });
   }
 
+  function recover(request: RemoteUiRecoveryRequest): void {
+    if (request.action === "retry") {
+      const mount = store.getSnapshot().mounts.find((candidate) => candidate.document.documentId === request.documentId);
+      postRuntime({
+        type: "resync",
+        documentId: request.documentId,
+        ...(mount === undefined ? {} : { knownRevision: mount.document.revision }),
+      });
+      return;
+    }
+    vscode.postMessage({
+      kind: "remoteUiRecovery",
+      action: request.action,
+      documentId: request.documentId,
+      ...(request.extensionId === undefined ? {} : { extensionId: request.extensionId }),
+      message: request.message,
+    });
+  }
+
   function render(): void {
-    root.render(<RemoteUiRenderer store={store} capabilities={capabilities} dispatch={dispatch} showTerminalFallback={showTerminalFallback} />);
+    root.render(<RemoteUiRenderer store={store} capabilities={capabilities} dispatch={dispatch} recover={recover} showTerminalFallback={showTerminalFallback} />);
   }
 
   function persist(): void {

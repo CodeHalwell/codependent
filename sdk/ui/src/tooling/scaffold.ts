@@ -63,12 +63,12 @@ export function ${renderer}({ title = "${renderer}", count = 0 }: ${renderer}Pro
 }
 `; }
 
-function reactComponent(renderer: string): string { return `import { useState } from "react";
+function reactComponent(id: string, renderer: string): string { return `import { workbenchHotReloadState } from "@codypendent/ui";
 import { Text as semanticText } from "@codypendent/ui";
-import { Badge, Button, Panel, Stack, Text, useViewport } from "@codypendent/ui/react";
+import { Badge, Button, Panel, Stack, Text, useHotReloadState, useViewport } from "@codypendent/ui/react";
 
 export function ${renderer}() {
-  const [count, setCount] = useState(0);
+  const [count, setCount] = useHotReloadState(workbenchHotReloadState, "${id}.count", 0);
   const viewport = useViewport();
   return (
     <Panel.Root id="root" accessibleLabel="${renderer}" fallback={semanticText({ value: "${renderer} is unavailable" })}>
@@ -85,10 +85,11 @@ export function ${renderer}() {
 }
 `; }
 
-function pureWorker(id: string, renderer: string): string { return `import { defaultWorkerCapabilities, createPureUiSurface, runStdioUiWorker } from "@codypendent/ui/worker";
+function pureWorker(id: string, renderer: string): string { return `import { workbenchHotReloadState } from "@codypendent/ui";
+import { defaultWorkerCapabilities, createPureUiSurface, runStdioUiWorker } from "@codypendent/ui/worker";
 import { ${renderer} } from "./component.js";
 
-let count = 0;
+const countKey = ${JSON.stringify(`${id}.count`)};
 
 await runStdioUiWorker({
   pluginId: ${JSON.stringify(id)},
@@ -98,18 +99,20 @@ await runStdioUiWorker({
   }),
   surfaces: [createPureUiSurface({
     documentId: "main",
-    render: () => <${renderer} count={count} />,
+    render: () => <${renderer} count={workbenchHotReloadState.get(countKey, 0)} />,
     onEvent: (event) => {
       if (event.targetId !== "local" || event.type !== "press") return false;
-      count += 1;
+      workbenchHotReloadState.set<number>(countKey, (count) => count + 1, 0);
       return true;
     },
   })],
   contributions: [{ id: ${JSON.stringify(`${id}.panel`)}, point: "panel", renderer: ${JSON.stringify(`${id}.${renderer}`)}, documentId: "main" }],
+  hotReloadState: workbenchHotReloadState,
 });
 `; }
 
-function reactWorker(id: string, renderer: string): string { return `import { defaultWorkerCapabilities, runStdioUiWorker } from "@codypendent/ui/worker";
+function reactWorker(id: string, renderer: string): string { return `import { workbenchHotReloadState } from "@codypendent/ui";
+import { defaultWorkerCapabilities, runStdioUiWorker } from "@codypendent/ui/worker";
 import { createReactUiSurface } from "@codypendent/ui/worker/react";
 import { ${renderer} } from "./component.js";
 
@@ -121,6 +124,7 @@ await runStdioUiWorker({
   }),
   surfaces: [createReactUiSurface({ documentId: "main", strictMode: true, render: () => <${renderer} /> })],
   contributions: [{ id: ${JSON.stringify(`${id}.panel`)}, point: "panel", renderer: ${JSON.stringify(`${id}.${renderer}`)}, documentId: "main" }],
+  hotReloadState: workbenchHotReloadState,
 });
 `; }
 
@@ -128,13 +132,13 @@ function packageJson(id: string, template: ScaffoldTemplate): string {
   return `${JSON.stringify({
     name: id, version: "0.1.0", private: true, type: "module",
     scripts: {
-      build: "esbuild src/worker.tsx --bundle --platform=node --format=esm --target=node20 --outfile=dist/worker.mjs",
+      build: "esbuild src/worker.tsx --bundle --platform=node --format=esm --target=node22 --outfile=dist/worker.mjs",
       typecheck: "tsc --noEmit", test: "vitest run", check: "npm run typecheck && npm test && npm run build",
       dev: "codypendent-ui dev", validate: "codypendent-ui validate", package: "codypendent-ui package",
     },
-    dependencies: { "@codypendent/ui": "^1.0.0", ...(template === "react" ? { react: "19.0.0", "react-reconciler": "0.31.0" } : {}) },
+    dependencies: { "@codypendent/ui": "^1.1.0", ...(template === "react" ? { react: "19.0.0", "react-reconciler": "0.31.0" } : {}) },
     devDependencies: { "@types/node": "^22.13.4", ...(template === "react" ? { "@types/react": "19.0.12" } : {}), esbuild: "^0.25.0", typescript: "^5.7.3", vitest: "^4.1.10" },
-    engines: { node: ">=20" },
+    engines: { node: ">=22.13" },
   }, null, 2)}\n`;
 }
 
@@ -185,10 +189,10 @@ export async function createScaffold(directory: string, template: ScaffoldTempla
   const files: Record<string, string> = {
     "package.json": packageJson(id, template), "tsconfig.json": tsconfig(template), "plugin.toml": manifest(id, renderer),
     ".gitignore": "node_modules/\ndist/\n*.cody-ui.tgz\n*.pem\n*.key\n",
-    "src/component.tsx": template === "pure" ? pureComponent(renderer) : reactComponent(renderer),
+    "src/component.tsx": template === "pure" ? pureComponent(renderer) : reactComponent(id, renderer),
     "src/worker.tsx": template === "pure" ? pureWorker(id, renderer) : reactWorker(id, renderer),
     "test/component.test.tsx": testSource(renderer, template),
-    "README.md": `# ${renderer}\n\nSandboxed Codypendent semantic UI component.\n\n\`npm run check\` validates, tests, and bundles. \`npm run dev\` rebuilds and runs the protocol inspector. \`npm run package -- --key publisher.pem\` creates a deterministic signed artifact.\n`,
+    "README.md": `# ${renderer}\n\nSandboxed Codypendent semantic UI component. The shared worker renders in terminal and graphical hosts and includes a semantic node fallback.\n\nNode 22.13+ is required for the development inspector's stable permission controls. \`npm run check\` validates, tests, and bundles. \`npm run dev\` opens the persistent workbench and transactionally keeps the last valid render after a failed rebuild. \`npm run package -- --key publisher.pem\` creates a deterministic signed artifact.\n`,
   };
   await Promise.all(Object.entries(files).map(([path, contents]) => writeFile(join(target, path), contents, { encoding: "utf8", flag: "wx" })));
   return target;

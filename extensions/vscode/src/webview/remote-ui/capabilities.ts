@@ -1,6 +1,6 @@
 import {
   DEFAULT_UI_HARD_LIMITS,
-  UI_CONTRIBUTION_POINTS,
+  UI_PRIMITIVES,
   UI_HOST_CAPABILITIES,
   UI_PROTOCOL_VERSION,
   type UiCapabilities,
@@ -8,29 +8,17 @@ import {
   type UiPrimitive,
   type UiViewport,
 } from "@codypendent/ui";
+import { WEB_CONTRIBUTION_POINTS, webSlotDefinition } from "./slot-registry.js";
 
 /** Every semantic primitive implemented by the VS Code webview renderer. */
 export const WEB_PRIMITIVES: readonly UiPrimitive[] = [
-  "Box", "Stack", "Row", "Grid", "Split", "Spacer", "ScrollArea", "VirtualList",
-  "Text", "Markdown", "Code", "Diff", "Image", "Audio", "JsonTree", "LogViewer",
-  "List", "Table", "Tree", "KeyValue", "Timeline", "Graph", "Chart", "Sparkline",
-  "Badge", "Progress", "Spinner", "Alert", "Toast", "EmptyState", "ErrorBoundary",
-  "Tabs", "Breadcrumb", "Menu", "CommandList", "Pagination", "Link", "Details",
-  "TextInput", "TextArea", "Select", "MultiSelect", "Checkbox", "Radio", "Form",
-  "Button", "ActionMenu", "Toolbar", "ContextMenu",
-  "ToolCard", "ArtifactCard", "AgentCard", "WorkflowNode",
-  "PatchCard", "TestReport", "TraceView", "CostView",
-  "TerminalOnly", "WebOnly",
+  ...UI_PRIMITIVES.filter((primitive) => primitive !== "ApprovalCard" && primitive !== "PermissionDiff"),
 ];
-
-const WEB_CONTRIBUTION_POINTS = new Set<string>(UI_CONTRIBUTION_POINTS);
 
 /** Validate untrusted extension→webview placement ingress against exactly the
  * points this renderer advertises. */
 export function supportedContributionPoint(value: unknown): UiContributionPoint | undefined {
-  return typeof value === "string" && WEB_CONTRIBUTION_POINTS.has(value)
-    ? value as UiContributionPoint
-    : undefined;
+  return webSlotDefinition(value)?.point;
 }
 
 function mediaMatches(query: string, fallback = false): boolean {
@@ -76,7 +64,7 @@ export function createWebviewCapabilities(viewport = viewportFromWindow()): UiCa
     reducedMotion: mediaMatches("(prefers-reduced-motion: reduce)"),
     clipboard: typeof navigator === "undefined" || navigator.clipboard !== undefined,
     capabilities: UI_HOST_CAPABILITIES,
-    contributionPoints: [...UI_CONTRIBUTION_POINTS],
+    contributionPoints: [...WEB_CONTRIBUTION_POINTS],
     limits: {
       ...DEFAULT_UI_HARD_LIMITS,
       maxNodes: Math.min(DEFAULT_UI_HARD_LIMITS.maxNodes, 10_000),

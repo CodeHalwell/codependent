@@ -136,9 +136,12 @@ jobs:
       - name: Install UI SDK dependencies
         working-directory: sdk/ui
         run: npm ci
-      - name: Build UI SDK
+      - name: Check UI SDK
         working-directory: sdk/ui
-        run: npm run build
+        run: npm run check
+      - name: Audit UI SDK dependencies
+        working-directory: sdk/ui
+        run: npm audit --audit-level=high
       - name: Install extension dependencies
         run: npm ci
       - name: Typecheck
@@ -147,3 +150,9 @@ jobs:
         run: npm run lint
       - name: Test
         run: npm test
+      - name: Build development bundle
+        run: npm run build
+      - name: Build production bundle
+        run: npm run vscode:prepublish
+      - name: Audit extension dependencies
+        run: npm audit --audit-level=high

@@ -295,10 +295,20 @@ headless client can request a structured textual representation of any view.
 ## Developer tooling
 
 The SDK and CLI provide scaffolding, development, component stories, fixtures,
-interaction tests, packaging, signing and publishing. Development mode includes
-hot reload, selectable viewport/theme/colour depth, keyboard and mouse
-simulation, accessibility inspection, tree/layout overlays, event and command
-logs, subscription inspection and render profiling.
+interaction tests, packaging, signing and publishing. The persistent workbench
+preflights each permission-restricted rebuild transactionally and preserves only
+explicit JSON-safe state. It supports selectable host target, contribution
+point, viewport, theme and colour depth; inert projection/action fixtures;
+automatic accessibility, fallback, token and target-layout diagnostics; full
+props/requirement/fallback trees; and event, patch, action, subscription and
+ordered protocol traces. Graphical hosts consume the same structural story for
+DOM/screenshot conformance while terminal hosts retain semantic goldens.
+
+VS Code's advertised point list is derived from its concrete slot registry.
+Every public point has a dedicated region/overlay adapter, deterministic order,
+focus lifecycle and semantic label/role. Documents are independently isolated;
+host-rendered Retry, confirmed Disable and Report controls recover one failed
+surface without replacing healthy siblings.
 
 Protocol types are generated from one canonical contract and checked with
 cross-language golden vectors. Test coverage includes deterministic render

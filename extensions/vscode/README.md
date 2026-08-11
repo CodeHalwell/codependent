@@ -25,6 +25,7 @@ The wire protocol is reproduced from the Rust `codypendent-protocol` crate:
 | Semantic Remote UI envelope bridge | `remote_ui.rs::UiWireMessage` | `src/remote-ui/wire.ts` |
 | Atomic document/patch projection | — | `src/webview/remote-ui/store.ts` |
 | Accessible React/DOM renderer | — | `src/webview/remote-ui/renderer.tsx` |
+| Truthful point/region/focus registry | — | `src/webview/remote-ui/slot-registry.ts` |
 | Webview capability/theme runtime | — | `src/webview/remote-ui/capabilities.ts`, `theme.ts`, `main.tsx` |
 
 **The only module that imports `vscode` is `src/extension.ts`.** Everything under
@@ -87,9 +88,16 @@ Security and recovery boundaries are deliberately narrow:
 - the webview CSP is `default-src 'none'` with nonce-bound scripts and styles;
 - webview view state caches bounded last-good snapshots only as a reload aid;
   the daemon remains authoritative and receives resync requests after restore;
-- theme tokens are validated before becoming CSS custom properties;
-- contribution documents are mounted deterministically by point, slot, and
-  priority without replacing the existing transcript/approval experience.
+- semantic theme tokens are validated and mapped consistently to governed CSS
+  custom properties (`text.*`, `surface.*`, `status.*`, `focus.*`, `spacing.*`);
+- the advertised contribution list is derived from a concrete 22-point slot
+  registry. Sidebar, navigation, primary, transcript, composer, setup, status,
+  and overlay regions have separate layout/lifecycle behavior; lower stacked
+  interactive overlays become inert while the topmost owns focus;
+- each document is isolated behind host-native recovery UI. Retry requests an
+  authoritative resync, Disable requires a modal confirmation before revoking
+  the owning plugin, and Report writes bounded details to the Codypendent output
+  channel. Healthy sibling documents stay mounted.
 
 Set `codypendent.remoteUi.terminalFallbackPreview` to show the deterministic
 minimal-terminal projection below graphical contributions. This is useful for
@@ -134,6 +142,11 @@ npm run build       # esbuild bundles -> dist/extension.js + dist/webview.js
 ```
 
 Press `F5` in VS Code (or Cursor) to launch an Extension Development Host.
+The test suite also runs jsdom structural visual conformance against the SDK's
+shared loading/empty/error/long-content story across public points, themes, and
+viewports. It asserts semantic roles, focus arbitration, recovery actions,
+long-content containment, and truthful capability advertisement; use real
+Extension Development Host screenshots for release-candidate pixel review.
 
 ## Smoke-test checklist
 
@@ -168,3 +181,8 @@ creates or executes anything — it attaches to a session id).
    incremental patches, form/keyboard events, theme, and terminal fallback.
    Reload the webview and verify it displays the last-good tree while requesting
    an authoritative resync.
+10. **Point placement and recovery.** Mount contributions in sidebar, transcript,
+    composer, status, and an overlay; verify each occupies its host region and
+    only the topmost interactive overlay receives focus. Force one document to
+    fail, then exercise Retry, Report, and confirmed Disable without disturbing
+    a healthy sibling.

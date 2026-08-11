@@ -1,4 +1,5 @@
 import React, {
+  Component,
   createContext,
   memo,
   use,
@@ -29,11 +30,21 @@ import {
 } from "@codypendent/ui";
 
 import type { MountedRemoteUi, RemoteUiStore } from "./store.js";
+import { webSlotDefinition, type WebHostRegion, type WebSlotDefinition } from "./slot-registry.js";
+
+export type RemoteUiRecoveryAction = "retry" | "disable" | "report";
+export interface RemoteUiRecoveryRequest {
+  action: RemoteUiRecoveryAction;
+  documentId: string;
+  extensionId?: string;
+  message: string;
+}
 
 export interface RemoteUiRendererProps {
   store: RemoteUiStore;
   capabilities: UiCapabilities;
   dispatch: (event: UiEvent) => void;
+  recover?: (request: RemoteUiRecoveryRequest) => void;
   showTerminalFallback?: boolean;
 }
 
@@ -47,6 +58,59 @@ interface RendererMeta {
 
 const RendererActionsContext = createContext<RendererActions | null>(null);
 const RendererMetaContext = createContext<RendererMeta | null>(null);
+
+export function RecoveryCard({ request, recover }: {
+  request: Omit<RemoteUiRecoveryRequest, "action">;
+  recover?: (request: RemoteUiRecoveryRequest) => void;
+}): ReactNode {
+  const submit = (action: RemoteUiRecoveryAction): void => recover?.({ ...request, action });
+  return (
+    <section className="ui-host-error" role="alert" aria-live="polite" data-ui-error-document={request.documentId}>
+      <strong>Extension surface unavailable</strong>
+      <span className="ui-host-error-message">{request.message}</span>
+      <code>{request.documentId}</code>
+      <div className="ui-host-error-actions" role="group" aria-label="Extension surface recovery">
+        <button type="button" onClick={() => submit("retry")}>Retry</button>
+        <button type="button" className="reject" disabled={request.extensionId === undefined} onClick={() => submit("disable")}>Disable extension surface</button>
+        <button type="button" className="ui-secondary-button" onClick={() => submit("report")}>Report details</button>
+      </div>
+    </section>
+  );
+}
+
+interface RemoteDocumentBoundaryProps {
+  documentId: string;
+  revision: number;
+  extensionId?: string;
+  recover?: (request: RemoteUiRecoveryRequest) => void;
+  children: ReactNode;
+}
+
+interface RemoteDocumentBoundaryState { message?: string; revision: number; }
+
+class RemoteDocumentBoundary extends Component<RemoteDocumentBoundaryProps, RemoteDocumentBoundaryState> {
+  override state: RemoteDocumentBoundaryState = { revision: this.props.revision };
+
+  static getDerivedStateFromError(error: unknown): Partial<RemoteDocumentBoundaryState> {
+    return { message: error instanceof Error ? error.message : String(error) };
+  }
+
+  static getDerivedStateFromProps(props: RemoteDocumentBoundaryProps, state: RemoteDocumentBoundaryState): Partial<RemoteDocumentBoundaryState> | null {
+    return props.revision === state.revision ? null : { revision: props.revision, message: undefined };
+  }
+
+  override render(): ReactNode {
+    if (this.state.message === undefined) return this.props.children;
+    return <RecoveryCard request={{
+      documentId: this.props.documentId,
+      ...(this.props.extensionId === undefined ? {} : { extensionId: this.props.extensionId }),
+      message: this.state.message,
+    }} recover={(request) => {
+      if (request.action === "retry") this.setState({ message: undefined, revision: this.props.revision });
+      this.props.recover?.(request);
+    }} />;
+  }
+}
 
 function useRendererActions(): RendererActions {
   const value = use(RendererActionsContext);
@@ -639,36 +703,82 @@ function RemoteDocument({ mount, emit, showTerminalFallback }: { mount: MountedR
   );
 }
 
-function ContributionGroup({ point, mounts, dispatch, showTerminalFallback }: { point: string; mounts: readonly MountedRemoteUi[]; dispatch: (event: UiEvent) => void; showTerminalFallback: boolean }): ReactNode {
-  const documents = mounts.map((mount) => <RemoteDocument key={mount.document.documentId} mount={mount} emit={dispatch} showTerminalFallback={showTerminalFallback} />);
-  const common = { className: `ui-contribution-group ui-slot-${point}`, "data-ui-contribution-point": point, "data-ui-slot-adapter": point };
-  switch (point) {
-    case "sidebar": return <aside {...common} aria-label="Extension sidebar">{documents}</aside>;
-    case "status-item": return <footer {...common} role="status" aria-label="Extension status items">{documents}</footer>;
-    case "command": return <nav {...common} aria-label="Extension commands">{documents}</nav>;
-    case "command-palette": return <section {...common} role="dialog" aria-label="Extension command palette">{documents}</section>;
-    case "quick-pick": return <section {...common} role="listbox" aria-label="Extension quick picks">{documents}</section>;
-    case "notification": return <aside {...common} aria-live="polite" aria-label="Extension notifications">{documents}</aside>;
-    case "composer-accessory": return <section {...common} aria-label="Extension composer accessories">{documents}</section>;
-    case "message-renderer": return <section {...common} role="feed" aria-label="Extension transcript entries">{documents}</section>;
-    case "tool-renderer": return <article {...common} aria-label="Extension tool results">{documents}</article>;
-    case "artifact-renderer": return <article {...common} aria-label="Extension artifact renderers">{documents}</article>;
-    case "workflow-inspector": return <section {...common} aria-label="Extension workflow nodes">{documents}</section>;
-    case "blackboard-renderer": return <section {...common} aria-label="Extension blackboard">{documents}</section>;
-    case "document-block": return <article {...common} aria-label="Extension document blocks">{documents}</article>;
-    case "code-graph-node": return <section {...common} aria-label="Extension code graph nodes">{documents}</section>;
-    case "settings-section": return <section {...common} aria-label="Extension settings">{documents}</section>;
-    case "setup-step": return <section {...common} aria-label="Extension setup steps">{documents}</section>;
-    case "form": return <section {...common} role="form" aria-label="Extension forms">{documents}</section>;
-    case "wizard": return <section {...common} role="dialog" aria-label="Extension wizards">{documents}</section>;
-    case "dashboard-card": return <section {...common} aria-label="Extension dashboard cards">{documents}</section>;
-    case "trace-span-renderer": return <article {...common} aria-label="Extension trace spans">{documents}</article>;
-    case "context-menu": return <section {...common} role="menu" aria-label="Extension context menu">{documents}</section>;
-    default: return <section {...common} aria-label={`${point} extensions`}>{documents}</section>;
+function ContributionGroup({ definition, mounts, dispatch, recover, showTerminalFallback, activeOverlay }: {
+  definition: WebSlotDefinition;
+  mounts: readonly MountedRemoteUi[];
+  dispatch: (event: UiEvent) => void;
+  recover?: (request: RemoteUiRecoveryRequest) => void;
+  showTerminalFallback: boolean;
+  activeOverlay?: boolean;
+}): ReactNode {
+  const containerRef = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (definition.focusManaged !== true || activeOverlay !== true) return;
+    const previouslyFocused = globalThis.document.activeElement instanceof HTMLElement
+      ? globalThis.document.activeElement
+      : undefined;
+    const preferred = containerRef.current?.querySelector<HTMLElement>("button, input, textarea, select, a, [tabindex]:not([tabindex='-1'])");
+    (preferred ?? containerRef.current)?.focus({ preventScroll: true });
+    return () => {
+      if (previouslyFocused?.isConnected === true) previouslyFocused.focus({ preventScroll: true });
+    };
+  }, [activeOverlay, definition.focusManaged]);
+  const documents = mounts.map((mount) => (
+    <RemoteDocumentBoundary
+      key={mount.document.documentId}
+      documentId={mount.document.documentId}
+      revision={mount.document.revision}
+      {...(mount.placement.extensionId === undefined ? {} : { extensionId: mount.placement.extensionId })}
+      {...(recover === undefined ? {} : { recover })}
+    >
+      <RemoteDocument mount={mount} emit={dispatch} showTerminalFallback={showTerminalFallback} />
+    </RemoteDocumentBoundary>
+  ));
+  return React.createElement(definition.element, {
+    ref: containerRef,
+    className: `ui-contribution-group ui-slot-${definition.point}`,
+    "data-ui-contribution-point": definition.point,
+    "data-ui-slot-adapter": definition.point,
+    "data-ui-slot-order": definition.order,
+    "aria-label": definition.label,
+    ...(definition.role === undefined ? {} : { role: definition.role }),
+    ...(definition.ariaLive === undefined ? {} : { "aria-live": definition.ariaLive }),
+    ...(definition.overlay === true ? { tabIndex: -1 } : {}),
+    ...(definition.focusManaged === true && activeOverlay !== true ? { inert: true, "aria-hidden": true } : {}),
+  }, documents);
+}
+
+const REGION_ORDER: readonly WebHostRegion[] = ["sidebar", "navigation", "primary", "transcript", "composer", "setup", "status", "overlay"];
+const REGION_LABELS: Readonly<Record<WebHostRegion, string>> = {
+  sidebar: "Extension sidebar region",
+  navigation: "Extension navigation region",
+  primary: "Extension primary region",
+  transcript: "Extension transcript region",
+  composer: "Extension composer region",
+  setup: "Extension setup region",
+  status: "Extension status region",
+  overlay: "Extension overlay region",
+};
+
+function HostRegion({ region, children }: { region: WebHostRegion; children: ReactNode }): ReactNode {
+  const common = {
+    className: `ui-host-region ui-host-region-${region}`,
+    "data-ui-host-region": region,
+    "aria-label": REGION_LABELS[region],
+  };
+  switch (region) {
+    case "sidebar": return <aside {...common}>{children}</aside>;
+    case "navigation": return <nav {...common}>{children}</nav>;
+    case "primary": return <main {...common}>{children}</main>;
+    case "transcript": return <section {...common}>{children}</section>;
+    case "composer": return <section {...common}>{children}</section>;
+    case "setup": return <section {...common}>{children}</section>;
+    case "status": return <footer {...common}>{children}</footer>;
+    case "overlay": return <div {...common} aria-live="polite">{children}</div>;
   }
 }
 
-export function RemoteUiRenderer({ store, capabilities, dispatch, showTerminalFallback = false }: RemoteUiRendererProps): ReactNode {
+export function RemoteUiRenderer({ store, capabilities, dispatch, recover, showTerminalFallback = false }: RemoteUiRendererProps): ReactNode {
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
   const shortcutClaims = useMemo(() => new Map(snapshot.mounts.map((mount) => [
     mount.document.documentId,
@@ -707,19 +817,50 @@ export function RemoteUiRenderer({ store, capabilities, dispatch, showTerminalFa
     return () => window.removeEventListener("keydown", listener);
   }, [dispatch, shortcutClaims]);
   const grouped = useMemo(() => {
-    const groups = new Map<string, MountedRemoteUi[]>();
+    const groups = new Map<WebHostRegion, { definition: WebSlotDefinition; mounts: MountedRemoteUi[] }[]>();
     for (const mount of snapshot.mounts) {
-      const point = mount.placement.point;
-      const values = groups.get(point) ?? [];
-      values.push(mount);
-      groups.set(point, values);
+      const definition = webSlotDefinition(mount.placement.point);
+      if (definition === undefined) continue;
+      const region = groups.get(definition.region) ?? [];
+      let slot = region.find((candidate) => candidate.definition.point === definition.point);
+      if (slot === undefined) {
+        slot = { definition, mounts: [] };
+        region.push(slot);
+        groups.set(definition.region, region);
+      }
+      slot.mounts.push(mount);
     }
+    groups.forEach((slots) => slots.sort((left, right) => left.definition.order - right.definition.order));
     return groups;
   }, [snapshot.mounts]);
   return (
     <div className="remote-ui-root" data-ui-client={capabilities.client}>
-      {Object.entries(snapshot.errors).map(([id, message]) => <div className="ui-host-error" role="alert" key={id}><strong>Extension surface error</strong><span>{message}</span></div>)}
-      {[...grouped].map(([point, mounts]) => <ContributionGroup key={point} point={point} mounts={mounts} dispatch={dispatch} showTerminalFallback={showTerminalFallback} />)}
+      <div className="ui-host-errors" aria-live="polite">
+        {Object.entries(snapshot.errors).map(([id, message]) => {
+          const extensionId = snapshot.mounts.find((mount) => mount.document.documentId === id)?.placement.extensionId;
+          return <RecoveryCard key={id} request={{ documentId: id, ...(extensionId === undefined ? {} : { extensionId }), message }} {...(recover === undefined ? {} : { recover })} />;
+        })}
+      </div>
+      <div className="ui-host-shell">
+        {REGION_ORDER.map((region) => {
+          const slots = grouped.get(region);
+          if (slots === undefined || slots.length === 0) return null;
+          const activeOverlay = region === "overlay"
+            ? slots.filter(({ definition }) => definition.focusManaged === true).at(-1)?.definition.point
+            : undefined;
+          return <HostRegion key={region} region={region}>{slots.map(({ definition, mounts }) => (
+            <ContributionGroup
+              key={definition.point}
+              definition={definition}
+              mounts={mounts}
+              dispatch={dispatch}
+              {...(recover === undefined ? {} : { recover })}
+              showTerminalFallback={showTerminalFallback}
+              {...(definition.focusManaged !== true ? {} : { activeOverlay: definition.point === activeOverlay })}
+            />
+          ))}</HostRegion>;
+        })}
+      </div>
     </div>
   );
 }
