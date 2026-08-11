@@ -21,6 +21,11 @@
 //!   bounded `reqwest` Tavily client, with the key brokered opaquely from
 //!   `TAVILY_API_KEY` and all returned content sanitized as untrusted evidence
 //!   in the runtime.
+//! - [`unsloth`] — Hugging Face Hub discovery for the Unsloth GGUF catalog
+//!   (local models): the [`unsloth::HfCatalogApi`] trait plus a bounded
+//!   `reqwest` client, listing an author's GGUF repos and, per repo, their
+//!   quant variants (with sizes) grouped from the file tree. Keyless — the
+//!   Hub's `api/models` surface is public.
 //!
 //! It depends only on the protocol crate and external crates; the assembly
 //! layer (`codypendentd`) wires the GitHub client into the tool layer and the
@@ -33,4 +38,5 @@ pub mod github;
 pub mod ide;
 pub mod mcp;
 pub mod search;
+pub mod unsloth;
 pub mod webhook;
