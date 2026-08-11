@@ -1,0 +1,605 @@
+diff --git a/crates/cli/src/tui.rs b/crates/cli/src/tui.rs
+index bea2313..d914c7b 100644
+--- a/crates/cli/src/tui.rs
++++ b/crates/cli/src/tui.rs
+@@ -2344,6 +2344,10 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
+             text,
+             mode,
+             model,
++            // The composer path submits plain text; the voice host builds its
++            // audio-envelope submission directly (see `crate::voice`), never
++            // through this intent mapping.
++            envelope: None,
+         },
+         Intent::ResolveApproval {
+             approval_id,
+@@ -4860,6 +4864,7 @@ mod tests {
+                 text: "also add tests".into(),
+                 mode: AgentMode::Build,
+                 model: Some(codypendent_protocol::ModelId("pinned-model-x".into())),
++                envelope: None,
+             }
+         );
+         // And an unpinned follow-up carries no model on the wire (inherit).
+@@ -4878,6 +4883,7 @@ mod tests {
+                 text: "keep going".into(),
+                 mode: AgentMode::Build,
+                 model: None,
++                envelope: None,
+             }
+         );
+ 
+diff --git a/crates/daemon/src/commands.rs b/crates/daemon/src/commands.rs
+index c397406..8c53f7f 100644
+--- a/crates/daemon/src/commands.rs
++++ b/crates/daemon/src/commands.rs
+@@ -1756,6 +1756,7 @@ mod tests {
+                         text: "focus on the parser".to_string(),
+                         mode: AgentMode::Build,
+                         model: None,
++                        envelope: None,
+                     },
+                     "input",
+                 ),
+@@ -1825,6 +1826,7 @@ mod tests {
+                         text: "keep going".to_string(),
+                         mode: AgentMode::Build,
+                         model: None,
++                        envelope: None,
+                     },
+                     "prov-input",
+                 ),
+@@ -1888,6 +1890,7 @@ mod tests {
+                         text: "switch to Y".to_string(),
+                         mode: AgentMode::Build,
+                         model: Some(ModelId("model-y".to_string())),
++                        envelope: None,
+                     },
+                     "repin-y",
+                 ),
+@@ -1920,6 +1923,7 @@ mod tests {
+                         text: "now Z".to_string(),
+                         mode: AgentMode::Build,
+                         model: Some(ModelId("model-z".to_string())),
++                        envelope: None,
+                     },
+                     "repin-z",
+                 ),
+@@ -1947,6 +1951,7 @@ mod tests {
+                         text: "keep going".to_string(),
+                         mode: AgentMode::Build,
+                         model: None,
++                        envelope: None,
+                     },
+                     "repin-none",
+                 ),
+@@ -2003,6 +2008,7 @@ mod tests {
+                         text: "use the big model".to_string(),
+                         mode: AgentMode::Build,
+                         model: Some(ModelId("just-picked".to_string())),
++                        envelope: None,
+                     },
+                     "unpinned-repin",
+                 ),
+@@ -2392,6 +2398,7 @@ mod tests {
+                         text: "keep going".to_string(),
+                         mode: AgentMode::Build,
+                         model: None,
++                        envelope: None,
+                     },
+                     "input",
+                 ),
+diff --git a/crates/daemon/src/server.rs b/crates/daemon/src/server.rs
+index 5f44a97..a581817 100644
+--- a/crates/daemon/src/server.rs
++++ b/crates/daemon/src/server.rs
+@@ -3835,6 +3835,7 @@ mod tests {
+             text: "x".to_string(),
+             mode: AgentMode::Build,
+             model: None,
++            envelope: None,
+         }));
+         // A run-state transition mutates an existing run — it never admits a
+         // new one, so it stays allowed even mid-shutdown.
+diff --git a/crates/daemon/tests/server_it.rs b/crates/daemon/tests/server_it.rs
+index f6c56d3..a75ed28 100644
+--- a/crates/daemon/tests/server_it.rs
++++ b/crates/daemon/tests/server_it.rs
+@@ -571,6 +571,7 @@ async fn create_attach_and_two_clients_observe_one_event() {
+                     text: "focus on the parser".to_string(),
+                     mode: AgentMode::Build,
+                     model: None,
++                    envelope: None,
+                 },
+                 "input-1",
+             )),
+@@ -715,6 +716,7 @@ async fn a_follow_up_launches_a_new_run_after_a_prior_run() {
+             text: "the follow up".to_string(),
+             mode: AgentMode::Build,
+             model: None,
++            envelope: None,
+         },
+         "input",
+     )
+@@ -823,6 +825,7 @@ async fn a_continuation_inherits_the_session_repository_and_pinned_model() {
+             text: "the follow up".to_string(),
+             mode: AgentMode::Build,
+             model: None,
++            envelope: None,
+         },
+         "cont-input",
+     )
+@@ -955,6 +958,7 @@ async fn a_mid_conversation_repin_applies_instantly() {
+             text: "switch to X".to_string(),
+             mode: AgentMode::Build,
+             model: Some(repin_x.clone()),
++            envelope: None,
+         },
+         "repin-input",
+     )
+diff --git a/crates/protocol/src/command.rs b/crates/protocol/src/command.rs
+index b008599..37ed0b7 100644
+--- a/crates/protocol/src/command.rs
++++ b/crates/protocol/src/command.rs
+@@ -7,10 +7,12 @@
+ 
+ use serde::{Deserialize, Serialize};
+ 
++use crate::artifact::DataClassification;
+ use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
+ use crate::handshake::{ClientRole, Subscription};
+ use crate::ide::IdeContextUpdate;
+ use crate::ids::{ApprovalId, CommandId, DocumentId, ModelId, RunId, SessionId, WorkspaceId};
++use crate::input::InputEnvelope;
+ use crate::run::{AgentMode, ApprovalDecision, ApprovalScope};
+ 
+ /// An idempotent, optionally revision-guarded request.
+@@ -133,6 +135,21 @@ pub enum CommandBody {
+         /// resolves the model exactly as before this field existed.
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         model: Option<ModelId>,
++        /// The full multimodal input this submission normalizes (voice v1,
++        /// rubric 8): a typed [`InputEnvelope`] whose blocks may reference
++        /// artifacts previously stored via
++        /// [`PutArtifact`](CommandBody::PutArtifact) — e.g. an
++        /// [`InputBlock::Audio`](crate::input::InputBlock::Audio) carrying a
++        /// recorded voice note. When the envelope carries audio without a
++        /// transcript, the daemon transcribes it (through its transcription
++        /// seam, gated by the [`transcription_allowed`](crate::input::transcription_allowed)
++        /// classification math) and the transcript text becomes the run input;
++        /// the original audio stays linked to its transcript (the
++        /// original-is-never-replaced invariant). Additive
++        /// (`#[serde(default)]`): an older client omits it and `text` alone
++        /// drives the run, exactly as before this field existed.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        envelope: Option<InputEnvelope>,
+     },
+     StartRun {
+         session_id: SessionId,
+@@ -417,6 +434,28 @@ pub enum CommandBody {
+         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+         include_superseded: bool,
+     },
++    /// Upload client-captured bytes into the daemon's content-addressed
++    /// artifact store (voice v1, rubric 8): the client→daemon half of the
++    /// multimodal input path. `bytes_base64` is base64 because JSON framing
++    /// has no byte-string scalar (the `InstallUiPlugin` precedent) and is
++    /// bounded by the ordinary 16 MiB daemon frame limit — comfortably enough
++    /// for ~1 minute of 16 kHz mono WAV (~2 MB). `sensitivity` classifies the
++    /// stored bytes (captured media should default to
++    /// [`DEFAULT_MEDIA_CLASSIFICATION`](crate::input::DEFAULT_MEDIA_CLASSIFICATION),
++    /// i.e. `Confidential`, so audio never leaves the device by accident);
++    /// classification checks downstream always read the ref returned in
++    /// [`ArtifactStored`](crate::envelope::Payload::ArtifactStored). Handled
++    /// at the connection level (artifacts live outside the session ledger) and
++    /// gated to the [`Controller`](crate::handshake::ClientRole::Controller)
++    /// role — an upload is operator-supplied input, not an observer surface.
++    PutArtifact {
++        /// IANA media type of the bytes, e.g. `audio/wav`.
++        media_type: String,
++        /// The raw bytes, base64-encoded (standard alphabet, with padding).
++        bytes_base64: String,
++        /// The stored occurrence's data classification.
++        sensitivity: DataClassification,
++    },
+     #[serde(other)]
+     Unknown,
+ }
+@@ -549,6 +588,7 @@ mod tests {
+             text: "switch to the big model".to_string(),
+             mode: AgentMode::Build,
+             model: Some(ModelId("claude-sonnet-5".to_string())),
++            envelope: None,
+         };
+         let json = serde_json::to_string(&pinned).expect("serialize");
+         assert!(
+@@ -565,12 +605,17 @@ mod tests {
+             text: "keep going".to_string(),
+             mode: AgentMode::Build,
+             model: None,
++            envelope: None,
+         };
+         let json = serde_json::to_string(&unpinned).expect("serialize");
+         assert!(
+             !json.contains("model"),
+             "an absent pinned model is skipped on the wire: {json}"
+         );
++        assert!(
++            !json.contains("envelope"),
++            "an absent envelope is skipped on the wire (an older client's exact bytes): {json}"
++        );
+         assert_eq!(
+             serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
+             unpinned,
+@@ -578,6 +623,75 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn submit_user_input_carries_an_audio_envelope_when_present() {
++        // Voice v1 (rubric 8): a follow-up may normalize its input as a full
++        // InputEnvelope. Here the common voice shape — one Audio block
++        // referencing a stored artifact, no transcript yet (the daemon
++        // produces it) — round-trips exactly, and an older payload without
++        // the key still parses to None (covered by the test above).
++        use crate::artifact::{ArtifactRef, DataClassification};
++        use crate::input::{AudioArtifact, InputBlock, InputSource, ScopeLevel};
++
++        let audio = AudioArtifact {
++            original: ArtifactRef {
++                id: crate::ids::ArtifactId::new(),
++                media_type: "audio/wav".to_string(),
++                byte_length: 64_000,
++                sha256: "b".repeat(64),
++                sensitivity: DataClassification::Confidential,
++            },
++            transcript: None,
++            duration_ms: Some(2_000),
++            sample_rate_hz: Some(16_000),
++        };
++        let body = CommandBody::SubmitUserInput {
++            session_id: SessionId::new(),
++            text: String::new(),
++            mode: AgentMode::Build,
++            model: None,
++            envelope: Some(InputEnvelope {
++                source: crate::input::InputSource::Voice,
++                blocks: vec![InputBlock::Audio(audio)],
++                scope: ScopeLevel::Session,
++                attachments: vec![],
++            }),
++        };
++        let json = serde_json::to_string(&body).expect("serialize");
++        assert!(json.contains("envelope"), "envelope on the wire: {json}");
++        assert_eq!(
++            serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
++            body
++        );
++        // The source survives verbatim (voice capture is attributed as such).
++        let CommandBody::SubmitUserInput {
++            envelope: Some(envelope),
++            ..
++        } = serde_json::from_str::<CommandBody>(&json).expect("deserialize")
++        else {
++            panic!("expected SubmitUserInput with an envelope");
++        };
++        assert_eq!(envelope.source, InputSource::Voice);
++    }
++
++    #[test]
++    fn put_artifact_round_trips_and_classification_is_explicit() {
++        // Voice v1 (rubric 8): the upload command carries its classification
++        // explicitly — nothing downstream may guess it from the bytes.
++        let body = CommandBody::PutArtifact {
++            media_type: "audio/wav".to_string(),
++            bytes_base64: "UklGRg==".to_string(),
++            sensitivity: DataClassification::Confidential,
++        };
++        let json = serde_json::to_string(&body).expect("serialize");
++        assert!(json.contains("audio/wav"));
++        assert!(json.contains("Confidential"));
++        assert_eq!(
++            serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
++            body
++        );
++    }
++
+     #[test]
+     fn every_command_body_round_trips() {
+         round_trip(CommandBody::CreateSession {
+@@ -597,6 +711,7 @@ mod tests {
+             text: "try again".to_string(),
+             mode: AgentMode::Build,
+             model: Some(ModelId("claude-sonnet-5".to_string())),
++            envelope: None,
+         });
+         // Also round-trip the unpinned continuation (no mid-conversation switch):
+         // the field is absent on the wire and reparses to None.
+@@ -605,6 +720,13 @@ mod tests {
+             text: "try again".to_string(),
+             mode: AgentMode::Build,
+             model: None,
++            envelope: None,
++        });
++        // Voice v1 (rubric 8): the upload half of the multimodal input path.
++        round_trip(CommandBody::PutArtifact {
++            media_type: "audio/wav".to_string(),
++            bytes_base64: "UklGRg==".to_string(),
++            sensitivity: DataClassification::Confidential,
+         });
+         round_trip(CommandBody::StartRun {
+             session_id: SessionId::new(),
+diff --git a/crates/protocol/src/envelope.rs b/crates/protocol/src/envelope.rs
+index 94e0206..19ac735 100644
+--- a/crates/protocol/src/envelope.rs
++++ b/crates/protocol/src/envelope.rs
+@@ -164,6 +164,15 @@ pub enum Payload {
+         command_id: CommandId,
+         plugins: Vec<crate::command::UiPluginLifecycleStatus>,
+     },
++    /// A `PutArtifact` command's reply (voice v1, rubric 8): the freshly minted
++    /// [`ArtifactRef`](crate::artifact::ArtifactRef) for the stored bytes. A
++    /// distinct reply from `CommandAccepted` because the client needs the ref
++    /// back — it is what an [`InputEnvelope`](crate::input::InputEnvelope)
++    /// audio block references on the next `SubmitUserInput`.
++    ArtifactStored {
++        command_id: CommandId,
++        artifact: crate::artifact::ArtifactRef,
++    },
+     /// A `ReadBlackboard` command's reply (Phase 5 STEP 5.3): the matching typed
+     /// artifacts on the workflow run's board. A distinct reply from
+     /// `CommandAccepted` because the client needs the items back, not just an
+@@ -519,6 +528,35 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn artifact_stored_payload_round_trips() {
++        use crate::artifact::{ArtifactRef, DataClassification};
++        use crate::ids::ArtifactId;
++
++        let command_id = CommandId::new();
++        let artifact = ArtifactRef {
++            id: ArtifactId::new(),
++            media_type: "audio/wav".to_string(),
++            byte_length: 64_000,
++            sha256: "c".repeat(64),
++            sensitivity: DataClassification::Confidential,
++        };
++        let stored = Payload::ArtifactStored {
++            command_id,
++            artifact: artifact.clone(),
++        };
++        match round_trip_payload(stored) {
++            Payload::ArtifactStored {
++                command_id: id,
++                artifact: got,
++            } => {
++                assert_eq!(id, command_id);
++                assert_eq!(got, artifact);
++            }
++            other => panic!("expected ArtifactStored, got {other:?}"),
++        }
++    }
++
+     #[test]
+     fn promotion_proposed_payload_round_trips() {
+         let command_id = CommandId::new();
+diff --git a/crates/protocol/tests/golden_vectors.rs b/crates/protocol/tests/golden_vectors.rs
+index ad497ad..8351a21 100644
+--- a/crates/protocol/tests/golden_vectors.rs
++++ b/crates/protocol/tests/golden_vectors.rs
+@@ -269,6 +269,11 @@ fn command_vectors() -> Vec<Vector> {
+                 text: "try again".to_string(),
+                 mode: AgentMode::Build,
+                 model: Some(ModelId("claude-sonnet-5".to_string())),
++                // `envelope: None` is skipped on the wire, so this vector's
++                // committed bytes are IDENTICAL to before the field existed —
++                // the additive-compatibility proof. The `Some` shape lives in
++                // `voice.json` (`voice_vectors`), a NEW vector file.
++                envelope: None,
+             },
+         ),
+         vec_of(
+@@ -1776,6 +1781,89 @@ fn input_vectors() -> Vec<Vector> {
+     ]
+ }
+ 
++// ---------------------------------------------------------------------------
++// Voice v1 (rubric 8): the audio-input wire shapes, in their OWN vector file so
++// the pre-existing files' committed bytes never change (additive-only rule).
++// ---------------------------------------------------------------------------
++
++fn voice_vectors() -> Vec<Vector> {
++    // The stored-audio ref a `PutArtifact` minted and a voice envelope cites.
++    let audio_ref = ArtifactRef {
++        id: artifact_id(),
++        media_type: "audio/wav".to_string(),
++        byte_length: 64_000,
++        sha256: "4".repeat(64),
++        sensitivity: DataClassification::Confidential,
++    };
++    vec![
++        vec_of(
++            "CommandBody_PutArtifact",
++            CommandBody::PutArtifact {
++                media_type: "audio/wav".to_string(),
++                bytes_base64: "UklGRiQAAABXQVZF".to_string(),
++                sensitivity: DataClassification::Confidential,
++            },
++        ),
++        // The un-transcribed submission a push-to-talk client sends: the daemon
++        // produces the transcript server-side, so the block carries none yet.
++        vec_of(
++            "CommandBody_SubmitUserInput_with_audio_envelope",
++            CommandBody::SubmitUserInput {
++                session_id: session_id(),
++                text: String::new(),
++                mode: AgentMode::Build,
++                model: None,
++                envelope: Some(InputEnvelope {
++                    source: InputSource::Voice,
++                    blocks: vec![InputBlock::Audio(AudioArtifact {
++                        original: audio_ref.clone(),
++                        transcript: None,
++                        duration_ms: Some(4_000),
++                        sample_rate_hz: Some(16_000),
++                    })],
++                    scope: ScopeLevel::Session,
++                    attachments: vec![],
++                }),
++            },
++        ),
++        // The transcribed shape the daemon persists: original + transcript
++        // linked (the original-is-never-replaced invariant on the wire).
++        vec_of(
++            "CommandBody_SubmitUserInput_with_transcribed_envelope",
++            CommandBody::SubmitUserInput {
++                session_id: session_id(),
++                text: "fix the flaky test".to_string(),
++                mode: AgentMode::Build,
++                model: None,
++                envelope: Some(InputEnvelope {
++                    source: InputSource::Voice,
++                    blocks: vec![InputBlock::Audio(AudioArtifact {
++                        original: audio_ref.clone(),
++                        transcript: Some(Transcript {
++                            text: "fix the flaky test".to_string(),
++                            mode: TranscriptionMode::Remote,
++                            model: Some(ModelId("whisper-large-v3-turbo".to_string())),
++                            reviewed: false,
++                            source_audio: artifact_id(),
++                        }),
++                        duration_ms: Some(4_000),
++                        sample_rate_hz: Some(16_000),
++                    })],
++                    scope: ScopeLevel::Session,
++                    attachments: vec![],
++                }),
++            },
++        ),
++        vec_of(
++            "Payload_ArtifactStored",
++            Payload::ArtifactStored {
++                command_id: command_id(),
++                artifact: audio_ref,
++            },
++        ),
++    ]
++}
++
+ // ---------------------------------------------------------------------------
+ // The single source of truth both the regenerator and the checks iterate.
+ // ---------------------------------------------------------------------------
+@@ -1796,6 +1884,9 @@ fn all_files() -> Vec<(&'static str, Vec<Vector>)> {
+         ("workflow.json", workflow_vectors()),
+         ("capabilities.json", capabilities_vectors()),
+         ("input.json", input_vectors()),
++        // Voice v1 additions live in their own file so every pre-existing
++        // vector file's committed bytes stay untouched (additive-only rule).
++        ("voice.json", voice_vectors()),
+     ]
+ }
+ 
+diff --git a/protocol-vectors/voice.json b/protocol-vectors/voice.json
+new file mode 100644
+index 0000000..40f607a
+--- /dev/null
++++ b/protocol-vectors/voice.json
+@@ -0,0 +1,96 @@
++{
++  "CommandBody_PutArtifact": {
++    "bytes_base64": "UklGRiQAAABXQVZF",
++    "media_type": "audio/wav",
++    "sensitivity": {
++      "type": "Confidential"
++    },
++    "type": "PutArtifact"
++  },
++  "CommandBody_SubmitUserInput_with_audio_envelope": {
++    "envelope": {
++      "blocks": [
++        {
++          "block": "audio",
++          "duration_ms": 4000,
++          "original": {
++            "byte_length": 64000,
++            "id": "80000000-0000-0000-0000-000000000001",
++            "media_type": "audio/wav",
++            "sensitivity": {
++              "type": "Confidential"
++            },
++            "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
++          },
++          "sample_rate_hz": 16000
++        }
++      ],
++      "scope": {
++        "type": "session"
++      },
++      "source": {
++        "type": "voice"
++      }
++    },
++    "mode": {
++      "type": "Build"
++    },
++    "session_id": "20000000-0000-0000-0000-000000000001",
++    "text": "",
++    "type": "SubmitUserInput"
++  },
++  "CommandBody_SubmitUserInput_with_transcribed_envelope": {
++    "envelope": {
++      "blocks": [
++        {
++          "block": "audio",
++          "duration_ms": 4000,
++          "original": {
++            "byte_length": 64000,
++            "id": "80000000-0000-0000-0000-000000000001",
++            "media_type": "audio/wav",
++            "sensitivity": {
++              "type": "Confidential"
++            },
++            "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
++          },
++          "sample_rate_hz": 16000,
++          "transcript": {
++            "mode": {
++              "type": "remote"
++            },
++            "model": "whisper-large-v3-turbo",
++            "reviewed": false,
++            "source_audio": "80000000-0000-0000-0000-000000000001",
++            "text": "fix the flaky test"
++          }
++        }
++      ],
++      "scope": {
++        "type": "session"
++      },
++      "source": {
++        "type": "voice"
++      }
++    },
++    "mode": {
++      "type": "Build"
++    },
++    "session_id": "20000000-0000-0000-0000-000000000001",
++    "text": "fix the flaky test",
++    "type": "SubmitUserInput"
++  },
++  "Payload_ArtifactStored": {
++    "artifact": {
++      "byte_length": 64000,
++      "id": "80000000-0000-0000-0000-000000000001",
++      "media_type": "audio/wav",
++      "sensitivity": {
++        "type": "Confidential"
++      },
++      "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
++    },
++    "command_id": "40000000-0000-0000-0000-000000000001",
++    "type": "ArtifactStored"
++  }
++}

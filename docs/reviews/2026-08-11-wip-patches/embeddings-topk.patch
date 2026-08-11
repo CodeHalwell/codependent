@@ -1,0 +1,1337 @@
+diff --git a/crates/knowledge/src/context.rs b/crates/knowledge/src/context.rs
+index 2e242aa..c3008fc 100644
+--- a/crates/knowledge/src/context.rs
++++ b/crates/knowledge/src/context.rs
+@@ -24,7 +24,7 @@ use crate::codegraph::CodeGraphError;
+ use crate::memory::{MemoryError, MemoryStore};
+ use crate::registry::{Registry, RegistryError};
+ use crate::retrieval::{
+-    retrieve, HashingEmbedder, RetrievalConfig, RetrievalError, RetrievalIndexes, RetrievalQuery,
++    retrieve, semantic_indexes, RetrievalConfig, RetrievalError, RetrievalQuery, SemanticEmbedder,
+ };
+ use crate::types::{EvidenceRef, MemoryRecord, RiskClass, Scope, ToolCard, TrustTier};
+ 
+@@ -220,6 +220,22 @@ pub async fn assemble_context(
+     repository: RepositoryId,
+     objective: &str,
+     scopes: &[Scope],
++) -> Result<ContextManifest, ContextError> {
++    assemble_context_with(pool, repository, objective, scopes, None).await
++}
++
++/// [`assemble_context`] with an injected embedding model (the `FactExtractor`
++/// injection pattern): when `semantic` is `Some`, dense retrieval runs over the
++/// persisted `registry_embeddings` vectors that model produced (missing items —
++/// and the query — embedded in one batch call), instead of the offline hashing
++/// embedder. `None` — or any model failure — keeps the exact pre-embedding
++/// behavior, so an unconfigured `models.toml` changes nothing.
++pub async fn assemble_context_with(
++    pool: &SqlitePool,
++    repository: RepositoryId,
++    objective: &str,
++    scopes: &[Scope],
++    semantic: Option<&dyn SemanticEmbedder>,
+ ) -> Result<ContextManifest, ContextError> {
+     // 1. Repository map — fold the persisted graph into the compact tree.
+     let repository_map = crate::repomap::repository_map(pool, repository)
+@@ -228,12 +244,13 @@ pub async fn assemble_context(
+ 
+     // 2. Retrieve the disclosed tool + skill cards over the whole registry.
+     let items = Registry::new().list(pool).await?;
+-    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new())?;
+-    let query = RetrievalQuery::new(
++    let (indexes, query_vector) = semantic_indexes(pool, &items, semantic, objective).await?;
++    let mut query = RetrievalQuery::new(
+         objective,
+         visible_scopes(repository, scopes),
+         RiskClass::Medium,
+     );
++    query.query_vector = query_vector;
+     let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default())?;
+     let tool_cards = result.tools.iter().map(ContextCard::from_card).collect();
+     let skill_cards = result.skills.iter().map(ContextCard::from_card).collect();
+diff --git a/crates/knowledge/src/lib.rs b/crates/knowledge/src/lib.rs
+index d70f032..dc8d4a1 100644
+--- a/crates/knowledge/src/lib.rs
++++ b/crates/knowledge/src/lib.rs
+@@ -49,9 +49,11 @@ pub use registry::{resolve_shadowed, Registry, RegistryError};
+ pub use skill_exec::{profile_for_permissions, run_script, SkillExecError};
+ 
+ pub use retrieval::{
+-    embedding_text, retrieve, Bm25Error, Bm25Index, Embedder, HashingEmbedder, RerankWeights,
+-    RetrievalConfig, RetrievalError, RetrievalIndexes, RetrievalQuery, RetrievalResult,
+-    RetrievalTrace, VectorIndex, EMBEDDING_DIMENSION,
++    drain_outbox, embedding_content_hash, embedding_text, reconcile_embeddings, retrieve,
++    semantic_indexes, Bm25Error, Bm25Index, DrainReport, EmbedError, Embedder, HashingEmbedder,
++    PersistError, RerankWeights, RetrievalConfig, RetrievalError, RetrievalIndexes,
++    RetrievalQuery, RetrievalResult, RetrievalTrace, SemanticEmbedder, StoredEmbedding,
++    VectorIndex, EMBEDDING_DIMENSION,
+ };
+ 
+ pub use adapter::{
+diff --git a/crates/knowledge/src/retrieval/embed.rs b/crates/knowledge/src/retrieval/embed.rs
+index fab8ce7..baa6add 100644
+--- a/crates/knowledge/src/retrieval/embed.rs
++++ b/crates/knowledge/src/retrieval/embed.rs
+@@ -28,6 +28,31 @@ pub trait Embedder {
+     fn embed(&self, text: &str) -> Vec<f32>;
+ }
+ 
++/// A failure calling a remote embedding model. Carries only a legible reason —
++/// callers degrade to the [`HashingEmbedder`] on any error, never fail a run.
++#[derive(Debug, thiserror::Error)]
++#[error("embedding failed: {0}")]
++pub struct EmbedError(pub String);
++
++/// A real (remote) embedding model behind an async seam — the `FactExtractor`
++/// pattern: this crate defines the trait and stays model-free (ADR-009); the
++/// runtime implements it over an OpenAI-compatible `/embeddings` endpoint
++/// configured by `models.toml`'s `[embedding]` entry, and the daemon injects it
++/// into context assembly and the index-outbox drain. Distinct from the sync
++/// [`Embedder`] (which the funnel calls inline for the offline hashing model):
++/// a network model must be batched and awaited, so its seam is async and
++/// fallible — any error degrades retrieval to the hashing embedder.
++#[async_trait::async_trait]
++pub trait SemanticEmbedder: Send + Sync {
++    /// The provider-side model name identifying this embedding space. Persisted
++    /// alongside every vector so a model change invalidates stored rows.
++    fn model(&self) -> &str;
++
++    /// Embed `texts` into dense vectors, one per input, in input order. All
++    /// vectors must share one dimensionality.
++    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError>;
++}
++
+ /// A deterministic, offline embedder: hashed character trigrams, term-frequency
+ /// weighted, projected into [`EMBEDDING_DIMENSION`] buckets and L2-normalized.
+ ///
+diff --git a/crates/knowledge/src/retrieval/mod.rs b/crates/knowledge/src/retrieval/mod.rs
+index fae5e43..c3454e1 100644
+--- a/crates/knowledge/src/retrieval/mod.rs
++++ b/crates/knowledge/src/retrieval/mod.rs
+@@ -23,6 +23,7 @@
+ mod bm25;
+ mod config;
+ mod embed;
++mod persist;
+ mod vector;
+ 
+ use std::collections::{HashMap, HashSet};
+@@ -35,7 +36,11 @@ use crate::types::{
+ 
+ pub use bm25::{Bm25Error, Bm25Index};
+ pub use config::{RerankWeights, RetrievalConfig};
+-pub use embed::{Embedder, HashingEmbedder, EMBEDDING_DIMENSION};
++pub use embed::{EmbedError, Embedder, HashingEmbedder, SemanticEmbedder, EMBEDDING_DIMENSION};
++pub use persist::{
++    drain_outbox, embedding_content_hash, load_embeddings, reconcile_embeddings,
++    semantic_indexes, upsert_embedding, DrainReport, PersistError, StoredEmbedding,
++};
+ pub use vector::VectorIndex;
+ 
+ /// A failure building the derived indexes or running retrieval.
+@@ -64,11 +69,20 @@ pub struct RetrievalQuery {
+     /// Ids of items that recently succeeded on similar tasks (history source);
+     /// empty when no history is available.
+     pub history: Vec<RegistryItemId>,
++    /// A pre-computed dense vector for [`text`](Self::text), in the SAME space
++    /// as the indexes' [`VectorIndex`]. `None` (the default) embeds the query
++    /// through the indexes' retained [`Embedder`] — today's behavior. Set by
++    /// [`semantic_indexes`] callers, whose item vectors come from an async
++    /// remote model the sync funnel cannot call: without the override the query
++    /// would be embedded in a different space than the items and dense scoring
++    /// would silently degrade to zero.
++    pub query_vector: Option<Vec<f32>>,
+ }
+ 
+ impl RetrievalQuery {
+     /// A query with the common defaults: no history, [`TrustTier::Untrusted`]
+-    /// floor (admit every tier), and the given text/scopes/ceiling.
++    /// floor (admit every tier), the retained-embedder query vector, and the
++    /// given text/scopes/ceiling.
+     #[must_use]
+     pub fn new(
+         text: impl Into<String>,
+@@ -81,6 +95,7 @@ impl RetrievalQuery {
+             risk_ceiling,
+             min_trust: TrustTier::Untrusted,
+             history: Vec::new(),
++            query_vector: None,
+         }
+     }
+ }
+@@ -148,6 +163,29 @@ impl RetrievalIndexes {
+             embedder: Box::new(embedder),
+         })
+     }
++
++    /// Assemble indexes from an already-built [`VectorIndex`] (persisted /
++    /// remote-model vectors), building only BM25 over `items` here. `embedder`
++    /// is retained as the query-time fallback; a caller whose vector index came
++    /// from a DIFFERENT embedding space must pass the matching query vector via
++    /// [`RetrievalQuery::query_vector`] — a fallback-embedded query then scores
++    /// dense 0 (cosine of mismatched dims), degrading gracefully rather than
++    /// mis-ranking.
++    pub fn from_parts<E>(
++        items: &[RegistryItem],
++        vector: VectorIndex,
++        embedder: E,
++    ) -> Result<Self, RetrievalError>
++    where
++        E: Embedder + Send + Sync + 'static,
++    {
++        let bm25 = Bm25Index::build(items)?;
++        Ok(Self {
++            vector,
++            bm25,
++            embedder: Box::new(embedder),
++        })
++    }
+ }
+ 
+ /// The text a registry item is embedded from: its name, description, and intents
+@@ -177,7 +215,12 @@ pub fn retrieve(
+         items.iter().map(|item| (item.id, item)).collect();
+ 
+     // ---- Candidate union: four complementary sources ------------------------
+-    let query_vec = indexes.embedder.embed(&query.text);
++    // A caller-supplied vector (async/remote model, same space as the index)
++    // wins; otherwise the retained embedder embeds the query as before.
++    let query_vec = match &query.query_vector {
++        Some(vector) => vector.clone(),
++        None => indexes.embedder.embed(&query.text),
++    };
+     let dense = indexes.vector.search(&query_vec, config.dense_top);
+     let lexical = indexes.bm25.search(&query.text, config.bm25_top)?;
+     let exact = exact_match(items, &query.text, config.exact_top);
+diff --git a/crates/knowledge/src/retrieval/persist.rs b/crates/knowledge/src/retrieval/persist.rs
+new file mode 100644
+index 0000000..9de40b5
+--- /dev/null
++++ b/crates/knowledge/src/retrieval/persist.rs
+@@ -0,0 +1,424 @@
++//! Persisted registry vectors + the index-outbox drain (rubric 9).
++//!
++//! Two jobs, both over the `registry_embeddings` table (migration 0022):
++//!
++//! 1. **Persistence** — store one dense vector per registry item, keyed by the
++//!    SHA-256 of its retrieval text and stamped with the embedding model + dims,
++//!    so [`semantic_indexes`] loads vectors instead of re-embedding every item on
++//!    every `assemble_context`, and a description edit / model switch / dims
++//!    mismatch is detected as staleness and re-embedded.
++//! 2. **The drain** — the first real consumer of the Chapter 06 `index_outbox`:
++//!    [`drain_outbox`] claims unprocessed rows, refreshes the vector rows for
++//!    changed registry items (deleting rows for removed items), and stamps every
++//!    row processed so the outbox stops growing without bound. Non-registry
++//!    kinds pass through [`handle_non_registry_event`], the deliberate hook where
++//!    document/memory/symbol indexing plugs in later.
++//!
++//! Everything here is derived data over `registry_items` authority: deletable at
++//! any time, rebuilt by replaying the outbox (or by [`reconcile_embeddings`],
++//! the full-scan form the daemon runs at startup so items written while no
++//! embedding model was configured are picked up).
++
++use std::collections::HashMap;
++
++use chrono::{DateTime, Utc};
++use codypendent_protocol::RegistryItemId;
++use sha2::{Digest, Sha256};
++use sqlx::SqlitePool;
++
++use crate::outbox::{self, OutboxRow};
++use crate::registry::Registry;
++use crate::types::RegistryItem;
++
++use super::embed::{EmbedError, SemanticEmbedder};
++use super::{embedding_text, HashingEmbedder, RetrievalIndexes, VectorIndex};
++
++/// A failure loading/storing persisted vectors or draining the outbox.
++#[derive(Debug, thiserror::Error)]
++pub enum PersistError {
++    #[error(transparent)]
++    Database(#[from] sqlx::Error),
++    /// The registry read behind a drain step failed.
++    #[error(transparent)]
++    Registry(#[from] crate::registry::RegistryError),
++    /// The embedding model call failed (the drain leaves the rows unprocessed
++    /// and retries on the next pass).
++    #[error(transparent)]
++    Embed(#[from] EmbedError),
++}
++
++/// One persisted vector row, as loaded for staleness checks and index builds.
++#[derive(Debug, Clone, PartialEq)]
++pub struct StoredEmbedding {
++    /// Hex SHA-256 of the text the vector was computed from.
++    pub content_hash: String,
++    /// The embedding model that produced it.
++    pub model: String,
++    /// The vector's dimensionality.
++    pub dims: usize,
++    /// The vector itself.
++    pub vector: Vec<f32>,
++}
++
++/// The hex SHA-256 of an item's retrieval text — the persistence key that makes
++/// a description/intent edit invalidate its stored vector.
++#[must_use]
++pub fn embedding_content_hash(text: &str) -> String {
++    hex::encode(Sha256::digest(text.as_bytes()))
++}
++
++/// Encode a vector as little-endian f32 bytes (the `vector BLOB` column).
++fn encode_vector(vector: &[f32]) -> Vec<u8> {
++    let mut bytes = Vec::with_capacity(vector.len() * 4);
++    for value in vector {
++        bytes.extend_from_slice(&value.to_le_bytes());
++    }
++    bytes
++}
++
++/// Decode a `vector BLOB` back into f32s. A ragged byte length (not a multiple
++/// of 4) truncates to whole values — the dims check upstream treats such a row
++/// as stale rather than erroring.
++fn decode_vector(bytes: &[u8]) -> Vec<f32> {
++    bytes
++        .chunks_exact(4)
++        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
++        .collect()
++}
++
++/// Load every persisted vector, keyed by item id. The caller filters by
++/// model/hash/dims per item (staleness is per-row, not per-table).
++pub async fn load_embeddings(
++    pool: &SqlitePool,
++) -> Result<HashMap<RegistryItemId, StoredEmbedding>, PersistError> {
++    let rows: Vec<(String, String, String, i64, Vec<u8>)> = sqlx::query_as(
++        "SELECT item_id, content_hash, model, dims, vector FROM registry_embeddings",
++    )
++    .fetch_all(pool)
++    .await?;
++    let mut out = HashMap::with_capacity(rows.len());
++    for (item_id, content_hash, model, dims, vector) in rows {
++        let Ok(id) = item_id.parse::<RegistryItemId>() else {
++            continue; // an unparseable id is dead derived data; the drain replaces it
++        };
++        out.insert(
++            id,
++            StoredEmbedding {
++                content_hash,
++                model,
++                dims: usize::try_from(dims).unwrap_or(0),
++                vector: decode_vector(&vector),
++            },
++        );
++    }
++    Ok(out)
++}
++
++/// Insert or replace one item's persisted vector.
++pub async fn upsert_embedding(
++    pool: &SqlitePool,
++    item_id: RegistryItemId,
++    content_hash: &str,
++    model: &str,
++    vector: &[f32],
++    now: DateTime<Utc>,
++) -> Result<(), PersistError> {
++    sqlx::query(
++        "INSERT OR REPLACE INTO registry_embeddings \
++         (item_id, content_hash, model, dims, vector, updated_at) \
++         VALUES (?, ?, ?, ?, ?, ?)",
++    )
++    .bind(item_id.to_string())
++    .bind(content_hash)
++    .bind(model)
++    .bind(vector.len() as i64)
++    .bind(encode_vector(vector))
++    .bind(now.to_rfc3339())
++    .execute(pool)
++    .await?;
++    Ok(())
++}
++
++/// Drop one item's persisted vector (its authoritative row was removed).
++pub async fn delete_embedding(
++    pool: &SqlitePool,
++    item_id: RegistryItemId,
++) -> Result<(), PersistError> {
++    sqlx::query("DELETE FROM registry_embeddings WHERE item_id = ?")
++        .bind(item_id.to_string())
++        .execute(pool)
++        .await?;
++    Ok(())
++}
++
++/// Whether `stored` is fresh for (`model`, `content_hash`): same model, same
++/// text hash, and the dims recorded actually match the vector's length (a model
++/// change usually flips the hash comparison via `model`; the explicit dims check
++/// additionally catches a provider that changed output width under one name).
++fn is_fresh(stored: &StoredEmbedding, model: &str, content_hash: &str) -> bool {
++    stored.model == model && stored.content_hash == content_hash && stored.dims == stored.vector.len()
++}
++
++/// What one maintenance pass did — logged by the daemon job, asserted by tests.
++#[derive(Debug, Default, Clone, PartialEq, Eq)]
++pub struct DrainReport {
++    /// Outbox rows stamped processed this pass.
++    pub processed: usize,
++    /// Registry vectors recomputed and persisted.
++    pub embedded: usize,
++    /// Persisted vectors dropped because their item was removed.
++    pub deleted: usize,
++    /// Non-registry outbox rows passed to the (currently no-op) hook.
++    pub deferred_kinds: usize,
++}
++
++/// The plug point for non-registry outbox kinds (`memory_changed`,
++/// `symbol_changed`, `document_changed`, `artifact_created`). Document indexing
++/// (and the rest) slots in here later; today the row is acknowledged so the
++/// outbox drains instead of growing forever — the derived indexes for those
++/// kinds are still rebuilt from authority on demand, so acknowledging loses
++/// nothing.
++fn handle_non_registry_event(row: &OutboxRow) {
++    tracing::trace!(kind = %row.event_kind, entity = %row.entity_id, "no derived index consumes this outbox kind yet");
++}
++
++/// Drain up to `limit` unprocessed `index_outbox` rows.
++///
++/// For each `registry_item_changed` row: re-read the item from authority; if it
++/// still exists and `embedder` is configured, refresh its persisted vector when
++/// stale (model/hash/dims mismatch — the re-embed trigger); if it was removed,
++/// drop the vector row. Other kinds go through [`handle_non_registry_event`].
++/// Every handled row is stamped processed. An embedding failure aborts the pass
++/// with rows left unprocessed, so the next pass retries — the outbox is the
++/// at-least-once retry queue.
++///
++/// With no `embedder` the drain still consumes rows (there is nothing to
++/// persist for the hashing model — it embeds inline at query time); a later
++/// [`reconcile_embeddings`] pass backfills vectors once a model is configured.
++pub async fn drain_outbox(
++    pool: &SqlitePool,
++    embedder: Option<&dyn SemanticEmbedder>,
++    limit: i64,
++) -> Result<DrainReport, PersistError> {
++    let rows = outbox::unprocessed(pool, limit).await?;
++    let mut report = DrainReport::default();
++    let registry = Registry::new();
++    for row in rows {
++        if row.event_kind == "registry_item_changed" {
++            if let Ok(item_id) = row.entity_id.parse::<RegistryItemId>() {
++                match registry.get(pool, item_id).await? {
++                    Some(item) => {
++                        if let Some(embedder) = embedder {
++                            report.embedded +=
++                                refresh_item_embedding(pool, embedder, &item).await?;
++                        }
++                    }
++                    None => {
++                        delete_embedding(pool, item_id).await?;
++                        report.deleted += 1;
++                    }
++                }
++            }
++        } else {
++            handle_non_registry_event(&row);
++            report.deferred_kinds += 1;
++        }
++        outbox::mark_processed(pool, &row.id, Utc::now()).await?;
++        report.processed += 1;
++    }
++    Ok(report)
++}
++
++/// Refresh one item's persisted vector if stale; returns how many vectors were
++/// written (0 or 1).
++async fn refresh_item_embedding(
++    pool: &SqlitePool,
++    embedder: &dyn SemanticEmbedder,
++    item: &RegistryItem,
++) -> Result<usize, PersistError> {
++    let text = embedding_text(item);
++    let hash = embedding_content_hash(&text);
++    let stored: Option<(String, String, i64, Vec<u8>)> = sqlx::query_as(
++        "SELECT content_hash, model, dims, vector FROM registry_embeddings WHERE item_id = ?",
++    )
++    .bind(item.id.to_string())
++    .fetch_optional(pool)
++    .await?;
++    if let Some((content_hash, model, dims, vector)) = stored {
++        let stored = StoredEmbedding {
++            content_hash,
++            model,
++            dims: usize::try_from(dims).unwrap_or(0),
++            vector: decode_vector(&vector),
++        };
++        if is_fresh(&stored, embedder.model(), &hash) {
++            return Ok(0);
++        }
++    }
++    let mut vectors = embedder.embed_batch(std::slice::from_ref(&text)).await?;
++    let Some(vector) = vectors.pop().filter(|v| !v.is_empty()) else {
++        return Err(PersistError::Embed(EmbedError(
++            "embedding model returned no vector".to_string(),
++        )));
++    };
++    upsert_embedding(pool, item.id, &hash, embedder.model(), &vector, Utc::now()).await?;
++    Ok(1)
++}
++
++/// Full-scan reconcile: persist a fresh vector for every listed registry item
++/// whose stored row is missing or stale for `embedder`'s model. Returns how
++/// many vectors were written. The daemon runs this at startup (and after model
++/// changes), so items written while embeddings were unconfigured — whose outbox
++/// rows an earlier drain already consumed — still get vectors.
++pub async fn reconcile_embeddings(
++    pool: &SqlitePool,
++    embedder: &dyn SemanticEmbedder,
++) -> Result<usize, PersistError> {
++    let items = Registry::new().list(pool).await?;
++    let stored = load_embeddings(pool).await?;
++    let mut written = 0;
++    for item in &items {
++        let text = embedding_text(item);
++        let hash = embedding_content_hash(&text);
++        let fresh = stored
++            .get(&item.id)
++            .is_some_and(|row| is_fresh(row, embedder.model(), &hash));
++        if fresh {
++            continue;
++        }
++        written += refresh_item_embedding(pool, embedder, item).await?;
++    }
++    Ok(written)
++}
++
++/// Build the derived retrieval indexes for `items`, plus the query vector for
++/// `query_text`, preferring the configured semantic model.
++///
++/// - **No `semantic` model** (or any model failure): both indexes are built
++///   exactly as before — the offline [`HashingEmbedder`] embeds every item and
++///   the query inline — and the returned query vector is `None`, so
++///   [`retrieve`](super::retrieve) embeds the query through the retained
++///   hashing embedder. Behavior-identical to the pre-embedding code.
++/// - **With a model**: item vectors come from `registry_embeddings` where fresh
++///   (the drain keeps them so); items missing a fresh vector — plus the query —
++///   are embedded in ONE batch call, and the freshly computed item vectors are
++///   persisted so the next assembly is warm. The returned query vector is in
++///   the same space as the index, and the caller passes it through
++///   [`RetrievalQuery::query_vector`](super::RetrievalQuery::query_vector) so
++///   the funnel never mixes embedding spaces.
++///
++/// Every model-path failure (endpoint down, dims mismatch, bad response)
++/// degrades to the hashing pair with a warning — retrieval is an aid, never a
++/// gate on running.
++pub async fn semantic_indexes(
++    pool: &SqlitePool,
++    items: &[RegistryItem],
++    semantic: Option<&dyn SemanticEmbedder>,
++    query_text: &str,
++) -> Result<(RetrievalIndexes, Option<Vec<f32>>), super::RetrievalError> {
++    let Some(embedder) = semantic else {
++        return Ok((RetrievalIndexes::build(items, HashingEmbedder::new())?, None));
++    };
++    match semantic_vectors(pool, items, embedder, query_text).await {
++        Ok((vector_index, query_vector)) => {
++            let indexes =
++                RetrievalIndexes::from_parts(items, vector_index, HashingEmbedder::new())?;
++            Ok((indexes, Some(query_vector)))
++        }
++        Err(error) => {
++            tracing::warn!(model = embedder.model(), %error, "semantic embedding unavailable; falling back to the hashing embedder");
++            Ok((RetrievalIndexes::build(items, HashingEmbedder::new())?, None))
++        }
++    }
++}
++
++/// The semantic half of [`semantic_indexes`]: assemble the item vector index
++/// from persisted + freshly batched vectors, and embed the query in the same
++/// call. Fails (for the caller to degrade on) rather than mixing spaces.
++async fn semantic_vectors(
++    pool: &SqlitePool,
++    items: &[RegistryItem],
++    embedder: &dyn SemanticEmbedder,
++    query_text: &str,
++) -> Result<(VectorIndex, Vec<f32>), PersistError> {
++    let stored = load_embeddings(pool).await?;
++
++    // Split items into (persisted-fresh) and (must-embed-now).
++    let mut fresh: Vec<(RegistryItemId, Vec<f32>)> = Vec::new();
++    let mut missing: Vec<(&RegistryItem, String, String)> = Vec::new(); // (item, text, hash)
++    for item in items {
++        let text = embedding_text(item);
++        let hash = embedding_content_hash(&text);
++        match stored.get(&item.id) {
++            Some(row) if is_fresh(row, embedder.model(), &hash) => {
++                fresh.push((item.id, row.vector.clone()));
++            }
++            _ => missing.push((item, text, hash)),
++        }
++    }
++
++    // One batch call: every missing item's text, then the query, last.
++    let mut batch: Vec<String> = missing.iter().map(|(_, text, _)| text.clone()).collect();
++    batch.push(query_text.to_string());
++    let mut vectors = embedder.embed_batch(&batch).await?;
++    if vectors.len() != batch.len() {
++        return Err(PersistError::Embed(EmbedError(format!(
++            "embedding model returned {} vectors for {} inputs",
++            vectors.len(),
++            batch.len()
++        ))));
++    }
++    let query_vector = vectors.pop().expect("batch always includes the query");
++
++    let mut index = VectorIndex::new();
++    for (id, vector) in fresh {
++        index.insert(id, vector);
++    }
++    let now = Utc::now();
++    for ((item, _text, hash), vector) in missing.iter().zip(vectors) {
++        // Persist opportunistically so the next assembly (and the drain) find
++        // the row fresh; the drain remains the authoritative refresher.
++        upsert_embedding(pool, item.id, hash, embedder.model(), &vector, now).await?;
++        index.insert(item.id, vector);
++    }
++    Ok((index, query_vector))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn vector_blob_round_trips_exactly() {
++        let vector = vec![0.0_f32, 1.5, -2.25, f32::MIN_POSITIVE];
++        assert_eq!(decode_vector(&encode_vector(&vector)), vector);
++    }
++
++    #[test]
++    fn ragged_blob_decodes_whole_values_only() {
++        let mut bytes = encode_vector(&[1.0, 2.0]);
++        bytes.push(0xFF); // a trailing partial value
++        assert_eq!(decode_vector(&bytes), vec![1.0, 2.0]);
++    }
++
++    #[test]
++    fn freshness_requires_model_hash_and_dims_agreement() {
++        let stored = StoredEmbedding {
++            content_hash: "abc".to_string(),
++            model: "m1".to_string(),
++            dims: 2,
++            vector: vec![0.1, 0.2],
++        };
++        assert!(is_fresh(&stored, "m1", "abc"));
++        assert!(!is_fresh(&stored, "m2", "abc"), "a model change is stale");
++        assert!(!is_fresh(&stored, "m1", "xyz"), "a text change is stale");
++        let mismatched = StoredEmbedding {
++            dims: 3,
++            ..stored.clone()
++        };
++        assert!(
++            !is_fresh(&mismatched, "m1", "abc"),
++            "a dims/vector mismatch is stale"
++        );
++    }
++}
+diff --git a/crates/knowledge/tests/embedding_persist_it.rs b/crates/knowledge/tests/embedding_persist_it.rs
+new file mode 100644
+index 0000000..68b917c
+--- /dev/null
++++ b/crates/knowledge/tests/embedding_persist_it.rs
+@@ -0,0 +1,304 @@
++//! Persisted registry vectors + the index-outbox drain (rubric 9): an outbox
++//! row written by a registry change is drained into a `registry_embeddings`
++//! row, retrieval sees the fresh content through the persisted vectors, and a
++//! model/dims change invalidates stored rows (re-embed on the next pass).
++
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++use codypendent_knowledge::retrieval::{
++    drain_outbox, embedding_content_hash, load_embeddings, reconcile_embeddings, retrieve,
++    semantic_indexes, EmbedError, RetrievalConfig, SemanticEmbedder,
++};
++use codypendent_knowledge::types::{
++    Provenance, RegistryItem, RegistryItemKind, RegistryStatus, RiskClass, Scope, TrustMetadata,
++    TrustTier, Version,
++};
++use codypendent_knowledge::{db, embedding_text, Registry, RetrievalQuery};
++use codypendent_protocol::RegistryItemId;
++
++/// A deterministic stand-in for a remote embedding model: three axes counting
++/// marker-word occurrences ("tests", "diff", "deploy"), L2-normalized. Real
++/// enough that dense cosine ranks a "run the tests" query onto a tests-worded
++/// item, deterministic enough for CI, and dimensionally DIFFERENT from the
++/// hashing embedder (3 vs 512) so a space mix-up cannot pass silently.
++struct MarkerEmbedder {
++    model: String,
++    calls: AtomicUsize,
++    fail: bool,
++}
++
++impl MarkerEmbedder {
++    fn new(model: &str) -> Self {
++        Self {
++            model: model.to_string(),
++            calls: AtomicUsize::new(0),
++            fail: false,
++        }
++    }
++
++    fn failing() -> Self {
++        Self {
++            model: "unreachable-model".to_string(),
++            calls: AtomicUsize::new(0),
++            fail: true,
++        }
++    }
++
++    fn embed_one(text: &str) -> Vec<f32> {
++        let lower = text.to_ascii_lowercase();
++        let mut v = vec![
++            lower.matches("test").count() as f32,
++            lower.matches("diff").count() as f32,
++            lower.matches("deploy").count() as f32,
++        ];
++        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
++        if norm > 0.0 {
++            for x in &mut v {
++                *x /= norm;
++            }
++        }
++        v
++    }
++}
++
++#[async_trait::async_trait]
++impl SemanticEmbedder for MarkerEmbedder {
++    fn model(&self) -> &str {
++        &self.model
++    }
++
++    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
++        self.calls.fetch_add(1, Ordering::SeqCst);
++        if self.fail {
++            return Err(EmbedError("endpoint unreachable".to_string()));
++        }
++        Ok(texts.iter().map(|t| Self::embed_one(t)).collect())
++    }
++}
++
++fn tool(name: &str, description: &str) -> RegistryItem {
++    let now = chrono::Utc::now();
++    RegistryItem {
++        id: RegistryItemId::new(),
++        kind: RegistryItemKind::Tool,
++        name: name.to_string(),
++        version: Version("1.0.0".to_string()),
++        scope: Scope::System,
++        description: description.to_string(),
++        intents: Vec::new(),
++        keywords: Vec::new(),
++        examples: Vec::new(),
++        input_schema: None,
++        output_schema: None,
++        dependencies: Vec::new(),
++        permissions: Vec::new(),
++        risk: RiskClass::Safe,
++        provenance: Provenance::BuiltIn,
++        trust: TrustMetadata {
++            publisher: "codypendent".to_string(),
++            signature_required: false,
++            signature: None,
++            tier: TrustTier::FirstParty,
++        },
++        status: RegistryStatus::Active,
++        content_hash: String::new(),
++        executable: true,
++        created_at: now,
++        updated_at: now,
++    }
++}
++
++async fn temp_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
++    let tmp = tempfile::tempdir().unwrap();
++    let pool = db::open(&tmp.path().join("codypendent.db")).await.unwrap();
++    (tmp, pool)
++}
++
++/// The headline flow: registry write → outbox row → drain → vector row →
++/// content change → drain → vector row UPDATED → retrieval (persisted vectors +
++/// same-space query vector) discloses by the fresh content.
++#[tokio::test]
++async fn outbox_drain_persists_and_refreshes_vectors_retrieval_sees_fresh_content() {
++    let (_tmp, pool) = temp_pool().await;
++    let registry = Registry::new();
++    let embedder = MarkerEmbedder::new("marker-3d");
++
++    let mut item = tool("repo.verify", "verify the change by running the tests");
++    registry.upsert(&pool, &item).await.unwrap();
++
++    // Drain the registry-change outbox row into a persisted vector.
++    let report = drain_outbox(&pool, Some(&embedder), 100).await.unwrap();
++    assert_eq!(report.processed, 1, "one outbox row consumed");
++    assert_eq!(report.embedded, 1, "one vector persisted");
++    let stored = load_embeddings(&pool).await.unwrap();
++    let first = stored.get(&item.id).expect("vector row exists");
++    assert_eq!(first.model, "marker-3d");
++    assert_eq!(first.dims, 3);
++    assert_eq!(
++        first.content_hash,
++        embedding_content_hash(&embedding_text(&item))
++    );
++
++    // A second drain is a no-op: nothing unprocessed, nothing re-embedded.
++    let idle = drain_outbox(&pool, Some(&embedder), 100).await.unwrap();
++    assert_eq!(idle.processed, 0);
++
++    // Change the item's retrieval text → new outbox row → drained → row updated.
++    item.description = "compute the diff between two revisions".to_string();
++    registry.upsert(&pool, &item).await.unwrap();
++    let report = drain_outbox(&pool, Some(&embedder), 100).await.unwrap();
++    assert_eq!((report.processed, report.embedded), (1, 1));
++    let stored = load_embeddings(&pool).await.unwrap();
++    let second = stored.get(&item.id).expect("vector row still exists");
++    assert_ne!(
++        second.content_hash, first.content_hash,
++        "a content change must refresh the persisted hash"
++    );
++    assert_ne!(second.vector, first.vector, "and the vector itself");
++
++    // Retrieval over the PERSISTED vectors sees the fresh content: the item now
++    // answers a "diff" query dense-first (no keywords/intents, so exact overlap
++    // cannot carry it; the marker space puts all its weight on the diff axis).
++    let items = registry.list(&pool).await.unwrap();
++    let (indexes, query_vector) = semantic_indexes(&pool, &items, Some(&embedder), "show the diff")
++        .await
++        .unwrap();
++    let calls_after_build = embedder.calls.load(Ordering::SeqCst);
++    let mut query = RetrievalQuery::new("show the diff", vec![Scope::System], RiskClass::Medium);
++    query.query_vector = query_vector;
++    let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default()).unwrap();
++    assert!(
++        result.tools.iter().any(|card| card.name == "repo.verify"),
++        "retrieval must disclose by the item's FRESH content: {:?}",
++        result.tools
++    );
++    // The assembly embedded ONLY the query (items came from persisted rows):
++    // exactly one batch call, so persisted vectors genuinely replaced
++    // per-assembly recomputation.
++    assert_eq!(
++        calls_after_build,
++        3, // two drains that embedded + one assembly (query-only)
++        "assembly must not re-embed persisted items"
++    );
++}
++
++/// A model change (different name → different space, possibly different dims)
++/// makes every stored row stale: the next drain/reconcile re-embeds under the
++/// new model rather than serving cross-space vectors.
++#[tokio::test]
++async fn dimension_or_model_mismatch_triggers_reembed() {
++    let (_tmp, pool) = temp_pool().await;
++    let registry = Registry::new();
++    let item = tool("workspace.probe", "probe the workspace tests");
++    registry.upsert(&pool, &item).await.unwrap();
++
++    let old = MarkerEmbedder::new("old-model");
++    drain_outbox(&pool, Some(&old), 100).await.unwrap();
++    let stored = load_embeddings(&pool).await.unwrap();
++    assert_eq!(stored.get(&item.id).unwrap().model, "old-model");
++
++    // Same item, new model: the outbox is already drained, so RECONCILE is the
++    // pass that must notice the model mismatch and rewrite the row.
++    let new = MarkerEmbedder::new("new-model");
++    let rewritten = reconcile_embeddings(&pool, &new).await.unwrap();
++    assert_eq!(rewritten, 1, "the stale-model row must be re-embedded");
++    let stored = load_embeddings(&pool).await.unwrap();
++    let row = stored.get(&item.id).unwrap();
++    assert_eq!(row.model, "new-model");
++    assert_eq!(row.dims, row.vector.len(), "dims must match the vector");
++
++    // Reconcile is idempotent once fresh.
++    assert_eq!(reconcile_embeddings(&pool, &new).await.unwrap(), 0);
++}
++
++/// Removing an item drains into a DELETE of its vector row; non-registry outbox
++/// kinds are acknowledged through the documented hook so the outbox never grows
++/// without bound.
++#[tokio::test]
++async fn drain_deletes_removed_items_and_acknowledges_other_kinds() {
++    let (_tmp, pool) = temp_pool().await;
++    let registry = Registry::new();
++    let embedder = MarkerEmbedder::new("marker-3d");
++
++    let item = tool("doomed.tool", "temporarily present tests helper");
++    registry.upsert(&pool, &item).await.unwrap();
++    drain_outbox(&pool, Some(&embedder), 100).await.unwrap();
++    assert!(load_embeddings(&pool)
++        .await
++        .unwrap()
++        .contains_key(&item.id));
++
++    registry.remove(&pool, item.id).await.unwrap();
++    // A non-registry kind rides the same queue (the plug-in hook's path).
++    codypendent_knowledge::outbox::enqueue(
++        &pool,
++        &codypendent_knowledge::KnowledgeIndexEvent::DocumentChanged(
++            codypendent_protocol::DocumentId::new(),
++        ),
++        chrono::Utc::now(),
++    )
++    .await
++    .unwrap();
++
++    let report = drain_outbox(&pool, Some(&embedder), 100).await.unwrap();
++    assert_eq!(report.processed, 2, "both rows consumed");
++    assert_eq!(report.deleted, 1, "the removed item's vector row is dropped");
++    assert_eq!(report.deferred_kinds, 1, "the document row hit the hook");
++    assert!(
++        !load_embeddings(&pool).await.unwrap().contains_key(&item.id),
++        "no orphan vector row may remain"
++    );
++    // Nothing left unprocessed.
++    let idle = drain_outbox(&pool, Some(&embedder), 100).await.unwrap();
++    assert_eq!(idle.processed, 0);
++}
++
++/// A drain that ran while NO embedding model was configured still consumes the
++/// outbox (bounding its growth); configuring a model later backfills through
++/// `reconcile_embeddings` — the startup pass — so no item is stranded.
++#[tokio::test]
++async fn unconfigured_drain_consumes_rows_and_reconcile_backfills_later() {
++    let (_tmp, pool) = temp_pool().await;
++    let registry = Registry::new();
++    let item = tool("late.embed", "arrives before any embedding model");
++    registry.upsert(&pool, &item).await.unwrap();
++
++    let report = drain_outbox(&pool, None, 100).await.unwrap();
++    assert_eq!((report.processed, report.embedded), (1, 0));
++    assert!(load_embeddings(&pool).await.unwrap().is_empty());
++
++    let embedder = MarkerEmbedder::new("marker-3d");
++    assert_eq!(reconcile_embeddings(&pool, &embedder).await.unwrap(), 1);
++    assert!(load_embeddings(&pool)
++        .await
++        .unwrap()
++        .contains_key(&item.id));
++}
++
++/// An unreachable model degrades `semantic_indexes` to the hashing pair —
++/// retrieval still runs (today's behavior), and the query vector override is
++/// None so the funnel embeds the query in the hashing space it indexed in.
++#[tokio::test]
++async fn semantic_index_build_falls_back_to_hashing_on_model_failure() {
++    let (_tmp, pool) = temp_pool().await;
++    let registry = Registry::new();
++    let item = tool("resilient.tool", "runs the tests even when embeddings are down");
++    registry.upsert(&pool, &item).await.unwrap();
++    let items = registry.list(&pool).await.unwrap();
++
++    let broken = MarkerEmbedder::failing();
++    let (indexes, query_vector) = semantic_indexes(&pool, &items, Some(&broken), "run the tests")
++        .await
++        .unwrap();
++    assert!(query_vector.is_none(), "fallback must not mix spaces");
++
++    let query = RetrievalQuery::new("run the tests", vec![Scope::System], RiskClass::Medium);
++    let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default()).unwrap();
++    assert!(
++        result.tools.iter().any(|card| card.name == "resilient.tool"),
++        "hashing fallback still serves retrieval: {:?}",
++        result.tools
++    );
++    // The failing model left an unprocessed-free table untouched.
++    assert!(load_embeddings(&pool).await.unwrap().is_empty());
++}
+diff --git a/crates/knowledge/tests/retrieval_eval.rs b/crates/knowledge/tests/retrieval_eval.rs
+index 713f4b2..b5b7864 100644
+--- a/crates/knowledge/tests/retrieval_eval.rs
++++ b/crates/knowledge/tests/retrieval_eval.rs
+@@ -12,7 +12,7 @@ use std::collections::HashSet;
+ use std::path::PathBuf;
+ 
+ use codypendent_knowledge::retrieval::{
+-    retrieve, HashingEmbedder, RetrievalConfig, RetrievalIndexes, RetrievalQuery,
++    retrieve, Embedder, HashingEmbedder, RetrievalConfig, RetrievalIndexes, RetrievalQuery,
+ };
+ use codypendent_knowledge::types::{
+     CapabilityRequest, Provenance, RegistryItem, RegistryItemKind, RegistryStatus, RiskClass,
+@@ -81,13 +81,75 @@ async fn seed() -> (tempfile::TempDir, Vec<RegistryItem>, RepositoryId) {
+     (tmp, items, repo)
+ }
+ 
++/// A deterministic stand-in for a *semantic* model behind the same [`Embedder`]
++/// seam: word-level unigram + bigram TF hashing into 384 buckets (FNV-1a),
++/// L2-normalized. Deliberately a DIFFERENT feature family and dimensionality
++/// than the char-trigram [`HashingEmbedder`], so running the eval over it
++/// asserts the funnel's gates hold independent of which embedding space fills
++/// the dense slot — the property that lets a real remote model plug in behind
++/// the trait without weakening the suite.
++struct WordHashEmbedder;
++
++impl WordHashEmbedder {
++    const DIMENSION: usize = 384;
++
++    fn bucket(token: &str) -> usize {
++        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
++        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
++        let mut hash = FNV_OFFSET;
++        for byte in token.bytes() {
++            hash ^= u64::from(byte);
++            hash = hash.wrapping_mul(FNV_PRIME);
++        }
++        (hash % Self::DIMENSION as u64) as usize
++    }
++}
++
++impl Embedder for WordHashEmbedder {
++    fn embed(&self, text: &str) -> Vec<f32> {
++        let tokens: Vec<String> = text
++            .split(|c: char| !c.is_alphanumeric())
++            .filter(|t| !t.is_empty())
++            .map(str::to_ascii_lowercase)
++            .collect();
++        let mut vector = vec![0.0_f32; Self::DIMENSION];
++        for token in &tokens {
++            vector[Self::bucket(token)] += 1.0;
++        }
++        for pair in tokens.windows(2) {
++            vector[Self::bucket(&format!("{} {}", pair[0], pair[1]))] += 1.0;
++        }
++        let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
++        if norm > 0.0 {
++            for value in &mut vector {
++                *value /= norm;
++            }
++        }
++        vector
++    }
++}
++
+ #[tokio::test]
+ async fn retrieval_beats_full_injection_recall_and_forbidden_exclusion() {
+     let (_tmp, items, repo) = seed().await;
++    // The gates must hold for BOTH embedding spaces — the shipped offline
++    // hashing model and a distinct "semantic" stand-in — with the SAME recall
++    // floor. Neither run may weaken the other's gate.
++    let hashing = RetrievalIndexes::build(&items, HashingEmbedder::new()).unwrap();
++    run_eval_gates("hashing-trigram", &items, repo, &hashing);
++    let semantic = RetrievalIndexes::build(&items, WordHashEmbedder).unwrap();
++    run_eval_gates("word-hash-semantic", &items, repo, &semantic);
++}
+ 
+-    // ---- Build the derived indexes over authority ---------------------------
+-    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new()).unwrap();
+-
++/// The full gate battery over one built index pair: mean recall@8 ≥ 0.8,
++/// 100 % forbidden exclusion, and top-k beating full injection under the token
++/// budget. `label` names the embedder in diagnostics and assertion messages.
++fn run_eval_gates(
++    label: &str,
++    items: &[RegistryItem],
++    repo: RepositoryId,
++    indexes: &RetrievalIndexes,
++) {
+     // recall@8: disclose up to 8 tool cards (+ 1–3 skill cards).
+     let config = RetrievalConfig {
+         disclose_tools_max: 8,
+@@ -109,8 +171,9 @@ async fn retrieval_beats_full_injection_recall_and_forbidden_exclusion() {
+             risk_ceiling: RiskClass::Medium,
+             min_trust: TrustTier::Untrusted,
+             history: Vec::new(),
++            query_vector: None,
+         };
+-        let result = retrieve(&items, &indexes, &query, &config).unwrap();
++        let result = retrieve(items, indexes, &query, &config).unwrap();
+ 
+         let disclosed: HashSet<&str> = result
+             .tools
+@@ -131,12 +194,14 @@ async fn retrieval_beats_full_injection_recall_and_forbidden_exclusion() {
+         // Forbidden exclusion is HARD: no forbidden name, ever.
+         for forbidden in &case.forbidden_ids {
+             if disclosed.contains(forbidden.as_str()) {
+-                forbidden_ever_disclosed.push(format!("{forbidden} for query: {}", case.query));
++                forbidden_ever_disclosed
++                    .push(format!("[{label}] {forbidden} for query: {}", case.query));
+             }
+         }
+         for forbidden in FORBIDDEN {
+             if disclosed.contains(forbidden) {
+-                forbidden_ever_disclosed.push(format!("{forbidden} for query: {}", case.query));
++                forbidden_ever_disclosed
++                    .push(format!("[{label}] {forbidden} for query: {}", case.query));
+             }
+         }
+ 
+@@ -160,30 +225,30 @@ async fn retrieval_beats_full_injection_recall_and_forbidden_exclusion() {
+     let mean_recall = recalls.iter().map(|(_, r)| *r).sum::<f32>() / recalls.len() as f32;
+     let mut worst = recalls.clone();
+     worst.sort_by(|a, b| a.1.total_cmp(&b.1));
+-    eprintln!("mean recall@8 = {mean_recall:.4}");
+-    eprintln!("hardest cases:");
++    eprintln!("[{label}] mean recall@8 = {mean_recall:.4}");
++    eprintln!("[{label}] hardest cases:");
+     for (query, recall) in worst.iter().take(5) {
+         eprintln!("  {recall:.2}  {query}");
+     }
+     assert!(
+         mean_recall >= 0.8,
+-        "mean recall@8 {mean_recall:.4} < 0.8; hardest: {:?}",
++        "[{label}] mean recall@8 {mean_recall:.4} < 0.8; hardest: {:?}",
+         &worst[..worst.len().min(5)]
+     );
+ 
+     // ---- Top-k beats full injection under the budget ------------------------
+     let full_injection_tokens: usize = items.iter().map(full_definition_tokens).sum();
+     eprintln!(
+-        "disclosed peak = {disclosed_token_peak} tokens; budget = {BUDGET_TOKENS}; \
++        "[{label}] disclosed peak = {disclosed_token_peak} tokens; budget = {BUDGET_TOKENS}; \
+          full injection = {full_injection_tokens} tokens"
+     );
+     assert!(
+         disclosed_token_peak <= BUDGET_TOKENS,
+-        "disclosed {disclosed_token_peak} tokens exceeds budget {BUDGET_TOKENS}"
++        "[{label}] disclosed {disclosed_token_peak} tokens exceeds budget {BUDGET_TOKENS}"
+     );
+     assert!(
+         BUDGET_TOKENS < full_injection_tokens,
+-        "full injection {full_injection_tokens} did not exceed budget {BUDGET_TOKENS}"
++        "[{label}] full injection {full_injection_tokens} did not exceed budget {BUDGET_TOKENS}"
+     );
+ }
+ 
+diff --git a/crates/runtime/src/models.rs b/crates/runtime/src/models.rs
+index de3473b..20d2b29 100644
+--- a/crates/runtime/src/models.rs
++++ b/crates/runtime/src/models.rs
+@@ -113,6 +113,116 @@ pub fn load_models(path: &Path) -> Result<Vec<ModelConfig>> {
+     Ok(file.model)
+ }
+ 
++// ---------------------------------------------------------------------------
++// models.toml extras: the `[embedding]` entry + `[retrieval]` tuning
++// ---------------------------------------------------------------------------
++
++/// The `[embedding]` entry in `models.toml` (rubric 9 — real embeddings):
++/// names the OpenAI-compatible `/embeddings` endpoint retrieval embeds with.
++/// Absent, retrieval keeps the offline hashing embedder (today's behavior).
++///
++/// ```toml
++/// [embedding]
++/// provider = "openai-compatible"          # the default; may be omitted
++/// base_url = "http://localhost:11434/v1"  # Ollama, OpenAI, Nebius, …
++/// model = "nomic-embed-text"
++/// api_key_env = ""                        # env var NAME; value never stored
++/// dims = 768                              # optional: verified against responses
++/// ```
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub struct EmbeddingConfig {
++    /// The runtime adapter; only `"openai-compatible"` is wired.
++    #[serde(default = "default_embedding_provider")]
++    pub provider: String,
++    /// The OpenAI-compatible base URL (`POST {base_url}/embeddings`).
++    pub base_url: String,
++    /// Provider-side embedding model name (e.g. `nomic-embed-text`,
++    /// `Qwen/Qwen3-Embedding-8B`).
++    pub model: String,
++    /// The NAME of the environment variable holding the API key, read at call
++    /// time — never persisted (the `ModelConfig::api_key_env` contract). Empty
++    /// means no key (a local endpoint).
++    #[serde(default)]
++    pub api_key_env: String,
++    /// Expected vector dimensionality. `None` accepts whatever the model
++    /// returns; `Some(n)` rejects a mismatched response (a wrong-model guard).
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub dims: Option<usize>,
++}
++
++fn default_embedding_provider() -> String {
++    "openai-compatible".to_string()
++}
++
++/// Default `[retrieval] mcp_top_k`: when a run's MCP bridge offers more than
++/// this many tools, only the `mcp_top_k` most relevant to the run are
++/// advertised (at or below it, all are — today's behavior). `0` disables the
++/// gate entirely (full injection).
++pub const DEFAULT_MCP_TOP_K: usize = 8;
++
++/// The `[retrieval]` tuning table in `models.toml`.
++///
++/// ```toml
++/// [retrieval]
++/// mcp_top_k = 8   # 0 disables retrieval gating (advertise every MCP tool)
++/// ```
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub struct RetrievalSettings {
++    /// See [`DEFAULT_MCP_TOP_K`].
++    #[serde(default = "default_mcp_top_k")]
++    pub mcp_top_k: usize,
++}
++
++fn default_mcp_top_k() -> usize {
++    DEFAULT_MCP_TOP_K
++}
++
++impl Default for RetrievalSettings {
++    fn default() -> Self {
++        Self {
++            mcp_top_k: DEFAULT_MCP_TOP_K,
++        }
++    }
++}
++
++/// The non-`[[model]]` tables of `models.toml`, parsed independently of
++/// [`load_models`] so both readers ignore each other's keys and an existing
++/// file is back-compatible in both directions.
++#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
++pub struct ModelExtras {
++    /// The `[embedding]` entry, when configured.
++    #[serde(default)]
++    pub embedding: Option<EmbeddingConfig>,
++    /// The `[retrieval]` tuning; every field defaults when the table is absent.
++    #[serde(default)]
++    pub retrieval: RetrievalSettings,
++}
++
++/// Parse the `[embedding]` / `[retrieval]` extras from `models.toml`. An
++/// ABSENT file yields the defaults (no embedding model, default tuning) —
++/// unlike [`load_models`], because these tables are optional configuration and
++/// a daemon with no `models.toml` at all must still assemble context. A
++/// present-but-malformed file is an error, so a typo is legible rather than a
++/// silent fallback.
++pub fn load_model_extras(path: &Path) -> Result<ModelExtras> {
++    let text = match std::fs::read_to_string(path) {
++        Ok(text) => text,
++        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
++            return Ok(ModelExtras::default())
++        }
++        Err(source) => {
++            return Err(ModelsError::ReadConfig {
++                path: path.to_path_buf(),
++                source,
++            })
++        }
++    };
++    toml::from_str(&text).map_err(|source| ModelsError::ParseConfig {
++        path: path.to_path_buf(),
++        source,
++    })
++}
++
+ // ---------------------------------------------------------------------------
+ // Errors
+ // ---------------------------------------------------------------------------
+@@ -1246,6 +1356,87 @@ api_key_env = "OPENAI_API_KEY"
+         healthy_server.await.unwrap();
+     }
+ 
++    // -- models.toml extras: [embedding] + [retrieval] ---------------------
++
++    #[test]
++    fn extras_parse_embedding_and_retrieval_alongside_model_entries() {
++        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
++        write!(
++            file,
++            r#"
++[[model]]
++id = "local-default"
++provider = "openai-compatible"
++base_url = "http://localhost:11434/v1"
++model = "qwen2.5-coder:14b"
++api_key_env = ""
++
++[embedding]
++base_url = "http://localhost:11434/v1"
++model = "nomic-embed-text"
++dims = 768
++
++[retrieval]
++mcp_top_k = 5
++"#
++        )
++        .expect("write temp file");
++
++        // Both readers coexist on one file: `load_models` ignores the new
++        // tables; `load_model_extras` ignores the [[model]] entries.
++        let models = load_models(file.path()).expect("model entries still parse");
++        assert_eq!(models.len(), 1);
++        let extras = load_model_extras(file.path()).expect("extras parse");
++        let embedding = extras.embedding.expect("embedding entry present");
++        assert_eq!(embedding.provider, "openai-compatible", "provider defaults");
++        assert_eq!(embedding.base_url, "http://localhost:11434/v1");
++        assert_eq!(embedding.model, "nomic-embed-text");
++        assert_eq!(embedding.api_key_env, "", "api_key_env defaults empty");
++        assert_eq!(embedding.dims, Some(768));
++        assert_eq!(extras.retrieval.mcp_top_k, 5);
++    }
++
++    #[test]
++    fn extras_default_when_tables_or_file_are_absent() {
++        // A models.toml with only [[model]] entries (the existing shape) yields
++        // the defaults: no embedding model, default MCP top-k.
++        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
++        write!(
++            file,
++            r#"
++[[model]]
++id = "hosted-default"
++provider = "openai-compatible"
++base_url = "https://api.openai.com/v1"
++model = "gpt-5.1-codex"
++api_key_env = "OPENAI_API_KEY"
++"#
++        )
++        .expect("write temp file");
++        let extras = load_model_extras(file.path()).expect("extras parse");
++        assert_eq!(extras.embedding, None);
++        assert_eq!(extras.retrieval.mcp_top_k, DEFAULT_MCP_TOP_K);
++
++        // No file at all: defaults too (context assembly must not need one).
++        let dir = tempfile::tempdir().expect("tempdir");
++        let extras =
++            load_model_extras(&dir.path().join("models.toml")).expect("absent file defaults");
++        assert_eq!(extras, ModelExtras::default());
++    }
++
++    #[test]
++    fn malformed_extras_are_a_legible_error_not_a_silent_default() {
++        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
++        write!(file, "[embedding]\nmodel = 42\n").expect("write temp file");
++        assert!(
++            matches!(
++                load_model_extras(file.path()),
++                Err(ModelsError::ParseConfig { .. })
++            ),
++            "a typo'd [embedding] table must error, never silently disable embeddings"
++        );
++    }
++
+     // -- authority_from_base_url -------------------------------------------
+ 
+     #[test]
+diff --git a/migrations/0022_registry_embeddings.sql b/migrations/0022_registry_embeddings.sql
+new file mode 100644
+index 0000000..e2f118a
+--- /dev/null
++++ b/migrations/0022_registry_embeddings.sql
+@@ -0,0 +1,19 @@
++-- Persisted dense vectors for registry items (rubric 9 — real embeddings).
++--
++-- One row per registry item, holding the vector a configured embedding model
++-- produced for the item's retrieval text (name + description + intents).
++-- `content_hash` is the SHA-256 of that text — not the package hash — so a
++-- description edit invalidates the row; `model` + `dims` identify the embedding
++-- space, so switching models (or a dims mismatch) invalidates it too. Rows are
++-- refreshed by the index-outbox drain (the Chapter 06 indexer worker this table
++-- finally gives a consumer) and loaded by context assembly instead of
++-- re-embedding every item per call. Derived data: deletable at any time and
++-- rebuilt from `registry_items` authority.
++CREATE TABLE registry_embeddings (
++    item_id TEXT PRIMARY KEY,         -- registry_items.id (no FK: the drain observes deletes via the outbox, after the authoritative row is gone)
++    content_hash TEXT NOT NULL,       -- hex SHA-256 of the embedded text
++    model TEXT NOT NULL,              -- provider-side embedding model name
++    dims INTEGER NOT NULL,            -- vector dimensionality
++    vector BLOB NOT NULL,             -- little-endian f32 values, dims * 4 bytes
++    updated_at TEXT NOT NULL
++);

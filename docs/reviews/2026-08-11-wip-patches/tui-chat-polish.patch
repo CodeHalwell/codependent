@@ -1,0 +1,327 @@
+diff --git a/crates/tui/src/render.rs b/crates/tui/src/render.rs
+index 4f5016e..00dd7e1 100644
+--- a/crates/tui/src/render.rs
++++ b/crates/tui/src/render.rs
+@@ -840,6 +840,95 @@ fn line_rows(columns: usize, inner_width: usize) -> u16 {
+     u16::try_from(rows).unwrap_or(u16::MAX)
+ }
+ 
++/// The one cell-granularity wrapping rule the transcript's measure pass and
++/// its draw pass share: a row breaks BEFORE the grapheme that would overflow
++/// `width`, and a grapheme wider than the whole viewport is force-placed
++/// alone (progress guarantee; the terminal clips it). [`cell_wrap_rows`]
++/// counts rows and [`split_line_cells`] materializes them by driving this
++/// same state machine, so measurement and drawing can never disagree — the
++/// old ceil-based measure under ratatui's word-wrap drew MORE rows than were
++/// measured on wrap-heavy content, under-estimating `max_scroll` and leaving
++/// follow mode clipping the newest lines.
++struct CellWrap {
++    width: usize,
++    col: usize,
++    rows: u16,
++}
++
++impl CellWrap {
++    fn new(width: u16) -> Self {
++        Self {
++            width: usize::from(width).max(1),
++            col: 0,
++            rows: 1,
++        }
++    }
++
++    /// Feed one grapheme of display width `w`; returns `true` when it starts
++    /// a new visual row. Zero-width graphemes join the current cell.
++    fn push(&mut self, w: usize) -> bool {
++        if w == 0 {
++            return false;
++        }
++        if self.col + w > self.width && self.col > 0 {
++            self.rows = self.rows.saturating_add(1);
++            self.col = w.min(self.width);
++            true
++        } else {
++            self.col += w;
++            false
++        }
++    }
++}
++
++/// Visual row count of one logical line (its text in span order) cell-wrapped
++/// into `width` columns. Exactly `split_line_cells(..).len()` — both drive
++/// [`CellWrap`].
++fn cell_wrap_rows<'x>(texts: impl Iterator<Item = &'x str>, width: u16) -> u16 {
++    let mut wrap = CellWrap::new(width);
++    for text in texts {
++        for grapheme in UnicodeSegmentation::graphemes(text, true) {
++            wrap.push(UnicodeWidthStr::width(grapheme));
++        }
++    }
++    wrap.rows
++}
++
++/// Split one styled `Line` into its visual rows at cell granularity (see
++/// [`CellWrap`]), preserving span styles across break points. The transcript
++/// `Paragraph` renders these rows UNwrapped, so the drawn geometry equals the
++/// measured geometry by construction.
++fn split_line_cells(line: &Line<'_>, width: u16) -> Vec<Line<'static>> {
++    let mut wrap = CellWrap::new(width);
++    let mut out: Vec<Line<'static>> = Vec::new();
++    let mut row: Vec<Span<'static>> = Vec::new();
++    let mut fragment = String::new();
++    let mut fragment_style = Style::default();
++    let flush_fragment = |row: &mut Vec<Span<'static>>, fragment: &mut String, style: Style| {
++        if !fragment.is_empty() {
++            row.push(Span::styled(std::mem::take(fragment), style));
++        }
++    };
++    for span in &line.spans {
++        flush_fragment(&mut row, &mut fragment, fragment_style);
++        fragment_style = span.style;
++        for grapheme in UnicodeSegmentation::graphemes(span.content.as_ref(), true) {
++            if wrap.push(UnicodeWidthStr::width(grapheme)) {
++                flush_fragment(&mut row, &mut fragment, fragment_style);
++                let mut visual = Line::from(std::mem::take(&mut row));
++                visual.style = line.style;
++                out.push(visual);
++            }
++            fragment.push_str(grapheme);
++        }
++    }
++    flush_fragment(&mut row, &mut fragment, fragment_style);
++    let mut visual = Line::from(row);
++    visual.style = line.style;
++    out.push(visual);
++    out
++}
++
+ /// One transcript row before placement (see module-level virtualization note).
+ struct Row<'a> {
+     kind: RowKind<'a>,
+@@ -892,26 +981,27 @@ impl<'a> Row<'a> {
+             bg: None,
+         }
+     }
+-    /// Display width, allocation-free (`Span::raw` borrows; `.width()` is unicode width).
+-    fn columns(&self) -> usize {
++    /// Wrapped visual-row height, allocation-free: drives the same
++    /// [`CellWrap`] rule the draw pass splits with, so measure == draw.
++    fn rows(&self, inner_width: u16) -> u16 {
+         match &self.kind {
+-            RowKind::Built(line) => line.width(),
++            RowKind::Built(line) => {
++                cell_wrap_rows(line.spans.iter().map(|s| s.content.as_ref()), inner_width)
++            }
+             RowKind::Model {
+                 prefix,
+                 text,
+                 caret,
+                 ..
+-            } => Span::raw(*prefix).width() + Span::raw(*text).width() + usize::from(*caret),
+-            RowKind::Rich(rl) => rl
+-                .spans
+-                .iter()
+-                .map(|s| Span::raw(s.text.as_str()).width())
+-                .sum(),
++            } => {
++                let caret = if *caret { "▋" } else { "" };
++                cell_wrap_rows([*prefix, *text, caret].into_iter(), inner_width)
++            }
++            RowKind::Rich(rl) => {
++                cell_wrap_rows(rl.spans.iter().map(|s| s.text.as_str()), inner_width)
++            }
+         }
+     }
+-    fn rows(&self, inner_width: u16) -> u16 {
+-        line_rows(self.columns(), inner_width as usize)
+-    }
+     fn into_line(self, theme: &Theme) -> Line<'a> {
+         match self.kind {
+             RowKind::Built(line) => line,
+@@ -1089,12 +1179,23 @@ fn for_each_row<'a>(
+                         None
+                     };
+                     let is_user = matches!(other, TranscriptEntry::User { .. });
+-                    for (j, line) in scratch.drain(..).enumerate() {
++                    // No distinct raised surface (ansi16/monochrome): mark the
++                    // You container with a leading accent bar instead of a
++                    // background. Inserted HERE — before measurement — so the
++                    // bar's column is part of the measured geometry.
++                    let user_accent_bar = is_user && theme.surface.user == theme.surface.panel;
++                    for (j, mut line) in scratch.drain(..).enumerate() {
++                        if user_accent_bar {
++                            line.spans.insert(
++                                0,
++                                Span::styled("▎", Style::default().fg(theme.focus.active)),
++                            );
++                        }
+                         let mut row = Row::built(line);
+                         if j == 0 {
+                             row.hit_entry = hit;
+                         }
+-                        if is_user {
++                        if is_user && !user_accent_bar {
+                             row.bg = Some(theme.surface.user);
+                         }
+                         visit(row);
+@@ -1169,24 +1270,22 @@ fn build_transcript_window<'a>(
+             let hit = row.hit_entry;
+             let bg = row.bg;
+             let index = out.len();
+-            let mut line = row.into_line(theme);
+-            if let Some(c) = bg {
+-                if c == theme.surface.panel {
+-                    // No distinct raised surface (ansi16/monochrome): a leading accent bar.
+-                    line.spans.insert(
+-                        0,
+-                        Span::styled("▎", Style::default().fg(theme.focus.active)),
+-                    );
+-                } else {
+-                    line.style = line.style.bg(c);
+-                    let pad = (inner_width as usize).saturating_sub(line.width());
++            let line = row.into_line(theme);
++            // Pre-split at cell granularity via the SAME rule the measure
++            // pass counted with (`CellWrap`), so the Paragraph below renders
++            // unwrapped and the drawn geometry equals the measured geometry.
++            for mut visual in split_line_cells(&line, inner_width) {
++                if let Some(c) = bg {
++                    visual.style = visual.style.bg(c);
++                    let pad = (inner_width as usize).saturating_sub(visual.width());
+                     if pad > 0 {
+-                        line.spans
++                        visual
++                            .spans
+                             .push(Span::styled(" ".repeat(pad), Style::default().bg(c)));
+                     }
+                 }
++                out.push(visual);
+             }
+-            out.push(line);
+             if let Some(entry) = hit {
+                 hits.push((index, entry));
+             }
+@@ -1333,9 +1432,10 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
+         }
+     }
+ 
+-    let paragraph = Paragraph::new(lines)
+-        .wrap(Wrap { trim: false })
+-        .scroll((r0, 0));
++    // No `Wrap`: every line was pre-split at cell granularity by
++    // `build_transcript_window`, so wrapping here would re-wrap rows the
++    // measure pass already accounted for (the follow-mode clipping bug).
++    let paragraph = Paragraph::new(lines).scroll((r0, 0));
+     frame.render_widget(paragraph, inner);
+ }
+ 
+@@ -10117,6 +10217,110 @@ mod tests {
+         );
+     }
+ 
++    /// The wrap-accounting contract: the measure pass (`cell_wrap_rows`, via
++    /// `Row::rows`) and the draw pass (`split_line_cells`) drive the same
++    /// `CellWrap` machine, so their row counts agree on EVERY input — plain
++    /// ASCII, long unbroken words, CJK/emoji wide glyphs straddling the row
++    /// boundary, zero-width combining marks, and empty lines.
++    #[test]
++    fn cell_wrap_measure_and_split_agree() {
++        let cases = [
++            "",
++            "short",
++            "a long sentence with several words that word-wrap would fold differently",
++            "one-unbreakable-hyphenless-word-longer-than-any-narrow-viewport-width",
++            "漢字が続く長い行はセル境界で折り返される必要がある",
++            "mixed 漢字 and ascii with emoji 🚀🚀🚀 straddling boundaries",
++            "e\u{301}e\u{301}e\u{301} combining marks join their base cell",
++        ];
++        for width in [1_u16, 2, 7, 10, 33] {
++            for case in cases {
++                let line = Line::from(vec![
++                    Span::styled("▌ ", Style::default()),
++                    Span::raw(case.to_owned()),
++                ]);
++                let measured = cell_wrap_rows(line.spans.iter().map(|s| s.content.as_ref()), width);
++                let split = split_line_cells(&line, width);
++                assert_eq!(
++                    measured as usize,
++                    split.len(),
++                    "measure/draw drift at width {width} for {case:?}"
++                );
++                // No visual row exceeds the viewport (except a single
++                // force-placed oversized grapheme, which cannot be split).
++                for visual in &split {
++                    let w: usize = visual.spans.iter().map(Span::width).sum();
++                    assert!(
++                        w <= usize::from(width) || visual.width() <= 2,
++                        "row overflows {width} cols: {visual:?}"
++                    );
++                }
++                // Nothing is lost across the split.
++                let rejoined: String = split
++                    .iter()
++                    .flat_map(|l| l.spans.iter())
++                    .map(|s| s.content.as_ref())
++                    .collect();
++                assert_eq!(rejoined, format!("▌ {case}"));
++            }
++        }
++    }
++
++    /// Follow mode must pin the TRUE bottom on wrap-heavy content. The old
++    /// measure assumed ceil cell-wrap while the draw used ratatui word-wrap,
++    /// which can produce MORE rows than measured — `max_scroll`
++    /// under-estimated, and the newest line(s) sat below the viewport.
++    #[test]
++    fn follow_mode_pins_the_true_bottom_on_wrap_heavy_content() {
++        let mut s = AppState::new();
++        let run_id = RunId::new();
++        reduce(
++            &mut s,
++            system_ev(EventBody::RunStarted {
++                run_id,
++                objective: "wrap torture".to_owned(),
++                mode: AgentMode::Build,
++            }),
++        );
++        // Word-wrap-adversarial prose: many short words at a narrow width
++        // (word wrap breaks early, producing more visual rows than
++        // ceil(width/viewport)), followed by a sentinel tail line.
++        let mut text = String::new();
++        for i in 0..60 {
++            text.push_str(&format!("wrapping words drift apart badly here {i}\n"));
++        }
++        text.push_str("FINAL-SENTINEL-LINE");
++        reduce(
++            &mut s,
++            Action::daemon_event(SessionEvent {
++                sequence: 2,
++                occurred_at: Utc::now(),
++                causation_id: None,
++                correlation_id: None,
++                actor: Actor::Agent {
++                    agent_id: codypendent_protocol::AgentId::new(),
++                    run_id,
++                    model: ModelId("m".to_owned()),
++                },
++                body: EventBody::ModelStreamDelta { run_id, text },
++            }),
++        );
++        // Finalize the stream so the rich cache renders (not the plain tail).
++        reduce(
++            &mut s,
++            system_ev(EventBody::RunStateChanged {
++                run_id,
++                state: RunState::Completed,
++            }),
++        );
++        assert!(s.runs[0].follow, "a fresh run follows the latest content");
++        let screen = render_to_string(&s, 34, 16);
++        assert!(
++            screen.contains("FINAL-SENTINEL-LINE"),
++            "follow mode must show the newest line on wrap-heavy content:\n{screen}"
++        );
++    }
++
+     // --- Task 8: register clickable surfaces + parity ---
+ 
+     #[test]

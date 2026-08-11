@@ -1,0 +1,1380 @@
+diff --git a/crates/knowledge/src/docs/collab.rs b/crates/knowledge/src/docs/collab.rs
+index d0715d1..687e033 100644
+--- a/crates/knowledge/src/docs/collab.rs
++++ b/crates/knowledge/src/docs/collab.rs
+@@ -342,6 +342,25 @@ impl SuggestionStore {
+             now,
+         )
+         .await?;
++        // Re-anchor the OTHER pending suggestions to the new revision — in the
++        // SAME transaction, so the review rail never lands half-updated. Without
++        // this, accepting one suggestion bumped the revision and stranded every
++        // other pending suggestion behind the `source_revision == doc.revision`
++        // guard above: a three-suggestion review session could accept exactly
++        // one. A suggestion is re-anchored only when its anchor still PROVES its
++        // offsets cover the text the proposer saw in the post-accept document:
++        //
++        // * a different block — untouched by this accept — whose anchor text
++        //   still matches (it must, but the check keeps this fail-closed);
++        // * the SAME block when its non-empty `original` still matches at the
++        //   stored offsets (the accepted range did not shift it).
++        //
++        // A zero-length (insertion) suggestion in the same block is never
++        // re-anchored: its empty `original` matches anywhere, so it cannot
++        // detect that the accepted edit shifted its offset — exactly the drift
++        // the revision guard exists to refuse. Genuinely drifted suggestions
++        // keep refusing with `SuggestionRangeDrifted`, unchanged.
++        re_anchor_pending_tx(&mut tx, doc, &suggestion, revision).await?;
+         tx.commit().await?;
+         doc.revision = revision;
+         Ok(revision)
+@@ -407,6 +426,57 @@ impl SuggestionStore {
+     }
+ }
+ 
++/// Re-anchor the still-pending suggestions of `doc` (other than the one just
++/// `accepted`) onto `new_revision`, inside the accept's own transaction. Only a
++/// suggestion whose anchor text still matches the post-accept CRDT at its
++/// stored offsets is bumped (see the call site's comment for the exact rules);
++/// everything else is left at its old `source_revision` and keeps refusing as
++/// drifted. An out-of-range anchor read simply skips the suggestion — drift,
++/// not an error.
++async fn re_anchor_pending_tx(
++    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
++    doc: &Document,
++    accepted: &Suggestion,
++    new_revision: u64,
++) -> Result<(), DocStoreError> {
++    let rows = sqlx::query(
++        "SELECT id, block_id, range_start, range_end, source_revision, original, replacement, \
++         author_json, rationale, status FROM document_suggestions \
++         WHERE document_id = ? AND status = 'pending' ORDER BY created_at ASC, id ASC",
++    )
++    .bind(doc.id.to_string())
++    .fetch_all(&mut **tx)
++    .await?;
++    for row in &rows {
++        let other = decode_suggestion(row, doc.id)?;
++        if other.id == accepted.id {
++            continue;
++        }
++        let same_block = other.block_id == accepted.block_id;
++        if same_block && other.original.is_empty() {
++            // An insertion's empty anchor cannot prove its offset survived an
++            // edit to its own block — leave it drifted.
++            continue;
++        }
++        let anchored = matches!(
++            doc.crdt
++                .text_range(&other.block_id, other.range_start, other.range_end),
++            Ok(current) if current == other.original
++        );
++        if anchored {
++            sqlx::query(
++                "UPDATE document_suggestions SET source_revision = ? \
++                 WHERE id = ? AND status = 'pending'",
++            )
++            .bind(new_revision as i64)
++            .bind(&other.id)
++            .execute(&mut **tx)
++            .await?;
++        }
++    }
++    Ok(())
++}
++
+ /// Stamp a suggestion's resolution **only if it is still pending**, within the
+ /// caller's executor (a pool or a transaction). Returns the number of rows
+ /// affected — `1` when this call claimed the pending suggestion, `0` when it was
+diff --git a/crates/knowledge/src/docs/import.rs b/crates/knowledge/src/docs/import.rs
+new file mode 100644
+index 0000000..c824d55
+--- /dev/null
++++ b/crates/knowledge/src/docs/import.rs
+@@ -0,0 +1,535 @@
++//! Markdown → blocks import (the lossy-but-reasonable inverse of
++//! [`render`](super::render)).
++//!
++//! [`markdown_to_blocks`] parses a Markdown document into typed
++//! [`DocumentBlock`]s at BLOCK granularity — headings, paragraphs, fenced code,
++//! tables, callouts, checklists, and the `{{ kind:target }}` embed markers the
++//! renderer emits — so `codypendent docs new --from file.md` and the agent's
++//! `docs.create` seed a real block-structured document rather than one giant
++//! paragraph. It is deliberately NOT a full CommonMark parser: inline styling
++//! stays inside a block's text verbatim (blocks carry flat text, ADR-016), an
++//! unrecognized construct degrades to a paragraph, and
++//! `import(render(blocks))` reproduces the block CONTENT (ids are fresh) for
++//! every kind the renderer emits — the round-trip property the tests pin.
++
++use super::model::{BlockContent, ChecklistItem, DocumentBlock};
++
++/// Parse `markdown` into typed document blocks. Total: any input produces a
++/// (possibly empty) block list; nothing errors. See the module docs for the
++/// dialect.
++#[must_use]
++pub fn markdown_to_blocks(markdown: &str) -> Vec<DocumentBlock> {
++    let lines: Vec<&str> = markdown.lines().collect();
++    let mut blocks = Vec::new();
++    let mut paragraph: Vec<&str> = Vec::new();
++    let mut i = 0;
++
++    // Flush the accumulated paragraph lines (joined by \n) as one block.
++    let flush = |paragraph: &mut Vec<&str>, blocks: &mut Vec<DocumentBlock>| {
++        if !paragraph.is_empty() {
++            let text = paragraph.join("\n");
++            paragraph.clear();
++            blocks.push(DocumentBlock::new(BlockContent::Paragraph { text }));
++        }
++    };
++
++    while i < lines.len() {
++        let line = lines[i];
++        let trimmed = line.trim_end();
++
++        // Blank line: paragraph separator.
++        if trimmed.trim().is_empty() {
++            flush(&mut paragraph, &mut blocks);
++            i += 1;
++            continue;
++        }
++
++        // Fenced code: ```lang … ``` — the renderer's Code/Diagram/Query form.
++        if let Some(info) = trimmed.strip_prefix("```") {
++            flush(&mut paragraph, &mut blocks);
++            let info = info.trim().to_string();
++            let mut body: Vec<&str> = Vec::new();
++            i += 1;
++            while i < lines.len() && lines[i].trim_end() != "```" {
++                body.push(lines[i]);
++                i += 1;
++            }
++            // Skip the closing fence when present; an unclosed fence consumes
++            // the rest of the input as code (lossy-but-reasonable).
++            if i < lines.len() {
++                i += 1;
++            }
++            let text = body.join("\n");
++            blocks.push(DocumentBlock::new(fenced_content(&info, text)));
++            continue;
++        }
++
++        // Heading: 1-6 leading #s then a space.
++        if let Some((level, text)) = parse_heading(trimmed) {
++            flush(&mut paragraph, &mut blocks);
++            blocks.push(DocumentBlock::new(BlockContent::Heading { level, text }));
++            i += 1;
++            continue;
++        }
++
++        // Callout: `> [!KIND]` then `> …` continuation lines (the renderer's
++        // multi-line form). A plain blockquote (no [!KIND]) stays a paragraph.
++        if let Some(kind) = parse_callout_opener(trimmed) {
++            flush(&mut paragraph, &mut blocks);
++            let mut body: Vec<String> = Vec::new();
++            i += 1;
++            while i < lines.len() {
++                let quoted = lines[i].trim_end();
++                if let Some(rest) = quoted.strip_prefix("> ") {
++                    body.push(rest.to_string());
++                } else if quoted == ">" {
++                    body.push(String::new());
++                } else {
++                    break;
++                }
++                i += 1;
++            }
++            blocks.push(DocumentBlock::new(BlockContent::Callout {
++                kind,
++                text: body.join("\n"),
++            }));
++            continue;
++        }
++
++        // Checklist run: `- [ ] …` / `- [x] …` lines.
++        if parse_checklist_item(trimmed).is_some() {
++            flush(&mut paragraph, &mut blocks);
++            let mut items = Vec::new();
++            while i < lines.len() {
++                match parse_checklist_item(lines[i].trim_end()) {
++                    Some(item) => {
++                        items.push(item);
++                        i += 1;
++                    }
++                    None => break,
++                }
++            }
++            blocks.push(DocumentBlock::new(BlockContent::Checklist { items }));
++            continue;
++        }
++
++        // Table run: consecutive `| … |` lines; the `| --- |` separator row is
++        // structural and dropped.
++        if is_table_row(trimmed) {
++            flush(&mut paragraph, &mut blocks);
++            let mut rows = Vec::new();
++            while i < lines.len() && is_table_row(lines[i].trim_end()) {
++                let row = parse_table_row(lines[i].trim_end());
++                if !row.iter().all(|cell| is_separator_cell(cell)) {
++                    rows.push(row.into_iter().map(|cell| unescape_cell(&cell)).collect());
++                }
++                i += 1;
++            }
++            blocks.push(DocumentBlock::new(BlockContent::Table { rows }));
++            continue;
++        }
++
++        // Embed markers, alone on their line (the renderer's verbatim form).
++        if let Some(content) = parse_embed(trimmed) {
++            flush(&mut paragraph, &mut blocks);
++            blocks.push(DocumentBlock::new(content));
++            i += 1;
++            continue;
++        }
++
++        // A `[path](path)` link alone on its line whose text equals its target
++        // is the renderer's EmbeddedFile form.
++        if let Some(path) = parse_self_link(trimmed) {
++            flush(&mut paragraph, &mut blocks);
++            blocks.push(DocumentBlock::new(BlockContent::EmbeddedFile { path }));
++            i += 1;
++            continue;
++        }
++
++        // Anything else accumulates into the current paragraph.
++        paragraph.push(trimmed);
++        i += 1;
++    }
++    flush(&mut paragraph, &mut blocks);
++    blocks
++}
++
++/// Parse `markdown` as the initial content of a NEW document titled `title`:
++/// [`markdown_to_blocks`], minus a leading H1 that repeats the title (the
++/// renderer emits `# <title>` first, so a file produced by `render_document` —
++/// or written by an author who titled it in the file — round-trips without a
++/// duplicated title heading).
++#[must_use]
++pub fn import_markdown(title: &str, markdown: &str) -> Vec<DocumentBlock> {
++    let mut blocks = markdown_to_blocks(markdown);
++    if let Some(first) = blocks.first() {
++        if matches!(&first.content, BlockContent::Heading { level: 1, text } if text == title) {
++            blocks.remove(0);
++        }
++    }
++    blocks
++}
++
++/// The typed content of a fenced block: the renderer writes queries as
++/// ` ```query `, diagrams as ` ```<format> ` for its known formats, and code as
++/// ` ```<language> `.
++fn fenced_content(info: &str, text: String) -> BlockContent {
++    match info {
++        "query" => BlockContent::Query { query: text },
++        // The diagram formats the fabric renders as diagram blocks. Anything
++        // else stays code — a `rust` fence must never round-trip as a diagram.
++        "mermaid" | "dot" | "graphviz" | "plantuml" | "d2" => BlockContent::Diagram {
++            format: info.to_string(),
++            source: text,
++        },
++        "" => BlockContent::Code {
++            language: None,
++            text,
++        },
++        language => BlockContent::Code {
++            language: Some(language.to_string()),
++            text,
++        },
++    }
++}
++
++/// `## Heading` → `(2, "Heading")`. At most six `#`s, and the space after them
++/// is required (so `#hashtag` stays paragraph text).
++fn parse_heading(line: &str) -> Option<(u8, String)> {
++    let hashes = line.bytes().take_while(|b| *b == b'#').count();
++    if hashes == 0 || hashes > 6 {
++        return None;
++    }
++    let rest = line.get(hashes..)?;
++    let text = rest.strip_prefix(' ')?;
++    Some((hashes as u8, text.to_string()))
++}
++
++/// `> [!WARNING]` → `Some("warning")`.
++fn parse_callout_opener(line: &str) -> Option<String> {
++    let rest = line.strip_prefix("> [!")?;
++    let kind = rest.strip_suffix(']')?;
++    if kind.is_empty() || kind.contains(']') {
++        return None;
++    }
++    Some(kind.to_lowercase())
++}
++
++/// `- [x] text` / `- [ ] text` → a checklist item.
++fn parse_checklist_item(line: &str) -> Option<ChecklistItem> {
++    let checked = if let Some(rest) = line.strip_prefix("- [x] ") {
++        Some((true, rest))
++    } else {
++        line.strip_prefix("- [ ] ").map(|rest| (false, rest))
++    }?;
++    Some(ChecklistItem {
++        text: checked.1.to_string(),
++        checked: checked.0,
++    })
++}
++
++/// A table row starts and ends with `|` (after trimming) and has content.
++fn is_table_row(line: &str) -> bool {
++    let line = line.trim();
++    line.len() >= 2 && line.starts_with('|') && line.ends_with('|')
++}
++
++/// Split a `| a | b |` row into raw cells, honouring `\|` escapes (a `\|` never
++/// splits) so the renderer's escaping is inverted by [`unescape_cell`].
++fn parse_table_row(line: &str) -> Vec<String> {
++    let inner = line.trim();
++    let inner = &inner[1..inner.len() - 1];
++    let mut cells = Vec::new();
++    let mut cell = String::new();
++    let mut chars = inner.chars().peekable();
++    while let Some(c) = chars.next() {
++        match c {
++            '\\' => {
++                // Keep the escape pair intact for `unescape_cell`.
++                cell.push('\\');
++                if let Some(next) = chars.next() {
++                    cell.push(next);
++                }
++            }
++            '|' => {
++                cells.push(cell.trim().to_string());
++                cell = String::new();
++            }
++            other => cell.push(other),
++        }
++    }
++    cells.push(cell.trim().to_string());
++    cells
++}
++
++/// A separator cell is dashes with optional alignment colons (e.g. `---`,
++/// `:---:`), which marks the header/body divider row.
++fn is_separator_cell(cell: &str) -> bool {
++    !cell.is_empty()
++        && cell
++            .chars()
++            .all(|c| c == '-' || c == ':')
++        && cell.contains('-')
++}
++
++/// Invert the renderer's cell escaping: `\|` → `|`, `\\` → `\`. Any other
++/// escape pair keeps its backslash verbatim.
++fn unescape_cell(cell: &str) -> String {
++    let mut out = String::with_capacity(cell.len());
++    let mut chars = cell.chars();
++    while let Some(c) = chars.next() {
++        if c == '\\' {
++            match chars.next() {
++                Some('|') => out.push('|'),
++                Some('\\') => out.push('\\'),
++                Some(other) => {
++                    out.push('\\');
++                    out.push(other);
++                }
++                None => out.push('\\'),
++            }
++        } else {
++            out.push(c);
++        }
++    }
++    out
++}
++
++/// `{{ symbol:X }}` / `{{ workflow:X }}` / `{{ skill:X }}` alone on a line.
++fn parse_embed(line: &str) -> Option<BlockContent> {
++    let inner = line.strip_prefix("{{ ")?.strip_suffix(" }}")?;
++    let (kind, target) = inner.split_once(':')?;
++    let target = target.trim().to_string();
++    if target.is_empty() {
++        return None;
++    }
++    match kind {
++        "symbol" => Some(BlockContent::EmbeddedSymbol { symbol: target }),
++        "workflow" => Some(BlockContent::EmbeddedWorkflow { workflow: target }),
++        "skill" => Some(BlockContent::EmbeddedSkill { skill: target }),
++        _ => None,
++    }
++}
++
++/// `[path](path)` alone on a line, text equal to target — the renderer's
++/// EmbeddedFile form. Any other link stays paragraph text.
++fn parse_self_link(line: &str) -> Option<String> {
++    let rest = line.strip_prefix('[')?;
++    let (text, rest) = rest.split_once("](")?;
++    let target = rest.strip_suffix(')')?;
++    (text == target && !text.is_empty()).then(|| text.to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::super::render::render_document;
++    use super::*;
++
++    fn contents(blocks: &[DocumentBlock]) -> Vec<BlockContent> {
++        blocks.iter().map(|b| b.content.clone()).collect()
++    }
++
++    /// The golden import case: one Markdown document covering every construct
++    /// the importer recognizes maps to exactly the expected typed block
++    /// sequence.
++    #[test]
++    fn golden_markdown_imports_to_typed_blocks() {
++        let markdown = "\
++# Payments Runbook
++
++Intro paragraph
++spanning two lines.
++
++## Charging
++
++```rust
++fn charge() {}
++```
++
++> [!WARNING]
++> Retries are not idempotent
++> below revision 3.
++
++- [x] rotate keys
++- [ ] add alerting
++
++| Field | Type |
++| --- | --- |
++| amount | u64 |
++| op | a\\|b |
++
++{{ symbol:payments::charge_customer }}
++
++[docs/api.md](docs/api.md)
++
++Closing paragraph.
++";
++        let blocks = markdown_to_blocks(markdown);
++        assert_eq!(
++            contents(&blocks),
++            vec![
++                BlockContent::Heading {
++                    level: 1,
++                    text: "Payments Runbook".into()
++                },
++                BlockContent::Paragraph {
++                    text: "Intro paragraph\nspanning two lines.".into()
++                },
++                BlockContent::Heading {
++                    level: 2,
++                    text: "Charging".into()
++                },
++                BlockContent::Code {
++                    language: Some("rust".into()),
++                    text: "fn charge() {}".into()
++                },
++                BlockContent::Callout {
++                    kind: "warning".into(),
++                    text: "Retries are not idempotent\nbelow revision 3.".into()
++                },
++                BlockContent::Checklist {
++                    items: vec![
++                        ChecklistItem {
++                            text: "rotate keys".into(),
++                            checked: true
++                        },
++                        ChecklistItem {
++                            text: "add alerting".into(),
++                            checked: false
++                        },
++                    ]
++                },
++                BlockContent::Table {
++                    rows: vec![
++                        vec!["Field".into(), "Type".into()],
++                        vec!["amount".into(), "u64".into()],
++                        vec!["op".into(), "a|b".into()],
++                    ]
++                },
++                BlockContent::EmbeddedSymbol {
++                    symbol: "payments::charge_customer".into()
++                },
++                BlockContent::EmbeddedFile {
++                    path: "docs/api.md".into()
++                },
++                BlockContent::Paragraph {
++                    text: "Closing paragraph.".into()
++                },
++            ]
++        );
++    }
++
++    /// `import(render(blocks))` reproduces the block content for every kind the
++    /// renderer emits — the lossy-but-reasonable round-trip property.
++    #[test]
++    fn import_inverts_render_at_block_granularity() {
++        let original = vec![
++            BlockContent::Heading {
++                level: 2,
++                text: "Service".into(),
++            },
++            BlockContent::Paragraph {
++                text: "Charges customers.".into(),
++            },
++            BlockContent::Code {
++                language: Some("rust".into()),
++                text: "fn charge() {}".into(),
++            },
++            BlockContent::Diagram {
++                format: "mermaid".into(),
++                source: "graph TD; a-->b".into(),
++            },
++            BlockContent::Table {
++                rows: vec![
++                    vec!["Field".into(), "Type".into()],
++                    vec!["pattern".into(), "a|b".into()],
++                ],
++            },
++            BlockContent::Callout {
++                kind: "note".into(),
++                text: "line one\nline two".into(),
++            },
++            BlockContent::Checklist {
++                items: vec![ChecklistItem {
++                    text: "retry".into(),
++                    checked: true,
++                }],
++            },
++            BlockContent::Query {
++                query: "stale-docs".into(),
++            },
++            BlockContent::EmbeddedFile {
++                path: "docs/api.md".into(),
++            },
++            BlockContent::EmbeddedSymbol {
++                symbol: "payments::charge".into(),
++            },
++            BlockContent::EmbeddedWorkflow {
++                workflow: "repair-github-check".into(),
++            },
++            BlockContent::EmbeddedSkill {
++                skill: "fix-ci".into(),
++            },
++        ];
++        let blocks: Vec<DocumentBlock> = original
++            .iter()
++            .cloned()
++            .map(DocumentBlock::new)
++            .collect();
++        let rendered = render_document("Runbook", &blocks);
++        // `import_markdown` strips the `# Runbook` title heading the renderer
++        // prepended, leaving exactly the original content sequence.
++        let reimported = import_markdown("Runbook", &rendered);
++        assert_eq!(contents(&reimported), original);
++    }
++
++    #[test]
++    fn leading_title_heading_is_stripped_only_when_it_matches() {
++        let markdown = "# Runbook\n\nBody.\n";
++        assert_eq!(
++            contents(&import_markdown("Runbook", markdown)),
++            vec![BlockContent::Paragraph {
++                text: "Body.".into()
++            }]
++        );
++        // A different H1 is real content and stays.
++        assert_eq!(
++            contents(&import_markdown("Other Title", markdown)).len(),
++            2
++        );
++    }
++
++    #[test]
++    fn unclosed_fence_consumes_the_rest_as_code() {
++        let blocks = markdown_to_blocks("```sh\necho hi\n");
++        assert_eq!(
++            contents(&blocks),
++            vec![BlockContent::Code {
++                language: Some("sh".into()),
++                text: "echo hi".into()
++            }]
++        );
++    }
++
++    #[test]
++    fn plain_blockquote_and_hashtag_degrade_to_paragraphs() {
++        let blocks = markdown_to_blocks("> just a quote\n\n#hashtag not a heading\n");
++        assert_eq!(
++            contents(&blocks),
++            vec![
++                BlockContent::Paragraph {
++                    text: "> just a quote".into()
++                },
++                BlockContent::Paragraph {
++                    text: "#hashtag not a heading".into()
++                },
++            ]
++        );
++    }
++
++    #[test]
++    fn empty_input_imports_to_no_blocks() {
++        assert!(markdown_to_blocks("").is_empty());
++        assert!(markdown_to_blocks("\n\n\n").is_empty());
++    }
++}
+diff --git a/crates/knowledge/src/docs/mod.rs b/crates/knowledge/src/docs/mod.rs
+index 71be016..33368f6 100644
+--- a/crates/knowledge/src/docs/mod.rs
++++ b/crates/knowledge/src/docs/mod.rs
+@@ -15,6 +15,7 @@
+ pub mod apply;
+ pub mod collab;
+ pub mod crdt;
++pub mod import;
+ pub mod leases;
+ pub mod model;
+ pub mod render;
+@@ -24,6 +25,7 @@ pub mod store;
+ 
+ pub use apply::{apply_mutation, ApplyError, MutationEffect, MutationOutcome};
+ pub use crdt::{DocCrdtError, DocumentCrdt};
++pub use import::{import_markdown, markdown_to_blocks};
+ pub use leases::{DocumentLease, DocumentLeaseStore, LeaseError};
+ pub use model::{
+     AuthorshipRecord, BlockContent, ChecklistItem, Citation, DocumentAuthor, DocumentBlock,
+diff --git a/crates/knowledge/src/docs/render.rs b/crates/knowledge/src/docs/render.rs
+index e1ef900..e0e80c2 100644
+--- a/crates/knowledge/src/docs/render.rs
++++ b/crates/knowledge/src/docs/render.rs
+@@ -42,7 +42,15 @@ fn render_block(content: &BlockContent, out: &mut String) {
+             let hashes = "#".repeat((*level).clamp(1, 6) as usize);
+             out.push_str(&hashes);
+             out.push(' ');
+-            out.push_str(text);
++            // A heading is one Markdown line by definition: an embedded newline
++            // would end the heading early and leak the remainder as body text,
++            // so it is folded to a space (deterministic, still one line).
++            for (i, line) in text.split('\n').enumerate() {
++                if i > 0 {
++                    out.push(' ');
++                }
++                out.push_str(line);
++            }
+             out.push('\n');
+         }
+         BlockContent::Paragraph { text } => {
+@@ -72,11 +80,16 @@ fn render_block(content: &BlockContent, out: &mut String) {
+         BlockContent::Table { rows } => render_table(rows, out),
+         BlockContent::Callout { kind, text } => {
+             // GitHub-style alert blockquote — deterministic, uppercased kind.
++            // EVERY line of the text is quoted: an unquoted second line would
++            // fall out of the blockquote in the published Markdown.
+             out.push_str("> [!");
+             out.push_str(&kind.to_uppercase());
+-            out.push_str("]\n> ");
+-            out.push_str(text);
+-            out.push('\n');
++            out.push_str("]\n");
++            for line in text.split('\n') {
++                out.push_str("> ");
++                out.push_str(line);
++                out.push('\n');
++            }
+         }
+         BlockContent::Checklist { items } => {
+             for item in items {
+@@ -116,17 +129,23 @@ fn render_block(content: &BlockContent, out: &mut String) {
+     }
+ }
+ 
+-/// Render a table with the first row as the header (GitHub Markdown).
++/// Render a table with the first row as the header (GitHub Markdown). Cell
++/// text is escaped so a literal `|` cannot open a phantom column (and the
++/// escaping backslash itself is escaped first, keeping the mapping invertible);
++/// a newline inside a cell is folded to a space — a Markdown table row is one
++/// line by definition.
+ fn render_table(rows: &[Vec<String>], out: &mut String) {
+     if rows.is_empty() {
+         return;
+     }
+     let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
++    let escape_cell =
++        |cell: &str| cell.replace('\\', "\\\\").replace('|', "\\|").replace('\n', " ");
+     let write_row = |out: &mut String, row: &[String]| {
+         out.push('|');
+         for c in 0..columns {
+             out.push(' ');
+-            out.push_str(row.get(c).map(String::as_str).unwrap_or(""));
++            out.push_str(&row.get(c).map(String::as_str).map(escape_cell).unwrap_or_default());
+             out.push_str(" |");
+         }
+         out.push('\n');
+@@ -291,3 +310,69 @@ pub async fn publications(
+         })
+         .collect())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn block(content: BlockContent) -> DocumentBlock {
++        DocumentBlock::with_id("b", content)
++    }
++
++    /// Every line of a multi-line callout is quoted — an unquoted second line
++    /// would fall out of the blockquote in published Markdown. This changes the
++    /// published bytes for multi-line callouts INTENTIONALLY (the old render
++    /// quoted only the first line); the output stays deterministic.
++    #[test]
++    fn multi_line_callout_quotes_every_line() {
++        let callout = || {
++            block(BlockContent::Callout {
++                kind: "warning".into(),
++                text: "first line\nsecond line".into(),
++            })
++        };
++        let md = render_document("Doc", &[callout()]);
++        assert!(md.contains("> [!WARNING]\n> first line\n> second line\n"));
++        // Deterministic: a second render is byte-identical.
++        assert_eq!(md, render_document("Doc", &[callout()]));
++    }
++
++    /// A literal `|` in a table cell is escaped so it cannot open a phantom
++    /// column, the escaping backslash is itself escaped (invertible), and a
++    /// newline inside a cell folds to a space (a table row is one line).
++    #[test]
++    fn table_cells_escape_pipes_and_backslashes() {
++        let md = render_document(
++            "Doc",
++            &[block(BlockContent::Table {
++                rows: vec![
++                    vec!["Name".into(), "Pattern".into()],
++                    vec!["or".into(), "a|b".into()],
++                    vec!["esc".into(), "a\\b".into()],
++                    vec!["nl".into(), "a\nb".into()],
++                ],
++            })],
++        );
++        assert!(md.contains("| or | a\\|b |"), "pipe escaped: {md}");
++        assert!(md.contains("| esc | a\\\\b |"), "backslash escaped: {md}");
++        assert!(md.contains("| nl | a b |"), "newline folded: {md}");
++    }
++
++    /// A newline inside a heading folds to a space — the heading stays one
++    /// Markdown line rather than leaking its tail as body text.
++    #[test]
++    fn heading_newline_is_guarded() {
++        let md = render_document(
++            "Doc",
++            &[block(BlockContent::Heading {
++                level: 2,
++                text: "Payments\nService".into(),
++            })],
++        );
++        assert!(md.contains("## Payments Service\n"), "folded: {md}");
++        assert!(
++            !md.contains("## Payments\nService"),
++            "no split heading: {md}"
++        );
++    }
++}
+diff --git a/crates/knowledge/src/docs/store.rs b/crates/knowledge/src/docs/store.rs
+index cd301db..aa7214e 100644
+--- a/crates/knowledge/src/docs/store.rs
++++ b/crates/knowledge/src/docs/store.rs
+@@ -392,20 +392,60 @@ impl DocumentStore {
+             }
+         }
+         let rows = q.fetch_all(pool).await?;
+-        rows.iter()
+-            .map(|row| {
+-                Ok(DocumentSummary {
+-                    id: row
+-                        .get::<String, _>("id")
+-                        .parse()
+-                        .map_err(|e: uuid::Error| DocStoreError::Corrupt(e.to_string()))?,
+-                    title: row.get("title"),
+-                    status: parse_status(row.get::<String, _>("status").as_str())?,
+-                    revision: row.get::<i64, _>("revision") as u64,
+-                })
+-            })
+-            .collect()
++        rows.iter().map(decode_summary).collect()
+     }
++
++    /// List EVERY document, newest first, across all scopes. This is the
++    /// daemon-side maintenance sweep's view (`/update-docs` staleness checking
++    /// walks every document it stores); client-facing listings go through
++    /// [`list`](Self::list), which enforces scope isolation.
++    pub async fn list_all(&self, pool: &SqlitePool) -> Result<Vec<DocumentSummary>, DocStoreError> {
++        let rows = sqlx::query(
++            "SELECT id, title, status, revision FROM documents \
++             ORDER BY created_at DESC, id DESC",
++        )
++        .fetch_all(pool)
++        .await?;
++        rows.iter().map(decode_summary).collect()
++    }
++
++    /// Set a document's lifecycle status (e.g. `Draft` → `Published` once a
++    /// publish plan executed, STEP 4.4). A metadata transition: it does **not**
++    /// bump the content revision or record authorship — the status column is
++    /// lifecycle state, not content — so pending suggestions and optimistic
++    /// saves keep their anchors. Errors with
++    /// [`DocStoreError::NoSuchDocument`] when the document is gone.
++    pub async fn set_status(
++        &self,
++        pool: &SqlitePool,
++        id: DocumentId,
++        status: DocumentStatus,
++    ) -> Result<(), DocStoreError> {
++        let affected = sqlx::query("UPDATE documents SET status = ?, updated_at = ? WHERE id = ?")
++            .bind(status.as_str())
++            .bind(Utc::now().to_rfc3339())
++            .bind(id.to_string())
++            .execute(pool)
++            .await?
++            .rows_affected();
++        if affected == 0 {
++            return Err(DocStoreError::NoSuchDocument(id));
++        }
++        Ok(())
++    }
++}
++
++/// Decode one summary row (`id, title, status, revision`).
++fn decode_summary(row: &sqlx::sqlite::SqliteRow) -> Result<DocumentSummary, DocStoreError> {
++    Ok(DocumentSummary {
++        id: row
++            .get::<String, _>("id")
++            .parse()
++            .map_err(|e: uuid::Error| DocStoreError::Corrupt(e.to_string()))?,
++        title: row.get("title"),
++        status: parse_status(row.get::<String, _>("status").as_str())?,
++        revision: row.get::<i64, _>("revision") as u64,
++    })
+ }
+ 
+ /// A compact document listing entry.
+diff --git a/crates/knowledge/src/lib.rs b/crates/knowledge/src/lib.rs
+index d70f032..b3ac3ba 100644
+--- a/crates/knowledge/src/lib.rs
++++ b/crates/knowledge/src/lib.rs
+@@ -81,6 +81,7 @@ pub use docs::collab::{
+     SuggestionStore,
+ };
+ pub use docs::crdt::{DocCrdtError, DocumentCrdt};
++pub use docs::import::{import_markdown, markdown_to_blocks};
+ pub use docs::leases::{DocumentLease, DocumentLeaseStore, LeaseError};
+ pub use docs::model::{
+     AuthorshipRecord, BlockContent, ChecklistItem, Citation, DocumentAuthor, DocumentBlock,
+diff --git a/crates/knowledge/tests/docs_collab_it.rs b/crates/knowledge/tests/docs_collab_it.rs
+index a2a2715..efa0204 100644
+--- a/crates/knowledge/tests/docs_collab_it.rs
++++ b/crates/knowledge/tests/docs_collab_it.rs
+@@ -569,3 +569,182 @@ async fn propose_refuses_a_stale_source_revision() {
+     // Nothing was recorded — no stale suggestion lingers on the review rail.
+     assert!(suggestions.pending(&pool, doc.id).await.unwrap().is_empty());
+ }
++
++#[tokio::test]
++async fn accepting_one_suggestion_re_anchors_the_others_so_all_three_apply() {
++    // The N>1 review-session fix: three suggestions proposed against the same
++    // revision, each targeting its own block. Accepting the first bumps the
++    // document revision; the other two must be re-anchored (their block text
++    // is untouched, so their anchors still hold) rather than stranded behind
++    // `SuggestionRangeDrifted` — a reviewer can accept all three.
++    let (_tmp, pool) = temp_pool().await;
++    let docs = DocumentStore::new();
++    let suggestions = SuggestionStore::new();
++    let human = DocumentAuthor::Human {
++        user: UserId("reviewer".into()),
++    };
++    let mut doc = docs
++        .create(
++            &pool,
++            NewDocument {
++                title: "Doc".into(),
++                scope: Scope::Organization(OrganizationId::new()),
++                metadata: DocumentMetadata::default(),
++                blocks: vec![
++                    DocumentBlock::with_id(
++                        "a",
++                        BlockContent::Paragraph {
++                            text: "alpha text".into(),
++                        },
++                    ),
++                    DocumentBlock::with_id(
++                        "b",
++                        BlockContent::Paragraph {
++                            text: "beta text".into(),
++                        },
++                    ),
++                    DocumentBlock::with_id(
++                        "c",
++                        BlockContent::Paragraph {
++                            text: "gamma text".into(),
++                        },
++                    ),
++                ],
++            },
++            &human,
++        )
++        .await
++        .unwrap();
++
++    let propose = |block: &str, original: &str, replacement: &str, revision: u64| NewSuggestion {
++        block_id: block.into(),
++        range_start: 0,
++        range_end: original.chars().count(),
++        source_revision: revision,
++        original: original.into(),
++        replacement: replacement.into(),
++        author: human.clone(),
++        rationale: None,
++    };
++    let s1 = suggestions
++        .propose(&pool, doc.id, propose("a", "alpha", "ALPHA", doc.revision))
++        .await
++        .unwrap();
++    let s2 = suggestions
++        .propose(&pool, doc.id, propose("b", "beta", "BETA", doc.revision))
++        .await
++        .unwrap();
++    let s3 = suggestions
++        .propose(&pool, doc.id, propose("c", "gamma", "GAMMA", doc.revision))
++        .await
++        .unwrap();
++
++    // Accept all three, in order — each accept re-anchors the survivors.
++    suggestions
++        .accept(&pool, &mut doc, &s1.id, &human)
++        .await
++        .expect("first accept");
++    suggestions
++        .accept(&pool, &mut doc, &s2.id, &human)
++        .await
++        .expect("second accept must not be stranded by the first");
++    suggestions
++        .accept(&pool, &mut doc, &s3.id, &human)
++        .await
++        .expect("third accept must not be stranded either");
++
++    let blocks = doc.blocks().unwrap();
++    assert_eq!(blocks[0].content_text(), "ALPHA text");
++    assert_eq!(blocks[1].content_text(), "BETA text");
++    assert_eq!(blocks[2].content_text(), "GAMMA text");
++    assert!(suggestions.pending(&pool, doc.id).await.unwrap().is_empty());
++
++    // The persisted document agrees (the re-anchor commits atomically with
++    // each accept).
++    let reloaded = docs.load(&pool, doc.id).await.unwrap().unwrap();
++    assert_eq!(reloaded.revision, 4);
++}
++
++#[tokio::test]
++async fn re_anchoring_still_refuses_a_genuinely_drifted_survivor() {
++    // Two suggestions on the SAME block: accepting the first changes text ahead
++    // of the second's range, so the second's anchor no longer matches. It must
++    // stay refused (`SuggestionRangeDrifted`) — re-anchoring never resurrects a
++    // suggestion whose offsets would now hit the wrong characters.
++    let (_tmp, pool) = temp_pool().await;
++    let docs = DocumentStore::new();
++    let suggestions = SuggestionStore::new();
++    let human = DocumentAuthor::Human {
++        user: UserId("reviewer".into()),
++    };
++    let mut doc = docs
++        .create(
++            &pool,
++            NewDocument {
++                title: "Doc".into(),
++                scope: Scope::Organization(OrganizationId::new()),
++                metadata: DocumentMetadata::default(),
++                blocks: vec![DocumentBlock::with_id(
++                    "p",
++                    BlockContent::Paragraph {
++                        text: "hello world".into(),
++                    },
++                )],
++            },
++            &human,
++        )
++        .await
++        .unwrap();
++
++    // First replaces "hello" (0..5) with a LONGER word, shifting everything
++    // after it; second targets "world" at 6..11 — stale after the first lands.
++    let s1 = suggestions
++        .propose(
++            &pool,
++            doc.id,
++            NewSuggestion {
++                block_id: "p".into(),
++                range_start: 0,
++                range_end: 5,
++                source_revision: doc.revision,
++                original: "hello".into(),
++                replacement: "greetings".into(),
++                author: human.clone(),
++                rationale: None,
++            },
++        )
++        .await
++        .unwrap();
++    let s2 = suggestions
++        .propose(
++            &pool,
++            doc.id,
++            NewSuggestion {
++                block_id: "p".into(),
++                range_start: 6,
++                range_end: 11,
++                source_revision: doc.revision,
++                original: "world".into(),
++                replacement: "WORLD".into(),
++                author: human.clone(),
++                rationale: None,
++            },
++        )
++        .await
++        .unwrap();
++
++    suggestions
++        .accept(&pool, &mut doc, &s1.id, &human)
++        .await
++        .expect("first accept");
++    assert_eq!(doc.blocks().unwrap()[0].content_text(), "greetings world");
++
++    // 6..11 now covers "gs wo", not "world" — refused, still pending.
++    let err = suggestions
++        .accept(&pool, &mut doc, &s2.id, &human)
++        .await
++        .unwrap_err();
++    assert!(matches!(err, DocStoreError::SuggestionRangeDrifted(_)));
++    assert_eq!(suggestions.pending(&pool, doc.id).await.unwrap().len(), 1);
++    assert_eq!(doc.blocks().unwrap()[0].content_text(), "greetings world");
++}
+diff --git a/crates/protocol/src/command.rs b/crates/protocol/src/command.rs
+index b008599..562e8be 100644
+--- a/crates/protocol/src/command.rs
++++ b/crates/protocol/src/command.rs
+@@ -185,6 +185,63 @@ pub enum CommandBody {
+         session_id: SessionId,
+         update: IdeContextUpdate,
+     },
++    /// Create a new collaborative document (Docs Studio, rubric #4 — before
++    /// this command existed the Docs Studio browsed a set nothing could ever
++    /// populate). Handled at the connection level like `MutateDocument`
++    /// (documents live outside the session ledger): the daemon creates the
++    /// document at revision 1 through its `DocumentCreator` seam — importing
++    /// `initial_markdown` into typed blocks when present, else an empty block
++    /// list — and replies
++    /// [`DocumentCreated`](crate::envelope::Payload::DocumentCreated) carrying
++    /// the new document id. An Observer is role-denied; a daemon assembled
++    /// without a creator rejects it `document.transport-unavailable`.
++    CreateDocument {
++        /// The document title (non-empty; the daemon rejects a blank one).
++        title: String,
++        /// The scope to create the document in: `"repository"` (the default
++        /// when absent — the document lives with the checkout),
++        /// `"system"`, or `"organization:<id>"` (organization docs default to
++        /// suggest-only agent collaboration). An unrecognized value is
++        /// rejected `document.invalid-scope`, never guessed at.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        scope: Option<String>,
++        /// The canonical filesystem root of the repository a
++        /// repository-scoped document belongs to. Mirrors
++        /// [`StartRun.repository`](CommandBody::StartRun::repository):
++        /// `#[serde(default)]` keeps an older client working — the daemon then
++        /// falls back to its own startup root.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        repository: Option<String>,
++        /// Markdown to seed the document's blocks from (`docs new --from
++        /// file.md`, the agent's `docs.create`). Imported lossily-but-
++        /// reasonably at block granularity; absent creates an empty document.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        initial_markdown: Option<String>,
++    },
++    /// Run the documentation staleness check (`/update-docs` glue, Phase 4
++    /// STEP 4.6 finally wired): resolve every document's `{{ symbol:… }}`
++    /// links against the code graph, persist them, diff for signature
++    /// changes/disappearances, and file each finding as a Maintain-mode
++    /// suggestion (never a direct edit). Handled at the connection level like
++    /// `MutateDocument`; the daemon replies
++    /// [`DocsCheckCompleted`](crate::envelope::Payload::DocsCheckCompleted)
++    /// with the sweep's counts. An Observer is role-denied (the sweep files
++    /// suggestions); a daemon assembled without a checker rejects it
++    /// `document.transport-unavailable`.
++    CheckDocuments {
++        /// The canonical filesystem root of the repository whose code graph
++        /// the links resolve against. Mirrors
++        /// [`StartRun.repository`](CommandBody::StartRun::repository); absent
++        /// falls back to the daemon's startup root.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        repository: Option<String>,
++        /// A session to surface the result into: when set and the sweep found
++        /// anything stale, the daemon appends a `NoteAppended` to this
++        /// session's ledger so the finding count reaches the active
++        /// conversation. Absent, the counts ride only on the reply.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        session_id: Option<SessionId>,
++    },
+     /// Apply a semantic mutation to a collaborative document (Phase 4 STEP 4.3).
+     ///
+     /// Handled at the connection level (documents live outside the session
+@@ -643,6 +700,27 @@ mod tests {
+                 ..Default::default()
+             },
+         });
++        round_trip(CommandBody::CreateDocument {
++            title: "Payments Runbook".to_string(),
++            scope: Some("repository".to_string()),
++            repository: Some("/home/user/project".to_string()),
++            initial_markdown: Some("# Payments Runbook\n\nBody.\n".to_string()),
++        });
++        // The minimal create (an older client's shape): only the title.
++        round_trip(CommandBody::CreateDocument {
++            title: "Notes".to_string(),
++            scope: None,
++            repository: None,
++            initial_markdown: None,
++        });
++        round_trip(CommandBody::CheckDocuments {
++            repository: Some("/home/user/project".to_string()),
++            session_id: Some(SessionId::new()),
++        });
++        round_trip(CommandBody::CheckDocuments {
++            repository: None,
++            session_id: None,
++        });
+         round_trip(CommandBody::MutateDocument {
+             document_id: DocumentId::new(),
+             mutation: DocumentMutation::EditText {
+@@ -847,6 +925,31 @@ mod tests {
+         assert_eq!(parsed, body);
+     }
+ 
++    #[test]
++    fn create_document_omits_absent_optionals() {
++        // A title-only create sends none of the optional keys, and such a
++        // payload (also what an older client emits) reparses with all three
++        // defaulted to None.
++        let body = CommandBody::CreateDocument {
++            title: "Notes".to_string(),
++            scope: None,
++            repository: None,
++            initial_markdown: None,
++        };
++        let json = serde_json::to_string(&body).expect("serialize");
++        assert!(!json.contains("scope"), "absent scope is skipped: {json}");
++        assert!(
++            !json.contains("repository"),
++            "absent repository is skipped: {json}"
++        );
++        assert!(
++            !json.contains("initial_markdown"),
++            "absent markdown is skipped: {json}"
++        );
++        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(parsed, body);
++    }
++
+     #[test]
+     fn acquire_document_lease_omits_absent_ttl_and_block() {
+         // A whole-document lease with the default TTL sends neither optional key,
+diff --git a/crates/protocol/src/envelope.rs b/crates/protocol/src/envelope.rs
+index 94e0206..3d275d0 100644
+--- a/crates/protocol/src/envelope.rs
++++ b/crates/protocol/src/envelope.rs
+@@ -15,7 +15,8 @@ use crate::error::CodypendentError;
+ use crate::events::SessionEvent;
+ use crate::handshake::{ClientHello, ServerHello};
+ use crate::ids::{
+-    ApprovalId, ClientId, CommandId, DaemonInstanceId, MessageId, RunId, SessionId, WorkspaceId,
++    ApprovalId, ClientId, CommandId, DaemonInstanceId, DocumentId, MessageId, RunId, SessionId,
++    WorkspaceId,
+ };
+ use crate::remote_ui::UiWireMessage;
+ use crate::version::{ProtocolVersion, PROTOCOL_V1};
+@@ -128,6 +129,30 @@ pub enum Payload {
+         command_id: CommandId,
+         grant: DocumentLeaseGrant,
+     },
++    /// A `CreateDocument` command was accepted; carries the new document's id
++    /// (Docs Studio creation). A distinct reply from `CommandAccepted` for the
++    /// same reason as `WorkflowRunStarted`: the client needs the id back to
++    /// select, subscribe to, and edit the document it just created.
++    DocumentCreated {
++        command_id: CommandId,
++        document_id: DocumentId,
++    },
++    /// A `CheckDocuments` command's reply: the staleness sweep's counts
++    /// (`/update-docs` glue over the Phase 4 STEP 4.6 engine). A distinct
++    /// reply from `CommandAccepted` because the client reports the counts to
++    /// the operator, not just an acknowledgement.
++    DocsCheckCompleted {
++        command_id: CommandId,
++        /// Documents the sweep examined.
++        documents_checked: u64,
++        /// Symbol links resolved (and persisted) against the code graph.
++        links_resolved: u64,
++        /// Staleness findings (signature changed / symbol disappeared).
++        stale_findings: u64,
++        /// Maintain-mode suggestions filed from those findings (never direct
++        /// edits; each still needs a human accept).
++        suggestions_filed: u64,
++    },
+     /// A `StartWorkflow` command was accepted; carries the new durable workflow-run
+     /// id (Phase 5 STEP 5.2). A distinct reply from `CommandAccepted` because the
+     /// client needs the run id back to track / show the run it just started.
+@@ -469,6 +494,52 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn document_created_payload_round_trips() {
++        let command_id = CommandId::new();
++        let document_id = DocumentId::new();
++        match round_trip_payload(Payload::DocumentCreated {
++            command_id,
++            document_id,
++        }) {
++            Payload::DocumentCreated {
++                command_id: id,
++                document_id: doc,
++            } => {
++                assert_eq!(id, command_id);
++                assert_eq!(doc, document_id);
++            }
++            other => panic!("expected DocumentCreated, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn docs_check_completed_payload_round_trips() {
++        let command_id = CommandId::new();
++        match round_trip_payload(Payload::DocsCheckCompleted {
++            command_id,
++            documents_checked: 4,
++            links_resolved: 9,
++            stale_findings: 2,
++            suggestions_filed: 2,
++        }) {
++            Payload::DocsCheckCompleted {
++                command_id: id,
++                documents_checked,
++                links_resolved,
++                stale_findings,
++                suggestions_filed,
++            } => {
++                assert_eq!(id, command_id);
++                assert_eq!(documents_checked, 4);
++                assert_eq!(links_resolved, 9);
++                assert_eq!(stale_findings, 2);
++                assert_eq!(suggestions_filed, 2);
++            }
++            other => panic!("expected DocsCheckCompleted, got {other:?}"),
++        }
++    }
++
+     #[test]
+     fn workflow_run_started_payload_round_trips() {
+         let command_id = CommandId::new();
+diff --git a/crates/protocol/src/run.rs b/crates/protocol/src/run.rs
+index 0c08901..e7dec71 100644
+--- a/crates/protocol/src/run.rs
++++ b/crates/protocol/src/run.rs
+@@ -204,6 +204,24 @@ pub enum ProposedAction {
+     /// engine's explicit arm); never serialized into a `ToolProposed` (never gated by
+     /// approval), so it needs no golden wire vector.
+     RecordMemory,
++    /// An agent `docs.*` tool call touching a collaborative document (rubric #4
++    /// doc-writer). Targets only the knowledge fabric's document store — not the
++    /// filesystem, a command, the network, or any remote — and every content
++    /// edit is still gated by the document's collaboration mode (organization
++    /// docs default to Suggest, so an agent edit lands as a reviewable
++    /// suggestion), while publishing to Git stays behind the separate
++    /// approval-gated `PublishDocument` pipeline. Always policy-`Allow`ed like
++    /// [`RecordMemory`](Self::RecordMemory) and recorded purely so the access
++    /// is traced; never serialized into a `ToolProposed`, so it needs no golden
++    /// wire vector.
++    DocumentEdit {
++        /// The document the tool call targets; empty for `docs.create` (the
++        /// document does not exist yet) and `docs.read` listings.
++        document_id: String,
++        /// A short human description of the access (e.g. `docs.edit block p`),
++        /// for the trace.
++        summary: String,
++    },
+     #[serde(other)]
+     Unknown,
+ }
+@@ -334,6 +352,10 @@ mod tests {
+             title: "write file".to_string(),
+             details: "{\"path\":\"src/lib.rs\"}".to_string(),
+         });
++        round_trip(ProposedAction::DocumentEdit {
++            document_id: "70000000-0000-0000-0000-000000000001".to_string(),
++            summary: "docs.edit block p".to_string(),
++        });
+         round_trip(ProposedAction::PublishDocument {
+             document_id: DocumentId::new(),
+             target: "repository file docs/architecture.md".to_string(),
+diff --git a/crates/protocol/tests/golden_vectors.rs b/crates/protocol/tests/golden_vectors.rs
+index ad497ad..f231386 100644
+--- a/crates/protocol/tests/golden_vectors.rs
++++ b/crates/protocol/tests/golden_vectors.rs
+@@ -337,6 +337,22 @@ fn command_vectors() -> Vec<Vector> {
+                 },
+             },
+         ),
++        vec_of(
++            "CommandBody_CreateDocument",
++            CommandBody::CreateDocument {
++                title: "Payments Runbook".to_string(),
++                scope: Some("repository".to_string()),
++                repository: Some("/home/user/project".to_string()),
++                initial_markdown: Some("# Payments Runbook\n\nBody.\n".to_string()),
++            },
++        ),
++        vec_of(
++            "CommandBody_CheckDocuments",
++            CommandBody::CheckDocuments {
++                repository: Some("/home/user/project".to_string()),
++                session_id: Some(session_id()),
++            },
++        ),
+         vec_of(
+             "CommandBody_MutateDocument",
+             CommandBody::MutateDocument {
+@@ -607,6 +623,23 @@ fn envelope_vectors() -> Vec<Vector> {
+                 },
+             },
+         ),
++        vec_of(
++            "Payload_DocumentCreated",
++            Payload::DocumentCreated {
++                command_id: command_id(),
++                document_id: document_id(),
++            },
++        ),
++        vec_of(
++            "Payload_DocsCheckCompleted",
++            Payload::DocsCheckCompleted {
++                command_id: command_id(),
++                documents_checked: 4,
++                links_resolved: 9,
++                stale_findings: 2,
++                suggestions_filed: 2,
++            },
++        ),
+         vec_of(
+             "Payload_WorkflowRunStarted",
+             Payload::WorkflowRunStarted {

@@ -1,0 +1,1067 @@
+diff --git a/crates/integrations/src/acp_client.rs b/crates/integrations/src/acp_client.rs
+index 1e17d50..7eddb04 100644
+--- a/crates/integrations/src/acp_client.rs
++++ b/crates/integrations/src/acp_client.rs
+@@ -5,7 +5,11 @@
+ //! (`gemini --acp`, `npx @agentclientprotocol/claude-agent-acp`, ...), does the
+ //! initialize/session handshake, delegates a run's objective as an ACP prompt,
+ //! and maps the agent's streamed `session/update`s onto Codypendent's existing
+-//! `EventBody` model. The agent owns its model; we send no model id.
++//! `EventBody` model. The agent owns its model catalog — the handshake's
++//! `config_options` advertise it ([`AcpClient::discovered_models`]), and a
++//! profile pinned to one of those models switches the session with
++//! `session/set_config_option` ([`AcpClient::set_model`]); nothing is ever
++//! guessed on the agent's behalf.
+ 
+ use std::collections::BTreeMap;
+ use std::path::PathBuf;
+@@ -19,16 +23,20 @@ use tokio::sync::{mpsc, oneshot};
+ use tokio::task::JoinHandle;
+ 
+ use agent_client_protocol::schema::v1::{
+-    ContentBlock, ContentChunk, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
++    ConfigOptionUpdate, ContentBlock, ContentChunk, CurrentModeUpdate, SessionConfigKind,
++    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
++    SessionConfigSelectOptions, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
+     ToolCallUpdate,
+ };
+ // The ACP *client* surface (see the client section below). `ContentBlock` above
+ // is shared with the Task 6 mapping; the rest are client-only.
+ use agent_client_protocol::schema::v1::{
+-    InitializeRequest, NewSessionRequest, PermissionOption as WirePermissionOption,
+-    PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+-    RequestPermissionResponse, SelectedPermissionOutcome, SessionNotification, StopReason,
+-    TextContent,
++    CancelNotification, InitializeRequest, InitializeResponse, McpServer as WireMcpServer,
++    McpServerStdio, NewSessionRequest, NewSessionResponse,
++    PermissionOption as WirePermissionOption, PermissionOptionKind, PromptRequest,
++    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
++    SelectedPermissionOutcome, SessionConfigId, SessionConfigOptionValue, SessionNotification,
++    SetSessionConfigOptionRequest, StopReason, TextContent,
+ };
+ use agent_client_protocol::schema::ProtocolVersion;
+ use agent_client_protocol::{
+@@ -53,14 +61,17 @@ use codypendent_protocol::{EventBody, RunId, ToolOutcome};
+ /// from exactly the same event vocabulary as a native one:
+ /// - `UserMessageChunk` echoes the user's own prompt back; it is not model
+ ///   output.
+-/// - `Plan`, `AvailableCommandsUpdate`, `CurrentModeUpdate`,
+-///   `ConfigOptionUpdate`, and `SessionInfoUpdate` are ACP session/UI concepts
+-///   with no Codypendent parallel.
++/// - `Plan`, `AvailableCommandsUpdate`, and `SessionInfoUpdate` are ACP
++///   session/UI concepts with no Codypendent parallel.
+ /// - `UsageUpdate` carries token/cost accounting; turning it into an
+ ///   `EventBody::BudgetWarning` would fabricate a threshold breach that never
+ ///   happened — the same cost-honesty rule that keeps the provider catalog's
+ ///   cost metadata display-only and out of any budget sum.
+ ///
++/// `CurrentModeUpdate` and `ConfigOptionUpdate` DO map — to run-scoped
++/// `NoteAppended` events — so an agent-initiated model or mode switch surfaces
++/// in the transcript instead of silently changing what the run executes on.
++///
+ /// The inverse of the server-side bridge in `crates/cli/src/acp.rs`.
+ #[must_use]
+ pub fn session_update_to_events(update: &SessionUpdate, run_id: RunId) -> Vec<EventBody> {
+@@ -70,13 +81,81 @@ pub fn session_update_to_events(update: &SessionUpdate, run_id: RunId) -> Vec<Ev
+         }
+         SessionUpdate::ToolCall(tool_call) => tool_started(tool_call, run_id),
+         SessionUpdate::ToolCallUpdate(tool_call_update) => tool_completed(tool_call_update, run_id),
++        SessionUpdate::CurrentModeUpdate(update) => current_mode_note(update, run_id),
++        SessionUpdate::ConfigOptionUpdate(update) => config_option_notes(update, run_id),
+         // No Codypendent `EventBody` equivalent (see the doc comment above) —
+         // covers `UserMessageChunk`, `Plan`, `AvailableCommandsUpdate`,
+-        // `CurrentModeUpdate`, `ConfigOptionUpdate`, `SessionInfoUpdate`,
+-        // `UsageUpdate`, and any variant a future ACP schema bump adds that
+-        // this build does not know yet (`SessionUpdate` is `#[non_exhaustive]`
+-        // — RULE 1: unknown wire content is handled safely, not a hard
+-        // error).
++        // `SessionInfoUpdate`, `UsageUpdate`, and any variant a future ACP
++        // schema bump adds that this build does not know yet (`SessionUpdate`
++        // is `#[non_exhaustive]` — RULE 1: unknown wire content is handled
++        // safely, not a hard error).
++        _ => Vec::new(),
++    }
++}
++
++/// The agent switched its own session mode mid-turn. Codypendent has no mode
++/// event, so this surfaces as a run-scoped note — visible in the transcript,
++/// never mistaken for model output.
++fn current_mode_note(update: &CurrentModeUpdate, run_id: RunId) -> Vec<EventBody> {
++    vec![EventBody::NoteAppended {
++        text: format!("ACP agent switched session mode to `{}`", update.current_mode_id),
++        run_id: Some(run_id),
++    }]
++}
++
++/// The agent re-announced its session configuration (the full set arrives on
++/// every change). Only the Model/Mode selector categories are noted — one note
++/// per selector, naming the now-current selection — so an agent-initiated
++/// model switch surfaces without spamming a note for every unrelated toggle.
++fn config_option_notes(update: &ConfigOptionUpdate, run_id: RunId) -> Vec<EventBody> {
++    update
++        .config_options
++        .iter()
++        .filter_map(|option| {
++            let label = match option.category {
++                Some(SessionConfigOptionCategory::Model) => "model",
++                Some(SessionConfigOptionCategory::Mode) => "mode",
++                // Other categories (thought level, misc model config, unknown
++                // future ones — the enum is `#[non_exhaustive]`) stay silent.
++                _ => return None,
++            };
++            let SessionConfigKind::Select(select) = &option.kind else {
++                return None;
++            };
++            let current = select.current_value.to_string();
++            let name = select_entries(select)
++                .into_iter()
++                .find(|(id, _)| *id == current)
++                .map(|(_, name)| name);
++            let text = match name {
++                Some(name) if name != current => {
++                    format!("ACP agent {label} is now `{name}` ({current})")
++                }
++                _ => format!("ACP agent {label} is now `{current}`"),
++            };
++            Some(EventBody::NoteAppended {
++                text,
++                run_id: Some(run_id),
++            })
++        })
++        .collect()
++}
++
++/// Flatten a select option's `(value id, display name)` pairs, whether the
++/// agent grouped them or not. An options shape this build does not know
++/// (`SessionConfigSelectOptions` is `#[non_exhaustive]`) flattens to nothing
++/// rather than failing.
++fn select_entries(select: &SessionConfigSelect) -> Vec<(String, String)> {
++    match &select.options {
++        SessionConfigSelectOptions::Ungrouped(options) => options
++            .iter()
++            .map(|option| (option.value.to_string(), option.name.clone()))
++            .collect(),
++        SessionConfigSelectOptions::Grouped(groups) => groups
++            .iter()
++            .flat_map(|group| group.options.iter())
++            .map(|option| (option.value.to_string(), option.name.clone()))
++            .collect(),
+         _ => Vec::new(),
+     }
+ }
+@@ -228,6 +307,236 @@ pub enum AcpClientError {
+     Prompt(String),
+ }
+ 
++/// One model advertised by a connected ACP agent — a `session/new`
++/// `config_options` entry with `category: "model"`, flattened to what a picker
++/// needs. `id` is the agent's own stable model id (the `SessionConfigValueId`
++/// that `session/set_config_option` accepts back).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct AcpModel {
++    /// The agent's stable id for this model.
++    pub id: String,
++    /// Human-readable display name.
++    pub name: String,
++    /// Whether the agent reports this as the currently-selected model.
++    pub current: bool,
++}
++
++/// One session mode advertised by a connected ACP agent, from the `session/new`
++/// `modes` state (or a Mode-category config option when no dedicated state was
++/// sent).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct AcpMode {
++    /// The agent's stable id for this mode.
++    pub id: String,
++    /// Human-readable display name.
++    pub name: String,
++    /// Whether the agent reports this as the current mode.
++    pub current: bool,
++}
++
++/// One authentication method advertised in the agent's `initialize` response.
++/// Surfaced verbatim so a failed `session/new` can tell the user exactly what
++/// the agent asked for (e.g. `claude-login — Run claude /login`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct AcpAuthMethod {
++    /// The agent's stable id for this method.
++    pub id: String,
++    /// Human-readable display name.
++    pub name: String,
++    /// Optional agent-provided instructions.
++    pub description: Option<String>,
++}
++
++/// A launch spec for one MCP stdio server, forwarded to the agent in
++/// `session/new`'s `mcp_servers` so an external agent inherits the same tool
++/// servers a native run would see. Deliberately carries NO environment pairs:
++/// `mcp.toml`'s `env` is the operator's channel for secrets, and secrets never
++/// cross into an external vendor process (see [`forwardable_mcp_servers`]).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct AcpMcpServer {
++    /// Server name (the `mcp.toml` server id).
++    pub name: String,
++    /// The executable to spawn.
++    pub command: String,
++    /// Arguments to the executable.
++    pub args: Vec<String>,
++}
++
++/// Options applied to the ACP session created during the handshake.
++#[derive(Debug, Clone, Default)]
++pub struct AcpSessionOptions {
++    /// MCP servers the agent should connect to (`session/new.mcpServers`).
++    pub mcp_servers: Vec<AcpMcpServer>,
++}
++
++/// Read `mcp.toml` at `mcp_toml` and derive the launch specs safe to forward
++/// to an external ACP agent: name + command + args only. A server declaring
++/// explicit `env` pairs is withheld entirely — those pairs are the operator's
++/// channel for secrets, and forwarding the spec without its declared
++/// environment would ship a knowingly broken launch line. Forwarding is ON by
++/// default; an `[acp] forward_mcp_servers = false` table in `mcp.toml` (a key
++/// the MCP loader itself ignores) turns it off. A missing or malformed file
++/// forwards nothing — the daemon already surfaces the parse error loudly at
++/// boot, so this stays quiet rather than double-reporting.
++#[must_use]
++pub fn forwardable_mcp_servers(mcp_toml: &std::path::Path) -> Vec<AcpMcpServer> {
++    #[derive(Default, serde::Deserialize)]
++    struct ForwardFile {
++        #[serde(default)]
++        acp: ForwardTable,
++    }
++    #[derive(serde::Deserialize)]
++    struct ForwardTable {
++        #[serde(default = "forward_default")]
++        forward_mcp_servers: bool,
++    }
++    impl Default for ForwardTable {
++        fn default() -> Self {
++            Self {
++                forward_mcp_servers: forward_default(),
++            }
++        }
++    }
++    fn forward_default() -> bool {
++        true
++    }
++
++    let Ok(config) = crate::mcp::load_mcp_config(mcp_toml) else {
++        return Vec::new();
++    };
++    let forward = std::fs::read_to_string(mcp_toml)
++        .ok()
++        .and_then(|text| toml::from_str::<ForwardFile>(&text).ok())
++        .is_none_or(|file| file.acp.forward_mcp_servers);
++    if !forward {
++        return Vec::new();
++    }
++    config
++        .servers
++        .into_iter()
++        .filter(|server| server.env.is_empty())
++        .map(|server| AcpMcpServer {
++            name: server.name,
++            command: server.command,
++            args: server.args,
++        })
++        .collect()
++}
++
++/// What the handshake taught us about the agent, shared between the connection
++/// driver (which populates it before signalling ready and refreshes it on
++/// `ConfigOptionUpdate` / `set_config_option` responses) and the
++/// [`AcpClient`]'s accessors.
++#[derive(Debug, Clone, Default)]
++struct AcpDiscovery {
++    auth_methods: Vec<AcpAuthMethod>,
++    models: Vec<AcpModel>,
++    modes: Vec<AcpMode>,
++    /// The `SessionConfigId` of the Model-category selector, kept so
++    /// [`AcpClient::set_model`] can target it.
++    model_config_id: Option<String>,
++    /// Whether `modes` came from the response's dedicated `modes` state (the
++    /// richer source); a Mode-category config option never overwrites it then.
++    modes_from_state: bool,
++}
++
++impl AcpDiscovery {
++    fn apply_initialize(&mut self, response: &InitializeResponse) {
++        self.auth_methods = response
++            .auth_methods
++            .iter()
++            .map(|method| AcpAuthMethod {
++                id: method.id().to_string(),
++                name: method.name().to_string(),
++                description: method.description().map(str::to_string),
++            })
++            .collect();
++    }
++
++    fn apply_session(&mut self, response: &NewSessionResponse) {
++        if let Some(state) = &response.modes {
++            self.modes_from_state = true;
++            let current = state.current_mode_id.to_string();
++            self.modes = state
++                .available_modes
++                .iter()
++                .map(|mode| AcpMode {
++                    current: mode.id.to_string() == current,
++                    id: mode.id.to_string(),
++                    name: mode.name.clone(),
++                })
++                .collect();
++        }
++        if let Some(options) = &response.config_options {
++            self.apply_config_options(options);
++        }
++    }
++
++    /// Fold a full config-option set (from `session/new`, a
++    /// `set_config_option` response, or a `ConfigOptionUpdate`) into the
++    /// discovery state. Every arrival carries the complete current set, so
++    /// Model/Mode selectors are replaced, never merged.
++    fn apply_config_options(&mut self, options: &[SessionConfigOption]) {
++        for option in options {
++            let SessionConfigKind::Select(select) = &option.kind else {
++                continue;
++            };
++            let current = select.current_value.to_string();
++            match option.category {
++                Some(SessionConfigOptionCategory::Model) => {
++                    self.model_config_id = Some(option.id.to_string());
++                    self.models = select_entries(select)
++                        .into_iter()
++                        .map(|(id, name)| AcpModel {
++                            current: id == current,
++                            id,
++                            name,
++                        })
++                        .collect();
++                }
++                Some(SessionConfigOptionCategory::Mode) if !self.modes_from_state => {
++                    self.modes = select_entries(select)
++                        .into_iter()
++                        .map(|(id, name)| AcpMode {
++                            current: id == current,
++                            id,
++                            name,
++                        })
++                        .collect();
++                }
++                // ModelConfig/ThoughtLevel/unknown categories (the enum is
++                // `#[non_exhaustive]`) are not model discovery.
++                _ => {}
++            }
++        }
++    }
++
++    fn apply_current_mode(&mut self, mode_id: &str) {
++        for mode in &mut self.modes {
++            mode.current = mode.id == mode_id;
++        }
++    }
++}
++
++/// A parenthesized suffix for `session/new` failures naming the agent's
++/// advertised authentication methods — turning an opaque "session/new failed"
++/// into an actionable "run `claude /login`"-style hint. Empty when the agent
++/// advertised none (never fabricate a remedy the agent did not offer).
++fn auth_methods_hint(methods: &[AcpAuthMethod]) -> String {
++    if methods.is_empty() {
++        return String::new();
++    }
++    let methods = methods
++        .iter()
++        .map(|method| match &method.description {
++            Some(description) => format!("{} — {description}", method.name),
++            None => method.name.clone(),
++        })
++        .collect::<Vec<_>>()
++        .join("; ");
++    format!(" (the agent advertises authentication: {methods})")
++}
++
+ /// Receives the events an ACP turn produces and answers the agent's permission
+ /// requests. The daemon implements this to fan mapped events into a run's ledger
+ /// and route permissions through the existing durable approval broker; tests
+@@ -258,6 +567,29 @@ pub struct AcpClient {
+     /// it is not detached mid-handshake; it exits on its own once `commands`
+     /// (its only sender) is dropped.
+     driver: JoinHandle<Result<(), AcpClientError>>,
++    /// Handshake discovery (auth methods, models, modes), kept live by the
++    /// driver as the agent announces config changes.
++    discovery: Arc<Mutex<AcpDiscovery>>,
++}
++
++/// A clonable handle that asks the agent to wind down the in-flight prompt
++/// turn (`session/cancel`) without borrowing the [`AcpClient`] — so a caller
++/// can hold it across the same `select!` that polls
++/// [`prompt`](AcpClient::prompt). Best-effort: a closed connection means there
++/// is nothing left to cancel.
++#[derive(Clone)]
++pub struct AcpCancelHandle {
++    commands: mpsc::Sender<PromptCommand>,
++}
++
++impl AcpCancelHandle {
++    /// Send the ACP `session/cancel` notification for the current turn. The
++    /// agent then finishes the in-flight `session/prompt` with the
++    /// wire-correct `cancelled` stop reason (or the caller times out and tears
++    /// the process down).
++    pub async fn cancel(&self) {
++        let _ = self.commands.send(PromptCommand::Cancel).await;
++    }
+ }
+ 
+ impl Drop for AcpClient {
+@@ -279,26 +611,57 @@ impl AcpClient {
+         R: AsyncRead + Unpin + Send + 'static,
+         W: AsyncWrite + Unpin + Send + 'static,
+     {
+-        Self::connect_transport(tokio_transport(reader, writer), cwd).await
++        Self::connect_with(reader, writer, cwd, AcpSessionOptions::default()).await
++    }
++
++    /// [`connect`](Self::connect) with explicit [`AcpSessionOptions`] (e.g. MCP
++    /// servers to forward into `session/new`).
++    pub async fn connect_with<R, W>(
++        reader: R,
++        writer: W,
++        cwd: &str,
++        options: AcpSessionOptions,
++    ) -> Result<AcpClient, AcpClientError>
++    where
++        R: AsyncRead + Unpin + Send + 'static,
++        W: AsyncWrite + Unpin + Send + 'static,
++    {
++        Self::connect_transport(tokio_transport(reader, writer), cwd, options).await
+     }
+ 
+     /// Spawn `command args` (with `env`) as a child ACP agent and connect over
+     /// its stdio. `env` carries the provider config's environment (secrets are
+     /// referenced by NAME upstream and resolved into `env` by the caller — never
+-    /// stored here). The agent owns its model; no model id is ever sent.
++    /// stored here).
+     pub async fn spawn(
+         command: &str,
+         args: &[String],
+         env: &BTreeMap<String, String>,
+         cwd: &str,
++    ) -> Result<AcpClient, AcpClientError> {
++        Self::spawn_with(command, args, env, cwd, AcpSessionOptions::default()).await
++    }
++
++    /// [`spawn`](Self::spawn) with explicit [`AcpSessionOptions`] (e.g. MCP
++    /// servers to forward into `session/new`).
++    pub async fn spawn_with(
++        command: &str,
++        args: &[String],
++        env: &BTreeMap<String, String>,
++        cwd: &str,
++        options: AcpSessionOptions,
+     ) -> Result<AcpClient, AcpClientError> {
+         let config = AcpAgentConfig::new(command)
+             .args(args.iter().cloned())
+             .envs(env.clone());
+-        Self::connect_transport(AcpAgent::new(config), cwd).await
++        Self::connect_transport(AcpAgent::new(config), cwd, options).await
+     }
+ 
+-    async fn connect_transport<T>(transport: T, cwd: &str) -> Result<AcpClient, AcpClientError>
++    async fn connect_transport<T>(
++        transport: T,
++        cwd: &str,
++        options: AcpSessionOptions,
++    ) -> Result<AcpClient, AcpClientError>
+     where
+         T: ConnectTo<Client> + Send + 'static,
+     {
+@@ -311,7 +674,15 @@ impl AcpClient {
+         }
+         let (ready_tx, ready_rx) = oneshot::channel();
+         let (commands, command_rx) = mpsc::channel(PROMPT_QUEUE_DEPTH);
+-        let driver = tokio::spawn(run_connection(transport, cwd, ready_tx, command_rx));
++        let discovery = Arc::new(Mutex::new(AcpDiscovery::default()));
++        let driver = tokio::spawn(run_connection(
++            transport,
++            cwd,
++            options,
++            Arc::clone(&discovery),
++            ready_tx,
++            command_rx,
++        ));
+         match tokio::time::timeout(HANDSHAKE_TIMEOUT, ready_rx).await {
+             Err(_) => {
+                 driver.abort();
+@@ -320,7 +691,11 @@ impl AcpClient {
+                     HANDSHAKE_TIMEOUT.as_secs()
+                 )))
+             }
+-            Ok(Ok(Ok(()))) => Ok(AcpClient { commands, driver }),
++            Ok(Ok(Ok(()))) => Ok(AcpClient {
++                commands,
++                driver,
++                discovery,
++            }),
+             // The driver reported a specific handshake failure before returning.
+             Ok(Ok(Err(error))) => {
+                 driver.abort();
+@@ -342,7 +717,9 @@ impl AcpClient {
+ 
+     /// Delegate `objective` to the agent as one ACP `session/prompt` turn,
+     /// feeding every mapped `session/update` event and permission request to
+-    /// `sink`, and returning why the turn ended. No model id is sent.
++    /// `sink`, and returning why the turn ended. The turn runs on whatever
++    /// model the session currently has — the agent's default, or the one
++    /// pinned earlier via [`set_model`](Self::set_model).
+     pub async fn prompt(
+         &mut self,
+         objective: &str,
+@@ -382,6 +759,87 @@ impl AcpClient {
+             "acp connection closed before the prompt completed".to_string(),
+         ))
+     }
++
++    /// The models the agent advertised over the session-config handshake, in
++    /// the agent's own order. Empty when the agent predates `config_options`
++    /// or exposes no model selector — the agent's default model then applies,
++    /// exactly the pre-discovery behavior.
++    #[must_use]
++    pub fn discovered_models(&self) -> Vec<AcpModel> {
++        self.discovery
++            .lock()
++            .expect("acp discovery mutex poisoned")
++            .models
++            .clone()
++    }
++
++    /// The session modes the agent advertised, in the agent's own order.
++    #[must_use]
++    pub fn discovered_modes(&self) -> Vec<AcpMode> {
++        self.discovery
++            .lock()
++            .expect("acp discovery mutex poisoned")
++            .modes
++            .clone()
++    }
++
++    /// The authentication methods the agent advertised in `initialize`.
++    #[must_use]
++    pub fn auth_methods(&self) -> Vec<AcpAuthMethod> {
++        self.discovery
++            .lock()
++            .expect("acp discovery mutex poisoned")
++            .auth_methods
++            .clone()
++    }
++
++    /// Switch the session to one of the agent's own models via
++    /// `session/set_config_option`, targeting the Model-category selector the
++    /// handshake advertised. `model_id` goes to the agent verbatim — the agent
++    /// is the authority on its catalog, so an unknown id fails with the
++    /// agent's own error rather than a local guess. Fails when the agent
++    /// advertised no model selector at all.
++    pub async fn set_model(&mut self, model_id: &str) -> Result<(), AcpClientError> {
++        let config_id = self
++            .discovery
++            .lock()
++            .expect("acp discovery mutex poisoned")
++            .model_config_id
++            .clone()
++            .ok_or_else(|| {
++                AcpClientError::Prompt(format!(
++                    "the agent advertises no model selector; cannot select `{model_id}`"
++                ))
++            })?;
++        let (reply, answer) = oneshot::channel();
++        self.commands
++            .send(PromptCommand::SetConfigOption {
++                config_id,
++                value: model_id.to_string(),
++                reply,
++            })
++            .await
++            .map_err(|_| {
++                AcpClientError::Prompt("acp connection is no longer running".to_string())
++            })?;
++        match answer.await {
++            Ok(Ok(())) => Ok(()),
++            Ok(Err(reason)) => Err(AcpClientError::Prompt(reason)),
++            Err(_) => Err(AcpClientError::Prompt(
++                "acp connection closed before set_config_option resolved".to_string(),
++            )),
++        }
++    }
++
++    /// A clonable [`AcpCancelHandle`] for graceful turn cancellation. Taken
++    /// BEFORE calling [`prompt`](Self::prompt) so the handle can be used while
++    /// the prompt future holds the `&mut self` borrow.
++    #[must_use]
++    pub fn cancel_handle(&self) -> AcpCancelHandle {
++        AcpCancelHandle {
++            commands: self.commands.clone(),
++        }
++    }
+ }
+ 
+ /// A prompt turn's live routing: which run the streamed updates belong to and
+@@ -394,13 +852,25 @@ struct ActivePrompt {
+     events: mpsc::Sender<PromptOut>,
+ }
+ 
+-/// A command from an [`AcpClient`] handle to its connection driver.
++/// A command from an [`AcpClient`] handle (or [`AcpCancelHandle`]) to its
++/// connection driver.
+ enum PromptCommand {
+     Prompt {
+         objective: String,
+         run_id: RunId,
+         events: mpsc::Sender<PromptOut>,
+     },
++    /// `session/set_config_option` — switch a select option (the model) and
++    /// report back whether the agent accepted it.
++    SetConfigOption {
++        config_id: String,
++        value: String,
++        reply: oneshot::Sender<Result<(), String>>,
++    },
++    /// `session/cancel` — ask the agent to wind down the in-flight turn. The
++    /// driver services this DURING a prompt (the whole point); with no turn in
++    /// flight it is still forwarded, which the agent treats as a no-op.
++    Cancel,
+ }
+ 
+ /// One item streamed from the connection driver back to an in-flight `prompt`.
+@@ -420,11 +890,14 @@ enum PromptOut {
+ }
+ 
+ /// Drive one ACP connection: run the builder's `connect_with`, complete the
+-/// handshake (signalling `ready`), then service prompt commands until every
++/// handshake (signalling `ready` and populating `discovery` from the
++/// `initialize` / `session/new` responses), then service commands until every
+ /// [`AcpClient`] handle drops and `commands` closes.
+ async fn run_connection<T>(
+     transport: T,
+     cwd: PathBuf,
++    options: AcpSessionOptions,
++    discovery: Arc<Mutex<AcpDiscovery>>,
+     ready: oneshot::Sender<Result<(), AcpClientError>>,
+     mut commands: mpsc::Receiver<PromptCommand>,
+ ) -> Result<(), AcpClientError>
+@@ -437,10 +910,28 @@ where
+         .builder()
+         .name("codypendent-acp-client")
+         // Every streamed `session/update` maps through the single Task 6 point.
++        // Config/mode announcements ALSO refresh the shared discovery state, so
++        // `discovered_models()` stays truthful after an agent-initiated switch.
+         .on_receive_notification(
+             {
+                 let active = Arc::clone(&active);
++                let discovery = Arc::clone(&discovery);
+                 async move |notification: SessionNotification, _cx| {
++                    match &notification.update {
++                        SessionUpdate::ConfigOptionUpdate(update) => {
++                            discovery
++                                .lock()
++                                .expect("acp discovery mutex poisoned")
++                                .apply_config_options(&update.config_options);
++                        }
++                        SessionUpdate::CurrentModeUpdate(update) => {
++                            discovery
++                                .lock()
++                                .expect("acp discovery mutex poisoned")
++                                .apply_current_mode(&update.current_mode_id.to_string());
++                        }
++                        _ => {}
++                    }
+                     let current = active
+                         .lock()
+                         .expect("acp active-prompt mutex poisoned")
+@@ -467,26 +958,54 @@ where
+             agent_client_protocol::on_receive_request!(),
+         )
+         .connect_with(transport, move |cx: ConnectionTo<Agent>| async move {
+-            // Handshake. The agent owns its model — we send no model id.
+-            if let Err(error) = cx
++            // Handshake. The responses are KEPT: `initialize` advertises auth
++            // methods (actionable errors), `session/new` advertises the
++            // agent's models/modes (the rubric's automatic model discovery).
++            match cx
+                 .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                 .block_task()
+                 .await
+             {
+-                let _ = ready.send(Err(AcpClientError::Handshake(format!(
+-                    "initialize failed: {error}"
+-                ))));
+-                return Err(error);
++                Ok(response) => discovery
++                    .lock()
++                    .expect("acp discovery mutex poisoned")
++                    .apply_initialize(&response),
++                Err(error) => {
++                    let _ = ready.send(Err(AcpClientError::Handshake(format!(
++                        "initialize failed: {error}"
++                    ))));
++                    return Err(error);
++                }
+             }
++            let mcp_servers = options
++                .mcp_servers
++                .iter()
++                .map(|server| {
++                    WireMcpServer::Stdio(
++                        McpServerStdio::new(server.name.clone(), server.command.clone())
++                            .args(server.args.clone()),
++                    )
++                })
++                .collect::<Vec<_>>();
+             let session_id = match cx
+-                .send_request(NewSessionRequest::new(cwd))
++                .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
+                 .block_task()
+                 .await
+             {
+-                Ok(response) => response.session_id,
++                Ok(response) => {
++                    let mut slot = discovery.lock().expect("acp discovery mutex poisoned");
++                    slot.apply_session(&response);
++                    response.session_id
++                }
+                 Err(error) => {
++                    // An auth-gated agent fails exactly here; name its
++                    // advertised remedies instead of an opaque failure.
++                    let hint = {
++                        let slot = discovery.lock().expect("acp discovery mutex poisoned");
++                        auth_methods_hint(&slot.auth_methods)
++                    };
+                     let _ = ready.send(Err(AcpClientError::Handshake(format!(
+-                        "session/new failed: {error}"
++                        "session/new failed: {error}{hint}"
+                     ))));
+                     return Err(error);
+                 }
+@@ -497,28 +1016,103 @@ where
+             // concurrently-dispatched update/permission callbacks reach this
+             // turn's event channel and run id while the request is in flight.
+             while let Some(command) = commands.recv().await {
+-                let PromptCommand::Prompt {
+-                    objective,
+-                    run_id,
+-                    events,
+-                } = command;
+-                *active.lock().expect("acp active-prompt mutex poisoned") = Some(ActivePrompt {
+-                    run_id,
+-                    events: events.clone(),
+-                });
+-                let result = cx
+-                    .send_request(PromptRequest::new(
+-                        session_id.clone(),
+-                        vec![ContentBlock::Text(TextContent::new(objective))],
+-                    ))
+-                    .block_task()
+-                    .await;
+-                *active.lock().expect("acp active-prompt mutex poisoned") = None;
+-                let resolved = match result {
+-                    Ok(response) => PromptOut::Done(map_stop_reason(response.stop_reason)),
+-                    Err(error) => PromptOut::Failed(format!("session/prompt failed: {error}")),
+-                };
+-                let _ = events.send(resolved).await;
++                match command {
++                    PromptCommand::Prompt {
++                        objective,
++                        run_id,
++                        events,
++                    } => {
++                        *active.lock().expect("acp active-prompt mutex poisoned") =
++                            Some(ActivePrompt {
++                                run_id,
++                                events: events.clone(),
++                            });
++                        let request = cx
++                            .send_request(PromptRequest::new(
++                                session_id.clone(),
++                                vec![ContentBlock::Text(TextContent::new(objective))],
++                            ))
++                            .block_task();
++                        let mut request = std::pin::pin!(request);
++                        // Keep servicing commands while the turn is in flight —
++                        // a `Cancel` must reach the agent as `session/cancel`
++                        // DURING the prompt or graceful cancellation could
++                        // never work.
++                        let mut commands_open = true;
++                        let result = loop {
++                            if !commands_open {
++                                break request.as_mut().await;
++                            }
++                            tokio::select! {
++                                result = request.as_mut() => break result,
++                                command = commands.recv() => match command {
++                                    Some(PromptCommand::Cancel) => {
++                                        let _ = cx.send_notification(CancelNotification::new(
++                                            session_id.clone(),
++                                        ));
++                                    }
++                                    Some(PromptCommand::SetConfigOption { reply, .. }) => {
++                                        let _ = reply.send(Err(
++                                            "a prompt turn is in flight".to_string(),
++                                        ));
++                                    }
++                                    Some(PromptCommand::Prompt { events, .. }) => {
++                                        // `prompt` takes `&mut self`, so a second
++                                        // in-flight turn cannot happen through the
++                                        // public API; refuse defensively anyway.
++                                        let _ = events
++                                            .send(PromptOut::Failed(
++                                                "a prompt turn is already in flight".to_string(),
++                                            ))
++                                            .await;
++                                    }
++                                    None => commands_open = false,
++                                },
++                            }
++                        };
++                        *active.lock().expect("acp active-prompt mutex poisoned") = None;
++                        let resolved = match result {
++                            Ok(response) => PromptOut::Done(map_stop_reason(response.stop_reason)),
++                            Err(error) => {
++                                PromptOut::Failed(format!("session/prompt failed: {error}"))
++                            }
++                        };
++                        let _ = events.send(resolved).await;
++                    }
++                    PromptCommand::SetConfigOption {
++                        config_id,
++                        value,
++                        reply,
++                    } => {
++                        let result = cx
++                            .send_request(SetSessionConfigOptionRequest::new(
++                                session_id.clone(),
++                                SessionConfigId::new(config_id),
++                                SessionConfigOptionValue::value_id(value),
++                            ))
++                            .block_task()
++                            .await;
++                        let outcome = match result {
++                            Ok(response) => {
++                                // The response carries the full refreshed set;
++                                // fold it so `discovered_models()` reports the
++                                // new current selection.
++                                discovery
++                                    .lock()
++                                    .expect("acp discovery mutex poisoned")
++                                    .apply_config_options(&response.config_options);
++                                Ok(())
++                            }
++                            Err(error) => {
++                                Err(format!("session/set_config_option failed: {error}"))
++                            }
++                        };
++                        let _ = reply.send(outcome);
++                    }
++                    PromptCommand::Cancel => {
++                        let _ = cx.send_notification(CancelNotification::new(session_id.clone()));
++                    }
++                }
+             }
+             Ok(())
+         })
+diff --git a/crates/integrations/src/acp_registry.rs b/crates/integrations/src/acp_registry.rs
+index 58ad867..60bc4e2 100644
+--- a/crates/integrations/src/acp_registry.rs
++++ b/crates/integrations/src/acp_registry.rs
+@@ -217,15 +217,41 @@ pub fn agent_coordinate(id: &str, version: &str) -> String {
+     format!("{}@{version}", canonical_agent_id(id))
+ }
+ 
+-/// Extract the canonical registry id from either an alias or a pinned
+-/// `id@version` model coordinate.
++/// A connected profile pinned to one of the agent's own models (discovered
++/// over the ACP session-config handshake) extends the coordinate additively:
++/// `id@version#model`. The `#model` part selects a model *inside* the session
++/// (`session/set_config_option`), never a different launch.
++#[must_use]
++pub fn agent_coordinate_with_model(id: &str, version: &str, model: &str) -> String {
++    format!("{}#{model}", agent_coordinate(id, version))
++}
++
++/// Extract the canonical registry id from an alias, a pinned `id@version`
++/// coordinate, or a model-pinned `id@version#model` coordinate.
+ #[must_use]
+ pub fn agent_id_from_coordinate(coordinate: &str) -> String {
+     split_agent_coordinate(coordinate).0
+ }
+ 
++/// The agent-model id pinned by an `…#model` coordinate, if any. Additive:
++/// coordinates written before model pinning existed have no `#` and yield
++/// `None`.
++#[must_use]
++pub fn agent_model_from_coordinate(coordinate: &str) -> Option<&str> {
++    coordinate
++        .trim()
++        .split_once('#')
++        .map(|(_, model)| model)
++        .filter(|model| !model.is_empty())
++}
++
+ fn split_agent_coordinate(coordinate: &str) -> (String, Option<String>) {
+     let coordinate = coordinate.trim();
++    // A pinned agent model (`…#model`) never affects which agent launches:
++    // strip it before resolving the id/version.
++    let coordinate = coordinate
++        .split_once('#')
++        .map_or(coordinate, |(agent, _)| agent);
+     if let Some((id, version)) = coordinate.rsplit_once('@') {
+         if !id.is_empty() && !version.is_empty() {
+             return (canonical_agent_id(id), Some(version.to_string()));
+@@ -1300,6 +1326,33 @@ mod tests {
+         assert_eq!(agent_id_from_coordinate("vibe-chat@2.24.0"), "mistral-vibe");
+     }
+ 
++    #[test]
++    fn model_pinned_coordinates_split_additively() {
++        // `#model` extends `id@version` without changing which agent resolves.
++        assert_eq!(
++            agent_coordinate_with_model("claude-code", "0.66.0", "claude-sonnet-4-5"),
++            "claude-acp@0.66.0#claude-sonnet-4-5"
++        );
++        assert_eq!(
++            agent_id_from_coordinate("claude-acp@0.66.0#claude-sonnet-4-5"),
++            "claude-acp"
++        );
++        assert_eq!(
++            split_agent_coordinate("claude-acp@0.66.0#claude-sonnet-4-5"),
++            ("claude-acp".to_string(), Some("0.66.0".to_string()))
++        );
++        assert_eq!(
++            agent_model_from_coordinate("claude-acp@0.66.0#claude-sonnet-4-5"),
++            Some("claude-sonnet-4-5")
++        );
++        // Pre-pinning coordinates keep splitting exactly as before.
++        assert_eq!(agent_model_from_coordinate("claude-acp@0.66.0"), None);
++        assert_eq!(agent_model_from_coordinate("claude-acp"), None);
++        // A dangling `#` pins nothing.
++        assert_eq!(agent_model_from_coordinate("claude-acp@0.66.0#"), None);
++        assert_eq!(agent_id_from_coordinate("claude-acp@0.66.0#"), "claude-acp");
++    }
++
+     #[test]
+     fn connected_agent_snapshot_stays_version_pinned_after_catalog_refresh() {
+         let dir = tempfile::tempdir().expect("tempdir");
+diff --git a/crates/runtime/src/models.rs b/crates/runtime/src/models.rs
+index de3473b..7ec8a8c 100644
+--- a/crates/runtime/src/models.rs
++++ b/crates/runtime/src/models.rs
+@@ -253,13 +253,108 @@ impl ModelRegistry {
+         self.get(id).is_some_and(|config| config.provider == "acp")
+     }
+ 
+-    /// The official registry id for an ACP profile.
++    /// The full ACP coordinate for an ACP profile — `id`, `id@version`, or
++    /// `id@version#model` once the profile pins one of the agent's own models.
++    /// Launch-oriented consumers strip the additive `#model` part with
++    /// [`acp_coordinate_agent`]; [`acp_agent_model`](Self::acp_agent_model)
++    /// reads the pin.
+     #[must_use]
+     pub fn acp_agent_id(&self, id: &ModelId) -> Option<&str> {
+         self.get(id)
+             .filter(|config| config.provider == "acp")
+             .map(|config| config.model.as_str())
+     }
++
++    /// The agent-model id an ACP profile pins on its external agent
++    /// (`id@version#model`), if any. `None` for a bare agent profile — the
++    /// agent then keeps whatever default model it booted with.
++    #[must_use]
++    pub fn acp_agent_model(&self, id: &ModelId) -> Option<&str> {
++        self.acp_agent_id(id).and_then(acp_coordinate_model)
++    }
++}
++
++/// Split an ACP model coordinate `id[@version][#model]` at the first `#` and
++/// return the launchable agent part. Additive: coordinates written before
++/// model pinning existed carry no `#` and return themselves unchanged.
++#[must_use]
++pub fn acp_coordinate_agent(coordinate: &str) -> &str {
++    coordinate
++        .split_once('#')
++        .map_or(coordinate, |(agent, _)| agent)
++}
++
++/// The agent-model id an ACP coordinate pins (`id[@version]#model`), if any.
++/// A dangling `#` pins nothing.
++#[must_use]
++pub fn acp_coordinate_model(coordinate: &str) -> Option<&str> {
++    coordinate
++        .split_once('#')
++        .map(|(_, model)| model)
++        .filter(|model| !model.is_empty())
++}
++
++#[cfg(test)]
++mod acp_coordinate_tests {
++    use super::*;
++
++    #[test]
++    fn coordinates_split_into_agent_and_optional_model_pin() {
++        assert_eq!(acp_coordinate_agent("claude-acp@0.66.0"), "claude-acp@0.66.0");
++        assert_eq!(acp_coordinate_model("claude-acp@0.66.0"), None);
++        assert_eq!(
++            acp_coordinate_agent("claude-acp@0.66.0#claude-sonnet-4-5"),
++            "claude-acp@0.66.0"
++        );
++        assert_eq!(
++            acp_coordinate_model("claude-acp@0.66.0#claude-sonnet-4-5"),
++            Some("claude-sonnet-4-5")
++        );
++        assert_eq!(acp_coordinate_model("claude-acp@0.66.0#"), None);
++    }
++
++    #[test]
++    fn registry_reads_the_model_pin_from_acp_profiles_only() {
++        let registry = ModelRegistry::new([
++            ModelConfig {
++                id: ModelId("acp/claude#sonnet".to_string()),
++                provider: "acp".to_string(),
++                base_url: String::new(),
++                model: "claude-acp@0.66.0#sonnet".to_string(),
++                api_key_env: String::new(),
++                context_tokens: None,
++            },
++            ModelConfig {
++                id: ModelId("acp/claude".to_string()),
++                provider: "acp".to_string(),
++                base_url: String::new(),
++                model: "claude-acp@0.66.0".to_string(),
++                api_key_env: String::new(),
++                context_tokens: None,
++            },
++            ModelConfig {
++                id: ModelId("hosted".to_string()),
++                provider: "openai-compatible".to_string(),
++                base_url: "https://example.test/v1".to_string(),
++                model: "some#model".to_string(),
++                api_key_env: String::new(),
++                context_tokens: None,
++            },
++        ]);
++        assert_eq!(
++            registry.acp_agent_model(&ModelId("acp/claude#sonnet".to_string())),
++            Some("sonnet")
++        );
++        assert_eq!(
++            registry.acp_agent_model(&ModelId("acp/claude".to_string())),
++            None
++        );
++        // Non-ACP profiles never expose a pin, whatever their model string.
++        assert_eq!(
++            registry.acp_agent_model(&ModelId("hosted".to_string())),
++            None
++        );
++    }
+ }
+ 
+ /// Map a persisted [`ModelConfig`] onto the provider abstraction. Chat profiles
