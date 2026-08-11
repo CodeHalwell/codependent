@@ -1303,6 +1303,12 @@ pub struct AppState {
     /// text lands here; Enter sends it (starting a run, or steering the active
     /// one). Empty by default.
     pub composer: String,
+    /// The insertion point in [`AppState::composer`], as a **byte** offset that
+    /// is always on a `char` boundary and never past `composer.len()`. Every
+    /// composer mutation goes through the splice helpers in [`crate::reduce`],
+    /// which maintain both invariants; `Left`/`Right` step whole graphemes, so
+    /// a multi-byte character or a combining sequence is never split.
+    pub composer_cursor: usize,
     /// Prior composer submissions (shell-style history), oldest first. `Up`
     /// (`HistoryPrev`) walks backward from the newest entry; `Down`
     /// (`HistoryNext`) walks forward. Populated by `InputSubmit` on a
@@ -1415,6 +1421,7 @@ impl AppState {
             selected_issue: 0,
             focus: Pane::Sessions,
             composer: String::new(),
+            composer_cursor: 0,
             composer_history: Vec::new(),
             history_cursor: None,
             composer_stash: None,

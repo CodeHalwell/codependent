@@ -417,8 +417,18 @@ fn map_composer_key(key: &KeyEvent) -> Action {
         KeyCode::Down if ctrl(key) => Action::NextRun,
         KeyCode::Up if alt(key) => Action::BrowseFoldPrev,
         KeyCode::Down if alt(key) => Action::BrowseFoldNext,
+        // ↑/↓ move between the draft's own lines first and only recall history
+        // at the draft's top/bottom edge (see `reduce::composer_up`).
         KeyCode::Up => Action::HistoryPrev,
         KeyCode::Down => Action::HistoryNext,
+        // Cursor editing: the draft is a real text field, not an append-only
+        // buffer.
+        KeyCode::Left => Action::CursorLeft,
+        KeyCode::Right => Action::CursorRight,
+        KeyCode::Home => Action::CursorLineStart,
+        KeyCode::End => Action::CursorLineEnd,
+        KeyCode::Char('w') if ctrl(key) => Action::DeleteWordBack,
+        KeyCode::Char('u') if ctrl(key) => Action::DeleteToLineStart,
         KeyCode::F(2) => Action::ToggleLayout,
         KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
             Action::RemoteUiNextDocument
@@ -875,6 +885,37 @@ mod tests {
         assert_eq!(
             map_event(&alt(KeyCode::Enter), InputMode::Composer, W, &[]),
             Action::InputNewline
+        );
+    }
+
+    /// The composer is a real text field: motion and word/line kill keys map
+    /// from the base view, without stealing Ctrl-C (detach) or plain letters.
+    #[test]
+    fn composer_cursor_keys_map() {
+        for (code, action) in [
+            (KeyCode::Left, Action::CursorLeft),
+            (KeyCode::Right, Action::CursorRight),
+            (KeyCode::Home, Action::CursorLineStart),
+            (KeyCode::End, Action::CursorLineEnd),
+        ] {
+            assert_eq!(map_event(&key(code), InputMode::Composer, W, &[]), action);
+        }
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Char('w')), InputMode::Composer, W, &[]),
+            Action::DeleteWordBack
+        );
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Char('u')), InputMode::Composer, W, &[]),
+            Action::DeleteToLineStart
+        );
+        // Unmodified `w`/`u` are still ordinary text.
+        assert_eq!(
+            map_event(&ch('w'), InputMode::Composer, W, &[]),
+            Action::InputChar('w')
+        );
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Char('c')), InputMode::Composer, W, &[]),
+            Action::Detach
         );
     }
 

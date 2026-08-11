@@ -157,8 +157,22 @@ pub enum Action {
     InputChar(char),
     /// Insert bracketed-paste text into the open prompt.
     InputPaste(String),
-    /// Delete the last character of the open prompt.
+    /// Delete the character before the cursor of the open prompt.
     InputBackspace,
+    /// Move the composer cursor one grapheme left / right (`←`/`→`).
+    /// Client-only.
+    CursorLeft,
+    /// Move the composer cursor one grapheme right (`→`). Client-only.
+    CursorRight,
+    /// Move the composer cursor to the start of its current line (`Home`).
+    CursorLineStart,
+    /// Move the composer cursor to the end of its current line (`End`).
+    CursorLineEnd,
+    /// Delete the word before the composer cursor (`Ctrl-W`). Client-only.
+    DeleteWordBack,
+    /// Delete from the start of the current line to the composer cursor
+    /// (`Ctrl-U`). Client-only.
+    DeleteToLineStart,
     /// Insert a manual line break into the open prompt (`Alt+Enter`) without
     /// submitting — the composer/prompt buffer already renders embedded `\n`
     /// as separate lines, growing to fit.

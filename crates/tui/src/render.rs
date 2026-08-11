@@ -817,28 +817,17 @@ fn composer_rendered_rows(composer: &str, width: u16) -> u16 {
     if composer.is_empty() {
         return 1;
     }
-    let segments = composer.split('\n').collect::<Vec<_>>();
-    let last = segments.len().saturating_sub(1);
-    segments
-        .iter()
-        .enumerate()
-        .fold(0_u16, |rows, (index, segment)| {
-            let columns = 2 + UnicodeWidthStr::width(*segment) + usize::from(index == last);
-            rows.saturating_add(line_rows(columns, usize::from(width.max(1))))
+    // Measured with the same `CellWrap` rule `render_composer` pre-splits its
+    // rows with, so the box is never a row too short for what is drawn. The
+    // trailing `" "` is the cursor cell: it only adds a column when the cursor
+    // sits at a line's end, and charging every line for it can at most make
+    // the box one row taller than strictly needed — never shorter.
+    composer
+        .split('\n')
+        .fold(0_u16, |rows, segment| {
+            rows.saturating_add(cell_wrap_rows(["  ", segment, " "].into_iter(), width))
         })
         .max(1)
-}
-
-/// Wrapped-row height of a line `columns` display-columns wide in an
-/// `inner_width` viewport: ceil(columns/inner_width), min 1.
-fn line_rows(columns: usize, inner_width: usize) -> u16 {
-    let iw = inner_width.max(1);
-    let rows = if columns == 0 {
-        1
-    } else {
-        columns.div_ceil(iw)
-    };
-    u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
 /// The one cell-granularity wrapping rule the transcript's measure pass and
@@ -1531,41 +1520,75 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         // A manual line break (`Alt+Enter`) or a multi-line paste puts a `\n`
         // in the draft: render each segment as its own `Line` (a raw `\n`
         // inside one `Line`'s text does not itself wrap) rather than a single
-        // wrapped line — only the first gets the `› ` prompt, and only the
-        // last gets the cursor.
-        let segments: Vec<&str> = state.composer.split('\n').collect();
-        let last = segments.len() - 1;
-        segments
-            .into_iter()
-            .enumerate()
-            .map(|(i, segment)| {
-                let mut spans = vec![Span::styled(if i == 0 { "❯ " } else { "  " }, prompt_style)];
-                spans.push(Span::styled(
-                    segment,
-                    Style::default().fg(theme.text.primary),
-                ));
-                if i == last {
-                    spans.push(Span::styled("▏", Style::default().fg(theme.focus.active)));
+        // wrapped line — only the first gets the `❯ ` prompt, and the cursor
+        // is drawn wherever `composer_cursor` actually is, not always at the
+        // end.
+        let cursor = state.composer_cursor.min(state.composer.len());
+        let text_style = Style::default().fg(theme.text.primary);
+        // A reversed cell IS the cursor: it inverts whatever character it sits
+        // on (or a trailing space at end-of-line), so it never displaces the
+        // text around it and stays visible on every theme depth.
+        let cursor_style = text_style.add_modifier(Modifier::REVERSED);
+        let mut lines = Vec::new();
+        let mut offset = 0_usize;
+        for (i, segment) in state.composer.split('\n').enumerate() {
+            let mut spans = vec![Span::styled(if i == 0 { "❯ " } else { "  " }, prompt_style)];
+            let end = offset + segment.len();
+            if (offset..=end).contains(&cursor) {
+                let at = cursor - offset;
+                let (before, rest) = segment.split_at(at);
+                let under = UnicodeSegmentation::graphemes(rest, true).next();
+                if !before.is_empty() {
+                    spans.push(Span::styled(before, text_style));
                 }
-                Line::from(spans)
-            })
-            .collect()
+                match under {
+                    Some(grapheme) => {
+                        spans.push(Span::styled(grapheme, cursor_style));
+                        spans.push(Span::styled(&rest[grapheme.len()..], text_style));
+                    }
+                    // At end-of-line: the cursor is a reversed blank cell.
+                    None => spans.push(Span::styled(" ", cursor_style)),
+                }
+            } else {
+                spans.push(Span::styled(segment, text_style));
+            }
+            // +1 for the `\n` that `split` consumed.
+            offset = end + 1;
+            lines.push(Line::from(spans));
+        }
+        lines
     };
 
-    // Keep the cursor (the last line) in view once the draft has more lines
-    // than the box shows — the box already grew toward `COMPOSER_MAX_HEIGHT`
-    // (see `composer_box_height`); this only matters once it's capped there.
+    // Keep the cursor's row in view once the draft has more rows than the box
+    // shows — the box already grew toward `COMPOSER_MAX_HEIGHT` (see
+    // `composer_box_height`); this only matters once it's capped there. Rows
+    // are counted with the same cell-wrap rule the pre-split below draws with,
+    // so the count and the drawing cannot disagree.
     let visible_rows = area.height.saturating_sub(1).max(1);
-    let total_rows = lines.iter().fold(0_u16, |rows, line| {
-        rows.saturating_add(line_rows(line.width(), usize::from(area.width.max(1))))
-    });
-    let scroll_y = total_rows.saturating_sub(visible_rows);
+    let inner_width = area.width.max(1);
+    let mut rows: Vec<Line> = Vec::with_capacity(lines.len());
+    let mut cursor_row = 0_u16;
+    for line in &lines {
+        for visual in split_line_cells(line, inner_width) {
+            if visual
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            {
+                cursor_row = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+            }
+            rows.push(visual);
+        }
+    }
+    // Scroll exactly enough to keep the cursor's row inside the box: 0 while it
+    // fits, otherwise the cursor's row sits on the bottom visible line (which
+    // is the old "pin to the last row" behaviour when the cursor is at the end).
+    let scroll_y = cursor_row.saturating_sub(visible_rows.saturating_sub(1));
 
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll_y, 0)),
+        // No `Wrap`: the rows above were pre-split at cell granularity, so
+        // wrapping again would double-fold them (and move the cursor row).
+        Paragraph::new(rows).block(block).scroll((scroll_y, 0)),
         area,
     );
     // Belt-and-braces: the full-screen scrim (`render_overlays`) already
@@ -6928,18 +6951,52 @@ mod tests {
         assert_eq!(resolve(0, 2), Some(Action::Dismiss));
     }
 
+    /// The cursor cell — a reversed cell, so it inverts the character it sits
+    /// on instead of displacing the text — as `(x, y)` positions in a frame.
+    fn cursor_cells(buffer: &Buffer) -> Vec<(u16, u16)> {
+        let area = *buffer.area();
+        let mut cells = Vec::new();
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                if buffer[(x, y)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+                {
+                    cells.push((x, y));
+                }
+            }
+        }
+        cells
+    }
+
     #[test]
     fn a_soft_wrapped_composer_keeps_its_cursor_visible() {
         let mut state = AppState::new();
         state.composer = "a long narrow draft ".repeat(12);
-        let text = render_to_string(&state, 40, 18);
+        state.composer_cursor = state.composer.len();
+        let theme = Theme::dark();
+        let buffer = render_buffer(&state, 40, 18, &theme);
+        let cells = cursor_cells(&buffer);
+        assert_eq!(cells.len(), 1, "exactly one cursor cell is painted");
+        // The draft overflows the capped box, so the cursor's row must have
+        // been scrolled to — it can never sit below the composer's last row.
         assert!(
-            text.contains('▏'),
-            "composer cursor scrolled out of view:\n{text}"
+            cells[0].1 < 18,
+            "composer cursor scrolled out of view: {cells:?}"
         );
         assert_eq!(
             composer_box_height(&state.composer, 40),
             COMPOSER_MAX_HEIGHT
+        );
+
+        // With the cursor moved to the very start, the composer scrolls back to
+        // the draft's first row and paints the cursor there instead.
+        state.composer_cursor = 0;
+        let top = cursor_cells(&render_buffer(&state, 40, 18, &theme));
+        assert_eq!(top.len(), 1);
+        assert!(
+            top[0].1 < cells[0].1,
+            "moving the cursor home scrolls the composer back up: {top:?} vs {cells:?}"
         );
     }
 
@@ -10701,6 +10758,62 @@ mod tests {
         assert!(
             s.runs[0].follow,
             "the pin is a draw-time projection — follow mode is untouched"
+        );
+    }
+
+    /// The composer draws the cursor where `composer_cursor` actually is —
+    /// mid-line, not always at the tail — as a reversed cell over the character
+    /// it sits on, so the surrounding text never shifts.
+    #[test]
+    fn the_composer_cursor_is_drawn_at_its_real_position() {
+        let mut state = AppState::new();
+        state.composer = "hello world".to_owned();
+        state.composer_cursor = 0;
+        let theme = Theme::dark();
+        let head = cursor_cells(&render_buffer(&state, 60, 12, &theme));
+        assert_eq!(head.len(), 1);
+
+        state.composer_cursor = 5;
+        let middle = cursor_cells(&render_buffer(&state, 60, 12, &theme));
+        assert_eq!(middle.len(), 1);
+        assert_eq!(
+            middle[0].0,
+            head[0].0 + 5,
+            "the cursor moves five columns right, on the same row"
+        );
+        assert_eq!(middle[0].1, head[0].1);
+
+        // The draft itself is unchanged by where the cursor sits.
+        let text = render_to_string(&state, 60, 12);
+        assert!(text.contains("hello world"), "{text}");
+    }
+
+    /// A wide glyph is one cursor cell, not a half-covered pair, and a
+    /// multi-line draft puts the cursor on its own line.
+    #[test]
+    fn the_cursor_covers_a_wide_glyph_and_follows_multiline_drafts() {
+        let mut state = AppState::new();
+        state.composer = "日本語".to_owned();
+        state.composer_cursor = 0;
+        let theme = Theme::dark();
+        let cells = cursor_cells(&render_buffer(&state, 60, 12, &theme));
+        assert_eq!(
+            cells.len(),
+            1,
+            "a double-width glyph is one styled cell, never split: {cells:?}"
+        );
+
+        state.composer = "first\nsecond".to_owned();
+        state.composer_cursor = 2; // on the first line
+        let first = cursor_cells(&render_buffer(&state, 60, 12, &theme));
+        state.composer_cursor = state.composer.len(); // on the second line
+        let second = cursor_cells(&render_buffer(&state, 60, 12, &theme));
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second[0].1,
+            first[0].1 + 1,
+            "the cursor sits on its own draft line: {first:?} vs {second:?}"
         );
     }
 }

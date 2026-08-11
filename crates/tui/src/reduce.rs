@@ -15,6 +15,8 @@ use codypendent_protocol::{
 };
 use codypendent_ui_host::UiSessionUpdate;
 use serde_json::{Map, Value};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, WorkflowNodeUpdate};
 use crate::remote_ui::{RemoteKey, RemoteUiRenderOutput};
@@ -303,15 +305,19 @@ pub fn reduce(state: &mut AppState, action: Action) {
 
         Action::InputChar(c) => input_char(state, c),
         Action::InputPaste(text) => {
-            edit_prompt(state, move |buf| buf.push_str(&text));
+            edit_prompt(state, &Edit::Insert(text));
             detach_history_on_edit(state);
         }
         Action::InputBackspace => {
-            edit_prompt(state, |buf| {
-                buf.pop();
-            });
+            edit_prompt(state, &Edit::Backspace);
             detach_history_on_edit(state);
         }
+        Action::CursorLeft => move_composer_cursor(state, CursorMove::Left),
+        Action::CursorRight => move_composer_cursor(state, CursorMove::Right),
+        Action::CursorLineStart => move_composer_cursor(state, CursorMove::LineStart),
+        Action::CursorLineEnd => move_composer_cursor(state, CursorMove::LineEnd),
+        Action::DeleteWordBack => delete_backwards(state, &Edit::WordBack),
+        Action::DeleteToLineStart => delete_backwards(state, &Edit::ToLineStart),
         // `Alt-Enter` expands the browsed transcript fold when one is under the
         // cursor (the keyboard path to tool cards and patch diffs), and is a
         // plain line break otherwise. The input mapper is stateless, so the
@@ -320,14 +326,16 @@ pub fn reduce(state: &mut AppState, action: Action) {
             if state.transcript_browse && matches!(state.overlay, Overlay::None) {
                 expand_selected(state);
             } else {
-                edit_prompt(state, |buf| buf.push('\n'));
+                edit_prompt(state, &Edit::Insert("\n".to_owned()));
                 detach_history_on_edit(state);
             }
         }
         Action::InputSubmit => submit_prompt(state),
         Action::InputCancel => input_cancel(state),
-        Action::HistoryPrev => history_prev(state),
-        Action::HistoryNext => history_next(state),
+        // `↑`/`↓` walk the draft's own lines first and only recall history at
+        // its top/bottom edge — a single-line draft is unchanged.
+        Action::HistoryPrev => composer_up(state),
+        Action::HistoryNext => composer_down(state),
 
         Action::OpenSkills => {
             state.overlay = match state.overlay {
@@ -2221,72 +2229,273 @@ fn apply_document_sync(
     clamp(&mut state.selected_suggestion, suggestions_len);
 }
 
-fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
+/// One text mutation, applied at the active buffer's insertion point. Only the
+/// composer has a movable cursor; every other prompt buffer is append-only, so
+/// [`append`] applies these at its end and reproduces the old push/pop
+/// behaviour exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Edit {
+    /// Insert text at the cursor (a typed char, a paste, or a line break).
+    Insert(String),
+    /// Delete the grapheme before the cursor.
+    Backspace,
+    /// Delete the word before the cursor (`Ctrl-W`).
+    WordBack,
+    /// Delete from the start of the cursor's line to the cursor (`Ctrl-U`).
+    ToLineStart,
+}
+
+/// `[start, end)` byte range of the line containing `cursor` (a line being the
+/// text between `\n`s — the composer's `Alt-Enter` breaks).
+fn line_bounds(text: &str, cursor: usize) -> (usize, usize) {
+    let start = text[..cursor].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[cursor..]
+        .find('\n')
+        .map_or(text.len(), |offset| cursor + offset);
+    (start, end)
+}
+
+/// Apply `edit` at `cursor`, keeping `cursor` on a `char` boundary and inside
+/// `buf`. Deletions step whole GRAPHEMES, so a combining sequence (`e` + U+0301)
+/// and a multi-byte or double-width character are removed as one unit rather
+/// than being cut in half into invalid text.
+fn splice(buf: &mut String, cursor: &mut usize, edit: &Edit) {
+    *cursor = (*cursor).min(buf.len());
+    while *cursor > 0 && !buf.is_char_boundary(*cursor) {
+        *cursor -= 1;
+    }
+    match edit {
+        Edit::Insert(text) => {
+            buf.insert_str(*cursor, text);
+            *cursor += text.len();
+        }
+        Edit::Backspace => {
+            if let Some(prev) = prev_grapheme(buf, *cursor) {
+                buf.replace_range(prev..*cursor, "");
+                *cursor = prev;
+            }
+        }
+        Edit::WordBack => {
+            let (line_start, _) = line_bounds(buf, *cursor);
+            // Skip the whitespace immediately before the cursor, then delete
+            // back to the start of the word it trails (readline's `Ctrl-W`).
+            let mut at = *cursor;
+            while at > line_start {
+                let Some(prev) = prev_grapheme(buf, at) else {
+                    break;
+                };
+                if buf[prev..at].chars().all(char::is_whitespace) {
+                    at = prev;
+                } else {
+                    break;
+                }
+            }
+            while at > line_start {
+                let Some(prev) = prev_grapheme(buf, at) else {
+                    break;
+                };
+                if buf[prev..at].chars().all(char::is_whitespace) {
+                    break;
+                }
+                at = prev;
+            }
+            buf.replace_range(at..*cursor, "");
+            *cursor = at;
+        }
+        Edit::ToLineStart => {
+            let (line_start, _) = line_bounds(buf, *cursor);
+            buf.replace_range(line_start..*cursor, "");
+            *cursor = line_start;
+        }
+    }
+}
+
+/// Apply `edit` at the end of an append-only buffer (every prompt except the
+/// composer). `Insert` is a push, `Backspace` a pop — exactly what these
+/// buffers did before the composer grew a cursor.
+fn append(buf: &mut String, edit: &Edit) {
+    let mut cursor = buf.len();
+    splice(buf, &mut cursor, edit);
+}
+
+/// The byte offset of the grapheme boundary before `cursor`, or `None` at the
+/// start of the buffer.
+fn prev_grapheme(text: &str, cursor: usize) -> Option<usize> {
+    UnicodeSegmentation::grapheme_indices(&text[..cursor], true)
+        .next_back()
+        .map(|(offset, _)| offset)
+}
+
+/// The byte offset of the grapheme boundary after `cursor`, or `None` at the
+/// end of the buffer.
+fn next_grapheme(text: &str, cursor: usize) -> Option<usize> {
+    UnicodeSegmentation::grapheme_indices(&text[cursor..], true)
+        .next()
+        .map(|(_, grapheme)| cursor + grapheme.len())
+}
+
+/// Where a cursor key moves the composer's insertion point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorMove {
+    Left,
+    Right,
+    LineStart,
+    LineEnd,
+}
+
+/// `←`/`→`/`Home`/`End` in the composer. Horizontal motion steps whole
+/// graphemes (never landing mid-character); `Home`/`End` are scoped to the
+/// cursor's own line, so they stay useful in a multi-line draft.
+fn move_composer_cursor(state: &mut AppState, motion: CursorMove) {
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    // Moving the caret is composing, not browsing.
+    end_browse(state);
+    let cursor = state.composer_cursor.min(state.composer.len());
+    let (line_start, line_end) = line_bounds(&state.composer, cursor);
+    state.composer_cursor = match motion {
+        CursorMove::Left => prev_grapheme(&state.composer, cursor).unwrap_or(0),
+        CursorMove::Right => next_grapheme(&state.composer, cursor).unwrap_or(cursor),
+        CursorMove::LineStart => line_start,
+        CursorMove::LineEnd => line_end,
+    };
+}
+
+/// Delete backwards in the composer (`Ctrl-W` / `Ctrl-U`); a no-op elsewhere,
+/// where these keys have never meant anything.
+fn delete_backwards(state: &mut AppState, edit: &Edit) {
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    splice(&mut state.composer, &mut state.composer_cursor, edit);
+    detach_history_on_edit(state);
+}
+
+/// The composer cursor's display column within its own line — the width the
+/// terminal actually paints, so `↑`/`↓` keep their column across CJK and emoji.
+fn cursor_column(text: &str, cursor: usize) -> usize {
+    let (start, _) = line_bounds(text, cursor);
+    UnicodeWidthStr::width(&text[start..cursor])
+}
+
+/// The byte offset within `[start, end)` closest to display `column` without
+/// overshooting it, snapped to a grapheme boundary.
+fn offset_for_column(text: &str, start: usize, end: usize, column: usize) -> usize {
+    let mut width = 0;
+    for (offset, grapheme) in UnicodeSegmentation::grapheme_indices(&text[start..end], true) {
+        if width >= column {
+            return start + offset;
+        }
+        width += UnicodeWidthStr::width(grapheme);
+    }
+    end
+}
+
+/// `↑` in the composer: move to the line above, keeping the display column;
+/// only at the draft's TOP line does it fall through to history recall. A
+/// single-line draft therefore behaves exactly as it did before.
+fn composer_up(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::None) {
+        let cursor = state.composer_cursor.min(state.composer.len());
+        let (line_start, _) = line_bounds(&state.composer, cursor);
+        if line_start > 0 {
+            let column = cursor_column(&state.composer, cursor);
+            let (prev_start, prev_end) = line_bounds(&state.composer, line_start - 1);
+            state.composer_cursor =
+                offset_for_column(&state.composer, prev_start, prev_end, column);
+            end_browse(state);
+            return;
+        }
+    }
+    history_prev(state);
+}
+
+/// `↓` in the composer: the mirror of [`composer_up`] — the line below, then
+/// history at the draft's bottom line.
+fn composer_down(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::None) {
+        let cursor = state.composer_cursor.min(state.composer.len());
+        let (_, line_end) = line_bounds(&state.composer, cursor);
+        if line_end < state.composer.len() {
+            let column = cursor_column(&state.composer, cursor);
+            let (next_start, next_end) = line_bounds(&state.composer, line_end + 1);
+            state.composer_cursor =
+                offset_for_column(&state.composer, next_start, next_end, column);
+            end_browse(state);
+            return;
+        }
+    }
+    history_next(state);
+}
+
+fn edit_prompt(state: &mut AppState, edit: &Edit) {
     match &mut state.overlay {
-        Overlay::NewRun(buf) | Overlay::Steering(buf) => edit(buf),
-        Overlay::WorkflowInputs { buffer, .. } => edit(buffer),
-        Overlay::EdgeSearch(buffer) => edit(buffer),
-        Overlay::DocEdit { buffer, .. } => edit(buffer),
-        Overlay::DocPublishPath { buffer, .. } => edit(buffer),
-        Overlay::AddModelId { buffer, .. } => edit(buffer),
+        Overlay::NewRun(buf) | Overlay::Steering(buf) => append(buf, edit),
+        Overlay::WorkflowInputs { buffer, .. } => append(buffer, edit),
+        Overlay::EdgeSearch(buffer) => append(buffer, edit),
+        Overlay::DocEdit { buffer, .. } => append(buffer, edit),
+        Overlay::DocPublishPath { buffer, .. } => append(buffer, edit),
+        Overlay::AddModelId { buffer, .. } => append(buffer, edit),
         // The key buffer is a redacting newtype; edit its inner String.
-        Overlay::AddModelKey { buffer, .. } => edit(&mut buffer.0),
+        Overlay::AddModelKey { buffer, .. } => append(&mut buffer.0, edit),
         // The `/keys` set prompt masks the same redacting newtype (D1).
-        Overlay::ApiKeySet { buffer, .. } => edit(&mut buffer.0),
+        Overlay::ApiKeySet { buffer, .. } => append(&mut buffer.0, edit),
         // The key-first prompt masks a redacting newtype, like `AddModelKey`.
-        Overlay::AddModelProviderKey { buffer, .. } => edit(&mut buffer.0),
+        Overlay::AddModelProviderKey { buffer, .. } => append(&mut buffer.0, edit),
         // The pick-list filters like the model picker: editing the query resets
         // the selection to the top of the new filtered set.
         Overlay::AddModelPick {
             query, selected, ..
         } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Editing the palette query changes the filtered set, so the selection
         // returns to the top rather than pointing past the new results.
         Overlay::Palette { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the palette: editing the model picker's query changes
         // the filtered set, so the selection returns to the top.
         Overlay::ModelPicker { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the model picker (Task 8): editing the provider
         // picker's query changes the filtered set, so the selection returns
         // to the top.
         Overlay::ProviderPicker { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the provider picker (PR C2): editing the mode
         // picker's query changes the filtered set, so the selection returns
         // to the top.
         Overlay::ModePicker { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the mode picker (D1): editing the `/keys` query
         // changes the filtered set, so the selection returns to the top.
         Overlay::ApiKeys { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         Overlay::CouncilBuilder(builder) => match builder.step {
-            CouncilBuilderStep::Name => edit(&mut builder.name),
-            CouncilBuilderStep::Description => edit(&mut builder.description),
+            CouncilBuilderStep::Name => append(&mut builder.name, edit),
+            CouncilBuilderStep::Description => append(&mut builder.description, edit),
             CouncilBuilderStep::MemberModel | CouncilBuilderStep::Chair => {
-                edit(&mut builder.query);
+                append(&mut builder.query, edit);
                 builder.selected = 0;
             }
-            CouncilBuilderStep::MemberRole => edit(&mut builder.role),
+            CouncilBuilderStep::MemberRole => append(&mut builder.role, edit),
             CouncilBuilderStep::Rounds | CouncilBuilderStep::Review => {}
         },
-        // The base view: text lands in the persistent composer draft.
-        Overlay::None => edit(&mut state.composer),
+        // The base view: text lands in the persistent composer draft, at
+        // its cursor — the one buffer with a movable insertion point.
+        Overlay::None => splice(&mut state.composer, &mut state.composer_cursor, edit),
         _ => {}
     }
     // Keep `selected_model` resolved to the new top-of-filter card (mirrors
@@ -2318,7 +2527,7 @@ fn input_char(state: &mut AppState, c: char) {
         };
         return;
     }
-    edit_prompt(state, |buf| buf.push(c));
+    edit_prompt(state, &Edit::Insert(c.to_string()));
     detach_history_on_edit(state);
 }
 
@@ -2376,6 +2585,7 @@ fn history_prev(state: &mut AppState) {
         Some(idx) => idx.saturating_sub(1),
     };
     state.composer = state.composer_history[idx].clone();
+    state.composer_cursor = state.composer.len();
     state.history_cursor = Some(idx);
 }
 
@@ -2394,6 +2604,7 @@ fn history_next(state: &mut AppState) {
         state.composer = state.composer_history[idx].clone();
         state.history_cursor = Some(idx);
     }
+    state.composer_cursor = state.composer.len();
 }
 
 /// `Esc`: clear the composer draft in the base view, return the block-edit prompt
@@ -2440,7 +2651,10 @@ fn input_cancel(state: &mut AppState) {
         return;
     }
     match state.overlay {
-        Overlay::None => state.composer.clear(),
+        Overlay::None => {
+            state.composer.clear();
+            state.composer_cursor = 0;
+        }
         // Abandoning the block-edit prompt returns to the browser, not the base
         // view (no lease was taken yet — the acquire only fires on submit).
         Overlay::DocEdit { .. } => state.overlay = Overlay::Docs,
@@ -3027,6 +3241,7 @@ fn submit_prompt(state: &mut AppState) {
                 }
             }
             state.composer.clear();
+            state.composer_cursor = 0;
             // Snap the conversation back to the latest so the reply is in view.
             if let Some(run) = state.selected_run_mut() {
                 run.follow = true;
@@ -8590,5 +8805,240 @@ mod tests {
             text: "hi".to_owned()
         }
         .is_foldable());
+    }
+
+    // --- composer cursor: a real text field, not an append-only buffer ---
+
+    /// Type `text` into an empty composer one action at a time, exactly as the
+    /// input layer would.
+    fn typed(text: &str) -> AppState {
+        let mut s = AppState::new();
+        for c in text.chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        assert_eq!(s.composer_cursor, s.composer.len());
+        s
+    }
+
+    #[test]
+    fn arrows_home_and_end_move_the_insertion_point_and_edits_splice() {
+        let mut s = typed("helo world");
+        // ← ← ← ← ← ← puts the caret between "hel" and "o world".
+        for _ in 0..7 {
+            reduce(&mut s, Action::CursorLeft);
+        }
+        assert_eq!(s.composer_cursor, 3);
+        reduce(&mut s, Action::InputChar('l'));
+        assert_eq!(s.composer, "hello world", "typing splices at the cursor");
+        assert_eq!(s.composer_cursor, 4, "the cursor follows the inserted text");
+
+        // Backspace deletes BEFORE the cursor, not at the end of the draft.
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.composer, "helo world");
+        assert_eq!(s.composer_cursor, 3);
+
+        reduce(&mut s, Action::CursorLineEnd);
+        assert_eq!(s.composer_cursor, s.composer.len());
+        reduce(&mut s, Action::CursorLineStart);
+        assert_eq!(s.composer_cursor, 0);
+        // Motion saturates at both ends instead of underflowing.
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(s.composer_cursor, 0);
+        reduce(&mut s, Action::CursorLineEnd);
+        reduce(&mut s, Action::CursorRight);
+        assert_eq!(s.composer_cursor, s.composer.len());
+    }
+
+    #[test]
+    fn ctrl_w_deletes_a_word_and_ctrl_u_deletes_to_the_line_start() {
+        let mut s = typed("cargo test --all-targets");
+        reduce(&mut s, Action::DeleteWordBack);
+        assert_eq!(s.composer, "cargo test ");
+        assert_eq!(s.composer_cursor, s.composer.len());
+        // Trailing whitespace is skipped before the word itself is eaten.
+        reduce(&mut s, Action::DeleteWordBack);
+        assert_eq!(s.composer, "cargo ");
+        reduce(&mut s, Action::DeleteToLineStart);
+        assert_eq!(s.composer, "");
+        assert_eq!(s.composer_cursor, 0);
+        // Both are inert on an empty draft rather than panicking.
+        reduce(&mut s, Action::DeleteWordBack);
+        reduce(&mut s, Action::DeleteToLineStart);
+        assert_eq!(s.composer, "");
+    }
+
+    #[test]
+    fn ctrl_w_and_ctrl_u_are_scoped_to_the_cursors_own_line() {
+        let mut s = typed("first line");
+        reduce(&mut s, Action::InputNewline);
+        for c in "second line".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::DeleteToLineStart);
+        assert_eq!(
+            s.composer, "first line\n",
+            "Ctrl-U clears the current line, never the whole draft"
+        );
+        reduce(&mut s, Action::DeleteWordBack);
+        assert_eq!(
+            s.composer, "first line\n",
+            "Ctrl-W stops at the line start rather than eating the line above"
+        );
+    }
+
+    #[test]
+    fn up_and_down_walk_the_drafts_own_lines_before_recalling_history() {
+        let mut s = AppState::new();
+        s.composer_history = vec!["recalled".to_owned()];
+        for c in "alpha".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputNewline);
+        for c in "bravo".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        // On the second line: ↑ moves within the draft, keeping the column.
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "alpha\nbravo", "the draft is untouched");
+        assert_eq!(s.composer_cursor, 5, "same column, line above");
+        // ↓ comes back down to the same column.
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer_cursor, 11);
+
+        // At the TOP line, ↑ falls through to history recall as before.
+        reduce(&mut s, Action::HistoryPrev);
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "recalled");
+        assert_eq!(
+            s.composer_cursor,
+            s.composer.len(),
+            "recall lands at the end"
+        );
+        // ...and ↓ past the newest entry restores the stashed draft.
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer, "alpha\nbravo");
+        assert_eq!(s.composer_cursor, s.composer.len());
+    }
+
+    #[test]
+    fn a_single_line_draft_recalls_history_exactly_as_before() {
+        // The vertical-motion change must not alter the shell-style contract
+        // for the ordinary one-line draft.
+        let mut s = AppState::new();
+        s.composer_history = vec!["older".to_owned(), "newer".to_owned()];
+        for c in "draft".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "newer");
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "older");
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer, "newer");
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer, "draft", "the stashed draft comes back");
+    }
+
+    #[test]
+    fn the_cursor_steps_whole_graphemes_over_multibyte_and_wide_text() {
+        // Multi-byte (é as e + U+0301), wide CJK, and an emoji: every motion
+        // and deletion must land on a grapheme boundary, never inside one —
+        // slicing a `String` off-boundary would panic.
+        let mut s = typed("e\u{301}日本🚀");
+        assert_eq!(s.composer_cursor, s.composer.len());
+
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(&s.composer[s.composer_cursor..], "🚀");
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(&s.composer[s.composer_cursor..], "本🚀");
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(&s.composer[s.composer_cursor..], "日本🚀");
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(
+            s.composer_cursor, 0,
+            "the combining sequence is one grapheme, not two steps"
+        );
+        reduce(&mut s, Action::CursorRight);
+        assert_eq!(s.composer_cursor, "e\u{301}".len());
+
+        // Typing splices between graphemes and backspace removes a whole one.
+        reduce(&mut s, Action::InputChar('X'));
+        assert_eq!(s.composer, "e\u{301}X日本🚀");
+        reduce(&mut s, Action::CursorLineEnd);
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.composer, "e\u{301}X日本", "the emoji is deleted whole");
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.composer, "e\u{301}X日");
+        for _ in 0..3 {
+            reduce(&mut s, Action::InputBackspace);
+        }
+        assert_eq!(
+            s.composer, "",
+            "the combining sequence is deleted as one grapheme"
+        );
+        assert_eq!(s.composer_cursor, 0);
+    }
+
+    #[test]
+    fn vertical_motion_keeps_the_display_column_across_wide_glyphs() {
+        // "日本語" is 6 display columns wide but 9 bytes; ↑ from the ASCII line
+        // must land on the glyph boundary at (or before) the same COLUMN.
+        let mut s = typed("日本語");
+        reduce(&mut s, Action::InputNewline);
+        for c in "abcdef".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        // Cursor after "abcd" — column 4 on the second line.
+        reduce(&mut s, Action::CursorLeft);
+        reduce(&mut s, Action::CursorLeft);
+        reduce(&mut s, Action::HistoryPrev);
+        // Column 4 on "日本語" falls inside the third glyph, so the cursor
+        // snaps to the boundary before it (after 日本 = 4 columns).
+        assert_eq!(&s.composer[..s.composer_cursor], "日本");
+        // Coming back down restores the column, not the byte offset.
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(
+            &s.composer[s.composer.find('\n').unwrap() + 1..s.composer_cursor],
+            "abcd"
+        );
+    }
+
+    #[test]
+    fn other_prompt_buffers_stay_append_only() {
+        // Only the composer grew a cursor: every other prompt keeps today's
+        // push/pop behaviour, and the cursor keys do nothing there.
+        let mut s = AppState::new();
+        s.overlay = Overlay::NewRun(String::new());
+        for c in "abc".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::CursorLeft);
+        reduce(&mut s, Action::CursorLineStart);
+        reduce(&mut s, Action::InputChar('d'));
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.overlay, Overlay::NewRun("abc".to_owned()));
+        assert_eq!(s.composer_cursor, 0, "the composer cursor is untouched");
+    }
+
+    #[test]
+    fn submitting_and_clearing_reset_the_cursor() {
+        let mut s = typed("hello");
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.composer, "");
+        assert_eq!(s.composer_cursor, 0);
+
+        let mut s = typed("hello");
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.composer, "");
+        assert_eq!(s.composer_cursor, 0);
+    }
+
+    #[test]
+    fn a_paste_lands_at_the_cursor() {
+        let mut s = typed("ab");
+        reduce(&mut s, Action::CursorLeft);
+        reduce(&mut s, Action::InputPaste("XY".to_owned()));
+        assert_eq!(s.composer, "aXYb");
+        assert_eq!(s.composer_cursor, 3);
     }
 }
