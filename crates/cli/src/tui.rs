@@ -72,11 +72,6 @@ const TICK: Duration = Duration::from_millis(200);
 /// spinner animates smoothly during a multi-second daemon spawn.
 const SPLASH_TICK: Duration = Duration::from_millis(80);
 
-/// How long the splash stays up once it has been drawn (D2 flash guard): a
-/// boot faster than the first [`SPLASH_TICK`] never shows it at all, but a
-/// shown splash never flashes away instantly.
-const SPLASH_MIN_HOLD: Duration = Duration::from_millis(600);
-
 /// Full linear snapshots intentionally run slower than graphical frames.
 /// Streaming token events would otherwise replay the whole document fast
 /// enough to overwhelm a screen reader or redirected output.
@@ -285,13 +280,10 @@ pub async fn run(
     let mut store = SessionStore::load(paths);
 
     // Drive boot and the splash concurrently: poll the pinned boot future to
-    // completion while redrawing the splash on each tick. The flash guard is
-    // implicit on the near side — the first tick lands SPLASH_TICK after
-    // start, so a boot faster than that never draws a single frame — and
-    // explicit below: once drawn, the splash holds for at least
-    // SPLASH_MIN_HOLD so a fast boot doesn't flash one frame away. The block
-    // scopes the pinned future (it borrows `state`/`store`) so its drop runs
-    // before the event loop takes them back.
+    // completion while redrawing the splash on each tick. Once boot is ready,
+    // a separate welcome state remains visible until the user deliberately
+    // presses Enter. The block scopes the pinned future (it borrows
+    // `state`/`store`) so its drop runs before the event loop takes them back.
     let booted = {
         let boot = boot_phase(
             paths,
@@ -305,8 +297,7 @@ pub async fn run(
         let mut splash_ticker =
             tokio::time::interval_at(tokio::time::Instant::now() + SPLASH_TICK, SPLASH_TICK);
         let mut splash_ticks: u64 = 0;
-        let mut splash_shown_at: Option<Instant> = None;
-        let booted = loop {
+        loop {
             tokio::select! {
                 outcome = &mut boot => break outcome?,
                 _ = splash_ticker.tick() => {
@@ -318,19 +309,31 @@ pub async fn run(
                         .clone();
                     guard
                         .terminal_mut()
-                        .draw(|frame| render_splash(frame, splash_ticks, &stage, &warnings, &theme))?;
-                    splash_shown_at.get_or_insert(Instant::now());
+                        .draw(|frame| render_splash(frame, splash_ticks, &stage, &warnings, false, &theme))?;
                 }
             }
-        };
-        if let Some(shown_at) = splash_shown_at {
-            let remaining = SPLASH_MIN_HOLD.saturating_sub(shown_at.elapsed());
-            if !remaining.is_zero() {
-                tokio::time::sleep(remaining).await;
-            }
         }
-        booted
     };
+
+    let (input_tx, mut input_rx) = mpsc::channel::<ClientInput>(256);
+    let input_running = Arc::new(AtomicBool::new(true));
+    spawn_input_thread(input_tx, Arc::clone(&input_running));
+
+    let workspace_name = repo
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("workspace");
+    let ready_stage = format!("{workspace_name} is ready");
+    let warnings = boot_warnings
+        .lock()
+        .expect("boot warnings mutex poisoned")
+        .clone();
+    if !wait_for_splash_entry(&mut guard, &theme, &ready_stage, &warnings, &mut input_rx).await? {
+        input_running.store(false, Ordering::Relaxed);
+        return Ok(());
+    }
+
     // Boot diagnostics become the TUI's own notices — ALWAYS when any were
     // collected, whether or not the splash drew a single frame: a reconcile
     // warning or a loader failure note is meaningful after boot regardless
@@ -343,10 +346,6 @@ pub async fn run(
         docs_pool,
         mut live,
     } = booted;
-
-    let (input_tx, mut input_rx) = mpsc::channel::<ClientInput>(256);
-    let input_running = Arc::new(AtomicBool::new(true));
-    spawn_input_thread(input_tx, Arc::clone(&input_running));
 
     let (mut width, _) = crossterm::terminal::size().unwrap_or((80, 24));
 
@@ -1490,6 +1489,49 @@ async fn event_loop<P: Presentation>(
                 apply_remove_api_key(state, paths, target);
                 continue;
             }
+            // Council creation is local, private configuration just like the
+            // model/key flows above. Keep it off the daemon wire and reuse the
+            // CLI council module's exact validation + atomic 0600 persistence.
+            if let Intent::CreateCouncil {
+                name,
+                description,
+                members,
+                chair,
+                rounds,
+            } = &intent
+            {
+                let definition = crate::council::CouncilDefinition {
+                    name: name.clone(),
+                    description: description.clone(),
+                    chair: chair.clone(),
+                    rounds: *rounds,
+                    members: members
+                        .iter()
+                        .map(|(model, role)| crate::council::CouncilMember {
+                            model: model.clone(),
+                            role: role.clone(),
+                        })
+                        .collect(),
+                };
+                match crate::council::persist_definition(paths, definition) {
+                    Ok(created) => reduce(
+                        state,
+                        Action::CouncilCreated {
+                            name: created.name,
+                            members: created.members.len(),
+                            rounds: created.rounds,
+                        },
+                    ),
+                    Err(error) => reduce(
+                        state,
+                        Action::CouncilCreateFailed {
+                            name: name.clone(),
+                            error: error.to_string(),
+                        },
+                    ),
+                }
+                continue;
+            }
             // Create and attach to a genuinely fresh session without tearing
             // down the TUI. A brand-new socket is fully handshaken and attached
             // before it replaces the old one. Dropping the old socket removes
@@ -2157,6 +2199,68 @@ async fn write_loop(mut write_half: OwnedWriteHalf, mut out_rx: mpsc::Receiver<E
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplashGateDecision {
+    Continue,
+    Quit,
+    Redraw,
+    Ignore,
+}
+
+/// Interpret only the small, host-owned input vocabulary of the welcome gate.
+/// Enter is the sole transition into the workspace; Escape/Ctrl-C remain a
+/// humane way out, and resize/focus events repaint without leaking a key into
+/// the main composer after startup.
+fn splash_gate_decision(event: &CrosstermEvent) -> SplashGateDecision {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+    match event {
+        CrosstermEvent::Key(key) if key.kind == KeyEventKind::Release => SplashGateDecision::Ignore,
+        CrosstermEvent::Key(key) if key.code == KeyCode::Enter => SplashGateDecision::Continue,
+        CrosstermEvent::Key(key)
+            if key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)) =>
+        {
+            SplashGateDecision::Quit
+        }
+        CrosstermEvent::Resize(_, _) | CrosstermEvent::FocusGained => SplashGateDecision::Redraw,
+        _ => SplashGateDecision::Ignore,
+    }
+}
+
+/// Hold the completed startup screen until the user explicitly enters the
+/// workspace. The existing input thread owns crossterm reads, so this gate and
+/// the main event loop share one lossless stream with no terminal teardown.
+async fn wait_for_splash_entry(
+    guard: &mut TerminalGuard,
+    theme: &Theme,
+    ready_stage: &str,
+    warnings: &[String],
+    input_rx: &mut mpsc::Receiver<ClientInput>,
+) -> anyhow::Result<bool> {
+    let draw = |guard: &mut TerminalGuard| -> io::Result<()> {
+        guard.terminal_mut().draw(|frame| {
+            render_splash(frame, 0, ready_stage, warnings, true, theme);
+        })?;
+        Ok(())
+    };
+    draw(guard)?;
+
+    loop {
+        match input_rx.recv().await {
+            Some(ClientInput::Terminal(event)) => match splash_gate_decision(&event) {
+                SplashGateDecision::Continue => return Ok(true),
+                SplashGateDecision::Quit => return Ok(false),
+                SplashGateDecision::Redraw => draw(guard)?,
+                SplashGateDecision::Ignore => {}
+            },
+            Some(ClientInput::AccessibleLine(_)) => {}
+            None => bail!("terminal input closed before the workspace was opened"),
+        }
+    }
+}
+
 /// Bridge blocking `crossterm` input into the async loop on a dedicated OS
 /// thread. Polls with a short timeout so it observes `running` going false
 /// promptly; sends each event over `tx` until the loop drops the receiver.
@@ -2333,6 +2437,9 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         // intercepted in the drain loop, never mapped.
         Intent::SetApiKey { .. } | Intent::RemoveApiKey { .. } => unreachable!(
             "SetApiKey/RemoveApiKey are applied locally by the harness (write_api_key), never sent to the daemon"
+        ),
+        Intent::CreateCouncil { .. } => unreachable!(
+            "CreateCouncil is validated and persisted locally by the harness, never sent to the daemon"
         ),
         Intent::NewConversation => unreachable!(
             "NewConversation is applied locally by the harness, never sent to the daemon"
@@ -4542,6 +4649,39 @@ mod tests {
     use codypendent_protocol::{
         AgentMode, ApprovalDecision, ApprovalId, ApprovalScope, ModelId, RunId,
     };
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    #[test]
+    fn splash_gate_requires_a_fresh_enter_and_keeps_quit_and_resize_responsive() {
+        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(splash_gate_decision(&enter), SplashGateDecision::Continue);
+
+        let mut released_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        released_enter.kind = KeyEventKind::Release;
+        assert_eq!(
+            splash_gate_decision(&CrosstermEvent::Key(released_enter)),
+            SplashGateDecision::Ignore,
+            "a release event must not enter the workspace"
+        );
+        assert_eq!(
+            splash_gate_decision(&CrosstermEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            ))),
+            SplashGateDecision::Ignore
+        );
+        assert_eq!(
+            splash_gate_decision(&CrosstermEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))),
+            SplashGateDecision::Quit
+        );
+        assert_eq!(
+            splash_gate_decision(&CrosstermEvent::Resize(120, 40)),
+            SplashGateDecision::Redraw
+        );
+    }
 
     #[test]
     fn accessible_presentation_is_stable_and_emits_no_terminal_escapes() {

@@ -186,7 +186,7 @@ export class DaemonClient extends EventEmitter {
     this.sessionId = options.sessionId;
     this.clientId = options.clientId ?? randomUUID();
     this.clientName = options.clientName ?? "codypendent-vscode";
-    this.clientVersion = options.clientVersion ?? "0.3.1";
+    this.clientVersion = options.clientVersion ?? "0.3.2";
     this.subscriptions = options.subscriptions ?? [
       { type: "SessionSummary" },
       { type: "AgentActivity" },

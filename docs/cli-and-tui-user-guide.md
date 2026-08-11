@@ -1,7 +1,7 @@
 # Codypendent CLI & TUI User Guide
 
 > **Product:** Codypendent — The local-first agentic developer environment
-> **Version:** 0.3.1
+> **Version:** 0.3.2
 > **Documentation Target:** CLI reference, Ratatui TUI shortcuts, environment setup, and workflow operations.
 
 ---
@@ -20,6 +20,7 @@
 ```bash
 # Start an interactive TUI session in the current repository
 codypendent
+# When startup is ready, press Enter to open the workspace (Esc quits).
 
 # Use the cooked, line-oriented accessibility client
 codypendent --accessible # --plain is an equivalent alias
@@ -48,7 +49,7 @@ codypendent daemon stop          # Gracefully shut down the daemon
 
 ## 3. Interactive TUI Reference (`codypendent`)
 
-Running `codypendent` with no subcommands opens the interactive Ratatui terminal user interface attached to the current directory's repository session.
+Running `codypendent` with no subcommands opens the interactive Ratatui terminal user interface attached to the current directory's repository session. Startup finishes on a welcome screen so you can read any diagnostics and confirm the workspace; press `Enter` to proceed or `Esc` to quit.
 
 ### 3.1 Theme Selection & Accessibility
 
@@ -370,6 +371,20 @@ and the chair receives its own durable session/run, with the selected profile
 pinned explicitly. A failed participant is reported; a surviving quorum may
 continue. Responses, dossiers, concurrency, rounds, and time are bounded.
 `councils.toml` is written atomically with user-only permissions.
+
+The normal TUI includes the same creation flow. Press `/`, select
+`/council  Agent council`, and complete these pages:
+
+1. Enter a stable council name and optional purpose.
+2. Pick a configured model profile, enter its role, and repeat until 2-8 unique
+   members are present. Provider names and readiness are shown beside models.
+3. Select the synthesis chair and choose 1-3 deliberation rounds.
+4. Review the complete definition and press Enter to create it.
+
+`Esc` moves back one page without discarding the draft (and closes from the
+first page). The final write is performed by the CLI host through the same
+validation and private atomic store as `codypendent council create`; the TUI
+renderer itself never performs filesystem I/O.
 
 ### 4.7 Knowledge Index Maintenance (`codypendent index`)
 

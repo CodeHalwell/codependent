@@ -94,6 +94,62 @@ pub enum InputMode {
     RemoteUi,
 }
 
+/// One model/role pair assembled by the host-owned council wizard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CouncilMemberDraft {
+    pub model: String,
+    pub role: String,
+}
+
+/// The current page of the council creation wizard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CouncilBuilderStep {
+    Name,
+    Description,
+    MemberModel,
+    MemberRole,
+    Chair,
+    Rounds,
+    Review,
+}
+
+/// Pure TUI state for creating a persisted multi-model council. The CLI harness
+/// performs the eventual validated, atomic write; the renderer and reducer only
+/// edit this draft and emit a client-local intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CouncilBuilderState {
+    pub step: CouncilBuilderStep,
+    pub name: String,
+    pub description: String,
+    pub members: Vec<CouncilMemberDraft>,
+    pub chair: Option<String>,
+    pub rounds: u8,
+    /// Filter text for the member/chair model pickers.
+    pub query: String,
+    /// Cursor into the current page's visible rows.
+    pub selected: usize,
+    /// Model awaiting a role on the MemberRole page.
+    pub pending_member_model: Option<String>,
+    pub role: String,
+}
+
+impl Default for CouncilBuilderState {
+    fn default() -> Self {
+        Self {
+            step: CouncilBuilderStep::Name,
+            name: String::new(),
+            description: String::new(),
+            members: Vec::new(),
+            chair: None,
+            rounds: 1,
+            query: String::new(),
+            selected: 0,
+            pending_member_model: None,
+            role: String::new(),
+        }
+    }
+}
+
 /// The top-most modal / overlay, if any. Text prompts carry their buffer inline.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Overlay {
@@ -164,6 +220,9 @@ pub enum Overlay {
     /// binding each. `query` is the live filter; `selected` indexes the filtered
     /// results (reset to 0 whenever the query changes). Opened with `/`.
     Palette { query: String, selected: usize },
+    /// Host-owned council creation wizard. It selects only configured model
+    /// profiles; persistence and final validation happen in the CLI harness.
+    CouncilBuilder(CouncilBuilderState),
     /// The Docs Studio block-edit prompt (Phase 4 STEP 4.3 client wiring): a
     /// single-line buffer for the text to insert into the focused block. On submit
     /// the reducer acquires the block's edit lease and, once granted, sends the
@@ -855,6 +914,25 @@ pub(crate) fn filter_models(models: &[ModelCard], query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Configured model rows matching a council-picker query, excluding profiles
+/// already serving as members. The chair picker deliberately uses
+/// [`filter_models`] instead because a member may also chair the synthesis.
+#[must_use]
+pub(crate) fn filter_council_member_models(
+    models: &[ModelCard],
+    query: &str,
+    members: &[CouncilMemberDraft],
+) -> Vec<usize> {
+    filter_models(models, query)
+        .into_iter()
+        .filter(|idx| {
+            models
+                .get(*idx)
+                .is_some_and(|card| !members.iter().any(|member| member.model == card.id.0))
+        })
+        .collect()
+}
+
 /// The indices into `models` whose name case-insensitively contains `query` —
 /// the add-model pick-list's substring filter, in list order. Mirrors
 /// [`filter_models`] adapted to plain `String` model names (the provider's
@@ -1319,6 +1397,17 @@ impl AppState {
     /// The input mode the next key should be interpreted in.
     #[must_use]
     pub fn input_mode(&self) -> InputMode {
+        if let Overlay::CouncilBuilder(builder) = &self.overlay {
+            return match builder.step {
+                CouncilBuilderStep::Name
+                | CouncilBuilderStep::Description
+                | CouncilBuilderStep::MemberRole => InputMode::Editing,
+                CouncilBuilderStep::MemberModel
+                | CouncilBuilderStep::Chair
+                | CouncilBuilderStep::Rounds
+                | CouncilBuilderStep::Review => InputMode::Palette,
+            };
+        }
         match self.overlay {
             Overlay::NewRun(_)
             | Overlay::Steering(_)
@@ -1360,6 +1449,9 @@ impl AppState {
             | Overlay::Blackboard
             | Overlay::UiPlugins
             | Overlay::AddModelQuerying { .. } => InputMode::Normal,
+            Overlay::CouncilBuilder(_) => {
+                unreachable!("council builder input mode is resolved above")
+            }
             // The base conversation view: an unresolved approval owns the screen
             // (decision keys only); otherwise the composer captures typed text.
             Overlay::None => {

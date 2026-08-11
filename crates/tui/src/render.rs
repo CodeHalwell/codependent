@@ -25,9 +25,10 @@ use crate::action::{Action, KeyTarget};
 use crate::reduce::capability_label;
 use crate::remote_ui_host::{TERMINAL_CENTRAL_SLOTS, TERMINAL_OVERLAY_SLOTS};
 use crate::state::{
-    filter_key_rows, filter_model_names, filter_models, filter_modes, filter_providers, AppState,
-    DocFocus, DocLeaseState, KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, ModelReadiness,
-    Overlay, Pane, PatchSummary, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
+    filter_providers, AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus, DocLeaseState,
+    KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, ModelReadiness, Overlay, Pane,
+    PatchSummary, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 use crate::{render_remote_ui, RemoteUiRenderOptions};
@@ -374,25 +375,26 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     );
 }
 
-/// The D2 startup splash, drawn by the CLI harness on the same alternate
-/// screen while boot proceeds (daemon spawn/poll, handshake, build reconcile,
-/// session restore, projection loads): the `CODYPENDENT` block-letter
-/// wordmark, a one-line tagline, the build id, and the current boot stage
-/// with a spinner animated from `tick`. `warnings` carries the boot
+/// The startup welcome, drawn by the CLI harness on the same alternate screen
+/// while boot proceeds and held after boot until the user presses Enter. It
+/// combines the `CODYPENDENT` block-letter wordmark, a short product promise,
+/// the build id, and either the current animated boot stage or a clear ready
+/// call-to-action. `warnings` carries the boot
 /// diagnostics collected so far (reconcile warnings, best-effort loader
 /// failures) — rendered as extra lines UNDER the stage line, warning-tinted,
 /// capped at [`MAX_SPLASH_WARNINGS`] with a `+N more` overflow line so a
 /// chatty boot can't push the wordmark off a short terminal. Pure projection
 /// onto the frame — theme tokens only, no I/O.
 ///
-/// Degradation: the wordmark is 65 columns wide, so under 70 cols (or 10
-/// rows) it collapses to a plain `codypendent` line; under 8 rows the tagline
-/// and version drop too, leaving just name + stage (+ warnings).
+/// Degradation: under 70 columns (or 12 rows) the block wordmark collapses to
+/// a plain `codypendent` line; under 8 rows the supporting copy drops too,
+/// leaving just name + status + the Enter call-to-action when ready.
 pub fn render_splash(
     frame: &mut Frame,
     tick: u64,
     stage: &str,
     warnings: &[String],
+    ready: bool,
     theme: &Theme,
 ) {
     // Braille-dot spinner frames (the ten glyphs CLI spinners conventionally
@@ -406,8 +408,16 @@ pub fn render_splash(
         area,
     );
 
+    let expanded = area.width >= 70 && area.height >= 12;
     let mut lines: Vec<Line> = Vec::new();
-    if area.width >= 70 && area.height >= 10 {
+    if expanded {
+        lines.push(Line::styled(
+            "COORDINATE  ·  COLLABORATE  ·  SHIP",
+            Style::default()
+                .fg(theme.agent.tool)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::raw(""));
         for row in wordmark_rows("CODYPENDENT") {
             lines.push(Line::styled(
                 row,
@@ -427,28 +437,41 @@ pub fn render_splash(
     }
     if area.height >= 8 {
         lines.push(Line::styled(
-            "the persistent agent daemon",
+            "Many agents. One shared workspace. You stay in control.",
             Style::default().fg(theme.text.secondary),
-        ));
-        lines.push(Line::styled(
-            format!("v{BUILD_ID}"),
-            Style::default().fg(theme.text.muted),
         ));
         lines.push(Line::raw(""));
     }
-    let spinner = SPINNER[(tick % SPINNER.len() as u64) as usize];
-    lines.push(Line::from(vec![
-        Span::styled(spinner.to_string(), Style::default().fg(theme.agent.tool)),
-        Span::styled(
-            format!(" {stage}"),
-            Style::default().fg(theme.text.secondary),
-        ),
-    ]));
+    if ready {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "✓ ",
+                Style::default()
+                    .fg(theme.status.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                stage,
+                Style::default()
+                    .fg(theme.text.primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    } else {
+        let spinner = SPINNER[(tick % SPINNER.len() as u64) as usize];
+        lines.push(Line::from(vec![
+            Span::styled(spinner.to_string(), Style::default().fg(theme.agent.tool)),
+            Span::styled(
+                format!(" {stage}"),
+                Style::default().fg(theme.text.secondary),
+            ),
+        ]));
+    }
     for warning in warnings.iter().take(MAX_SPLASH_WARNINGS) {
-        lines.push(Line::styled(
-            warning.clone(),
-            Style::default().fg(theme.status.warning),
-        ));
+        lines.push(Line::from(vec![
+            Span::styled("! ", Style::default().fg(theme.status.warning)),
+            Span::styled(warning.clone(), Style::default().fg(theme.status.warning)),
+        ]));
     }
     let overflow = warnings.len().saturating_sub(MAX_SPLASH_WARNINGS);
     if overflow > 0 {
@@ -458,15 +481,61 @@ pub fn render_splash(
         ));
     }
 
-    // Centered as a block: vertically by offsetting a content-height rect,
-    // horizontally via the paragraph's alignment.
-    let height = (lines.len() as u16).min(area.height);
-    let content = Rect {
-        x: area.x,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width: area.width,
-        height,
+    if ready {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                " ENTER ",
+                Style::default()
+                    .fg(theme.surface.background)
+                    .bg(theme.focus.active)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  open workspace",
+                Style::default()
+                    .fg(theme.text.primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        if area.height >= 16 {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "/ commands   ·   F2 workspace   ·   F6 extension UI   ·   Esc quit",
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+    }
+
+    // A restrained, centered card makes the opening state read as a deliberate
+    // welcome rather than transient debug output. It safely collapses to the
+    // available terminal dimensions without clipping the outer border.
+    let card_width = 78.min(area.width.saturating_sub(4)).max(1);
+    let card_height = (lines.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(1);
+    let card = Rect {
+        x: area.x + area.width.saturating_sub(card_width) / 2,
+        y: area.y + area.height.saturating_sub(card_height) / 2,
+        width: card_width,
+        height: card_height,
     };
+    let border = if ready {
+        theme.focus.active
+    } else {
+        theme.surface.border
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .style(Style::default().bg(theme.surface.panel))
+        .title_bottom(Line::styled(
+            format!(" v{BUILD_ID} "),
+            Style::default().fg(theme.text.muted),
+        ));
+    let content = block.inner(card);
+    frame.render_widget(block, card);
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), content);
 }
 
@@ -2088,6 +2157,9 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         ),
         Overlay::Palette { query, selected } => {
             render_palette(frame, area, state, theme, query, *selected);
+        }
+        Overlay::CouncilBuilder(builder) => {
+            render_council_builder(frame, area, state, theme, builder);
         }
         Overlay::ModelPicker { query, selected } => {
             render_model_picker(frame, area, state, theme, query, *selected);
@@ -5444,6 +5516,570 @@ fn action_kind(action: &ProposedAction) -> &'static str {
     }
 }
 
+fn render_council_builder(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    builder: &CouncilBuilderState,
+) {
+    let rect = centered_modal(area, 104, 34);
+    let step_number = council_step_number(builder.step);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!(
+            "Create agent council · {step_number}/7 · {}",
+            council_step_label(builder.step)
+        ),
+        state,
+        theme,
+    );
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(4),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+
+    let progress = [
+        "Name", "Purpose", "Members", "Roles", "Chair", "Rounds", "Review",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(idx, label)| {
+        let active = idx + 1 == step_number;
+        Span::styled(
+            format!(" {}{} ", idx + 1, label),
+            if active {
+                theme.selection_style().add_modifier(Modifier::BOLD)
+            } else if idx + 1 < step_number {
+                Style::default().fg(theme.status.success)
+            } else {
+                Style::default().fg(theme.text.muted)
+            },
+        )
+    })
+    .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(Line::from(progress)).style(Style::default().bg(theme.surface.overlay)),
+        rows[0],
+    );
+
+    match builder.step {
+        CouncilBuilderStep::Name => render_council_text_step(
+            frame,
+            rows[1],
+            "Council name",
+            &builder.name,
+            "architecture-review",
+            "Stable identifier: letters, numbers, dot, dash, or underscore.",
+            theme,
+        ),
+        CouncilBuilderStep::Description => render_council_text_step(
+            frame,
+            rows[1],
+            "Purpose (optional)",
+            &builder.description,
+            "What should this council be especially good at?",
+            "Shown in council listings; the objective is supplied when the council runs.",
+            theme,
+        ),
+        CouncilBuilderStep::MemberRole => {
+            let model = builder.pending_member_model.as_deref().unwrap_or("model");
+            render_council_text_step(
+                frame,
+                rows[1],
+                &format!("Role for {model}"),
+                &builder.role,
+                "member",
+                "Describe this member's perspective, e.g. security reviewer or product strategist.",
+                theme,
+            );
+        }
+        CouncilBuilderStep::MemberModel => {
+            render_council_member_picker(frame, rows[1], state, theme, builder);
+        }
+        CouncilBuilderStep::Chair => {
+            render_council_chair_picker(frame, rows[1], state, theme, builder);
+        }
+        CouncilBuilderStep::Rounds => {
+            render_council_rounds(frame, rows[1], state, theme, builder);
+        }
+        CouncilBuilderStep::Review => {
+            render_council_review(frame, rows[1], theme, builder);
+        }
+    }
+
+    let footer = match builder.step {
+        CouncilBuilderStep::Name => "  Enter continue · Esc close",
+        CouncilBuilderStep::Description => "  Enter continue · Esc back",
+        CouncilBuilderStep::MemberModel => {
+            if builder.members.len() < 2 {
+                "  ↑/↓ choose model · Enter add role · at least 2 members · Esc back"
+            } else {
+                "  ↑/↓ choose · Enter add/continue · 2–8 unique profiles · Esc back"
+            }
+        }
+        CouncilBuilderStep::MemberRole => "  Enter add member · blank role = member · Esc back",
+        CouncilBuilderStep::Chair => "  ↑/↓ choose synthesis chair · Enter continue · Esc back",
+        CouncilBuilderStep::Rounds => "  ↑/↓ choose deliberation depth · Enter review · Esc back",
+        CouncilBuilderStep::Review => "  Enter create council · Esc back",
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            footer,
+            Style::default().fg(theme.focus.active),
+        )),
+        rows[2],
+    );
+    if rows[2].height > 0 {
+        state.register_hit(rows[2], Action::InputSubmit);
+    }
+}
+
+fn council_step_number(step: CouncilBuilderStep) -> usize {
+    match step {
+        CouncilBuilderStep::Name => 1,
+        CouncilBuilderStep::Description => 2,
+        CouncilBuilderStep::MemberModel => 3,
+        CouncilBuilderStep::MemberRole => 4,
+        CouncilBuilderStep::Chair => 5,
+        CouncilBuilderStep::Rounds => 6,
+        CouncilBuilderStep::Review => 7,
+    }
+}
+
+fn council_step_label(step: CouncilBuilderStep) -> &'static str {
+    match step {
+        CouncilBuilderStep::Name => "Name",
+        CouncilBuilderStep::Description => "Purpose",
+        CouncilBuilderStep::MemberModel => "Add members",
+        CouncilBuilderStep::MemberRole => "Member role",
+        CouncilBuilderStep::Chair => "Choose chair",
+        CouncilBuilderStep::Rounds => "Deliberation rounds",
+        CouncilBuilderStep::Review => "Review",
+    }
+}
+
+fn render_council_text_step(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    value: &str,
+    placeholder: &str,
+    help: &str,
+    theme: &Theme,
+) {
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(5),
+        Constraint::Length(2),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!("  {title}"),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        )),
+        rows[0],
+    );
+    let field = modal_panel("Value", theme);
+    let field_inner = field.inner(rows[1]);
+    frame.render_widget(field, rows[1]);
+    let shown = if value.is_empty() {
+        Span::styled(
+            placeholder.to_owned(),
+            Style::default().fg(theme.text.muted),
+        )
+    } else {
+        Span::styled(
+            tail_window(value, usize::from(field_inner.width.saturating_sub(3))),
+            Style::default().fg(theme.text.primary),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            shown,
+            Span::styled("▏", Style::default().fg(theme.focus.active)),
+        ])),
+        field_inner,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!("  {help}"),
+            Style::default().fg(theme.text.muted),
+        ))
+        .wrap(Wrap { trim: true }),
+        rows[2],
+    );
+}
+
+fn render_council_member_picker(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    builder: &CouncilBuilderState,
+) {
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    render_modal_search(frame, rows[0], &builder.query, theme);
+    let (list_area, detail_area) = picker_regions(rows[2]);
+    let list_block = modal_panel(
+        format!("Configured profiles · {} selected", builder.members.len()),
+        theme,
+    );
+    let list_inner = list_block.inner(list_area);
+    frame.render_widget(list_block, list_area);
+
+    let indices = if builder.members.len() >= 8 {
+        Vec::new()
+    } else {
+        filter_council_member_models(&state.models, &builder.query, &builder.members)
+    };
+    let continue_row = builder.members.len() >= 2 && builder.query.trim().is_empty();
+    let remove_row = !builder.members.is_empty() && builder.query.trim().is_empty();
+    let total = indices.len() + usize::from(continue_row) + usize::from(remove_row);
+    let visible = usize::from(list_inner.height).max(1);
+    let first = first_visible_row(builder.selected, total, visible);
+    let mut items = Vec::new();
+    for row in first..total.min(first + visible) {
+        let selected = row == builder.selected;
+        if continue_row && row == 0 {
+            let item = ListItem::new(Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    theme.selection_aware_text_style(selected, theme.focus.active),
+                ),
+                Span::styled(
+                    format!("Continue with {} members →", builder.members.len()),
+                    theme
+                        .selection_aware_text_style(selected, theme.status.success)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            items.push(if selected {
+                item.style(theme.selection_style())
+            } else {
+                item
+            });
+            continue;
+        }
+        let model_row = row.saturating_sub(usize::from(continue_row));
+        if remove_row && model_row == indices.len() {
+            let removed = builder
+                .members
+                .last()
+                .map_or("member", |member| member.model.as_str());
+            let item = ListItem::new(Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    theme.selection_aware_text_style(selected, theme.focus.active),
+                ),
+                Span::styled(
+                    format!("Remove last member · {removed}"),
+                    theme.selection_aware_text_style(selected, theme.status.warning),
+                ),
+            ]));
+            items.push(if selected {
+                item.style(theme.selection_style())
+            } else {
+                item
+            });
+            continue;
+        }
+        if let Some(card) = indices
+            .get(model_row)
+            .and_then(|idx| state.models.get(*idx))
+        {
+            let marker = if selected { "› " } else { "  " };
+            let readiness = match &card.readiness {
+                ModelReadiness::Ready => "ready",
+                ModelReadiness::Unverified => "unverified",
+                ModelReadiness::Unavailable(_) => "unavailable",
+            };
+            let item = ListItem::new(Line::from(vec![
+                Span::styled(
+                    marker,
+                    theme.selection_aware_text_style(selected, theme.focus.active),
+                ),
+                Span::styled(
+                    truncate_display_width(&card.id.0, 34),
+                    theme
+                        .selection_aware_text_style(selected, theme.text.primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {} · {readiness}", card.provider),
+                    theme.selection_aware_text_style(selected, theme.text.muted),
+                ),
+            ]));
+            items.push(if selected {
+                item.style(theme.selection_style())
+            } else {
+                item
+            });
+        }
+    }
+    if total == 0 {
+        items.push(ListItem::new(Line::styled(
+            "  No matching unselected profiles",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    frame.render_widget(List::new(items), list_inner);
+    for (screen_row, row) in (first..total.min(first + visible)).enumerate() {
+        if let Some(hit) = visible_row_hit(list_inner, screen_row, 1) {
+            state.register_hit(hit, Action::ActivateRow(row));
+        }
+    }
+    if let Some(detail_area) = detail_area {
+        render_council_members_summary(frame, detail_area, theme, builder);
+    }
+}
+
+fn render_council_chair_picker(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    builder: &CouncilBuilderState,
+) {
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    render_modal_search(frame, rows[0], &builder.query, theme);
+    let (list_area, detail_area) = picker_regions(rows[2]);
+    let list_block = modal_panel("Synthesis model", theme);
+    let list_inner = list_block.inner(list_area);
+    frame.render_widget(list_block, list_area);
+    let indices = filter_models(&state.models, &builder.query);
+    let visible = usize::from(list_inner.height).max(1);
+    let first = first_visible_row(builder.selected, indices.len(), visible);
+    let mut items = Vec::new();
+    for (screen_row, idx) in indices.iter().skip(first).take(visible).enumerate() {
+        let row = first + screen_row;
+        let selected = row == builder.selected;
+        if let Some(card) = state.models.get(*idx) {
+            let item = ListItem::new(Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    theme.selection_aware_text_style(selected, theme.focus.active),
+                ),
+                Span::styled(
+                    truncate_display_width(&card.id.0, 36),
+                    theme
+                        .selection_aware_text_style(selected, theme.text.primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", card.provider),
+                    theme.selection_aware_text_style(selected, theme.text.muted),
+                ),
+            ]));
+            items.push(if selected {
+                item.style(theme.selection_style())
+            } else {
+                item
+            });
+            if let Some(hit) = visible_row_hit(list_inner, screen_row, 1) {
+                state.register_hit(hit, Action::ActivateRow(row));
+            }
+        }
+    }
+    if indices.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  No matching configured profiles",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    frame.render_widget(List::new(items), list_inner);
+    if let Some(detail_area) = detail_area {
+        render_council_members_summary(frame, detail_area, theme, builder);
+    }
+}
+
+fn render_council_members_summary(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    builder: &CouncilBuilderState,
+) {
+    let block = modal_panel(
+        format!("Council members · {}/8", builder.members.len()),
+        theme,
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines = Vec::new();
+    if builder.members.is_empty() {
+        lines.push(Line::styled(
+            "  Add at least two distinct profiles.",
+            Style::default().fg(theme.text.muted),
+        ));
+    } else {
+        for (idx, member) in builder.members.iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}. ", idx + 1),
+                    Style::default().fg(theme.focus.active),
+                ),
+                Span::styled(
+                    truncate_display_width(&member.model, 30),
+                    Style::default().fg(theme.text.primary),
+                ),
+            ]));
+            lines.push(Line::styled(
+                format!("     {}", member.role),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_council_rounds(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    builder: &CouncilBuilderState,
+) {
+    let block = modal_panel("Deliberation depth", theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let choices = [
+        ("1 round", "Independent answers, then chair synthesis"),
+        (
+            "2 rounds",
+            "Members critique the first dossier before synthesis",
+        ),
+        (
+            "3 rounds",
+            "Two critique passes for difficult or contested decisions",
+        ),
+    ];
+    let mut items = Vec::new();
+    for (idx, (title, detail)) in choices.iter().enumerate() {
+        let selected = idx == builder.selected;
+        let item = ListItem::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    theme.selection_aware_text_style(selected, theme.focus.active),
+                ),
+                Span::styled(
+                    (*title).to_owned(),
+                    theme
+                        .selection_aware_text_style(selected, theme.text.primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::styled(
+                format!("    {detail}"),
+                theme.selection_aware_text_style(selected, theme.text.muted),
+            ),
+        ]);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+        if let Some(hit) = visible_row_hit(inner, idx, 2) {
+            state.register_hit(hit, Action::ActivateRow(idx));
+        }
+    }
+    frame.render_widget(List::new(items), inner);
+}
+
+fn render_council_review(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    builder: &CouncilBuilderState,
+) {
+    let block = modal_panel("Ready to create", theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  Name: ", Style::default().fg(theme.text.muted)),
+            Span::styled(
+                builder.name.clone(),
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Purpose: ", Style::default().fg(theme.text.muted)),
+            Span::styled(
+                if builder.description.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    builder.description.clone()
+                },
+                Style::default().fg(theme.text.secondary),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Chair: ", Style::default().fg(theme.text.muted)),
+            Span::styled(
+                builder
+                    .chair
+                    .clone()
+                    .unwrap_or_else(|| "(not selected)".into()),
+                Style::default().fg(theme.focus.active),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Rounds: ", Style::default().fg(theme.text.muted)),
+            Span::styled(
+                builder.rounds.to_string(),
+                Style::default().fg(theme.text.primary),
+            ),
+        ]),
+        Line::default(),
+        Line::styled(
+            format!("  Members · {}", builder.members.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    for member in &builder.members {
+        lines.push(Line::from(vec![
+            Span::styled("  • ", Style::default().fg(theme.status.success)),
+            Span::styled(
+                member.model.clone(),
+                Style::default().fg(theme.text.primary),
+            ),
+            Span::styled(
+                format!(" — {}", member.role),
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "  Saved privately to councils.toml. Running it creates durable, attributed sessions.",
+        Style::default().fg(theme.text.muted),
+    ));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -5925,6 +6561,90 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    fn council_model(id: &str, provider: &str) -> ModelCard {
+        ModelCard {
+            id: ModelId(id.to_owned()),
+            provider: provider.to_owned(),
+            readiness: ModelReadiness::Ready,
+            location: None,
+            cost_per_1k_usd: None,
+            context_tokens: None,
+        }
+    }
+
+    #[test]
+    fn council_builder_renders_the_full_flow_at_compact_and_wide_sizes() {
+        let mut state = AppState::new();
+        state.models = vec![
+            council_model("claude-reviewer", "claude-code"),
+            council_model("kimi-architect", "kimi-code"),
+            council_model("amp-chair", "amp"),
+        ];
+        state.overlay = Overlay::CouncilBuilder(CouncilBuilderState::default());
+        let name = render_to_string(&state, 80, 24);
+        assert!(
+            name.contains("Create agent council"),
+            "wizard title:\n{name}"
+        );
+        assert!(name.contains("Council name"), "name field:\n{name}");
+
+        let builder = CouncilBuilderState {
+            step: CouncilBuilderStep::MemberModel,
+            name: "design-council".to_owned(),
+            description: "Architecture review".to_owned(),
+            members: vec![
+                crate::state::CouncilMemberDraft {
+                    model: "claude-reviewer".to_owned(),
+                    role: "security reviewer".to_owned(),
+                },
+                crate::state::CouncilMemberDraft {
+                    model: "kimi-architect".to_owned(),
+                    role: "systems architect".to_owned(),
+                },
+            ],
+            chair: None,
+            rounds: 1,
+            query: String::new(),
+            selected: 0,
+            pending_member_model: None,
+            role: String::new(),
+        };
+        state.overlay = Overlay::CouncilBuilder(builder.clone());
+        let members = render_to_string(&state, 120, 36);
+        assert!(
+            members.contains("Continue with 2 members"),
+            "continue row:\n{members}"
+        );
+        assert!(
+            members.contains("security reviewer"),
+            "member role:\n{members}"
+        );
+        assert!(
+            members.contains("amp-chair"),
+            "remaining profile:\n{members}"
+        );
+        assert!(state
+            .hit_map
+            .borrow()
+            .iter()
+            .any(|(_, action)| matches!(action, Action::ActivateRow(0))));
+
+        state.overlay = Overlay::CouncilBuilder(CouncilBuilderState {
+            step: CouncilBuilderStep::Review,
+            chair: Some("amp-chair".to_owned()),
+            rounds: 2,
+            ..builder
+        });
+        let review = render_to_string(&state, 80, 24);
+        assert!(review.contains("Ready to create"), "review card:\n{review}");
+        assert!(review.contains("design-council"), "review name:\n{review}");
+        assert!(review.contains("amp-chair"), "review chair:\n{review}");
+        assert!(
+            review.contains("Enter create council"),
+            "review action:\n{review}"
+        );
+    }
+
     #[test]
     fn selected_picker_children_use_the_selection_foreground_in_every_theme() {
         let mut state = AppState::new();
@@ -6198,6 +6918,7 @@ mod tests {
         tick: u64,
         stage: &str,
         warnings: &[String],
+        ready: bool,
         w: u16,
         h: u16,
     ) -> String {
@@ -6205,17 +6926,17 @@ mod tests {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
-            .draw(|f| render_splash(f, tick, stage, warnings, &theme))
+            .draw(|f| render_splash(f, tick, stage, warnings, ready, &theme))
             .expect("draw");
         buffer_text(terminal.backend().buffer())
     }
 
     #[test]
     fn splash_shows_wordmark_tagline_version_and_stage() {
-        let text = render_splash_to_string(0, "connecting…", &[], 100, 30);
+        let text = render_splash_to_string(0, "connecting…", &[], false, 100, 30);
         assert!(text.contains("███"), "block wordmark missing:\n{text}");
         assert!(
-            text.contains("the persistent agent daemon"),
+            text.contains("Many agents. One shared workspace"),
             "tagline missing:\n{text}"
         );
         assert!(
@@ -6227,8 +6948,8 @@ mod tests {
 
     #[test]
     fn splash_spinner_varies_with_tick() {
-        let first = render_splash_to_string(0, "connecting…", &[], 100, 30);
-        let second = render_splash_to_string(1, "connecting…", &[], 100, 30);
+        let first = render_splash_to_string(0, "connecting…", &[], false, 100, 30);
+        let second = render_splash_to_string(1, "connecting…", &[], false, 100, 30);
         assert!(
             first.contains('⠋'),
             "tick-0 spinner frame missing:\n{first}"
@@ -6242,7 +6963,7 @@ mod tests {
 
     #[test]
     fn splash_falls_back_to_plain_name_on_narrow_terminals() {
-        let text = render_splash_to_string(0, "loading workspace…", &[], 50, 24);
+        let text = render_splash_to_string(0, "loading workspace…", &[], false, 50, 24);
         assert!(text.contains("codypendent"), "plain name missing:\n{text}");
         assert!(
             !text.contains("███"),
@@ -6256,12 +6977,35 @@ mod tests {
 
     #[test]
     fn splash_drops_tagline_and_version_on_short_terminals() {
-        let text = render_splash_to_string(0, "starting daemon…", &[], 100, 6);
+        let text = render_splash_to_string(0, "starting daemon…", &[], false, 100, 6);
         assert!(text.contains("codypendent"), "plain name missing:\n{text}");
         assert!(text.contains("starting daemon…"), "stage missing:\n{text}");
         assert!(
-            !text.contains("persistent agent daemon"),
+            !text.contains("Many agents. One shared workspace"),
             "tagline should drop at 6 rows:\n{text}"
+        );
+    }
+
+    #[test]
+    fn ready_splash_requires_enter_and_shows_first_run_shortcuts() {
+        let text = render_splash_to_string(4, "codypendent is ready", &[], true, 100, 30);
+        assert!(text.contains("✓"), "ready mark missing:\n{text}");
+        assert!(
+            text.contains("codypendent is ready"),
+            "ready state missing:\n{text}"
+        );
+        assert!(text.contains("ENTER"), "Enter keycap missing:\n{text}");
+        assert!(
+            text.contains("open workspace"),
+            "call to action missing:\n{text}"
+        );
+        assert!(
+            text.contains("F2 workspace"),
+            "shortcut help missing:\n{text}"
+        );
+        assert!(
+            !text.contains('⠼'),
+            "ready state must not look busy:\n{text}"
         );
     }
 
@@ -6271,7 +7015,7 @@ mod tests {
             "daemon build mismatch; continuing on the running build".to_owned(),
             "could not list model profiles: db locked".to_owned(),
         ];
-        let text = render_splash_to_string(0, "restoring session…", &warnings, 100, 30);
+        let text = render_splash_to_string(0, "restoring session…", &warnings, false, 100, 30);
         assert!(
             text.contains("restoring session…"),
             "stage missing:\n{text}"
@@ -6296,7 +7040,7 @@ mod tests {
     #[test]
     fn splash_truncates_a_long_warning_list_with_an_overflow_line() {
         let warnings: Vec<String> = (1..=6).map(|n| format!("warning number {n}")).collect();
-        let text = render_splash_to_string(0, "connecting…", &warnings, 100, 30);
+        let text = render_splash_to_string(0, "connecting…", &warnings, false, 100, 30);
         for kept in &warnings[..MAX_SPLASH_WARNINGS] {
             assert!(text.contains(kept), "{kept} should render:\n{text}");
         }

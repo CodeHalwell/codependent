@@ -164,7 +164,7 @@ pub const COMMANDS: &[PaletteEntry] = &[
     PaletteEntry {
         command: PaletteCommand::Council,
         title: "/council  Agent council",
-        description: "assemble multiple provider/model profiles and a synthesis chair",
+        description: "create a council from multiple model profiles, roles, and a synthesis chair",
         key: "—",
         group: "Models",
     },

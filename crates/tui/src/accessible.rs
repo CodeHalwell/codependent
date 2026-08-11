@@ -297,6 +297,23 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
             "Confirmation: cancel workflow run {}?",
             clean(workflow_run_id)
         )),
+        Overlay::CouncilBuilder(builder) => {
+            lines.push(format!(
+                "Council builder: step {:?}; name {}; {} member(s); chair {}; rounds {}",
+                builder.step,
+                clean(&builder.name),
+                builder.members.len(),
+                clean(builder.chair.as_deref().unwrap_or("not selected")),
+                builder.rounds
+            ));
+            for member in &builder.members {
+                lines.push(format!(
+                    "Council member: {}; role {}",
+                    clean(&member.model),
+                    clean(&member.role)
+                ));
+            }
+        }
         other => lines.push(format!("Open dialog: {}", overlay_name(other))),
     }
 }
@@ -314,6 +331,7 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::ApiKeys { .. } => "API keys",
         Overlay::ApiKeySet { .. } => "API key entry",
         Overlay::ApiKeyRemoveConfirm { .. } => "remove API key confirmation",
+        Overlay::CouncilBuilder(_) => "council builder",
         Overlay::AddModelId { .. }
         | Overlay::AddModelKey { .. }
         | Overlay::AddModelProviderKey { .. }
@@ -589,6 +607,7 @@ fn clean(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft};
     use codypendent_protocol::{
         Actor, EventBody, RunId, SessionEvent, UiContributionId, UiContributionPoint,
         UiContributionRegistration, UiDocument, UiDocumentId, UiExtensionId, UiSlotId,
@@ -611,6 +630,31 @@ mod tests {
             map_accessible_input("shift-f6", InputMode::RemoteUi),
             vec![Action::RemoteUiNextDocument]
         );
+    }
+
+    #[test]
+    fn council_builder_is_announced_with_attributed_members() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::CouncilBuilder(CouncilBuilderState {
+            step: CouncilBuilderStep::Review,
+            name: "design-board".to_owned(),
+            description: "Architecture".to_owned(),
+            members: vec![CouncilMemberDraft {
+                model: "kimi-code".to_owned(),
+                role: "systems architect".to_owned(),
+            }],
+            chair: Some("amp".to_owned()),
+            rounds: 2,
+            query: String::new(),
+            selected: 0,
+            pending_member_model: None,
+            role: String::new(),
+        });
+        let snapshot = accessible_snapshot(&state);
+        assert!(snapshot.contains("Council builder: step Review"));
+        assert!(snapshot.contains("design-board"));
+        assert!(snapshot.contains("Council member: kimi-code; role systems architect"));
+        assert!(snapshot.contains("chair amp; rounds 2"));
     }
 
     #[test]

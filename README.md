@@ -135,7 +135,8 @@ Image ingestion preserves source image plus extracted/OCR interpretation.
 Real event model includes key, mouse, paste, resize, backend, IDE, voice, and tick events.
 All mouse actions must have keyboard equivalents.
 
-Run `codypendent` for the full TUI. Press `F6` to enter mounted extension UI,
+Run `codypendent` for the full TUI, then press `Enter` on the ready screen to
+open the workspace. Press `F6` to enter mounted extension UI,
 `Shift-F6` to move to the next extension document, and `Esc` to return. For a
 cooked, line-oriented screen-reader or plain-terminal client with no alternate
 screen or mouse escapes, run `codypendent --accessible` (alias: `--plain`). See
@@ -240,6 +241,12 @@ Council membership is stored in private `councils.toml` configuration. Every
 participant is pinned by its configured model-profile id, responses and the
 chair run remain ordinary durable Codypendent sessions, and `--json` returns
 the full member/session/run attribution for automation.
+
+You can also create the definition without leaving the TUI: open `/`, choose
+`/council`, then follow the seven-step builder to name the council, select each
+configured model and its role, choose the chair and rounds, review, and save.
+Unavailable profiles are rejected before save and the same typed validation and
+private atomic persistence used by the CLI applies.
 
 ## Agentic Setup & Personalization
 
