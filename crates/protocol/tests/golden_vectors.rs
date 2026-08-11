@@ -66,24 +66,25 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+use codypendent_protocol::{
+    board_scope_id, AgentMode, ApprovalDecision, ApprovalScope, ArtifactRef, AudioArtifact,
+    BlackboardItemDraft, BlackboardItemView, BlackboardScope, BudgetDimension, CanaryMetrics,
+    Catchup, ClientCapabilities, ClientHello, ClientRole, CodypendentError, Command, CommandBody,
+    DaemonStatus, DataClassification, Diagnostic, DiagnosticSeverity, DiffRequest,
+    DirtyBufferDigest, DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync,
+    EditorSelection, EventBody, GitHubRefKind, GitHubReference, IdeContextUpdate, IdeRequest,
+    ImageArtifact, ImageRegion, InputBlock, InputEnvelope, InputSource, Location, ModelObservation,
+    OffDevicePolicy, Payload, Position, PromotionAction, ProposedAction, ProtocolError,
+    PublishTarget, Range, ResumeToken, Risk, RiskLevel, RunDisposition, RunState, ScopeLevel,
+    ServerHello, SessionEvent, SessionProjection, SourceProvenance, Subscription, SuggestionInput,
+    SymbolRef, TextEdit, ToolOutcome, Transcript, TranscriptionMode, UserAction, WorkflowEvent,
+    WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceEdit,
+    PROTOCOL_V1,
+};
 use codypendent_protocol::{Actor, ApprovalId, ArtifactId, ChangeSetId, ClientId, CommandId};
 use codypendent_protocol::{
     AgentId, CorrelationId, DaemonInstanceId, DocumentId, ModelId, RunId, SessionId, UserId,
     WorkspaceId,
-};
-use codypendent_protocol::{
-    AgentMode, ApprovalDecision, ApprovalScope, ArtifactRef, AudioArtifact, BlackboardItemView,
-    BudgetDimension, CanaryMetrics, Catchup, ClientCapabilities, ClientHello, ClientRole,
-    CodypendentError, Command, CommandBody, DaemonStatus, DataClassification, Diagnostic,
-    DiagnosticSeverity, DiffRequest, DirtyBufferDigest, DocumentEditLease, DocumentLeaseGrant,
-    DocumentMutation, DocumentSync, EditorSelection, EventBody, GitHubRefKind, GitHubReference,
-    IdeContextUpdate, IdeRequest, ImageArtifact, ImageRegion, InputBlock, InputEnvelope,
-    InputSource, Location, ModelObservation, OffDevicePolicy, Payload, Position, PromotionAction,
-    ProposedAction, ProtocolError, PublishTarget, Range, ResumeToken, Risk, RiskLevel,
-    RunDisposition, RunState, ScopeLevel, ServerHello, SessionEvent, SessionProjection,
-    SourceProvenance, Subscription, SuggestionInput, SymbolRef, TextEdit, ToolOutcome, Transcript,
-    TranscriptionMode, UserAction, WorkflowEvent, WorkflowNodeState, WorkflowNodeView,
-    WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceEdit, PROTOCOL_V1,
 };
 
 // ---------------------------------------------------------------------------
@@ -457,6 +458,9 @@ fn command_vectors() -> Vec<Vector> {
                 workflow_run_id: "wfrun-abc123".to_string(),
                 kind: Some("finding".to_string()),
                 include_superseded: true,
+                // Additive and default-skipped: this original vector's bytes
+                // are unchanged; the board-scoped read lives in board.json.
+                board_repository: None,
             },
         ),
         vec_of(
@@ -1518,11 +1522,124 @@ fn blackboard_item() -> BlackboardItemView {
         evidence: vec![json!({ "path": "src/parse.rs", "line": 42 })],
         revision: 1,
         superseded_by: None,
+        // The board fields are additive and default-skipped, so this original
+        // vector's bytes are unchanged; the populated shapes live in board.json.
+        board_scope: None,
+        status: None,
+        assignee: None,
+        ordinal: None,
     }
 }
 
 fn blackboard_vectors() -> Vec<Vector> {
     vec![vec_of("BlackboardItemView", blackboard_item())]
+}
+
+// ---------------------------------------------------------------------------
+// board.json (NEW FILE — the kanban/board additions ride here so the original
+// blackboard.json/command.json/envelope.json vectors stay byte-identical):
+// BlackboardScope, BlackboardItemDraft, the client write commands, the
+// board-scoped read, the write reply, a board card view, and the task.* /
+// workflow.query proposed actions.
+// ---------------------------------------------------------------------------
+
+/// A stored board card: a `task` on the repository board's synthetic run, with
+/// every board field populated.
+fn board_card() -> BlackboardItemView {
+    BlackboardItemView {
+        id: "0192-card".to_string(),
+        workflow_run_id: board_scope_id("/home/user/project"),
+        kind: "task".to_string(),
+        payload: json!({ "title": "wire the DAG viewer", "description": "edges on the wire" }),
+        author: json!({ "role": "operator", "client_id": "60000000-0000-0000-0000-000000000001" }),
+        confidence: None,
+        evidence: Vec::new(),
+        revision: 1,
+        superseded_by: None,
+        board_scope: Some("/home/user/project".to_string()),
+        status: Some("todo".to_string()),
+        assignee: Some("dana".to_string()),
+        ordinal: Some(1),
+    }
+}
+
+fn board_vectors() -> Vec<Vector> {
+    let draft = BlackboardItemDraft {
+        kind: "task".to_string(),
+        payload: json!({ "title": "wire the DAG viewer" }),
+        confidence: None,
+        evidence: Vec::new(),
+        status: Some("todo".to_string()),
+        assignee: Some("dana".to_string()),
+        ordinal: Some(1),
+    };
+    vec![
+        vec_of(
+            "BlackboardScope_WorkflowRun",
+            BlackboardScope::WorkflowRun {
+                workflow_run_id: "wfrun-abc123".to_string(),
+            },
+        ),
+        vec_of(
+            "BlackboardScope_RepositoryBoard",
+            BlackboardScope::RepositoryBoard {
+                repository: "/home/user/project".to_string(),
+            },
+        ),
+        vec_of("BlackboardItemDraft", draft.clone()),
+        vec_of("BlackboardItemView_board_card", board_card()),
+        vec_of(
+            "CommandBody_PostBlackboardItem",
+            CommandBody::PostBlackboardItem {
+                scope: BlackboardScope::RepositoryBoard {
+                    repository: "/home/user/project".to_string(),
+                },
+                item: draft,
+            },
+        ),
+        vec_of(
+            "CommandBody_UpdateBlackboardItem",
+            CommandBody::UpdateBlackboardItem {
+                scope: BlackboardScope::RepositoryBoard {
+                    repository: "/home/user/project".to_string(),
+                },
+                item_id: "0192-card".to_string(),
+                status: Some("doing".to_string()),
+                assignee: None,
+                ordinal: Some(2),
+                payload: None,
+            },
+        ),
+        vec_of(
+            "CommandBody_ReadBlackboard_board",
+            CommandBody::ReadBlackboard {
+                workflow_run_id: String::new(),
+                kind: Some("task".to_string()),
+                include_superseded: false,
+                board_repository: Some("/home/user/project".to_string()),
+            },
+        ),
+        vec_of(
+            "Payload_BlackboardItemApplied",
+            Payload::BlackboardItemApplied {
+                command_id: command_id(),
+                item: board_card(),
+            },
+        ),
+        vec_of(
+            "ProposedAction_TaskWrite",
+            ProposedAction::TaskWrite {
+                repository: "/home/user/project".to_string(),
+                summary: "create \"wire the DAG viewer\"".to_string(),
+            },
+        ),
+        vec_of(
+            "ProposedAction_TaskRead",
+            ProposedAction::TaskRead {
+                repository: "/home/user/project".to_string(),
+            },
+        ),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1538,7 +1655,86 @@ fn workflow_node_view() -> WorkflowNodeView {
         cost: Some(json!({ "wall_time_secs": 12, "tool_calls": 3 })),
         error: None,
         warnings: vec!["tool_calls at 4/5 (80%)".to_string()],
+        // Additive and default-skipped, so this original vector's bytes are
+        // unchanged; the edge-carrying shapes live in workflow_graph.json.
+        depends_on: Vec::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// workflow_graph.json (NEW FILE — the DAG-edge additions ride here so the
+// original workflow.json vectors stay byte-identical): a node view carrying
+// `depends_on`, a snapshot whose nodes form a real two-edge graph, and the
+// workflow.query proposed action.
+// ---------------------------------------------------------------------------
+
+fn workflow_graph_vectors() -> Vec<Vector> {
+    let inspect = workflow_node_view();
+    let verify = WorkflowNodeView {
+        workflow_run_id: "wfrun-abc".to_string(),
+        node_id: "verify".to_string(),
+        state: WorkflowNodeState::Running,
+        attempt: 1,
+        cost: None,
+        error: None,
+        warnings: Vec::new(),
+        depends_on: vec!["inspect".to_string()],
+    };
+    let review = WorkflowNodeView {
+        workflow_run_id: "wfrun-abc".to_string(),
+        node_id: "review".to_string(),
+        state: WorkflowNodeState::Pending,
+        attempt: 0,
+        cost: None,
+        error: None,
+        warnings: Vec::new(),
+        depends_on: vec!["inspect".to_string(), "verify".to_string()],
+    };
+    vec![
+        vec_of("WorkflowNodeView_with_depends_on", verify.clone()),
+        vec_of(
+            "WorkflowRunSnapshot_with_edges",
+            WorkflowRunSnapshot {
+                workflow_run_id: "wfrun-abc".to_string(),
+                phase: WorkflowRunPhase::Running,
+                nodes: vec![inspect, verify, review],
+            },
+        ),
+        vec_of(
+            "ProposedAction_WorkflowQuery",
+            ProposedAction::WorkflowQuery {
+                workflow_run_id: "wfrun-abc123".to_string(),
+            },
+        ),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// history.json (NEW FILE — the paged history read): ReadSessionEvents and its
+// SessionEventsPage reply.
+// ---------------------------------------------------------------------------
+
+fn history_vectors() -> Vec<Vector> {
+    vec![
+        vec_of(
+            "CommandBody_ReadSessionEvents",
+            CommandBody::ReadSessionEvents {
+                session_id: session_id(),
+                after_sequence: 500,
+                limit: 200,
+            },
+        ),
+        vec_of(
+            "Payload_SessionEventsPage",
+            Payload::SessionEventsPage {
+                command_id: command_id(),
+                session_id: session_id(),
+                events: vec![event_with(EventBody::SessionClosed)],
+                through: 501,
+                has_more: true,
+            },
+        ),
+    ]
 }
 
 fn workflow_vectors() -> Vec<Vector> {
@@ -1796,6 +1992,13 @@ fn all_files() -> Vec<(&'static str, Vec<Vector>)> {
         ("workflow.json", workflow_vectors()),
         ("capabilities.json", capabilities_vectors()),
         ("input.json", input_vectors()),
+        // New vector FILES for the additive kanban/DAG/history shapes — the
+        // original files above stay byte-identical because every new field is
+        // `#[serde(default)]` + skip-when-default and no existing generator
+        // sets one.
+        ("board.json", board_vectors()),
+        ("workflow_graph.json", workflow_graph_vectors()),
+        ("history.json", history_vectors()),
     ]
 }
 

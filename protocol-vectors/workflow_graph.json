@@ -1,0 +1,63 @@
+{
+  "ProposedAction_WorkflowQuery": {
+    "type": "WorkflowQuery",
+    "workflow_run_id": "wfrun-abc123"
+  },
+  "WorkflowNodeView_with_depends_on": {
+    "attempt": 1,
+    "depends_on": [
+      "inspect"
+    ],
+    "node_id": "verify",
+    "state": {
+      "type": "Running"
+    },
+    "workflow_run_id": "wfrun-abc"
+  },
+  "WorkflowRunSnapshot_with_edges": {
+    "nodes": [
+      {
+        "attempt": 1,
+        "cost": {
+          "tool_calls": 3,
+          "wall_time_secs": 12
+        },
+        "node_id": "inspect",
+        "state": {
+          "type": "Completed"
+        },
+        "warnings": [
+          "tool_calls at 4/5 (80%)"
+        ],
+        "workflow_run_id": "wfrun-abc"
+      },
+      {
+        "attempt": 1,
+        "depends_on": [
+          "inspect"
+        ],
+        "node_id": "verify",
+        "state": {
+          "type": "Running"
+        },
+        "workflow_run_id": "wfrun-abc"
+      },
+      {
+        "attempt": 0,
+        "depends_on": [
+          "inspect",
+          "verify"
+        ],
+        "node_id": "review",
+        "state": {
+          "type": "Pending"
+        },
+        "workflow_run_id": "wfrun-abc"
+      }
+    ],
+    "phase": {
+      "type": "Running"
+    },
+    "workflow_run_id": "wfrun-abc"
+  }
+}

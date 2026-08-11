@@ -105,6 +105,7 @@ async fn seed_board(paths: &RuntimePaths, workflow_run_id: &str) {
                 }),
                 confidence: Some(0.9),
                 evidence: vec![json!({ "path": "src/parse.rs", "line": 42 })],
+                board: Default::default(),
             },
         )
         .await
@@ -239,6 +240,7 @@ async fn an_observer_reads_the_board_over_the_socket_and_sees_node_authored_item
             workflow_run_id: workflow_run_id.to_string(),
             kind: Some("finding".to_string()),
             include_superseded: false,
+            board_repository: None,
         },
         "read",
     )

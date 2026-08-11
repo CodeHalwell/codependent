@@ -204,6 +204,36 @@ pub enum ProposedAction {
     /// engine's explicit arm); never serialized into a `ToolProposed` (never gated by
     /// approval), so it needs no golden wire vector.
     RecordMemory,
+    /// Query a durable workflow run's graph state (the `workflow.query` runtime
+    /// tool, rubric 5): nodes, states, dependency edges, and measured costs. A
+    /// pure read of Codypendent's own durable store — no filesystem, command,
+    /// network, or remote effect — so it is always policy-`Allow`ed (see the
+    /// daemon policy engine's explicit arm) and recorded only so the access is
+    /// traced like any other tool call.
+    WorkflowQuery {
+        /// The workflow run being read, or empty when listing the repository's
+        /// runs (server-derived from the run context / validated args).
+        workflow_run_id: String,
+    },
+    /// Write a card on the repository task board (the `task.create` /
+    /// `task.update` / `task.move` runtime tools, rubric 10). Internal
+    /// coordination state in Codypendent's own store — like a blackboard post it
+    /// touches no file, command, network, or remote — so policy allows it
+    /// without an approval gate; the action is recorded so every board write is
+    /// traced and attributable.
+    TaskWrite {
+        /// The canonical repository whose board is written (server-derived from
+        /// the run context, never model-supplied).
+        repository: String,
+        /// A short human rendering of the write (e.g. `create "wire the DAG"`).
+        summary: String,
+    },
+    /// Read the repository task board (the `task.list` runtime tool). A read of
+    /// internal state; always policy-`Allow`ed and recorded for the trace.
+    TaskRead {
+        /// The canonical repository whose board is read (server-derived).
+        repository: String,
+    },
     #[serde(other)]
     Unknown,
 }

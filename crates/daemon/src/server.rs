@@ -36,7 +36,10 @@ use tracing::{error, info, warn};
 
 use crate::approvals::ApprovalBroker;
 use crate::artifacts::ArtifactStore;
-use crate::blackboard::{BlackboardHub, BlackboardReader, ReadBlackboardRequest};
+use crate::blackboard::{
+    BlackboardHub, BlackboardReader, BlackboardWriter, BoardTarget, PostBlackboardRequest,
+    ReadBlackboardRequest, UpdateBlackboardRequest,
+};
 use crate::commands::{ApplyContext, CommandProcessor};
 use crate::documents::{
     DocumentHub, DocumentLeaseReleaseRequest, DocumentLeaseRequest, DocumentLeaser,
@@ -142,6 +145,11 @@ pub struct ServerState {
     /// rejected `workflow.transport-unavailable`); the assembly injects a
     /// `codypendent-workflow`-backed implementation over the pool.
     pub blackboard_reader: Option<Arc<dyn BlackboardReader>>,
+    /// Stores a `Controller` client's `PostBlackboardItem` / `UpdateBlackboardItem`
+    /// (Phase B kanban). `None` in a lib-only / test embedding (both commands are
+    /// then rejected `workflow.transport-unavailable`); the assembly injects a
+    /// `codypendent-workflow`-backed implementation over the pool.
+    pub blackboard_writer: Option<Arc<dyn BlackboardWriter>>,
     /// Per-workflow-run node-lifecycle fan-out: the workflow host publishes each
     /// node transition (and run-phase change) here, and a client's
     /// `Subscription::Workflow` forwarder delivers from it (Phase 5 STEP 5.2 / T9).
@@ -287,6 +295,7 @@ pub async fn run_with_executor_on(
     // so both sides must share one hub — exactly as `collaborators` shares the
     // `SubscriptionHub`. Absent an executor, a fresh empty hub (never published to).
     let blackboard_reader = executor.as_ref().and_then(|e| e.blackboard_reader());
+    let blackboard_writer = executor.as_ref().and_then(|e| e.blackboard_writer());
     let blackboards = executor
         .as_ref()
         .and_then(|e| e.blackboard_hub())
@@ -393,6 +402,7 @@ pub async fn run_with_executor_on(
         promotion,
         blackboards,
         blackboard_reader,
+        blackboard_writer,
         workflows,
         workflow_reader,
         run_admission: Arc::new(tokio::sync::RwLock::new(())),
@@ -1663,14 +1673,17 @@ async fn handle_request(
                 // Reading a workflow run's blackboard is intercepted at the
                 // connection level like `StartWorkflow` (the board lives in its own
                 // durable store outside the session ledger). Unlike the lifecycle
-                // commands this is a READ — an Observer may issue it (there is no
-                // client-facing post command; only the workflow executor writes the
-                // board) — so it carries no role gate, only the transport check
-                // (Phase 5 STEP 5.3).
+                // commands this is a READ — an Observer may issue it (only a
+                // Controller writes, through `PostBlackboardItem` below) — so it
+                // carries no role gate, only the transport check (Phase 5 STEP 5.3).
+                // `board_repository` re-points the same read at a repository task
+                // board (Phase B kanban); the assembly resolves it to the synthetic
+                // board run, and an unwritten board reads empty.
                 CommandBody::ReadBlackboard {
                     workflow_run_id,
                     kind,
                     include_superseded,
+                    board_repository,
                 } => {
                     let Some(reader) = state.blackboard_reader.as_ref() else {
                         let reply = Envelope::reply_to(
@@ -1686,6 +1699,7 @@ async fn handle_request(
                     };
                     let read = ReadBlackboardRequest {
                         workflow_run_id: workflow_run_id.clone(),
+                        board_repository: board_repository.clone(),
                         kind: kind.clone(),
                         include_superseded: *include_superseded,
                         client_id: conn.client_id_or(request.client_id),
@@ -1696,6 +1710,119 @@ async fn handle_request(
                             Payload::BlackboardItems {
                                 command_id: command.command_id,
                                 items,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // The two client-facing board WRITES (Phase B kanban), intercepted
+                // alongside the read because the board lives outside the session
+                // ledger. Unlike the read they are `Controller`-only: a board write
+                // is the trusted local operator's, an Observer stays read-only, and
+                // an agent writes through its own `blackboard.*` / `task.*` tools
+                // (which carry server-built agent attribution) rather than here.
+                CommandBody::PostBlackboardItem { scope, item } => {
+                    let Some(target) = board_target(scope) else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(unknown_board_scope()),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let Some(writer_seam) =
+                        board_writer_or_reject(&state, conn, &request, writer).await?
+                    else {
+                        return Ok(false);
+                    };
+                    let post = PostBlackboardRequest {
+                        target,
+                        item: item.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match writer_seam.post(post).await {
+                        Ok(item) => Envelope::reply_to(
+                            &request,
+                            Payload::BlackboardItemApplied {
+                                command_id: command.command_id,
+                                item,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::UpdateBlackboardItem {
+                    scope,
+                    item_id,
+                    status,
+                    assignee,
+                    ordinal,
+                    payload,
+                } => {
+                    let Some(target) = board_target(scope) else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(unknown_board_scope()),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let Some(writer_seam) =
+                        board_writer_or_reject(&state, conn, &request, writer).await?
+                    else {
+                        return Ok(false);
+                    };
+                    let update = UpdateBlackboardRequest {
+                        target,
+                        item_id: item_id.clone(),
+                        status: status.clone(),
+                        assignee: assignee.clone(),
+                        ordinal: *ordinal,
+                        payload: payload.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match writer_seam.update(update).await {
+                        Ok(item) => Envelope::reply_to(
+                            &request,
+                            Payload::BlackboardItemApplied {
+                                command_id: command.command_id,
+                                item,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // One page of a session's durable history. Intercepted here (not run
+                // through the command write path) for the same reason as every read:
+                // it appends nothing to the ledger. Any attached client — an
+                // Observer included — may page; the daemon serves it from the same
+                // windowed `(session_id, sequence)` read the attach catch-up uses, so
+                // a client >500 events behind can rebuild its transcript instead of
+                // being handed a `Catchup::Snapshot` with no history at all.
+                CommandBody::ReadSessionEvents {
+                    session_id,
+                    after_sequence,
+                    limit,
+                } => {
+                    let reply = match read_session_events_page(
+                        &state.pool,
+                        *session_id,
+                        *after_sequence,
+                        *limit,
+                    )
+                    .await
+                    {
+                        Ok((events, through, has_more)) => Envelope::reply_to(
+                            &request,
+                            Payload::SessionEventsPage {
+                                command_id: command.command_id,
+                                session_id: *session_id,
+                                events,
+                                through,
+                                has_more,
                             },
                         ),
                         Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
@@ -3642,6 +3769,121 @@ async fn workflow_control_seam<'a>(
         return Ok(None);
     };
     Ok(Some(lifecycle))
+}
+
+/// Lower a wire [`BlackboardScope`] to the daemon's [`BoardTarget`], or `None`
+/// for the `Unknown` variant a newer client's scope parses into — rejected
+/// structurally at the edge rather than guessed at (Phase B kanban).
+fn board_target(scope: &codypendent_protocol::BlackboardScope) -> Option<BoardTarget> {
+    match scope {
+        codypendent_protocol::BlackboardScope::WorkflowRun { workflow_run_id } => {
+            Some(BoardTarget::WorkflowRun(workflow_run_id.clone()))
+        }
+        codypendent_protocol::BlackboardScope::RepositoryBoard { repository } => {
+            Some(BoardTarget::Repository(repository.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// The rejection for a board scope this daemon does not understand.
+fn unknown_board_scope() -> codypendent_protocol::CodypendentError {
+    codypendent_protocol::CodypendentError::new(
+        "blackboard.unknown-scope",
+        "this daemon does not understand the requested board scope".to_string(),
+        false,
+    )
+}
+
+/// The `Controller` role gate + transport check both board writes share: replies
+/// the rejection itself and yields `None` when either fails, mirroring
+/// [`workflow_control_seam`].
+async fn board_writer_or_reject<'a>(
+    state: &'a Arc<ServerState>,
+    conn: &ConnState,
+    request: &Envelope,
+    writer: &SharedWriter,
+) -> anyhow::Result<Option<&'a Arc<dyn BlackboardWriter>>> {
+    if conn.role != ClientRole::Controller {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "protocol.role-denied",
+                "only a Controller may write the blackboard".to_string(),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    }
+    let Some(seam) = state.blackboard_writer.as_ref() else {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "workflow.transport-unavailable",
+                "workflow transport is not enabled on this daemon".to_string(),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    };
+    Ok(Some(seam))
+}
+
+/// The largest page `ReadSessionEvents` serves, and the page size a request that
+/// names none gets. Bounded so one command can never be asked to materialize a
+/// 100k-event session into a single frame (the 16 MiB frame limit is a wall, not
+/// a policy) — a pager simply walks forward instead.
+const MAX_SESSION_EVENTS_PAGE: u32 = 500;
+
+/// Serve one ascending page of a session's durable history: events with
+/// `after_sequence < sequence <= after_sequence + limit`, the page's highest
+/// sequence, and whether anything existed beyond it at read time. An unknown
+/// session is rejected rather than answered with an empty page, so a typo'd id
+/// never reads as "empty session" (the same discipline the attach catch-up uses).
+async fn read_session_events_page(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    after_sequence: u64,
+    limit: u32,
+) -> Result<(Vec<SessionEvent>, u64, bool), codypendent_protocol::CodypendentError> {
+    let store_error = |error: anyhow::Error| {
+        codypendent_protocol::CodypendentError::new(
+            "protocol.store-error",
+            format!("could not read the session history: {error}"),
+            true,
+        )
+    };
+    match ledger::session_exists(pool, session_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(codypendent_protocol::CodypendentError::new(
+                "protocol.session-not-found",
+                format!("no session {session_id}"),
+                false,
+            ));
+        }
+        Err(error) => return Err(store_error(error)),
+    }
+    // 0 (or absent) asks for the server default; anything larger is clamped to
+    // the ceiling rather than refused, so a client never has to know the limit.
+    let limit = if limit == 0 {
+        MAX_SESSION_EVENTS_PAGE
+    } else {
+        limit.min(MAX_SESSION_EVENTS_PAGE)
+    };
+    let through = after_sequence.saturating_add(u64::from(limit));
+    let events = ledger::load_events_between(pool, session_id, after_sequence, through)
+        .await
+        .map_err(store_error)?;
+    let latest = ledger::next_sequence(pool, session_id)
+        .await
+        .map_err(store_error)?;
+    // An empty page keeps the caller's cursor where it was, so paging is a fixed
+    // point once drained rather than silently skipping the requested window.
+    let reached = events.last().map_or(after_sequence, |event| event.sequence);
+    Ok((events, reached, latest > reached))
 }
 
 async fn send(writer: &SharedWriter, envelope: &Envelope) -> Result<(), FrameError> {
