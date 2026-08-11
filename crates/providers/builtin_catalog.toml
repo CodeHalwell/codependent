@@ -389,3 +389,1344 @@ protocol = "acp"
 kind = "acp"
 command = "agent"
 args = ["acp"]
+
+# =============================================================================
+# Curated model prefill — added by the 2026-08-11 product review.
+#
+# Display-only metadata (`providers/src/model.rs::Model`), addressed by
+# (provider_id, id) and served via `Catalog::models()` / `Catalog::model()`.
+# Sources: live `/models` dumps (Nebius models_info, OpenRouter, DeepInfra,
+# SambaNova, Novita, Venice, Chutes, Inference.net, OpenCode Zen) and official
+# provider docs, all captured 2026-08-11 — see
+# docs/reviews/2026-08-11-verticals/11-model-catalog-research.md for the
+# discovery-endpoint matrix, per-model capability flags, and confidence notes.
+# Prices are USD per 1M tokens and are omitted where unverified. Ids are the
+# exact strings each API expects. Providers whose catalogs are huge or
+# key-gated (OpenRouter beyond flagships, Featherless, Fireworks, Hyperbolic,
+# Parasail) are left to live `GET {base}/models` discovery.
+# =============================================================================
+
+# --- Nebius Token Factory (live-verified; full public text/vision catalog) ---
+[[model]]
+id = "deepseek-ai/DeepSeek-V4-Pro"
+provider_id = "nebius"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.75
+cost_per_1m_output_usd = 3.5
+
+[[model]]
+id = "deepseek-ai/DeepSeek-V4-Flash"
+provider_id = "nebius"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.14
+cost_per_1m_output_usd = 0.28
+
+[[model]]
+id = "zai-org/GLM-5.2"
+provider_id = "nebius"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.4
+cost_per_1m_output_usd = 4.4
+
+[[model]]
+id = "zai-org/GLM-5.1"
+provider_id = "nebius"
+context_tokens = 202752
+cost_per_1m_input_usd = 1.4
+cost_per_1m_output_usd = 4.4
+
+[[model]]
+id = "moonshotai/Kimi-K3"
+provider_id = "nebius"
+context_tokens = 1048576
+cost_per_1m_input_usd = 3.0
+cost_per_1m_output_usd = 15.0
+
+[[model]]
+id = "moonshotai/Kimi-K2.7-Code"
+provider_id = "nebius"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.95
+cost_per_1m_output_usd = 4.0
+
+[[model]]
+id = "moonshotai/Kimi-K2.6"
+provider_id = "nebius"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.95
+cost_per_1m_output_usd = 4.0
+
+[[model]]
+id = "MiniMaxAI/MiniMax-M3"
+provider_id = "nebius"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.3
+cost_per_1m_output_usd = 1.2
+
+[[model]]
+id = "MiniMaxAI/MiniMax-M2.5"
+provider_id = "nebius"
+context_tokens = 196608
+cost_per_1m_input_usd = 0.3
+cost_per_1m_output_usd = 1.2
+
+[[model]]
+id = "Qwen/Qwen3.5-397B-A17B"
+provider_id = "nebius"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.6
+cost_per_1m_output_usd = 3.6
+
+[[model]]
+id = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+provider_id = "nebius"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.2
+cost_per_1m_output_usd = 0.6
+
+[[model]]
+id = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+provider_id = "nebius"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.1
+cost_per_1m_output_usd = 0.3
+
+[[model]]
+id = "Qwen/Qwen3-32B"
+provider_id = "nebius"
+context_tokens = 40960
+cost_per_1m_input_usd = 0.1
+cost_per_1m_output_usd = 0.3
+
+[[model]]
+id = "Qwen/Qwen3-Next-80B-A3B-Thinking"
+provider_id = "nebius"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.15
+cost_per_1m_output_usd = 1.2
+
+[[model]]
+id = "Qwen/Qwen2.5-VL-72B-Instruct"
+provider_id = "nebius"
+name = "Qwen2.5 VL 72B (vision)"
+context_tokens = 32000
+cost_per_1m_input_usd = 0.25
+cost_per_1m_output_usd = 0.75
+
+[[model]]
+id = "nvidia/Nemotron-3_5-Lightning"
+provider_id = "nebius"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.06
+cost_per_1m_output_usd = 0.24
+
+[[model]]
+id = "nvidia/Nemotron-3-Ultra-550b-a55b"
+provider_id = "nebius"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.0
+cost_per_1m_output_usd = 3.0
+
+[[model]]
+id = "nvidia/nemotron-3-super-120b-a12b"
+provider_id = "nebius"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.3
+cost_per_1m_output_usd = 0.9
+
+[[model]]
+id = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
+provider_id = "nebius"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.06
+cost_per_1m_output_usd = 0.24
+
+[[model]]
+id = "nvidia/Nemotron-3-Nano-Omni"
+provider_id = "nebius"
+name = "Nemotron 3 Nano Omni (vision)"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.06
+cost_per_1m_output_usd = 0.24
+
+[[model]]
+id = "nvidia/Cosmos3-Super-Reasoner"
+provider_id = "nebius"
+name = "Cosmos3 Super Reasoner (vision)"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.1
+cost_per_1m_output_usd = 0.3
+
+[[model]]
+id = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1"
+provider_id = "nebius"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.6
+cost_per_1m_output_usd = 1.8
+
+[[model]]
+id = "openai/gpt-oss-120b"
+provider_id = "nebius"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.15
+cost_per_1m_output_usd = 0.6
+
+[[model]]
+id = "meta-llama/Llama-3.3-70B-Instruct"
+provider_id = "nebius"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.13
+cost_per_1m_output_usd = 0.4
+
+[[model]]
+id = "google/gemma-3-27b-it"
+provider_id = "nebius"
+context_tokens = 110000
+cost_per_1m_input_usd = 0.1
+cost_per_1m_output_usd = 0.3
+
+[[model]]
+id = "NousResearch/Hermes-4-405B"
+provider_id = "nebius"
+context_tokens = 131072
+cost_per_1m_input_usd = 1.0
+cost_per_1m_output_usd = 3.0
+
+[[model]]
+id = "NousResearch/Hermes-4-70B"
+provider_id = "nebius"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.13
+cost_per_1m_output_usd = 0.4
+
+[[model]]
+id = "openbmb/MiniCPM-V-4_5"
+provider_id = "nebius"
+name = "MiniCPM V 4.5 (vision)"
+context_tokens = 32768
+cost_per_1m_input_usd = 0.658
+cost_per_1m_output_usd = 1.11
+
+[[model]]
+id = "Qwen/Qwen3-Embedding-8B"
+provider_id = "nebius"
+name = "Qwen3 Embedding 8B (embeddings)"
+context_tokens = 32768
+cost_per_1m_input_usd = 0.01
+
+# --- OpenAI (official pricing page, 2026-08) ---
+[[model]]
+id = "gpt-5.6-sol"
+provider_id = "openai"
+context_tokens = 1048576
+cost_per_1m_input_usd = 5.0
+cost_per_1m_output_usd = 30.0
+
+[[model]]
+id = "gpt-5.6-terra"
+provider_id = "openai"
+context_tokens = 1048576
+cost_per_1m_input_usd = 2.0
+cost_per_1m_output_usd = 12.0
+
+[[model]]
+id = "gpt-5.6-luna"
+provider_id = "openai"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.2
+cost_per_1m_output_usd = 1.2
+
+[[model]]
+id = "gpt-5.5"
+provider_id = "openai"
+context_tokens = 1048576
+cost_per_1m_input_usd = 5.0
+cost_per_1m_output_usd = 30.0
+
+[[model]]
+id = "gpt-5.5-pro"
+provider_id = "openai"
+context_tokens = 1048576
+cost_per_1m_input_usd = 30.0
+cost_per_1m_output_usd = 180.0
+
+[[model]]
+id = "gpt-5.4"
+provider_id = "openai"
+context_tokens = 1048576
+cost_per_1m_input_usd = 2.5
+cost_per_1m_output_usd = 15.0
+
+[[model]]
+id = "gpt-5.4-mini"
+provider_id = "openai"
+context_tokens = 400000
+cost_per_1m_input_usd = 0.75
+cost_per_1m_output_usd = 4.5
+
+[[model]]
+id = "gpt-5.4-nano"
+provider_id = "openai"
+context_tokens = 400000
+cost_per_1m_input_usd = 0.2
+cost_per_1m_output_usd = 1.25
+
+[[model]]
+id = "gpt-5.3-codex"
+provider_id = "openai"
+context_tokens = 400000
+cost_per_1m_input_usd = 1.75
+cost_per_1m_output_usd = 14.0
+
+[[model]]
+id = "gpt-4o-transcribe"
+provider_id = "openai"
+name = "GPT-4o Transcribe (speech-to-text)"
+
+[[model]]
+id = "gpt-4o-mini-transcribe"
+provider_id = "openai"
+name = "GPT-4o Mini Transcribe (speech-to-text)"
+
+# --- Anthropic (official model table) ---
+[[model]]
+id = "claude-fable-5"
+provider_id = "anthropic"
+context_tokens = 1048576
+cost_per_1m_input_usd = 10.0
+cost_per_1m_output_usd = 50.0
+
+[[model]]
+id = "claude-opus-5"
+provider_id = "anthropic"
+context_tokens = 1048576
+cost_per_1m_input_usd = 5.0
+cost_per_1m_output_usd = 25.0
+
+[[model]]
+id = "claude-opus-4-8"
+provider_id = "anthropic"
+context_tokens = 1048576
+cost_per_1m_input_usd = 5.0
+cost_per_1m_output_usd = 25.0
+
+[[model]]
+id = "claude-opus-4-7"
+provider_id = "anthropic"
+context_tokens = 1048576
+cost_per_1m_input_usd = 5.0
+cost_per_1m_output_usd = 25.0
+
+[[model]]
+id = "claude-opus-4-6"
+provider_id = "anthropic"
+context_tokens = 1048576
+cost_per_1m_input_usd = 5.0
+cost_per_1m_output_usd = 25.0
+
+[[model]]
+id = "claude-sonnet-5"
+provider_id = "anthropic"
+context_tokens = 1048576
+cost_per_1m_input_usd = 3.0
+cost_per_1m_output_usd = 15.0
+
+[[model]]
+id = "claude-sonnet-4-6"
+provider_id = "anthropic"
+context_tokens = 1048576
+cost_per_1m_input_usd = 3.0
+cost_per_1m_output_usd = 15.0
+
+[[model]]
+id = "claude-haiku-4-5"
+provider_id = "anthropic"
+context_tokens = 200000
+cost_per_1m_input_usd = 1.0
+cost_per_1m_output_usd = 5.0
+
+# --- Google Gemini (OpenAI-compat endpoint) ---
+[[model]]
+id = "gemini-3.6-flash"
+provider_id = "gemini"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.5
+cost_per_1m_output_usd = 7.5
+
+[[model]]
+id = "gemini-3.5-flash"
+provider_id = "gemini"
+context_tokens = 1048576
+
+[[model]]
+id = "gemini-3.5-flash-lite"
+provider_id = "gemini"
+context_tokens = 1048576
+
+[[model]]
+id = "gemini-3.1-pro-preview"
+provider_id = "gemini"
+context_tokens = 1048576
+cost_per_1m_input_usd = 2.0
+cost_per_1m_output_usd = 12.0
+
+[[model]]
+id = "gemini-3.1-flash-lite"
+provider_id = "gemini"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.25
+cost_per_1m_output_usd = 1.5
+
+[[model]]
+id = "gemini-2.5-pro"
+provider_id = "gemini"
+context_tokens = 1048576
+
+[[model]]
+id = "gemini-2.5-flash"
+provider_id = "gemini"
+context_tokens = 1048576
+
+# --- xAI Grok ---
+[[model]]
+id = "grok-4.5"
+provider_id = "xai"
+context_tokens = 500000
+cost_per_1m_input_usd = 2.0
+cost_per_1m_output_usd = 6.0
+
+[[model]]
+id = "grok-4.3"
+provider_id = "xai"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.25
+cost_per_1m_output_usd = 2.5
+
+[[model]]
+id = "grok-4.20-0309-reasoning"
+provider_id = "xai"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.25
+cost_per_1m_output_usd = 2.5
+
+[[model]]
+id = "grok-build-0.1"
+provider_id = "xai"
+context_tokens = 262144
+cost_per_1m_input_usd = 1.0
+cost_per_1m_output_usd = 2.0
+
+# --- DeepSeek ---
+[[model]]
+id = "deepseek-v4-flash"
+provider_id = "deepseek"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.14
+cost_per_1m_output_usd = 0.28
+
+[[model]]
+id = "deepseek-v4-pro"
+provider_id = "deepseek"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.435
+cost_per_1m_output_usd = 0.87
+
+# --- Mistral (-latest aliases; version pins in the research appendix) ---
+[[model]]
+id = "mistral-medium-latest"
+provider_id = "mistral"
+
+[[model]]
+id = "mistral-large-latest"
+provider_id = "mistral"
+
+[[model]]
+id = "mistral-small-latest"
+provider_id = "mistral"
+
+[[model]]
+id = "codestral-latest"
+provider_id = "mistral"
+
+# --- Moonshot AI (Kimi) ---
+[[model]]
+id = "kimi-k3"
+provider_id = "moonshot"
+context_tokens = 1048576
+cost_per_1m_input_usd = 3.0
+cost_per_1m_output_usd = 15.0
+
+[[model]]
+id = "kimi-k2.7-code"
+provider_id = "moonshot"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.95
+cost_per_1m_output_usd = 4.0
+
+[[model]]
+id = "kimi-k2.6"
+provider_id = "moonshot"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.95
+cost_per_1m_output_usd = 4.0
+
+[[model]]
+id = "kimi-k2.5"
+provider_id = "moonshot"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.6
+cost_per_1m_output_usd = 3.0
+
+# --- Zhipu / Z.ai (GLM) ---
+[[model]]
+id = "glm-5.2"
+provider_id = "zhipu"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.4
+cost_per_1m_output_usd = 4.4
+
+[[model]]
+id = "glm-5.1"
+provider_id = "zhipu"
+context_tokens = 200000
+cost_per_1m_input_usd = 1.4
+cost_per_1m_output_usd = 4.4
+
+[[model]]
+id = "glm-5"
+provider_id = "zhipu"
+context_tokens = 200000
+cost_per_1m_input_usd = 1.0
+cost_per_1m_output_usd = 3.2
+
+[[model]]
+id = "glm-5-turbo"
+provider_id = "zhipu"
+cost_per_1m_input_usd = 1.2
+cost_per_1m_output_usd = 4.0
+
+[[model]]
+id = "glm-4.7"
+provider_id = "zhipu"
+cost_per_1m_input_usd = 0.6
+cost_per_1m_output_usd = 2.2
+
+[[model]]
+id = "glm-4.7-flashx"
+provider_id = "zhipu"
+cost_per_1m_input_usd = 0.07
+cost_per_1m_output_usd = 0.4
+
+[[model]]
+id = "glm-4.7-flash"
+provider_id = "zhipu"
+name = "GLM 4.7 Flash (free tier)"
+cost_per_1m_input_usd = 0.0
+cost_per_1m_output_usd = 0.0
+
+# --- MiniMax ---
+[[model]]
+id = "MiniMax-M3"
+provider_id = "minimax"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.3
+cost_per_1m_output_usd = 1.2
+
+[[model]]
+id = "MiniMax-M2.7"
+provider_id = "minimax"
+context_tokens = 204800
+cost_per_1m_input_usd = 0.3
+cost_per_1m_output_usd = 1.2
+
+[[model]]
+id = "MiniMax-M2.5"
+provider_id = "minimax"
+context_tokens = 204800
+cost_per_1m_input_usd = 0.3
+cost_per_1m_output_usd = 1.2
+
+# --- Alibaba Qwen (DashScope intl) ---
+[[model]]
+id = "qwen3.7-max"
+provider_id = "qwen"
+
+[[model]]
+id = "qwen3.7-plus"
+provider_id = "qwen"
+
+[[model]]
+id = "qwen3.6-plus"
+provider_id = "qwen"
+context_tokens = 1000000
+
+[[model]]
+id = "qwen3.6-flash"
+provider_id = "qwen"
+context_tokens = 1000000
+
+[[model]]
+id = "qwen3.5-plus"
+provider_id = "qwen"
+
+[[model]]
+id = "qwen3-coder-plus"
+provider_id = "qwen"
+
+# --- Perplexity (no /models endpoint — static prefill is the only option) ---
+[[model]]
+id = "sonar"
+provider_id = "perplexity"
+
+[[model]]
+id = "sonar-pro"
+provider_id = "perplexity"
+
+[[model]]
+id = "sonar-reasoning-pro"
+provider_id = "perplexity"
+
+[[model]]
+id = "sonar-deep-research"
+provider_id = "perplexity"
+
+# --- Cohere (compat endpoint) ---
+[[model]]
+id = "command-a-plus-05-2026"
+provider_id = "cohere"
+context_tokens = 131072
+
+[[model]]
+id = "command-a-03-2025"
+provider_id = "cohere"
+context_tokens = 262144
+
+[[model]]
+id = "command-a-reasoning-08-2025"
+provider_id = "cohere"
+context_tokens = 262144
+
+[[model]]
+id = "command-a-vision-07-2025"
+provider_id = "cohere"
+name = "Command A Vision (vision)"
+
+[[model]]
+id = "command-r-plus-08-2024"
+provider_id = "cohere"
+
+# --- Groq (official model docs; per-token prices unpublished there) ---
+[[model]]
+id = "llama-3.1-8b-instant"
+provider_id = "groq"
+context_tokens = 131072
+
+[[model]]
+id = "llama-3.3-70b-versatile"
+provider_id = "groq"
+context_tokens = 131072
+
+[[model]]
+id = "openai/gpt-oss-120b"
+provider_id = "groq"
+context_tokens = 131072
+
+[[model]]
+id = "openai/gpt-oss-20b"
+provider_id = "groq"
+context_tokens = 131072
+
+[[model]]
+id = "groq/compound"
+provider_id = "groq"
+name = "Groq Compound (built-in web search + code exec)"
+context_tokens = 131072
+
+[[model]]
+id = "groq/compound-mini"
+provider_id = "groq"
+context_tokens = 131072
+
+[[model]]
+id = "qwen/qwen3.6-27b"
+provider_id = "groq"
+context_tokens = 131072
+
+[[model]]
+id = "minimaxai/minimax-m2.7"
+provider_id = "groq"
+context_tokens = 196608
+
+[[model]]
+id = "whisper-large-v3"
+provider_id = "groq"
+name = "Whisper Large v3 (speech-to-text)"
+
+[[model]]
+id = "whisper-large-v3-turbo"
+provider_id = "groq"
+name = "Whisper Large v3 Turbo (speech-to-text)"
+
+[[model]]
+id = "canopylabs/orpheus-v1-english"
+provider_id = "groq"
+name = "Orpheus v1 English (text-to-speech, preview)"
+
+# --- Cerebras ---
+[[model]]
+id = "gpt-oss-120b"
+provider_id = "cerebras"
+context_tokens = 131072
+
+[[model]]
+id = "gemma-4-31b"
+provider_id = "cerebras"
+context_tokens = 131072
+
+# --- Together AI (serverless docs; prices via authed /models) ---
+[[model]]
+id = "thinkingmachines/Inkling"
+provider_id = "together"
+context_tokens = 524288
+
+[[model]]
+id = "MiniMaxAI/MiniMax-M3"
+provider_id = "together"
+context_tokens = 524288
+
+[[model]]
+id = "moonshotai/Kimi-K3"
+provider_id = "together"
+context_tokens = 1048576
+
+[[model]]
+id = "moonshotai/Kimi-K2.7-Code"
+provider_id = "together"
+context_tokens = 262144
+
+[[model]]
+id = "moonshotai/Kimi-K2.6"
+provider_id = "together"
+context_tokens = 262144
+
+[[model]]
+id = "zai-org/GLM-5.2"
+provider_id = "together"
+context_tokens = 524288
+
+[[model]]
+id = "deepseek-ai/DeepSeek-V4-Pro"
+provider_id = "together"
+context_tokens = 524288
+
+[[model]]
+id = "deepseek-ai/DeepSeek-V4-Flash-0731"
+provider_id = "together"
+context_tokens = 1048576
+
+[[model]]
+id = "openai/gpt-oss-120b"
+provider_id = "together"
+context_tokens = 131072
+
+[[model]]
+id = "openai/gpt-oss-20b"
+provider_id = "together"
+context_tokens = 131072
+
+[[model]]
+id = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+provider_id = "together"
+context_tokens = 131072
+
+[[model]]
+id = "google/gemma-4-31B-it"
+provider_id = "together"
+context_tokens = 262144
+
+[[model]]
+id = "openai/whisper-large-v3"
+provider_id = "together"
+name = "Whisper Large v3 (speech-to-text)"
+
+[[model]]
+id = "cartesia/sonic-3"
+provider_id = "together"
+name = "Cartesia Sonic 3 (text-to-speech)"
+
+# --- DeepInfra (live-verified ids + prices) ---
+[[model]]
+id = "deepseek-ai/DeepSeek-V4-Pro"
+provider_id = "deepinfra"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.3
+cost_per_1m_output_usd = 2.6
+
+[[model]]
+id = "deepseek-ai/DeepSeek-V4-Flash-0731"
+provider_id = "deepinfra"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.08
+cost_per_1m_output_usd = 0.18
+
+[[model]]
+id = "moonshotai/Kimi-K3"
+provider_id = "deepinfra"
+context_tokens = 1048576
+cost_per_1m_input_usd = 2.85
+cost_per_1m_output_usd = 14.25
+
+[[model]]
+id = "moonshotai/Kimi-K2.7-Code"
+provider_id = "deepinfra"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.68
+cost_per_1m_output_usd = 3.4
+
+[[model]]
+id = "moonshotai/Kimi-K2.6"
+provider_id = "deepinfra"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.75
+cost_per_1m_output_usd = 3.5
+
+[[model]]
+id = "zai-org/GLM-5.2"
+provider_id = "deepinfra"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.75
+cost_per_1m_output_usd = 2.4
+
+[[model]]
+id = "zai-org/GLM-5.1"
+provider_id = "deepinfra"
+context_tokens = 202752
+cost_per_1m_input_usd = 1.05
+cost_per_1m_output_usd = 3.5
+
+[[model]]
+id = "MiniMaxAI/MiniMax-M3"
+provider_id = "deepinfra"
+context_tokens = 524288
+cost_per_1m_input_usd = 0.28
+cost_per_1m_output_usd = 1.1
+
+[[model]]
+id = "Qwen/Qwen3.8-Max"
+provider_id = "deepinfra"
+context_tokens = 262144
+cost_per_1m_input_usd = 1.65
+cost_per_1m_output_usd = 4.95
+
+[[model]]
+id = "Qwen/Qwen3.5-397B-A17B"
+provider_id = "deepinfra"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.45
+cost_per_1m_output_usd = 3.0
+
+[[model]]
+id = "Qwen/Qwen3.6-27B"
+provider_id = "deepinfra"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.32
+cost_per_1m_output_usd = 3.2
+
+[[model]]
+id = "openai/gpt-oss-120b-Ultra"
+provider_id = "deepinfra"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.2
+cost_per_1m_output_usd = 0.95
+
+[[model]]
+id = "google/gemma-4-31B-it"
+provider_id = "deepinfra"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.13
+cost_per_1m_output_usd = 0.38
+
+[[model]]
+id = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B"
+provider_id = "deepinfra"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.5
+cost_per_1m_output_usd = 2.2
+
+[[model]]
+id = "thinkingmachines/Inkling"
+provider_id = "deepinfra"
+context_tokens = 524288
+cost_per_1m_input_usd = 0.95
+cost_per_1m_output_usd = 4.05
+
+[[model]]
+id = "ByteDance/Seed-2.0-code"
+provider_id = "deepinfra"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.5
+cost_per_1m_output_usd = 3.0
+
+[[model]]
+id = "tencent/Hy3"
+provider_id = "deepinfra"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.14
+cost_per_1m_output_usd = 0.58
+
+[[model]]
+id = "openai/whisper-large-v3-turbo"
+provider_id = "deepinfra"
+name = "Whisper Large v3 Turbo (speech-to-text)"
+
+[[model]]
+id = "hexgrad/Kokoro-82M"
+provider_id = "deepinfra"
+name = "Kokoro 82M (text-to-speech)"
+
+# --- SambaNova (live-verified) ---
+[[model]]
+id = "DeepSeek-V3.1"
+provider_id = "sambanova"
+context_tokens = 131072
+cost_per_1m_input_usd = 3.0
+cost_per_1m_output_usd = 4.5
+
+[[model]]
+id = "DeepSeek-V3.2"
+provider_id = "sambanova"
+context_tokens = 32768
+cost_per_1m_input_usd = 3.0
+cost_per_1m_output_usd = 4.5
+
+[[model]]
+id = "Meta-Llama-3.3-70B-Instruct"
+provider_id = "sambanova"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.6
+cost_per_1m_output_usd = 1.2
+
+[[model]]
+id = "MiniMax-M2.7"
+provider_id = "sambanova"
+context_tokens = 196608
+cost_per_1m_input_usd = 0.6
+cost_per_1m_output_usd = 2.4
+
+[[model]]
+id = "gemma-4-31B-it"
+provider_id = "sambanova"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.38
+cost_per_1m_output_usd = 1.15
+
+[[model]]
+id = "gpt-oss-120b"
+provider_id = "sambanova"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.22
+cost_per_1m_output_usd = 0.59
+
+# --- Novita AI (live-verified) ---
+[[model]]
+id = "deepseek/deepseek-v4-pro"
+provider_id = "novita"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.6
+cost_per_1m_output_usd = 3.2
+
+[[model]]
+id = "deepseek/deepseek-v4-flash"
+provider_id = "novita"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.14
+cost_per_1m_output_usd = 0.28
+
+[[model]]
+id = "moonshotai/kimi-k3"
+provider_id = "novita"
+context_tokens = 1048576
+cost_per_1m_input_usd = 3.0
+cost_per_1m_output_usd = 15.0
+
+[[model]]
+id = "moonshotai/kimi-k2.7-code"
+provider_id = "novita"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.95
+cost_per_1m_output_usd = 4.0
+
+[[model]]
+id = "moonshotai/kimi-k2.6"
+provider_id = "novita"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.8
+cost_per_1m_output_usd = 3.4
+
+[[model]]
+id = "zai-org/glm-5.2"
+provider_id = "novita"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.4
+cost_per_1m_output_usd = 4.4
+
+[[model]]
+id = "qwen/qwen3.7-max"
+provider_id = "novita"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.25
+cost_per_1m_output_usd = 3.75
+
+[[model]]
+id = "qwen/qwen3.6-27b"
+provider_id = "novita"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.6
+cost_per_1m_output_usd = 3.6
+
+[[model]]
+id = "qwen/qwen3.5-397b-a17b"
+provider_id = "novita"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.6
+cost_per_1m_output_usd = 3.6
+
+[[model]]
+id = "minimax/minimax-m3"
+provider_id = "novita"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.3
+cost_per_1m_output_usd = 1.2
+
+[[model]]
+id = "minimax/minimax-m2.7"
+provider_id = "novita"
+context_tokens = 204800
+cost_per_1m_input_usd = 0.3
+cost_per_1m_output_usd = 1.2
+
+[[model]]
+id = "google/gemma-4-31b-it"
+provider_id = "novita"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.14
+cost_per_1m_output_usd = 0.4
+
+[[model]]
+id = "nvidia/nemotron-3-nano-30b-a3b"
+provider_id = "novita"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.05
+cost_per_1m_output_usd = 0.2
+
+# --- Venice AI (live-verified, native models) ---
+[[model]]
+id = "zai-org-glm-5-2"
+provider_id = "venice"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.4
+cost_per_1m_output_usd = 4.4
+
+[[model]]
+id = "qwen3-6-27b"
+provider_id = "venice"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.325
+cost_per_1m_output_usd = 3.25
+
+[[model]]
+id = "qwen3-5-397b-a17b"
+provider_id = "venice"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.75
+cost_per_1m_output_usd = 4.5
+
+[[model]]
+id = "venice-uncensored-1-2"
+provider_id = "venice"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.2
+cost_per_1m_output_usd = 0.9
+
+[[model]]
+id = "kimi-k3"
+provider_id = "venice"
+context_tokens = 1048576
+cost_per_1m_input_usd = 3.75
+cost_per_1m_output_usd = 18.75
+
+[[model]]
+id = "deepseek-v4-flash"
+provider_id = "venice"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.138
+cost_per_1m_output_usd = 0.275
+
+[[model]]
+id = "openai-gpt-oss-120b"
+provider_id = "venice"
+context_tokens = 131072
+cost_per_1m_input_usd = 0.07
+cost_per_1m_output_usd = 0.3
+
+# --- Chutes (confidential-compute TEE tier; non-TEE ids drop the suffix) ---
+[[model]]
+id = "zai-org/GLM-5.2-TEE"
+provider_id = "chutes"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.25
+cost_per_1m_output_usd = 3.95
+
+[[model]]
+id = "moonshotai/Kimi-K3-TEE"
+provider_id = "chutes"
+context_tokens = 1048576
+cost_per_1m_input_usd = 3.0
+cost_per_1m_output_usd = 15.0
+
+[[model]]
+id = "deepseek-ai/DeepSeek-V4-Flash-0731-TEE"
+provider_id = "chutes"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.14
+cost_per_1m_output_usd = 0.28
+
+[[model]]
+id = "Qwen/Qwen3.5-397B-A17B-TEE"
+provider_id = "chutes"
+context_tokens = 262144
+cost_per_1m_input_usd = 0.45
+cost_per_1m_output_usd = 3.0
+
+# --- Baseten Model APIs (official docs; prices via authed /models) ---
+[[model]]
+id = "deepseek-ai/DeepSeek-V4-Pro"
+provider_id = "baseten"
+context_tokens = 262144
+
+[[model]]
+id = "deepseek-ai/DeepSeek-V4-Flash-0731"
+provider_id = "baseten"
+context_tokens = 1048576
+
+[[model]]
+id = "zai-org/GLM-5.2"
+provider_id = "baseten"
+context_tokens = 1048576
+
+[[model]]
+id = "moonshotai/Kimi-K3"
+provider_id = "baseten"
+context_tokens = 1048576
+
+[[model]]
+id = "moonshotai/Kimi-K2.7-Code"
+provider_id = "baseten"
+context_tokens = 262144
+
+[[model]]
+id = "thinkingmachines/inkling"
+provider_id = "baseten"
+context_tokens = 1048576
+
+[[model]]
+id = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B"
+provider_id = "baseten"
+context_tokens = 202752
+
+[[model]]
+id = "openai/gpt-oss-120b"
+provider_id = "baseten"
+context_tokens = 131072
+
+# --- Inference.net (live-verified ids; router incl. frontier proxies) ---
+[[model]]
+id = "claude-opus-5"
+provider_id = "inference-net"
+
+[[model]]
+id = "gpt-5.6-sol"
+provider_id = "inference-net"
+
+[[model]]
+id = "gemini-3.6-flash"
+provider_id = "inference-net"
+
+[[model]]
+id = "grok-4.5"
+provider_id = "inference-net"
+
+[[model]]
+id = "deepseek-v4-pro"
+provider_id = "inference-net"
+
+[[model]]
+id = "glm-5.2"
+provider_id = "inference-net"
+
+[[model]]
+id = "kimi-k3"
+provider_id = "inference-net"
+
+# --- OpenRouter (live-verified flagship coding set; full catalog via /models) ---
+[[model]]
+id = "anthropic/claude-opus-5"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 5.0
+cost_per_1m_output_usd = 25.0
+
+[[model]]
+id = "anthropic/claude-sonnet-5"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 2.0
+cost_per_1m_output_usd = 10.0
+
+[[model]]
+id = "anthropic/claude-fable-5"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 10.0
+cost_per_1m_output_usd = 50.0
+
+[[model]]
+id = "openai/gpt-5.6-sol"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 5.0
+cost_per_1m_output_usd = 30.0
+
+[[model]]
+id = "openai/gpt-5.4"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 2.5
+cost_per_1m_output_usd = 15.0
+
+[[model]]
+id = "openai/gpt-5.3-codex"
+provider_id = "openrouter"
+context_tokens = 400000
+cost_per_1m_input_usd = 1.75
+cost_per_1m_output_usd = 14.0
+
+[[model]]
+id = "google/gemini-3.6-flash"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 1.5
+cost_per_1m_output_usd = 7.5
+
+[[model]]
+id = "google/gemini-3.1-pro-preview"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 2.0
+cost_per_1m_output_usd = 12.0
+
+[[model]]
+id = "x-ai/grok-4.5"
+provider_id = "openrouter"
+context_tokens = 500000
+cost_per_1m_input_usd = 2.0
+cost_per_1m_output_usd = 6.0
+
+[[model]]
+id = "x-ai/grok-build-0.1"
+provider_id = "openrouter"
+context_tokens = 262144
+cost_per_1m_input_usd = 1.0
+cost_per_1m_output_usd = 2.0
+
+[[model]]
+id = "deepseek/deepseek-v4-pro"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.63
+cost_per_1m_output_usd = 1.26
+
+[[model]]
+id = "deepseek/deepseek-v4-flash"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.14
+cost_per_1m_output_usd = 0.28
+
+[[model]]
+id = "moonshotai/kimi-k3"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 3.0
+cost_per_1m_output_usd = 15.0
+
+[[model]]
+id = "z-ai/glm-5.2"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.49
+cost_per_1m_output_usd = 1.54
+
+[[model]]
+id = "minimax/minimax-m3"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.3
+cost_per_1m_output_usd = 1.2
+
+[[model]]
+id = "qwen/qwen3.6-plus"
+provider_id = "openrouter"
+context_tokens = 1048576
+cost_per_1m_input_usd = 0.33
+cost_per_1m_output_usd = 1.95
+
+# --- OpenCode Zen (live-verified curated coding gateway; bare ids) ---
+[[model]]
+id = "claude-opus-5"
+provider_id = "opencode-zen"
+
+[[model]]
+id = "claude-sonnet-5"
+provider_id = "opencode-zen"
+
+[[model]]
+id = "gpt-5.6-sol"
+provider_id = "opencode-zen"
+
+[[model]]
+id = "gpt-5.3-codex"
+provider_id = "opencode-zen"
+
+[[model]]
+id = "gemini-3.6-flash"
+provider_id = "opencode-zen"
+
+[[model]]
+id = "grok-build-0.1"
+provider_id = "opencode-zen"
+
+[[model]]
+id = "deepseek-v4-pro"
+provider_id = "opencode-zen"
+
+[[model]]
+id = "deepseek-v4-flash-free"
+provider_id = "opencode-zen"
+name = "DeepSeek V4 Flash (free tier)"
+
+[[model]]
+id = "glm-5.2"
+provider_id = "opencode-zen"
+
+[[model]]
+id = "kimi-k3"
+provider_id = "opencode-zen"
+
+[[model]]
+id = "minimax-m3"
+provider_id = "opencode-zen"
+
+[[model]]
+id = "qwen3.6-plus"
+provider_id = "opencode-zen"
