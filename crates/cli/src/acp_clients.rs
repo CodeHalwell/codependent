@@ -382,10 +382,6 @@ fn connected_profiles(paths: &RuntimePaths) -> anyhow::Result<Vec<(String, Strin
         .collect())
 }
 
-fn upsert_profile(paths: &RuntimePaths, profile: &str, agent: &str) -> anyhow::Result<()> {
-    upsert_profiles(paths, &[(profile.to_string(), agent.to_string())])
-}
-
 /// Replace `profiles` (id → ACP coordinate) in `models.toml` in ONE
 /// load-modify-write, so connecting an agent that advertises many models does
 /// not rewrite the file once per model — and never leaves a half-written set
@@ -474,12 +470,18 @@ fn agent_status(
 mod tests {
     use super::*;
 
+    /// The single-profile shorthand the tests below drive `upsert_profiles`
+    /// with (`connect` always writes a whole set at once).
+    fn upsert_profile(paths: &RuntimePaths, profile: &str, agent: &str) -> anyhow::Result<()> {
+        upsert_profiles(paths, &[(profile.to_string(), agent.to_string())])
+    }
+
     #[test]
     fn profile_upsert_is_typed_and_preserves_other_models() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
         upsert_profile(&paths, "acp/codex", "codex-acp").expect("add profile");
-        upsert_profile(&paths, "acp/claude", "claude-acp").expect("add second");
+        upsert_profile(&paths, "acp/vibe", "mistral-vibe").expect("add second");
         upsert_profile(&paths, "acp/codex", "codex-acp").expect("replace profile");
         let configs = load_models(&paths.data_dir.join("models.toml")).expect("load");
         assert_eq!(configs.len(), 2);
@@ -487,9 +489,9 @@ mod tests {
         assert_eq!(
             configs
                 .iter()
-                .find(|config| config.id.0 == "acp/claude")
+                .find(|config| config.id.0 == "acp/vibe")
                 .map(|config| config.model.as_str()),
-            Some("claude-acp")
+            Some("mistral-vibe")
         );
     }
 

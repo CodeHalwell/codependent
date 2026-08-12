@@ -40,6 +40,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
+use agent_client_protocol::schema::v1::{
+    ContentBlock, ContentChunk, SessionUpdate, TextContent, ToolCall, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -246,6 +250,74 @@ fn parse_outcome(result: Option<&Value>) -> PermissionOutcome {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Spec-shaped payload builders
+// ---------------------------------------------------------------------------
+//
+// A backend hands [`PromptSink::update`] an opaque `Value`, and hand-rolled
+// `json!` shapes drifted from the wire: an update the schema cannot parse is
+// silently dropped by a spec-strict client (Zed parses with these very types),
+// so a whole turn can stream nothing visible. These builders serialize the
+// SDK's own `schema::v1` types instead — the single place the serve direction's
+// wire shapes are decided, mirroring `acp_client::session_update_to_events` on
+// the way in. They return `Value` so the CLI keeps no ACP dependency of its own.
+
+/// Serialize an SDK payload for the wire. Infallible in practice — these are
+/// plain data types — and a serialization failure degrades to a dropped update
+/// rather than killing the turn (protocol RULE 1).
+fn wire<T: Serialize>(payload: &T) -> Value {
+    serde_json::to_value(payload).unwrap_or(Value::Null)
+}
+
+/// A `session/update` carrying a chunk of the agent's reply
+/// (`agent_message_chunk`) — the shape a client renders as streamed output.
+#[must_use]
+pub fn agent_message_chunk(text: impl Into<String>) -> Value {
+    wire(&SessionUpdate::AgentMessageChunk(ContentChunk::new(
+        ContentBlock::Text(TextContent::new(text.into())),
+    )))
+}
+
+/// A `session/update` carrying host-side commentary as the agent's internal
+/// reasoning (`agent_thought_chunk`). Codypendent's run notes are not model
+/// output, so they must not arrive as `agent_message_chunk`.
+#[must_use]
+pub fn agent_thought_chunk(text: impl Into<String>) -> Value {
+    wire(&SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+        ContentBlock::Text(TextContent::new(text.into())),
+    )))
+}
+
+/// A `session/update` announcing a tool call that is already running.
+#[must_use]
+pub fn tool_call_started(tool_call_id: impl Into<String>, title: impl Into<String>) -> Value {
+    wire(&SessionUpdate::ToolCall(
+        ToolCall::new(tool_call_id.into(), title).status(ToolCallStatus::InProgress),
+    ))
+}
+
+/// A `session/update` announcing a tool call that has been proposed but not yet
+/// authorized.
+#[must_use]
+pub fn tool_call_pending(tool_call_id: impl Into<String>, title: impl Into<String>) -> Value {
+    wire(&SessionUpdate::ToolCall(
+        ToolCall::new(tool_call_id.into(), title).status(ToolCallStatus::Pending),
+    ))
+}
+
+/// The `toolCall` field of a `session/request_permission` request: a real
+/// [`ToolCallUpdate`], carrying the `toolCallId` a spec-strict client requires
+/// to correlate the request with the call it authorizes.
+#[must_use]
+pub fn permission_tool_call(tool_call_id: impl Into<String>, title: impl Into<String>) -> Value {
+    wire(&ToolCallUpdate::new(
+        tool_call_id.into(),
+        ToolCallUpdateFields::new()
+            .title(title.into())
+            .status(ToolCallStatus::Pending),
+    ))
+}
+
 /// The [`PromptSink`] the adapter hands to the backend for one prompt turn. It
 /// serializes outgoing traffic onto the shared writer channel and correlates
 /// permission responses back through the [`PendingPermissions`] map.
@@ -393,14 +465,22 @@ where
             // A request from the client.
             (Some(method), Some(id)) => match method.as_str() {
                 "initialize" => {
-                    let version = incoming
+                    // The response states the version this adapter will SPEAK,
+                    // not the one the client asked for. Echoing a requested v2+
+                    // verbatim claims a protocol this build does not implement,
+                    // and the client would then send messages it never gets an
+                    // answer to. Clamp to what is actually implemented; per the
+                    // spec the client disconnects if that is too old for it.
+                    let requested = incoming
                         .params
                         .as_ref()
                         .and_then(|p| p.get("protocolVersion"))
                         .and_then(Value::as_u64)
-                        .map_or(DEFAULT_PROTOCOL_VERSION, |v| v as u32);
+                        .map_or(DEFAULT_PROTOCOL_VERSION, |v| {
+                            u32::try_from(v).unwrap_or(u32::MAX)
+                        });
                     let result = json!({
-                        "protocolVersion": version,
+                        "protocolVersion": requested.min(DEFAULT_PROTOCOL_VERSION),
                         "agentCapabilities": { "promptCapabilities": { "image": false } },
                     });
                     let _ = out_tx.send(response_msg(id, result)).await;
@@ -643,7 +723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_echoes_protocol_version_and_capabilities() {
+    async fn initialize_clamps_the_protocol_version_to_what_is_implemented() {
         let (mut reader, mut writer) = start(Mode::Empty);
         write_msg(
             &mut writer,
@@ -654,11 +734,95 @@ mod tests {
 
         let resp = read_msg(&mut reader).await;
         assert_eq!(resp["id"], json!(1));
-        assert_eq!(resp["result"]["protocolVersion"], json!(3));
+        assert_eq!(
+            resp["result"]["protocolVersion"],
+            json!(DEFAULT_PROTOCOL_VERSION),
+            "claiming a version this adapter does not implement would strand the client"
+        );
         assert_eq!(
             resp["result"]["agentCapabilities"]["promptCapabilities"]["image"],
             json!(false)
         );
+    }
+
+    #[tokio::test]
+    async fn initialize_answers_a_client_that_asks_for_the_implemented_version() {
+        let (mut reader, mut writer) = start(Mode::Empty);
+        write_msg(
+            &mut writer,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": { "protocolVersion": 1 } }),
+        )
+        .await;
+        let resp = read_msg(&mut reader).await;
+        assert_eq!(resp["result"]["protocolVersion"], json!(1));
+    }
+
+    #[test]
+    fn update_builders_emit_the_schemas_own_wire_shapes() {
+        // These are the shapes a spec-strict client parses; an ad-hoc payload
+        // is silently dropped, so assert the discriminator and body directly.
+        let chunk = agent_message_chunk("hello");
+        assert_eq!(chunk["sessionUpdate"], json!("agent_message_chunk"));
+        assert_eq!(chunk["content"]["type"], json!("text"));
+        assert_eq!(chunk["content"]["text"], json!("hello"));
+
+        let thought = agent_thought_chunk("a note");
+        assert_eq!(thought["sessionUpdate"], json!("agent_thought_chunk"));
+        assert_eq!(thought["content"]["text"], json!("a note"));
+
+        let started = tool_call_started("tool-1", "run tests");
+        assert_eq!(started["sessionUpdate"], json!("tool_call"));
+        assert_eq!(started["toolCallId"], json!("tool-1"));
+        assert_eq!(started["title"], json!("run tests"));
+        assert_eq!(started["status"], json!("in_progress"));
+
+        let pending = tool_call_pending("tool-2", "write a file");
+        assert_eq!(pending["sessionUpdate"], json!("tool_call"));
+        // `pending` is the schema's default status, so it is omitted on the
+        // wire; its absence IS the pending state (asserted by round trip below).
+        assert!(pending
+            .get("status")
+            .is_none_or(|status| *status == json!("pending")));
+
+        // The permission request's `toolCall` is a real `ToolCallUpdate` — the
+        // `toolCallId` a client needs to correlate it with the call.
+        let permission = permission_tool_call("approval-7", "run tests");
+        assert_eq!(permission["toolCallId"], json!("approval-7"));
+        assert_eq!(permission["title"], json!("run tests"));
+        assert!(
+            permission.get("sessionUpdate").is_none(),
+            "a permission toolCall is not itself a session update"
+        );
+    }
+
+    #[test]
+    fn update_builders_round_trip_through_the_schema() {
+        // The real proof they are spec-shaped: the SDK's own types parse them.
+        use agent_client_protocol::schema::v1::{SessionUpdate, ToolCallUpdate};
+
+        let chunk: SessionUpdate =
+            serde_json::from_value(agent_message_chunk("hello")).expect("agent_message_chunk");
+        assert!(matches!(chunk, SessionUpdate::AgentMessageChunk(_)));
+        let thought: SessionUpdate =
+            serde_json::from_value(agent_thought_chunk("note")).expect("agent_thought_chunk");
+        assert!(matches!(thought, SessionUpdate::AgentThoughtChunk(_)));
+        let call: SessionUpdate =
+            serde_json::from_value(tool_call_started("tool-1", "t")).expect("tool_call");
+        let SessionUpdate::ToolCall(call) = call else {
+            panic!("expected a tool_call update");
+        };
+        assert_eq!(call.status, ToolCallStatus::InProgress);
+        let pending: SessionUpdate =
+            serde_json::from_value(tool_call_pending("tool-2", "t")).expect("tool_call");
+        let SessionUpdate::ToolCall(pending) = pending else {
+            panic!("expected a tool_call update");
+        };
+        assert_eq!(pending.status, ToolCallStatus::Pending);
+        let permission: ToolCallUpdate =
+            serde_json::from_value(permission_tool_call("approval-7", "t")).expect("toolCall");
+        assert_eq!(permission.tool_call_id.to_string(), "approval-7");
+        assert_eq!(permission.fields.status, Some(ToolCallStatus::Pending));
     }
 
     #[tokio::test]
