@@ -47,6 +47,9 @@ pub enum PaletteCommand {
     ApiKeys,
     /// Surface the persisted multi-provider council workflow.
     Council,
+    /// Browse the Unsloth GGUF catalog on Hugging Face and pull one via
+    /// `ollama` into a selectable local model.
+    UnslothCatalog,
     /// Flip between the chat and workspace layouts.
     ToggleLayout,
     /// Toggle the help overlay.
@@ -166,6 +169,16 @@ pub const COMMANDS: &[PaletteEntry] = &[
         title: "/council  Agent council",
         description: "list, run, and manage persisted multi-model councils; `n` inside creates one",
         key: "C",
+        group: "Models",
+    },
+    PaletteEntry {
+        command: PaletteCommand::UnslothCatalog,
+        title: "Local models: browse Unsloth catalog",
+        description:
+            "browse Unsloth GGUF repos on Hugging Face, pick a quant, and pull it via ollama",
+        // Palette-only: a rare, deliberate action gets no single-key slot,
+        // mirroring the other model-configuration entries in this group.
+        key: "—",
         group: "Models",
     },
     // --- Workspace: live studios, workflow controls, and inspectors. ---
@@ -358,6 +371,18 @@ mod tests {
     #[test]
     fn filters_to_the_agent_council_command() {
         assert_eq!(filtered("council")[0].command, PaletteCommand::Council);
+    }
+
+    #[test]
+    fn filters_to_the_unsloth_catalog_command() {
+        assert_eq!(
+            filtered("unsloth")[0].command,
+            PaletteCommand::UnslothCatalog
+        );
+        assert_eq!(
+            filtered("Local models")[0].command,
+            PaletteCommand::UnslothCatalog
+        );
     }
 
     #[test]

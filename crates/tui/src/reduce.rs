@@ -21,10 +21,11 @@ use crate::remote_ui::{RemoteKey, RemoteUiRenderOutput};
 use crate::remote_ui_host::{empty_message, terminal_viewport_message};
 use crate::state::{
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
-    filter_providers, key_row_target, AppState, CouncilBuilderState, CouncilBuilderStep,
-    CouncilMemberDraft, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView,
-    KeyStatus, ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView,
-    ToolCard, ToolStatus, TranscriptEntry, EDGE_PAGE_SIZE,
+    filter_providers, filter_unsloth_quants, filter_unsloth_repos, key_row_target, AppState,
+    CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft, DocBlockView, DocEdit, DocFocus,
+    DocLeaseState, DocSuggestionView, KeyStatus, ModelReadiness, Overlay, Pane, PatchSummary,
+    PendingApproval, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard,
+    UnslothRepoCard, EDGE_PAGE_SIZE,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -592,6 +593,26 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.key_status = models;
             state.tavily_key_status = tavily;
         }
+
+        // --- Local models: Unsloth catalog browse/pull ---
+        Action::UnslothReposLoaded(repos) => on_unsloth_repos_loaded(state, repos),
+        Action::UnslothReposFailed(reason) => on_unsloth_repos_failed(state, reason),
+        Action::UnslothQuantsLoaded { repo_id, quants } => {
+            on_unsloth_quants_loaded(state, repo_id, quants)
+        }
+        Action::UnslothQuantsFailed { repo_id, reason } => {
+            on_unsloth_quants_failed(state, repo_id, reason)
+        }
+        Action::UnslothPullProgress {
+            repo_id,
+            quant,
+            line,
+        } => on_unsloth_pull_progress(state, repo_id, quant, line),
+        Action::UnslothPullFinished {
+            repo_id,
+            quant,
+            result,
+        } => on_unsloth_pull_finished(state, repo_id, quant, result),
 
         Action::NoOp => {}
     }
@@ -1745,6 +1766,29 @@ fn nav(state: &mut AppState, delta: i32) {
             step(selected, indices.len(), delta);
             return;
         }
+        // The Unsloth repo/quant browsers: the same filterable-list shape as
+        // the add-model pick-list, over the overlay's own list field. Safe
+        // while `loading` (an empty list steps to 0 and stays there).
+        Overlay::UnslothRepos {
+            ref query,
+            ref mut selected,
+            ref repos,
+            ..
+        } => {
+            let indices = filter_unsloth_repos(repos, query);
+            step(selected, indices.len(), delta);
+            return;
+        }
+        Overlay::UnslothQuants {
+            ref query,
+            ref mut selected,
+            ref quants,
+            ..
+        } => {
+            let indices = filter_unsloth_quants(quants, query);
+            step(selected, indices.len(), delta);
+            return;
+        }
         _ => {}
     }
     // Base view: a pending approval owns the arrows (move between stacked
@@ -2003,6 +2047,29 @@ fn confirm_top(state: &mut AppState) {
             if let Overlay::ConfirmCouncilDelete { name } = std::mem::take(&mut state.overlay) {
                 state.outbox.push(Intent::DeleteCouncil { name });
                 state.overlay = Overlay::CouncilBrowser;
+            }
+        }
+        // Confirmed: drive the pull. The overlay moves to the live-progress
+        // step; a late `Action::UnslothPullProgress`/`PullFinished` for a
+        // repo/quant this operator backed out of before confirming can never
+        // arrive (nothing was ever sent), unlike a dismiss of the *next*
+        // step's overlay (see `Overlay::UnslothPulling`'s doc comment).
+        Overlay::UnslothConfirmPull { .. } => {
+            if let Overlay::UnslothConfirmPull { repo_id, quant, .. } =
+                std::mem::take(&mut state.overlay)
+            {
+                state.outbox.push(Intent::PullUnslothModel {
+                    repo_id: repo_id.clone(),
+                    quant: quant.clone(),
+                });
+                state.overlay = Overlay::UnslothPulling {
+                    repo_id,
+                    quant,
+                    lines: Vec::new(),
+                    done: false,
+                    error: None,
+                    registered_id: None,
+                };
             }
         }
         _ => {}
@@ -2305,6 +2372,20 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
             edit(query);
             *selected = 0;
         }
+        // Same shape as the add-model pick-list: the Unsloth repo/quant
+        // browsers filter on their own query, resetting to the top of the
+        // new filtered set. Reachable only once loaded (`InputMode::Palette`
+        // — see `AppState::input_mode`); while loading, printable keys never
+        // reach here.
+        Overlay::UnslothRepos {
+            query, selected, ..
+        }
+        | Overlay::UnslothQuants {
+            query, selected, ..
+        } => {
+            edit(query);
+            *selected = 0;
+        }
         // Editing the palette query changes the filtered set, so the selection
         // returns to the top rather than pointing past the new results.
         Overlay::Palette { query, selected } => {
@@ -2520,6 +2601,14 @@ fn set_overlay_selected(state: &mut AppState, n: usize) {
         }
         | Overlay::AddModelPick {
             ref mut selected, ..
+        }
+        // Same shape: no resolved `AppState` index to keep in sync, exactly
+        // like the mode picker / `/keys` below.
+        | Overlay::UnslothRepos {
+            ref mut selected, ..
+        }
+        | Overlay::UnslothQuants {
+            ref mut selected, ..
         } => {
             *selected = n;
         }
@@ -2616,7 +2705,9 @@ fn activate_row(state: &mut AppState, n: usize) {
         | Overlay::ModePicker { .. }
         | Overlay::ApiKeys { .. }
         | Overlay::AddModelPick { .. }
-        | Overlay::CouncilBuilder(_) => {
+        | Overlay::CouncilBuilder(_)
+        | Overlay::UnslothRepos { .. }
+        | Overlay::UnslothQuants { .. } => {
             set_overlay_selected(state, n);
             submit_prompt(state);
         }
@@ -3223,6 +3314,52 @@ fn submit_prompt(state: &mut AppState) {
                 }
             }
         }
+        // Step 1 → 2 of the Unsloth pull flow: resolve the filtered selection
+        // (same zero-match-closes convention as `AddModelPick`/`ModelPicker`
+        // above — an empty `repos` list during `loading` can never match, so
+        // a stray submit while still fetching simply closes) and begin
+        // fetching the chosen repo's quant variants.
+        Overlay::UnslothRepos {
+            repos,
+            query,
+            selected,
+            ..
+        } => {
+            if let Some(&idx) = filter_unsloth_repos(&repos, &query).get(selected) {
+                if let Some(card) = repos.get(idx) {
+                    let repo_id = card.id.clone();
+                    state.outbox.push(Intent::ListUnslothQuants {
+                        repo_id: repo_id.clone(),
+                    });
+                    state.overlay = Overlay::UnslothQuants {
+                        repo_id,
+                        quants: Vec::new(),
+                        query: String::new(),
+                        selected: 0,
+                        loading: true,
+                    };
+                }
+            }
+        }
+        // Step 2 → 3: resolve the filtered selection and open the pull
+        // confirm dialog.
+        Overlay::UnslothQuants {
+            repo_id,
+            quants,
+            query,
+            selected,
+            ..
+        } => {
+            if let Some(&idx) = filter_unsloth_quants(&quants, &query).get(selected) {
+                if let Some(card) = quants.get(idx) {
+                    state.overlay = Overlay::UnslothConfirmPull {
+                        repo_id,
+                        quant: card.quant.clone(),
+                        size_label: card.size_label.clone(),
+                    };
+                }
+            }
+        }
         // Nothing to submit; restore the (non-text) overlay we took.
         other => state.overlay = other,
     }
@@ -3425,6 +3562,135 @@ fn on_provider_models_failed(state: &mut AppState, provider_id: String, reason: 
     }
 }
 
+/// Open the "Local models: browse Unsloth catalog" overlay (palette entry)
+/// and kick off the repo listing. Always starts loading — a fresh browse
+/// never shows stale results from a prior session.
+fn open_unsloth_catalog(state: &mut AppState) {
+    state.overlay = Overlay::UnslothRepos {
+        repos: Vec::new(),
+        query: String::new(),
+        selected: 0,
+        loading: true,
+    };
+    state.outbox.push(Intent::ListUnslothRepos);
+}
+
+/// Fold the fetched Unsloth repo listing into the in-flight
+/// `Overlay::UnslothRepos { loading: true, .. }`. Ignored (race guard) if the
+/// operator closed the overlay before the fetch returned.
+fn on_unsloth_repos_loaded(state: &mut AppState, repos: Vec<UnslothRepoCard>) {
+    if !matches!(state.overlay, Overlay::UnslothRepos { loading: true, .. }) {
+        return;
+    }
+    state.overlay = Overlay::UnslothRepos {
+        repos,
+        query: String::new(),
+        selected: 0,
+        loading: false,
+    };
+}
+
+/// The repo listing failed: close the overlay (this flow has no free-text
+/// fallback to offer, unlike model-discovery) and surface a notice. Ignored
+/// if the overlay no longer matches.
+fn on_unsloth_repos_failed(state: &mut AppState, reason: String) {
+    if !matches!(state.overlay, Overlay::UnslothRepos { loading: true, .. }) {
+        return;
+    }
+    state.overlay = Overlay::None;
+    state.notice = Some((
+        format!("could not browse the Unsloth catalog: {reason}"),
+        state.tick + 40,
+    ));
+}
+
+/// Fold the fetched quant-variant listing into the in-flight
+/// `Overlay::UnslothQuants { loading: true, .. }`, guarded by `repo_id` so a
+/// stale reply for a repo the operator already navigated away from is
+/// dropped (mirrors [`on_provider_models_loaded`]'s `provider_id` guard).
+fn on_unsloth_quants_loaded(state: &mut AppState, repo_id: String, quants: Vec<UnslothQuantCard>) {
+    let matched = matches!(
+        &state.overlay,
+        Overlay::UnslothQuants { repo_id: current, loading: true, .. } if *current == repo_id
+    );
+    if !matched {
+        return;
+    }
+    state.overlay = Overlay::UnslothQuants {
+        repo_id,
+        quants,
+        query: String::new(),
+        selected: 0,
+        loading: false,
+    };
+}
+
+/// The quant listing failed: close the overlay and surface a notice, guarded
+/// by `repo_id` exactly like [`on_unsloth_quants_loaded`].
+fn on_unsloth_quants_failed(state: &mut AppState, repo_id: String, reason: String) {
+    let matched = matches!(
+        &state.overlay,
+        Overlay::UnslothQuants { repo_id: current, loading: true, .. } if *current == repo_id
+    );
+    if !matched {
+        return;
+    }
+    state.overlay = Overlay::None;
+    state.notice = Some((
+        format!("could not list quants for {repo_id}: {reason}"),
+        state.tick + 40,
+    ));
+}
+
+/// Append one parsed `ollama pull` progress line to the in-flight
+/// `Overlay::UnslothPulling`, guarded by `repo_id`+`quant` so a line from a
+/// pull the operator already dismissed (it keeps running detached — see the
+/// overlay's doc comment) is dropped rather than corrupting an unrelated
+/// view. A no-op once `done` (the terminal signal already arrived).
+fn on_unsloth_pull_progress(state: &mut AppState, repo_id: String, quant: String, line: String) {
+    if let Overlay::UnslothPulling {
+        repo_id: current_repo,
+        quant: current_quant,
+        lines,
+        done,
+        ..
+    } = &mut state.overlay
+    {
+        if !*done && *current_repo == repo_id && *current_quant == quant {
+            lines.push(line);
+        }
+    }
+}
+
+/// Fold the terminal pull outcome into the in-flight `Overlay::UnslothPulling`,
+/// guarded exactly like [`on_unsloth_pull_progress`]. Sets exactly one of
+/// `error`/`registered_id` and flips `done` — the render layer reads those to
+/// show either the registered-model notice or the failure.
+fn on_unsloth_pull_finished(
+    state: &mut AppState,
+    repo_id: String,
+    quant: String,
+    result: Result<String, String>,
+) {
+    if let Overlay::UnslothPulling {
+        repo_id: current_repo,
+        quant: current_quant,
+        done,
+        error,
+        registered_id,
+        ..
+    } = &mut state.overlay
+    {
+        if *current_repo == repo_id && *current_quant == quant {
+            *done = true;
+            match result {
+                Ok(id) => *registered_id = Some(id),
+                Err(reason) => *error = Some(reason),
+            }
+        }
+    }
+}
+
 /// Run a command chosen from the palette. Each maps onto the same effect its
 /// single-key binding produces — the palette is a front door to the existing
 /// commands, not a second code path. The palette overlay is already closed when
@@ -3504,6 +3770,7 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         PaletteCommand::Council => {
             state.overlay = Overlay::CouncilBrowser;
         }
+        PaletteCommand::UnslothCatalog => open_unsloth_catalog(state),
         PaletteCommand::ToggleLayout => {
             state.layout = state.layout.toggled();
             if matches!(state.layout, crate::state::LayoutMode::Workspace) {
@@ -8711,5 +8978,464 @@ mod tests {
             0,
             "already-cached entry re-parsed"
         );
+    }
+
+    // --- Local models: browse the Unsloth GGUF catalog ---
+
+    fn unsloth_repo(id: &str) -> UnslothRepoCard {
+        UnslothRepoCard {
+            id: id.to_owned(),
+            downloads_label: "6.6M downloads".to_owned(),
+            likes_label: "891 likes".to_owned(),
+            updated_label: "updated 2026-01-30".to_owned(),
+        }
+    }
+
+    fn unsloth_quant(quant: &str) -> UnslothQuantCard {
+        UnslothQuantCard {
+            quant: quant.to_owned(),
+            size_label: "18.7 GB".to_owned(),
+            file_count: 1,
+            size_bytes: 18_700_000_000,
+        }
+    }
+
+    #[test]
+    fn palette_opens_the_unsloth_catalog_loading_and_requests_the_repo_listing() {
+        let mut s = AppState::new();
+        run_palette_command(&mut s, crate::palette::PaletteCommand::UnslothCatalog);
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothRepos {
+                repos: Vec::new(),
+                query: String::new(),
+                selected: 0,
+                loading: true,
+            }
+        );
+        assert_eq!(s.drain_outbox(), vec![Intent::ListUnslothRepos]);
+    }
+
+    #[test]
+    fn unsloth_repos_loaded_fills_the_loading_overlay() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothRepos {
+            repos: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+        };
+        let repos = vec![unsloth_repo("unsloth/Qwen3-32B-GGUF")];
+        reduce(&mut s, Action::UnslothReposLoaded(repos.clone()));
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothRepos {
+                repos,
+                query: String::new(),
+                selected: 0,
+                loading: false,
+            }
+        );
+    }
+
+    #[test]
+    fn unsloth_repos_loaded_after_the_overlay_closed_is_ignored() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::None;
+        reduce(
+            &mut s,
+            Action::UnslothReposLoaded(vec![unsloth_repo("unsloth/Qwen3-32B-GGUF")]),
+        );
+        assert_eq!(s.overlay, Overlay::None, "a late reply must not reopen it");
+    }
+
+    #[test]
+    fn unsloth_repos_failed_closes_with_a_notice() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothRepos {
+            repos: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+        };
+        reduce(
+            &mut s,
+            Action::UnslothReposFailed("network error".to_owned()),
+        );
+        assert_eq!(s.overlay, Overlay::None);
+        assert!(s.notice.is_some());
+        assert!(s.notice.unwrap().0.contains("network error"));
+    }
+
+    #[test]
+    fn entering_a_repo_row_begins_fetching_its_quants() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothRepos {
+            repos: vec![unsloth_repo("unsloth/Qwen3-32B-GGUF")],
+            query: String::new(),
+            selected: 0,
+            loading: false,
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothQuants {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quants: Vec::new(),
+                query: String::new(),
+                selected: 0,
+                loading: true,
+            }
+        );
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::ListUnslothQuants {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn entering_a_repo_row_with_a_filtered_query_resolves_the_visible_selection() {
+        // Regression guard for the zero-match convention: `selected` indexes
+        // the FILTERED list, not the full one.
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothRepos {
+            repos: vec![
+                unsloth_repo("unsloth/Qwen3-32B-GGUF"),
+                unsloth_repo("unsloth/gpt-oss-20b-GGUF"),
+            ],
+            query: "gpt-oss".to_owned(),
+            selected: 0,
+            loading: false,
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::ListUnslothQuants {
+                repo_id: "unsloth/gpt-oss-20b-GGUF".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unsloth_quants_loaded_fills_the_matching_repo() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothQuants {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quants: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+        };
+        let quants = vec![unsloth_quant("Q4_K_M"), unsloth_quant("UD-Q4_K_XL")];
+        reduce(
+            &mut s,
+            Action::UnslothQuantsLoaded {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quants: quants.clone(),
+            },
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothQuants {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quants,
+                query: String::new(),
+                selected: 0,
+                loading: false,
+            }
+        );
+    }
+
+    #[test]
+    fn unsloth_quants_loaded_for_a_stale_repo_is_ignored() {
+        // The operator navigated back and picked a DIFFERENT repo before this
+        // reply for the first one landed.
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothQuants {
+            repo_id: "unsloth/gpt-oss-20b-GGUF".to_owned(),
+            quants: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+        };
+        reduce(
+            &mut s,
+            Action::UnslothQuantsLoaded {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quants: vec![unsloth_quant("Q4_K_M")],
+            },
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothQuants {
+                repo_id: "unsloth/gpt-oss-20b-GGUF".to_owned(),
+                quants: Vec::new(),
+                query: String::new(),
+                selected: 0,
+                loading: true,
+            },
+            "a stale reply for a different repo must not overwrite the current browse"
+        );
+    }
+
+    #[test]
+    fn unsloth_quants_failed_closes_with_a_notice_naming_the_repo() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothQuants {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quants: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+        };
+        reduce(
+            &mut s,
+            Action::UnslothQuantsFailed {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                reason: "404".to_owned(),
+            },
+        );
+        assert_eq!(s.overlay, Overlay::None);
+        let notice = s.notice.expect("a notice is set");
+        assert!(notice.0.contains("unsloth/Qwen3-32B-GGUF"));
+        assert!(notice.0.contains("404"));
+    }
+
+    #[test]
+    fn entering_a_quant_row_opens_the_pull_confirm() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothQuants {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quants: vec![unsloth_quant("UD-Q4_K_XL")],
+            query: String::new(),
+            selected: 0,
+            loading: false,
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothConfirmPull {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                size_label: "18.7 GB".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn confirming_the_pull_starts_it_and_emits_the_pull_intent() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothConfirmPull {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            size_label: "18.7 GB".to_owned(),
+        };
+        reduce(&mut s, Action::ConfirmCancel);
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothPulling {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                lines: Vec::new(),
+                done: false,
+                error: None,
+                registered_id: None,
+            }
+        );
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::PullUnslothModel {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn declining_the_pull_confirm_closes_without_emitting_anything() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothConfirmPull {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            size_label: "18.7 GB".to_owned(),
+        };
+        reduce(&mut s, Action::Dismiss);
+        assert_eq!(s.overlay, Overlay::None);
+        assert!(s.drain_outbox().is_empty());
+    }
+
+    #[test]
+    fn pull_progress_lines_append_only_for_the_matching_repo_and_quant() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothPulling {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            lines: Vec::new(),
+            done: false,
+            error: None,
+            registered_id: None,
+        };
+        reduce(
+            &mut s,
+            Action::UnslothPullProgress {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                line: "pulling manifest".to_owned(),
+            },
+        );
+        // A line for a DIFFERENT quant of a pull the operator already moved
+        // past must not land in this view.
+        reduce(
+            &mut s,
+            Action::UnslothPullProgress {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "Q4_K_M".to_owned(),
+                line: "should not appear".to_owned(),
+            },
+        );
+        match &s.overlay {
+            Overlay::UnslothPulling { lines, .. } => {
+                assert_eq!(lines, &vec!["pulling manifest".to_owned()]);
+            }
+            other => panic!("expected UnslothPulling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pull_finished_success_sets_done_and_the_registered_id() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothPulling {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            lines: vec!["pulling manifest".to_owned()],
+            done: false,
+            error: None,
+            registered_id: None,
+        };
+        reduce(
+            &mut s,
+            Action::UnslothPullFinished {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                result: Ok("hf.co/unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL".to_owned()),
+            },
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothPulling {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                lines: vec!["pulling manifest".to_owned()],
+                done: true,
+                error: None,
+                registered_id: Some("hf.co/unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn pull_finished_failure_sets_done_and_the_error() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothPulling {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            lines: Vec::new(),
+            done: false,
+            error: None,
+            registered_id: None,
+        };
+        reduce(
+            &mut s,
+            Action::UnslothPullFinished {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                result: Err("ollama not found".to_owned()),
+            },
+        );
+        match &s.overlay {
+            Overlay::UnslothPulling {
+                done,
+                error,
+                registered_id,
+                ..
+            } => {
+                assert!(*done);
+                assert_eq!(error.as_deref(), Some("ollama not found"));
+                assert_eq!(*registered_id, None);
+            }
+            other => panic!("expected UnslothPulling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pull_finished_for_a_dismissed_overlay_is_dropped() {
+        // Mirrors `AddModelQuerying`'s documented "a late result is ignored"
+        // behavior: the operator closed the progress view, the detached pull
+        // keeps running, and its terminal result has nowhere to land.
+        let mut s = AppState::new();
+        s.overlay = Overlay::None;
+        reduce(
+            &mut s,
+            Action::UnslothPullFinished {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                result: Ok("hf.co/unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL".to_owned()),
+            },
+        );
+        assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn esc_closes_every_step_of_the_unsloth_flow() {
+        let overlays = vec![
+            Overlay::UnslothRepos {
+                repos: vec![unsloth_repo("unsloth/Qwen3-32B-GGUF")],
+                query: String::new(),
+                selected: 0,
+                loading: false,
+            },
+            Overlay::UnslothQuants {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quants: vec![unsloth_quant("Q4_K_M")],
+                query: String::new(),
+                selected: 0,
+                loading: false,
+            },
+            Overlay::UnslothConfirmPull {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "Q4_K_M".to_owned(),
+                size_label: "18.7 GB".to_owned(),
+            },
+            Overlay::UnslothPulling {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "Q4_K_M".to_owned(),
+                lines: Vec::new(),
+                done: false,
+                error: None,
+                registered_id: None,
+            },
+        ];
+        for overlay in overlays {
+            let mut s = AppState::new();
+            s.overlay = overlay.clone();
+            reduce(&mut s, Action::Dismiss);
+            assert_eq!(s.overlay, Overlay::None, "Esc must close {overlay:?}");
+        }
+    }
+
+    #[test]
+    fn unsloth_repo_and_quant_filter_functions_match_case_insensitive_substrings() {
+        let repos = vec![
+            unsloth_repo("unsloth/Qwen3-32B-GGUF"),
+            unsloth_repo("unsloth/gpt-oss-20b-GGUF"),
+        ];
+        assert_eq!(filter_unsloth_repos(&repos, ""), vec![0, 1]);
+        assert_eq!(filter_unsloth_repos(&repos, "GPT-OSS"), vec![1]);
+        assert!(filter_unsloth_repos(&repos, "zzz").is_empty());
+
+        let quants = vec![unsloth_quant("Q4_K_M"), unsloth_quant("UD-Q4_K_XL")];
+        assert_eq!(filter_unsloth_quants(&quants, "ud-"), vec![1]);
     }
 }

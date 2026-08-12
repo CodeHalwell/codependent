@@ -13,6 +13,8 @@ pub mod connection;
 pub mod council;
 pub mod doctor;
 pub mod eval;
+pub mod finetune;
+pub mod models_pull;
 pub mod restart;
 pub mod stream;
 pub mod theme_select;

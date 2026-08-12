@@ -350,6 +350,62 @@ pub enum Overlay {
     /// [`Intent::RemoveApiKey`]; `n`/`Esc` dismisses. Opened by `Delete` on a row
     /// whose status is [`KeyStatus::Stored`].
     ApiKeyRemoveConfirm { target: KeyTarget },
+
+    /// Local models: browse the Unsloth GGUF catalog, step 1 of 4 — a
+    /// fuzzy-filterable list of repos fetched from the Hugging Face Hub,
+    /// opened from the command palette's "Local models: browse Unsloth
+    /// catalog" entry. `loading` is `true` from the moment the palette
+    /// command fires (`repos` empty, non-interactive — see
+    /// [`AppState::input_mode`]) until the harness's
+    /// [`crate::action::Intent::ListUnslothRepos`] round trip lands; `query`/
+    /// `selected` are the same filterable-list shape as
+    /// [`Overlay::ProviderPicker`]. `Enter` on a row begins step 2
+    /// ([`Overlay::UnslothQuants`]).
+    UnslothRepos {
+        repos: Vec<UnslothRepoCard>,
+        query: String,
+        selected: usize,
+        loading: bool,
+    },
+    /// Step 2: the quant variants (with sizes) for the repo chosen in
+    /// [`Overlay::UnslothRepos`], fetched from the Hub's file tree. Same
+    /// loading/filterable shape as step 1. `Enter` on a row begins step 3
+    /// ([`Overlay::UnslothConfirmPull`]).
+    UnslothQuants {
+        repo_id: String,
+        quants: Vec<UnslothQuantCard>,
+        query: String,
+        selected: usize,
+        loading: bool,
+    },
+    /// Step 3: confirm the pull before it drives `ollama pull` (a real
+    /// multi-gigabyte download) — the same y/n confirm shape as
+    /// [`Overlay::ConfirmWorkflowCancel`]. `y`/`Enter` begins step 4
+    /// ([`Overlay::UnslothPulling`]); `n`/`Esc` backs out to
+    /// [`Overlay::None`] (mirrors every other confirm overlay here — none of
+    /// them return to the picker they were opened from).
+    UnslothConfirmPull {
+        repo_id: String,
+        quant: String,
+        size_label: String,
+    },
+    /// Step 4: live `ollama pull` progress, then the registered-model notice
+    /// once it completes. `lines` is the tail of parsed progress output
+    /// (oldest first); `done` flips once the harness's pull task finishes
+    /// (success or failure), at which point exactly one of `error` /
+    /// `registered_id` is `Some`. Non-interactive except `Esc` (dismiss —
+    /// the pull itself is NOT cancelled: it keeps running detached, and a
+    /// late [`crate::action::Action::UnslothPullFinished`] is dropped by the
+    /// same repo_id/quant match guard [`Overlay::AddModelQuerying`]'s docs
+    /// describe for its own late-result case).
+    UnslothPulling {
+        repo_id: String,
+        quant: String,
+        lines: Vec<String>,
+        done: bool,
+        error: Option<String>,
+        registered_id: Option<String>,
+    },
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -1109,6 +1165,70 @@ pub(crate) fn filter_providers(providers: &[ProviderCard], query: &str) -> Vec<u
         .collect()
 }
 
+/// One Unsloth GGUF repo row for the "Local models: browse Unsloth catalog"
+/// overlay ([`Overlay::UnslothRepos`]). Every field is pre-rendered by the
+/// CLI harness from the Hugging Face Hub discovery client
+/// (`codypendent_integrations::unsloth`) — the tui crate performs no
+/// formatting, mirroring [`ModelCard`]/[`ProviderCard`]'s convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnslothRepoCard {
+    /// The full repo id, e.g. `unsloth/Qwen3-32B-GGUF`.
+    pub id: String,
+    /// Pre-rendered download count, e.g. `"6.6M downloads"`.
+    pub downloads_label: String,
+    /// Pre-rendered like count, e.g. `"891 likes"`.
+    pub likes_label: String,
+    /// Pre-rendered last-updated date, or `"updated unknown"` when the Hub
+    /// reported none — never a fabricated date.
+    pub updated_label: String,
+}
+
+/// The indices into `repos` whose id case-insensitively contains `query` —
+/// the Unsloth repo browser's substring filter, in list order. Mirrors
+/// [`filter_providers`]. An empty query matches every repo.
+#[must_use]
+pub(crate) fn filter_unsloth_repos(repos: &[UnslothRepoCard], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    repos
+        .iter()
+        .enumerate()
+        .filter(|(_, card)| needle.is_empty() || card.id.to_lowercase().contains(&needle))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// One quant-variant row for a chosen Unsloth repo
+/// ([`Overlay::UnslothQuants`]). Pre-rendered by the CLI harness from
+/// `codypendent_integrations::unsloth::QuantVariant`; `size_bytes` rides
+/// alongside the label so a later step (the confirm dialog) can reuse it
+/// without re-parsing the display string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnslothQuantCard {
+    /// The quant tag, e.g. `UD-Q4_K_XL` — passed verbatim to `ollama pull
+    /// hf.co/<repo>:<quant>` and then used as the registered model id.
+    pub quant: String,
+    /// Pre-rendered download size, e.g. `"18.7 GB"`.
+    pub size_label: String,
+    /// How many split files make up this quant (`1` for the common case).
+    pub file_count: usize,
+    /// The raw combined size, carried through for the confirm step.
+    pub size_bytes: u64,
+}
+
+/// The indices into `quants` whose quant tag case-insensitively contains
+/// `query`. Mirrors [`filter_unsloth_repos`]. An empty query matches every
+/// quant.
+#[must_use]
+pub(crate) fn filter_unsloth_quants(quants: &[UnslothQuantCard], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    quants
+        .iter()
+        .enumerate()
+        .filter(|(_, card)| needle.is_empty() || card.quant.to_lowercase().contains(&needle))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 /// One row of the `/mode` picker (PR C2 — plan mode): a submission mode the
 /// operator can pick for the next run. The table is static — the mode set is a
 /// protocol enum, not configured data — so "current" is not a field here
@@ -1468,6 +1588,24 @@ impl AppState {
                 | CouncilBuilderStep::Review => InputMode::Palette,
             };
         }
+        // The Unsloth repo/quant browsers share one overlay each across their
+        // loading and loaded sub-states (mirrors the CouncilBuilder
+        // resolution above): non-interactive while fetching, filterable once
+        // loaded.
+        if let Overlay::UnslothRepos { loading, .. } = &self.overlay {
+            return if *loading {
+                InputMode::Normal
+            } else {
+                InputMode::Palette
+            };
+        }
+        if let Overlay::UnslothQuants { loading, .. } = &self.overlay {
+            return if *loading {
+                InputMode::Normal
+            } else {
+                InputMode::Palette
+            };
+        }
         match self.overlay {
             Overlay::NewRun(_)
             | Overlay::Steering(_)
@@ -1486,7 +1624,8 @@ impl AppState {
             | Overlay::ConfirmUiPluginApprove { .. }
             | Overlay::ConfirmUiPluginReject { .. }
             | Overlay::ConfirmUiPluginRevoke { .. }
-            | Overlay::ConfirmCouncilDelete { .. } => InputMode::Confirm,
+            | Overlay::ConfirmCouncilDelete { .. }
+            | Overlay::UnslothConfirmPull { .. } => InputMode::Confirm,
             // The palette, the model picker, the provider picker, the mode
             // picker, the `/keys` overlay, and the add-model pick-list all
             // filter on printable keys while staying arrow-navigable, so they
@@ -1511,9 +1650,13 @@ impl AppState {
             | Overlay::Blackboard
             | Overlay::UiPlugins
             | Overlay::CouncilBrowser
-            | Overlay::AddModelQuerying { .. } => InputMode::Normal,
+            | Overlay::AddModelQuerying { .. }
+            | Overlay::UnslothPulling { .. } => InputMode::Normal,
             Overlay::CouncilBuilder(_) => {
                 unreachable!("council builder input mode is resolved above")
+            }
+            Overlay::UnslothRepos { .. } | Overlay::UnslothQuants { .. } => {
+                unreachable!("unsloth repo/quant browser input mode is resolved above")
             }
             // The base conversation view: an unresolved approval owns the screen
             // (decision keys only); otherwise the composer captures typed text.

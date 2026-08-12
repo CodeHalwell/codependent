@@ -264,6 +264,82 @@ codypendent promote approve <CANDIDATE_ID> # Requires human operator approval
 codypendent promote rollback <CANDIDATE_ID> # Roll back to predecessor version
 ```
 
+### 4.5.1 Local models via Unsloth
+
+Codypendent can browse the [Unsloth](https://huggingface.co/unsloth) org's
+GGUF catalog on Hugging Face, pull a quant through
+[Ollama](https://ollama.com), and register it as a selectable local model —
+and, separately, scaffold a QLoRA fine-tuning project for the same family of
+base models. **Honesty first:** Codypendent itself needs neither a GPU nor
+Ollama to run; both of the flows below shell out to binaries you install
+yourself (`ollama` for pulling, a CUDA-capable Python environment for
+fine-tuning), and every command degrades to an actionable error — never a
+silent failure or a fabricated result — when they're missing.
+
+```bash
+# Resolve unsloth/Qwen3-32B-GGUF, auto-pick a quant (Q4_K_M if present, or
+# the repo's only quant; otherwise it lists the choices instead of guessing),
+# drive `ollama pull` with streamed progress, and register the result
+codypendent models pull Qwen3-32B-GGUF
+
+# Pin an exact quant, or pull from outside the unsloth org
+codypendent models pull Qwen3-32B-GGUF:UD-Q4_K_XL
+codypendent models pull some-org/Some-Model-GGUF:Q8_0
+```
+
+`models pull` registers the pulled model in `models.toml` against the
+`ollama` provider using the **exact reference Ollama itself uses**
+(`hf.co/<org>/<repo>:<quant>` — what `ollama list` shows, and what the
+OpenAI-compatible `model` field must match at call time), carrying
+`context_tokens` from the repo's Hugging Face metadata when the Hub reports
+one. It prints a `codypendent models bench <id>` suggestion afterward so the
+router gets a measured profile, exactly like any other freshly-added local
+model. Requires `ollama` on `PATH`; a missing binary fails with an
+`install it from https://ollama.com` message rather than a bare error.
+
+The TUI offers the same catalog browse through the command palette. Press
+`/`, select **Local models: browse Unsloth catalog**, and step through:
+
+1. **Repos** — a fuzzy-filterable list of the org's GGUF repos (downloads,
+   likes, last updated), fetched live from the Hub.
+2. **Quants** — for the chosen repo, every quant variant parsed from its file
+   tree (including Unsloth's dynamic `UD-` quants and multi-part split
+   files), each with its combined download size.
+3. **Confirm** — a yes/no prompt naming the exact `ollama pull` reference and
+   its download size before anything downloads.
+4. **Progress** — live `ollama pull` output, then a registered-model notice
+   (or the failure, verbatim) once it finishes. Closing this view with `Esc`
+   does not cancel the pull — it keeps running detached, the same way a
+   dismissed model-discovery query does.
+
+```bash
+# Scaffold a standalone Unsloth QLoRA fine-tuning project (pinned
+# requirements, a train.py for the base model, a JSONL dataset stub, and a
+# README covering GPU requirements, training, GGUF export, and `ollama
+# create`). Refuses if the target directory already exists.
+codypendent finetune init
+codypendent finetune init --model unsloth/Qwen3-8B-unsloth-bnb-4bit --out my-finetune
+
+# Verify Python and CUDA are present on THIS machine before training there.
+# A missing GPU only warns (the scaffold is still useful without one); a
+# missing Python interpreter fails.
+codypendent finetune check
+
+# Seed dataset/train.jsonl from the repo's own session/eval history, where a
+# clean seam exists to do so. Today it prints exactly why that seam doesn't
+# exist yet (a daemon-side transcript-reconstruction API the CLI can't reach
+# read-only) instead of silently producing nothing.
+codypendent finetune dataset export
+```
+
+The scaffolded project is entirely separate from Codypendent's own build:
+`train.py` is a normal Unsloth QLoRA script you run yourself, on a machine
+with an NVIDIA GPU. Once you've exported a GGUF and run `ollama create` on
+it (both covered in the scaffold's own `README.md`), add the result to
+Codypendent the same way as any other local Ollama model — via the
+`/model`/`/provider` picker, or a hand-written `[[model]]` entry in
+`models.toml` — then `codypendent models bench <id>` to measure it.
+
 ### 4.6 IDE Integration, ACP Agents & Handoff (`codypendent open` / `acp`)
 
 ```bash

@@ -60,6 +60,9 @@ serde_json = { workspace = true }
 # depend on it directly yet; the same crate the GitHub client uses.
 reqwest = { workspace = true }
 anyhow = { workspace = true }
+# Typed errors for `codypendent models pull` (`models_pull::PullError`),
+# mirroring the rest of the workspace's error style.
+thiserror = { workspace = true }
 # Resolves the platform config dir for the trusted-publisher key store
 # (`<config_dir>/codypendent/trusted_publishers.toml`), the `models.toml` precedent.
 directories = { workspace = true }
