@@ -62,8 +62,8 @@ pub use state::{
     DocFocus, DocLeaseState, DocSuggestionView, EDGE_PAGE_SIZE, GraphEdgeCard, InputMode,
     KanbanCard, KeyStatus, LayoutMode, MemoryCard, ModelCard, ModelListOrigin,
     ModelLocationLabel, ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval,
-    ProviderCard, RunView, SkillCard, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
-    UnslothQuantCard, UnslothRepoCard, WorkflowNodeCard,
+    ProviderCard, RunView, SkillCard, StatusProjection, ThemeChoice, ToolCard, ToolStatus,
+    TranscriptEntry, UnslothQuantCard, UnslothRepoCard, WorkflowNodeCard,
 };
 pub use terminal::TerminalGuard;
 pub use theme::{ColorDepth, Theme, ThemePreferences, ThemeVariant};

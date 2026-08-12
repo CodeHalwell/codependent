@@ -7,6 +7,7 @@
 //! transcript/run/approval state is the core, and it is what the unit tests
 //! below exercise.
 
+use chrono::Utc;
 use codypendent_protocol::{
     Actor, ApprovalDecision, ApprovalScope, BudgetDimension, DocumentId, DocumentMutation,
     EventBody, ProposedAction, RunDisposition, RunState, SessionEvent, ToolOutcome,
@@ -15,6 +16,8 @@ use codypendent_protocol::{
 };
 use codypendent_ui_host::UiSessionUpdate;
 use serde_json::{Map, Value};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, WorkflowNodeUpdate};
 use crate::remote_ui::{RemoteKey, RemoteUiRenderOutput};
@@ -23,10 +26,10 @@ use crate::state::{
     AddModelRow, AppState, CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft,
     DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView, EDGE_PAGE_SIZE,
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models,
-    filter_modes, filter_providers, filter_unsloth_quants, filter_unsloth_repos, key_row_target,
-    KeyStatus, ModelListOrigin, ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval,
-    RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard,
-    UnslothRepoCard,
+    filter_modes, filter_providers, filter_themes, filter_unsloth_quants, filter_unsloth_repos,
+    key_row_target, KeyStatus, ModelListOrigin, ModelReadiness, Overlay, Pane, PatchSummary,
+    PendingApproval, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    UnslothQuantCard, UnslothRepoCard,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -210,6 +213,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
                         text,
                         expanded: false,
                     },
+                    Utc::now(),
                 );
             } else {
                 state.notice = Some((text, state.tick + 40));
@@ -238,6 +242,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
                             text,
                             expanded: false,
                         },
+                        Utc::now(),
                     );
                 }
                 state.notice = Some((format!("council `{name}` finished"), state.tick + 60));
@@ -250,6 +255,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
                             text: format!("council `{name}` failed: {error}"),
                             expanded: false,
                         },
+                        Utc::now(),
                     );
                 }
                 state.notice = Some((format!("council `{name}` failed: {error}"), state.tick + 90));
@@ -330,7 +336,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::SelectNext => nav(state, 1),
         Action::ScrollPageUp => scroll_page(state, true),
         Action::ScrollPageDown => scroll_page(state, false),
+        Action::ScrollLinesUp => scroll_transcript(state, true, WHEEL_LINES),
+        Action::ScrollLinesDown => scroll_transcript(state, false, WHEEL_LINES),
         Action::Expand => expand_selected(state),
+        Action::BrowseFoldPrev => browse_fold(state, -1),
+        Action::BrowseFoldNext => browse_fold(state, 1),
         Action::RemoveApiKey => begin_remove_key(state),
         Action::VerifyApiKey => begin_verify_key(state),
         Action::RefreshProviderModels => refresh_provider_models(state),
@@ -405,23 +415,37 @@ pub fn reduce(state: &mut AppState, action: Action) {
 
         Action::InputChar(c) => input_char(state, c),
         Action::InputPaste(text) => {
-            edit_prompt(state, move |buf| buf.push_str(&text));
+            edit_prompt(state, &Edit::Insert(text));
             detach_history_on_edit(state);
         }
         Action::InputBackspace => {
-            edit_prompt(state, |buf| {
-                buf.pop();
-            });
+            edit_prompt(state, &Edit::Backspace);
             detach_history_on_edit(state);
         }
+        Action::CursorLeft => move_composer_cursor(state, CursorMove::Left),
+        Action::CursorRight => move_composer_cursor(state, CursorMove::Right),
+        Action::CursorLineStart => move_composer_cursor(state, CursorMove::LineStart),
+        Action::CursorLineEnd => move_composer_cursor(state, CursorMove::LineEnd),
+        Action::DeleteWordBack => delete_backwards(state, &Edit::WordBack),
+        Action::DeleteToLineStart => delete_backwards(state, &Edit::ToLineStart),
+        // `Alt-Enter` expands the browsed transcript fold when one is under the
+        // cursor (the keyboard path to tool cards and patch diffs), and is a
+        // plain line break otherwise. The input mapper is stateless, so the
+        // decision lives here, where the browse flag does.
         Action::InputNewline => {
-            edit_prompt(state, |buf| buf.push('\n'));
-            detach_history_on_edit(state);
+            if state.transcript_browse && matches!(state.overlay, Overlay::None) {
+                expand_selected(state);
+            } else {
+                edit_prompt(state, &Edit::Insert("\n".to_owned()));
+                detach_history_on_edit(state);
+            }
         }
         Action::InputSubmit => submit_prompt(state),
         Action::InputCancel => input_cancel(state),
-        Action::HistoryPrev => history_prev(state),
-        Action::HistoryNext => history_next(state),
+        // `↑`/`↓` walk the draft's own lines first and only recall history at
+        // its top/bottom edge — a single-line draft is unchanged.
+        Action::HistoryPrev => composer_up(state),
+        Action::HistoryNext => composer_down(state),
 
         Action::OpenSkills => {
             state.overlay = match state.overlay {
@@ -1170,9 +1194,16 @@ fn upsert_blackboard_item(state: &mut AppState, item: crate::state::BlackboardIt
     }
 }
 
-/// Fold one durable event into run / transcript / approval state.
+/// Fold one durable event into run / transcript / approval state. The event's
+/// `occurred_at` rides along to `push_entry`, which timestamps the transcript
+/// entry it produces — this is what the transcript's turn-header clocks read.
 fn apply_event(state: &mut AppState, event: SessionEvent) {
-    let SessionEvent { actor, body, .. } = event;
+    let SessionEvent {
+        actor,
+        body,
+        occurred_at: at,
+        ..
+    } = event;
 
     // Learn the serving model from any agent-authored event.
     if let Actor::Agent { run_id, model, .. } = &actor {
@@ -1234,7 +1265,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         expanded: false,
                     },
                 };
-                AppState::push_entry(run, backstage);
+                AppState::push_entry(run, backstage, at);
                 return;
             }
 
@@ -1244,6 +1275,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     text,
                     expanded: false,
                 },
+                at,
             );
         }
         EventBody::SessionClosed => state.session_closed = true,
@@ -1278,7 +1310,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 ) {
                     run.state = RunState::Preparing;
                 }
-                AppState::push_entry(run, TranscriptEntry::User { text: objective });
+                AppState::push_entry(run, TranscriptEntry::User { text: objective }, at);
             }
         }
         EventBody::RunStateChanged { run_id, state: rs } => {
@@ -1301,7 +1333,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
         }
         EventBody::ModelStreamDelta { run_id, text } => {
             if let Some(run) = state.run_mut(run_id) {
-                AppState::append_model_text(run, &text);
+                AppState::append_model_text(run, &text, at);
                 run.activity = RunActivity::Streaming;
             }
         }
@@ -1324,6 +1356,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         approval_id: Some(approval_id),
                         expanded: false,
                     })),
+                    at,
                 );
             }
             // Backfill the run link onto a matching pending approval.
@@ -1360,6 +1393,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         approval_id: None,
                         expanded: false,
                     })),
+                    at,
                 );
                 run.activity = RunActivity::Thinking;
             }
@@ -1400,6 +1434,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             approval_id: None,
                             expanded: false,
                         })),
+                        at,
                     ),
                 }
                 run.activity = RunActivity::RunningTool(tool_name);
@@ -1434,6 +1469,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             approval_id: None,
                             expanded: false,
                         })),
+                        at,
                     ),
                 }
                 // The tool finished; the agent is back to composing its next
@@ -1464,6 +1500,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         preview_truncated,
                         expanded: false,
                     }),
+                    at,
                 );
             }
         }
@@ -1488,7 +1525,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
         }
         EventBody::SteeringQueued { run_id } => {
             if let Some(run) = state.run_mut(run_id) {
-                AppState::push_entry(run, TranscriptEntry::Steering { applied: false });
+                AppState::push_entry(run, TranscriptEntry::Steering { applied: false }, at);
             }
         }
         EventBody::SteeringApplied { run_id } => {
@@ -1499,7 +1536,9 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 });
                 match marked {
                     Some(applied) => *applied = true,
-                    None => AppState::push_entry(run, TranscriptEntry::Steering { applied: true }),
+                    None => {
+                        AppState::push_entry(run, TranscriptEntry::Steering { applied: true }, at);
+                    }
                 }
             }
         }
@@ -1525,6 +1564,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         used,
                         limit,
                     },
+                    at,
                 );
             }
         }
@@ -1541,6 +1581,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         disposition: disposition.clone(),
                         expanded: false,
                     },
+                    at,
                 );
                 run.disposition = Some(disposition);
                 run.activity = RunActivity::Idle;
@@ -1578,6 +1619,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     TranscriptEntry::Unsupported {
                         label: "unsupported event".to_owned(),
                     },
+                    at,
                 );
             }
         }
@@ -1766,6 +1808,16 @@ fn nav(state: &mut AppState, delta: i32) {
             step(selected, indices.len(), delta);
             return;
         }
+        // The theme picker: the same shape again. Moving the cursor is all the
+        // preview needs — the renderer reads the focused row every frame.
+        Overlay::ThemePicker {
+            ref query,
+            ref mut selected,
+        } => {
+            let indices = filter_themes(&state.themes, query);
+            step(selected, indices.len(), delta);
+            return;
+        }
         // The `/keys` overlay (D1): the same filtered-cursor shape, over the
         // model list plus the final Tavily row — no resolved `AppState` index
         // (like the mode picker).
@@ -1872,7 +1924,18 @@ fn nav(state: &mut AppState, delta: i32) {
     }
 }
 
+/// `PgUp`/`PgDn`: a viewport-sized-ish jump.
+const PAGE: u16 = 10;
+
+/// One wheel notch. Conventional terminals scroll ~3 lines per notch; mapping
+/// the wheel to a 10-row page made the conversation lurch.
+const WHEEL_LINES: u16 = 3;
+
 fn scroll_page(state: &mut AppState, up: bool) {
+    scroll_transcript(state, up, PAGE);
+}
+
+fn scroll_transcript(state: &mut AppState, up: bool, rows: u16) {
     if matches!(state.overlay, Overlay::Edges) {
         let page = if up {
             state.edge_page.saturating_sub(1)
@@ -1884,7 +1947,8 @@ fn scroll_page(state: &mut AppState, up: bool) {
         request_edge_page(state, page);
         return;
     }
-    const PAGE: u16 = 10;
+    // Scrolling means the user is driving the viewport, not the fold cursor.
+    end_browse(state);
     // The renderer cached the true bottom last frame; use it so leaving follow
     // mode starts a page up from the bottom (not a jump to the top), and paging
     // back to the bottom re-enters follow.
@@ -1896,9 +1960,9 @@ fn scroll_page(state: &mut AppState, up: bool) {
                 run.follow = false;
                 run.scroll = max;
             }
-            run.scroll = run.scroll.saturating_sub(PAGE);
+            run.scroll = run.scroll.saturating_sub(rows);
         } else {
-            run.scroll = run.scroll.saturating_add(PAGE).min(max);
+            run.scroll = run.scroll.saturating_add(rows).min(max);
             if run.scroll >= max {
                 run.follow = true;
             }
@@ -1914,13 +1978,69 @@ fn request_edge_page(state: &mut AppState, page: usize) {
     });
 }
 
+/// `Alt-↑`/`Alt-↓`: walk the selected run's *foldable* entries — tool cards,
+/// patch diffs, the backstage fold, long notes, failed-run errors — and mark
+/// the transcript as being browsed, so the renderer highlights the landing
+/// entry, keeps it in the viewport, and `Alt-Enter` expands it. Stepping only
+/// over foldable entries means every stop has something to open (the mouse's
+/// click targets are exactly this set — see `TranscriptEntry::is_foldable`).
+/// A no-op when the selected run has no foldable entry at all.
+fn browse_fold(state: &mut AppState, delta: i32) {
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    let browsing = state.transcript_browse;
+    let Some(run) = state.selected_run_mut() else {
+        return;
+    };
+    let folds: Vec<usize> = run
+        .transcript
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.is_foldable())
+        .map(|(idx, _)| idx)
+        .collect();
+    let Some(&last) = folds.last() else {
+        return;
+    };
+    // The first Alt-↑/Alt-↓ enters browse mode at the newest fold (the one the
+    // tail of the conversation is showing); later presses walk from there.
+    if !browsing {
+        run.transcript_selected = last;
+        state.transcript_browse = true;
+        return;
+    }
+    let current = run.transcript_selected;
+    let position = folds
+        .iter()
+        .position(|&idx| idx == current)
+        .unwrap_or(folds.len() - 1);
+    let next = if delta < 0 {
+        position.saturating_sub(1)
+    } else {
+        (position + 1).min(folds.len() - 1)
+    };
+    run.transcript_selected = folds[next];
+}
+
+/// Leave transcript-browse mode: the selection stops being highlighted and
+/// `Alt-Enter` goes back to inserting a line break. Called by every gesture
+/// that means "I am driving the composer or the viewport again".
+fn end_browse(state: &mut AppState) {
+    state.transcript_browse = false;
+}
+
 fn expand_selected(state: &mut AppState) {
     // In the memory browser, `Enter` opens the focused memory's source.
     if matches!(state.overlay, Overlay::Memory { .. }) {
         open_source(state);
         return;
     }
-    if state.focus != Pane::Transcript {
+    // The transcript fold is reachable from the base conversation — by click
+    // (`ActivateRow`) or by `Alt-Enter` while browsing — and from the
+    // workspace transcript pane. An open browser overlay owns `Enter` for its
+    // own list, so it must not silently toggle a fold behind the modal.
+    if !matches!(state.overlay, Overlay::None) && state.focus != Pane::Transcript {
         return;
     }
     let idx = state.selected_run;
@@ -2478,29 +2598,229 @@ fn apply_document_sync(
     clamp(&mut state.selected_suggestion, suggestions_len);
 }
 
-fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
+/// One text mutation, applied at the active buffer's insertion point. Only the
+/// composer has a movable cursor; every other prompt buffer is append-only, so
+/// [`append`] applies these at its end and reproduces the old push/pop
+/// behaviour exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Edit {
+    /// Insert text at the cursor (a typed char, a paste, or a line break).
+    Insert(String),
+    /// Delete the grapheme before the cursor.
+    Backspace,
+    /// Delete the word before the cursor (`Ctrl-W`).
+    WordBack,
+    /// Delete from the start of the cursor's line to the cursor (`Ctrl-U`).
+    ToLineStart,
+}
+
+/// `[start, end)` byte range of the line containing `cursor` (a line being the
+/// text between `\n`s — the composer's `Alt-Enter` breaks).
+fn line_bounds(text: &str, cursor: usize) -> (usize, usize) {
+    let start = text[..cursor].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[cursor..]
+        .find('\n')
+        .map_or(text.len(), |offset| cursor + offset);
+    (start, end)
+}
+
+/// Apply `edit` at `cursor`, keeping `cursor` on a `char` boundary and inside
+/// `buf`. Deletions step whole GRAPHEMES, so a combining sequence (`e` + U+0301)
+/// and a multi-byte or double-width character are removed as one unit rather
+/// than being cut in half into invalid text.
+fn splice(buf: &mut String, cursor: &mut usize, edit: &Edit) {
+    *cursor = (*cursor).min(buf.len());
+    while *cursor > 0 && !buf.is_char_boundary(*cursor) {
+        *cursor -= 1;
+    }
+    match edit {
+        Edit::Insert(text) => {
+            buf.insert_str(*cursor, text);
+            *cursor += text.len();
+        }
+        Edit::Backspace => {
+            if let Some(prev) = prev_grapheme(buf, *cursor) {
+                buf.replace_range(prev..*cursor, "");
+                *cursor = prev;
+            }
+        }
+        Edit::WordBack => {
+            let (line_start, _) = line_bounds(buf, *cursor);
+            // Skip the whitespace immediately before the cursor, then delete
+            // back to the start of the word it trails (readline's `Ctrl-W`).
+            let mut at = *cursor;
+            while at > line_start {
+                let Some(prev) = prev_grapheme(buf, at) else {
+                    break;
+                };
+                if buf[prev..at].chars().all(char::is_whitespace) {
+                    at = prev;
+                } else {
+                    break;
+                }
+            }
+            while at > line_start {
+                let Some(prev) = prev_grapheme(buf, at) else {
+                    break;
+                };
+                if buf[prev..at].chars().all(char::is_whitespace) {
+                    break;
+                }
+                at = prev;
+            }
+            buf.replace_range(at..*cursor, "");
+            *cursor = at;
+        }
+        Edit::ToLineStart => {
+            let (line_start, _) = line_bounds(buf, *cursor);
+            buf.replace_range(line_start..*cursor, "");
+            *cursor = line_start;
+        }
+    }
+}
+
+/// Apply `edit` at the end of an append-only buffer (every prompt except the
+/// composer). `Insert` is a push, `Backspace` a pop — exactly what these
+/// buffers did before the composer grew a cursor.
+fn append(buf: &mut String, edit: &Edit) {
+    let mut cursor = buf.len();
+    splice(buf, &mut cursor, edit);
+}
+
+/// The byte offset of the grapheme boundary before `cursor`, or `None` at the
+/// start of the buffer.
+fn prev_grapheme(text: &str, cursor: usize) -> Option<usize> {
+    UnicodeSegmentation::grapheme_indices(&text[..cursor], true)
+        .next_back()
+        .map(|(offset, _)| offset)
+}
+
+/// The byte offset of the grapheme boundary after `cursor`, or `None` at the
+/// end of the buffer.
+fn next_grapheme(text: &str, cursor: usize) -> Option<usize> {
+    UnicodeSegmentation::grapheme_indices(&text[cursor..], true)
+        .next()
+        .map(|(_, grapheme)| cursor + grapheme.len())
+}
+
+/// Where a cursor key moves the composer's insertion point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorMove {
+    Left,
+    Right,
+    LineStart,
+    LineEnd,
+}
+
+/// `←`/`→`/`Home`/`End` in the composer. Horizontal motion steps whole
+/// graphemes (never landing mid-character); `Home`/`End` are scoped to the
+/// cursor's own line, so they stay useful in a multi-line draft.
+fn move_composer_cursor(state: &mut AppState, motion: CursorMove) {
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    // Moving the caret is composing, not browsing.
+    end_browse(state);
+    let cursor = state.composer_cursor.min(state.composer.len());
+    let (line_start, line_end) = line_bounds(&state.composer, cursor);
+    state.composer_cursor = match motion {
+        CursorMove::Left => prev_grapheme(&state.composer, cursor).unwrap_or(0),
+        CursorMove::Right => next_grapheme(&state.composer, cursor).unwrap_or(cursor),
+        CursorMove::LineStart => line_start,
+        CursorMove::LineEnd => line_end,
+    };
+}
+
+/// Delete backwards in the composer (`Ctrl-W` / `Ctrl-U`); a no-op elsewhere,
+/// where these keys have never meant anything.
+fn delete_backwards(state: &mut AppState, edit: &Edit) {
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    splice(&mut state.composer, &mut state.composer_cursor, edit);
+    detach_history_on_edit(state);
+}
+
+/// The composer cursor's display column within its own line — the width the
+/// terminal actually paints, so `↑`/`↓` keep their column across CJK and emoji.
+fn cursor_column(text: &str, cursor: usize) -> usize {
+    let (start, _) = line_bounds(text, cursor);
+    UnicodeWidthStr::width(&text[start..cursor])
+}
+
+/// The byte offset within `[start, end)` closest to display `column` without
+/// overshooting it, snapped to a grapheme boundary.
+fn offset_for_column(text: &str, start: usize, end: usize, column: usize) -> usize {
+    let mut width = 0;
+    for (offset, grapheme) in UnicodeSegmentation::grapheme_indices(&text[start..end], true) {
+        if width >= column {
+            return start + offset;
+        }
+        width += UnicodeWidthStr::width(grapheme);
+    }
+    end
+}
+
+/// `↑` in the composer: move to the line above, keeping the display column;
+/// only at the draft's TOP line does it fall through to history recall. A
+/// single-line draft therefore behaves exactly as it did before.
+fn composer_up(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::None) {
+        let cursor = state.composer_cursor.min(state.composer.len());
+        let (line_start, _) = line_bounds(&state.composer, cursor);
+        if line_start > 0 {
+            let column = cursor_column(&state.composer, cursor);
+            let (prev_start, prev_end) = line_bounds(&state.composer, line_start - 1);
+            state.composer_cursor =
+                offset_for_column(&state.composer, prev_start, prev_end, column);
+            end_browse(state);
+            return;
+        }
+    }
+    history_prev(state);
+}
+
+/// `↓` in the composer: the mirror of [`composer_up`] — the line below, then
+/// history at the draft's bottom line.
+fn composer_down(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::None) {
+        let cursor = state.composer_cursor.min(state.composer.len());
+        let (_, line_end) = line_bounds(&state.composer, cursor);
+        if line_end < state.composer.len() {
+            let column = cursor_column(&state.composer, cursor);
+            let (next_start, next_end) = line_bounds(&state.composer, line_end + 1);
+            state.composer_cursor =
+                offset_for_column(&state.composer, next_start, next_end, column);
+            end_browse(state);
+            return;
+        }
+    }
+    history_next(state);
+}
+
+fn edit_prompt(state: &mut AppState, edit: &Edit) {
     match &mut state.overlay {
-        Overlay::NewRun(buf) | Overlay::Steering(buf) => edit(buf),
-        Overlay::WorkflowInputs { buffer, .. } => edit(buffer),
-        Overlay::CouncilRunObjective { buffer, .. } => edit(buffer),
-        Overlay::EdgeSearch(buffer) => edit(buffer),
-        Overlay::DocEdit { buffer, .. } => edit(buffer),
-        Overlay::DocNew { buffer } => edit(buffer),
-        Overlay::DocInsert { buffer, .. } => edit(buffer),
-        Overlay::DocPublishPath { buffer, .. } => edit(buffer),
-        Overlay::AddModelId { buffer, .. } => edit(buffer),
+        Overlay::NewRun(buf) | Overlay::Steering(buf) => append(buf, edit),
+        Overlay::WorkflowInputs { buffer, .. } => append(buffer, edit),
+        Overlay::CouncilRunObjective { buffer, .. } => append(buffer, edit),
+        Overlay::EdgeSearch(buffer) => append(buffer, edit),
+        Overlay::DocNew { buffer } => append(buffer, edit),
+        Overlay::DocInsert { buffer, .. } => append(buffer, edit),
+        Overlay::DocEdit { buffer, .. } => append(buffer, edit),
+        Overlay::DocPublishPath { buffer, .. } => append(buffer, edit),
+        Overlay::AddModelId { buffer, .. } => append(buffer, edit),
         // The key buffer is a redacting newtype; edit its inner String.
-        Overlay::AddModelKey { buffer, .. } => edit(&mut buffer.0),
+        Overlay::AddModelKey { buffer, .. } => append(&mut buffer.0, edit),
         // The `/keys` set prompt masks the same redacting newtype (D1).
-        Overlay::ApiKeySet { buffer, .. } => edit(&mut buffer.0),
+        Overlay::ApiKeySet { buffer, .. } => append(&mut buffer.0, edit),
         // The key-first prompt masks a redacting newtype, like `AddModelKey`.
-        Overlay::AddModelProviderKey { buffer, .. } => edit(&mut buffer.0),
+        Overlay::AddModelProviderKey { buffer, .. } => append(&mut buffer.0, edit),
         // The pick-list filters like the model picker: editing the query resets
         // the selection to the top of the new filtered set.
         Overlay::AddModelPick {
             query, selected, ..
         } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the add-model pick-list: the Unsloth repo/quant
@@ -2514,53 +2834,61 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
         | Overlay::UnslothQuants {
             query, selected, ..
         } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Editing the palette query changes the filtered set, so the selection
         // returns to the top rather than pointing past the new results.
         Overlay::Palette { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the palette: editing the model picker's query changes
         // the filtered set, so the selection returns to the top.
         Overlay::ModelPicker { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the model picker (Task 8): editing the provider
         // picker's query changes the filtered set, so the selection returns
         // to the top.
         Overlay::ProviderPicker { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the provider picker (PR C2): editing the mode
         // picker's query changes the filtered set, so the selection returns
         // to the top.
         Overlay::ModePicker { query, selected } => {
-            edit(query);
+            append(query, edit);
+            *selected = 0;
+        }
+        // Same shape as the mode picker: editing the theme query changes the
+        // filtered set, so the selection (and therefore the live preview)
+        // returns to the top of the new results.
+        Overlay::ThemePicker { query, selected } => {
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the mode picker (D1): editing the `/keys` query
         // changes the filtered set, so the selection returns to the top.
         Overlay::ApiKeys { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         Overlay::CouncilBuilder(builder) => match builder.step {
-            CouncilBuilderStep::Name => edit(&mut builder.name),
-            CouncilBuilderStep::Description => edit(&mut builder.description),
+            CouncilBuilderStep::Name => append(&mut builder.name, edit),
+            CouncilBuilderStep::Description => append(&mut builder.description, edit),
             CouncilBuilderStep::MemberModel | CouncilBuilderStep::Chair => {
-                edit(&mut builder.query);
+                append(&mut builder.query, edit);
                 builder.selected = 0;
             }
-            CouncilBuilderStep::MemberRole => edit(&mut builder.role),
+            CouncilBuilderStep::MemberRole => append(&mut builder.role, edit),
             CouncilBuilderStep::Rounds | CouncilBuilderStep::Review => {}
         },
-        // The base view: text lands in the persistent composer draft.
-        Overlay::None => edit(&mut state.composer),
+        // The base view: text lands in the persistent composer draft, at
+        // its cursor — the one buffer with a movable insertion point.
+        Overlay::None => splice(&mut state.composer, &mut state.composer_cursor, edit),
         _ => {}
     }
     // Keep `selected_model` resolved to the new top-of-filter card (mirrors
@@ -2592,7 +2920,7 @@ fn input_char(state: &mut AppState, c: char) {
         };
         return;
     }
-    edit_prompt(state, |buf| buf.push(c));
+    edit_prompt(state, &Edit::Insert(c.to_string()));
     detach_history_on_edit(state);
 }
 
@@ -2628,6 +2956,9 @@ fn begin_remove_key(state: &mut AppState) {
 fn detach_history_on_edit(state: &mut AppState) {
     if matches!(state.overlay, Overlay::None) {
         state.history_cursor = None;
+        // Typing means the composer, not the transcript, has the user's
+        // attention: leave fold-browse mode so `Alt-Enter` is a line break again.
+        end_browse(state);
     }
 }
 
@@ -2647,6 +2978,7 @@ fn history_prev(state: &mut AppState) {
         Some(idx) => idx.saturating_sub(1),
     };
     state.composer = state.composer_history[idx].clone();
+    state.composer_cursor = state.composer.len();
     state.history_cursor = Some(idx);
 }
 
@@ -2665,6 +2997,7 @@ fn history_next(state: &mut AppState) {
         state.composer = state.composer_history[idx].clone();
         state.history_cursor = Some(idx);
     }
+    state.composer_cursor = state.composer.len();
 }
 
 /// `Esc`: clear the composer draft in the base view, return the block-edit prompt
@@ -2703,8 +3036,18 @@ fn input_cancel(state: &mut AppState) {
         }
         return;
     }
+    // `Esc` while browsing folds steps out of browse mode first, so an
+    // in-progress draft is never destroyed by a keypress the user meant as
+    // "stop browsing".
+    if state.transcript_browse && matches!(state.overlay, Overlay::None) {
+        end_browse(state);
+        return;
+    }
     match state.overlay {
-        Overlay::None => state.composer.clear(),
+        Overlay::None => {
+            state.composer.clear();
+            state.composer_cursor = 0;
+        }
         // Abandoning the block-edit prompt returns to the browser, not the base
         // view (no lease was taken yet — the acquire only fires on submit).
         Overlay::DocEdit { .. }
@@ -2723,6 +3066,8 @@ fn input_cancel(state: &mut AppState) {
 /// Switch the conversation to another run (`Ctrl-↑/↓`), clamping at the ends.
 fn cycle_run(state: &mut AppState, delta: i32) {
     step(&mut state.selected_run, state.runs.len(), delta);
+    // The browsed fold belonged to the run we just left.
+    end_browse(state);
 }
 
 /// Set the open list overlay's `selected` to `n`, mirroring `nav`'s picker
@@ -2769,8 +3114,11 @@ fn set_overlay_selected(state: &mut AppState, n: usize) {
         } => {
             *selected = n;
         }
-        // Same for the `/keys` overlay (D1).
-        Overlay::ApiKeys {
+        // Same for the theme picker and the `/keys` overlay (D1).
+        Overlay::ThemePicker {
+            ref mut selected, ..
+        }
+        | Overlay::ApiKeys {
             ref mut selected, ..
         } => {
             *selected = n;
@@ -2842,6 +3190,7 @@ fn activate_row(state: &mut AppState, n: usize) {
         | Overlay::ModelPicker { .. }
         | Overlay::ProviderPicker { .. }
         | Overlay::ModePicker { .. }
+        | Overlay::ThemePicker { .. }
         | Overlay::ApiKeys { .. }
         | Overlay::AddModelPick { .. }
         | Overlay::CouncilBuilder(_)
@@ -2856,6 +3205,10 @@ fn activate_row(state: &mut AppState, n: usize) {
             if let Some(run) = state.runs.get_mut(idx) {
                 if n < run.transcript.len() {
                     run.transcript_selected = n;
+                    // A clicked fold becomes the browsed one, so the keyboard
+                    // can carry on from where the mouse left off (and the row
+                    // the click landed on is visibly selected).
+                    state.transcript_browse = true;
                 }
             }
             expand_selected(state);
@@ -3292,6 +3645,19 @@ fn submit_prompt(state: &mut AppState) {
                 ));
             }
         }
+        // Enter keeps the previewed theme: the renderer already draws in it
+        // (`AppState::effective_theme`), so this only makes the choice sticky
+        // and asks the harness to remember it for the next launch. Same
+        // zero-match guard as every other picker. `mem::take` already closed
+        // the picker.
+        Overlay::ThemePicker { query, selected } => {
+            if let Some(&idx) = filter_themes(&state.themes, &query).get(selected) {
+                state.theme_selected = Some(idx);
+                let id = state.themes[idx].id.clone();
+                state.notice = Some((format!("theme set to {id}"), state.tick + 25));
+                state.outbox.push(Intent::SetTheme { id });
+            }
+        }
         // Enter on a `/keys` row (D1) opens the masked set/replace prompt for
         // that row's target. Re-derives the filtered selection from the
         // overlay's own `query`/`selected` (the zero-match guard the other
@@ -3314,6 +3680,14 @@ fn submit_prompt(state: &mut AppState) {
             let key = buffer.0.trim().to_owned();
             if key.is_empty() {
                 state.notice = Some(("key not saved (blank)".to_owned(), state.tick + 25));
+                // Reopen the prompt rather than dropping the operator back to
+                // the base view: a stray `Enter` mid-paste should not discard
+                // the flow they were in. Mirrors `AddModelId`, which has always
+                // reopened on a blank submit.
+                state.overlay = Overlay::ApiKeySet {
+                    target,
+                    buffer: SecretKey(String::new()),
+                };
             } else {
                 state.outbox.push(Intent::SetApiKey {
                     target,
@@ -3368,6 +3742,7 @@ fn submit_prompt(state: &mut AppState) {
                 }
             }
             state.composer.clear();
+            state.composer_cursor = 0;
             // Snap the conversation back to the latest so the reply is in view.
             if let Some(run) = state.selected_run_mut() {
                 run.follow = true;
@@ -4100,6 +4475,14 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
                     .iter()
                     .position(|card| card.mode == state.default_mode)
                     .unwrap_or(0),
+            };
+        }
+        // Open on the theme in force, so the first thing the cursor previews is
+        // what is already on screen.
+        PaletteCommand::Theme => {
+            state.overlay = Overlay::ThemePicker {
+                query: String::new(),
+                selected: state.theme_selected.unwrap_or(0),
             };
         }
         // D1: open the `/keys` overlay (rows come from `state.models` +
@@ -10041,6 +10424,120 @@ mod tests {
             }
         );
     }
+    // --- Alt-↑/↓ + Alt-Enter: the keyboard path to tool cards and diffs ---
+
+    /// Builds a run whose transcript is: [0] User objective, [1] Tool card,
+    /// [2] Model prose, [3] Patch — two folds separated by a non-foldable
+    /// entry, so a walk that stepped one *entry* at a time would land on
+    /// something with nothing to open.
+    fn run_with_two_folds() -> AppState {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc".to_owned(),
+                label: Some("cargo test".to_owned()),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "on it".to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::PatchProposed {
+                run_id,
+                changeset_id: ChangeSetId::new(),
+                artifact: artifact(),
+                files: vec!["src/lib.rs".to_owned()],
+                additions: 2,
+                deletions: 1,
+                preview: "@@ -1 +1 @@\n-old\n+new".to_owned(),
+                preview_truncated: false,
+            }),
+        );
+        assert!(matches!(s.runs[0].transcript[1], TranscriptEntry::Tool(_)));
+        assert!(matches!(
+            s.runs[0].transcript[2],
+            TranscriptEntry::Model { .. }
+        ));
+        assert!(matches!(s.runs[0].transcript[3], TranscriptEntry::Patch(_)));
+        s
+    }
+
+    fn tool_expanded(s: &AppState) -> bool {
+        let TranscriptEntry::Tool(card) = &s.runs[0].transcript[1] else {
+            unreachable!()
+        };
+        card.expanded
+    }
+
+    fn patch_expanded(s: &AppState) -> bool {
+        let TranscriptEntry::Patch(patch) = &s.runs[0].transcript[3] else {
+            unreachable!()
+        };
+        patch.expanded
+    }
+
+    #[test]
+    fn alt_arrows_walk_only_foldable_entries_and_alt_enter_expands_them() {
+        let mut s = run_with_two_folds();
+        assert!(!s.transcript_browse, "the base view composes by default");
+
+        // The first Alt-↑ enters browse mode at the NEWEST fold — the one the
+        // tail of the conversation is already showing.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert!(s.transcript_browse);
+        assert_eq!(
+            s.runs[0].transcript_selected, 3,
+            "entered at the newest fold"
+        );
+
+        // Alt-Enter expands it: the diff renderer was unreachable before this.
+        reduce(&mut s, Action::InputNewline);
+        assert!(patch_expanded(&s), "Alt-Enter expands the browsed patch");
+        assert!(
+            s.composer.is_empty(),
+            "Alt-Enter while browsing must not type a newline into the draft"
+        );
+        reduce(&mut s, Action::InputNewline);
+        assert!(!patch_expanded(&s), "Alt-Enter toggles it back");
+
+        // Alt-↑ SKIPS the model prose at index 2 (nothing to open there).
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!(
+            s.runs[0].transcript_selected, 1,
+            "skipped the non-foldable model entry"
+        );
+        reduce(&mut s, Action::InputNewline);
+        assert!(tool_expanded(&s), "Alt-Enter expands the browsed tool card");
+
+        // Saturates at the oldest fold rather than wrapping into the objective…
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!(s.runs[0].transcript_selected, 1);
+        // …and walks forward again.
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert_eq!(s.runs[0].transcript_selected, 3);
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert_eq!(
+            s.runs[0].transcript_selected, 3,
+            "saturates at the newest fold"
+        );
+    }
 
     #[test]
     fn unsloth_repos_loaded_after_the_overlay_closed_is_ignored() {
@@ -10441,5 +10938,766 @@ mod tests {
 
         let quants = vec![unsloth_quant("Q4_K_M"), unsloth_quant("UD-Q4_K_XL")];
         assert_eq!(filter_unsloth_quants(&quants, "ud-"), vec![1]);
+    }
+    fn alt_enter_is_still_a_line_break_when_not_browsing() {
+        let mut s = run_with_two_folds();
+        reduce(&mut s, Action::InputChar('h'));
+        reduce(&mut s, Action::InputNewline);
+        reduce(&mut s, Action::InputChar('i'));
+        assert_eq!(s.composer, "h\ni");
+        assert!(!tool_expanded(&s) && !patch_expanded(&s));
+    }
+
+    #[test]
+    fn typing_scrolling_esc_and_run_switching_leave_browse_mode() {
+        // Browse mode is a transient "the transcript has my attention" state:
+        // every gesture meaning "I am driving the composer or the viewport
+        // again" ends it, so Alt-Enter is a line break once more.
+        let mut s = run_with_two_folds();
+
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(&mut s, Action::InputChar('x'));
+        assert!(!s.transcript_browse, "typing returns to composing");
+        assert_eq!(s.composer, "x");
+
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(&mut s, Action::ScrollPageUp);
+        assert!(
+            !s.transcript_browse,
+            "scrolling drives the viewport by hand"
+        );
+
+        // Esc steps out of browse mode WITHOUT destroying the draft; a second
+        // Esc then clears the draft as it always did.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(&mut s, Action::InputCancel);
+        assert!(!s.transcript_browse);
+        assert_eq!(s.composer, "x", "Esc out of browse mode keeps the draft");
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.composer, "", "a second Esc clears the draft");
+
+        // Switching runs abandons a selection that belonged to the other run.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(&mut s, Action::PrevRun);
+        assert!(!s.transcript_browse);
+    }
+
+    #[test]
+    fn browsing_is_a_no_op_without_folds_or_under_an_overlay() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // Only the User objective — nothing foldable.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert!(!s.transcript_browse, "no fold to browse, no browse mode");
+
+        // An open overlay owns the arrows; browsing must not run underneath it.
+        let mut s = run_with_two_folds();
+        s.overlay = Overlay::Help;
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert!(!s.transcript_browse);
+    }
+
+    #[test]
+    fn expand_no_longer_needs_the_unreachable_transcript_pane_focus() {
+        // The old guard required `focus == Pane::Transcript`, which `Tab` could
+        // not reach from the base view — that is what made tool cards and patch
+        // diffs dead UI. In the base view (no overlay) the fold expands from
+        // whatever the vestigial pane focus happens to be.
+        let mut s = run_with_two_folds();
+        s.focus = Pane::Sessions;
+        s.runs[0].transcript_selected = 1;
+        reduce(&mut s, Action::Expand);
+        assert!(tool_expanded(&s));
+
+        // A browser overlay still owns Enter for its own list: no silent
+        // toggling of a fold hidden behind the modal.
+        let mut s = run_with_two_folds();
+        s.focus = Pane::Sessions;
+        s.overlay = Overlay::Skills;
+        s.runs[0].transcript_selected = 1;
+        reduce(&mut s, Action::Expand);
+        assert!(!tool_expanded(&s));
+    }
+
+    #[test]
+    fn clicking_a_fold_row_hands_the_keyboard_the_same_selection() {
+        // RULE 3 both ways: a click selects + toggles and leaves the fold
+        // browsable, so Alt-↑ carries on from the clicked row.
+        let mut s = run_with_two_folds();
+        reduce(&mut s, Action::ActivateRow(3));
+        assert!(patch_expanded(&s));
+        assert!(s.transcript_browse, "the clicked fold is the browsed fold");
+        assert_eq!(s.runs[0].transcript_selected, 3);
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!(
+            s.runs[0].transcript_selected, 1,
+            "the keyboard continues from the click"
+        );
+    }
+
+    #[test]
+    fn every_foldable_entry_kind_is_reachable_by_both_click_and_keyboard() {
+        // `TranscriptEntry::is_foldable` is the single predicate the renderer's
+        // click targets and the Alt-↑/↓ walk share, so this list IS the parity
+        // guarantee.
+        let tool = TranscriptEntry::Tool(Box::new(crate::state::ToolCard {
+            tool: "shell.run".to_owned(),
+            status: crate::state::ToolStatus::Running,
+            action: None,
+            args_digest: None,
+            label: None,
+            outcome: None,
+            artifact: None,
+            approval_id: None,
+            expanded: false,
+        }));
+        assert!(tool.is_foldable(), "tool cards were the dead feature");
+        assert!(TranscriptEntry::Patch(PatchSummary {
+            changeset_id: ChangeSetId::new(),
+            artifact: artifact(),
+            files: vec!["a.rs".to_owned()],
+            additions: 1,
+            deletions: 0,
+            preview: "@@".to_owned(),
+            preview_truncated: false,
+            expanded: false,
+        })
+        .is_foldable());
+        assert!(TranscriptEntry::Backstage {
+            context_lines: Some(3),
+            memory_updates: 0,
+            raw: vec!["x".to_owned()],
+            expanded: false,
+        }
+        .is_foldable());
+        assert!(TranscriptEntry::Note {
+            text: "a\nb\nc".to_owned(),
+            expanded: false,
+        }
+        .is_foldable());
+        assert!(
+            !TranscriptEntry::Note {
+                text: "one liner".to_owned(),
+                expanded: false,
+            }
+            .is_foldable(),
+            "a short note renders inline — there is nothing to unfold"
+        );
+        assert!(TranscriptEntry::Completed {
+            disposition: RunDisposition::Failed {
+                reason: "boom".to_owned()
+            },
+            expanded: false,
+        }
+        .is_foldable());
+        assert!(!TranscriptEntry::User {
+            text: "hi".to_owned()
+        }
+        .is_foldable());
+    }
+
+    // --- composer cursor: a real text field, not an append-only buffer ---
+
+    /// Type `text` into an empty composer one action at a time, exactly as the
+    /// input layer would.
+    fn typed(text: &str) -> AppState {
+        let mut s = AppState::new();
+        for c in text.chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        assert_eq!(s.composer_cursor, s.composer.len());
+        s
+    }
+
+    #[test]
+    fn arrows_home_and_end_move_the_insertion_point_and_edits_splice() {
+        let mut s = typed("helo world");
+        // ← ← ← ← ← ← puts the caret between "hel" and "o world".
+        for _ in 0..7 {
+            reduce(&mut s, Action::CursorLeft);
+        }
+        assert_eq!(s.composer_cursor, 3);
+        reduce(&mut s, Action::InputChar('l'));
+        assert_eq!(s.composer, "hello world", "typing splices at the cursor");
+        assert_eq!(s.composer_cursor, 4, "the cursor follows the inserted text");
+
+        // Backspace deletes BEFORE the cursor, not at the end of the draft.
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.composer, "helo world");
+        assert_eq!(s.composer_cursor, 3);
+
+        reduce(&mut s, Action::CursorLineEnd);
+        assert_eq!(s.composer_cursor, s.composer.len());
+        reduce(&mut s, Action::CursorLineStart);
+        assert_eq!(s.composer_cursor, 0);
+        // Motion saturates at both ends instead of underflowing.
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(s.composer_cursor, 0);
+        reduce(&mut s, Action::CursorLineEnd);
+        reduce(&mut s, Action::CursorRight);
+        assert_eq!(s.composer_cursor, s.composer.len());
+    }
+
+    #[test]
+    fn ctrl_w_deletes_a_word_and_ctrl_u_deletes_to_the_line_start() {
+        let mut s = typed("cargo test --all-targets");
+        reduce(&mut s, Action::DeleteWordBack);
+        assert_eq!(s.composer, "cargo test ");
+        assert_eq!(s.composer_cursor, s.composer.len());
+        // Trailing whitespace is skipped before the word itself is eaten.
+        reduce(&mut s, Action::DeleteWordBack);
+        assert_eq!(s.composer, "cargo ");
+        reduce(&mut s, Action::DeleteToLineStart);
+        assert_eq!(s.composer, "");
+        assert_eq!(s.composer_cursor, 0);
+        // Both are inert on an empty draft rather than panicking.
+        reduce(&mut s, Action::DeleteWordBack);
+        reduce(&mut s, Action::DeleteToLineStart);
+        assert_eq!(s.composer, "");
+    }
+
+    #[test]
+    fn ctrl_w_and_ctrl_u_are_scoped_to_the_cursors_own_line() {
+        let mut s = typed("first line");
+        reduce(&mut s, Action::InputNewline);
+        for c in "second line".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::DeleteToLineStart);
+        assert_eq!(
+            s.composer, "first line\n",
+            "Ctrl-U clears the current line, never the whole draft"
+        );
+        reduce(&mut s, Action::DeleteWordBack);
+        assert_eq!(
+            s.composer, "first line\n",
+            "Ctrl-W stops at the line start rather than eating the line above"
+        );
+    }
+
+    #[test]
+    fn up_and_down_walk_the_drafts_own_lines_before_recalling_history() {
+        let mut s = AppState::new();
+        s.composer_history = vec!["recalled".to_owned()];
+        for c in "alpha".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputNewline);
+        for c in "bravo".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        // On the second line: ↑ moves within the draft, keeping the column.
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "alpha\nbravo", "the draft is untouched");
+        assert_eq!(s.composer_cursor, 5, "same column, line above");
+        // ↓ comes back down to the same column.
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer_cursor, 11);
+
+        // At the TOP line, ↑ falls through to history recall as before.
+        reduce(&mut s, Action::HistoryPrev);
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "recalled");
+        assert_eq!(
+            s.composer_cursor,
+            s.composer.len(),
+            "recall lands at the end"
+        );
+        // ...and ↓ past the newest entry restores the stashed draft.
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer, "alpha\nbravo");
+        assert_eq!(s.composer_cursor, s.composer.len());
+    }
+
+    #[test]
+    fn a_single_line_draft_recalls_history_exactly_as_before() {
+        // The vertical-motion change must not alter the shell-style contract
+        // for the ordinary one-line draft.
+        let mut s = AppState::new();
+        s.composer_history = vec!["older".to_owned(), "newer".to_owned()];
+        for c in "draft".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "newer");
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "older");
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer, "newer");
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer, "draft", "the stashed draft comes back");
+    }
+
+    #[test]
+    fn the_cursor_steps_whole_graphemes_over_multibyte_and_wide_text() {
+        // Multi-byte (é as e + U+0301), wide CJK, and an emoji: every motion
+        // and deletion must land on a grapheme boundary, never inside one —
+        // slicing a `String` off-boundary would panic.
+        let mut s = typed("e\u{301}日本🚀");
+        assert_eq!(s.composer_cursor, s.composer.len());
+
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(&s.composer[s.composer_cursor..], "🚀");
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(&s.composer[s.composer_cursor..], "本🚀");
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(&s.composer[s.composer_cursor..], "日本🚀");
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(
+            s.composer_cursor, 0,
+            "the combining sequence is one grapheme, not two steps"
+        );
+        reduce(&mut s, Action::CursorRight);
+        assert_eq!(s.composer_cursor, "e\u{301}".len());
+
+        // Typing splices between graphemes and backspace removes a whole one.
+        reduce(&mut s, Action::InputChar('X'));
+        assert_eq!(s.composer, "e\u{301}X日本🚀");
+        reduce(&mut s, Action::CursorLineEnd);
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.composer, "e\u{301}X日本", "the emoji is deleted whole");
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.composer, "e\u{301}X日");
+        for _ in 0..3 {
+            reduce(&mut s, Action::InputBackspace);
+        }
+        assert_eq!(
+            s.composer, "",
+            "the combining sequence is deleted as one grapheme"
+        );
+        assert_eq!(s.composer_cursor, 0);
+    }
+
+    #[test]
+    fn vertical_motion_keeps_the_display_column_across_wide_glyphs() {
+        // "日本語" is 6 display columns wide but 9 bytes; ↑ from the ASCII line
+        // must land on the glyph boundary at (or before) the same COLUMN.
+        let mut s = typed("日本語");
+        reduce(&mut s, Action::InputNewline);
+        for c in "abcdef".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        // Cursor after "abcd" — column 4 on the second line.
+        reduce(&mut s, Action::CursorLeft);
+        reduce(&mut s, Action::CursorLeft);
+        reduce(&mut s, Action::HistoryPrev);
+        // Column 4 on "日本語" falls inside the third glyph, so the cursor
+        // snaps to the boundary before it (after 日本 = 4 columns).
+        assert_eq!(&s.composer[..s.composer_cursor], "日本");
+        // Coming back down restores the column, not the byte offset.
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(
+            &s.composer[s.composer.find('\n').unwrap() + 1..s.composer_cursor],
+            "abcd"
+        );
+    }
+
+    #[test]
+    fn other_prompt_buffers_stay_append_only() {
+        // Only the composer grew a cursor: every other prompt keeps today's
+        // push/pop behaviour, and the cursor keys do nothing there.
+        let mut s = AppState::new();
+        s.overlay = Overlay::NewRun(String::new());
+        for c in "abc".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::CursorLeft);
+        reduce(&mut s, Action::CursorLineStart);
+        reduce(&mut s, Action::InputChar('d'));
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.overlay, Overlay::NewRun("abc".to_owned()));
+        assert_eq!(s.composer_cursor, 0, "the composer cursor is untouched");
+    }
+
+    #[test]
+    fn submitting_and_clearing_reset_the_cursor() {
+        let mut s = typed("hello");
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.composer, "");
+        assert_eq!(s.composer_cursor, 0);
+
+        let mut s = typed("hello");
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.composer, "");
+        assert_eq!(s.composer_cursor, 0);
+    }
+
+    #[test]
+    fn a_paste_lands_at_the_cursor() {
+        let mut s = typed("ab");
+        reduce(&mut s, Action::CursorLeft);
+        reduce(&mut s, Action::InputPaste("XY".to_owned()));
+        assert_eq!(s.composer, "aXYb");
+        assert_eq!(s.composer_cursor, 3);
+    }
+
+    // --- wheel granularity, blank `/keys` submit, live mode chip ---
+
+    /// A wheel notch scrolls a few lines; `PgUp`/`PgDn` still move a page. Both
+    /// share the follow-mode contract (leaving at the true bottom, re-entering
+    /// when scrolled back down).
+    #[test]
+    fn the_wheel_scrolls_lines_while_page_keys_scroll_a_page() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // The renderer's cached bottom (a tall transcript).
+        s.transcript_max_scroll.set(100);
+        assert!(s.runs[0].follow);
+
+        reduce(&mut s, Action::ScrollLinesUp);
+        assert!(!s.runs[0].follow, "scrolling up leaves follow mode");
+        assert_eq!(
+            s.runs[0].scroll, 97,
+            "a wheel notch is a few lines from the true bottom, not a page"
+        );
+        reduce(&mut s, Action::ScrollLinesUp);
+        assert_eq!(s.runs[0].scroll, 94);
+
+        reduce(&mut s, Action::ScrollPageUp);
+        assert_eq!(s.runs[0].scroll, 84, "a page is still a page");
+
+        // Scrolling back to the bottom re-enters follow either way.
+        for _ in 0..6 {
+            reduce(&mut s, Action::ScrollLinesDown);
+        }
+        assert_eq!(s.runs[0].scroll, 100);
+        assert!(
+            s.runs[0].follow,
+            "reaching the bottom re-enters follow mode"
+        );
+    }
+
+    /// A blank `/keys` submit must reopen the masked prompt rather than
+    /// dropping the operator back to the base view — the same rule
+    /// `AddModelId` has always followed.
+    #[test]
+    fn a_blank_key_submit_reopens_the_prompt() {
+        let mut s = AppState::new();
+        let target = KeyTarget::Model("groq/llama".to_owned());
+        s.overlay = Overlay::ApiKeySet {
+            target: target.clone(),
+            buffer: SecretKey("   ".to_owned()),
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.overlay,
+            Overlay::ApiKeySet {
+                target,
+                buffer: SecretKey(String::new()),
+            },
+            "the prompt reopens, cleared, instead of closing"
+        );
+        assert!(s.outbox.is_empty(), "nothing is written for a blank key");
+        assert!(s.notice.is_some(), "and the operator is told why");
+    }
+
+    // --- turn timestamps: `SessionEvent.occurred_at` survives the fold ---
+
+    /// The event's wall-clock time used to be dropped at the fold. It now rides
+    /// along to the entry it produced, one timestamp per entry, in lockstep.
+    #[test]
+    fn folding_an_event_records_when_it_happened() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        let started = Utc::now() - chrono::Duration::minutes(5);
+        reduce(
+            &mut s,
+            Action::daemon_event(SessionEvent {
+                sequence: 1,
+                occurred_at: started,
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::RunStarted {
+                    run_id,
+                    objective: "o".to_owned(),
+                    mode: AgentMode::Build,
+                },
+            }),
+        );
+        let replied = Utc::now();
+        reduce(
+            &mut s,
+            Action::daemon_event(SessionEvent {
+                sequence: 2,
+                occurred_at: replied,
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::ModelStreamDelta {
+                    run_id,
+                    text: "hello".to_owned(),
+                },
+            }),
+        );
+        assert_eq!(
+            s.runs[0].entry_time(0),
+            Some(started),
+            "the user turn's time"
+        );
+        assert_eq!(s.runs[0].entry_time(1), Some(replied), "the reply's time");
+
+        // A coalesced stream keeps the time of its FIRST delta — when the turn
+        // began, which is what the turn header shows.
+        reduce(
+            &mut s,
+            Action::daemon_event(SessionEvent {
+                sequence: 3,
+                occurred_at: Utc::now() + chrono::Duration::seconds(30),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::ModelStreamDelta {
+                    run_id,
+                    text: " world".to_owned(),
+                },
+            }),
+        );
+        assert_eq!(s.runs[0].transcript.len(), 2, "the deltas coalesced");
+        assert_eq!(s.runs[0].entry_time(1), Some(replied));
+    }
+
+    /// The two vectors are written only by `push_entry`, including through the
+    /// transcript cap's oldest-entry drop — this asserts they never desync.
+    #[test]
+    fn transcript_and_entry_times_stay_in_lockstep() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // Well past MAX_TRANSCRIPT_ENTRIES, so the cap's drop path runs.
+        for i in 0..1_200 {
+            reduce(
+                &mut s,
+                system_ev(EventBody::NoteAppended {
+                    text: format!("note {i}"),
+                    run_id: Some(run_id),
+                }),
+            );
+            reduce(&mut s, system_ev(EventBody::SteeringQueued { run_id }));
+        }
+        let run = &s.runs[0];
+        assert_eq!(
+            run.transcript.len(),
+            run.entry_times.len(),
+            "one timestamp per entry, even after the cap dropped the oldest"
+        );
+        assert!(run.entry_time(run.transcript.len() - 1).is_some());
+        assert_eq!(
+            run.entry_time(run.transcript.len()),
+            None,
+            "no time past the end"
+        );
+    }
+
+    /// The interactive client redraws every tick while this holds, so the
+    /// answer must be true exactly when something on screen is turning.
+    #[test]
+    fn is_animating_tracks_every_spinner_surface() {
+        let mut s = AppState::new();
+        assert!(!s.is_animating(), "an idle shell needs no frames");
+
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Running,
+            }),
+        );
+        assert_eq!(s.runs[0].activity, RunActivity::Thinking);
+        assert!(s.is_animating(), "a thinking run shows the working spinner");
+
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+        assert!(!s.is_animating(), "a finished run stops the frames");
+
+        // The code-graph loading modal and the model-list fetch box each spin.
+        s.edge_loading = true;
+        assert!(s.is_animating());
+        s.edge_loading = false;
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+        };
+        assert!(s.is_animating());
+        s.overlay = Overlay::None;
+        assert!(!s.is_animating());
+    }
+
+    // --- /theme: pick a theme at runtime, preview it live, keep it ---
+
+    /// Open the theme picker through the palette front door, exactly as an
+    /// operator does: `/` → filter → Enter.
+    fn open_theme_picker(s: &mut AppState) {
+        reduce(s, Action::OpenPalette);
+        for c in "theme picker".chars() {
+            reduce(s, Action::InputChar(c));
+        }
+        reduce(s, Action::InputSubmit);
+    }
+
+    #[test]
+    fn the_theme_palette_entry_opens_the_picker_on_the_current_theme() {
+        let mut s = AppState::new();
+        assert_eq!(
+            s.themes.len(),
+            7,
+            "the seven built-in variants are always offered"
+        );
+        s.theme_selected = Some(2);
+        open_theme_picker(&mut s);
+        assert_eq!(
+            s.overlay,
+            Overlay::ThemePicker {
+                query: String::new(),
+                selected: 2,
+            },
+            "the picker opens on the theme already in force"
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
+    }
+
+    #[test]
+    fn moving_the_theme_cursor_previews_and_enter_keeps_it() {
+        let mut s = AppState::new();
+        let boot = crate::Theme::dark();
+        assert_eq!(
+            s.effective_theme(&boot),
+            boot,
+            "with no choice, the harness's boot theme stands"
+        );
+
+        open_theme_picker(&mut s);
+        reduce(&mut s, Action::SelectNext); // → light
+        assert_eq!(
+            s.effective_theme(&boot),
+            s.themes[1].theme,
+            "moving the cursor previews that theme across the whole shell"
+        );
+        assert_eq!(
+            s.theme_selected, None,
+            "previewing is not choosing — nothing is kept until Enter"
+        );
+
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::None);
+        assert_eq!(s.theme_selected, Some(1));
+        assert_eq!(
+            s.effective_theme(&boot),
+            s.themes[1].theme,
+            "the kept theme survives the picker closing"
+        );
+        assert_eq!(
+            s.outbox,
+            vec![Intent::SetTheme {
+                id: "light".to_owned()
+            }],
+            "the harness is asked to remember it for the next launch"
+        );
+
+        // Esc abandons a preview: the kept theme comes back.
+        open_theme_picker(&mut s);
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.theme_selected, Some(1));
+        assert_eq!(s.effective_theme(&boot), s.themes[1].theme);
+    }
+
+    #[test]
+    fn the_theme_picker_filters_and_guards_a_zero_match_submit() {
+        let mut s = AppState::new();
+        open_theme_picker(&mut s);
+        for c in "mono".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        let Overlay::ThemePicker { query, selected } = &s.overlay else {
+            unreachable!("the picker stays open while filtering")
+        };
+        assert_eq!(query, "mono");
+        assert_eq!(*selected, 0, "editing the query returns to the top");
+        let matches = crate::state::filter_themes(&s.themes, "mono");
+        assert_eq!(matches.len(), 1);
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.themes[s.theme_selected.expect("kept")].id, "monochrome");
+
+        // A query matching nothing keeps nothing (the zero-match guard every
+        // other picker uses).
+        let before = s.theme_selected;
+        s.outbox.clear();
+        open_theme_picker(&mut s);
+        for c in "zzzz".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.theme_selected, before);
+        assert!(s.outbox.is_empty());
+    }
+
+    #[test]
+    fn an_installed_pack_is_offered_and_previewed_like_a_builtin() {
+        // The harness parses packs and hands them over as rows; the reducer
+        // treats them exactly like the built-ins.
+        let mut s = AppState::new();
+        let mut pack_theme = crate::Theme::light();
+        pack_theme.focus.active = ratatui::style::Color::Rgb(1, 2, 3);
+        s.themes.push(crate::state::ThemeChoice {
+            id: "solarized".to_owned(),
+            summary: "installed theme pack".to_owned(),
+            theme: pack_theme,
+            pack: true,
+        });
+        open_theme_picker(&mut s);
+        for c in "solar".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        assert_eq!(
+            s.effective_theme(&crate::Theme::dark()),
+            pack_theme,
+            "live preview"
+        );
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::SetTheme {
+                id: "solarized".to_owned()
+            }]
+        );
     }
 }

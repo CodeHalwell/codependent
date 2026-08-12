@@ -7,6 +7,8 @@
 
 use std::cell::{Cell, RefCell};
 
+use chrono::{DateTime, Utc};
+
 use ratatui::layout::Rect;
 
 use codypendent_protocol::{
@@ -16,6 +18,7 @@ use codypendent_protocol::{
 
 use crate::action::{Action, Intent, KeyTarget, SecretKey};
 use crate::remote_ui_host::RemoteUiHostState;
+use crate::theme::{Theme, ThemeVariant};
 
 /// Maximum code-graph rows held in UI state at once. Shared by the renderer,
 /// reducer paging logic, and the CLI's SQLite query so range labels and page
@@ -303,6 +306,13 @@ pub enum Overlay {
     /// `Enter` sets [`AppState::default_mode`]; the current default is marked
     /// in the list.
     ModePicker { query: String, selected: usize },
+    /// The theme picker, opened from the command palette's `/theme` entry: the
+    /// seven built-in variants plus any data-only packs the CLI loaded at boot
+    /// ([`AppState::themes`]). The same filter/selection shape as
+    /// [`Overlay::ModePicker`]; moving the cursor previews the focused theme
+    /// across the WHOLE shell (see [`AppState::effective_theme`]), and `Enter`
+    /// keeps it and asks the harness to persist it.
+    ThemePicker { query: String, selected: usize },
     /// Add-model flow, free-text fallback (step 2): the provider-side model name,
     /// for the catalog provider chosen in step 1 (`provider_id`). `requires_key`
     /// was read from that provider's card. `api_key`:
@@ -556,6 +566,34 @@ pub enum TranscriptEntry {
     Unsupported { label: String },
 }
 
+/// Notes at or under this many lines render inline; a longer note folds
+/// (mirroring [`ToolCard`]/[`PatchSummary`]). Lives here, next to
+/// [`TranscriptEntry::is_foldable`], so the renderer's click targets and the
+/// reducer's keyboard walk can never disagree about which notes fold.
+pub(crate) const NOTE_INLINE_LINE_THRESHOLD: usize = 2;
+
+impl TranscriptEntry {
+    /// Whether this entry renders a collapsible head — a tool card, a patch
+    /// diff, the backstage fold, a long note, or a failed run's raw error
+    /// chain. The single source of truth for RULE 3 parity here: the renderer
+    /// registers a click target on exactly these entries, and `Alt-↑`/`Alt-↓`
+    /// walk exactly these entries, so every fold reachable by mouse is
+    /// reachable by keyboard and vice versa.
+    #[must_use]
+    pub fn is_foldable(&self) -> bool {
+        match self {
+            TranscriptEntry::Tool(_)
+            | TranscriptEntry::Patch(_)
+            | TranscriptEntry::Backstage { .. } => true,
+            TranscriptEntry::Note { text, .. } => text.lines().count() > NOTE_INLINE_LINE_THRESHOLD,
+            TranscriptEntry::Completed { disposition, .. } => {
+                matches!(disposition, RunDisposition::Failed { .. })
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A pending approval awaiting a decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApproval {
@@ -611,6 +649,14 @@ pub struct RunView {
     pub disposition: Option<RunDisposition>,
     /// The ordered transcript.
     pub transcript: Vec<TranscriptEntry>,
+    /// When each transcript entry's originating event occurred
+    /// (`SessionEvent.occurred_at`), parallel to `transcript` — index `i` is
+    /// entry `i`'s time. Kept in lockstep by [`AppState::push_entry`], the one
+    /// writer of both, and read only through [`RunView::entry_time`]. Carried
+    /// as a side vector rather than a field on every `TranscriptEntry` variant
+    /// so that folding a time onto an entry costs nothing at the ~30 match
+    /// sites that do not care about it.
+    pub entry_times: Vec<DateTime<Utc>>,
     /// Selected transcript entry (for expand / detail).
     pub transcript_selected: usize,
     /// Transcript scroll offset in rows (used only when not following).
@@ -636,10 +682,19 @@ impl RunView {
             cost_minor: None,
             disposition: None,
             transcript: Vec::new(),
+            entry_times: Vec::new(),
             transcript_selected: 0,
             scroll: 0,
             follow: true,
         }
+    }
+
+    /// When transcript entry `idx` arrived, if known. `None` for an entry
+    /// pushed by a test straight into `transcript` (the reducer always goes
+    /// through [`AppState::push_entry`]).
+    #[must_use]
+    pub fn entry_time(&self, idx: usize) -> Option<DateTime<Utc>> {
+        self.entry_times.get(idx).copied()
     }
 }
 
@@ -1431,6 +1486,84 @@ pub(crate) const MODE_CARDS: &[ModeCard] = &[
     },
 ];
 
+/// One selectable theme: a built-in variant, or a data-only theme pack the CLI
+/// loaded from `<data-dir>/themes/<id>.toml` at boot. The resolved [`Theme`]
+/// travels with the row so the picker can preview it live — the TUI crate
+/// performs no I/O, so a pack's colours must arrive already parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeChoice {
+    /// The id `--theme`/`CODYPENDENT_THEME` and the persisted preference use.
+    pub id: String,
+    /// What this theme is for, in one line.
+    pub summary: String,
+    /// The colours themselves.
+    pub theme: Theme,
+    /// `true` for a data-only pack, `false` for a built-in variant.
+    pub pack: bool,
+}
+
+/// The seven built-in variants, in the order the picker lists them: the two
+/// everyday themes first, then the accessibility variants, then the
+/// reduced-depth fallbacks.
+#[must_use]
+pub fn builtin_theme_choices() -> Vec<ThemeChoice> {
+    [
+        ("dark", "true-colour dark — the default", ThemeVariant::Dark),
+        ("light", "true-colour light terminals", ThemeVariant::Light),
+        (
+            "high-contrast",
+            "pure black on white, maximum contrast",
+            ThemeVariant::HighContrast,
+        ),
+        (
+            "color-blind-safe",
+            "Okabe–Ito hues, safe for all common colour vision",
+            ThemeVariant::ColorBlindSafe,
+        ),
+        (
+            "ansi256",
+            "xterm-256 indexed palette",
+            ThemeVariant::Ansi256,
+        ),
+        (
+            "ansi16",
+            "basic ANSI palette for 16-colour terminals",
+            ThemeVariant::Ansi16,
+        ),
+        (
+            "monochrome",
+            "no colour at all — white, grey, black",
+            ThemeVariant::Monochrome,
+        ),
+    ]
+    .into_iter()
+    .map(|(id, summary, variant)| ThemeChoice {
+        id: id.to_owned(),
+        summary: summary.to_owned(),
+        theme: Theme::variant(variant),
+        pack: false,
+    })
+    .collect()
+}
+
+/// The indices into `themes` whose id or summary case-insensitively contains
+/// `query`, in list order — the theme picker's substring filter, the same
+/// shape as [`filter_models`]. An empty query matches every theme.
+#[must_use]
+pub fn filter_themes(themes: &[ThemeChoice], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    themes
+        .iter()
+        .enumerate()
+        .filter(|(_, choice)| {
+            needle.is_empty()
+                || choice.id.to_lowercase().contains(&needle)
+                || choice.summary.to_lowercase().contains(&needle)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 /// The indices into [`MODE_CARDS`] whose label or summary case-insensitively
 /// contains `query` — the mode picker's substring filter, in table order.
 /// Mirrors [`filter_models`], adapted to a static table (no state list to
@@ -1618,6 +1751,12 @@ pub struct AppState {
     /// text lands here; Enter sends it (starting a run, or steering the active
     /// one). Empty by default.
     pub composer: String,
+    /// The insertion point in [`AppState::composer`], as a **byte** offset that
+    /// is always on a `char` boundary and never past `composer.len()`. Every
+    /// composer mutation goes through the splice helpers in [`crate::reduce`],
+    /// which maintain both invariants; `Left`/`Right` step whole graphemes, so
+    /// a multi-byte character or a combining sequence is never split.
+    pub composer_cursor: usize,
     /// Prior composer submissions (shell-style history), oldest first. `Up`
     /// (`HistoryPrev`) walks backward from the newest entry; `Down`
     /// (`HistoryNext`) walks forward. Populated by `InputSubmit` on a
@@ -1636,6 +1775,23 @@ pub struct AppState {
     /// `HistoryNext` walking back past the newest entry can restore it
     /// verbatim. The in-progress text is never lost.
     pub composer_stash: Option<String>,
+    /// Whether the transcript fold selection is live: the base view is
+    /// *browsing* its folds (`Alt-↑`/`Alt-↓`) rather than purely composing.
+    /// While set, the selected run's `transcript_selected` entry renders
+    /// highlighted, the viewport keeps it in sight, and `Alt-Enter` toggles it
+    /// instead of inserting a line break. Cleared by typing, scrolling, or
+    /// `Esc` — every gesture that means "I am driving the composer/view
+    /// again". Client-only view state; never on the wire.
+    pub transcript_browse: bool,
+    /// Every theme the `/theme` picker offers: the seven built-in variants,
+    /// plus any data-only packs the CLI loaded from `<data-dir>/themes/` at
+    /// boot (the TUI crate does no I/O, so a pack arrives already parsed).
+    pub themes: Vec<ThemeChoice>,
+    /// Index into [`AppState::themes`] of the theme in force, once the operator
+    /// has picked one. `None` means "whatever the harness resolved at boot"
+    /// (the `--theme` flag, `CODYPENDENT_THEME`, a persisted preference, or
+    /// terminal detection) — see [`AppState::effective_theme`].
+    pub theme_selected: Option<usize>,
     /// Which base layout is rendered (chat single-column vs. workspace panes).
     /// Toggled with `F2`; defaults to [`LayoutMode::Chat`].
     pub layout: LayoutMode,
@@ -1745,9 +1901,13 @@ impl AppState {
             selected_issue: 0,
             focus: Pane::Sessions,
             composer: String::new(),
+            composer_cursor: 0,
             composer_history: Vec::new(),
             history_cursor: None,
             composer_stash: None,
+            transcript_browse: false,
+            themes: builtin_theme_choices(),
+            theme_selected: None,
             layout: LayoutMode::Chat,
             transcript_max_scroll: Cell::new(0),
             hit_map: RefCell::new(Vec::new()),
@@ -1824,6 +1984,7 @@ impl AppState {
             | Overlay::ModelPicker { .. }
             | Overlay::ProviderPicker { .. }
             | Overlay::ModePicker { .. }
+            | Overlay::ThemePicker { .. }
             | Overlay::ApiKeys { .. }
             | Overlay::AddModelPick { .. } => InputMode::Palette,
             // The Skills / Memory / Docs / Edges / Workflow / Help browsers are
@@ -2037,6 +2198,46 @@ impl AppState {
         }
     }
 
+    /// The theme this frame draws in: the row the `/theme` picker is focused on
+    /// (so moving the cursor previews the whole shell in that theme), else the
+    /// operator's kept choice, else `boot` — whatever the harness resolved from
+    /// `--theme`/`CODYPENDENT_THEME`/the persisted preference/terminal
+    /// detection. Pure, so the renderer stays a projection of state.
+    #[must_use]
+    pub fn effective_theme(&self, boot: &Theme) -> Theme {
+        if let Overlay::ThemePicker { query, selected } = &self.overlay {
+            let filtered = filter_themes(&self.themes, query);
+            if let Some(choice) = filtered
+                .get(*selected)
+                .and_then(|&idx| self.themes.get(idx))
+            {
+                return choice.theme;
+            }
+        }
+        self.theme_selected
+            .and_then(|idx| self.themes.get(idx))
+            .map_or(*boot, |choice| choice.theme)
+    }
+
+    /// Whether any surface on screen right now has a moving part — a run that
+    /// is thinking or executing a tool, a code-graph page in flight, or a
+    /// provider's model list being fetched.
+    ///
+    /// The interactive client redraws on every tick while this holds, and
+    /// falls back to its sparse keep-alive redraw otherwise. Without it, the
+    /// spinners were repainted once every 25 ticks (~5s) — a "spinner" that
+    /// changes frame once every five seconds reads as a frozen UI, which is
+    /// the exact opposite of what it is there to say.
+    #[must_use]
+    pub fn is_animating(&self) -> bool {
+        self.edge_loading
+            || matches!(self.overlay, Overlay::AddModelQuerying { .. })
+            || self
+                .runs
+                .iter()
+                .any(|run| !matches!(run.activity, RunActivity::Idle))
+    }
+
     /// Drain the outbox of intents accumulated since the last call. The CLI's
     /// connection task calls this after each reduce to dispatch commands.
     pub fn drain_outbox(&mut self) -> Vec<Intent> {
@@ -2105,8 +2306,10 @@ impl AppState {
         self.runs.get_mut(self.selected_run)
     }
 
-    /// Append model text, coalescing into a trailing `Model` entry.
-    pub(crate) fn append_model_text(run: &mut RunView, text: &str) {
+    /// Append model text, coalescing into a trailing `Model` entry. The
+    /// coalesced entry keeps the timestamp of its FIRST delta — that is when
+    /// the turn began, which is what the turn header shows.
+    pub(crate) fn append_model_text(run: &mut RunView, text: &str, at: DateTime<Utc>) {
         if let Some(TranscriptEntry::Model {
             text: existing,
             rendered,
@@ -2130,17 +2333,25 @@ impl AppState {
                 text: text.to_owned(),
                 rendered: None,
             },
+            at,
         );
     }
 
-    /// Append a transcript entry, holding the transcript to
-    /// [`MAX_TRANSCRIPT_ENTRIES`] by dropping the oldest — the ledger, not this
-    /// view, is the durable record. Selection/scroll indices shift with the
-    /// drop so the focused entry stays the same one.
-    pub(crate) fn push_entry(run: &mut RunView, entry: TranscriptEntry) {
+    /// Append a transcript entry and the wall-clock time of the event that
+    /// produced it, holding the transcript to [`MAX_TRANSCRIPT_ENTRIES`] by
+    /// dropping the oldest — the ledger, not this view, is the durable record.
+    /// Selection/scroll indices shift with the drop so the focused entry stays
+    /// the same one.
+    ///
+    /// This is the ONLY writer of [`RunView::entry_times`]; keeping the push
+    /// and the timestamp in one call is what holds the two vectors in lockstep
+    /// (asserted by `transcript_and_entry_times_stay_in_lockstep`).
+    pub(crate) fn push_entry(run: &mut RunView, entry: TranscriptEntry, at: DateTime<Utc>) {
         run.transcript.push(entry);
+        run.entry_times.push(at);
         while run.transcript.len() > MAX_TRANSCRIPT_ENTRIES {
             run.transcript.remove(0);
+            run.entry_times.remove(0);
             run.transcript_selected = run.transcript_selected.saturating_sub(1);
             run.scroll = run.scroll.saturating_sub(1);
         }

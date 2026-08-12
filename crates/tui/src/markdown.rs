@@ -53,6 +53,8 @@ pub enum SyntaxRole {
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use synoptic::{from_extension, TokOpt};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 // Test-only, per-test-thread instrumentation. A thread-local counter keeps
 // parallel renderer tests from being mistaken for work performed by the
@@ -384,7 +386,12 @@ fn layout_table(t: &TableState) -> Vec<Vec<RichSpan>> {
     }
     let cell_text =
         |cell: &[RichSpan]| -> String { cell.iter().map(|s| s.text.as_str()).collect() };
-    let cell_width = |cell: &[RichSpan]| -> usize { cell_text(cell).chars().count() };
+    // Column budgets are terminal CELLS, so widths and padding must both be
+    // measured in display columns: a CJK or emoji cell counted by `char`s
+    // occupies twice the space it was allotted and shears every column to its
+    // right out of alignment.
+    let cell_width =
+        |cell: &[RichSpan]| -> usize { UnicodeWidthStr::width(cell_text(cell).as_str()) };
 
     // Column widths, capped so n_cols columns + " │ " joins fit MAX_TABLE_WIDTH.
     let cap = (MAX_TABLE_WIDTH / n_cols).max(3);
@@ -397,9 +404,23 @@ fn layout_table(t: &TableState) -> Vec<Vec<RichSpan>> {
 
     let pad_cell = |cell: &[RichSpan], w: usize, align: Alignment, role: SpanRole| -> RichSpan {
         let mut text = cell_text(cell);
-        let len = text.chars().count();
+        let len = UnicodeWidthStr::width(text.as_str());
         if len > w {
-            text = text.chars().take(w.saturating_sub(1)).collect::<String>() + "…";
+            // Drop whole graphemes until the "…" fits: a wide glyph may free
+            // two columns at once, and half a grapheme is not a character.
+            let mut kept = String::new();
+            let mut width = 0;
+            for grapheme in UnicodeSegmentation::graphemes(text.as_str(), true) {
+                let next = UnicodeWidthStr::width(grapheme);
+                if width + next > w.saturating_sub(1) {
+                    break;
+                }
+                kept.push_str(grapheme);
+                width += next;
+            }
+            // The ellipsis is one column; anything left over is padding, so the
+            // cell still occupies exactly `w` columns.
+            text = kept + "…" + &" ".repeat(w.saturating_sub(width + 1));
         } else {
             let fill = w - len;
             match align {
@@ -730,5 +751,60 @@ mod tests {
         };
         assert_eq!(widths(&lines[0]), widths(&lines[2]), "columns not aligned");
         assert!(lines[2].spans.iter().any(|s| s.role == SpanRole::TableCell));
+    }
+
+    /// Table columns are terminal CELLS. A CJK or emoji cell counted by `char`s
+    /// takes twice the columns it was allotted, shearing every column to its
+    /// right; widths and padding are therefore measured in display columns.
+    #[test]
+    fn table_columns_align_by_display_width_not_char_count() {
+        let md = "| name | n |\n| :- | -: |\n| 日本語 | 1 |\n| ab | 2 |\n| 🚀🚀 | 3 |";
+        let lines = parse(md);
+        let display_width = |l: &RichLine| -> usize {
+            l.spans
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.text.as_str()))
+                .sum()
+        };
+        let header = display_width(&lines[0]);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(
+                display_width(line),
+                header,
+                "row {i} is a different number of terminal columns:\n{:?}",
+                line.spans.iter().map(|s| &s.text).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// An overlong wide cell is ellipsed on a grapheme boundary and padded back
+    /// out to its full column budget — never half a glyph, never a short cell.
+    #[test]
+    fn an_overlong_wide_cell_truncates_on_a_grapheme_boundary() {
+        let long = "日".repeat(80);
+        let md = format!("| a |\n| :- |\n| {long} |");
+        let lines = parse(&md);
+        let body = lines.last().expect("a body row");
+        let text: String = body.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains('…'), "an overlong cell is ellipsed: {text:?}");
+        // Every kept glyph is whole (the string is valid, and re-splitting it
+        // into graphemes round-trips).
+        let rejoined: String =
+            unicode_segmentation::UnicodeSegmentation::graphemes(text.as_str(), true).collect();
+        assert_eq!(rejoined, text);
+        let header_width: usize = lines[0]
+            .spans
+            .iter()
+            .map(|s| unicode_width::UnicodeWidthStr::width(s.text.as_str()))
+            .sum();
+        let body_width: usize = body
+            .spans
+            .iter()
+            .map(|s| unicode_width::UnicodeWidthStr::width(s.text.as_str()))
+            .sum();
+        assert_eq!(
+            body_width, header_width,
+            "the ellipsed cell keeps its budget"
+        );
     }
 }

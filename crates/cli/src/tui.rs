@@ -254,8 +254,15 @@ pub async fn run(
 
     // STEP 6.6 wiring: terminal color-depth detection (NO_COLOR/COLORTERM/TERM)
     // with a manual override that always wins, replacing the old hardcoded
-    // `Theme::dark()`.
-    let theme = crate::theme_select::resolve_theme(paths, theme_override.as_deref())?;
+    // `Theme::dark()`. The session store is loaded first so the theme the
+    // operator last kept in `/theme` participates in that resolution (below an
+    // explicit `--theme`/`CODYPENDENT_THEME`, above detection).
+    let mut store = SessionStore::load(paths);
+    let theme = crate::theme_select::resolve_theme(
+        paths,
+        theme_override.as_deref(),
+        store.theme.as_deref(),
+    )?;
 
     // D2: enter raw mode + the alternate screen EARLY — before any daemon
     // work — so the (possibly multi-second) boot draws a splash instead of
@@ -280,7 +287,29 @@ pub async fn run(
     let boot_warnings: BootWarnings = BootWarnings::default();
 
     let mut state = AppState::new();
-    let mut store = SessionStore::load(paths);
+    // The `/theme` picker's rows: the built-in variants `AppState::new` seeds,
+    // plus every installed data-only pack (the TUI crate does no I/O, so packs
+    // are parsed out here). The row matching the theme actually in force is
+    // marked current, so the picker opens on what is already on screen.
+    state.themes.extend(
+        crate::theme_select::discover_theme_packs(paths)
+            .into_iter()
+            .map(|(id, theme)| codypendent_tui::ThemeChoice {
+                id,
+                summary: "installed theme pack".to_owned(),
+                theme,
+                pack: true,
+            }),
+    );
+    state.theme_selected = theme_override
+        .as_deref()
+        .or(store.theme.as_deref())
+        .and_then(|id| {
+            state
+                .themes
+                .iter()
+                .position(|choice| choice.id.eq_ignore_ascii_case(id))
+        });
 
     // Drive boot and the splash concurrently: poll the pinned boot future to
     // completion while redrawing the splash on each tick. Once boot is ready,
@@ -1522,12 +1551,16 @@ async fn event_loop<P: Presentation>(
                 ),
             }
         }
-        // The steady shell has no frame-based animation. Wakeups still drive
-        // repair and reducer time, but only notice expiry and the periodic
-        // projection refresh need a new frame; input and daemon events redraw
-        // immediately through the non-tick path.
+        // A steady shell has no frame-based animation, so most ticks need no
+        // frame: input and daemon events redraw immediately through the
+        // non-tick path. But while a spinner is on screen — a run thinking or
+        // running a tool, a graph page loading, a model list being fetched —
+        // every tick must draw, or the "spinner" advances one frame per 25
+        // ticks (~5s) and reads as a frozen UI. The 25-tick beat stays as the
+        // keep-alive for notice expiry and the periodic projection refresh.
         let redraw = !tick_action
             || state.notice != notice_before
+            || state.is_animating()
             || state.tick.is_multiple_of(25)
             || presentation.wants_periodic_draw();
 
@@ -1891,6 +1924,15 @@ async fn event_loop<P: Presentation>(
             }
             if let Intent::RemoveApiKey { target } = &intent {
                 apply_remove_api_key(state, paths, target);
+                continue;
+            }
+            // `/theme` is a display preference, not a daemon command: the live
+            // switch already happened (the renderer draws in the picked theme),
+            // so all that remains is to remember it for the next launch.
+            // `theme_select` reads it back below `--theme`/`CODYPENDENT_THEME`.
+            if let Intent::SetTheme { id } = &intent {
+                store.theme = Some(id.clone());
+                store.save(paths);
                 continue;
             }
             // Council creation is local, private configuration just like the
@@ -3137,6 +3179,9 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         ),
         Intent::VerifyApiKey { .. } => unreachable!(
             "VerifyApiKey is probed locally by the harness (verify_model_key), never sent to the daemon"
+        ),
+        Intent::SetTheme { .. } => unreachable!(
+            "SetTheme is a local display preference persisted by the harness, never sent to the daemon"
         ),
         Intent::CreateCouncil { .. } => unreachable!(
             "CreateCouncil is validated and persisted locally by the harness, never sent to the daemon"
@@ -5884,6 +5929,13 @@ struct SessionStore {
     /// on the next launch so this client keeps one identity across restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume_token: Option<String>,
+    /// The theme id last kept in the TUI's `/theme` picker — a built-in variant
+    /// name or an installed pack id. Read at boot by `theme_select`, BELOW an
+    /// explicit `--theme`/`CODYPENDENT_THEME` (an explicit override always
+    /// wins) and above terminal detection. An unknown id simply falls through
+    /// to detection, so a removed pack cannot wedge the TUI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
 }
 
 /// One remembered session: its id and the workspace it belongs to.

@@ -73,11 +73,26 @@ codypendent
 - `ansi256` / `ansi16` (legacy terminal fallbacks)
 - `monochrome` (grayscale / no-color mode)
 
+#### Switching themes while running
+
+Open the command palette with `/` and choose **`/theme`  Theme picker**. It
+lists the seven built-in variants plus any data-only theme packs installed
+under `<data-dir>/themes/*.toml`. Moving the cursor previews the theme across
+the whole interface; `Enter` keeps it, `Esc` goes back to the one in force.
+
+A kept theme is remembered for the next launch. Resolution order at boot is:
+`--theme` / `CODYPENDENT_THEME` (an explicit override always wins) → the theme
+last kept in the picker → terminal capability detection. A remembered theme
+that no longer resolves (an uninstalled pack) quietly falls back to detection
+rather than failing the launch.
+
 ---
 
 ### 3.2 Keyboard & Mouse Parity Reference
 
-The TUI guarantees 100% feature parity between keyboard hotkeys and mouse actions.
+Every mouse gesture the TUI recognizes has a keyboard equivalent; the reverse
+is not claimed — some keys (steering, run switching, cursor motion) have no
+mouse gesture at all, and the table below says so with `-`.
 
 ```mermaid
 graph LR
@@ -89,36 +104,48 @@ graph LR
 
 #### Complete Hotkey Matrix
 
+The TUI has no permanent buttons, tabs, or toolbars: every surface is either
+the conversation, the composer, the one-line footer, or an overlay. The mouse
+column below therefore names only the things that actually exist on screen —
+rows, chips, and panes you can see. Where it says `-`, the mouse has no
+equivalent and the key is the only way in.
+
 | Category | Key | Action | Mouse Equivalent |
 | :--- | :--- | :--- | :--- |
-| **Navigation** | `F2` | Toggle layout (Chat ⇄ Workspace Panes) | Click Layout Button |
-| | `Tab` | Cycle focused pane | Click Pane Header |
-| | `↑` / `↓` or `k` / `j` | Move selection in list / browser / palette | Scroll Wheel |
-| | `PgUp` / `PgDn` | Scroll chat conversation history | Scroll Wheel on Chat |
+| **Navigation** | `F2` | Toggle layout (Chat ⇄ Workspace Panes) | Click the `F2 workspace` footer chip |
+| | `Tab` | Cycle focused pane (Workspace layout) | Click a pane |
+| | `↑` / `↓` or `k` / `j` | Move selection in list / browser / palette | Scroll wheel |
+| | `PgUp` / `PgDn` | Scroll chat conversation history a page | Scroll wheel (3 lines per notch) |
 | | `Ctrl-↑` / `Ctrl-↓` | Switch to previous / next active run | - |
+| | `Alt-↑` / `Alt-↓` | Browse transcript folds (tool cards, diffs, long notes) | Click a fold line |
+| | `Alt-Enter` | Expand / collapse the browsed fold, else insert a line break | Click a fold line |
+| **Composer** | `←` / `→` / `Home` / `End` | Move the draft cursor (within its own line) | - |
+| | `Ctrl-W` / `Ctrl-U` | Delete the word before the cursor / to the line start | - |
+| | `↑` / `↓` | Move between the draft's lines; recall history at its edges | - |
 | **Remote UI** | `F6` | Enter the mounted extension document without activating a control | Click extension chrome / the "Extension UI ready" footer |
 | | `Shift-F6` | Focus the next mounted extension document | - |
 | | `Tab` / `Shift-Tab` | Move through controls across all mounted documents | Click a control |
 | | `Enter` / `Space` | Activate the focused extension control | Click the control |
 | | `Esc` | Return to the conversation composer | - |
-| **Run Control** | `n` | Start a new run | Click "+ New Run" |
-| | `p` | Pause current run | Click "Pause" |
-| | `c` | Cancel active run | Click "Cancel" |
-| | `s` | Steer / add prompt to running agent | - |
-| | `q` or `Ctrl-C` | Detach TUI (run continues in daemon) | Click "Detach" |
-| **Approvals** | `a` | Approve requested action **once** | Click "Approve Once" |
-| | `A` | Approve requested action **for the whole run** | Click "Approve All" |
-| | `r` | Reject proposed action | Click "Reject" |
-| **Studios & Views** | `/` | Open searchable Command Palette | Click Palette Icon |
-| | `S` | Open Skills Studio | Click Skills Tab |
-| | `M` | Open Memory & Knowledge Fabric Browser | Click Memory Tab |
-| | `o` | Open current source file in external editor | Click File Link |
-| | `D` | Open Collaborative Docs Studio | Click Docs Tab |
-| | `G` | Open Code Graph Edge Inspector | Click Graph Node |
-| | `W` | Open Workflow Conductor View | Click Workflow Tab |
-| | `B` | Open Agent Blackboard / Claims View | Click Blackboard Tab |
-| | `?` | Toggle Help Overlay | Click Help Button |
-| | `Esc` | Clear draft, exit prompt, or close overlay | - |
+| **Run Control** | `n` | Start a new run | Palette row "New run" |
+| | `p` | Pause current run | Palette row "Pause / resume run" |
+| | `c` | Cancel active run | Palette row "Cancel run" |
+| | `s` | Steer / add prompt to running agent | Palette row "Steer run" |
+| | `q` or `Ctrl-C` | Detach TUI (run continues in daemon) | Palette row "Detach" |
+| **Approvals** | `a` | Approve requested action **once** | Click the `a once` footer chip |
+| | `A` | Approve requested action **for the whole run** | Click the `A run` footer chip |
+| | `r` | Reject proposed action | Click the `r reject` footer chip |
+| **Studios & Views** | `/` | Open searchable Command Palette | Click the `/ commands` footer chip |
+| | `S` | Open Skills Studio | Palette row "Skills" (or the `S skills` chip in Memory) |
+| | `M` | Open Memory & Knowledge Fabric Browser | Palette row "Memory" (or the `M memory` chip in Skills) |
+| | `o` | Reveal the focused memory's source | Click the `o source` chip in Memory |
+| | `D` | Open Collaborative Docs Studio | Palette row "Docs Studio" |
+| | `G` | Open Code Graph Edge Inspector | Palette row "Code graph" |
+| | `W` | Open Workflow Conductor View | Palette row "Workflows" |
+| | `B` | Open Agent Blackboard / Claims View | Palette row "Blackboard" |
+| | `/theme` | Switch the colour theme (previews live) | Palette row "/theme  Theme picker" |
+| | `?` | Toggle Help Overlay | Palette row "Help" |
+| | `Esc` | Clear draft, exit prompt, or close overlay | Click outside an overlay, or its `Esc close` chip |
 
 ---
 

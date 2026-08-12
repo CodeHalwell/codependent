@@ -144,8 +144,22 @@ pub enum Action {
     ScrollPageUp,
     /// Scroll the transcript down a page (`PageDown`).
     ScrollPageDown,
+    /// Scroll the transcript up a few lines (one wheel notch). The finer
+    /// sibling of [`Action::ScrollPageUp`]; a wheel notch that jumped ten rows
+    /// read as a page jump, not a scroll.
+    ScrollLinesUp,
+    /// Scroll the transcript down a few lines (one wheel notch).
+    ScrollLinesDown,
     /// Open / expand the selected item (`Enter`).
     Expand,
+    /// Move the transcript fold selection to the previous foldable entry of the
+    /// selected run (`Alt-↑` in the base conversation). Entering this browse
+    /// mode is what makes tool cards and patch diffs keyboard-reachable:
+    /// `Alt-Enter` then expands the browsed fold. Client-only.
+    BrowseFoldPrev,
+    /// Move the transcript fold selection to the next foldable entry
+    /// (`Alt-↓`). Client-only.
+    BrowseFoldNext,
 
     // --- run control ---
     /// Switch the conversation to the previous run (`Ctrl-↑`).
@@ -175,8 +189,22 @@ pub enum Action {
     InputChar(char),
     /// Insert bracketed-paste text into the open prompt.
     InputPaste(String),
-    /// Delete the last character of the open prompt.
+    /// Delete the character before the cursor of the open prompt.
     InputBackspace,
+    /// Move the composer cursor one grapheme left / right (`←`/`→`).
+    /// Client-only.
+    CursorLeft,
+    /// Move the composer cursor one grapheme right (`→`). Client-only.
+    CursorRight,
+    /// Move the composer cursor to the start of its current line (`Home`).
+    CursorLineStart,
+    /// Move the composer cursor to the end of its current line (`End`).
+    CursorLineEnd,
+    /// Delete the word before the composer cursor (`Ctrl-W`). Client-only.
+    DeleteWordBack,
+    /// Delete from the start of the current line to the composer cursor
+    /// (`Ctrl-U`). Client-only.
+    DeleteToLineStart,
     /// Insert a manual line break into the open prompt (`Alt+Enter`) without
     /// submitting — the composer/prompt buffer already renders embedded `\n`
     /// as separate lines, growing to fit.
@@ -722,6 +750,14 @@ pub enum Intent {
         model_id: String,
     },
 
+    /// Remember the theme picked in `/theme` so the next launch starts in it
+    /// (client-only — a display preference, never a daemon command). The
+    /// harness persists the id beside its session store; `theme_select` reads
+    /// it at boot, below `--theme`/`CODYPENDENT_THEME`. The live switch does
+    /// not depend on this: the renderer already draws in the picked theme.
+    SetTheme {
+        id: String,
+    },
     /// Set (or replace) an API key from the `/keys` overlay (D1; client-only —
     /// NOT a daemon command, keeping the key off the wire exactly like
     /// `AddModel`). The harness writes it to `auth.json` (load-before-write,

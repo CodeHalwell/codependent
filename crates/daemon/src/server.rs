@@ -3536,6 +3536,7 @@ async fn authorize_workflow_resource(
     .bind(workflow_run_id)
     .fetch_optional(pool)
     .await?;
+    // Deny-first: no row, or a row owned by another session, both fail.
     if owner.is_none_or(|(owner,)| owner != session_id.to_string()) {
         anyhow::bail!("workflow resource does not belong to the broker session");
     }

@@ -54,6 +54,8 @@ pub enum PaletteCommand {
     UnslothCatalog,
     /// Toggle speaking finalized assistant turns aloud (voice v1, rubric 8).
     VoiceSpeak,
+    /// Open the theme picker (7 built-in variants + installed packs).
+    Theme,
     /// Flip between the chat and workspace layouts.
     ToggleLayout,
     /// Toggle the help overlay.
@@ -250,6 +252,14 @@ pub const COMMANDS: &[PaletteEntry] = &[
             "read each finished assistant turn aloud (needs a [speech] entry and a play_command)",
         // Palette-only: speaking aloud is a deliberate, occasional choice, not
         // something to fire from a stray keystroke.
+        key: "—",
+        group: "Session",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Theme,
+        title: "/theme  Theme picker",
+        description: "switch the colour theme — previews live as you move",
+        // Palette-only, like the model/provider/mode pickers.
         key: "—",
         group: "Session",
     },
