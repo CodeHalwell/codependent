@@ -529,9 +529,9 @@ impl AcpDiscovery {
 }
 
 /// A parenthesized suffix for `session/new` failures naming the agent's
-/// advertised authentication methods — turning an opaque "session/new failed"
-/// into an actionable "run `claude /login`"-style hint. Empty when the agent
-/// advertised none (never fabricate a remedy the agent did not offer).
+/// advertised authentication methods, in the agent's own words — turning an
+/// opaque "session/new failed" into a message that says what to go do. Empty
+/// when the agent advertised none: never fabricate a remedy it did not offer.
 fn auth_methods_hint(methods: &[AcpAuthMethod]) -> String {
     if methods.is_empty() {
         return String::new();
