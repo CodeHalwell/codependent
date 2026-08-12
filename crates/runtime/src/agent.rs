@@ -1889,11 +1889,27 @@ impl FrameworkAgentRuntime {
                         // boundaries; chunks still queued at completion are
                         // caught by the drain below.
                         biased;
-                        _ = cancel.cancelled() => break 'agent Terminal::Cancelled,
+                        // Both abandon-the-step arms flush `pending` on the way
+                        // out. Coalescing means text can be buffered but not yet
+                        // journaled at the instant a cancel or the wall clock
+                        // fires; without this, up to one window's worth of text
+                        // the reader ALREADY SAW live would be missing from the
+                        // ledger, breaking the "deltas are journaled" recovery
+                        // property precisely on the abnormal paths where the
+                        // record matters most.
+                        _ = cancel.cancelled() => {
+                            self.flush_deltas(&run, &run_actor, &mut pending).await?;
+                            break 'agent Terminal::Cancelled;
+                        }
                         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
                             run_started + Duration::from_secs(MAX_WALL_CLOCK_SECS)
                                 + paused_total
-                        )) => break 'agent Terminal::Failed("wall-clock budget exhausted".to_string()),
+                        )) => {
+                            self.flush_deltas(&run, &run_actor, &mut pending).await?;
+                            break 'agent Terminal::Failed(
+                                "wall-clock budget exhausted".to_string()
+                            );
+                        }
                         res = &mut step_fut => break res,
                         Some(chunk) = rx.recv() => {
                             streamed_this_step = true;
@@ -1903,15 +1919,7 @@ impl FrameworkAgentRuntime {
                                 // A newline is a natural reader boundary —
                                 // journal the buffered line(s) immediately.
                                 flush_deadline = None;
-                                self.emit(
-                                    run.session_id,
-                                    run_actor.clone(),
-                                    EventBody::ModelStreamDelta {
-                                        run_id: run.run_id,
-                                        text: std::mem::take(&mut pending),
-                                    },
-                                )
-                                .await?;
+                                self.flush_deltas(&run, &run_actor, &mut pending).await?;
                             } else if flush_deadline.is_none() {
                                 flush_deadline = Some(
                                     tokio::time::Instant::now() + DELTA_COALESCE_WINDOW,
@@ -1927,17 +1935,7 @@ impl FrameworkAgentRuntime {
                             flush_deadline.unwrap_or_else(tokio::time::Instant::now)
                         ), if flush_deadline.is_some() => {
                             flush_deadline = None;
-                            if !pending.is_empty() {
-                                self.emit(
-                                    run.session_id,
-                                    run_actor.clone(),
-                                    EventBody::ModelStreamDelta {
-                                        run_id: run.run_id,
-                                        text: std::mem::take(&mut pending),
-                                    },
-                                )
-                                .await?;
-                            }
+                            self.flush_deltas(&run, &run_actor, &mut pending).await?;
                         }
                     }
                 }
@@ -1953,17 +1951,7 @@ impl FrameworkAgentRuntime {
                 streamed_this_step = true;
                 pending.push_str(&chunk);
             }
-            if !pending.is_empty() {
-                self.emit(
-                    run.session_id,
-                    run_actor.clone(),
-                    EventBody::ModelStreamDelta {
-                        run_id: run.run_id,
-                        text: std::mem::take(&mut pending),
-                    },
-                )
-                .await?;
-            }
+            self.flush_deltas(&run, &run_actor, &mut pending).await?;
             let StepOutcome {
                 step,
                 usage: step_usage,
@@ -2286,6 +2274,34 @@ impl FrameworkAgentRuntime {
         if self.journal.run_state(run_id).await? != Some(state) {
             self.transition(session_id, run_id, state).await?;
         }
+        Ok(())
+    }
+
+    /// Journal-then-publish whatever stream text has coalesced in `pending` as
+    /// ONE `ModelStreamDelta`, leaving the buffer empty. The single flush point
+    /// for delta coalescing, called from every path that can end a buffering
+    /// window — a newline boundary, the window's expiry, the step's completion,
+    /// and the cancel / wall-clock exits — so no path can quietly skip one and
+    /// leave text the reader already saw missing from the ledger. An empty
+    /// buffer emits nothing, so calling it defensively is free.
+    async fn flush_deltas(
+        &self,
+        run: &RunContext,
+        run_actor: &Actor,
+        pending: &mut String,
+    ) -> anyhow::Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        self.emit(
+            run.session_id,
+            run_actor.clone(),
+            EventBody::ModelStreamDelta {
+                run_id: run.run_id,
+                text: std::mem::take(pending),
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -8053,6 +8069,72 @@ mod tests {
         );
         let deltas = drain_deltas(&mut events);
         assert_eq!(deltas.concat(), "partial");
+    }
+
+    /// Streams one sub-line chunk (so it stays BUFFERED — no newline to flush
+    /// it), signals that it has, then parks forever waiting to be cancelled.
+    struct StreamThenHangDriver {
+        chunk: String,
+        streamed: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ModelDriver for StreamThenHangDriver {
+        fn model_id(&self) -> ModelId {
+            ModelId("hang".to_string())
+        }
+
+        async fn next_step(
+            &self,
+            _transcript: &[TurnItem],
+            _tools: &[ToolDefinition],
+            sink: &mut dyn DeltaSink,
+        ) -> anyhow::Result<StepOutcome> {
+            sink.on_text(&self.chunk);
+            self.streamed.notify_one();
+            std::future::pending::<()>().await;
+            unreachable!("the run is cancelled while this future is parked")
+        }
+    }
+
+    #[tokio::test]
+    async fn text_buffered_when_a_run_is_cancelled_is_still_journaled() {
+        // Coalescing means text can be live on screen but not yet journaled
+        // when a cancel fires. The cancel path must flush it: otherwise the
+        // reader saw text the ledger has no record of — the recovery property
+        // broken exactly on the abnormal path where the record matters most.
+        let streamed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let driver = StreamThenHangDriver {
+            // No newline: nothing forces a flush before the cancel.
+            chunk: "half a thou".to_string(),
+            streamed: streamed.clone(),
+        };
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "stream then hang",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        let (handle, token) = cancellation();
+
+        let (outcome, ()) = tokio::join!(runtime.execute_run(&driver, ctx, token), async {
+            streamed.notified().await;
+            handle.cancel();
+        });
+
+        assert!(matches!(
+            outcome.expect("execute_run returns Ok").disposition,
+            RunDisposition::Cancelled { .. }
+        ));
+        assert_eq!(
+            drain_deltas(&mut events).concat(),
+            "half a thou",
+            "buffered text must be journaled before the run stops"
+        );
     }
 
     // -----------------------------------------------------------------------
