@@ -2057,7 +2057,7 @@ async fn event_loop<P: Presentation>(
         for intent in state.drain_outbox() {
             if let Intent::LoadCouncilResults { selector } = &intent {
                 let loaded = match selector {
-                    Some(selector) => crate::council::result_by_name_or_id(paths, &selector)
+                    Some(selector) => crate::council::result_by_name_or_id(paths, selector)
                         .map(|result| result.into_iter().map(council_stored_summary).collect()),
                     None => {
                         let mut warnings = Vec::new();

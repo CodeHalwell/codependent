@@ -484,7 +484,7 @@ fn render_run_telemetry(frame: &mut Frame, area: Rect, state: &AppState, theme: 
         + required.len().saturating_sub(1) * 3;
     for item in optional {
         let additional = 3 + item.text.width();
-        if used + additional + 1 <= usize::from(area.width) {
+        if used + additional < usize::from(area.width) {
             used += additional;
             required.push(item);
         }

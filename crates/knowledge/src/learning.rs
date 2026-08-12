@@ -333,7 +333,7 @@ pub enum Verification {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActivationOutcome {
     /// Record is now active and verified.
-    Activated(LearningRecord),
+    Activated(Box<LearningRecord>),
     /// An active record with the same conflict key must be resolved first.
     Conflict { conflicts_with: Vec<LearningId> },
 }
@@ -594,9 +594,7 @@ impl LearningStore {
                 conflict_key: None,
                 provenance: current.provenance.clone(),
                 confidence: confidence.unwrap_or(current.confidence),
-                expires_at: expires_at
-                    .clone()
-                    .unwrap_or_else(|| current.expires_at.clone()),
+                expires_at: expires_at.unwrap_or(current.expires_at),
                 activation: ActivationIntent::Propose,
             };
             if let Some(reason) = capture_policy_reason(&probe) {
@@ -713,7 +711,7 @@ impl LearningStore {
         let hash = normalized_hash(&record.content)?;
         update_record(&mut *tx, &record, &hash, expected_revision).await?;
         tx.commit().await?;
-        Ok(ActivationOutcome::Activated(record))
+        Ok(ActivationOutcome::Activated(Box::new(record)))
     }
 
     /// Reject a proposal or active record with an explicit reason.

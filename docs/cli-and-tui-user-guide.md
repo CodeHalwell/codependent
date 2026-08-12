@@ -1,7 +1,7 @@
 # Codypendent CLI & TUI User Guide
 
 > **Product:** Codypendent — The local-first agentic developer environment
-> **Version:** 0.4.3
+> **Version:** 0.4.4
 > **Documentation Target:** CLI reference, Ratatui TUI shortcuts, environment setup, and workflow operations.
 
 ---
@@ -44,7 +44,7 @@ codypendent update --check
 
 # Install the newest published release, or pin an exact tag.
 codypendent update
-codypendent update v0.4.3
+codypendent update v0.4.4
 ```
 
 Updating never kills an active run. An idle daemon restarts immediately; a busy

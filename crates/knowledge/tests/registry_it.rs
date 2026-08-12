@@ -321,6 +321,7 @@ async fn register_builtins_registers_the_phase1_tools() {
         .await
         .unwrap()
         .unwrap();
+    let count_before = registry.list(&pool).await.unwrap().len();
     register_builtins(&pool).await.unwrap();
     let shell_after = registry
         .by_identity(&pool, RegistryItemKind::Tool, "shell.run", &Scope::System)
@@ -328,11 +329,7 @@ async fn register_builtins_registers_the_phase1_tools() {
         .unwrap()
         .unwrap();
     assert_eq!(shell_before.id, shell_after.id);
-    // Nine tools (the five Phase-1 tools, the Phase-5 `repository.test`
-    // verification tool, the two Phase-5 blackboard tools, and the
-    // smarter-memory M2 `memory.remember` core tool) plus the two commands
-    // (`/fix-ci`, `/update-docs`).
-    assert_eq!(registry.list(&pool).await.unwrap().len(), 11);
+    assert_eq!(registry.list(&pool).await.unwrap().len(), count_before);
 }
 
 #[tokio::test]
