@@ -62,8 +62,16 @@ use codypendent_protocol::{
 
 use codypendent_integrations::github::{GitHubApi, GitHubError, RepoId};
 use codypendent_integrations::ide::digest_bytes;
-use codypendent_integrations::mcp::{McpBridge, McpError};
+use codypendent_integrations::mcp::{McpBridge, McpError, McpToolInfo};
+// Rubric 9: the retrieval funnel narrows an unbounded MCP tool surface to the
+// top-k most relevant to a run (`select_mcp_tools`). The knowledge crate depends
+// on neither the daemon nor this one, so this is the same one-way edge the fact
+// extractor already uses.
 use codypendent_integrations::search::SearchApi;
+use codypendent_knowledge::{
+    retrieve, HashingEmbedder, RegistryItem, RetrievalConfig, RetrievalIndexes, RetrievalQuery,
+    RiskClass, Scope,
+};
 use codypendent_protocol::ide::{DirtyBufferDigest, SourceProvenance};
 // THE untrusted-content chokepoint for MCP tool results (PR B): every byte a
 // server returns passes through `sanitize_untrusted` before it can enter the
@@ -80,15 +88,16 @@ use crate::models::ModelRegistry;
 use crate::tools::{
     new_pull_request, parse_blackboard_post, parse_blackboard_query, parse_create_check_run,
     parse_create_draft_pull_request, parse_edit_file as parse_edit_file_args,
-    parse_get_pull_request, parse_list_check_runs, parse_memory_remember,
+    parse_get_pull_request, parse_list_check_runs, parse_memory_remember, parse_skills_search,
     parse_update_pull_request, parse_web_search, parse_write_file as parse_write_file_args,
-    render_check_runs, render_pull_request, render_search_outcome, tool_label, ApplyPatch,
-    ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput,
-    BlackboardQueryTool, CommandRequest, CreateCheckRunInput, CreateCheckRunSummary,
-    CreateDraftPullRequest, CreateDraftPullRequestInput, EditFile, EditFileInput,
-    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns,
-    ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput,
-    RepositoryTest, Search, SearchInput, Shell, UpdatePullRequestInput, UpdatePullRequestTool,
+    render_check_runs, render_pull_request, render_registry_search, render_search_outcome,
+    tool_label, ApplyPatch, ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
+    BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CreateCheckRunInput,
+    CreateCheckRunSummary, CreateDraftPullRequest, CreateDraftPullRequestInput, EditFile,
+    EditFileInput, EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput,
+    ListCheckRuns, ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile,
+    ReadFileInput, RegistrySearch, RegistrySearchRequest, RepositoryTest, Search, SearchInput,
+    Shell, SkillsSearch, SkillsSearchInput, UpdatePullRequestInput, UpdatePullRequestTool,
     WebSearch, WebSearchInput, WriteFile, WriteFileInput,
 };
 
@@ -830,6 +839,17 @@ pub struct RunContext {
     /// instead of starting cold. A carrier only: nothing in this task yet
     /// prepends it to the live transcript (a later task does).
     pub prior: Vec<TurnItem>,
+    /// This run's retrieval-gated MCP advertisement (rubric 9), computed ONCE
+    /// per run by [`FrameworkAgentRuntime::select_mcp_tools`] and consulted by
+    /// [`offered_tool_names`](FrameworkAgentRuntime::offered_tool_names) on
+    /// every step.
+    ///
+    /// `None` — the default, and the value for every run whose bridge offers at
+    /// most `mcp_top_k` tools — means "advertise every MCP tool the bridge
+    /// offers", exactly today's behavior. `Some(names)` is the top-k subset a
+    /// large MCP surface was narrowed to. Only the `mcp.*` family is ever gated:
+    /// the core built-in tools are always advertised in full.
+    pub mcp_advertised: Option<Vec<String>>,
 }
 
 impl RunContext {
@@ -854,6 +874,7 @@ impl RunContext {
             workflow: None,
             steering: None,
             prior: Vec::new(),
+            mcp_advertised: None,
         }
     }
 
@@ -1077,6 +1098,17 @@ pub struct FrameworkAgentRuntime {
     /// nodes; a run is offered the tools only when this is set AND the run carries a
     /// [`WorkflowContext`]. The assembly binds it over a real `BlackboardStore`.
     blackboard: Option<Arc<dyn BlackboardChannel>>,
+    /// Retrieval gating for the MCP tool family (rubric 9): when a run's bridge
+    /// offers MORE than this many tools, only the `mcp_top_k` most relevant to
+    /// the run are advertised. At or below it — and at `0`, which disables the
+    /// gate outright — every offered MCP tool is advertised, today's behavior.
+    /// Set from `models.toml`'s `[retrieval] mcp_top_k`.
+    mcp_top_k: usize,
+    /// The registry the `skills.search` tool queries (rubric 9), if wired.
+    /// Process-wide (one knowledge pool), like `github`/`mcp`, so it lives on
+    /// the runtime rather than the run context. `None` leaves the tool unoffered
+    /// and the run behaves exactly as before.
+    registry: Option<Arc<dyn RegistrySearch>>,
 }
 
 /// How a run terminated, before it is folded into a [`RunDisposition`].
@@ -1111,6 +1143,8 @@ impl FrameworkAgentRuntime {
             mcp: None,
             search: None,
             blackboard: None,
+            mcp_top_k: crate::models::DEFAULT_MCP_TOP_K,
+            registry: None,
         }
     }
 
@@ -1146,6 +1180,27 @@ impl FrameworkAgentRuntime {
     /// the channel over a real `BlackboardStore` + pool + the per-run fan-out hub.
     pub fn with_blackboard(mut self, blackboard: Arc<dyn BlackboardChannel>) -> Self {
         self.blackboard = Some(blackboard);
+        self
+    }
+
+    /// Set the MCP retrieval-gating threshold (rubric 9) from `models.toml`'s
+    /// `[retrieval] mcp_top_k`. `0` disables the gate (advertise every MCP tool
+    /// a warm server offers, exactly as before this existed). Additive: the
+    /// default is [`crate::models::DEFAULT_MCP_TOP_K`], and a run whose bridge
+    /// offers at most that many tools is unaffected either way.
+    #[must_use]
+    pub fn with_mcp_top_k(mut self, mcp_top_k: usize) -> Self {
+        self.mcp_top_k = mcp_top_k;
+        self
+    }
+
+    /// Inject the registry the `skills.search` tool queries (rubric 9). Without
+    /// it the tool is never offered, so a run's surface is unchanged. The daemon
+    /// binds it over the knowledge pool and the same retrieval funnel context
+    /// assembly uses.
+    #[must_use]
+    pub fn with_registry_search(mut self, registry: Arc<dyn RegistrySearch>) -> Self {
+        self.registry = Some(registry);
         self
     }
 
@@ -1222,6 +1277,13 @@ impl FrameworkAgentRuntime {
         if self.search.is_some() {
             names.push(WebSearch::NAME.to_string());
         }
+        // Rubric 9: offered whenever the registry seam is wired — a read of the
+        // daemon's own catalog, so like `web.search` the configured gate alone
+        // decides, and unlike the write tools no mode overlay can deny it (the
+        // filter below leaves it in every mode).
+        if self.registry.is_some() {
+            names.push(SkillsSearch::NAME.to_string());
+        }
         if self.offers_blackboard(run) {
             names.extend(
                 [BlackboardPostTool::NAME, BlackboardQueryTool::NAME]
@@ -1230,11 +1292,23 @@ impl FrameworkAgentRuntime {
             );
         }
         if let Some(bridge) = &self.mcp {
+            // Rubric 9: the MCP family is the one UNBOUNDED tool set — a handful
+            // of servers can offer hundreds of tools, all of which used to be
+            // injected in full on every step. When this run's advertisement was
+            // narrowed to a top-k selection (`select_mcp_tools`, computed once
+            // per run), honour it; otherwise offer everything the bridge has,
+            // exactly as before. Dispatch is unaffected either way:
+            // [`mcp_target`](Self::mcp_target) re-verifies against the bridge's
+            // own cache, so narrowing what the model SEES never strands a tool.
             names.extend(
                 bridge
                     .offered_tools()
                     .iter()
-                    .map(|info| format!("mcp.{}.{}", info.server, info.name)),
+                    .map(|info| format!("mcp.{}.{}", info.server, info.name))
+                    .filter(|name| match &run.mcp_advertised {
+                        Some(selected) => selected.contains(name),
+                        None => true,
+                    }),
             );
         }
         // PR C2 (plan mode): mirror the mode overlay's denials (see the doc
@@ -1319,6 +1393,86 @@ impl FrameworkAgentRuntime {
         definitions
     }
 
+    /// Choose which `mcp.*` tools this run advertises (rubric 9 — retrieval-gated
+    /// tool advertisement), or `None` to advertise them all.
+    ///
+    /// The built-in tool set is small, fixed, and always relevant, so it stays
+    /// static and fully advertised — ALWAYS. The MCP family is the opposite: it
+    /// grows without bound with the operator's server list, and every tool in it
+    /// used to be injected on every step. Above the `mcp_top_k` threshold this
+    /// runs the SAME retrieval funnel the knowledge fabric uses for context
+    /// assembly (`codypendent_knowledge::retrieve`) over the bridge's tools — each
+    /// projected into an in-memory registry item carrying the server-supplied
+    /// name and description — and keeps the `k` most relevant to what this run is
+    /// actually doing.
+    ///
+    /// Returns `None` (advertise everything, unchanged behavior) when: no bridge
+    /// is wired, the gate is disabled (`mcp_top_k == 0`), the bridge offers at
+    /// most `k` tools, or the funnel itself fails. Retrieval is an aid, never a
+    /// gate on running — a degraded funnel widens the advertisement, never
+    /// narrows it wrongly.
+    ///
+    /// Computed once per run (see [`execute_run`](Self::execute_run)), not per
+    /// step: the query is the run's objective plus its latest user turn, neither
+    /// of which changes mid-step, so re-running the funnel every step would burn
+    /// work for an identical answer.
+    #[must_use]
+    pub fn select_mcp_tools(&self, run: &RunContext) -> Option<Vec<String>> {
+        let bridge = self.mcp.as_ref()?;
+        if self.mcp_top_k == 0 {
+            return None;
+        }
+        let offered = bridge.offered_tools();
+        if offered.len() <= self.mcp_top_k {
+            return None;
+        }
+
+        let items: Vec<RegistryItem> = offered.iter().map(mcp_registry_item).collect();
+        let indexes = match RetrievalIndexes::build(&items, HashingEmbedder::new()) {
+            Ok(indexes) => indexes,
+            Err(error) => {
+                warn_mcp_gate_degraded(&error.to_string());
+                return None;
+            }
+        };
+        // Every projected item is System-scoped, Active, executable and Medium
+        // risk (see `mcp_registry_item`), so the funnel's hard filters admit the
+        // whole family and this is a pure relevance ranking — the security
+        // decision for an MCP call stays where it already is: the daemon's
+        // policy engine at dispatch, plus the mode overlay's `mcp.*` filter
+        // below in `offered_tool_names`.
+        let query = RetrievalQuery::new(
+            retrieval_query_text(run),
+            vec![Scope::System],
+            RiskClass::Medium,
+        );
+        let config = RetrievalConfig {
+            disclose_tools_min: self.mcp_top_k,
+            disclose_tools_max: self.mcp_top_k,
+            // The projection has no skills, so ask for none.
+            disclose_skills_min: 0,
+            disclose_skills_max: 0,
+            ..RetrievalConfig::default()
+        };
+        match retrieve(&items, &indexes, &query, &config) {
+            Ok(result) => {
+                let selected: Vec<String> =
+                    result.tools.into_iter().map(|card| card.name).collect();
+                tracing::info!(
+                    run_id = %run.run_id,
+                    offered = offered.len(),
+                    advertised = selected.len(),
+                    "retrieval narrowed this run's mcp tool advertisement"
+                );
+                Some(selected)
+            }
+            Err(error) => {
+                warn_mcp_gate_degraded(&error.to_string());
+                None
+            }
+        }
+    }
+
     /// The model registry (used by callers to build a [`FrameworkModelDriver`]).
     pub fn models(&self) -> &ModelRegistry {
         &self.models
@@ -1344,6 +1498,13 @@ impl FrameworkAgentRuntime {
         cancel: CancellationToken,
     ) -> anyhow::Result<RunOutcome> {
         let mut run = run;
+        // Rubric 9: narrow an unbounded MCP tool surface to the top-k most
+        // relevant to this run, ONCE, here — the objective and the prior turns
+        // are already final, and `advertised_tool_definitions` (recomputed every
+        // step) then reads this decision instead of re-running the funnel. A
+        // `None` result means "advertise every offered MCP tool", the behavior
+        // before this existed.
+        run.mcp_advertised = self.select_mcp_tools(&run);
         let model_id = driver.model_id();
         let run_actor = Actor::Agent {
             agent_id: AgentId::new(),
@@ -2326,6 +2487,16 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::MemoryRemember(input),
                 })
             }
+            // Rubric 9: guarded on the seam being wired, the `web.search` idiom —
+            // a call with no registry falls through to the unknown-tool refusal,
+            // the same answer the offering gate already gave the model.
+            SkillsSearch::NAME if self.registry.is_some() => {
+                let input = parse_skills_search(args)?;
+                Ok(Prepared {
+                    action: SkillsSearch::proposed_action(),
+                    tool: PreparedTool::SkillsSearch(input),
+                })
+            }
             // MCP client (PR B): an `mcp.<server>.<tool>` call. The match guard
             // re-verifies the bridge CURRENTLY offers that exact server.tool pair
             // (defense in depth, the blackboard match-guard idiom above): a cold
@@ -2748,6 +2919,44 @@ impl FrameworkAgentRuntime {
                     }
                 },
             },
+            // Rubric 9: the registry read. The rendered result is already
+            // evidence-framed and its opened `SKILL.md` already sanitized under
+            // `SKILL_DOCUMENT_MAX_BYTES` (see `render_registry_search`), so the
+            // observation carries a bounded, trust-labelled block — the same
+            // discipline as the MCP/web arms, applied at the renderer because the
+            // cards themselves are first-party while only the procedure is not.
+            PreparedTool::SkillsSearch(input) => match self.registry.as_ref() {
+                None => (
+                    "skills.search is unavailable (no registry connection)".to_string(),
+                    None,
+                    ToolOutcome::Failed {
+                        message: "skills.search.unavailable".to_string(),
+                    },
+                ),
+                Some(registry) => {
+                    let request = RegistrySearchRequest {
+                        query: &input.query,
+                        open: input.open.as_deref(),
+                        // Server-derived, never model-supplied: a search sees
+                        // exactly this run's repository scope.
+                        repository: &run.repository,
+                    };
+                    match registry.search(request).await {
+                        Ok(outcome) => (
+                            render_registry_search(&outcome),
+                            None,
+                            ToolOutcome::Succeeded,
+                        ),
+                        Err(reason) => (
+                            format!("skills.search failed: {reason}"),
+                            None,
+                            ToolOutcome::Failed {
+                                message: "skills.search.failed".to_string(),
+                            },
+                        ),
+                    }
+                }
+            },
             PreparedTool::Mcp { server, tool, args } => match self.mcp.as_ref() {
                 None => mcp_unavailable(&format!("mcp.{server}.{tool}")),
                 Some(bridge) => match bridge.call_tool(&server, &tool, args).await {
@@ -3037,6 +3246,9 @@ enum PreparedTool {
     BlackboardPost(BlackboardPostInput),
     BlackboardQuery(BlackboardQueryInput),
     MemoryRemember(MemoryRememberInput),
+    /// A `skills.search` call (rubric 9): the parsed query plus the optional
+    /// skill name whose procedure to open.
+    SkillsSearch(SkillsSearchInput),
     /// An MCP tool call (PR B): the dispatch pair `prepare`'s guard verified
     /// against the bridge's offered cache, plus the RAW model-supplied args
     /// (the canonical form lives on the `McpToolCall` action, for the digest).
@@ -3118,6 +3330,98 @@ fn mcp_unavailable(tool: &str) -> (String, Option<ArtifactRef>, ToolOutcome) {
             message: "mcp.unavailable".to_string(),
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// Retrieval-gated MCP advertisement (rubric 9)
+// ---------------------------------------------------------------------------
+
+/// Project one bridge-offered MCP tool into an in-memory [`RegistryItem`] the
+/// retrieval funnel can rank.
+///
+/// Nothing here is persisted — the bridge's tool cache IS the authority for what
+/// a warm server offers, and it changes whenever a server restarts, so writing
+/// these into `registry_items` would only create rows to garbage-collect. The
+/// item carries exactly what the server told us: the dotted tool name and its
+/// description. Its `name` is the SAME `mcp.<server>.<tool>` string the model
+/// calls and `offered_tool_names` filters on, so a selected card maps back with
+/// no lookup table.
+///
+/// The governance fields are deliberately uniform across the family — Active,
+/// System-scoped, executable, `Community` trust, `Medium` risk — so ranking is a
+/// pure relevance comparison among peers and the funnel's hard filters admit all
+/// of them. This projection is NOT a security decision: an MCP call is
+/// dispositioned by the daemon's policy engine at dispatch, exactly as before.
+fn mcp_registry_item(info: &McpToolInfo) -> RegistryItem {
+    use codypendent_knowledge::{
+        Provenance as KnowledgeProvenance, RegistryItemKind, RegistryStatus, TrustMetadata,
+        TrustTier, Version,
+    };
+    let now = chrono::Utc::now();
+    RegistryItem {
+        id: codypendent_protocol::RegistryItemId::new(),
+        kind: RegistryItemKind::Tool,
+        name: format!("mcp.{}.{}", info.server, info.name),
+        version: Version("1.0.0".to_string()),
+        scope: Scope::System,
+        description: info.description.clone(),
+        // The bare tool name and its server are what a user actually types
+        // ("use the notion search"), so both feed the exact-overlap signal
+        // alongside the dotted name.
+        intents: Vec::new(),
+        keywords: vec![info.name.clone(), info.server.clone()],
+        examples: Vec::new(),
+        input_schema: None,
+        output_schema: None,
+        dependencies: Vec::new(),
+        permissions: Vec::new(),
+        risk: RiskClass::Medium,
+        provenance: KnowledgeProvenance::Package {
+            path: format!("mcp://{}", info.server),
+        },
+        trust: TrustMetadata {
+            publisher: info.server.clone(),
+            signature_required: false,
+            signature: None,
+            tier: TrustTier::Community,
+        },
+        status: RegistryStatus::Active,
+        content_hash: String::new(),
+        executable: true,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// The text the MCP gate ranks against: the run's objective plus its latest user
+/// turn, when the run carries one.
+///
+/// A continuation run's objective is the follow-up the user just sent, but its
+/// `prior` may end with an earlier steering message that named the tool family
+/// the user actually cares about — so both are fed to the funnel. Only USER text
+/// is used (objective + steering): assistant prose and tool observations are the
+/// model's own output and would let one irrelevant tool result drag the next
+/// step's advertisement after it.
+fn retrieval_query_text(run: &RunContext) -> String {
+    let latest_user_turn = run.prior.iter().rev().find_map(|item| match item {
+        TurnItem::Steering(text) | TurnItem::Objective(text) => Some(text.as_str()),
+        _ => None,
+    });
+    match latest_user_turn {
+        Some(text) if text != run.objective => format!("{} {text}", run.objective),
+        _ => run.objective.clone(),
+    }
+}
+
+/// Log a degraded MCP gate once per process: the funnel failed, so this run (and
+/// any other in the same state) advertises the FULL MCP set — the pre-gate
+/// behavior. Warned rather than propagated because retrieval is an aid, never a
+/// gate on running.
+fn warn_mcp_gate_degraded(reason: &str) {
+    tracing::warn!(
+        %reason,
+        "mcp retrieval gate unavailable; advertising every offered mcp tool"
+    );
 }
 
 /// Render a JSON value canonically — object keys recursively sorted — so two
@@ -3741,6 +4045,24 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {"statement": {"type": "string"}, "value": {}},
                 "required": ["statement"]
+            }),
+        ),
+        // Rubric 9: the agent-callable half of retrieval. Offered only when the
+        // daemon wired a registry seam (`advertised_tool_definitions` projects
+        // through `offered_tool_names`, so an unwired daemon never shows it).
+        decl(
+            SkillsSearch::NAME,
+            "Search the tool/skill registry for what fits a task, returning compact cards \
+                 (name, kind, summary, declared permissions). Pass `open` with a skill name \
+                 from an earlier result to also receive that skill's written procedure. Use \
+                 when you suspect a capability exists but is not in your tool list.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "open": {"type": "string"}
+                },
+                "required": ["query"]
             }),
         ),
         decl(
@@ -5000,6 +5322,220 @@ mod tests {
         );
     }
 
+    // -- Rubric 9: retrieval-gated MCP advertisement -------------------------
+
+    /// Twenty fake MCP tools: four about running tests (the relevant family for
+    /// the query below) and sixteen about unrelated subjects, each with a
+    /// distinct vocabulary so the funnel has real signal to separate them.
+    fn many_mcp_tools() -> Vec<McpToolInfo> {
+        let relevant = [
+            (
+                "run_tests",
+                "run the repository test suite and report failures",
+            ),
+            ("test_report", "summarize the latest test suite run results"),
+            (
+                "flaky_tests",
+                "list tests that fail intermittently across runs",
+            ),
+            ("coverage", "measure test coverage for the repository"),
+        ];
+        let irrelevant = [
+            ("book_flight", "book an airline ticket for a traveller"),
+            ("weather", "report tomorrow's weather forecast for a city"),
+            ("send_sms", "send a short text message to a phone number"),
+            ("play_song", "play a song on the connected speaker"),
+            ("order_pizza", "order a pizza for delivery to an address"),
+            ("stock_quote", "look up the share price of a listed company"),
+            (
+                "translate",
+                "translate a phrase between two human languages",
+            ),
+            ("calendar", "create an appointment in the shared calendar"),
+            (
+                "photo_crop",
+                "crop a photograph to the requested aspect ratio",
+            ),
+            ("recipe", "suggest a dinner recipe from pantry ingredients"),
+            ("currency", "convert an amount between two currencies"),
+            ("sunrise", "report the sunrise time at a latitude"),
+            ("dog_facts", "return a trivia fact about dog breeds"),
+            ("poem", "compose a short poem on a given subject"),
+            (
+                "chess_move",
+                "suggest the strongest move in a chess position",
+            ),
+            ("plant_care", "advise how often to water a houseplant"),
+        ];
+        relevant
+            .into_iter()
+            .chain(irrelevant)
+            .map(|(name, description)| McpToolInfo {
+                server: "big".to_string(),
+                name: name.to_string(),
+                description: description.to_string(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            })
+            .collect()
+    }
+
+    fn bridge_with(tools: Vec<McpToolInfo>) -> Arc<StubMcpBridge> {
+        Arc::new(StubMcpBridge {
+            tools,
+            result: Ok(String::new()),
+        })
+    }
+
+    /// Rubric 9: past the threshold, a run is advertised only the top-k MCP
+    /// tools relevant to its objective — the unrelated majority is dropped from
+    /// BOTH the offered set and the advertised definitions, while every core
+    /// built-in tool stays advertised in full.
+    #[test]
+    fn a_large_mcp_surface_is_narrowed_to_the_relevant_top_k() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_mcp(bridge_with(many_mcp_tools()))
+            .with_mcp_top_k(8);
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "the test suite is failing; run the tests and fix them",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+
+        run.mcp_advertised = runtime.select_mcp_tools(&run);
+        let selected = run
+            .mcp_advertised
+            .clone()
+            .expect("20 tools past a threshold of 8 must be gated");
+        assert_eq!(selected.len(), 8, "exactly top-k: {selected:?}");
+
+        let names = runtime.offered_tool_names(&run);
+        let mcp: Vec<&String> = names.iter().filter(|n| n.starts_with("mcp.")).collect();
+        assert_eq!(mcp.len(), 8, "only the selection is offered: {mcp:?}");
+        for relevant in [
+            "mcp.big.run_tests",
+            "mcp.big.test_report",
+            "mcp.big.flaky_tests",
+            "mcp.big.coverage",
+        ] {
+            assert!(
+                names.iter().any(|n| n == relevant),
+                "the test-related tools must survive the gate: {mcp:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n == "mcp.big.book_flight"
+                || n == "mcp.big.recipe"
+                || n == "mcp.big.plant_care"),
+            "clearly irrelevant tools must be dropped: {mcp:?}"
+        );
+
+        // CORE tools are never gated, and advertised ≡ offered still holds.
+        assert!(
+            names.iter().any(|n| n == Shell::NAME)
+                && names.iter().any(|n| n == ReadFile::NAME)
+                && names.iter().any(|n| n == MemoryRemember::NAME),
+            "the core built-ins stay static and fully advertised: {names:?}"
+        );
+        let mut advertised: Vec<String> = runtime
+            .advertised_tool_definitions(&run)
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        let mut offered = names.clone();
+        advertised.sort();
+        offered.sort();
+        assert_eq!(advertised, offered, "advertised ≡ offered under the gate");
+    }
+
+    /// At or below the threshold nothing is gated: every offered MCP tool is
+    /// advertised, exactly as before the gate existed.
+    #[test]
+    fn an_mcp_surface_at_or_below_the_threshold_is_advertised_in_full() {
+        let (runtime, _events, session_id) = test_runtime();
+        let eight: Vec<McpToolInfo> = many_mcp_tools().into_iter().take(8).collect();
+        let runtime = runtime.with_mcp(bridge_with(eight)).with_mcp_top_k(8);
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut run = solo_run(session_id, repo.path());
+
+        run.mcp_advertised = runtime.select_mcp_tools(&run);
+        assert!(
+            run.mcp_advertised.is_none(),
+            "at the threshold the gate must not fire"
+        );
+        let mcp = runtime
+            .offered_tool_names(&run)
+            .into_iter()
+            .filter(|n| n.starts_with("mcp."))
+            .count();
+        assert_eq!(mcp, 8, "every offered tool is still advertised");
+    }
+
+    /// `mcp_top_k = 0` turns the gate off entirely: full injection returns even
+    /// for a large surface — the escape hatch for an operator who wants the old
+    /// behavior.
+    #[test]
+    fn a_zero_threshold_restores_full_mcp_injection() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_mcp(bridge_with(many_mcp_tools()))
+            .with_mcp_top_k(0);
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "the test suite is failing",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+
+        run.mcp_advertised = runtime.select_mcp_tools(&run);
+        assert!(run.mcp_advertised.is_none(), "the gate is disabled");
+        let mcp = runtime
+            .offered_tool_names(&run)
+            .into_iter()
+            .filter(|n| n.starts_with("mcp."))
+            .count();
+        assert_eq!(mcp, 20, "all 20 tools are injected");
+    }
+
+    /// The gate ranks against the objective AND the latest user turn, so a
+    /// continuation whose steering named a different subject still sees the
+    /// tools that subject needs.
+    #[test]
+    fn the_gate_query_includes_the_latest_user_turn() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let (_runtime, _events, session_id) = test_runtime();
+        let mut run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "keep going",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        run.prior = vec![
+            TurnItem::Objective("something older".to_string()),
+            TurnItem::Assistant("assistant prose is not user text".to_string()),
+            TurnItem::Steering("actually translate the phrase".to_string()),
+        ];
+        let query = retrieval_query_text(&run);
+        assert!(query.contains("keep going") && query.contains("translate"));
+        assert!(
+            !query.contains("assistant prose"),
+            "model output must not steer the advertisement: {query}"
+        );
+
+        // With no prior at all the query is exactly the objective.
+        let bare = solo_run(session_id, repo.path());
+        assert_eq!(retrieval_query_text(&bare), bare.objective);
+    }
+
     /// PR B: the `McpToolCall` action's canonical args make the Run-scoped
     /// auto-approval digest key-order-insensitive — recursively.
     #[test]
@@ -5927,6 +6463,129 @@ mod tests {
             }
             other => panic!("expected NoteAppended, got {other:?}"),
         }
+    }
+
+    /// A `RegistrySearch` stub: records what it was asked and answers with a
+    /// fixed card plus (when `open` was set) a skill procedure.
+    struct StubRegistry {
+        seen: Mutex<Vec<(String, Option<String>, PathBuf)>>,
+    }
+
+    #[async_trait]
+    impl RegistrySearch for StubRegistry {
+        async fn search(
+            &self,
+            request: RegistrySearchRequest<'_>,
+        ) -> Result<crate::tools::RegistrySearchOutcome, String> {
+            self.seen.lock().expect("stub lock").push((
+                request.query.to_string(),
+                request.open.map(str::to_string),
+                request.repository.to_path_buf(),
+            ));
+            Ok(crate::tools::RegistrySearchOutcome {
+                cards: vec![crate::tools::RegistryCard {
+                    name: "rust.fix-ci".to_string(),
+                    kind: "skill".to_string(),
+                    summary: "diagnose and fix a failing CI build".to_string(),
+                    permissions: vec!["command:cargo".to_string()],
+                }],
+                document: request.open.map(|name| crate::tools::SkillDocument {
+                    name: name.to_string(),
+                    content: "1. read the failing job log\n2. reproduce locally".to_string(),
+                }),
+                open_note: None,
+            })
+        }
+    }
+
+    /// Rubric 9: `skills.search` is offered only when a registry seam is wired,
+    /// and the whole `prepare` → policy → `execute_prepared` path works — the
+    /// action is policy-`Allow`ed (a read of the daemon's own catalog), the
+    /// repository scope is SERVER-derived from the run, and an opened skill's
+    /// procedure comes back evidence-framed.
+    #[tokio::test]
+    async fn skills_search_is_seam_gated_and_returns_evidence_framed_cards() {
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        // Unwired: neither offered nor dispatchable.
+        let (bare, _events, session_id) = test_runtime();
+        let run = solo_run(session_id, repo.path());
+        assert!(
+            !bare
+                .offered_tool_names(&run)
+                .iter()
+                .any(|n| n == SkillsSearch::NAME),
+            "no registry seam → the tool is not offered"
+        );
+        assert!(
+            bare.prepare(SkillsSearch::NAME, &json!({"query": "x"}), &run)
+                .await
+                .is_err(),
+            "an unoffered tool is not dispatchable"
+        );
+
+        // Wired: offered, advertised, and executable.
+        let registry = Arc::new(StubRegistry {
+            seen: Mutex::new(Vec::new()),
+        });
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime.with_registry_search(registry.clone());
+        let run = solo_run(session_id, repo.path());
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+        assert!(runtime
+            .offered_tool_names(&run)
+            .iter()
+            .any(|n| n == SkillsSearch::NAME));
+        assert!(
+            runtime
+                .advertised_tool_definitions(&run)
+                .iter()
+                .any(|d| d.name == SkillsSearch::NAME),
+            "advertised ≡ offered covers the new tool too"
+        );
+
+        let prepared = runtime
+            .prepare(
+                SkillsSearch::NAME,
+                &json!({"query": "the ci build is red", "open": "rust.fix-ci"}),
+                &run,
+            )
+            .await
+            .expect("prepares");
+        let decision = runtime
+            .policy
+            .evaluate(&prepared.action, &runtime.eval_ctx(&run));
+        assert_eq!(
+            decision.decision,
+            Decision::Allow,
+            "a registry read is always permitted"
+        );
+
+        let (observation, artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(artifact.is_none());
+        assert!(observation.contains("EVIDENCE, NOT INSTRUCTIONS"));
+        assert!(observation.contains("skill rust.fix-ci"));
+        assert!(observation.contains("permissions: command:cargo"));
+        assert!(
+            observation.contains("read the failing job log"),
+            "an opened skill's SKILL.md is injected: {observation}"
+        );
+
+        let seen = registry.seen.lock().expect("stub lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "the ci build is red");
+        assert_eq!(seen[0].1.as_deref(), Some("rust.fix-ci"));
+        assert_eq!(
+            seen[0].2,
+            repo.path(),
+            "the repository scope is server-derived from the run, not the model"
+        );
     }
 
     /// Continuation-content persistence, Task 1: `read_file`'s output was

@@ -54,9 +54,11 @@ pub use skills::{
 };
 
 pub use retrieval::{
-    embedding_text, retrieve, Bm25Error, Bm25Index, Embedder, HashingEmbedder, RerankWeights,
-    RetrievalConfig, RetrievalError, RetrievalIndexes, RetrievalQuery, RetrievalResult,
-    RetrievalTrace, VectorIndex, EMBEDDING_DIMENSION,
+    drain_outbox, embedding_content_hash, embedding_text, reconcile_embeddings, retrieve,
+    semantic_indexes, Bm25Error, Bm25Index, DrainReport, EmbedError, Embedder, HashingEmbedder,
+    PersistError, RerankWeights, RetrievalConfig, RetrievalError, RetrievalIndexes, RetrievalQuery,
+    RetrievalResult, RetrievalTrace, SemanticEmbedder, StoredEmbedding, VectorIndex,
+    EMBEDDING_DIMENSION,
 };
 
 pub use adapter::{

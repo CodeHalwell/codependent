@@ -46,9 +46,10 @@ use codypendent_integrations::mcp::{McpBridge, McpRegistry};
 use codypendent_integrations::search::SearchApi;
 #[cfg(test)]
 use codypendent_integrations::search::TavilyClient;
+use codypendent_knowledge::context::assemble_context_with;
 use codypendent_knowledge::{
     chronicle_candidates, extract_candidates, ContextAssembler, Curation, ExtractionInput,
-    FactExtractor, GitRevision, MemoryStore, NoopExtractor, Revision, Scope,
+    FactExtractor, GitRevision, MemoryStore, NoopExtractor, Revision, Scope, SemanticEmbedder,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
@@ -60,13 +61,16 @@ use codypendent_runtime::agent::{
     cancellation, mode_overlay, ApprovalRequest, CancellationHandle, CancellationToken,
     FrameworkAgentRuntime, FrameworkModelDriver, RunContext, RunJournal, TurnItem,
 };
-use codypendent_runtime::models::{load_models, resolve_model, ModelPolicy, ModelRegistry};
+use codypendent_runtime::models::{
+    load_models, resolve_model, ModelPolicy, ModelRegistry, RetrievalSettings,
+};
 use codypendent_runtime::tools::{ArtifactSink, ClosureSink};
 use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::blackboard::WorkflowBlackboardReader;
 use crate::promotion::PromotionStoreGateway;
+use crate::retrieval::PoolRegistrySearch;
 use crate::routing::{estimate_input_tokens, RoutingConfig, RoutingCoordinator};
 use crate::scan;
 use crate::session_history::{context_turn, continuation_prior, CONTEXT_PSEUDO_TOOL};
@@ -219,6 +223,15 @@ pub struct RuntimeExecutor {
     /// shares ONE cache; invalidation is the stamp probe inside the assembler
     /// (any registry write — a skill install, a builtin refresh — moves it).
     context: Arc<ContextAssembler>,
+    /// The configured embedding model (rubric 9), or `None` when `models.toml`
+    /// declares no `[embedding]` entry — in which case retrieval keeps the
+    /// offline hashing embedder and every path here behaves exactly as before.
+    /// Shared with the index-maintenance job, so one content-hash cache serves
+    /// both context assembly and the outbox drain.
+    embedder: Option<Arc<dyn SemanticEmbedder>>,
+    /// The `[retrieval]` tuning (today: the MCP top-k threshold), handed to each
+    /// run's [`FrameworkAgentRuntime`].
+    retrieval: RetrievalSettings,
 }
 
 impl RuntimeExecutor {
@@ -298,7 +311,29 @@ impl RuntimeExecutor {
             workflow_cancellations,
             routing,
             context: Arc::new(ContextAssembler::new()),
+            embedder: None,
+            retrieval: RetrievalSettings::default(),
         }
+    }
+
+    /// Inject the retrieval configuration (rubric 9): the embedding model the
+    /// context assembler and `skills.search` embed with, and the `[retrieval]`
+    /// tuning each run's agent runtime is built with.
+    ///
+    /// Unlike [`Self::with_github`]/[`Self::with_mcp`] this does NOT rebuild the
+    /// workflow host: nothing it sets reaches a workflow agent node today (a
+    /// node emits no context manifest), so rebuilding would only risk dropping
+    /// another builder's injection for no gain. A node's runtime therefore keeps
+    /// the default MCP threshold and is not offered `skills.search`.
+    #[must_use]
+    pub fn with_retrieval(
+        mut self,
+        embedder: Option<Arc<dyn SemanticEmbedder>>,
+        retrieval: RetrievalSettings,
+    ) -> Self {
+        self.embedder = embedder;
+        self.retrieval = retrieval;
+        self
     }
 
     /// Set the repository root a `PublishDocument` command operates against
@@ -710,6 +745,17 @@ impl RuntimeExecutor {
         if let Some(search) = &self.search {
             runtime = runtime.with_search(search.clone());
         }
+        // Rubric 9: the MCP top-k threshold this run gates its tool
+        // advertisement with, and the registry seam that backs `skills.search`.
+        // Both are unconditional — an unset `[retrieval]` table yields the
+        // default threshold, and the search tool reads the same pool + funnel
+        // `emit_context` just used.
+        runtime = runtime
+            .with_mcp_top_k(self.retrieval.mcp_top_k)
+            .with_registry_search(Arc::new(PoolRegistrySearch::new(
+                self.pool.clone(),
+                self.embedder.clone(),
+            )));
 
         // Bind the run's worktree (STEP 1.8, the Phase-1 follow-up): a writing
         // mode (`Build`) gets a DEDICATED, isolated worktree carved from the
@@ -1244,10 +1290,24 @@ impl RuntimeExecutor {
             codypendent_knowledge::local_user_scope(),
             Scope::Repository(repository),
         ];
-        match self
-            .context
-            .assemble(&self.pool, repository, objective, &scopes)
-            .await
+        // Rubric 9: with an `[embedding]` entry configured, dense retrieval runs
+        // over the PERSISTED vectors that model produced, with the query embedded
+        // in the same space — that path sources the registry per call, so it does
+        // not use the stamped cache. With no model configured (the default) the
+        // caching assembler serves the offline hashing indexes, which is both the
+        // cheaper path and byte-for-byte the previous behaviour.
+        let assembled = match self.embedder.as_deref() {
+            Some(semantic) => {
+                assemble_context_with(&self.pool, repository, objective, &scopes, Some(semantic))
+                    .await
+            }
+            None => {
+                self.context
+                    .assemble(&self.pool, repository, objective, &scopes)
+                    .await
+            }
+        };
+        match assembled
         {
             Ok(manifest) => {
                 let rendered = manifest.render();

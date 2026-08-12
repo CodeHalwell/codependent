@@ -25,7 +25,8 @@ use crate::codegraph::CodeGraphError;
 use crate::memory::{MemoryError, MemoryStore};
 use crate::registry::{Registry, RegistryError};
 use crate::retrieval::{
-    retrieve, HashingEmbedder, RetrievalConfig, RetrievalError, RetrievalIndexes, RetrievalQuery,
+    retrieve, semantic_indexes, HashingEmbedder, RetrievalConfig, RetrievalError, RetrievalIndexes,
+    RetrievalQuery, SemanticEmbedder,
 };
 use crate::types::{
     EvidenceRef, MemoryRecord, RegistryItem, RiskClass, Scope, ToolCard, TrustTier,
@@ -224,15 +225,45 @@ pub async fn assemble_context(
     objective: &str,
     scopes: &[Scope],
 ) -> Result<ContextManifest, ContextError> {
-    let items = Registry::new().list(pool).await?;
-    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new())?;
-    assemble_with(pool, repository, objective, scopes, &items, &indexes).await
+    assemble_context_with(pool, repository, objective, scopes, None).await
 }
 
-/// The assembly core beneath [`assemble_context`] and
+/// [`assemble_context`] with an injected embedding model (the `FactExtractor`
+/// injection pattern): when `semantic` is `Some`, dense retrieval runs over the
+/// persisted `registry_embeddings` vectors that model produced (missing items —
+/// and the query — embedded in one batch call), instead of the offline hashing
+/// embedder. `None` — or any model failure — keeps the exact pre-embedding
+/// behavior, so an unconfigured `models.toml` changes nothing.
+///
+/// This entry sources the retrieval authority itself; [`ContextAssembler`]
+/// serves the same core from its stamped cache instead.
+pub async fn assemble_context_with(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    objective: &str,
+    scopes: &[Scope],
+    semantic: Option<&dyn SemanticEmbedder>,
+) -> Result<ContextManifest, ContextError> {
+    let items = Registry::new().list(pool).await?;
+    let (indexes, query_vector) = semantic_indexes(pool, &items, semantic, objective).await?;
+    assemble_with(
+        pool,
+        repository,
+        objective,
+        scopes,
+        &items,
+        &indexes,
+        query_vector,
+    )
+    .await
+}
+
+/// The assembly core beneath [`assemble_context_with`] and
 /// [`ContextAssembler::assemble`]: everything except sourcing the retrieval
 /// authority (`items`) and its derived `indexes`, which the stateless entry
 /// rebuilds per call and the assembler serves from its stamped cache.
+/// `query_vector` carries the semantically-embedded objective when a model is
+/// configured; `None` leaves the offline hashing path exactly as it was.
 async fn assemble_with(
     pool: &SqlitePool,
     repository: RepositoryId,
@@ -240,6 +271,7 @@ async fn assemble_with(
     scopes: &[Scope],
     items: &[RegistryItem],
     indexes: &RetrievalIndexes,
+    query_vector: Option<Vec<f32>>,
 ) -> Result<ContextManifest, ContextError> {
     // 1. Repository map — fold the persisted graph into the compact tree.
     let repository_map = crate::repomap::repository_map(pool, repository)
@@ -247,11 +279,12 @@ async fn assemble_with(
         .render();
 
     // 2. Retrieve the disclosed tool + skill cards over the whole registry.
-    let query = RetrievalQuery::new(
+    let mut query = RetrievalQuery::new(
         objective,
         visible_scopes(repository, scopes),
         RiskClass::Medium,
     );
+    query.query_vector = query_vector;
     let result = retrieve(items, indexes, &query, &RetrievalConfig::default())?;
     let tool_cards = result.tools.iter().map(ContextCard::from_card).collect();
     let skill_cards = result.skills.iter().map(ContextCard::from_card).collect();
@@ -367,7 +400,11 @@ impl ContextAssembler {
         scopes: &[Scope],
     ) -> Result<ContextManifest, ContextError> {
         let (items, indexes) = self.retrieval_authority(pool).await?;
-        assemble_with(pool, repository, objective, scopes, &items, &indexes).await
+        // The cached path serves the offline hashing indexes it stamped, so it
+        // carries no semantic query vector; a configured embedding model routes
+        // through `assemble_context_with` instead (see the executor's
+        // `emit_context`), which sources and embeds per call.
+        assemble_with(pool, repository, objective, scopes, &items, &indexes, None).await
     }
 
     /// The current `(items, indexes)` pair: the cached build when the registry

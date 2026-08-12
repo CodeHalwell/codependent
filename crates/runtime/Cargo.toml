@@ -54,6 +54,9 @@ rustix = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 sqlx = { workspace = true }
+# The mock OpenAI-compatible `/embeddings` endpoint the `HttpEmbedder` tests
+# drive (`tests/embedding_it.rs`) — the same harness the GitHub client uses.
+wiremock = { workspace = true }
 
 [features]
 default = ["provider-openai"]
