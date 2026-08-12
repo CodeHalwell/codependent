@@ -205,6 +205,7 @@ pub fn canonical_agent_id(id: &str) -> String {
         "kimi-cli" => "kimi".to_string(),
         "vibe" | "vibe-chat" | "mistral" => "mistral-vibe".to_string(),
         "gemini-cli" => "gemini".to_string(),
+        "antigravity" | "antigravity-cli" | "agy" | "agy-acp" => "antigravity-acp".to_string(),
         _ => normalized,
     }
 }
@@ -337,7 +338,7 @@ impl AcpRegistryStore {
     /// Resolve a cached agent to an executable launch. NPM/Python entries remain
     /// version-pinned commands; binary entries must have been explicitly installed.
     pub fn launch_spec(&self, coordinate: &str) -> Result<AcpLaunchSpec, AcpRegistryError> {
-        if let Some(spec) = resolve_local_kimi_code(coordinate)? {
+        if let Some(spec) = resolve_local_acp_agent(coordinate)? {
             return Ok(spec);
         }
         let agent = self.resolve_agent(coordinate)?;
@@ -400,7 +401,7 @@ impl AcpRegistryStore {
         coordinate: &str,
         allow_unverified: bool,
     ) -> Result<AcpLaunchSpec, AcpRegistryError> {
-        if let Some(spec) = resolve_local_kimi_code(coordinate)? {
+        if let Some(spec) = resolve_local_acp_agent(coordinate)? {
             return Ok(spec);
         }
         let agent = self.resolve_agent(coordinate)?;
@@ -586,6 +587,84 @@ pub fn local_kimi_code_spec() -> Option<AcpLaunchSpec> {
     })
 }
 
+/// Discover ACP servers supplied by locally installed vendor/community tools.
+///
+/// These adapters are never downloaded by Codypendent. That is especially
+/// important for Antigravity: Google does not currently ship native ACP, and
+/// the community `agy-acp` bridge warns that using third-party software with an
+/// Antigravity OAuth account may violate Google's Terms of Service. The user
+/// must install and opt into that bridge themselves.
+#[must_use]
+pub fn local_acp_agent_spec(id: &str) -> Option<AcpLaunchSpec> {
+    let id = canonical_agent_id(id);
+    match id.as_str() {
+        "kimi-code" => local_kimi_code_spec(),
+        "junie" => local_binary_spec("junie", "Junie", &["junie"], &["--acp=true"]),
+        "cursor" => local_binary_spec("cursor", "Cursor", &["cursor-agent"], &["acp"]),
+        "cortex-code" => {
+            local_binary_spec("cortex-code", "Cortex Code", &["cortex"], &["acp", "serve"])
+        }
+        "corust-agent" => {
+            local_binary_spec("corust-agent", "Corust Agent", &["corust-agent-acp"], &[])
+        }
+        "crow-cli" => local_binary_spec("crow-cli", "Crow CLI", &["crow-cli"], &["acp"]),
+        "devin" => local_binary_spec("devin", "Devin", &["devin"], &["acp"]),
+        "stakpak" => local_binary_spec("stakpak", "Stakpak", &["stakpak"], &["acp"]),
+        "antigravity-acp" => local_binary_spec(
+            "antigravity-acp",
+            "Google Antigravity (community ACP bridge)",
+            &[
+                "agy-acp",
+                "antigravity-acp",
+                "agy-acp-darwin-arm64",
+                "agy-acp-darwin-x64",
+                "agy-acp-linux-arm64",
+                "agy-acp-linux-x64",
+            ],
+            &[],
+        ),
+        _ => None,
+    }
+}
+
+/// Every installed local ACP adapter Codypendent can launch without weakening
+/// the official registry's checksum policy.
+#[must_use]
+pub fn local_acp_agent_specs() -> Vec<AcpLaunchSpec> {
+    [
+        "kimi-code",
+        "junie",
+        "cursor",
+        "cortex-code",
+        "corust-agent",
+        "crow-cli",
+        "devin",
+        "stakpak",
+        "antigravity-acp",
+    ]
+    .into_iter()
+    .filter_map(local_acp_agent_spec)
+    .collect()
+}
+
+fn local_binary_spec(
+    registry_id: &str,
+    name: &str,
+    commands: &[&str],
+    args: &[&str],
+) -> Option<AcpLaunchSpec> {
+    let command = commands.iter().find_map(|command| resolve_tool(command))?;
+    let version = local_tool_version(&command).unwrap_or_else(|| "local".to_string());
+    Some(AcpLaunchSpec {
+        registry_id: registry_id.to_string(),
+        name: name.to_string(),
+        version,
+        command,
+        args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        env: BTreeMap::new(),
+    })
+}
+
 fn local_tool_version(command: &Path) -> Option<String> {
     use std::process::Stdio;
     use std::time::Instant;
@@ -605,16 +684,23 @@ fn local_tool_version(command: &Path) -> Option<String> {
                     return None;
                 }
                 let output = child.wait_with_output().ok()?;
-                let version = std::str::from_utf8(&output.stdout).ok()?.trim();
-                if !version.is_empty()
-                    && version.len() <= 128
-                    && version.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+')
+                let output = std::str::from_utf8(&output.stdout).ok()?.trim();
+                return output
+                    .split_ascii_whitespace()
+                    .map(|part| {
+                        part.trim_matches(|ch: char| {
+                            !ch.is_ascii_alphanumeric() && !matches!(ch, '.' | '-' | '+')
+                        })
                     })
-                {
-                    return Some(version.to_string());
-                }
-                return None;
+                    .find(|part| {
+                        !part.is_empty()
+                            && part.len() <= 128
+                            && part.bytes().any(|byte| byte.is_ascii_digit())
+                            && part.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+')
+                            })
+                    })
+                    .map(ToOwned::to_owned);
             }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
@@ -628,13 +714,36 @@ fn local_tool_version(command: &Path) -> Option<String> {
     }
 }
 
-fn resolve_local_kimi_code(coordinate: &str) -> Result<Option<AcpLaunchSpec>, AcpRegistryError> {
+fn resolve_local_acp_agent(coordinate: &str) -> Result<Option<AcpLaunchSpec>, AcpRegistryError> {
     let (id, pinned) = split_agent_coordinate(coordinate);
-    if id != "kimi-code" {
+    if !matches!(
+        id.as_str(),
+        "kimi-code"
+            | "junie"
+            | "cursor"
+            | "cortex-code"
+            | "corust-agent"
+            | "crow-cli"
+            | "devin"
+            | "stakpak"
+            | "antigravity-acp"
+    ) {
         return Ok(None);
     }
-    let spec = local_kimi_code_spec().ok_or_else(|| AcpRegistryError::ToolUnavailable {
-        tool: "kimi".into(),
+    let spec = local_acp_agent_spec(&id).ok_or_else(|| AcpRegistryError::ToolUnavailable {
+        tool: match id.as_str() {
+            "kimi-code" => "kimi",
+            "junie" => "junie",
+            "cursor" => "cursor-agent",
+            "cortex-code" => "cortex",
+            "corust-agent" => "corust-agent-acp",
+            "crow-cli" => "crow-cli",
+            "devin" => "devin",
+            "stakpak" => "stakpak",
+            "antigravity-acp" => "agy-acp",
+            _ => unreachable!("known local ACP id"),
+        }
+        .into(),
     })?;
     if pinned
         .as_deref()
@@ -1318,6 +1427,8 @@ mod tests {
         assert_eq!(canonical_agent_id("kimi-code"), "kimi-code");
         assert_eq!(canonical_agent_id("kimi-cli"), "kimi");
         assert_eq!(canonical_agent_id("vibe-chat"), "mistral-vibe");
+        assert_eq!(canonical_agent_id("antigravity"), "antigravity-acp");
+        assert_eq!(canonical_agent_id("agy"), "antigravity-acp");
         assert_eq!(canonical_agent_id(" OpenCode "), "opencode");
         assert_eq!(
             agent_coordinate("claude-code", "0.66.0"),

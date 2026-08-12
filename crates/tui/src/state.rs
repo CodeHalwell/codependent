@@ -93,6 +93,9 @@ pub enum InputMode {
     /// A pending approval owns the screen: only the decision keys (`a`/`A`/`r`)
     /// and selection arrows are live, so an approval is never typed past.
     Approval,
+    /// Council results combine a selectable result list with a vertically
+    /// scrollable long-form synthesis/detail pane.
+    CouncilResults,
     /// A mounted public Remote UI surface owns focus.
     RemoteUi,
 }
@@ -2515,9 +2518,9 @@ impl AppState {
             | Overlay::Kanban
             | Overlay::UiPlugins
             | Overlay::CouncilBrowser
-            | Overlay::CouncilResults
             | Overlay::AddModelQuerying { .. }
             | Overlay::UnslothPulling { .. } => InputMode::Normal,
+            Overlay::CouncilResults => InputMode::CouncilResults,
             Overlay::CouncilBuilder(_) => {
                 unreachable!("council builder input mode is resolved above")
             }

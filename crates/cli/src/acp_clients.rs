@@ -8,7 +8,7 @@ use codypendent_integrations::acp::PermissionOption;
 use codypendent_integrations::acp_client::{AcpClient, AcpClientError, AcpEventSink};
 use codypendent_integrations::acp_registry::{
     agent_coordinate, agent_coordinate_with_model, agent_id_from_coordinate,
-    agent_model_from_coordinate, local_kimi_code_spec, AcpRegistry, AcpRegistryStore,
+    agent_model_from_coordinate, local_acp_agent_specs, AcpRegistry, AcpRegistryStore,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{EventBody, ModelId, RunId};
@@ -47,13 +47,19 @@ pub async fn list(paths: &RuntimePaths, refresh: bool, json: bool) -> anyhow::Re
                 })
             })
             .collect::<Vec<_>>();
-        if let Some(spec) = local_kimi_code_spec() {
+        for spec in local_acp_agent_specs() {
+            if rows
+                .iter()
+                .any(|row| row["id"].as_str() == Some(spec.registry_id.as_str()))
+            {
+                continue;
+            }
             rows.push(serde_json::json!({
                 "id": spec.registry_id,
                 "name": spec.name,
                 "version": spec.version,
-                "description": "Locally installed Kimi Code native ACP server",
-                "repository": "https://github.com/MoonshotAI/kimi-code",
+                "description": local_adapter_description(&spec.registry_id),
+                "repository": local_adapter_repository(&spec.registry_id),
                 "distribution": "local",
                 "ready": true,
                 "status": "ready (local ACP executable)",
@@ -85,7 +91,10 @@ pub async fn list(paths: &RuntimePaths, refresh: bool, json: bool) -> anyhow::Re
             agent.id, agent.name, agent.version, state
         );
     }
-    if let Some(spec) = local_kimi_code_spec() {
+    for spec in local_acp_agent_specs() {
+        if registry.get(&spec.registry_id).is_some() {
+            continue;
+        }
         let profiles = connected
             .iter()
             .filter_map(|(id, registry_id)| {
@@ -106,6 +115,28 @@ pub async fn list(paths: &RuntimePaths, refresh: bool, json: bool) -> anyhow::Re
         );
     }
     Ok(())
+}
+
+fn local_adapter_description(id: &str) -> &'static str {
+    match id {
+        "kimi-code" => "Locally installed Kimi Code native ACP server",
+        "junie" => "Locally installed JetBrains Junie native ACP server",
+        "cursor" => "Locally installed Cursor CLI native ACP server",
+        "antigravity-acp" => {
+            "Opt-in community ACP bridge for Google Antigravity; review Google's third-party access terms before use"
+        }
+        _ => "Locally installed ACP server",
+    }
+}
+
+fn local_adapter_repository(id: &str) -> &'static str {
+    match id {
+        "kimi-code" => "https://github.com/MoonshotAI/kimi-code",
+        "junie" => "https://www.jetbrains.com/junie/",
+        "cursor" => "https://cursor.com/cli",
+        "antigravity-acp" => "https://github.com/shubzkothekar/antigravity-acp",
+        _ => "",
+    }
 }
 
 pub async fn install(
@@ -275,6 +306,15 @@ pub async fn probe(
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
+        );
+    }
+    if matches!(
+        stop,
+        codypendent_integrations::acp_client::AcpStopReason::EndTurn
+    ) && safe_output.trim().is_empty()
+    {
+        bail!(
+            "ACP agent `{agent}` ended the turn without returning an assistant message; update or re-authenticate the agent, then retry"
         );
     }
     Ok(())

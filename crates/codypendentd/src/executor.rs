@@ -1113,7 +1113,17 @@ impl RuntimeExecutor {
         let changed_files = self
             .emit_acp_changeset(launch, &operating_tree, &sink.actor)
             .await?;
+        let empty_end_turn =
+            matches!(stop, AcpStopReason::EndTurn) && sink.assistant_text.trim().is_empty();
         let (state, disposition) = match stop {
+            AcpStopReason::EndTurn if empty_end_turn => (
+                RunState::Failed,
+                RunDisposition::Failed {
+                    reason: format!(
+                        "ACP agent `{registry_agent_id}` ended the turn without returning an assistant message; retry after updating or re-authenticating the agent"
+                    ),
+                },
+            ),
             AcpStopReason::EndTurn => (
                 RunState::Completed,
                 RunDisposition::Completed {

@@ -293,7 +293,10 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
 
 fn render_run_telemetry(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let status = state.status();
-    let model = status.model.as_ref().or(state.pending_model.as_ref());
+    // A newly staged model is the user's current selection for the next run.
+    // Prefer it immediately over the still-running model so the persistent
+    // strip never appears to ignore a successful picker action.
+    let model = state.pending_model.as_ref().or(status.model.as_ref());
     let model_card = model.and_then(|id| state.models.iter().find(|card| card.id == *id));
     let model_label = model.map_or("none", |id| id.0.as_str());
     let provider_label = model_card.map_or("—", |card| card.provider.as_str());
@@ -4248,8 +4251,10 @@ fn render_model_picker(
     let current = state.selected_run().and_then(|run| run.model.as_ref());
 
     // Left: the filtered model list (id, current marker, provider + badges).
-    // Each row is 3 lines tall; window the list around `selected` so it scrolls.
-    const ROW_LINES: usize = 3;
+    // Keep configured models compact: identity plus provider. Cost/context and
+    // location belong in the detail pane; rendering unknown placeholders here
+    // produced a noisy `hosted · — · —` third line for every ACP profile.
+    const ROW_LINES: usize = 2;
     let list_block = modal_panel("Models", theme);
     let list_area = list_block.inner(list_region);
     frame.render_widget(list_block, list_region);
@@ -4294,18 +4299,11 @@ fn render_model_picker(
                 theme.selection_aware_text_style(is_selected, theme.text.primary),
             ),
         ]);
-        // Provider and badges each get their own line (rather than one long
-        // joined line) so they survive the list's fixed-width column without
-        // truncating the trailing badges off a narrow terminal.
         let provider_line = Line::styled(
             format!("      {}", card.provider),
             theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
-        let badges_line = Line::styled(
-            format!("      {}", model_badges(card)),
-            theme.selection_aware_text_style(is_selected, theme.text.muted),
-        );
-        let item = ListItem::new(vec![head, provider_line, badges_line]);
+        let item = ListItem::new(vec![head, provider_line]);
         items.push(if is_selected {
             item.style(theme.selection_style())
         } else {
@@ -4327,7 +4325,7 @@ fn render_model_picker(
             &mut scrollbar,
         );
     }
-    // Each visible row is a fixed 3 lines tall (head/provider/badges) — register
+    // Each visible row is a fixed 2 lines tall (head/provider) — register
     // a rect of that height per rendered row (offset by the scroll window) so a
     // click maps to the right index even after the list has scrolled.
     for (row, _) in matches.iter().enumerate().skip(first) {
@@ -4438,19 +4436,6 @@ fn render_model_picker(
         .alignment(Alignment::Center),
         rows[2],
     );
-}
-
-/// A model card's badges, space-joined: `local ✓` / `hosted` (or nothing when
-/// unprofiled), the measured cost per 1K tokens, and the declared context
-/// window — each rendered `—` when the model has no measured profile
-/// (best-effort; `models.toml` is the authoritative selectable list).
-fn model_badges(card: &ModelCard) -> String {
-    format!(
-        "{} · {} · {}",
-        location_label(card.location),
-        cost_label(card.cost_per_1k_usd),
-        context_label(card.context_tokens)
-    )
 }
 
 /// Honest authentication posture for a configured model. A missing local key
@@ -6876,7 +6861,10 @@ fn render_palette(
     selected: usize,
 ) {
     let matches = crate::palette::filtered(query);
-    let rect = centered_modal(area, 112, 30);
+    // Long command identities and descriptions are useful discovery content,
+    // not decorative copy. Use the available wide terminal rather than
+    // truncating them inside the old 112-column cap.
+    let rect = centered_modal(area, 148, 34);
     let inner = modal_surface(frame, rect, "Command palette", state, theme);
 
     let rows = Layout::default()
@@ -6993,7 +6981,7 @@ fn render_palette(
         .map(|entry| UnicodeWidthStr::width(entry.title))
         .max()
         .unwrap_or(12)
-        .clamp(12, 24)
+        .clamp(12, 38)
         .min(inner_w.saturating_sub(key_w + 8));
     // marker(2) + title + space + description(fill) + key
     let desc_w = inner_w.saturating_sub(2 + title_w + 1 + key_w).max(1);
@@ -7439,6 +7427,7 @@ fn render_add_model_pick(
 ) {
     let matches = filter_model_names(models, query);
     let rect = centered_modal(area, 96, 26);
+    let amp_effort = provider_id == "amp-acp";
     let source = match origin {
         ModelListOrigin::Live => "live list".to_owned(),
         ModelListOrigin::Cached(age) => format!("cached {age}"),
@@ -7449,7 +7438,8 @@ fn render_add_model_pick(
         frame,
         rect,
         format!(
-            "Choose model · Step 2 of 2 · {} · {} of {} · {}{}",
+            "Choose {} · Step 2 of 2 · {} · {} of {} · {}{}",
+            if amp_effort { "effort" } else { "model" },
             truncate_display_width(provider_id, 24),
             matches.len(),
             models.len(),
@@ -7472,9 +7462,19 @@ fn render_add_model_pick(
 
     let list_block = modal_panel(
         format!(
-            "Models  ·  {} of {}  ·  ctx · $/1M in · out",
+            "{}  ·  {} of {}{}",
+            if amp_effort {
+                "Effort levels"
+            } else {
+                "Models"
+            },
             matches.len(),
-            models.len()
+            models.len(),
+            if amp_effort {
+                "  ·  Amp chooses the underlying model"
+            } else {
+                "  ·  ctx · $/1M in · out"
+            }
         ),
         theme,
     );
@@ -7529,13 +7529,20 @@ fn render_add_model_pick(
             ),
         ]);
         let detail = Line::styled(
-            format!(
-                "      {} · ctx {} · in {} · out {}",
-                card.name.as_deref().unwrap_or("—"),
-                context_label(card.context_tokens),
-                price_per_1m_label(card.cost_per_1m_input_usd),
-                price_per_1m_label(card.cost_per_1m_output_usd),
-            ),
+            if amp_effort {
+                format!(
+                    "      {}",
+                    card.name.as_deref().unwrap_or("Amp effort level")
+                )
+            } else {
+                format!(
+                    "      {} · ctx {} · in {} · out {}",
+                    card.name.as_deref().unwrap_or("—"),
+                    context_label(card.context_tokens),
+                    price_per_1m_label(card.cost_per_1m_input_usd),
+                    price_per_1m_label(card.cost_per_1m_output_usd),
+                )
+            },
             theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, detail]);
@@ -12053,6 +12060,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn staged_model_immediately_replaces_the_running_model_in_the_status_strip() {
+        let mut state = running_build_state();
+        state.models.push(ModelCard {
+            id: ModelId("acp/kimi-code#kimi-for-coding".to_owned()),
+            provider: "acp".to_owned(),
+            readiness: ModelReadiness::Ready,
+            location: Some(ModelLocationLabel::Hosted),
+            cost_per_1k_usd: None,
+            context_tokens: Some(262_144),
+        });
+        state.pending_model = Some(ModelId("acp/kimi-code#kimi-for-coding".to_owned()));
+
+        let output = render_to_string(&state, 140, 30);
+        let strip = output.lines().last().expect("persistent strip");
+        assert!(
+            strip.contains("model acp/kimi-code#kimi-for-"),
+            "new model selection should be visible immediately: {strip}"
+        );
+        assert!(
+            !strip.contains("model gpt-5.1-codex"),
+            "the prior run model must not mask the staged selection: {strip}"
+        );
+    }
+
     fn telemetry_agent(state: &str) -> crate::state::WorkflowNodeCard {
         crate::state::WorkflowNodeCard {
             workflow_id: "status-strip".to_owned(),
@@ -12632,18 +12664,20 @@ mod tests {
             "the list must not mark the non-current model's row current:\n{text}"
         );
 
-        // Local/hosted + cost + context badges.
-        assert!(text.contains("hosted"), "hosted badge missing:\n{text}");
+        // The list is deliberately compact: provider only. Rich profile data
+        // belongs to the focused detail pane, so an unfocused hosted row does
+        // not add a third `hosted · cost · context` filler line.
         assert!(
             text.contains("local \u{2713}"),
-            "local badge missing:\n{text}"
+            "focused model location missing from details:\n{text}"
         );
-        assert!(text.contains("$0.03/1k"), "cost badge missing:\n{text}");
-        assert!(text.contains("200k"), "context badge missing:\n{text}");
-        // The unprofiled model's badges are omitted gracefully, never crash.
         assert!(
             text.contains("32k"),
-            "the profiled model's context missing:\n{text}"
+            "focused model context missing from details:\n{text}"
+        );
+        assert!(
+            !text.contains("$0.03/1k") && !text.contains("200k"),
+            "unfocused model metadata should not create a noisy third row:\n{text}"
         );
     }
 

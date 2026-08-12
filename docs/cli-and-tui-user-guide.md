@@ -1,7 +1,7 @@
 # Codypendent CLI & TUI User Guide
 
 > **Product:** Codypendent — The local-first agentic developer environment
-> **Version:** 0.4.4
+> **Version:** 0.4.5
 > **Documentation Target:** CLI reference, Ratatui TUI shortcuts, environment setup, and workflow operations.
 
 ---
@@ -44,7 +44,7 @@ codypendent update --check
 
 # Install the newest published release, or pin an exact tag.
 codypendent update
-codypendent update v0.4.4
+codypendent update v0.4.5
 ```
 
 Updating never kills an active run. An idle daemon restarts immediately; a busy
@@ -488,8 +488,23 @@ and size limits. An entry without a digest requires the explicit
 Known native ACP servers are also detected without replacing the curated
 catalog. In particular, `~/.kimi-code/bin/kimi` (or a `kimi` on `PATH`) appears
 as `kimi-code`, launches `kimi acp`, shares the credentials created by
-`kimi login`, and pins the executable's bounded `--version` result. The older
-official `kimi` registry entry remains separately addressable as `kimi-cli`.
+`kimi login`, and pins the executable's bounded `--version` result. Installed
+Junie (`junie --acp=true`), Cursor CLI (`cursor-agent acp`), Cortex Code,
+Corust Agent, Crow CLI, Devin, and Stakpak are detected the same way when their
+documented ACP executable is already on `PATH`. This makes official-registry
+entries usable without weakening the checksum rule for downloaded archives.
+The older official `kimi` registry entry remains separately addressable as
+`kimi-cli`.
+
+Google Antigravity does not currently ship a native ACP server. Codypendent can
+detect an explicitly installed `agy-acp`/`antigravity-acp` community bridge and
+shows it as `antigravity-acp`; it never downloads or launches that bridge
+automatically. The bridge project's own documentation warns that using
+third-party software with an Antigravity OAuth account may violate Google's
+Terms of Service and risk account suspension. Review those terms and the
+bridge source before opting in. Installing the bridge executable on `PATH`,
+then opening `/provider` (or running `codypendent acp connect antigravity`), is
+the complete Codypendent-side setup.
 
 Discovery tracks the latest catalogue, but connecting snapshots an immutable
 `agent-id@version` coordinate into the model profile. A daily registry refresh

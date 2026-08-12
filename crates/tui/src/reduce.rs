@@ -526,8 +526,8 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::SelectLast => nav_to_edge(state, true),
         Action::ScrollPageUp => scroll_page(state, true),
         Action::ScrollPageDown => scroll_page(state, false),
-        Action::ScrollLinesUp => scroll_transcript(state, true, WHEEL_LINES),
-        Action::ScrollLinesDown => scroll_transcript(state, false, WHEEL_LINES),
+        Action::ScrollLinesUp => scroll_lines(state, true),
+        Action::ScrollLinesDown => scroll_lines(state, false),
         Action::Expand => expand_selected(state),
         Action::BrowseFoldPrev => browse_fold(state, -1),
         Action::BrowseFoldNext => browse_fold(state, 1),
@@ -2487,6 +2487,18 @@ const PAGE: u16 = 10;
 /// One wheel notch. Conventional terminals scroll ~3 lines per notch; mapping
 /// the wheel to a 10-row page made the conversation lurch.
 const WHEEL_LINES: u16 = 3;
+
+fn scroll_lines(state: &mut AppState, up: bool) {
+    if matches!(state.overlay, Overlay::CouncilResults) {
+        state.council_result_scroll = if up {
+            state.council_result_scroll.saturating_sub(WHEEL_LINES)
+        } else {
+            state.council_result_scroll.saturating_add(WHEEL_LINES)
+        };
+    } else {
+        scroll_transcript(state, up, WHEEL_LINES);
+    }
+}
 
 fn scroll_page(state: &mut AppState, up: bool) {
     if matches!(state.overlay, Overlay::CouncilResults) {
@@ -14098,6 +14110,17 @@ mod tests {
             s.runs[0].follow,
             "reaching the bottom re-enters follow mode"
         );
+    }
+
+    #[test]
+    fn council_results_wheel_scrolls_the_long_form_detail() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::CouncilResults;
+
+        reduce(&mut state, Action::ScrollLinesDown);
+        assert_eq!(state.council_result_scroll, WHEEL_LINES);
+        reduce(&mut state, Action::ScrollLinesUp);
+        assert_eq!(state.council_result_scroll, 0);
     }
 
     /// A blank `/keys` submit must reopen the masked prompt rather than

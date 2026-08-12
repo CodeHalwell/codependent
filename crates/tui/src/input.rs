@@ -279,6 +279,7 @@ fn map_key(key: &KeyEvent, mode: InputMode) -> Action {
         InputMode::Palette => map_palette_key(key),
         InputMode::Composer => map_composer_key(key),
         InputMode::Approval => map_approval_key(key),
+        InputMode::CouncilResults => map_normal_key(key),
         InputMode::RemoteUi => map_remote_ui_key(key),
         InputMode::Normal => map_normal_key(key),
     }
@@ -569,6 +570,14 @@ fn map_mouse(
         // List surfaces — browsers, the palette, stacked approvals — move their
         // selection on the wheel. A left click resolves through the same
         // hit-test map (a registered row), falling back to inert otherwise.
+        InputMode::CouncilResults => match mouse.kind {
+            MouseEventKind::ScrollUp => Action::ScrollLinesUp,
+            MouseEventKind::ScrollDown => Action::ScrollLinesDown,
+            MouseEventKind::Down(MouseButton::Left) => {
+                hit_test(hit_map, mouse.column, mouse.row).unwrap_or(Action::NoOp)
+            }
+            _ => Action::NoOp,
+        },
         InputMode::Normal | InputMode::Palette | InputMode::Approval => match mouse.kind {
             MouseEventKind::ScrollUp => Action::SelectPrev,
             MouseEventKind::ScrollDown => Action::SelectNext,
@@ -1018,6 +1027,17 @@ mod tests {
         assert_eq!(
             map_event(&key(KeyCode::PageDown), InputMode::Composer, W, &[]),
             Action::ScrollPageDown
+        );
+
+        assert_eq!(
+            map_event(
+                &wheel(MouseEventKind::ScrollDown, 10),
+                InputMode::CouncilResults,
+                W,
+                &[]
+            ),
+            Action::ScrollLinesDown,
+            "Council Results owns a scrollable detail pane, not just a result list"
         );
     }
 

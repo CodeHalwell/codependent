@@ -2182,13 +2182,26 @@ async fn event_loop<P: Presentation>(
                                 result: Ok(probe.coordinate(None)),
                             },
                             Ok(probe) => ReaderSignal::ProviderModels {
-                                provider_id,
+                                provider_id: provider_id.clone(),
                                 request_id,
                                 // An agent advertises ids only — there is no
                                 // catalog metadata for a model that lives
                                 // inside someone else's agent.
                                 result: Ok((
-                                    probe.models.into_iter().map(AddModelRow::live).collect(),
+                                    probe
+                                        .models
+                                        .into_iter()
+                                        .map(|model| {
+                                            let mut row = AddModelRow::live(model);
+                                            if provider_id == "amp-acp" {
+                                                row.name = Some(
+                                                    "Amp effort level · underlying model selected by Amp"
+                                                        .to_string(),
+                                                );
+                                            }
+                                            row
+                                        })
+                                        .collect(),
                                     ModelListOrigin::Live,
                                 )),
                             },
@@ -4168,25 +4181,20 @@ fn write_add_model(
     // Resolve the catalog base_url for the chosen provider (built-ins layered with
     // any user providers.toml; a load failure falls back to the built-ins).
     let acp_store = codypendent_integrations::acp_registry::AcpRegistryStore::new(data_dir);
-    let acp_agent = acp_store
-        .load_cached()
-        .ok()
-        .and_then(|registry| registry.get(provider_id).cloned());
+    let acp_agent = is_acp_provider(paths, provider_id);
     let catalog = Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
         .unwrap_or_else(|_| Catalog::builtin());
-    let (runtime_provider, base_url, provider_model, catalog_provider) = if let Some(agent) =
-        acp_agent
-    {
+    let (runtime_provider, base_url, provider_model, catalog_provider) = if acp_agent {
         let coordinate = if codypendent_integrations::acp_registry::agent_id_from_coordinate(model)
-            == agent.id
+            == provider_id
         {
             model.to_string()
         } else {
-            agent.id.clone()
+            provider_id.to_string()
         };
         acp_store
             .launch_spec(&coordinate)
-            .with_context(|| format!("ACP agent `{}` is not launchable", agent.id))?;
+            .with_context(|| format!("ACP agent `{provider_id}` is not launchable"))?;
         ("acp".to_string(), String::new(), coordinate, false)
     } else {
         let provider = catalog
@@ -4367,8 +4375,7 @@ fn is_acp_provider(paths: &RuntimePaths, provider_id: &str) -> bool {
         .load_cached()
         .ok()
         .is_some_and(|registry| registry.get(provider_id).is_some())
-        || codypendent_integrations::acp_registry::local_kimi_code_spec()
-            .is_some_and(|spec| spec.registry_id == provider_id)
+        || codypendent_integrations::acp_registry::local_acp_agent_spec(provider_id).is_some()
 }
 
 /// The `models.toml` profile id for a connected ACP agent — `acp/<agent>`, or
@@ -6450,22 +6457,49 @@ async fn load_provider_cards(
             }
         }));
     }
-    if let Some(spec) = codypendent_integrations::acp_registry::local_kimi_code_spec() {
-        if !cards.iter().any(|card| card.id == spec.registry_id) {
-            cards.push(ProviderCard {
-                id: spec.registry_id,
-                name: spec.name,
-                protocol: "acp".to_string(),
-                auth: format!("acp: local · {}", spec.version),
-                local: true,
-                requires_key: false,
-                // Locally installed, so it can be handshaken for its models.
-                can_list_models: true,
-                available: true,
-                catalog_models: 0,
-                has_key: false,
-            });
+    for spec in codypendent_integrations::acp_registry::local_acp_agent_specs() {
+        if let Some(card) = cards.iter_mut().find(|card| card.id == spec.registry_id) {
+            // The registry describes how an adapter can be installed, while
+            // this projection describes what is actually usable now. Prefer
+            // the installed executable so Junie/Cursor/etc. do not remain
+            // labelled as hosted previews after local discovery succeeds.
+            card.name = spec.name;
+            card.auth = format!("acp: local · {}", spec.version);
+            card.local = true;
+            card.can_list_models = true;
+            card.available = true;
+            continue;
         }
+        cards.push(ProviderCard {
+            id: spec.registry_id,
+            name: spec.name,
+            protocol: "acp".to_string(),
+            auth: format!("acp: local · {}", spec.version),
+            local: true,
+            requires_key: false,
+            // Locally installed, so it can be handshaken for its models.
+            can_list_models: true,
+            available: true,
+            catalog_models: 0,
+            has_key: false,
+        });
+    }
+    // Google does not currently ship a native Antigravity ACP server. Keep the
+    // opt-in community bridge discoverable without downloading or launching it
+    // behind the user's back; its own documentation warns of account/ToS risk.
+    if !cards.iter().any(|card| card.id == "antigravity-acp") {
+        cards.push(ProviderCard {
+            id: "antigravity-acp".to_string(),
+            name: "Google Antigravity (community bridge)".to_string(),
+            protocol: "acp".to_string(),
+            auth: "acp: install agy-acp · third-party ToS risk".to_string(),
+            local: true,
+            requires_key: false,
+            can_list_models: false,
+            available: false,
+            catalog_models: 0,
+            has_key: false,
+        });
     }
     // Put usable providers first, with local endpoints before hosted ones. The
     // complete catalog remains searchable below them as an honest preview.

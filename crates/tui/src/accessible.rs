@@ -888,6 +888,9 @@ fn controls_for(mode: InputMode) -> &'static str {
         InputMode::Approval => {
             "Controls: approve, approve-run, reject, up, down, pageup, pagedown"
         }
+        InputMode::CouncilResults => {
+            "Controls: up/down select a result, pageup/pagedown scroll its synthesis, Enter toggles member reports, copy copies the synthesis, Esc closes"
+        }
         InputMode::Normal => "Controls: up, down, Enter, Esc, help, quit",
     }
 }
@@ -944,6 +947,7 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
                 },
                 InputMode::Palette => Action::RemoveSelected,
                 InputMode::Normal => Action::ClearIssues,
+                InputMode::CouncilResults => Action::NoOp,
                 InputMode::Composer
                 | InputMode::Editing
                 | InputMode::Confirm
@@ -963,6 +967,7 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
                     Action::InputBackspace
                 }
                 InputMode::Normal | InputMode::Confirm | InputMode::Approval => Action::NoOp,
+                InputMode::CouncilResults => Action::NoOp,
             }];
         }
         _ => {}
@@ -1010,7 +1015,7 @@ fn submit_action(mode: InputMode) -> Action {
         },
         InputMode::Confirm => Action::ConfirmCancel,
         InputMode::Approval => Action::NoOp,
-        InputMode::Normal => Action::Expand,
+        InputMode::Normal | InputMode::CouncilResults => Action::Expand,
         _ => Action::InputSubmit,
     }
 }
@@ -1062,7 +1067,10 @@ fn navigation_action(mode: InputMode, previous: bool) -> Action {
                 Action::HistoryNext
             }
         }
-        InputMode::Normal | InputMode::Palette | InputMode::Approval => {
+        InputMode::Normal
+        | InputMode::Palette
+        | InputMode::Approval
+        | InputMode::CouncilResults => {
             if previous {
                 Action::SelectPrev
             } else {
@@ -1090,7 +1098,7 @@ fn page_action(mode: InputMode, previous: bool) -> Action {
                 Action::SelectPageNext
             }
         }
-        InputMode::Composer | InputMode::Normal => {
+        InputMode::Composer | InputMode::Normal | InputMode::CouncilResults => {
             if previous {
                 Action::ScrollPageUp
             } else {
