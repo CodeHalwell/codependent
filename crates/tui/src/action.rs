@@ -118,6 +118,12 @@ pub enum Action {
     ScrollPageUp,
     /// Scroll the transcript down a page (`PageDown`).
     ScrollPageDown,
+    /// Scroll the transcript up a few lines (one wheel notch). The finer
+    /// sibling of [`Action::ScrollPageUp`]; a wheel notch that jumped ten rows
+    /// read as a page jump, not a scroll.
+    ScrollLinesUp,
+    /// Scroll the transcript down a few lines (one wheel notch).
+    ScrollLinesDown,
     /// Open / expand the selected item (`Enter`).
     Expand,
     /// Move the transcript fold selection to the previous foldable entry of the

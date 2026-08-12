@@ -241,6 +241,8 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::SelectNext => nav(state, 1),
         Action::ScrollPageUp => scroll_page(state, true),
         Action::ScrollPageDown => scroll_page(state, false),
+        Action::ScrollLinesUp => scroll_transcript(state, true, WHEEL_LINES),
+        Action::ScrollLinesDown => scroll_transcript(state, false, WHEEL_LINES),
         Action::Expand => expand_selected(state),
         Action::BrowseFoldPrev => browse_fold(state, -1),
         Action::BrowseFoldNext => browse_fold(state, 1),
@@ -1695,7 +1697,18 @@ fn nav(state: &mut AppState, delta: i32) {
     }
 }
 
+/// `PgUp`/`PgDn`: a viewport-sized-ish jump.
+const PAGE: u16 = 10;
+
+/// One wheel notch. Conventional terminals scroll ~3 lines per notch; mapping
+/// the wheel to a 10-row page made the conversation lurch.
+const WHEEL_LINES: u16 = 3;
+
 fn scroll_page(state: &mut AppState, up: bool) {
+    scroll_transcript(state, up, PAGE);
+}
+
+fn scroll_transcript(state: &mut AppState, up: bool, rows: u16) {
     if matches!(state.overlay, Overlay::Edges) {
         let page = if up {
             state.edge_page.saturating_sub(1)
@@ -1709,7 +1722,6 @@ fn scroll_page(state: &mut AppState, up: bool) {
     }
     // Scrolling means the user is driving the viewport, not the fold cursor.
     end_browse(state);
-    const PAGE: u16 = 10;
     // The renderer cached the true bottom last frame; use it so leaving follow
     // mode starts a page up from the bottom (not a jump to the top), and paging
     // back to the bottom re-enters follow.
@@ -1721,9 +1733,9 @@ fn scroll_page(state: &mut AppState, up: bool) {
                 run.follow = false;
                 run.scroll = max;
             }
-            run.scroll = run.scroll.saturating_sub(PAGE);
+            run.scroll = run.scroll.saturating_sub(rows);
         } else {
-            run.scroll = run.scroll.saturating_add(PAGE).min(max);
+            run.scroll = run.scroll.saturating_add(rows).min(max);
             if run.scroll >= max {
                 run.follow = true;
             }
@@ -3187,6 +3199,14 @@ fn submit_prompt(state: &mut AppState) {
             let key = buffer.0.trim().to_owned();
             if key.is_empty() {
                 state.notice = Some(("key not saved (blank)".to_owned(), state.tick + 25));
+                // Reopen the prompt rather than dropping the operator back to
+                // the base view: a stray `Enter` mid-paste should not discard
+                // the flow they were in. Mirrors `AddModelId`, which has always
+                // reopened on a blank submit.
+                state.overlay = Overlay::ApiKeySet {
+                    target,
+                    buffer: SecretKey(String::new()),
+                };
             } else {
                 state.outbox.push(Intent::SetApiKey {
                     target,
@@ -9040,5 +9060,73 @@ mod tests {
         reduce(&mut s, Action::InputPaste("XY".to_owned()));
         assert_eq!(s.composer, "aXYb");
         assert_eq!(s.composer_cursor, 3);
+    }
+
+    // --- wheel granularity, blank `/keys` submit, live mode chip ---
+
+    /// A wheel notch scrolls a few lines; `PgUp`/`PgDn` still move a page. Both
+    /// share the follow-mode contract (leaving at the true bottom, re-entering
+    /// when scrolled back down).
+    #[test]
+    fn the_wheel_scrolls_lines_while_page_keys_scroll_a_page() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // The renderer's cached bottom (a tall transcript).
+        s.transcript_max_scroll.set(100);
+        assert!(s.runs[0].follow);
+
+        reduce(&mut s, Action::ScrollLinesUp);
+        assert!(!s.runs[0].follow, "scrolling up leaves follow mode");
+        assert_eq!(
+            s.runs[0].scroll, 97,
+            "a wheel notch is a few lines from the true bottom, not a page"
+        );
+        reduce(&mut s, Action::ScrollLinesUp);
+        assert_eq!(s.runs[0].scroll, 94);
+
+        reduce(&mut s, Action::ScrollPageUp);
+        assert_eq!(s.runs[0].scroll, 84, "a page is still a page");
+
+        // Scrolling back to the bottom re-enters follow either way.
+        for _ in 0..6 {
+            reduce(&mut s, Action::ScrollLinesDown);
+        }
+        assert_eq!(s.runs[0].scroll, 100);
+        assert!(
+            s.runs[0].follow,
+            "reaching the bottom re-enters follow mode"
+        );
+    }
+
+    /// A blank `/keys` submit must reopen the masked prompt rather than
+    /// dropping the operator back to the base view — the same rule
+    /// `AddModelId` has always followed.
+    #[test]
+    fn a_blank_key_submit_reopens_the_prompt() {
+        let mut s = AppState::new();
+        let target = KeyTarget::Model("groq/llama".to_owned());
+        s.overlay = Overlay::ApiKeySet {
+            target: target.clone(),
+            buffer: SecretKey("   ".to_owned()),
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.overlay,
+            Overlay::ApiKeySet {
+                target,
+                buffer: SecretKey(String::new()),
+            },
+            "the prompt reopens, cleared, instead of closing"
+        );
+        assert!(s.outbox.is_empty(), "nothing is written for a blank key");
+        assert!(s.notice.is_some(), "and the operator is told why");
     }
 }

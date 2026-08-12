@@ -495,8 +495,10 @@ fn map_mouse(
         // resolves through the hit-test map (a registered fold line, footer chip,
         // etc.), falling back to inert when nothing is registered there.
         InputMode::Composer => match mouse.kind {
-            MouseEventKind::ScrollUp => Action::ScrollPageUp,
-            MouseEventKind::ScrollDown => Action::ScrollPageDown,
+            // A notch is a few lines, the conventional wheel granularity —
+            // `PgUp`/`PgDn` remain the page-sized keyboard equivalent.
+            MouseEventKind::ScrollUp => Action::ScrollLinesUp,
+            MouseEventKind::ScrollDown => Action::ScrollLinesDown,
             MouseEventKind::Down(MouseButton::Left) => {
                 hit_test(hit_map, mouse.column, mouse.row).unwrap_or(Action::NoOp)
             }
@@ -1028,8 +1030,9 @@ mod tests {
             map_event(&key(KeyCode::Down), InputMode::Normal, W, &[])
         );
 
-        // In the conversation the wheel scrolls the transcript, reachable from
-        // PgUp / PgDn.
+        // In the conversation the wheel scrolls the transcript a few lines per
+        // notch; PgUp / PgDn are the page-sized keyboard equivalent (RULE 3 is
+        // "reachable by keyboard", not "identical granularity").
         assert_eq!(
             map_event(
                 &wheel(MouseEventKind::ScrollUp, 10),
@@ -1037,11 +1040,24 @@ mod tests {
                 W,
                 &[]
             ),
-            Action::ScrollPageUp
+            Action::ScrollLinesUp
+        );
+        assert_eq!(
+            map_event(
+                &wheel(MouseEventKind::ScrollDown, 10),
+                InputMode::Composer,
+                W,
+                &[]
+            ),
+            Action::ScrollLinesDown
         );
         assert_eq!(
             map_event(&key(KeyCode::PageUp), InputMode::Composer, W, &[]),
             Action::ScrollPageUp
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::PageDown), InputMode::Composer, W, &[]),
+            Action::ScrollPageDown
         );
 
         // A left click with nothing registered under it (an empty hit-test map)

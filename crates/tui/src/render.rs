@@ -315,12 +315,25 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             )]);
         }
         if show_mode {
-            groups.push(vec![Span::styled(
-                mode_label(state.default_mode).to_owned(),
+            // The mode the selected run is ACTUALLY running in — showing only
+            // `default_mode` let the chip contradict the run right under it.
+            // When the next submission would use a different mode (a `/mode`
+            // pick mid-run), both are shown as `live → next` so the pick is
+            // still confirmed on screen without lying about the live run.
+            let live = status.mode.unwrap_or(state.default_mode);
+            let mut chip = vec![Span::styled(
+                mode_label(live).to_owned(),
                 Style::default()
                     .fg(theme.focus.active)
                     .add_modifier(Modifier::BOLD),
-            )]);
+            )];
+            if status.mode.is_some_and(|mode| mode != state.default_mode) {
+                chip.push(Span::styled(
+                    format!(" → {}", mode_label(state.default_mode)),
+                    Style::default().fg(theme.text.muted),
+                ));
+            }
+            groups.push(chip);
         }
         if show_context {
             groups.push(vec![Span::styled(
@@ -10862,6 +10875,38 @@ mod tests {
         assert!(
             header.contains("gpt-5.1-codex") && header.contains("Build"),
             "a wide title must not crowd the model/mode chips off the header: {header:?}"
+        );
+    }
+
+    /// The header's mode chip names the mode the live run is ACTUALLY in — it
+    /// used to show the session default, which could contradict the run right
+    /// under it. A pending `/mode` pick is still confirmed, as `live → next`.
+    #[test]
+    fn the_header_mode_chip_names_the_live_runs_mode() {
+        let mut state = running_build_state();
+        assert_eq!(state.runs[0].mode, AgentMode::Build);
+        let same = header_line(&state, 120);
+        assert!(same.contains("Build"), "the live run's mode shows:\n{same}");
+        assert!(
+            !same.contains('→'),
+            "no pending arrow when the next run matches:\n{same}"
+        );
+
+        // Picking a different mode mid-run shows both, without lying about the
+        // run that is already going.
+        state.default_mode = AgentMode::Plan;
+        let pending = header_line(&state, 120);
+        assert!(
+            pending.contains("Build") && pending.contains("Plan"),
+            "the live mode and the pending pick both show:\n{pending}"
+        );
+
+        // With no run at all, the session default is all there is.
+        let fresh = AppState::new();
+        let empty = header_line(&fresh, 120);
+        assert!(
+            empty.contains("Build"),
+            "the session default stands in before the first run:\n{empty}"
         );
     }
 }
