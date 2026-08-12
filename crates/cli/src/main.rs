@@ -552,6 +552,19 @@ enum ModelsCommand {
         /// endpoint the profile + probe are keyed under).
         id: String,
     },
+    /// Pull a GGUF model from the Unsloth catalog on Hugging Face and register
+    /// it against the `ollama` provider. Resolves `<hf-repo>[:<quant>]`
+    /// (defaulting a bare repo name to the `unsloth/` org and, with no
+    /// `:quant`, an auto-picked default), drives `ollama pull
+    /// hf.co/<org>/<repo>:<quant>` with streamed progress, then writes
+    /// `models.toml` using the exact reference `ollama list` shows. Requires
+    /// `ollama` on `PATH` (see https://ollama.com); this command never
+    /// downloads or runs model weights itself.
+    Pull {
+        /// `<hf-repo>[:<quant>]`, e.g. `Qwen3-32B-GGUF`,
+        /// `Qwen3-32B-GGUF:UD-Q4_K_XL`, or `some-org/Some-Model-GGUF:Q8_0`.
+        spec: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -929,6 +942,16 @@ async fn main() -> anyhow::Result<()> {
         },
         TopCommand::Models { command } => match command {
             ModelsCommand::Bench { id } => commands::models_bench(&paths, &id).await,
+            ModelsCommand::Pull { spec } => {
+                let hf = codypendent_integrations::unsloth::HfHubClient::hub()?;
+                codypendent_cli::models_pull::run(
+                    &paths,
+                    &spec,
+                    &hf,
+                    codypendent_cli::models_pull::OLLAMA_BIN,
+                )
+                .await
+            }
         },
         TopCommand::Promote { command } => match command {
             PromoteCommand::Propose {

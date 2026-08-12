@@ -26,7 +26,7 @@ pub mod client;
 pub mod quant;
 
 pub use client::HfHubClient;
-pub use quant::{GgufFile, QuantVariant};
+pub use quant::{pick_default_quant, GgufFile, QuantVariant};
 
 use async_trait::async_trait;
 

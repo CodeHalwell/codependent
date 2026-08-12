@@ -93,6 +93,27 @@ pub(crate) fn group_quant_variants(entries: &[TreeEntry]) -> Vec<QuantVariant> {
     variants
 }
 
+/// A sensible default quant when the caller named none (`codypendent models
+/// pull <repo>` with no `:quant` suffix): prefer the community-standard
+/// "balanced" tag `Q4_K_M` — present in most Unsloth GGUF repos alongside
+/// their dynamic (`UD-`) quants — then fall back to the repo's only variant
+/// when there is exactly one. Returns `None` when several variants exist and
+/// none is `Q4_K_M`: resolving that ambiguity is the caller's job (ask the
+/// user, or list the choices), never a silent guess.
+#[must_use]
+pub fn pick_default_quant(variants: &[QuantVariant]) -> Option<&QuantVariant> {
+    if let Some(balanced) = variants
+        .iter()
+        .find(|v| v.quant.eq_ignore_ascii_case("Q4_K_M"))
+    {
+        return Some(balanced);
+    }
+    match variants {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
 /// Parse a quant label from a flat (non-nested) GGUF filename stem (the
 /// filename with `.gguf` already stripped), e.g. `Qwen3-32B-UD-Q4_K_XL` →
 /// `UD-Q4_K_XL`, `Qwen3-32B-Q4_K_M` → `Q4_K_M`, `gpt-oss-20b-F16` → `F16`.
@@ -351,5 +372,55 @@ mod tests {
                 "expected {rejected} to NOT be a quant token"
             );
         }
+    }
+
+    fn variant(quant: &str, size: u64) -> QuantVariant {
+        QuantVariant {
+            quant: quant.to_string(),
+            files: vec![GgufFile {
+                path: format!("Repo-{quant}.gguf"),
+                size_bytes: size,
+            }],
+            total_size_bytes: size,
+        }
+    }
+
+    #[test]
+    fn pick_default_quant_prefers_q4_k_m_even_when_it_is_not_smallest() {
+        let variants = vec![
+            variant("UD-IQ1_S", 1),
+            variant("Q4_K_M", 2),
+            variant("Q8_0", 3),
+        ];
+        let picked = pick_default_quant(&variants).expect("a default is picked");
+        assert_eq!(picked.quant, "Q4_K_M");
+    }
+
+    #[test]
+    fn pick_default_quant_matches_q4_k_m_case_insensitively() {
+        let variants = vec![variant("q4_k_m", 2)];
+        let picked = pick_default_quant(&variants).expect("a default is picked");
+        assert_eq!(picked.quant, "q4_k_m");
+    }
+
+    #[test]
+    fn pick_default_quant_falls_back_to_the_only_variant() {
+        let variants = vec![variant("Q8_0", 3)];
+        let picked = pick_default_quant(&variants).expect("the only variant is picked");
+        assert_eq!(picked.quant, "Q8_0");
+    }
+
+    #[test]
+    fn pick_default_quant_is_none_when_ambiguous() {
+        let variants = vec![variant("UD-IQ1_S", 1), variant("Q8_0", 3)];
+        assert!(
+            pick_default_quant(&variants).is_none(),
+            "multiple variants with no Q4_K_M must not guess"
+        );
+    }
+
+    #[test]
+    fn pick_default_quant_is_none_for_an_empty_list() {
+        assert!(pick_default_quant(&[]).is_none());
     }
 }
