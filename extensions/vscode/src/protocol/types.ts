@@ -311,6 +311,14 @@ export type EventBody =
   | { type: "SteeringApplied"; run_id: Uuid }
   | { type: "BudgetWarning"; run_id: Uuid; dimension: BudgetDimension; used: number; limit: number }
   | { type: "RunCompleted"; run_id: Uuid; disposition: RunDisposition; chronicle: ArtifactRef }
+  | {
+      type: "LearningsCaptured";
+      run_id: Uuid;
+      proposed_count: number;
+      proposed_ids?: Uuid[];
+      activated_count: number;
+      activated_ids?: Uuid[];
+    }
   | { type: "ClientPresenceChanged"; client_id: Uuid; role: ClientRole; present: boolean }
   | { type: "Unknown" };
 

@@ -33,6 +33,7 @@
 
 mod artifact;
 mod blackboard;
+mod council;
 mod docs;
 mod edit_file;
 mod git;
@@ -48,6 +49,7 @@ mod secure_fs;
 mod shell;
 mod task;
 mod web_search;
+mod workflow_control;
 mod workflow_query;
 mod write_file;
 
@@ -62,6 +64,11 @@ pub use artifact::{parse_artifact_read, ArtifactRead, ArtifactReadInput};
 pub use blackboard::{
     parse_blackboard_post, parse_blackboard_query, BlackboardPostInput, BlackboardPostTool,
     BlackboardQueryInput, BlackboardQueryTool,
+};
+pub use council::{
+    council_create_action, council_result_action, council_run_action, parse_council_create,
+    parse_council_result, parse_council_run, CouncilCreateInput, CouncilCreateTool,
+    CouncilResultInput, CouncilResultTool, CouncilRunInput, CouncilRunTool,
 };
 pub use docs::{
     docs_proposed_action, parse_docs_create, parse_docs_edit, parse_docs_read, parse_docs_suggest,
@@ -97,6 +104,11 @@ pub use task::{
     TaskUpdateInput, TaskUpdateTool,
 };
 pub use web_search::{parse_web_search, render_search_outcome, WebSearch, WebSearchInput};
+pub use workflow_control::{
+    parse_workflow_create, parse_workflow_run, workflow_create_action, workflow_draft_schema,
+    workflow_run_action, WorkflowCreateInput, WorkflowCreateTool, WorkflowRunInput,
+    WorkflowRunTool,
+};
 pub use workflow_query::{parse_workflow_query, WorkflowQueryInput, WorkflowQueryTool};
 pub use write_file::{parse_write_file, WriteFile, WriteFileInput, WriteFileOutcome};
 

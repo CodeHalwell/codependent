@@ -241,6 +241,23 @@ pub enum ProposedAction {
         /// runs (server-derived from the run context / validated args).
         workflow_run_id: String,
     },
+    /// Persist a validated, reviewable workflow manifest in the user's workflow
+    /// directory. The full structured draft stays tool-local; this bounded
+    /// preview is what policy, approval UIs, and the audit ledger record.
+    WorkflowCreate {
+        workflow_id: String,
+        summary: String,
+    },
+    /// Start a named persisted workflow or a validated inline workflow in the
+    /// current run's repository. Both forms can spend model/tool budget and are
+    /// therefore explicitly approval-gated.
+    WorkflowRun {
+        workflow_id: String,
+        /// `named` or `inline`, so approval surfaces distinguish persistence
+        /// from an ephemeral manifest without decoding tool arguments.
+        kind: String,
+        summary: String,
+    },
     /// Write a card on the repository task board (the `task.create` /
     /// `task.update` / `task.move` runtime tools, rubric 10). Internal
     /// coordination state in Codypendent's own store — like a blackboard post it
@@ -259,6 +276,22 @@ pub enum ProposedAction {
     TaskRead {
         /// The canonical repository whose board is read (server-derived).
         repository: String,
+    },
+    /// Persist a validated multi-model council definition. The summary is a
+    /// bounded policy preview; the full typed definition remains tool-local.
+    CouncilCreate {
+        name: String,
+        summary: String,
+    },
+    /// Convene a persisted council. This may fan out paid model requests, so it
+    /// always reaches an explicit approval before execution.
+    CouncilRun {
+        name: String,
+        summary: String,
+    },
+    /// Read a durable council result by stable result id or council name.
+    CouncilResultRead {
+        selector: String,
     },
     #[serde(other)]
     Unknown,

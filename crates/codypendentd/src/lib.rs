@@ -24,6 +24,7 @@ pub mod docs_channel;
 mod docs_job;
 pub mod documents;
 mod executor;
+mod learning_capture;
 mod promotion;
 mod publish;
 mod retrieval;

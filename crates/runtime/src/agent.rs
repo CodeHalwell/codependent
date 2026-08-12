@@ -67,6 +67,7 @@ use codypendent_integrations::mcp::{McpBridge, McpError, McpToolInfo};
 // top-k most relevant to a run (`select_mcp_tools`). The knowledge crate depends
 // on neither the daemon nor this one, so this is the same one-way edge the fact
 // extractor already uses.
+use codypendent_council::CouncilService;
 use codypendent_integrations::search::SearchApi;
 use codypendent_knowledge::{
     retrieve, HashingEmbedder, RegistryItem, RetrievalConfig, RetrievalIndexes, RetrievalQuery,
@@ -94,26 +95,33 @@ use crate::models::ModelRegistry;
 #[cfg(feature = "provider-openai")]
 use crate::models::{classify_provider_message, FailureClass};
 use crate::tools::{
-    docs_proposed_action, new_pull_request, parse_artifact_read, parse_blackboard_post,
-    parse_blackboard_query, parse_create_check_run, parse_create_draft_pull_request,
-    parse_docs_create, parse_docs_edit, parse_docs_read, parse_docs_suggest,
-    parse_edit_file as parse_edit_file_args, parse_get_pull_request, parse_list_check_runs,
-    parse_memory_remember, parse_skills_search, parse_task_create, parse_task_list,
-    parse_task_move, parse_task_update, parse_update_pull_request, parse_web_search,
-    parse_workflow_query, parse_write_file as parse_write_file_args, render_check_runs,
-    render_pull_request, render_registry_search, render_search_outcome, task_read_action,
-    task_write_action, tool_label, ApplyPatch, ApplyPatchInput, ArtifactRead, ArtifactReadInput,
-    ArtifactReader, ArtifactSink, BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput,
-    BlackboardQueryTool, CommandRequest, CreateCheckRunInput, CreateCheckRunSummary,
-    CreateDraftPullRequest, CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool,
-    DocsEditInput, DocsEditTool, DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool,
-    EditFile, EditFileInput, EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff,
-    GitDiffInput, ListCheckRuns, ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile,
-    ReadFileInput, RegistrySearch, RegistrySearchRequest, RepositoryTest, Search, SearchInput,
-    Shell, SkillsSearch, SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput,
-    TaskListTool, TaskMoveTool, TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput,
-    UpdatePullRequestTool, WebSearch, WebSearchInput, WorkflowQueryInput, WorkflowQueryTool,
-    WriteFile, WriteFileInput,
+    council_create_action, council_result_action, council_run_action, docs_proposed_action,
+    new_pull_request, parse_artifact_read, parse_blackboard_post, parse_blackboard_query,
+    parse_council_create, parse_council_result, parse_council_run, parse_create_check_run,
+    parse_create_draft_pull_request, parse_docs_create, parse_docs_edit, parse_docs_read,
+    parse_docs_suggest, parse_edit_file as parse_edit_file_args, parse_get_pull_request,
+    parse_list_check_runs, parse_memory_remember, parse_skills_search, parse_task_create,
+    parse_task_list, parse_task_move, parse_task_update, parse_update_pull_request,
+    parse_web_search, parse_workflow_create, parse_workflow_query, parse_workflow_run,
+    parse_write_file as parse_write_file_args, render_check_runs, render_pull_request,
+    render_registry_search, render_search_outcome, task_read_action, task_write_action, tool_label,
+    workflow_create_action, workflow_run_action, ApplyPatch, ApplyPatchInput, ArtifactRead,
+    ArtifactReadInput, ArtifactReader, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
+    BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CouncilCreateInput,
+    CouncilCreateTool, CouncilResultInput, CouncilResultTool, CouncilRunInput, CouncilRunTool,
+    CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
+    CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool, DocsEditInput, DocsEditTool,
+    DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool, EditFile, EditFileInput,
+    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns,
+    ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput,
+    RegistrySearch, RegistrySearchRequest, RepositoryTest, Search, SearchInput, Shell,
+    SkillsSearch, SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool,
+    TaskMoveTool, TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput, UpdatePullRequestTool,
+    WebSearch, WebSearchInput, WorkflowCreateInput, WorkflowCreateTool, WorkflowQueryInput,
+    WorkflowQueryTool, WorkflowRunInput, WorkflowRunTool, WriteFile, WriteFileInput,
+};
+use crate::workflow_control::{
+    WorkflowControlChannel, WorkflowCreateRequest, WorkflowRunRequest, WorkflowRunTarget,
 };
 
 /// Safety valve: the maximum number of `next_step` calls a single run makes
@@ -1400,9 +1408,14 @@ pub struct FrameworkAgentRuntime {
     /// (rubric 5), if wired. Repository-scoped rather than run-scoped, so it also
     /// serves a plain chat run.
     workflow_query: Option<Arc<dyn WorkflowQueryChannel>>,
+    /// Validated workflow authoring/start seam. Wired by the assembly over the
+    /// same conductor host used by transport-level StartWorkflow.
+    workflow_control: Option<Arc<dyn WorkflowControlChannel>>,
     /// The repository task board the `task.*` backlog tools write and read
     /// (rubric 10), if wired.
     task_board: Option<Arc<dyn TaskBoardChannel>>,
+    /// Persisted multi-model councils, available to ordinary chat runs.
+    councils: Option<Arc<dyn CouncilService>>,
 }
 
 /// How a run terminated, before it is folded into a [`RunDisposition`].
@@ -1442,7 +1455,9 @@ impl FrameworkAgentRuntime {
             docs: None,
             artifacts: None,
             workflow_query: None,
+            workflow_control: None,
             task_board: None,
+            councils: None,
         }
     }
 
@@ -1552,10 +1567,24 @@ impl FrameworkAgentRuntime {
         self
     }
 
+    /// Inject workflow authoring and launch. The tool surface remains absent
+    /// without this seam or without a server-derived repository identity.
+    pub fn with_workflow_control(mut self, workflows: Arc<dyn WorkflowControlChannel>) -> Self {
+        self.workflow_control = Some(workflows);
+        self
+    }
+
     /// Inject the task-board channel the `task.*` tools use (rubric 10). Without
     /// it those tools are never offered.
     pub fn with_task_board(mut self, board: Arc<dyn TaskBoardChannel>) -> Self {
         self.task_board = Some(board);
+        self
+    }
+
+    /// Inject the validated persisted council service. Without it council tools
+    /// are not advertised and cannot be dispatched.
+    pub fn with_councils(mut self, councils: Arc<dyn CouncilService>) -> Self {
+        self.councils = Some(councils);
         self
     }
 
@@ -1565,6 +1594,10 @@ impl FrameworkAgentRuntime {
     /// either an ambient workflow run or a known repository identity to scope to.
     fn offers_workflow_query(&self, run: &RunContext) -> bool {
         self.workflow_query.is_some() && (run.workflow.is_some() || run.board_repository.is_some())
+    }
+
+    fn offers_workflow_control(&self, run: &RunContext) -> bool {
+        self.workflow_control.is_some() && run.board_repository.is_some()
     }
 
     /// Whether the `task.*` tools are offered to `run`: a wired board channel plus
@@ -1686,6 +1719,13 @@ impl FrameworkAgentRuntime {
         if self.offers_workflow_query(run) {
             names.push(WorkflowQueryTool::NAME.to_string());
         }
+        if self.offers_workflow_control(run) {
+            names.extend(
+                [WorkflowCreateTool::NAME, WorkflowRunTool::NAME]
+                    .iter()
+                    .map(|name| (*name).to_string()),
+            );
+        }
         if self.offers_task_board(run) {
             names.extend(
                 [
@@ -1696,6 +1736,17 @@ impl FrameworkAgentRuntime {
                 ]
                 .iter()
                 .map(|name| (*name).to_string()),
+            );
+        }
+        if self.councils.is_some() && run.board_repository.is_some() {
+            names.extend(
+                [
+                    CouncilCreateTool::NAME,
+                    CouncilRunTool::NAME,
+                    CouncilResultTool::NAME,
+                ]
+                .iter()
+                .map(|name| (*name).to_owned()),
             );
         }
         if let Some(bridge) = &self.mcp {
@@ -3151,6 +3202,20 @@ impl FrameworkAgentRuntime {
                     }),
                 })
             }
+            WorkflowCreateTool::NAME if self.offers_workflow_control(run) => {
+                let input = parse_workflow_create(args)?;
+                Ok(Prepared {
+                    action: workflow_create_action(&input),
+                    tool: PreparedTool::WorkflowCreate(input),
+                })
+            }
+            WorkflowRunTool::NAME if self.offers_workflow_control(run) => {
+                let input = parse_workflow_run(args)?;
+                Ok(Prepared {
+                    action: workflow_run_action(&input),
+                    tool: PreparedTool::WorkflowRun(input),
+                })
+            }
             // Rubric 10 (NL backlog): the BOARD is server-derived from the run's
             // repository identity — a model can never redirect a card onto another
             // repository's board by passing a path.
@@ -3183,6 +3248,31 @@ impl FrameworkAgentRuntime {
                 Ok(Prepared {
                     action: task_read_action(&repository),
                     tool: PreparedTool::TaskList(parse_task_list(args)),
+                })
+            }
+            CouncilCreateTool::NAME
+                if self.councils.is_some() && run.board_repository.is_some() =>
+            {
+                let input = parse_council_create(args)?;
+                Ok(Prepared {
+                    action: council_create_action(&input),
+                    tool: PreparedTool::CouncilCreate(input),
+                })
+            }
+            CouncilRunTool::NAME if self.councils.is_some() && run.board_repository.is_some() => {
+                let input = parse_council_run(args)?;
+                Ok(Prepared {
+                    action: council_run_action(&input),
+                    tool: PreparedTool::CouncilRun(input),
+                })
+            }
+            CouncilResultTool::NAME
+                if self.councils.is_some() && run.board_repository.is_some() =>
+            {
+                let input = parse_council_result(args)?;
+                Ok(Prepared {
+                    action: council_result_action(&input),
+                    tool: PreparedTool::CouncilResult(input),
                 })
             }
             // CORE (smarter-memory M2): unconditional — no run gate, unlike the
@@ -3595,9 +3685,14 @@ impl FrameworkAgentRuntime {
             PreparedTool::BlackboardPost(input) => self.execute_blackboard_post(input, run).await,
             PreparedTool::BlackboardQuery(input) => self.execute_blackboard_query(input, run).await,
             PreparedTool::WorkflowQuery(input) => self.execute_workflow_query(input, run).await,
+            PreparedTool::WorkflowCreate(input) => self.execute_workflow_create(input).await,
+            PreparedTool::WorkflowRun(input) => self.execute_workflow_run(input, run).await,
             PreparedTool::TaskCreate(input) => self.execute_task_create(input, run).await,
             PreparedTool::TaskUpdate(input) => self.execute_task_update(input, run).await,
             PreparedTool::TaskList(input) => self.execute_task_list(input, run).await,
+            PreparedTool::CouncilCreate(input) => self.execute_council_create(input).await,
+            PreparedTool::CouncilRun(input) => self.execute_council_run(input, run).await,
+            PreparedTool::CouncilResult(input) => self.execute_council_result(input).await,
             PreparedTool::MemoryRemember(input) => {
                 self.execute_memory_remember(input, run, run_actor).await
             }
@@ -4075,6 +4170,75 @@ impl FrameworkAgentRuntime {
         }
     }
 
+    async fn execute_workflow_create(
+        &self,
+        input: WorkflowCreateInput,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let Some(channel) = self.workflow_control.as_ref() else {
+            return workflow_control_unavailable(WorkflowCreateTool::NAME);
+        };
+        match channel
+            .create(WorkflowCreateRequest {
+                workflow: input.workflow,
+            })
+            .await
+        {
+            Ok(created) => (
+                format!(
+                    "saved workflow `{}` v{} — {}",
+                    created.workflow_id, created.version, created.handle
+                ),
+                None,
+                ToolOutcome::Succeeded,
+            ),
+            Err(error) => workflow_control_failure(WorkflowCreateTool::NAME, &error.to_string()),
+        }
+    }
+
+    async fn execute_workflow_run(
+        &self,
+        input: WorkflowRunInput,
+        run: &RunContext,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let (Some(channel), Some(repository)) = (
+            self.workflow_control.as_ref(),
+            run.board_repository.as_deref(),
+        ) else {
+            return workflow_control_unavailable(WorkflowRunTool::NAME);
+        };
+        let workflow_id = match &input.target {
+            WorkflowRunTarget::Named(id) => id.clone(),
+            WorkflowRunTarget::Inline(workflow) => workflow.id.clone(),
+        };
+        // This is stable for a replay of the same call. Deliberately includes the
+        // agent run id so a later chat run may intentionally launch the same
+        // workflow again while a transport retry cannot duplicate it.
+        let idempotency_key = format!(
+            "agent-workflow:{}:{}:{}",
+            run.session_id, run.run_id, workflow_id
+        );
+        match channel
+            .run(WorkflowRunRequest {
+                target: input.target,
+                inputs: input.inputs,
+                repository: repository.to_string(),
+                session_id: run.session_id,
+                idempotency_key,
+            })
+            .await
+        {
+            Ok(started) => (
+                format!(
+                    "started workflow `{}` — durable run `{}` (use workflow.query to inspect it)",
+                    started.workflow_id, started.workflow_run_id
+                ),
+                None,
+                ToolOutcome::Succeeded,
+            ),
+            Err(error) => workflow_control_failure(WorkflowRunTool::NAME, &error.to_string()),
+        }
+    }
+
     /// Create a backlog card on the repository's board (rubric 10). Attribution is
     /// built server-side from the run context, exactly as a blackboard post's is.
     async fn execute_task_create(
@@ -4193,6 +4357,116 @@ impl FrameworkAgentRuntime {
                     message: e.code().to_string(),
                 },
             ),
+        }
+    }
+
+    async fn execute_council_create(
+        &self,
+        input: CouncilCreateInput,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let Some(service) = self.councils.as_ref() else {
+            return council_unavailable(CouncilCreateTool::NAME);
+        };
+        match service.create(input.definition).await {
+            Ok(definition) => (
+                format!(
+                    "created council `{}` with {} members, chair `{}`, {} round(s); use council.run with an objective to convene it",
+                    definition.name,
+                    definition.members.len(),
+                    definition.chair,
+                    definition.rounds
+                ),
+                None,
+                ToolOutcome::Succeeded,
+            ),
+            Err(error) => council_failure(CouncilCreateTool::NAME, &error),
+        }
+    }
+
+    async fn execute_council_run(
+        &self,
+        input: CouncilRunInput,
+        run: &RunContext,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let (Some(service), Some(repository)) =
+            (self.councils.as_ref(), run.board_repository.as_deref())
+        else {
+            return council_unavailable(CouncilRunTool::NAME);
+        };
+        match service
+            .run(
+                &input.name,
+                input.objective,
+                std::path::PathBuf::from(repository),
+                Some(run.session_id),
+                input.evidence,
+            )
+            .await
+        {
+            Ok(outcome) => {
+                let synthesis = sanitize_untrusted(
+                    "agent council synthesis",
+                    &outcome.outcome.chair.response,
+                    16_000,
+                );
+                (
+                    format!(
+                        "council result {} persisted at {}\n\n<untrusted-council-synthesis>\n{}\n</untrusted-council-synthesis>",
+                        outcome.handle.result_id,
+                        outcome.handle.markdown_path.display(),
+                        synthesis.text
+                    ),
+                    None,
+                    ToolOutcome::Succeeded,
+                )
+            }
+            Err(error) => council_failure(CouncilRunTool::NAME, &error),
+        }
+    }
+
+    async fn execute_council_result(
+        &self,
+        input: CouncilResultInput,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let Some(service) = self.councils.as_ref() else {
+            return council_unavailable(CouncilResultTool::NAME);
+        };
+        match service.result(&input.selector).await {
+            Ok(Some(stored)) => {
+                let synthesis = stored.report.chair.as_ref().map_or_else(
+                    || "(no chair synthesis; inspect the partial report)".to_owned(),
+                    |chair| {
+                        sanitize_untrusted(
+                            "stored agent council synthesis",
+                            &chair.response,
+                            16_000,
+                        )
+                        .text
+                    },
+                );
+                (
+                    format!(
+                        "council result {} [{}] persisted at {}\n\n<untrusted-council-synthesis>\n{}\n</untrusted-council-synthesis>",
+                        stored.handle.result_id,
+                        stored.handle.status,
+                        stored.handle.markdown_path.display(),
+                        synthesis
+                    ),
+                    None,
+                    ToolOutcome::Succeeded,
+                )
+            }
+            Ok(None) => (
+                format!(
+                    "council.result: no durable result matches `{}`",
+                    input.selector
+                ),
+                None,
+                ToolOutcome::Failed {
+                    message: "council.result-not-found".to_owned(),
+                },
+            ),
+            Err(error) => council_failure(CouncilResultTool::NAME, &error),
         }
     }
 
@@ -4342,6 +4616,10 @@ enum PreparedTool {
     /// A `workflow.query` call (rubric 5): the run to read, or `None` to list the
     /// repository's recent runs.
     WorkflowQuery(WorkflowQueryInput),
+    /// A validated workflow manifest to persist in the user's workflow source.
+    WorkflowCreate(WorkflowCreateInput),
+    /// A named or validated inline workflow to start in the current repository.
+    WorkflowRun(WorkflowRunInput),
     /// A `task.create` call (rubric 10).
     TaskCreate(TaskCreateInput),
     /// A `task.update` or `task.move` call — one shape, since a move is an update
@@ -4349,6 +4627,9 @@ enum PreparedTool {
     TaskUpdate(TaskUpdateInput),
     /// A `task.list` call.
     TaskList(TaskListInput),
+    CouncilCreate(CouncilCreateInput),
+    CouncilRun(CouncilRunInput),
+    CouncilResult(CouncilResultInput),
     MemoryRemember(MemoryRememberInput),
     /// A `skills.search` call (rubric 9): the parsed query plus the optional
     /// skill name whose procedure to open.
@@ -4677,6 +4958,49 @@ fn blackboard_unavailable(tool: &str) -> (String, Option<ArtifactRef>, ToolOutco
         None,
         ToolOutcome::Failed {
             message: BlackboardChannelError::Unavailable.code().to_string(),
+        },
+    )
+}
+
+fn workflow_control_unavailable(tool: &str) -> (String, Option<ArtifactRef>, ToolOutcome) {
+    (
+        format!("{tool} is not available for this run"),
+        None,
+        ToolOutcome::Failed {
+            message: "workflow.control-unavailable".to_string(),
+        },
+    )
+}
+
+fn workflow_control_failure(tool: &str, error: &str) -> (String, Option<ArtifactRef>, ToolOutcome) {
+    (
+        format!("{tool} error: {error}"),
+        None,
+        ToolOutcome::Failed {
+            message: "workflow.operation-failed".to_string(),
+        },
+    )
+}
+
+fn council_unavailable(tool: &str) -> (String, Option<ArtifactRef>, ToolOutcome) {
+    (
+        format!("{tool} is not available for this run"),
+        None,
+        ToolOutcome::Failed {
+            message: "council.unavailable".to_owned(),
+        },
+    )
+}
+
+fn council_failure(
+    tool: &str,
+    error: &anyhow::Error,
+) -> (String, Option<ArtifactRef>, ToolOutcome) {
+    (
+        format!("{tool} error: {error:#}"),
+        None,
+        ToolOutcome::Failed {
+            message: "council.operation-failed".to_owned(),
         },
     )
 }
@@ -5185,6 +5509,82 @@ impl FrameworkModelDriver {
 /// the loop hands the driver. A free function (not a `FrameworkModelDriver`
 /// method) so the runtime's projection compiles even when no provider feature
 /// is enabled — [`FrameworkModelDriver`] itself is `provider-openai`-gated.
+fn workflow_draft_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "id": {"type": "string"},
+            "version": {"type": "integer", "minimum": 1},
+            "description": {"type": "string"},
+            "inputs": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "type": {"type": "string"},
+                        "required": {"type": "boolean"}
+                    },
+                    "required": ["type"]
+                }
+            },
+            "budget": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "maximum_cost_usd": {"type": "number", "exclusiveMinimum": 0},
+                    "maximum_duration_seconds": {"type": "integer", "minimum": 1},
+                    "maximum_agents": {"type": "integer", "minimum": 1}
+                }
+            },
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 64,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "id": {"type": "string"},
+                        "depends_on": {"type": "array", "items": {"type": "string"}},
+                        "agent": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "role": {"type": "string"},
+                                "model_policy": {"type": "string"}
+                            },
+                            "required": ["role"]
+                        },
+                        "tool": {"type": "string"},
+                        "with": {"type": "object"},
+                        "skill": {"type": "string"},
+                        "workspace": {"type": "string", "enum": ["shared-worktree", "isolated-worktree"]},
+                        "approval": {"type": "string", "enum": ["before-write", "always"]},
+                        "retry": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "attempts": {"type": "integer", "minimum": 1, "maximum": 10},
+                                "backoff_seconds": {"type": "integer", "minimum": 0}
+                            },
+                            "required": ["attempts"]
+                        },
+                        "outputs": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["id"]
+                }
+            },
+            "orchestration_reason": {
+                "type": "string",
+                "enum": ["parallelism", "independent-review", "access-separation", "specialist"]
+            }
+        },
+        "required": ["id", "steps"]
+    })
+}
+
 pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
     use agent_framework_core::tools::{ApprovalMode, ToolDefinition, ToolKind};
     let decl = |name: &str, description: &str, parameters: Value| ToolDefinition {
@@ -5501,6 +5901,24 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         ),
+        decl(
+            WorkflowCreateTool::NAME,
+            "Create a safe, reviewable workflow manifest in the user's workflow library. Pass the structured manifest fields directly (never YAML or a path). The manifest is compiled before an explicit approval and atomic persistence.",
+            workflow_draft_schema(),
+        ),
+        decl(
+            WorkflowRunTool::NAME,
+            "Start a durable workflow in this repository. Pass exactly one of `workflow_id` (a saved workflow) or `workflow` (a structured inline manifest), plus typed `inputs`. Explicit approval is always required.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "workflow_id": {"type": "string"},
+                    "workflow": workflow_draft_schema(),
+                    "inputs": {"type": "object"}
+                }
+            }),
+        ),
         // Rubric 10 (NL backlog): the repository's task board. The board is
         // server-derived from the run's repository — no argument names it.
         decl(
@@ -5558,6 +5976,58 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "status": {"type": "string"}
+                }
+            }),
+        ),
+        decl(
+            CouncilCreateTool::NAME,
+            "Create and persist an agent council after gathering every required field. The +                 exact name, member model/role pairs, chair, rounds, and evidence mode are +                 previewed for explicit approval before writing.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "members": {
+                        "type": "array",
+                        "minItems": 2,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "model": {"type": "string"},
+                                "role": {"type": "string"}
+                            },
+                            "required": ["model", "role"]
+                        }
+                    },
+                    "chair": {"type": "string"},
+                    "rounds": {"type": "integer", "minimum": 1, "maximum": 3},
+                    "evidence": {"type": "boolean"}
+                },
+                "required": ["name", "members", "chair"]
+            }),
+        ),
+        decl(
+            CouncilRunTool::NAME,
+            "Run a persisted multi-model council for a concrete objective. This fans out model +                 requests and always shows a policy preview for explicit approval; the terminal +                 result is persisted and returned with a stable result id and report path.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "objective": {"type": "string"},
+                    "evidence": {"type": "boolean"}
+                },
+                "required": ["name", "objective"]
+            }),
+        ),
+        decl(
+            CouncilResultTool::NAME,
+            "Retrieve a durable council result by stable result id or council name (latest).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string"},
+                    "result_id": {"type": "string"},
+                    "name": {"type": "string"}
                 }
             }),
         ),

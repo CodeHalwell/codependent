@@ -31,11 +31,12 @@ use crate::reduce::capability_label;
 use crate::remote_ui_host::{TERMINAL_CENTRAL_SLOTS, TERMINAL_OVERLAY_SLOTS};
 use crate::state::{
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
-    filter_providers, filter_themes, filter_unsloth_quants, filter_unsloth_repos, AddModelRow,
-    AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus, DocLeaseState, KeyStatus,
-    LayoutMode, ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness, Overlay, Pane,
-    PatchSummary, ProviderCard, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
-    UnslothQuantCard, UnslothRepoCard, NOTE_INLINE_LINE_THRESHOLD,
+    filter_onboard_providers, filter_providers, filter_themes, filter_unsloth_quants,
+    filter_unsloth_repos, AddModelRow, AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus,
+    DocLeaseState, KeyStatus, LayoutMode, ModelCard, ModelListOrigin, ModelLocationLabel,
+    ModelReadiness, OnboardProviderClass, OnboardStep, Overlay, Pane, PatchSummary, ProviderCard,
+    RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard, UnslothRepoCard,
+    NOTE_INLINE_LINE_THRESHOLD,
 };
 use crate::theme::Theme;
 use crate::{render_remote_ui, RemoteUiRenderOptions};
@@ -71,7 +72,7 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
                     .add_modifier(Modifier::BOLD),
             ),
             Line::styled(
-                "resize terminal to continue",
+                "resize terminal to at least 20 columns",
                 Style::default().fg(theme.text.muted),
             ),
         ];
@@ -295,27 +296,66 @@ fn render_run_telemetry(frame: &mut Frame, area: Rect, state: &AppState, theme: 
     let model = status.model.as_ref().or(state.pending_model.as_ref());
     let model_card = model.and_then(|id| state.models.iter().find(|card| card.id == *id));
     let model_label = model.map_or("none", |id| id.0.as_str());
+    let provider_label = model_card.map_or("—", |card| card.provider.as_str());
     let context_window = model_card.and_then(|card| card.context_tokens);
     let context = match (status.context_percent, context_window) {
-        (Some(percent), Some(tokens)) => format!("{percent}% / {}", context_label(Some(tokens))),
-        (Some(percent), None) => format!("{percent}%"),
-        (None, Some(tokens)) => format!("0% / {}", context_label(Some(tokens))),
+        (Some(percent), Some(tokens)) => format!(
+            "{percent}% used/{}% left/{}",
+            100_u16.saturating_sub(percent.min(100)),
+            context_label(Some(tokens))
+        ),
+        (Some(percent), None) => format!(
+            "{percent}% used/{}% left",
+            100_u16.saturating_sub(percent.min(100))
+        ),
+        (None, Some(tokens)) => format!("0% used/100% left/{}", context_label(Some(tokens))),
         (None, None) => "—".to_owned(),
     };
-    let workflow_subagents = state
+    let workflow_active = state
         .workflow
         .iter()
         .filter(|node| {
             node.kind.eq_ignore_ascii_case("agent")
                 && matches!(
                     node.state.to_ascii_lowercase().as_str(),
-                    "running" | "preparing" | "queued" | "waiting"
+                    "running" | "preparing"
                 )
         })
         .count();
-    let active_subagents = workflow_subagents.saturating_add(state.council_subagents);
+    let workflow_queued = state
+        .workflow
+        .iter()
+        .filter(|node| {
+            node.kind.eq_ignore_ascii_case("agent")
+                && matches!(
+                    node.state.to_ascii_lowercase().as_str(),
+                    "queued" | "waiting"
+                )
+        })
+        .count();
+    let active_subagents = workflow_active.saturating_add(state.council_subagents);
+    let mode = status.mode.unwrap_or(state.default_mode);
+    let permission = match mode {
+        AgentMode::Ask | AgentMode::Explore | AgentMode::Plan => "read-only",
+        AgentMode::Review => "verify",
+        AgentMode::Build => "full access",
+        _ => "policy",
+    };
+    let workspace = status.worktree.as_deref().unwrap_or("—");
+    let health = if state.issues.is_empty() {
+        if state.daemon_build_id.is_some() {
+            "connected".to_owned()
+        } else {
+            "local".to_owned()
+        }
+    } else {
+        format!("{} issue(s)", state.issues.len())
+    };
 
-    if area.width < 42 {
+    // The 40-column tier is deliberately terse and fixed-priority: model,
+    // mode, context, and agents are the four things an operator needs while a
+    // run is moving. Lower-priority telemetry joins only when it fits whole.
+    if area.width < 48 {
         let compact_context = status
             .context_percent
             .map_or_else(|| "—".to_owned(), |percent| format!("{percent}%"));
@@ -323,14 +363,16 @@ fn render_run_telemetry(frame: &mut Frame, area: Rect, state: &AppState, theme: 
             Paragraph::new(Line::from(vec![
                 Span::styled(" m:", Style::default().fg(theme.text.muted)),
                 Span::styled(
-                    truncate_display_width(model_label, 6),
+                    truncate_display_width(model_label, 8),
                     Style::default().fg(theme.text.primary),
                 ),
+                Span::styled(" ", Style::default()),
+                Span::styled(mode_label(mode), Style::default().fg(theme.focus.active)),
                 Span::styled(" c:", Style::default().fg(theme.text.muted)),
                 Span::styled(compact_context, Style::default().fg(theme.status.info)),
                 Span::styled(" a:", Style::default().fg(theme.text.muted)),
                 Span::styled(
-                    active_subagents.to_string(),
+                    format!("{active_subagents}+{workflow_queued}"),
                     Style::default().fg(theme.text.secondary),
                 ),
             ]))
@@ -339,40 +381,127 @@ fn render_run_telemetry(frame: &mut Frame, area: Rect, state: &AppState, theme: 
         );
         return;
     }
-    let (context_prefix, agent_prefix, max_model) = if area.width >= 72 {
-        ("context ", "subagents ", 34usize)
-    } else {
-        ("ctx ", "agents ", 20usize)
-    };
-    let line = Line::from(vec![
-        Span::raw("  "),
-        Span::styled("model ", Style::default().fg(theme.text.muted)),
-        Span::styled(
-            truncate_display_width(model_label, max_model),
-            Style::default()
-                .fg(theme.text.primary)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  {context_prefix}"),
-            Style::default().fg(theme.text.muted),
-        ),
-        Span::styled(context, Style::default().fg(theme.status.info)),
-        Span::styled(
-            format!("  {agent_prefix}"),
-            Style::default().fg(theme.text.muted),
-        ),
-        Span::styled(
-            active_subagents.to_string(),
-            Style::default().fg(if active_subagents > 0 {
+
+    #[derive(Clone)]
+    struct TelemetryItem {
+        text: String,
+        color: Color,
+    }
+    let mut required = vec![
+        TelemetryItem {
+            text: format!(
+                "model {}",
+                truncate_display_width(model_label, if area.width >= 100 { 24 } else { 14 })
+            ),
+            color: theme.text.primary,
+        },
+        TelemetryItem {
+            text: mode_label(mode).to_owned(),
+            color: theme.focus.active,
+        },
+        TelemetryItem {
+            text: format!(
+                "ctx {}",
+                if area.width >= 160 {
+                    context.clone()
+                } else {
+                    status.context_percent.map_or_else(
+                        || "—".to_owned(),
+                        |value| format!("{value}/{}%", 100_u16.saturating_sub(value.min(100))),
+                    )
+                }
+            ),
+            color: theme.status.info,
+        },
+        TelemetryItem {
+            text: format!("agents {active_subagents}+{workflow_queued}"),
+            color: if active_subagents + workflow_queued > 0 {
                 theme.status.success
             } else {
                 theme.text.secondary
-            }),
-        ),
-    ]);
+            },
+        },
+    ];
+    let verbose = area.width >= 160;
+    let optional = [
+        TelemetryItem {
+            text: format!("via {}", truncate_display_width(provider_label, 18)),
+            color: theme.text.secondary,
+        },
+        TelemetryItem {
+            text: if verbose {
+                format!("cost {}", format_cost(status.cost_minor))
+            } else {
+                format_cost(status.cost_minor)
+            },
+            color: theme.status.warning,
+        },
+        TelemetryItem {
+            text: if verbose {
+                format!("permissions {permission}")
+            } else {
+                format!("perm:{permission}")
+            },
+            color: theme.text.secondary,
+        },
+        TelemetryItem {
+            text: if verbose {
+                format!("branch/worktree {}", truncate_display_width(workspace, 18))
+            } else {
+                format!("wt:{}", truncate_display_width(workspace, 10))
+            },
+            color: theme.text.secondary,
+        },
+        TelemetryItem {
+            text: if verbose {
+                format!("health {health}")
+            } else if state.issues.is_empty() {
+                "health:ok".to_owned()
+            } else {
+                format!("health:{}!", state.issues.len())
+            },
+            color: if state.issues.is_empty() {
+                theme.status.success
+            } else {
+                theme.status.warning
+            },
+        },
+        TelemetryItem {
+            text: if verbose {
+                "reasoning —".to_owned()
+            } else {
+                "r:—".to_owned()
+            },
+            color: theme.text.muted,
+        },
+        TelemetryItem {
+            text: "Shift-drag copy".to_owned(),
+            color: theme.text.muted,
+        },
+    ];
+    let mut used = 2_usize
+        + required.iter().map(|item| item.text.width()).sum::<usize>()
+        + required.len().saturating_sub(1) * 3;
+    for item in optional {
+        let additional = 3 + item.text.width();
+        if used + additional + 1 <= usize::from(area.width) {
+            used += additional;
+            required.push(item);
+        }
+    }
+    let mut spans = vec![Span::raw("  ")];
+    for (index, item) in required.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(theme.text.muted)));
+        }
+        let mut style = Style::default().fg(item.color);
+        if index == 0 {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(item.text, style));
+    }
     frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(theme.surface.background)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.surface.background)),
         area,
     );
 }
@@ -1344,7 +1473,7 @@ fn for_each_row<'a>(runs: &'a [RunView], view: TranscriptView<'_>, mut visit: im
                     // (`Alt-↑`/`Alt-↓`); a stale `transcript_selected` from an
                     // earlier click must not paint a selection nobody asked for.
                     let selected = run_idx == selected_run && browsed == Some(idx);
-                    entry_lines(other, theme, selected, false, &mut scratch);
+                    entry_lines_with_run(other, run, theme, selected, false, &mut scratch);
                     let hit = if run_idx == selected_run {
                         fold_hit_entry(other, idx)
                     } else {
@@ -1396,6 +1525,8 @@ fn for_each_row<'a>(runs: &'a [RunView], view: TranscriptView<'_>, mut visit: im
             )));
         }
         if let Some(status) = activity_status_line(&run.activity, tick, theme) {
+            visit(Row::built(status));
+        } else if let Some(status) = lifecycle_status_line(run, theme) {
             visit(Row::built(status));
         }
     }
@@ -1637,25 +1768,29 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
 
     if state.runs.is_empty() {
         state.transcript_max_scroll.set(0);
-        let lines = if state.models.is_empty() {
+        let lines = if !state.has_runnable_models() {
             vec![
                 Line::styled(
-                    "✦  Connect your first model",
+                    "✦  Connect a runnable model",
                     Style::default()
                         .fg(theme.text.heading)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Line::raw(""),
                 Line::styled(
-                    "Codypendent needs one verified model before it can work with you.",
+                    if state.models.is_empty() {
+                        "No model is configured yet. Codypendent needs one verified model to start a run."
+                    } else {
+                        "Your saved models are not runnable yet. A key, endpoint, or supported adapter may be missing."
+                    },
                     Style::default().fg(theme.text.secondary),
                 ),
                 Line::styled(
-                    "Press / and choose Provider catalog to discover a local or hosted model.",
+                    "Press Enter with an empty message to open guided setup.",
                     Style::default().fg(theme.text.primary),
                 ),
                 Line::styled(
-                    "Setup & diagnostics verifies the exact model—not just its endpoint.",
+                    "Setup validates the exact model before calling it ready.  / opens all commands.",
                     Style::default().fg(theme.text.muted),
                 ),
             ]
@@ -1772,6 +1907,59 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         }
     }
 
+    // Failure-card actions get precise label-sized targets. The rest of the
+    // transcript remains unregistered so ordinary terminal Shift-drag text
+    // selection/copy is never swallowed by an application-wide hit surface.
+    let failure_actions = [
+        ("Alt-R retry", Action::RetryFailedRun),
+        ("Alt-A re-authenticate", Action::ReauthenticateFailedModel),
+        ("Alt-M choose model", Action::ChooseFailureModel),
+        ("diagnostics", Action::OpenIssues),
+        ("Alt-D disable", Action::DisableFailureModel),
+        ("Alt-Y copy", Action::CopyFocusedCard),
+    ];
+    let recovery_is_focused = state.transcript_browse
+        && state.selected_run().is_some_and(|run| {
+            matches!(
+                run.transcript.get(run.transcript_selected),
+                Some(TranscriptEntry::Completed {
+                    disposition: RunDisposition::Failed { .. },
+                    ..
+                })
+            )
+        });
+    for (line_index, line) in lines.iter().enumerate() {
+        if !recovery_is_focused {
+            break;
+        }
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let screen_y = inner.y as i32 + line_index as i32 - r0 as i32;
+        if screen_y < inner.y as i32 || screen_y >= inner.bottom() as i32 {
+            continue;
+        }
+        for (label, action) in &failure_actions {
+            let Some(byte) = text.find(label) else {
+                continue;
+            };
+            let x = inner
+                .x
+                .saturating_add(u16::try_from(UnicodeWidthStr::width(&text[..byte])).unwrap_or(0));
+            state.register_hit(
+                Rect {
+                    x,
+                    y: screen_y as u16,
+                    width: u16::try_from(UnicodeWidthStr::width(*label)).unwrap_or(0),
+                    height: 1,
+                },
+                action.clone(),
+            );
+        }
+    }
+
     // No `Wrap`: every line was pre-split at cell granularity by
     // `build_transcript_window`, so wrapping here would re-wrap rows the
     // measure pass already accounted for (the follow-mode clipping bug).
@@ -1791,7 +1979,11 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let block = Block::default()
         .borders(Borders::TOP)
         .title(Span::styled(
-            if steering { " STEER " } else { " MESSAGE " },
+            if steering {
+                " STEER · Enter queues "
+            } else {
+                " MESSAGE · Enter sends "
+            },
             Style::default()
                 .fg(theme.focus.active)
                 .add_modifier(Modifier::BOLD),
@@ -1929,8 +2121,46 @@ fn activity_status_line(activity: &RunActivity, tick: u64, theme: &Theme) -> Opt
     ]))
 }
 
-fn entry_lines<'a>(
+fn lifecycle_status_line(run: &RunView, theme: &Theme) -> Option<Line<'static>> {
+    let (glyph, label, color) = match run.state {
+        RunState::Queued => ("◌", "queued", theme.status.warning),
+        RunState::Preparing => ("◔", "preparing", theme.status.running),
+        RunState::Paused => ("Ⅱ", "paused", theme.status.warning),
+        RunState::WaitingForApproval => ("!", "waiting for approval", theme.status.warning),
+        RunState::WaitingForUserInput => ("?", "waiting for input", theme.status.warning),
+        RunState::Recovering => ("↻", "recovering", theme.status.running),
+        RunState::Completed => ("✓", "completed", theme.status.success),
+        RunState::Cancelled => ("⊘", "cancelled", theme.text.muted),
+        RunState::Failed | RunState::Running | RunState::Unknown => return None,
+        _ => return None,
+    };
+    Some(Line::styled(
+        format!("{glyph} {label}"),
+        Style::default().fg(color),
+    ))
+}
+
+fn entry_lines_with_run<'a>(
     entry: &'a TranscriptEntry,
+    run: &'a RunView,
+    theme: &Theme,
+    selected: bool,
+    streaming_tail: bool,
+    out: &mut Vec<Line<'a>>,
+) {
+    entry_lines_with_model(
+        entry,
+        run.model.as_ref(),
+        theme,
+        selected,
+        streaming_tail,
+        out,
+    );
+}
+
+fn entry_lines_with_model<'a>(
+    entry: &'a TranscriptEntry,
+    model: Option<&'a codypendent_protocol::ModelId>,
     theme: &Theme,
     selected: bool,
     streaming_tail: bool,
@@ -2005,13 +2235,54 @@ fn entry_lines<'a>(
             // ever lost, just folded.
             RunDisposition::Failed { reason } => {
                 let marker = if *expanded { "▾" } else { "▸" };
-                out.push(head(
-                    format!("{marker} ✗ {}", summarize_error(reason)),
-                    theme.status.error,
-                ));
-                if *expanded {
+                if let Some(failure) = crate::state::acp_failure_summary(model, reason) {
+                    out.push(head(
+                        format!(
+                            "{marker} ✗ {} · {} · {} failed",
+                            failure.provider, failure.model, failure.phase
+                        ),
+                        theme.status.error,
+                    ));
                     out.push(Line::styled(
-                        format!("    {reason}"),
+                        format!("    {}", failure.cause),
+                        Style::default().fg(theme.text.secondary),
+                    ));
+                    let auth = if failure.auth_related {
+                        " · Alt-A re-authenticate"
+                    } else {
+                        ""
+                    };
+                    out.push(Line::styled(
+                        format!(
+                            "    Alt-R retry{auth} · Alt-M choose model · / diagnostics · Alt-D disable · Alt-Y copy"
+                        ),
+                        Style::default().fg(theme.focus.active),
+                    ));
+                } else {
+                    out.push(head(
+                        format!("{marker} ✗ {}", summarize_error(reason)),
+                        theme.status.error,
+                    ));
+                    let lower = reason.to_ascii_lowercase();
+                    let auth = if ["auth", "login", "credential", "unauthorized"]
+                        .iter()
+                        .any(|needle| lower.contains(needle))
+                    {
+                        " · Alt-A re-authenticate"
+                    } else {
+                        ""
+                    };
+                    out.push(Line::styled(
+                        format!(
+                            "    Alt-R retry{auth} · Alt-M choose model · / diagnostics · Alt-D disable · Alt-Y copy"
+                        ),
+                        Style::default().fg(theme.focus.active),
+                    ));
+                }
+                if *expanded {
+                    let safe_reason = crate::state::sanitize_failure_text(reason);
+                    out.push(Line::styled(
+                        format!("    {safe_reason}"),
                         Style::default().fg(theme.text.muted),
                     ));
                 }
@@ -2223,8 +2494,9 @@ fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &
             ));
         }
         if let Some(codypendent_protocol::ToolOutcome::Failed { message }) = &card.outcome {
+            let safe_message = crate::state::sanitize_failure_text(message);
             out.push(Line::styled(
-                format!("    error: {message}"),
+                format!("    error: {safe_message}"),
                 Style::default().fg(theme.status.error),
             ));
         }
@@ -2237,6 +2509,10 @@ fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &
                 Style::default().fg(theme.text.muted),
             ));
         }
+        out.push(Line::styled(
+            "    Alt-Y copy card · Alt-Enter collapse",
+            Style::default().fg(theme.focus.active),
+        ));
     }
 }
 
@@ -2321,14 +2597,29 @@ fn note_lines<'a>(
         Style::default().fg(theme.text.secondary)
     };
     let line_count = text.lines().count();
+    let kind = if text
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("reasoning:")
+    {
+        "reasoning"
+    } else if text
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("learning:")
+    {
+        "learning"
+    } else {
+        "note"
+    };
     if line_count <= NOTE_INLINE_LINE_THRESHOLD {
-        out.push(Line::styled(format!("• note: {text}"), head_style));
+        out.push(Line::styled(format!("• {kind}: {text}"), head_style));
         return;
     }
     let marker = if expanded { "▾" } else { "▸" };
     out.push(Line::styled(
         format!(
-            "{marker} note: {} ({line_count} lines)",
+            "{marker} {kind}: {} ({line_count} lines)",
             first_non_empty_line(text)
         ),
         head_style,
@@ -2435,7 +2726,13 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             ],
             right,
         )
-    } else if let Some((notice, _)) = &state.notice {
+    } else if status.pending_approvals == 0 && status.run_state.is_none() && state.notice.is_some()
+    {
+        let notice = state
+            .notice
+            .as_ref()
+            .map(|(notice, _)| notice.as_str())
+            .unwrap_or_default();
         let right = if status.pending_approvals > 0 {
             vec![
                 Chip::new("a", "once", Action::Approve(ApprovalScope::Once)),
@@ -2451,7 +2748,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             vec![
                 Span::raw("  "),
                 Span::styled("● ", Style::default().fg(theme.status.warning)),
-                Span::styled(notice.clone(), Style::default().fg(theme.text.secondary)),
+                Span::styled(notice.to_owned(), Style::default().fg(theme.text.secondary)),
             ],
             right,
         )
@@ -2496,17 +2793,33 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             vec![Chip::new("/", "commands", Action::OpenPalette)],
         )
     } else if !state.composer.is_empty() {
+        let steering = state.selected_run_is_active();
         (
             vec![
                 Span::raw("  "),
                 Span::styled("● ", Style::default().fg(theme.focus.active)),
-                Span::styled("Draft ready", Style::default().fg(theme.text.secondary)),
+                Span::styled(
+                    if steering {
+                        "Steering draft ready"
+                    } else {
+                        "Message ready"
+                    },
+                    Style::default().fg(theme.text.secondary),
+                ),
             ],
-            vec![
-                Chip::new("Enter", "send", Action::InputSubmit),
-                Chip::new("⌥Enter", "newline", Action::InputNewline),
-                Chip::new("Esc", "clear", Action::InputCancel),
-            ],
+            if steering {
+                vec![
+                    Chip::new("Enter", "queue steer", Action::InputSubmit),
+                    Chip::new("⌥Enter", "newline", Action::InputNewline),
+                    Chip::new("c", "interrupt", Action::Cancel),
+                ]
+            } else {
+                vec![
+                    Chip::new("Enter", "send", Action::InputSubmit),
+                    Chip::new("⌥Enter", "newline", Action::InputNewline),
+                    Chip::new("Esc", "clear", Action::InputCancel),
+                ]
+            },
         )
     } else if !central_remote_ui_is_active(state)
         && !state
@@ -2557,10 +2870,35 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     Style::default().fg(theme.text.secondary),
                 ),
             ],
-            vec![
-                Chip::new("/", "commands", Action::OpenPalette),
-                Chip::new("F2", "workspace", Action::ToggleLayout),
-            ],
+            if matches!(
+                run_state,
+                RunState::Queued
+                    | RunState::Preparing
+                    | RunState::Running
+                    | RunState::Paused
+                    | RunState::WaitingForApproval
+                    | RunState::WaitingForUserInput
+                    | RunState::Recovering
+            ) {
+                vec![
+                    Chip::new("s", "steer", Action::Steer),
+                    Chip::new(
+                        "p",
+                        if matches!(run_state, RunState::Paused) {
+                            "resume"
+                        } else {
+                            "pause"
+                        },
+                        Action::Pause,
+                    ),
+                    Chip::new("c", "interrupt", Action::Cancel),
+                ]
+            } else {
+                vec![
+                    Chip::new("n", "new", Action::NewRun),
+                    Chip::new("/", "commands", Action::OpenPalette),
+                ]
+            },
         )
     } else {
         state.register_hit(area, Action::OpenPalette);
@@ -2627,6 +2965,14 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         state.register_hit(area, Action::Dismiss);
     }
     match &state.overlay {
+        Overlay::Onboard { step } => render_onboard(frame, area, state, theme, step),
+        Overlay::OnboardProviderPicker {
+            class,
+            query,
+            selected,
+        } => render_onboard_provider_picker(
+            frame, area, state, theme, *class, query, *selected,
+        ),
         Overlay::Help => render_help(frame, area, state, theme),
         Overlay::Issues => render_issues(frame, area, state, theme),
         Overlay::NewRun(buffer) => {
@@ -2653,6 +2999,22 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             &format!("Inputs for {workflow_id} (JSON object; blank = {{}})"),
             buffer,
         ),
+        Overlay::KanbanNew { buffer } => render_prompt(
+            frame,
+            area,
+            state,
+            theme,
+            "Create Kanban task (example: Add a regression test for ACP reconnects)",
+            buffer,
+        ),
+        Overlay::BlackboardPost { buffer, .. } => render_prompt(
+            frame,
+            area,
+            state,
+            theme,
+            "Post open question to Blackboard (evidence, decisions, artifacts)",
+            buffer,
+        ),
         Overlay::ConfirmCancel => render_confirm(frame, area, state, theme),
         Overlay::ConfirmWorkflowCancel { workflow_run_id } => render_confirm_box(
             frame,
@@ -2669,6 +3031,14 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::Memory { source_open } => {
             render_memory(frame, area, state, theme, *source_open);
         }
+        Overlay::Journey => render_journey(frame, area, state, theme),
+        Overlay::LearningEdit { buffer, .. } => render_prompt(
+            frame, area, state, theme, "Edit curated learning", buffer,
+        ),
+        Overlay::ConfirmLearningDelete { label, .. } => render_confirm_box(
+            frame, area, state, theme, "Permanently delete this learning?",
+            &format!("{} · the learning store has no undo", truncate(label, 72)),
+        ),
         Overlay::Docs => render_docs(frame, area, state, theme),
         Overlay::Edges => render_edges(frame, area, state, theme),
         Overlay::EdgeSearch(buffer) => {
@@ -2737,6 +3107,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             render_council_builder(frame, area, state, theme, builder);
         }
         Overlay::CouncilBrowser => render_council_browser(frame, area, state, theme),
+        Overlay::CouncilResults => render_council_results(frame, area, state, theme),
         Overlay::CouncilRunObjective { name, buffer } => render_prompt(
             frame,
             area,
@@ -2762,7 +3133,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             theme,
             "Remove this configured model?",
             &format!(
-                "{model_id}\nprovider: {provider}\n\nThis removes its models.toml entry and model-specific saved key. The provider catalogue remains available."
+                "{model_id}\nprovider: {provider}\n\nOnly this user-configured models.toml entry and its model-specific saved key are removed. Comments, ordering, and the provider catalogue remain intact."
             ),
         ),
         Overlay::ModelPicker { query, selected } => {
@@ -2986,6 +3357,349 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         state.register_hit(area, Action::NoOp);
         render_approval_modal(frame, area, state, theme);
     }
+}
+
+fn onboard_class_label(class: OnboardProviderClass) -> &'static str {
+    match class {
+        OnboardProviderClass::Hosted => "Hosted API",
+        OnboardProviderClass::LocalEndpoint => "Local endpoint",
+        OnboardProviderClass::AcpAgent => "ACP coding agent",
+    }
+}
+
+/// Focused, reversible first-run setup. This deliberately says what setup can
+/// and cannot establish: selecting a route does not install an agent or claim a
+/// saved profile works, and completion waits for the host's runnable refresh.
+fn render_onboard(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    step: &OnboardStep,
+) {
+    let rect = centered_modal(area, 76, 22);
+    let title = match step {
+        OnboardStep::Triage { .. } => "Connect a model",
+        OnboardStep::SkipConfirm { .. } => "Skip model setup?",
+        OnboardStep::Validating { .. } => "Checking model",
+    };
+    let inner = modal_surface(frame, rect, title, state, theme);
+
+    if let OnboardStep::Validating { model_id } = step {
+        let copy = vec![
+            Line::raw(""),
+            Line::styled(
+                format!("  Validating {}", model_id.0),
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::styled(
+                "  The profile was saved. Codypendent is now checking credentials,",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  protocol support, and availability for this exact model.",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::raw(""),
+            Line::styled(
+                "  Setup completes only when the model can start a run.",
+                Style::default().fg(theme.status.info),
+            ),
+            Line::styled(
+                "  Please wait · Esc cannot cancel a write already in progress",
+                Style::default().fg(theme.text.muted),
+            ),
+        ];
+        frame.render_widget(
+            Paragraph::new(copy)
+                .style(Style::default().bg(theme.surface.overlay))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+
+    let (intro, selected, choices): (&str, usize, [(&str, &str); 3]) = match step {
+        OnboardStep::Triage { selected } => (
+            "Choose one route. You will review a provider and model before anything is saved.",
+            *selected,
+            [
+                (
+                    "Hosted API",
+                    "Use a provider API key already in your environment, or save one locally.",
+                ),
+                (
+                    "Local endpoint",
+                    "Connect Ollama, LM Studio, or vLLM already running on this machine.",
+                ),
+                (
+                    "ACP coding agent",
+                    "Connect an installed agent such as Claude Code, Codex, Kimi, Amp, or Cline.",
+                ),
+            ],
+        ),
+        OnboardStep::SkipConfirm { selected } => (
+            "Without a runnable model Codypendent cannot start agent runs. Choose what happens next.",
+            *selected,
+            [
+                (
+                    "Skip future startup setup",
+                    "Do not open this automatically again; the empty chat remains a setup shortcut.",
+                ),
+                (
+                    "Continue setup",
+                    "Return to the connection choices without changing your saved preference.",
+                ),
+                (
+                    "Cancel",
+                    "Return to setup now. No provider, model, or credential is changed.",
+                ),
+            ],
+        ),
+        OnboardStep::Validating { .. } => unreachable!("handled above"),
+    };
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(9),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(intro)
+            .style(Style::default().fg(theme.text.secondary))
+            .wrap(Wrap { trim: true }),
+        rows[0],
+    );
+
+    let list_block = modal_panel("Choose", theme);
+    let list_area = list_block.inner(rows[1]);
+    frame.render_widget(list_block, rows[1]);
+    let detail_width = usize::from(list_area.width.saturating_sub(6));
+    let items = choices
+        .iter()
+        .enumerate()
+        .map(|(index, (label, detail))| {
+            let focused = index == selected.min(2);
+            let item = ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        if focused { "▎ " } else { "  " },
+                        theme.selection_aware_text_style(focused, theme.focus.active),
+                    ),
+                    Span::styled(
+                        *label,
+                        theme
+                            .selection_aware_text_style(focused, theme.text.primary)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::styled(
+                    format!("    {}", truncate_display_width(detail, detail_width)),
+                    theme.selection_aware_text_style(focused, theme.text.muted),
+                ),
+                Line::raw(""),
+            ]);
+            if focused {
+                item.style(theme.selection_style())
+            } else {
+                item
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
+        list_area,
+    );
+    for index in 0..choices.len() {
+        if let Some(hit) = visible_row_hit(list_area, index, 3) {
+            state.register_hit(hit, Action::ActivateRow(index));
+        }
+    }
+
+    let hint = if rows[2].width < 54 {
+        "↑/↓ select · Enter choose · Esc back"
+    } else {
+        "↑/↓ select · Enter choose · Esc back · keyboard and mouse supported"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(hint, Style::default().fg(theme.text.muted)))
+            .alignment(Alignment::Center),
+        rows[2],
+    );
+}
+
+fn render_onboard_provider_picker(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    class: OnboardProviderClass,
+    query: &str,
+    selected: usize,
+) {
+    let matches = filter_onboard_providers(&state.providers, class, query);
+    let class_total = state
+        .providers
+        .iter()
+        .filter(|card| card.is_onboard_class(class))
+        .count();
+    let rect = centered_modal(area, 116, 36);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!(
+            "{} providers  ·  {} of {}",
+            onboard_class_label(class),
+            matches.len(),
+            class_total
+        ),
+        state,
+        theme,
+    );
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    render_modal_search(frame, rows[0], query, theme);
+    let (list_region, detail_region) = picker_regions(rows[1]);
+
+    const ROW_LINES: usize = 3;
+    let list_block = modal_panel(onboard_class_label(class), theme);
+    let list_area = list_block.inner(list_region);
+    frame.render_widget(list_block, list_region);
+    let visible_rows = (usize::from(list_area.height) / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
+    let mut items = Vec::new();
+    if matches.is_empty() {
+        let message = if query.trim().is_empty() {
+            "  no available providers were discovered for this route"
+        } else {
+            "  no provider in this route matches the search"
+        };
+        items.push(ListItem::new(Line::styled(
+            message,
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &provider_index) in matches.iter().enumerate().skip(first).take(visible_rows) {
+        let card = &state.providers[provider_index];
+        let focused = row == selected;
+        let item = ListItem::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    if focused { "▎ " } else { "  " },
+                    theme.selection_aware_text_style(focused, theme.focus.active),
+                ),
+                Span::styled(
+                    "✓ ",
+                    theme.selection_aware_text_style(focused, theme.status.success),
+                ),
+                Span::styled(
+                    truncate_display_width(
+                        &card.name,
+                        usize::from(list_area.width.saturating_sub(6)),
+                    ),
+                    theme
+                        .selection_aware_text_style(focused, theme.text.primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::styled(
+                format!("      {} · {}", card.id, card.protocol),
+                theme.selection_aware_text_style(focused, theme.text.muted),
+            ),
+            Line::styled(
+                format!(
+                    "      {} · {}",
+                    provider_location_label(card.local),
+                    provider_listing_label(card)
+                ),
+                theme.selection_aware_text_style(focused, theme.text.muted),
+            ),
+        ]);
+        items.push(if focused {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
+        list_area,
+    );
+    for row in first..matches.len() {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
+            break;
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
+    }
+
+    if let Some(detail_area) = detail_region {
+        let detail_block = modal_panel("What happens next", theme);
+        let focused = matches
+            .get(selected)
+            .and_then(|index| state.providers.get(*index));
+        let lines = if let Some(card) = focused {
+            vec![
+                Line::styled(
+                    card.name.clone(),
+                    Style::default()
+                        .fg(theme.text.heading)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(
+                    format!("  protocol: {}", card.protocol),
+                    Style::default().fg(theme.text.secondary),
+                ),
+                Line::styled(
+                    format!("  authentication: {}", card.auth),
+                    Style::default().fg(theme.text.secondary),
+                ),
+                Line::styled(
+                    format!("  models: {}", provider_listing_label(card)),
+                    Style::default().fg(theme.text.secondary),
+                ),
+                Line::raw(""),
+                Line::styled(
+                    "Enter opens model discovery. Nothing is called ready until the selected model passes validation.",
+                    Style::default().fg(theme.text.muted),
+                ),
+            ]
+        } else {
+            vec![
+                Line::styled(
+                    "No provider selected.",
+                    Style::default().fg(theme.text.secondary),
+                ),
+                Line::styled(
+                    "Change the search or press Esc to choose another connection route.",
+                    Style::default().fg(theme.text.muted),
+                ),
+            ]
+        };
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(detail_block)
+                .wrap(Wrap { trim: false }),
+            detail_area,
+        );
+    }
+
+    let hint = if rows[2].width < 60 {
+        "↑/↓ select · Enter continue · Esc routes"
+    } else {
+        "↑/↓ or wheel · type to filter · Enter discover models · Esc connection routes"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(hint, Style::default().fg(theme.text.muted)))
+            .alignment(Alignment::Center),
+        rows[2],
+    );
 }
 
 /// Persistent first-run/runtime diagnostics. The left rail keeps every issue
@@ -3650,11 +4364,13 @@ fn render_model_picker(
                 Span::styled(v, Style::default().fg(color)),
             ])
         };
-        lines.push(field(
-            "provider",
-            card.provider.clone(),
-            theme.text.secondary,
-        ));
+        let provider = card.acp_supplier().map_or_else(
+            || card.provider.clone(),
+            |supplier| format!("{supplier} · ACP supplier"),
+        );
+        lines.push(field("provider", provider, theme.text.secondary));
+        let (auth, auth_color) = model_auth_label(state, card, theme);
+        lines.push(field("auth", auth, auth_color));
         let (readiness, color) = match &card.readiness {
             ModelReadiness::Ready => ("ready".to_owned(), theme.status.success),
             ModelReadiness::Unverified => (
@@ -3686,7 +4402,9 @@ fn render_model_picker(
             if matches!(card.readiness, ModelReadiness::Unavailable(_)) {
                 "  This model cannot be staged until it is available"
             } else if card.acp_supplier().is_some() {
-                "  Enter browses this supplier's available models"
+                "  Enter connects, tests, then browses this supplier's live models"
+            } else if state.model_removal_blocker(&card.id.0).is_some() {
+                "  In use · switch the pending model or finish its active run before removal"
             } else {
                 "  Enter stages this model for your next run"
             },
@@ -3709,7 +4427,7 @@ fn render_model_picker(
     let submit_hint = state
         .focused_model()
         .and_then(ModelCard::acp_supplier)
-        .map_or("Enter stage", |_| "Enter browse models");
+        .map_or("Enter stage", |_| "Enter browse/test");
     frame.render_widget(
         Paragraph::new(Line::styled(
             format!(
@@ -3733,6 +4451,36 @@ fn model_badges(card: &ModelCard) -> String {
         cost_label(card.cost_per_1k_usd),
         context_label(card.context_tokens)
     )
+}
+
+/// Honest authentication posture for a configured model. A missing local key
+/// is not automatically an error: ACP suppliers may use their own login and
+/// local runtimes require no cloud secret. Hosted generic adapters keep the
+/// uncertainty visible until `/keys` or a live probe resolves it.
+fn model_auth_label(state: &AppState, card: &ModelCard, theme: &Theme) -> (String, Color) {
+    if card.acp_supplier().is_some() || card.provider == "acp" {
+        return (
+            "agent login/session · tested on connect".to_owned(),
+            theme.status.info,
+        );
+    }
+    if matches!(card.location, Some(ModelLocationLabel::Local)) {
+        return ("not required (local)".to_owned(), theme.status.success);
+    }
+    match state
+        .key_status
+        .iter()
+        .find(|(model_id, _)| model_id == &card.id.0)
+        .map(|(_, status)| status)
+        .unwrap_or(&KeyStatus::Missing)
+    {
+        KeyStatus::Stored => ("saved locally".to_owned(), theme.status.success),
+        KeyStatus::Env(name) => (format!("environment · {name}"), theme.status.warning),
+        KeyStatus::Missing => (
+            "not stored · provider login may apply".to_owned(),
+            theme.status.warning,
+        ),
+    }
 }
 
 fn location_label(location: Option<ModelLocationLabel>) -> &'static str {
@@ -3786,7 +4534,7 @@ fn render_provider_picker(
         frame,
         rect,
         format!(
-            "Provider catalog  ·  {} of {} adapters",
+            "Provider catalog · Step 1 of 2 · {} of {} adapters",
             matches.len(),
             state.providers.len()
         ),
@@ -3935,7 +4683,7 @@ fn render_provider_picker(
         lines.push(Line::raw(""));
         lines.push(Line::styled(
             if card.available {
-                "  Enter or Tab — browse this provider's models to add one"
+                "  Enter or Tab — browse models and add model"
             } else {
                 "  Runtime adapter not installed — this provider cannot be added yet"
             },
@@ -3953,7 +4701,7 @@ fn render_provider_picker(
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "  ↑/↓ select · Enter/Tab add model · Esc close",
+        "  ↑/↓ select · Enter/Tab browse models · Esc close",
         Style::default().fg(theme.text.muted),
     ));
     if let Some(detail_area) = detail_region {
@@ -4421,6 +5169,119 @@ fn provider_listing_label(card: &ProviderCard) -> String {
         (false, 0) => "type the model name".to_owned(),
         (false, n) => format!("catalog {n} models"),
     }
+}
+
+/// Governed learning review. Only safe, curated projection fields reach this
+/// renderer; source text and tool material never enter `LearningCard`.
+fn render_journey(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(84, 84, area);
+    shield_modal(state, rect);
+    frame.render_widget(Clear, rect);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Learning journey ({}) ", state.learnings.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(rows[0]);
+    let mut items = Vec::new();
+    if state.learnings.is_empty() {
+        items.push(ListItem::new(vec![
+            Line::styled(
+                "  No useful learnings yet",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  Explicit preferences and verified outcomes appear here.",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
+    }
+    for (idx, card) in state.learnings.iter().enumerate() {
+        let selected = idx == state.selected_learning;
+        let pin = if card.pinned { "◆ " } else { "  " };
+        items.push(
+            ListItem::new(vec![
+                Line::styled(
+                    format!("{pin}{}", truncate(&card.statement, 34)),
+                    theme.selection_aware_text_style(selected, theme.text.primary),
+                ),
+                Line::styled(
+                    format!("    {} · {} · {}", card.state, card.kind, card.scope),
+                    theme.selection_aware_text_style(selected, theme.text.muted),
+                ),
+            ])
+            .style(if selected {
+                theme.selection_style()
+            } else {
+                Style::default()
+            }),
+        );
+    }
+    frame.render_widget(List::new(items), cols[0]);
+    for (idx, _) in state.learnings.iter().enumerate() {
+        if let Some(hit) = visible_row_hit(cols[0], idx, 2) {
+            state.register_hit(hit, Action::ActivateRow(idx));
+        }
+    }
+    let mut detail = Vec::new();
+    if let Some(card) = state.focused_learning() {
+        detail.push(section("Curated learning", theme));
+        detail.push(Line::styled(
+            format!("  {}", card.statement),
+            Style::default().fg(theme.text.primary),
+        ));
+        detail.push(Line::raw(""));
+        detail.push(Line::styled(
+            format!(
+                "  state: {}{}",
+                card.state,
+                if card.pinned { " · pinned" } else { "" }
+            ),
+            Style::default().fg(theme.text.secondary),
+        ));
+        detail.push(Line::styled(
+            format!("  scope: {}", card.scope),
+            Style::default().fg(theme.text.secondary),
+        ));
+        detail.push(Line::styled(
+            format!("  confidence: {:.2}", card.confidence),
+            Style::default().fg(theme.status.info),
+        ));
+        detail.push(Line::styled(
+            format!("  provenance: {}", card.provenance),
+            Style::default().fg(theme.text.muted),
+        ));
+        detail.push(Line::raw(""));
+        detail.push(Line::styled(
+            "  Content is curated; raw logs, tool output, URLs, and secrets are never shown.",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    frame.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), cols[1]);
+    frame.render_widget(
+        Paragraph::new("a activate · r reject · p pin/unpin · e edit · d delete · Esc close")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.text.muted)),
+        rows[1],
+    );
 }
 
 /// The memory browser (STEP 2.6): the visible-scope memories on the left, and a
@@ -5269,7 +6130,10 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let outer = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            format!(" Workflow ({} node(s)) ", state.workflow.len()),
+            format!(
+                " Executable Workflow graph ({} node(s)) ",
+                state.workflow.len()
+            ),
             Style::default()
                 .fg(theme.text.heading)
                 .add_modifier(Modifier::BOLD),
@@ -5452,8 +6316,13 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         lines.push(field("depends on", &node.depends_on, theme.text.secondary));
         lines.push(field("outputs", &node.outputs, theme.text.secondary));
     } else {
+        lines.push(section("No persisted workflow manifests found", theme));
         lines.push(Line::styled(
-            "  no node selected",
+            "  n drafts an example inspect → implement → verify workflow request",
+            Style::default().fg(theme.text.secondary),
+        ));
+        lines.push(Line::styled(
+            "  Manifests live in .codypendent/workflows/*.yaml and run durably.",
             Style::default().fg(theme.text.muted),
         ));
     }
@@ -5464,7 +6333,11 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                "  n start · p pause/resume · r retry",
+                if state.workflow.is_empty() {
+                    "  n draft example workflow"
+                } else {
+                    "  n run · p pause/resume · r retry"
+                },
                 Style::default().fg(theme.focus.active),
             ),
             Line::styled(
@@ -5588,7 +6461,7 @@ fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     let outer = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            format!(" Task board ({} card(s)) ", state.kanban.len()),
+            format!(" Kanban task board ({} card(s)) ", state.kanban.len()),
             Style::default()
                 .fg(theme.text.heading)
                 .add_modifier(Modifier::BOLD),
@@ -5693,19 +6566,35 @@ fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 ),
             ]),
             Line::styled(
-                "  \u{2190}/\u{2192} move column \u{b7} \u{2191}/\u{2193} card \u{b7} Esc close",
+                "  n create · \u{2190}/\u{2192} move column · \u{2191}/\u{2193} card · Esc close",
                 Style::default().fg(theme.focus.active),
             ),
         ],
         None => vec![
-            Line::styled("  No cards yet", Style::default().fg(theme.text.secondary)),
             Line::styled(
-                "  Ask an agent to break a feature into backlog cards, or add one from chat.",
+                "  No Kanban tasks yet · n create task",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  Example: Add a regression test for ACP reconnects (council handoff is explicit).",
                 Style::default().fg(theme.text.muted),
             ),
         ],
     };
     frame.render_widget(Paragraph::new(footer), rows[1]);
+
+    // The create affordance is always present, including the empty board.
+    if rows[1].height >= 1 {
+        state.register_hit(
+            Rect {
+                x: rows[1].x.saturating_add(2),
+                y: rows[1].y,
+                width: 10.min(rows[1].width.saturating_sub(2)),
+                height: 1,
+            },
+            Action::NewRun,
+        );
+    }
 
     // Mouse parity for the two column-move affordances named on the footer line.
     if rows[1].height >= 2 && state.focused_card().is_some() {
@@ -5736,7 +6625,8 @@ fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
 /// The blackboard view (Phase 5 STEP 5.3): the typed artifacts agents share
 /// within a workflow run — a list on the left, grouped by run, and, for the
 /// focused item, its kind, author, confidence, evidence, revision, and payload
-/// summary on the right. Read-only. Colors are Theme tokens only (RULE 7).
+/// summary on the right. Operators can post an explicit open question; agent
+/// claims still flow through governed tools and evidence rules.
 fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rect = centered_rect(86, 86, area);
     shield_modal(state, rect);
@@ -5774,11 +6664,11 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     if state.blackboard.is_empty() {
         items.push(ListItem::new(vec![
             Line::styled(
-                "  No workflow artifacts yet",
+                "  No Blackboard evidence, decisions, or artifacts yet",
                 Style::default().fg(theme.text.secondary),
             ),
             Line::styled(
-                "  Start a workflow; findings and decisions will appear here live.",
+                "  Start a workflow, then press n to post an open question (example: What should review verify?).",
                 Style::default().fg(theme.text.muted),
             ),
         ]));
@@ -5891,8 +6781,9 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
             ));
         }
     } else {
+        lines.push(section("Workflow evidence stream", theme));
         lines.push(Line::styled(
-            "  no artifact selected",
+            "  Findings, decisions, and artifacts appear here with provenance.",
             Style::default().fg(theme.text.muted),
         ));
     }
@@ -5908,6 +6799,15 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         detail_rows[1],
     );
     if detail_rows[1].height >= 1 {
+        state.register_hit(
+            Rect {
+                x: detail_rows[1].x.saturating_add(2),
+                y: detail_rows[1].y,
+                width: 15.min(detail_rows[1].width.saturating_sub(2)),
+                height: 1,
+            },
+            Action::NewRun,
+        );
         state.register_hit(
             Rect {
                 x: detail_rows[1].x.saturating_add(13),
@@ -6004,8 +6904,97 @@ fn render_palette(
     let list_area = results_block.inner(rows[1]);
     frame.render_widget(results_block, rows[1]);
     let inner_w = list_area.width as usize;
-    let title_w = 20usize;
-    let key_w = 4usize;
+    // Below 68 columns the former three fixed columns collided: a long title
+    // occupied the same cells as its description and shortcut. Compact rows
+    // deliberately use two physical lines—identity+shortcut, then description.
+    // This preserves all three semantics instead of hiding whichever happens
+    // to fall off the right edge.
+    if inner_w < 68 {
+        const ROW_LINES: usize = 2;
+        let visible_rows = (usize::from(list_area.height) / ROW_LINES).max(1);
+        let first = first_visible_row(selected, matches.len(), visible_rows);
+        let last = (first + visible_rows).min(matches.len());
+        let mut items = Vec::new();
+        if matches.is_empty() {
+            items.push(ListItem::new(Line::styled(
+                "  no matching command",
+                Style::default().fg(theme.text.muted),
+            )));
+        }
+        for (command_index, entry) in matches.iter().enumerate().skip(first).take(visible_rows) {
+            let is_selected = command_index == selected;
+            let shortcut = if entry.key == "—" { "" } else { entry.key };
+            let shortcut_w = UnicodeWidthStr::width(shortcut);
+            let title_budget = inner_w.saturating_sub(3 + shortcut_w).max(1);
+            let title = truncate_display_width(entry.title, title_budget);
+            let occupied = 2 + UnicodeWidthStr::width(title.as_str()) + shortcut_w;
+            let gap = inner_w.saturating_sub(occupied).max(1);
+            let head = Line::from(vec![
+                Span::styled(
+                    if is_selected { "▎ " } else { "  " },
+                    theme.selection_aware_text_style(is_selected, theme.focus.active),
+                ),
+                Span::styled(
+                    title,
+                    theme.selection_aware_text_style(is_selected, theme.text.primary),
+                ),
+                Span::styled(
+                    " ".repeat(gap),
+                    theme.selection_aware_text_style(is_selected, theme.text.primary),
+                ),
+                Span::styled(
+                    shortcut.to_owned(),
+                    theme.selection_aware_text_style(is_selected, theme.status.info),
+                ),
+            ]);
+            let detail = Line::styled(
+                format!(
+                    "  {}",
+                    truncate_display_width(entry.description, inner_w.saturating_sub(2))
+                ),
+                theme.selection_aware_text_style(is_selected, theme.text.muted),
+            );
+            let item = ListItem::new(vec![head, detail]);
+            items.push(if is_selected {
+                item.style(theme.selection_style())
+            } else {
+                item
+            });
+        }
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(theme.surface.panel)),
+            list_area,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "↑/↓ · Enter run · Esc close · click",
+                Style::default().fg(theme.text.muted),
+            ))
+            .alignment(Alignment::Center),
+            rows[2],
+        );
+        for (screen_row, command_index) in (first..last).enumerate() {
+            if let Some(hit) = visible_row_hit(list_area, screen_row, ROW_LINES as u16) {
+                state.register_hit(hit, Action::ActivateRow(command_index));
+            }
+        }
+        return;
+    }
+
+    let key_w = matches
+        .iter()
+        .filter(|entry| entry.key != "—")
+        .map(|entry| UnicodeWidthStr::width(entry.key))
+        .max()
+        .unwrap_or(0)
+        .clamp(3, 10);
+    let title_w = matches
+        .iter()
+        .map(|entry| UnicodeWidthStr::width(entry.title))
+        .max()
+        .unwrap_or(12)
+        .clamp(12, 24)
+        .min(inner_w.saturating_sub(key_w + 8));
     // marker(2) + title + space + description(fill) + key
     let desc_w = inner_w.saturating_sub(2 + title_w + 1 + key_w).max(1);
     let show_groups = query.trim().is_empty();
@@ -6058,19 +7047,24 @@ fn render_palette(
                 let key = if entry.key == "—" {
                     " ".repeat(key_w)
                 } else {
-                    format!("{:>width$}", entry.key, width = key_w)
+                    format!(
+                        "{}{}",
+                        " ".repeat(key_w.saturating_sub(UnicodeWidthStr::width(entry.key))),
+                        entry.key
+                    )
                 };
+                let title = truncate_display_width(entry.title, title_w);
+                let title_pad = title_w.saturating_sub(UnicodeWidthStr::width(title.as_str()));
+                let description = truncate_display_width(entry.description, desc_w);
+                let description_pad =
+                    desc_w.saturating_sub(UnicodeWidthStr::width(description.as_str()));
                 let head = Line::from(vec![
                     Span::styled(
                         marker,
                         theme.selection_aware_text_style(is_selected, theme.focus.active),
                     ),
                     Span::styled(
-                        format!(
-                            "{:<width$}",
-                            truncate_display_width(entry.title, title_w),
-                            width = title_w
-                        ),
+                        format!("{title}{}", " ".repeat(title_pad)),
                         theme.selection_aware_text_style(is_selected, theme.text.primary),
                     ),
                     Span::styled(
@@ -6078,11 +7072,7 @@ fn render_palette(
                         theme.selection_aware_text_style(is_selected, theme.text.primary),
                     ),
                     Span::styled(
-                        format!(
-                            "{:<width$}",
-                            truncate(entry.description, desc_w),
-                            width = desc_w
-                        ),
+                        format!("{description}{}", " ".repeat(description_pad)),
                         theme.selection_aware_text_style(is_selected, theme.text.muted),
                     ),
                     Span::styled(
@@ -6459,7 +7449,7 @@ fn render_add_model_pick(
         frame,
         rect,
         format!(
-            "Add model · {}  ·  {} of {} results  ·  {}{}",
+            "Choose model · Step 2 of 2 · {} · {} of {} · {}{}",
             truncate_display_width(provider_id, 24),
             matches.len(),
             models.len(),
@@ -6492,10 +7482,16 @@ fn render_add_model_pick(
     frame.render_widget(list_block, rows[1]);
     let mut items: Vec<ListItem> = Vec::new();
     if models.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "  no models returned",
-            Style::default().fg(theme.text.muted),
-        )));
+        items.push(ListItem::new(vec![
+            Line::styled(
+                "  no models returned by this supplier",
+                Style::default().fg(theme.text.muted),
+            ),
+            Line::styled(
+                "  Ctrl-R reconnects and tests the live catalogue",
+                Style::default().fg(theme.status.warning),
+            ),
+        ]));
     } else if matches.is_empty() {
         items.push(ListItem::new(Line::styled(
             "  no matching model",
@@ -6560,14 +7556,15 @@ fn render_add_model_pick(
         };
         state.register_hit(hit, Action::ActivateRow(row));
     }
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            "↑/↓ select  ·  Enter add  ·  Ctrl-R refresh  ·  Esc close",
-            Style::default().fg(theme.text.muted),
-        ))
-        .alignment(Alignment::Center),
-        rows[2],
-    );
+    let chips = [
+        Chip::new("↑/↓", "select", Action::SelectNext),
+        Chip::new("Enter", "add", Action::InputSubmit),
+        Chip::new("Ctrl-R", "retry/test", Action::RefreshProviderModels),
+        Chip::new("Esc", "close", Action::Dismiss),
+    ];
+    let (spans, placed) = chip_row(&chips, rows[2].width, theme);
+    frame.render_widget(Paragraph::new(Line::from(spans)), rows[2]);
+    register_chip_hits(state, rows[2].x, rows[2].y, &placed, &chips[..placed.len()]);
 }
 
 /// Compact centered message for a loading step of the Unsloth catalog flow
@@ -7093,6 +8090,29 @@ fn describe_action(action: &ProposedAction) -> Vec<String> {
             format!("tool: {title}"),
             format!("details: {details}"),
         ],
+        ProposedAction::CouncilCreate { name, summary } => vec![
+            format!("create council: {name}"),
+            format!("preview: {summary}"),
+        ],
+        ProposedAction::CouncilRun { name, summary } => vec![
+            format!("run council: {name}"),
+            format!("preview: {summary}"),
+        ],
+        ProposedAction::WorkflowCreate {
+            workflow_id,
+            summary,
+        } => vec![
+            format!("create workflow: {workflow_id}"),
+            format!("preview: {summary}"),
+        ],
+        ProposedAction::WorkflowRun {
+            workflow_id,
+            kind,
+            summary,
+        } => vec![
+            format!("run {kind} workflow: {workflow_id}"),
+            format!("preview: {summary}"),
+        ],
         _ => vec!["unsupported action".to_owned()],
     }
 }
@@ -7109,6 +8129,10 @@ fn action_kind(action: &ProposedAction) -> &'static str {
         ProposedAction::PublishDocument { .. } => "publish document",
         ProposedAction::McpToolCall { .. } => "mcp tool",
         ProposedAction::AcpToolCall { .. } => "acp tool",
+        ProposedAction::CouncilCreate { .. } => "create council",
+        ProposedAction::CouncilRun { .. } => "run council",
+        ProposedAction::WorkflowCreate { .. } => "create workflow",
+        ProposedAction::WorkflowRun { .. } => "run workflow",
         _ => "unsupported",
     }
 }
@@ -7257,6 +8281,274 @@ fn render_council_browser(frame: &mut Frame, area: Rect, state: &AppState, theme
         ]),
         rows[1],
     );
+}
+
+/// Durable-result workbench. Report strings are never shortened: the viewport
+/// scrolls over the exact chair/member text retained in state.
+fn render_council_results(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_modal(area, 140, 42);
+    shield_modal(state, rect);
+    frame.render_widget(Clear, rect);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Council results ({}) ", state.council_results.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+    let compact = rect.width < 72;
+    let cols = if compact {
+        vec![Rect::default(), rows[0]]
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+            .split(rows[0])
+            .to_vec()
+    };
+
+    let visible = (cols[0].height as usize / 3).max(1);
+    let first = first_visible_row(
+        state.selected_council_result,
+        state.council_results.len(),
+        visible,
+    );
+    let mut items = Vec::new();
+    if state.council_results.is_empty() {
+        items.push(ListItem::new(vec![
+            Line::styled(
+                "  No durable results found",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  Use /council result <name-or-id>",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
+    }
+    for (index, result) in state
+        .council_results
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(visible)
+    {
+        let selected = index == state.selected_council_result;
+        let status_color = if result.status == "completed" {
+            theme.status.success
+        } else if result.status == "running" {
+            theme.status.warning
+        } else {
+            theme.status.error
+        };
+        let status_label = match result.status.as_str() {
+            "completed" => "COMPLETED".to_owned(),
+            "running" => "RUNNING".to_owned(),
+            other => format!("FAILED · {}", other.to_uppercase()),
+        };
+        let item = ListItem::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    if selected { "› " } else { "  " },
+                    theme.selection_aware_text_style(selected, theme.focus.active),
+                ),
+                Span::styled(
+                    status_label,
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::styled(
+                format!("  {}", result.council),
+                theme.selection_aware_text_style(selected, theme.text.primary),
+            ),
+            Line::styled(
+                format!("  {} · {}", result.finished_at, result.result_id),
+                theme.selection_aware_text_style(selected, theme.text.muted),
+            ),
+        ]);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    if !compact {
+        frame.render_widget(
+            List::new(items).style(Style::default().bg(theme.surface.overlay)),
+            cols[0],
+        );
+        for (screen_row, index) in (first..state.council_results.len())
+            .take(visible)
+            .enumerate()
+        {
+            if let Some(hit) = visible_row_hit(cols[0], screen_row, 3) {
+                state.register_hit(hit, Action::ActivateRow(index));
+            }
+        }
+    }
+
+    let detail = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive));
+    let detail_inner = detail.inner(cols[1]);
+    frame.render_widget(detail, cols[1]);
+    let mut lines = Vec::new();
+    if let Some(result) = state.focused_council_result() {
+        let status_color = if result.status == "completed" {
+            theme.status.success
+        } else if result.status == "running" {
+            theme.status.warning
+        } else {
+            theme.status.error
+        };
+        let status_label = match result.status.as_str() {
+            "completed" => "COMPLETED".to_owned(),
+            "running" => "RUNNING".to_owned(),
+            other => format!("FAILED · {}", other.to_uppercase()),
+        };
+        lines.push(Line::styled(
+            format!("{status_label} · {}", result.council),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::from(format!("handle: {}", result.result_id)));
+        lines.push(Line::from(format!("objective: {}", result.objective)));
+        lines.push(Line::from(format!("started: {}", result.started_at)));
+        lines.push(Line::from(format!("finished: {}", result.finished_at)));
+        lines.push(Line::from(format!("repository: {}", result.repository)));
+        lines.push(Line::from(format!(
+            "origin session: {}",
+            result.origin_session_id.as_deref().unwrap_or("—")
+        )));
+        lines.push(Line::from(format!(
+            "evidence: {} · {}",
+            if result.evidence { "on" } else { "off" },
+            result.cost_line
+        )));
+        if let Some(failure) = &result.failure {
+            lines.push(Line::styled(
+                format!("failure: {failure}"),
+                Style::default().fg(theme.status.error),
+            ));
+        }
+        for warning in &result.warnings {
+            lines.push(Line::styled(
+                format!("warning: {warning}"),
+                Style::default().fg(theme.status.warning),
+            ));
+        }
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "Chair synthesis (verbatim)",
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::UNDERLINED),
+        ));
+        lines.extend(
+            result
+                .synthesis
+                .lines()
+                .map(|line| Line::raw(line.to_owned())),
+        );
+        if state.council_result_expanded {
+            for round in &result.rounds {
+                lines.push(Line::default());
+                lines.push(Line::styled(
+                    format!("Round {}", round.round),
+                    Style::default()
+                        .fg(theme.text.heading)
+                        .add_modifier(Modifier::UNDERLINED),
+                ));
+                for failure in &round.failures {
+                    lines.push(Line::styled(
+                        format!("member failure: {failure}"),
+                        Style::default().fg(theme.status.error),
+                    ));
+                }
+                for member in &round.members {
+                    lines.push(Line::styled(
+                        format!(
+                            "{} · {} · session {} · run {}",
+                            member.role, member.model, member.session_id, member.run_id
+                        ),
+                        Style::default()
+                            .fg(theme.text.secondary)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    lines.extend(
+                        member
+                            .response
+                            .lines()
+                            .map(|line| Line::raw(line.to_owned())),
+                    );
+                    lines.push(Line::styled(
+                        format!(
+                            "usage: {} token(s) · {}",
+                            member
+                                .tokens
+                                .map_or_else(|| "unmeasured".to_owned(), |v| v.to_string()),
+                            member.cost_micros.map_or_else(
+                                || "cost unmeasured".to_owned(),
+                                |v| format!("{v} µUSD")
+                            )
+                        ),
+                        Style::default().fg(theme.text.muted),
+                    ));
+                }
+            }
+        }
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            format!("report: {}", result.report_markdown),
+            Style::default().fg(theme.text.muted),
+        ));
+    } else {
+        lines.push(Line::styled(
+            "No council result selected.",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((state.council_result_scroll, 0)),
+        detail_inner,
+    );
+    let primary = [
+        Chip::new("↑/↓", "result", Action::SelectNext),
+        Chip::new("PgUp/PgDn", "scroll", Action::ScrollPageDown),
+        Chip::new("Enter", "member reports", Action::Expand),
+    ];
+    let secondary = [
+        Chip::new("y", "copy synthesis", Action::CopyFocusedCard),
+        Chip::new("Esc", "close", Action::Dismiss),
+    ];
+    let footer_rows =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(rows[1]);
+    for (area, chips) in [
+        (footer_rows[0], primary.as_slice()),
+        (footer_rows[1], secondary.as_slice()),
+    ] {
+        let (spans, placed) = chip_row(chips, area.width, theme);
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        register_chip_hits(state, area.x, area.y, &placed, &chips[..placed.len()]);
+    }
 }
 
 fn render_council_builder(
@@ -8426,6 +9718,161 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn onboard_provider(
+        id: &str,
+        name: &str,
+        protocol: &str,
+        local: bool,
+        requires_key: bool,
+        available: bool,
+    ) -> ProviderCard {
+        ProviderCard {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            protocol: protocol.to_owned(),
+            auth: if requires_key {
+                format!("api-key: {}_API_KEY", id.to_uppercase())
+            } else if protocol == "acp" {
+                "acp: installed executable".to_owned()
+            } else {
+                "none".to_owned()
+            },
+            local,
+            requires_key,
+            can_list_models: protocol != "acp",
+            available,
+            catalog_models: usize::from(protocol != "acp"),
+            has_key: false,
+        }
+    }
+
+    #[test]
+    fn onboarding_triage_is_responsive_keyboard_operable_and_mouse_shielded() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::Onboard {
+            step: OnboardStep::Triage { selected: 1 },
+        };
+        for width in [40, 60, 80, 120] {
+            let text = render_to_string(&state, width, 30);
+            assert!(text.contains("Connect a model"), "{width} columns:\n{text}");
+            assert!(text.contains("Hosted API"), "{width} columns:\n{text}");
+            assert!(text.contains("Local endpoint"), "{width} columns:\n{text}");
+            assert!(
+                text.contains("ACP coding agent"),
+                "{width} columns:\n{text}"
+            );
+            let hits = state.hit_map.borrow();
+            for row in 0..3 {
+                assert!(
+                    hits.iter().any(|(rect, action)| {
+                        rect.width > 0 && rect.height > 0 && action == &Action::ActivateRow(row)
+                    }),
+                    "row {row} needs a live hit target at {width} columns"
+                );
+            }
+            assert!(
+                hits.iter().any(|(_, action)| action == &Action::NoOp),
+                "modal interior must shield the base"
+            );
+            assert!(
+                hits.iter().any(|(_, action)| action == &Action::Dismiss),
+                "the scrim needs a keyboard-equivalent back action"
+            );
+        }
+
+        // Prove the same route can be completed without mouse input.
+        reduce(&mut state, Action::SelectPrev);
+        assert!(matches!(
+            state.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 0 }
+            }
+        ));
+        state.providers = vec![onboard_provider(
+            "openai",
+            "OpenAI",
+            "openai-chat",
+            false,
+            true,
+            true,
+        )];
+        reduce(&mut state, Action::InputSubmit);
+        assert!(matches!(
+            state.overlay,
+            Overlay::OnboardProviderPicker {
+                class: OnboardProviderClass::Hosted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn onboarding_provider_picker_stays_scoped_at_compact_and_wide_widths() {
+        let mut state = AppState::new();
+        state.providers = vec![
+            onboard_provider("openai", "OpenAI", "openai-chat", false, true, true),
+            onboard_provider("ollama", "Ollama", "openai-chat", true, false, true),
+            onboard_provider("kimi-code", "Kimi Code", "acp", true, false, true),
+            onboard_provider(
+                "disabled",
+                "Unavailable Hosted",
+                "openai-chat",
+                false,
+                true,
+                false,
+            ),
+        ];
+        state.overlay = Overlay::OnboardProviderPicker {
+            class: OnboardProviderClass::Hosted,
+            query: String::new(),
+            selected: 0,
+        };
+        for width in [40, 60, 80, 120] {
+            let text = render_to_string(&state, width, 30);
+            assert!(
+                text.contains("Hosted API providers"),
+                "{width} columns:\n{text}"
+            );
+            assert!(text.contains("OpenAI"), "{width} columns:\n{text}");
+            assert!(
+                !text.contains("Ollama"),
+                "route leaked at {width} columns:\n{text}"
+            );
+            assert!(
+                !text.contains("Kimi Code"),
+                "ACP route leaked at {width} columns:\n{text}"
+            );
+            assert!(
+                !text.contains("Unavailable Hosted"),
+                "disabled provider leaked at {width} columns:\n{text}"
+            );
+            let hits = state.hit_map.borrow();
+            assert!(hits.iter().any(|(rect, action)| {
+                rect.width > 0 && rect.height > 0 && action == &Action::ActivateRow(0)
+            }));
+            assert!(!hits
+                .iter()
+                .any(|(_, action)| action == &Action::ActivateRow(1)));
+        }
+    }
+
+    #[test]
+    fn configured_but_zero_runnable_models_get_the_guided_setup_cta() {
+        let mut state = AppState::new();
+        state.models = vec![ModelCard {
+            id: codypendent_protocol::ModelId("saved-but-missing-key".to_owned()),
+            provider: "openai-compatible".to_owned(),
+            readiness: ModelReadiness::Unavailable("missing API key".to_owned()),
+            location: Some(ModelLocationLabel::Hosted),
+            cost_per_1k_usd: None,
+            context_tokens: None,
+        }];
+        let text = render_to_string(&state, 80, 30);
+        assert!(text.contains("Connect a runnable model"), "{text}");
+        assert!(text.contains("saved models are not runnable"), "{text}");
+        assert!(text.contains("Press Enter with an empty message"), "{text}");
     }
 
     fn council_model(id: &str, provider: &str) -> ModelCard {
@@ -10364,8 +11811,8 @@ mod tests {
         let text = render_to_string(&state, 80, 24);
         // A truly fresh state cannot start a run yet; the empty conversation
         // guides model setup instead of promising Enter will work.
-        assert!(text.contains("Connect your first model"));
-        assert!(text.contains("Provider catalog"));
+        assert!(text.contains("Connect a runnable model"));
+        assert!(text.contains("guided setup"));
     }
 
     #[test]
@@ -10461,8 +11908,8 @@ mod tests {
         let state = running_build_state();
         let out = render_to_string(&state, 100, 30);
         assert!(out.contains("Running"), "live state:\n{out}");
-        assert!(out.contains("commands"), "commands chip:\n{out}");
-        assert!(out.contains("workspace"), "workspace chip:\n{out}");
+        assert!(out.contains("steer"), "steer chip:\n{out}");
+        assert!(out.contains("interrupt"), "interrupt chip:\n{out}");
         assert!(
             !out.contains("help"),
             "rare controls belong in the command palette:\n{out}"
@@ -10485,14 +11932,14 @@ mod tests {
         // telemetry row; neither may consume the composer's space.
         let footer_row = lines[lines.len() - 2];
         assert!(
-            footer_row.contains("Running") && footer_row.contains("commands"),
+            footer_row.contains("Running") && footer_row.contains("steer"),
             "bottom row should be the context footer:\n{footer_row:?}"
         );
         let telemetry_row = lines[lines.len() - 1];
         assert!(
             telemetry_row.contains("model gpt-5.1-codex")
-                && telemetry_row.contains("context 42%")
-                && telemetry_row.contains("subagents 0"),
+                && telemetry_row.contains("ctx 42/58%")
+                && telemetry_row.contains("agents 0+0"),
             "durable telemetry should occupy the final row:\n{telemetry_row:?}"
         );
 
@@ -10512,7 +11959,7 @@ mod tests {
         let idle = render_to_string(&state, 120, 30);
         assert!(idle.contains("Running"), "run state:\n{idle}");
         assert!(
-            idle.contains("commands") || idle.contains("F2"),
+            idle.contains("steer") && idle.contains("interrupt"),
             "footer command chips:\n{idle}"
         );
 
@@ -10522,7 +11969,7 @@ mod tests {
         }
         let drafting = render_to_string(&state, 120, 30);
         assert!(
-            drafting.contains("Draft ready") && drafting.contains("send"),
+            drafting.contains("Steering draft ready") && drafting.contains("queue steer"),
             "draft actions in the footer:\n{drafting}"
         );
     }
@@ -10567,12 +12014,12 @@ mod tests {
         let noticed = render_to_string(&state, 120, 20);
         let noticed_footer = noticed.lines().rev().nth(1).unwrap_or("");
         assert!(
-            noticed_footer.contains("Settings saved"),
+            !noticed_footer.contains("Settings saved"),
             "{noticed_footer}"
         );
         assert!(
             noticed_footer.contains("a once") && noticed_footer.contains("r reject"),
-            "a transient notice must not hide approval decisions: {noticed_footer}"
+            "approval decisions must replace a lower-priority transient notice: {noticed_footer}"
         );
     }
 
@@ -10601,8 +12048,109 @@ mod tests {
             "model should remain on the status line:\n{status_row}"
         );
         assert!(
-            status_row.contains("context 42% / 100k") && status_row.contains("subagents 2"),
+            status_row.contains("ctx 42/58%") && status_row.contains("agents 2+0"),
             "context and subagents should remain on the status line:\n{status_row}"
+        );
+    }
+
+    fn telemetry_agent(state: &str) -> crate::state::WorkflowNodeCard {
+        crate::state::WorkflowNodeCard {
+            workflow_id: "status-strip".to_owned(),
+            workflow: "status-strip v1".to_owned(),
+            workflow_run_id: Some("run-status".to_owned()),
+            run_phase: "running".to_owned(),
+            inputs: "—".to_owned(),
+            id: format!("agent-{state}"),
+            action: "agent collaborator".to_owned(),
+            kind: "agent".to_owned(),
+            state: state.to_owned(),
+            agent: "collaborator".to_owned(),
+            model_policy: "coding".to_owned(),
+            workspace: "isolated worktree".to_owned(),
+            approval: "before write".to_owned(),
+            retry: "1 attempt".to_owned(),
+            depends_on: "—".to_owned(),
+            depends_on_ids: Vec::new(),
+            outputs: "result".to_owned(),
+            cost: "—".to_owned(),
+            error: "—".to_owned(),
+        }
+    }
+
+    #[test]
+    fn competitive_session_strip_prioritizes_and_expands_across_widths() {
+        let mut state = header_state();
+        state.runs[0].worktree = Some("codex/status-strip".to_owned());
+        state.workflow = vec![telemetry_agent("running"), telemetry_agent("queued")];
+        state.council_subagents = 2;
+
+        for width in [40, 60, 80, 120, 240] {
+            let output = render_to_string(&state, width, 30);
+            let strip = output.lines().last().expect("persistent strip");
+            assert!(strip.contains("gpt-5.1"), "model at {width}: {strip}");
+            assert!(strip.contains("Build"), "mode at {width}: {strip}");
+            assert!(strip.contains("42"), "context at {width}: {strip}");
+            assert!(
+                strip.contains("3+1"),
+                "active+queued agents at {width}: {strip}"
+            );
+            assert!(
+                UnicodeWidthStr::width(strip) <= usize::from(width),
+                "strip overflow at {width}: {strip}"
+            );
+        }
+
+        let wide = render_to_string(&state, 240, 30);
+        let strip = wide.lines().last().unwrap_or("");
+        for field in [
+            "via openai",
+            "cost $12.34",
+            "permissions full access",
+            "branch/worktree codex/status-strip",
+            "reasoning —",
+            "Shift-drag copy",
+            "health connected",
+        ] {
+            assert!(strip.contains(field), "missing {field:?}: {strip}");
+        }
+        assert!(strip.contains("42% used/58% left/100k"), "{strip}");
+    }
+
+    #[test]
+    fn composer_has_three_text_rows_and_explicit_send_and_steer_semantics() {
+        let idle = AppState::new();
+        for width in [40, 60, 80, 120] {
+            assert_eq!(composer_box_height("", width), 4);
+            let text = render_to_string(&idle, width, 18);
+            assert!(text.contains("MESSAGE · Enter sends"), "{width}:\n{text}");
+        }
+
+        let mut live = running_build_state();
+        live.composer = "please inspect the Unicode boundary 🚀".repeat(8);
+        live.composer_cursor = live.composer.len();
+        for width in [40, 60, 80, 120] {
+            let height = composer_box_height(&live.composer, width);
+            assert!((4..=COMPOSER_MAX_HEIGHT).contains(&height));
+            let text = render_to_string(&live, width, 24);
+            assert!(text.contains("STEER · Enter queues"), "{width}:\n{text}");
+            if width >= 80 {
+                assert!(text.contains("queue steer"), "{width}:\n{text}");
+                assert!(text.contains("interrupt"), "{width}:\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_has_no_blanket_mouse_hit_that_blocks_native_selection() {
+        let state = running_build_state();
+        let _ = render_to_string(&state, 120, 30);
+        let hits = state.hit_map.borrow();
+        assert!(
+            !hits.iter().any(|(rect, action)| {
+                rect.height > 3
+                    && matches!(action, Action::ActivateRow(_) | Action::FocusPane(Pane::Transcript))
+            }),
+            "transcript must reserve drag selection; only small fold heads may be clickable: {hits:?}"
         );
     }
 
@@ -10634,8 +12182,11 @@ mod tests {
 
         let before = render_to_string(&s, 110, 30);
         assert!(
-            !before.contains("ctx"),
-            "unknown context should be omitted:\n{before}"
+            before
+                .lines()
+                .last()
+                .is_some_and(|line| line.contains("ctx —")),
+            "the persistent strip should disclose unknown context:\n{before}"
         );
         assert!(
             !before.contains("ctx 25%"),
@@ -10966,6 +12517,56 @@ mod tests {
             !filtered.contains("New run"),
             "non-match should be filtered out:\n{filtered}"
         );
+    }
+
+    #[test]
+    fn command_palette_is_collision_free_and_clickable_at_competitive_widths() {
+        for width in [40, 60, 80, 120] {
+            let mut state = running_build_state();
+            reduce(&mut state, Action::OpenPalette);
+            let text = render_to_string(&state, width, 40);
+            assert!(
+                text.contains("Command palette"),
+                "palette title missing at {width} columns:\n{text}"
+            );
+            assert!(
+                text.contains("Setup & diagnostics"),
+                "long title missing at {width} columns:\n{text}"
+            );
+            assert!(
+                text.contains("review persistent"),
+                "description needs its own readable budget at {width} columns:\n{text}"
+            );
+            assert!(
+                text.lines()
+                    .all(|line| UnicodeWidthStr::width(line) <= usize::from(width)),
+                "a row overran {width} columns:\n{text}"
+            );
+            let hits = state.hit_map.borrow();
+            let (rect, _) = hits
+                .iter()
+                .find(|(_, action)| action == &Action::ActivateRow(0))
+                .unwrap_or_else(|| panic!("selected command needs a hit target at {width}"));
+            assert!(
+                rect.right() <= width,
+                "hit target overran {width}: {rect:?}"
+            );
+            assert_eq!(
+                rect.height,
+                if width < 80 { 2 } else { 1 },
+                "compact command rows must expose their full two-line target"
+            );
+        }
+
+        let mut cooked = running_build_state();
+        reduce(&mut cooked, Action::OpenPalette);
+        let snapshot = crate::accessible::accessible_snapshot(&cooked);
+        assert!(snapshot.contains("Highlighted command 1"), "{snapshot}");
+        assert!(
+            snapshot.contains("review persistent configuration"),
+            "{snapshot}"
+        );
+        assert!(snapshot.contains("no direct shortcut"), "{snapshot}");
     }
 
     #[test]
@@ -11503,7 +13104,7 @@ mod tests {
         };
         let text = render_to_string(&state, 100, 30);
         assert!(
-            text.contains("Add model · groq"),
+            text.contains("Choose model · Step 2 of 2 · groq"),
             "the pick-list title:\n{text}"
         );
         assert!(
@@ -11528,6 +13129,16 @@ mod tests {
         assert!(
             text.contains("live list"),
             "the header states where the rows came from:\n{text}"
+        );
+        assert!(
+            text.contains("retry/test"),
+            "live supplier retry control:\n{text}"
+        );
+        let hits = state.hit_map.borrow();
+        assert!(
+            hits.iter()
+                .any(|(_, action)| { action == &Action::RefreshProviderModels }),
+            "Ctrl-R needs mouse parity"
         );
     }
 
@@ -11921,7 +13532,7 @@ mod tests {
 
         let compact = render_to_string(&state, 80, 24);
         assert!(
-            compact.contains("n start · p pause/resume"),
+            compact.contains("n run · p pause/resume"),
             "workflow controls must stay pinned at 80x24:\n{compact}"
         );
         assert!(
@@ -12043,7 +13654,7 @@ mod tests {
         reduce(&mut state, Action::OpenKanban);
         let text = render_to_string(&state, 140, 32);
 
-        assert!(text.contains("Task board"), "title missing:\n{text}");
+        assert!(text.contains("Kanban task board"), "title missing:\n{text}");
         for column in crate::state::KANBAN_COLUMNS {
             assert!(text.contains(column), "column `{column}` missing:\n{text}");
         }
@@ -12058,6 +13669,7 @@ mod tests {
         // hit target (the keyboard-only affordance would otherwise be a gap).
         let hits = state.hit_map.borrow();
         for action in [
+            Action::NewRun,
             Action::ActivateRow(0),
             Action::MoveCardForward,
             Action::MoveCardBack,
@@ -12068,6 +13680,23 @@ mod tests {
                 "{action:?} needs a non-empty hit target"
             );
         }
+    }
+
+    #[test]
+    fn empty_kanban_renders_a_concrete_create_action_with_mouse_parity() {
+        let mut state = running_build_state();
+        reduce(&mut state, Action::OpenKanban);
+        let text = render_to_string(&state, 140, 32);
+        assert!(
+            text.contains("n create task"),
+            "missing primary action:\n{text}"
+        );
+        assert!(text.contains("regression test"), "missing example:\n{text}");
+        assert!(state
+            .hit_map
+            .borrow()
+            .iter()
+            .any(|(rect, action)| action == &Action::NewRun && rect.width > 0));
     }
 
     #[test]
@@ -13407,7 +15036,7 @@ mod tests {
         let (row, footer) = text
             .lines()
             .enumerate()
-            .find(|(_, line)| line.contains("Enter send"))
+            .find(|(_, line)| line.contains("Message ready"))
             .expect("the draft footer");
         let y = u16::try_from(row).expect("row fits");
 

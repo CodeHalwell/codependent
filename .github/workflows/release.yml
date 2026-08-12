@@ -165,6 +165,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          body_path: docs/releases/v${{ steps.version.outputs.version }}.md
           files: ${{ steps.package.outputs.artifact }}
 
       # Every push to main cuts a fresh, per-commit prerelease. The tag
@@ -179,4 +180,5 @@ jobs:
           name: codypendent v${{ steps.version.outputs.version }} (build ${{ github.run_number }})
           target_commitish: ${{ github.sha }}
           prerelease: true
+          body_path: docs/releases/v${{ steps.version.outputs.version }}.md
           files: ${{ steps.package.outputs.artifact }}

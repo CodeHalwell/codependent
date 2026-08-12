@@ -1,7 +1,18 @@
 {
+  "ProposedAction_WorkflowCreate": {
+    "summary": "save workflow `review-change` v1 with 2 step(s)",
+    "type": "WorkflowCreate",
+    "workflow_id": "review-change"
+  },
   "ProposedAction_WorkflowQuery": {
     "type": "WorkflowQuery",
     "workflow_run_id": "wfrun-abc123"
+  },
+  "ProposedAction_WorkflowRun": {
+    "kind": "named",
+    "summary": "start named workflow `review-change`",
+    "type": "WorkflowRun",
+    "workflow_id": "review-change"
   },
   "WorkflowNodeView_with_depends_on": {
     "attempt": 1,

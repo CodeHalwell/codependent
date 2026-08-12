@@ -153,6 +153,53 @@ impl Default for CouncilBuilderState {
     }
 }
 
+/// The mutually-exclusive route selected by the first-run setup triage.
+///
+/// Classification is deliberately a TUI contract rather than a display-text
+/// convention: a local ACP executable (for example Kimi) is always an
+/// [`AcpAgent`](Self::AcpAgent), never a local HTTP endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardProviderClass {
+    Hosted,
+    LocalEndpoint,
+    AcpAgent,
+}
+
+/// One of the small, reducer-owned onboarding screens. Provider/model browsing
+/// is handed off to the existing discovery overlays instead of being copied
+/// into this enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnboardStep {
+    /// Hosted, local endpoint, or ACP agent.
+    Triage { selected: usize },
+    /// 0 = skip forever, 1 = continue setup, 2 = cancel and return to setup.
+    SkipConfirm { selected: usize },
+    /// A model profile was submitted to the host and is not considered usable
+    /// until an authoritative runnable-model refresh confirms it.
+    Validating { model_id: ModelId },
+}
+
+/// State retained while onboarding borrows the ordinary provider/add-model
+/// overlays. It is the explicit return address that prevents Esc or a
+/// recoverable host failure from dumping a zero-model operator into dead Chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardFlow {
+    pub class: OnboardProviderClass,
+    pub provider_id: Option<String>,
+    pub awaiting_model: Option<ModelId>,
+}
+
+impl OnboardFlow {
+    #[must_use]
+    pub fn new(class: OnboardProviderClass) -> Self {
+        Self {
+            class,
+            provider_id: None,
+            awaiting_model: None,
+        }
+    }
+}
+
 /// The top-most modal / overlay, if any. Text prompts carry their buffer inline.
 ///
 /// `PartialEq` but NOT `Eq`: the add-model pick-list carries catalog prices as
@@ -163,6 +210,17 @@ pub enum Overlay {
     /// No overlay; the base layout is interactive.
     #[default]
     None,
+    /// First-run setup shell. It owns only triage, skip confirmation, and the
+    /// short validation wait; provider/model discovery reuses existing flows.
+    Onboard { step: OnboardStep },
+    /// Provider picker scoped to exactly one onboarding class. This is separate
+    /// from `/provider` so the triage choice cannot silently dissolve into an
+    /// unfiltered catalog, and so Esc has an unambiguous return destination.
+    OnboardProviderPicker {
+        class: OnboardProviderClass,
+        query: String,
+        selected: usize,
+    },
     /// The help overlay listing key bindings.
     Help,
     /// Persistent setup and runtime diagnostics. Unlike the one-line transient
@@ -185,6 +243,21 @@ pub enum Overlay {
     /// opening surfaces the full source string in place; a real file-open is the
     /// CLI's job later ("every retrieved memory opens its source").
     Memory { source_open: bool },
+    /// Curated, governed learnings only. Unlike legacy Memory this excludes
+    /// transcript-like episodic capture and never carries raw source material.
+    Journey,
+    /// Edit the concise statement of the focused learning.
+    LearningEdit {
+        id: String,
+        revision: u64,
+        buffer: String,
+    },
+    /// Permanent deletion is always confirmed; the store has no restore API.
+    ConfirmLearningDelete {
+        id: String,
+        revision: u64,
+        label: String,
+    },
     /// The Docs Studio browser (Phase 4 client wiring): the [`AppState::docs`]
     /// tree on the left, and the focused document's editor rail (its blocks) +
     /// review rail (its pending suggestions) on the right. Read-only — the live
@@ -243,6 +316,15 @@ pub enum Overlay {
     ConfirmWorkflowCancel { workflow_run_id: String },
     /// JSON inputs for a new durable workflow run. Blank means `{}`.
     WorkflowInputs { workflow_id: String, buffer: String },
+    /// Create a repository Kanban card. Submit posts a typed `task` artifact to
+    /// the repository board; Esc returns to the board without writing.
+    KanbanNew { buffer: String },
+    /// Post an operator-authored open question to one workflow run's
+    /// Blackboard. Questions deliberately carry no unverified factual claim.
+    BlackboardPost {
+        workflow_run_id: String,
+        buffer: String,
+    },
     /// The command palette: a searchable list of every command the TUI exposes,
     /// so the growing feature set stays reachable without consuming a single-key
     /// binding each. `query` is the live filter; `selected` indexes the filtered
@@ -258,6 +340,10 @@ pub enum Overlay {
     /// [`Overlay::CouncilBuilder`] to create a new one; `r` prompts for an
     /// objective and runs the focused council; `d` asks to remove it.
     CouncilBrowser,
+    /// Durable council outcomes. Unlike the workflow and Blackboard surfaces,
+    /// this browser is backed only by the council result store and can reopen a
+    /// report in a later session by its stable handle.
+    CouncilResults,
     /// The council run-objective prompt (`r` from the browser): a free-text
     /// buffer for what the focused council should deliberate. Submitting
     /// emits `Intent::RunCouncil` and returns to the browser, which shows
@@ -618,6 +704,184 @@ impl TranscriptEntry {
     }
 }
 
+/// Remove terminal-control payloads and credential-shaped values from an
+/// untrusted provider/agent error before it is rendered, announced, or copied.
+/// The original event remains in the durable daemon ledger; the client surface
+/// deliberately projects only this bounded, safe explanation.
+#[must_use]
+pub(crate) fn sanitize_failure_text(raw: &str) -> String {
+    const MAX_CHARS: usize = 2_048;
+    let cleaned: String = raw
+        .chars()
+        .filter(|character| {
+            matches!(character, '\n' | '\t')
+                || (!character.is_control()
+                    && !matches!(
+                        character,
+                        '\u{061c}'
+                            | '\u{200e}'
+                            | '\u{200f}'
+                            | '\u{202a}'..='\u{202e}'
+                            | '\u{2066}'..='\u{2069}'
+                    ))
+        })
+        .take(MAX_CHARS)
+        .collect();
+    let mut words = Vec::new();
+    // Number of following whitespace-delimited fields that belong to a
+    // credential header. `Authorization: Bearer <token>` needs two, whereas
+    // `password: <value>` and `token <value>` need one. A boolean here leaked
+    // the actual bearer token after redacting only the authentication scheme.
+    let mut redact_following = 0_usize;
+    for word in cleaned.split_whitespace() {
+        let lower = word.to_ascii_lowercase();
+        let credential_label = lower.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if redact_following > 0 {
+            words.push("[REDACTED]".to_owned());
+            redact_following -= 1;
+            continue;
+        }
+        if credential_label == "authorization" || lower.ends_with("authorization:") {
+            words.push(word.to_owned());
+            redact_following = 2;
+            continue;
+        }
+        if matches!(
+            credential_label,
+            "bearer" | "token" | "api_key" | "apikey" | "password"
+        ) || lower.ends_with("api-key:")
+        {
+            words.push(word.to_owned());
+            redact_following = 1;
+            continue;
+        }
+        let secret_prefix = lower.starts_with("sk-")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("github_pat_")
+            || lower.starts_with("xoxb-")
+            || lower.starts_with("xoxp-")
+            || lower.starts_with("tvly-");
+        let inline_secret = ["token=", "api_key=", "apikey=", "password=", "bearer="]
+            .iter()
+            .find_map(|needle| lower.find(needle).map(|index| (needle, index)));
+        let json_secret = ["\"token\":", "\"api_key\":", "\"password\":"]
+            .iter()
+            .any(|needle| lower.contains(needle));
+        if secret_prefix || json_secret {
+            words.push("[REDACTED]".to_owned());
+        } else if let Some((needle, index)) = inline_secret {
+            let keep = index + needle.len();
+            words.push(format!("{}[REDACTED]", &word[..keep]));
+        } else {
+            words.push(word.to_owned());
+        }
+    }
+    let mut safe = words.join(" ");
+    if safe.chars().count() > MAX_CHARS {
+        safe = safe.chars().take(MAX_CHARS).collect();
+    }
+    if raw.chars().count() > MAX_CHARS {
+        if safe.chars().count() == MAX_CHARS {
+            safe.pop();
+        }
+        safe.push('…');
+    }
+    safe
+}
+
+/// Provider/model/phase metadata projected from an ACP model id plus its
+/// sanitized error chain. Kept in state so graphical, cooked, and clipboard
+/// paths cannot drift into three different diagnoses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcpFailureSummary {
+    pub provider: String,
+    pub model: String,
+    pub phase: &'static str,
+    pub cause: String,
+    pub auth_related: bool,
+}
+
+#[must_use]
+pub(crate) fn acp_failure_summary(
+    model: Option<&codypendent_protocol::ModelId>,
+    raw: &str,
+) -> Option<AcpFailureSummary> {
+    let coordinate = model.and_then(|model| model.0.strip_prefix("acp/"));
+    if coordinate.is_none() && !raw.to_ascii_lowercase().contains("acp") {
+        return None;
+    }
+    let (provider, concrete) = coordinate
+        .map(|coordinate| {
+            coordinate
+                .split_once('#')
+                .unwrap_or((coordinate, "default"))
+        })
+        .unwrap_or(("unknown ACP agent", "unknown model"));
+    let lower = raw.to_ascii_lowercase();
+    let phase = if lower.contains("initialize") {
+        "initialize"
+    } else if lower.contains("session/new") || lower.contains("session new") {
+        "session setup"
+    } else if lower.contains("tool") {
+        "tool call"
+    } else if lower.contains("prompt") {
+        "prompt"
+    } else {
+        "connection"
+    };
+    let auth_related = ["auth", "login", "sign in", "credential", "unauthorized"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let safe = sanitize_failure_text(raw);
+    let cause = extract_failure_detail(&safe).unwrap_or_else(|| {
+        if auth_related {
+            "authentication is required or expired".to_owned()
+        } else {
+            format!("{phase} failed; expand for the sanitized provider response")
+        }
+    });
+    Some(AcpFailureSummary {
+        provider: provider.to_owned(),
+        model: concrete.to_owned(),
+        phase,
+        cause,
+        auth_related,
+    })
+}
+
+fn extract_failure_detail(safe: &str) -> Option<String> {
+    for marker in ["\"details\"", "details", "message"] {
+        let Some(index) = safe.to_ascii_lowercase().find(marker) else {
+            continue;
+        };
+        let tail = safe[index + marker.len()..]
+            .trim_start_matches([' ', ':', '=', '\"', '{'])
+            .trim_end_matches([' ', '\"', '}', '.']);
+        if !tail.is_empty() {
+            return Some(
+                tail.split(['\"', '}'])
+                    .next()
+                    .unwrap_or(tail)
+                    .trim()
+                    .to_owned(),
+            );
+        }
+    }
+    safe.rsplit(": ")
+        .map(str::trim)
+        .find(|segment| {
+            !segment.is_empty()
+                && !matches!(
+                    segment.to_ascii_lowercase().as_str(),
+                    "acp prompt failed"
+                        | "prompt failed"
+                        | "session/prompt failed"
+                        | "internal error"
+                )
+        })
+        .map(str::to_owned)
+}
+
 /// A pending approval awaiting a decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApproval {
@@ -796,6 +1060,20 @@ pub struct CouncilCard {
 /// never needs to name `crate::council`'s types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CouncilRunSummary {
+    /// Stable handle allocated before the first member starts.
+    pub result_id: String,
+    pub council: String,
+    /// `completed`, `quorum-failed`, or `chair-failed`.
+    pub status: String,
+    pub objective: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub repository: String,
+    pub origin_session_id: Option<String>,
+    pub evidence: bool,
+    pub warnings: Vec<String>,
+    pub rounds: Vec<CouncilRoundSummary>,
+    pub failure: Option<String>,
     /// The chair's final synthesis text, verbatim.
     pub synthesis: String,
     /// One attributed line per member plus the chair (model, role, session,
@@ -805,6 +1083,50 @@ pub struct CouncilRunSummary {
     pub cost_line: String,
     /// Where the durable JSON+Markdown report landed, for the transcript note.
     pub report_markdown: String,
+}
+
+/// One complete, attributed member answer retained inside a durable result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CouncilMemberSummary {
+    pub model: String,
+    pub role: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub response: String,
+    pub tokens: Option<u64>,
+    pub cost_micros: Option<u64>,
+}
+
+/// One persisted council round, including partial failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CouncilRoundSummary {
+    pub round: u8,
+    pub members: Vec<CouncilMemberSummary>,
+    pub failures: Vec<String>,
+}
+
+/// Typed phase for live council progress. Keeping this structured prevents
+/// terminal state and warnings from being inferred from display prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CouncilProgressPhase {
+    RoundStarted,
+    MemberCompleted,
+    MemberFailed,
+    ChairStarted,
+    Warning,
+}
+
+impl CouncilProgressPhase {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RoundStarted => "round started",
+            Self::MemberCompleted => "member completed",
+            Self::MemberFailed => "member failed",
+            Self::ChairStarted => "chair synthesis",
+            Self::Warning => "warning",
+        }
+    }
 }
 
 /// A memory provenance card (STEP 2.6): one curated memory projected for the
@@ -832,6 +1154,22 @@ pub struct MemoryCard {
     pub confidence: f32,
     /// The human-readable evidence source (what "open source" reveals).
     pub source: String,
+}
+
+/// Safe projection of one governed learning. Provenance is reduced to a
+/// categorical label by the CLI; raw tool output, commands, paths, and URIs are
+/// intentionally absent from this presentation type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LearningCard {
+    pub id: String,
+    pub statement: String,
+    pub kind: String,
+    pub state: String,
+    pub scope: String,
+    pub provenance: String,
+    pub confidence: f32,
+    pub pinned: bool,
+    pub revision: u64,
 }
 
 /// A Docs Studio card (STEP 4.x client wiring): one [`KnowledgeDocument`]
@@ -1425,6 +1763,22 @@ pub struct ProviderCard {
     pub has_key: bool,
 }
 
+impl ProviderCard {
+    /// Whether this card belongs to one and only one onboarding lane.
+    #[must_use]
+    pub fn is_onboard_class(&self, class: OnboardProviderClass) -> bool {
+        if !self.available {
+            return false;
+        }
+        let acp = self.protocol.eq_ignore_ascii_case("acp");
+        match class {
+            OnboardProviderClass::AcpAgent => acp,
+            OnboardProviderClass::LocalEndpoint => self.local && !acp && !self.requires_key,
+            OnboardProviderClass::Hosted => !self.local && !acp && self.requires_key,
+        }
+    }
+}
+
 /// The indices into `providers` whose id/name/protocol case-insensitively
 /// contains `query` — the provider picker's substring filter, in list order.
 /// Mirrors [`filter_models`] exactly, adapted to [`ProviderCard`] fields. An
@@ -1440,6 +1794,29 @@ pub(crate) fn filter_providers(providers: &[ProviderCard], query: &str) -> Vec<u
                 || card.id.to_lowercase().contains(&needle)
                 || card.name.to_lowercase().contains(&needle)
                 || card.protocol.to_lowercase().contains(&needle)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// Provider indices visible in one onboarding lane. Unlike `/provider`, this
+/// never admits unavailable catalog entries or another lane while filtering.
+#[must_use]
+pub(crate) fn filter_onboard_providers(
+    providers: &[ProviderCard],
+    class: OnboardProviderClass,
+    query: &str,
+) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    providers
+        .iter()
+        .enumerate()
+        .filter(|(_, card)| {
+            card.is_onboard_class(class)
+                && (needle.is_empty()
+                    || card.id.to_lowercase().contains(&needle)
+                    || card.name.to_lowercase().contains(&needle)
+                    || card.protocol.to_lowercase().contains(&needle))
         })
         .map(|(idx, _)| idx)
         .collect()
@@ -1718,6 +2095,12 @@ pub struct AppState {
     pub memories: Vec<MemoryCard>,
     /// Index into `memories` of the focused memory.
     pub selected_memory: usize,
+    /// Useful governed learnings: active items plus proposals awaiting review.
+    pub learnings: Vec<LearningCard>,
+    pub selected_learning: usize,
+    /// Quiet count updated by `LearningsCaptured`, including when it arrives
+    /// after the terminal run event.
+    pub pending_learning_review: u32,
     /// The Docs Studio projection (Phase 4 client wiring): the visible-scope
     /// documents, mapped to self-contained [`DocCard`]s by the CLI. May be
     /// empty. The [`Overlay::Docs`] browser reads it.
@@ -1779,6 +2162,13 @@ pub struct AppState {
     /// workers are subagents just like durable workflow agent nodes; the
     /// persistent footer combines both sources instead of hiding council work.
     pub council_subagents: usize,
+    /// Durable council reports loaded through the dedicated council-result API.
+    pub council_results: Vec<CouncilRunSummary>,
+    pub selected_council_result: usize,
+    /// Detail-rail viewport; the full synthesis remains in memory verbatim.
+    pub council_result_scroll: u16,
+    /// Whether the detail rail includes all member reports/rounds.
+    pub council_result_expanded: bool,
     /// The repository task board (rubric 10): every live `task` card on the
     /// repository's board, mapped to self-contained [`KanbanCard`]s by the CLI.
     /// The [`Overlay::Kanban`] view reads it; a live `BlackboardPosted` on the
@@ -1803,6 +2193,14 @@ pub struct AppState {
     /// this task (MP1) — nothing yet reads it to change routing behavior; a
     /// later task (MP2) wires it to pin the next run's model.
     pub pending_model: Option<ModelId>,
+    /// Authoritative runnable-model projection supplied by the CLI harness.
+    /// This is intentionally distinct from `models`: a configured profile can
+    /// still be missing credentials, unreachable, or protocol-disabled. The
+    /// zero-runnable CTA and onboarding completion both use this projection.
+    pub runnable_models: Vec<ModelId>,
+    /// Return/correlation state while onboarding reuses provider and add-model
+    /// overlays. `None` outside an active handoff.
+    pub onboard_flow: Option<OnboardFlow>,
     /// The provider-catalog projection for the `/provider` picker (Task 8):
     /// the built-in ~40-provider catalog, layered with any user
     /// `providers.toml`, mapped to a self-contained [`ProviderCard`] by the
@@ -1954,6 +2352,9 @@ impl AppState {
             selected_skill: 0,
             memories: Vec::new(),
             selected_memory: 0,
+            learnings: Vec::new(),
+            selected_learning: 0,
+            pending_learning_review: 0,
             docs: Vec::new(),
             selected_doc: 0,
             pending_document_selection: None,
@@ -1974,11 +2375,17 @@ impl AppState {
             councils: Vec::new(),
             selected_council: 0,
             council_subagents: 0,
+            council_results: Vec::new(),
+            selected_council_result: 0,
+            council_result_scroll: 0,
+            council_result_expanded: false,
             kanban: Vec::new(),
             selected_card: 0,
             models: Vec::new(),
             selected_model: 0,
             pending_model: None,
+            runnable_models: Vec::new(),
+            onboard_flow: None,
             providers: Vec::new(),
             selected_provider: 0,
             key_status: Vec::new(),
@@ -2049,11 +2456,14 @@ impl AppState {
             Overlay::NewRun(_)
             | Overlay::Steering(_)
             | Overlay::WorkflowInputs { .. }
+            | Overlay::KanbanNew { .. }
+            | Overlay::BlackboardPost { .. }
             | Overlay::EdgeSearch(_)
             | Overlay::DocEdit { .. }
             | Overlay::DocNew { .. }
             | Overlay::DocInsert { .. }
             | Overlay::DocPublishPath { .. }
+            | Overlay::LearningEdit { .. }
             | Overlay::AddModelId { .. }
             | Overlay::AddModelKey { .. }
             | Overlay::AddModelProviderKey { .. }
@@ -2067,6 +2477,7 @@ impl AppState {
             | Overlay::ConfirmUiPluginEnable { .. }
             | Overlay::ConfirmUiPluginRevoke { .. }
             | Overlay::ConfirmCouncilDelete { .. }
+            | Overlay::ConfirmLearningDelete { .. }
             | Overlay::ConfirmModelRemove { .. }
             | Overlay::UnslothConfirmPull { .. }
             | Overlay::DocDeleteConfirm { .. } => InputMode::Confirm,
@@ -2075,6 +2486,10 @@ impl AppState {
             // filter on printable keys while staying arrow-navigable, so they
             // share this input mode (see [`crate::input::map_palette_key`]).
             Overlay::Palette { .. }
+            | Overlay::Onboard {
+                step: OnboardStep::Triage { .. } | OnboardStep::SkipConfirm { .. },
+            }
+            | Overlay::OnboardProviderPicker { .. }
             | Overlay::ModelPicker { .. }
             | Overlay::ProviderPicker { .. }
             | Overlay::ModePicker { .. }
@@ -2086,9 +2501,13 @@ impl AppState {
             // mode. The add-model querying box is likewise non-interactive except
             // `Esc` (dismiss), so it shares this mode too.
             Overlay::Help
+            | Overlay::Onboard {
+                step: OnboardStep::Validating { .. },
+            }
             | Overlay::Issues
             | Overlay::Skills
             | Overlay::Memory { .. }
+            | Overlay::Journey
             | Overlay::Docs
             | Overlay::Edges
             | Overlay::Workflow
@@ -2096,6 +2515,7 @@ impl AppState {
             | Overlay::Kanban
             | Overlay::UiPlugins
             | Overlay::CouncilBrowser
+            | Overlay::CouncilResults
             | Overlay::AddModelQuerying { .. }
             | Overlay::UnslothPulling { .. } => InputMode::Normal,
             Overlay::CouncilBuilder(_) => {
@@ -2118,6 +2538,13 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Whether the harness has confirmed at least one configured profile can
+    /// start a run without another setup/auth step.
+    #[must_use]
+    pub fn has_runnable_models(&self) -> bool {
+        !self.runnable_models.is_empty()
     }
 
     /// The currently selected run, if any.
@@ -2267,10 +2694,47 @@ impl AppState {
         self.councils.get(self.selected_council)
     }
 
+    #[must_use]
+    pub fn focused_learning(&self) -> Option<&LearningCard> {
+        self.learnings.get(self.selected_learning)
+    }
+
+    /// The focused durable council result, if one has been loaded.
+    #[must_use]
+    pub fn focused_council_result(&self) -> Option<&CouncilRunSummary> {
+        self.council_results.get(self.selected_council_result)
+    }
+
     /// The focused model-picker card, if any.
     #[must_use]
     pub fn focused_model(&self) -> Option<&ModelCard> {
         self.models.get(self.selected_model)
+    }
+
+    /// Why a configured model cannot be removed yet, if it is still part of
+    /// live session routing. Deletion is intentionally limited to the
+    /// configured [`ModelCard`] projection; provider-catalog rows never enter
+    /// this path. The confirmation reducer checks this a second time so a run
+    /// starting while the dialog is open cannot invalidate the first guard.
+    #[must_use]
+    pub fn model_removal_blocker(&self, model_id: &str) -> Option<&'static str> {
+        if self
+            .pending_model
+            .as_ref()
+            .is_some_and(|pending| pending.0 == model_id)
+        {
+            return Some("it is selected for the next run; switch models first");
+        }
+        if self.runs.iter().any(|run| {
+            run.model.as_ref().is_some_and(|model| model.0 == model_id)
+                && !matches!(
+                    run.state,
+                    RunState::Completed | RunState::Failed | RunState::Cancelled
+                )
+        }) {
+            return Some("it is serving an active run; finish or cancel that run first");
+        }
+        None
     }
 
     /// The focused provider-picker card, if any.
@@ -2571,5 +3035,33 @@ mod tests {
                 "expected a redaction marker: {dbg}"
             );
         }
+    }
+
+    #[test]
+    fn acp_failure_summary_names_coordinate_phase_and_redacts_provider_secrets() {
+        let model = ModelId("acp/cline#openai/gpt-5.6-sol".to_owned());
+        let raw = "ACP prompt failed: session/new failed: {\"details\":\"cline requires re-authentication token=super-secret\"}\u{1b}[31m";
+        let failure = acp_failure_summary(Some(&model), raw).expect("ACP coordinate");
+        assert_eq!(failure.provider, "cline");
+        assert_eq!(failure.model, "openai/gpt-5.6-sol");
+        assert_eq!(failure.phase, "session setup");
+        assert!(failure.auth_related);
+        assert!(failure.cause.contains("re-authentication"), "{:?}", failure);
+        assert!(!failure.cause.contains("super-secret"), "{:?}", failure);
+        assert!(!failure.cause.contains('\u{1b}'), "{:?}", failure);
+    }
+
+    #[test]
+    fn failure_sanitizer_redacts_common_credentials_and_is_bounded() {
+        let raw = format!(
+            "Authorization: Bearer abc123 api_key=sk-live password: hunter2 ghp_deadbeef {}",
+            "x".repeat(4_096)
+        );
+        let safe = sanitize_failure_text(&raw);
+        for secret in ["abc123", "sk-live", "hunter2", "ghp_deadbeef"] {
+            assert!(!safe.contains(secret), "secret {secret} leaked: {safe}");
+        }
+        assert!(safe.contains("[REDACTED]"));
+        assert!(safe.chars().count() <= 2_049, "sanitizer must stay bounded");
     }
 }

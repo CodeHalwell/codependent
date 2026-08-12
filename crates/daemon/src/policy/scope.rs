@@ -48,6 +48,13 @@ pub enum Capability {
         /// The server name from the trusted `mcp.toml`.
         server: String,
     },
+    /// Create or run a persisted agent council. Marker capability: execution
+    /// stays inside Codypendent but may change config and incur model cost.
+    CouncilManage,
+    /// Create or run a durable workflow. Marker capability: the compiler and
+    /// workflow host enforce the concrete manifest/repository boundaries while
+    /// this grant records the fresh human approval.
+    WorkflowManage,
 }
 
 /// The verdict of checking a single path against a [`PathScope`].

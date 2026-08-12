@@ -22,6 +22,7 @@ pub mod embedding;
 pub mod extractor;
 pub mod models;
 pub mod tools;
+pub mod workflow_control;
 
 pub use embedding::HttpEmbedder;
 

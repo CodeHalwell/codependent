@@ -27,6 +27,8 @@ pub enum PaletteCommand {
     Skills,
     /// Open the memory browser.
     Memory,
+    /// Review useful, governed facts and preferences.
+    Journey,
     /// Open the Docs Studio browser.
     Docs,
     /// Open the code-graph edge inspector.
@@ -49,6 +51,8 @@ pub enum PaletteCommand {
     ApiKeys,
     /// Surface the persisted multi-provider council workflow.
     Council,
+    /// Browse or directly retrieve durable council outcomes.
+    CouncilResults,
     /// Browse the Unsloth GGUF catalog on Hugging Face and pull one via
     /// `ollama` into a selectable local model.
     UnslothCatalog,
@@ -178,6 +182,13 @@ pub const COMMANDS: &[PaletteEntry] = &[
         group: "Models",
     },
     PaletteEntry {
+        command: PaletteCommand::CouncilResults,
+        title: "/council result  Council results",
+        description: "open durable outcomes; append a council name or result id for direct lookup",
+        key: "—",
+        group: "Models",
+    },
+    PaletteEntry {
         command: PaletteCommand::UnslothCatalog,
         title: "Local models: browse Unsloth catalog",
         description:
@@ -204,22 +215,22 @@ pub const COMMANDS: &[PaletteEntry] = &[
     },
     PaletteEntry {
         command: PaletteCommand::Workflow,
-        title: "/workflow  Workflow graph",
-        description: "start and control durable workflows with live node state",
+        title: "/workflow  Executable workflow graph",
+        description: "create, open, and run persisted workflow manifests with a live DAG",
         key: "W",
         group: "Workspace",
     },
     PaletteEntry {
         command: PaletteCommand::Blackboard,
-        title: "/blackboard  Blackboard",
-        description: "follow live workflow findings, decisions, and evidence",
+        title: "/blackboard  Blackboard evidence stream",
+        description: "inspect or post attributed workflow evidence, decisions, and artifacts",
         key: "B",
         group: "Workspace",
     },
     PaletteEntry {
         command: PaletteCommand::Kanban,
-        title: "/board  Task board",
-        description: "backlog cards in columns; move them, or ask an agent to fill them",
+        title: "/board  Kanban task board",
+        description: "create, assign, and move repository backlog tasks in Kanban columns",
         key: "K",
         group: "Workspace",
     },
@@ -235,6 +246,13 @@ pub const COMMANDS: &[PaletteEntry] = &[
         title: "/memory  Memory",
         description: "browse curated memories and their provenance",
         key: "M",
+        group: "Workspace",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Journey,
+        title: "/journey  Learning review",
+        description: "review, activate, edit, pin, reject, or delete curated learnings",
+        key: "J",
         group: "Workspace",
     },
     PaletteEntry {

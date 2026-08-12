@@ -263,6 +263,10 @@ fn action_title(action: &ProposedAction) -> String {
         ProposedAction::BlackboardPost { kind, .. } => format!("post {kind} to the blackboard"),
         ProposedAction::BlackboardQuery { .. } => "query the blackboard".to_string(),
         ProposedAction::McpToolCall { summary, .. } => summary.clone(),
+        ProposedAction::CouncilCreate { summary, .. }
+        | ProposedAction::CouncilRun { summary, .. }
+        | ProposedAction::WorkflowCreate { summary, .. }
+        | ProposedAction::WorkflowRun { summary, .. } => summary.clone(),
         _ => "tool call".to_string(),
     }
 }

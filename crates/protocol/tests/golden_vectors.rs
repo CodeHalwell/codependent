@@ -83,8 +83,8 @@ use codypendent_protocol::{
 };
 use codypendent_protocol::{Actor, ApprovalId, ArtifactId, ChangeSetId, ClientId, CommandId};
 use codypendent_protocol::{
-    AgentId, CorrelationId, DaemonInstanceId, DocumentId, ModelId, RunId, SessionId, UserId,
-    WorkspaceId,
+    AgentId, CorrelationId, DaemonInstanceId, DocumentId, LearningId, ModelId, RunId, SessionId,
+    UserId, WorkspaceId,
 };
 
 // ---------------------------------------------------------------------------
@@ -128,6 +128,9 @@ fn correlation_id() -> CorrelationId {
 }
 fn agent_id() -> AgentId {
     "c0000000-0000-0000-0000-000000000001".parse().unwrap()
+}
+fn learning_id() -> LearningId {
+    "d0000000-0000-0000-0000-000000000001".parse().unwrap()
 }
 
 /// A fixed instant — never `Utc::now()` — so every timestamp in the vector set
@@ -949,6 +952,16 @@ fn events_vectors() -> Vec<Vector> {
             }),
         ),
         vec_of(
+            "EventBody_LearningsCaptured",
+            event_with(EventBody::LearningsCaptured {
+                run_id: run_id(),
+                proposed_count: 1,
+                proposed_ids: vec![learning_id()],
+                activated_count: 0,
+                activated_ids: Vec::new(),
+            }),
+        ),
+        vec_of(
             "EventBody_ClientPresenceChanged",
             event_with(EventBody::ClientPresenceChanged {
                 client_id: client_id(),
@@ -1743,6 +1756,21 @@ fn workflow_graph_vectors() -> Vec<Vector> {
             "ProposedAction_WorkflowQuery",
             ProposedAction::WorkflowQuery {
                 workflow_run_id: "wfrun-abc123".to_string(),
+            },
+        ),
+        vec_of(
+            "ProposedAction_WorkflowCreate",
+            ProposedAction::WorkflowCreate {
+                workflow_id: "review-change".to_string(),
+                summary: "save workflow `review-change` v1 with 2 step(s)".to_string(),
+            },
+        ),
+        vec_of(
+            "ProposedAction_WorkflowRun",
+            ProposedAction::WorkflowRun {
+                workflow_id: "review-change".to_string(),
+                kind: "named".to_string(),
+                summary: "start named workflow `review-change`".to_string(),
             },
         ),
     ]

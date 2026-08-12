@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 codypendent-protocol = { workspace = true }
+codypendent-council = { workspace = true }
 codypendent-daemon = { workspace = true }
 codypendent-integrations = { workspace = true }
 # The `codypendent models bench <id>` harness (`src/bench.rs`) measures a local

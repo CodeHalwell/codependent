@@ -50,6 +50,10 @@ uuid_id!(AgentId);
 uuid_id!(ArtifactId);
 uuid_id!(ChangeSetId);
 uuid_id!(WorkflowId);
+uuid_id!(
+    /// Stable identity of one durable multi-model council outcome.
+    CouncilResultId
+);
 uuid_id!(ToolId);
 uuid_id!(SkillId);
 uuid_id!(PluginId);
@@ -65,6 +69,10 @@ uuid_id!(DaemonInstanceId);
 // Phase 2 — knowledge fabric (registry, memory, code graph).
 uuid_id!(RegistryItemId);
 uuid_id!(MemoryId);
+uuid_id!(
+    /// A curated fact or reusable procedure in the governed learning ledger.
+    LearningId
+);
 uuid_id!(CodeNodeId);
 uuid_id!(RepositoryId);
 uuid_id!(BranchId);

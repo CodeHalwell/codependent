@@ -19,6 +19,7 @@ path = "src/lib.rs"
 codypendent-daemon = { workspace = true }
 codypendent-runtime = { workspace = true }
 codypendent-protocol = { workspace = true }
+codypendent-council = { workspace = true }
 # The Phase-7 utility router (behind the default-OFF routing seam in
 # `src/routing.rs`): `Router::route`/`escalate`, `TaskNode`, the security hard
 # filter, and the classifier this assembly builds a `TaskNode` for.
@@ -35,6 +36,7 @@ tracing-subscriber = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 # Parses the `<data_dir>/routing.toml` registry item that enables the Phase-7
 # routing seam (default OFF), the `models.toml` precedent.
 toml = { workspace = true }

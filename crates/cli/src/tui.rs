@@ -25,7 +25,7 @@
 //! and pongs from the reader. A third OS thread bridges blocking `crossterm`
 //! input into the async loop.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,28 +33,33 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
+use base64::Engine as _;
 use codypendent_integrations::unsloth::HfCatalogApi;
 use codypendent_knowledge::{
-    db as knowledge_db, BlockContent, CapabilityRequest, CollaborationMode, DocumentAuthor,
-    DocumentBlock, DocumentReplica, DocumentStore, EvidenceRef, KnowledgeDocument, MemoryClass,
-    MemoryRecord, MemoryStore, Registry, RegistryItem, RegistryItemKind, RegistryStatus, RiskClass,
-    Scope, Suggestion, SuggestionStatus, SuggestionStore, TrustTier,
+    db as knowledge_db, ActivationOutcome, BlockContent, CapabilityRequest, CollaborationMode,
+    DocumentAuthor, DocumentBlock, DocumentReplica, DocumentStore, EvidenceRef, KnowledgeDocument,
+    LearningContent, LearningMutationOutcome, LearningPatch, LearningProvenance, LearningQuery,
+    LearningRecord, LearningScope, LearningState, LearningStore, MemoryClass, MemoryRecord,
+    MemoryStore, Registry, RegistryItem, RegistryItemKind, RegistryStatus, RiskClass, Scope,
+    Suggestion, SuggestionStatus, SuggestionStore, TrustTier, Verification,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    read_envelope, write_envelope, Catchup, ClientId, ClientRole, Command, CommandBody, CommandId,
-    DocumentEditLease, DocumentId, DocumentSync, Envelope, ModelId, Payload, RepositoryId,
-    SessionEvent, SessionId, Subscription, WorkspaceId,
+    read_envelope, write_envelope, BlackboardItemDraft, BlackboardScope, Catchup, ClientId,
+    ClientRole, Command, CommandBody, CommandId, DocumentEditLease, DocumentId, DocumentSync,
+    Envelope, LearningId, ModelId, Payload, RepositoryId, SessionEvent, SessionId, Subscription,
+    UserId, WorkspaceId,
 };
 use codypendent_runtime::models::provider_auth_id;
 use codypendent_tui::{
     accessible_snapshot, accessible_terminal_capabilities_message, map_accessible_input, map_event,
     reduce, render, render_splash, sanitize_accessible_text, terminal_capabilities_message, Action,
-    AddModelRow, AppState, BlackboardItemCard, ColorDepth, DocBlockView, DocCard,
-    DocSuggestionView, GraphEdgeCard, Intent, KanbanCard, KeyStatus, KeyTarget, MemoryCard,
-    ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness, ProjectionKind, ProviderCard,
-    SkillCard, TerminalGuard, Theme, UnslothQuantCard, UnslothRepoCard, WorkflowNodeCard,
-    WorkflowNodeUpdate, EDGE_PAGE_SIZE,
+    AddModelRow, AppState, BlackboardItemCard, ColorDepth, CouncilMemberSummary,
+    CouncilProgressPhase, CouncilRoundSummary, CouncilRunSummary, DocBlockView, DocCard,
+    DocSuggestionView, GraphEdgeCard, Intent, KanbanCard, KeyStatus, KeyTarget, LearningCard,
+    LearningMutation, MemoryCard, ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness,
+    ProjectionKind, ProviderCard, SkillCard, TerminalGuard, Theme, UnslothQuantCard,
+    UnslothRepoCard, WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -357,7 +362,7 @@ pub async fn run(
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or("workspace");
-    let ready_stage = format!("{workspace_name} is ready");
+    let ready_stage = splash_ready_stage(workspace_name, state.runnable_models.len());
     let warnings = boot_warnings
         .lock()
         .expect("boot warnings mutex poisoned")
@@ -366,6 +371,7 @@ pub async fn run(
         input_running.store(false, Ordering::Relaxed);
         return Ok(());
     }
+    apply_post_boot_onboard_gate(&mut state, &store);
 
     // Boot diagnostics become the TUI's own notices — ALWAYS when any were
     // collected, whether or not the splash drew a single frame: a reconcile
@@ -489,6 +495,21 @@ async fn run_accessible(
             }
         }
     };
+    let accessible_stage = splash_ready_stage(
+        repo.file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("workspace"),
+        state.runnable_models.len(),
+    );
+    writeln!(stdout, "Ready: {}", ascii_stage(&accessible_stage))?;
+    if apply_post_boot_onboard_gate(&mut state, &store) {
+        writeln!(
+            stdout,
+            "Model setup is open. Choose Hosted, Local endpoint, or ACP agent."
+        )?;
+    }
+    stdout.flush()?;
     drain_boot_warnings(&mut state, &boot_warnings);
     let Booted {
         session_id,
@@ -536,6 +557,29 @@ fn ascii_stage(stage: &str) -> String {
         .replace('·', "-")
 }
 
+/// Honest completed-boot copy. A connected daemon and loaded workspace are not
+/// enough to claim readiness when no configured profile can start a run.
+fn splash_ready_stage(workspace_name: &str, runnable_count: usize) -> String {
+    if runnable_count == 0 {
+        "set up a model to continue".to_owned()
+    } else {
+        format!("{workspace_name} is ready")
+    }
+}
+
+/// Apply the single shared first-run decision after boot for both graphical
+/// and accessible presentations. The durable preference records only the
+/// explicit "skip forever" choice; successful setup is represented by the
+/// authoritative runnable projection itself, avoiding a stale second source
+/// of truth.
+fn apply_post_boot_onboard_gate(state: &mut AppState, store: &SessionStore) -> bool {
+    let open = state.runnable_models.is_empty() && !store.onboard_skipped;
+    if open {
+        reduce(state, Action::OpenOnboard);
+    }
+    open
+}
+
 fn accessible_viewport() -> (u16, u16) {
     let parse = |name: &str, fallback: u16| {
         std::env::var(name)
@@ -560,6 +604,7 @@ trait Presentation {
     fn viewport(&self) -> (u16, u16);
     fn capabilities_message(&self) -> codypendent_protocol::UiWireMessage;
     fn draw(&mut self, state: &AppState, force_prompt: bool) -> io::Result<()>;
+    fn copy_text(&mut self, text: &str) -> io::Result<()>;
     fn wants_periodic_draw(&self) -> bool {
         false
     }
@@ -591,6 +636,24 @@ impl Presentation for InteractivePresentation<'_> {
             .terminal_mut()
             .draw(|frame| render(frame, state, self.theme))
             .map(|_| ())
+    }
+
+    fn copy_text(&mut self, text: &str) -> io::Result<()> {
+        // OSC 52 is terminal-native and avoids a platform clipboard dependency.
+        // Bound before encoding: a malicious provider failure must not turn one
+        // copy gesture into an unbounded control sequence.
+        const MAX_COPY_BYTES: usize = 64 * 1024;
+        let end = text
+            .char_indices()
+            .take_while(|(index, character)| index + character.len_utf8() <= MAX_COPY_BYTES)
+            .map(|(index, character)| index + character.len_utf8())
+            .last()
+            .unwrap_or(0)
+            .min(text.len());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&text.as_bytes()[..end]);
+        let backend = self.guard.terminal_mut().backend_mut();
+        write!(backend, "\x1b]52;c;{encoded}\x07")?;
+        backend.flush()
     }
 }
 
@@ -647,6 +710,28 @@ impl<W: Write> Presentation for AccessiblePresentation<W> {
         self.last_snapshot = Some(snapshot);
         self.last_emitted_at = Some(Instant::now());
         Ok(())
+    }
+
+    fn copy_text(&mut self, text: &str) -> io::Result<()> {
+        // Cooked mode cannot reach a terminal clipboard. Treat copied card
+        // contents as untrusted before echoing them: notes, patches, and ACP
+        // output may contain ANSI/OSC controls. Keep the fallback bounded to
+        // the same budget as the interactive OSC 52 path.
+        const MAX_COPY_BYTES: usize = 64 * 1024;
+        let safe = sanitize_accessible_text(text);
+        let end = safe
+            .char_indices()
+            .take_while(|(index, character)| index + character.len_utf8() <= MAX_COPY_BYTES)
+            .map(|(index, character)| index + character.len_utf8())
+            .last()
+            .unwrap_or(0)
+            .min(safe.len());
+        writeln!(
+            self.output,
+            "\nCopied card (terminal clipboard unavailable):\n{}",
+            &safe[..end]
+        )?;
+        self.output.flush()
     }
 
     fn wants_periodic_draw(&self) -> bool {
@@ -918,12 +1003,14 @@ async fn boot_phase(
     // MP1: seed the model-picker projection (models.toml + any measured
     // profile from `model_profiles`), exactly like the projections above.
     state.models = load_model_cards(paths, &mut loader_warnings).await;
+    refresh_runnable_models(state, None);
     // Task 8: seed the provider-catalog picker projection (the built-in
     // catalog + any user `providers.toml`), exactly like `load_model_cards`.
     state.providers = load_provider_cards(paths, &mut loader_warnings).await;
     // Rubric 6 TUI wiring: seed the `/council` browser projection (persisted
     // councils.toml definitions), exactly like `load_model_cards` above.
     state.councils = load_council_cards(paths, &mut loader_warnings);
+    state.council_results = load_council_result_cards(paths, &mut loader_warnings);
     // D1 (/keys): seed the API-key status projection — auth.json entries +
     // models.toml `api_key_env` declarations (the tui crate does no I/O, so
     // the harness reads the files and folds the projection as an Action, the
@@ -1270,6 +1357,11 @@ async fn event_loop<P: Presentation>(
     // sanitized health projection periodically so failures that race initial
     // startup still reach the persistent Issues rail.
     let mut next_integration_health_tick = state.tick.saturating_add(150);
+    // Every provider discovery/ACP operation is stamped in the harness. Only
+    // the newest terminal result for a provider may reach the reducer or write
+    // configuration, so a slow handshake cannot connect an agent after the
+    // operator has retried or chosen another model from that provider.
+    let mut provider_requests = ProviderRequestGenerations::default();
 
     loop {
         // A CRDT sync needs an async merge (+ a suggestion re-read) that cannot run
@@ -1376,9 +1468,15 @@ async fn event_loop<P: Presentation>(
                         changed_files.len()
                     )),
                 },
-                Some(ReaderSignal::ProviderModels { provider_id, result }) => match result {
-                    Ok((models, origin)) => Action::ProviderModelsLoaded { provider_id, models, origin },
-                    Err(reason) => Action::ProviderModelsFailed { provider_id, reason },
+                Some(ReaderSignal::ProviderModels { provider_id, request_id, result }) => {
+                    if !provider_requests.is_current(&provider_id, request_id) {
+                        Action::NoOp
+                    } else {
+                        match result {
+                            Ok((models, origin)) => Action::ProviderModelsLoaded { provider_id, models, origin },
+                            Err(reason) => Action::ProviderModelsFailed { provider_id, reason },
+                        }
+                    }
                 },
                 Some(ReaderSignal::UnslothRepos(result)) => match result {
                     Ok(repos) => Action::UnslothReposLoaded(
@@ -1415,8 +1513,10 @@ async fn event_loop<P: Presentation>(
                     Ok(()) => Action::ModelKeyVerified { model_id, ok: true, reason: String::new() },
                     Err(reason) => Action::ModelKeyVerified { model_id, ok: false, reason },
                 },
-                Some(ReaderSignal::AcpConnected { display_id, provider_id, result }) => {
-                    connected_acp = Some((display_id, provider_id, result));
+                Some(ReaderSignal::AcpConnected { display_id, provider_id, request_id, result }) => {
+                    if provider_requests.is_current(&provider_id, request_id) {
+                        connected_acp = Some((display_id, provider_id, result));
+                    }
                     Action::NoOp
                 }
                 Some(ReaderSignal::WorkflowRunStarted { workflow_run_id }) => {
@@ -1459,10 +1559,28 @@ async fn event_loop<P: Presentation>(
                         Action::BlackboardItemUpdated(wire_blackboard_item_card(label, &item))
                     }
                 }
-                Some(ReaderSignal::CouncilProgress { name, message, active_subagents }) => {
-                    Action::CouncilProgress { name, message, active_subagents }
+                Some(ReaderSignal::CouncilProgress { name, result_id, phase, occurred_at, message, active_subagents }) => {
+                    Action::CouncilProgress {
+                        name,
+                        result_id,
+                        phase,
+                        occurred_at,
+                        message,
+                        active_subagents,
+                    }
                 }
                 Some(ReaderSignal::CouncilRunFinished { name, result }) => {
+                    let result = match result {
+                        Ok(summary) => Ok(summary),
+                        Err(failure) => match failure.handle {
+                            Some(handle) => match crate::council::result_by_id(paths, handle.result_id) {
+                                Ok(Some(stored)) => Ok(Box::new(council_stored_summary(stored))),
+                                Ok(None) => Err(format!("{} · durable result {} was not found", failure.message, handle.result_id)),
+                                Err(error) => Err(format!("{} · could not reload result {}: {error:#}", failure.message, handle.result_id)),
+                            },
+                            None => Err(failure.message),
+                        },
+                    };
                     Action::CouncilRunFinished { name, result }
                 }
                 // Voice v1 (rubric 8): the upload landed, so submit the turn
@@ -1813,16 +1931,31 @@ async fn event_loop<P: Presentation>(
             reduce(state, Action::Notice(voice.speech_unavailable_message()));
         }
         if let Some((display_id, provider_id, result)) = connected_acp.take() {
+            let model_id = ModelId(display_id.clone());
+            // A no-model-selector ACP query completes directly in the harness,
+            // without passing through the reducer's ordinary `AddModel` queue.
+            // Bind that accepted (generation-checked) terminal result to the
+            // active onboarding flow before success/failure is folded.
+            if let Some(flow) = &mut state.onboard_flow {
+                if flow.provider_id.as_deref() == Some(provider_id.as_str())
+                    && flow.awaiting_model.is_none()
+                {
+                    flow.awaiting_model = Some(model_id.clone());
+                }
+            }
+            let onboarding = state.onboard_flow.is_some();
             // A connect can land while an add-model overlay is still open —
             // either the "connecting…" step or the "fetching models…" step an
             // agent with no model selector short-circuits out of. The flow is
             // over either way, so close it rather than leaving the user parked
             // on a step that will never resolve.
-            if matches!(
-                state.overlay,
-                codypendent_tui::Overlay::AddModelQuerying { .. }
-                    | codypendent_tui::Overlay::AddModelPick { .. }
-            ) {
+            if !onboarding
+                && matches!(
+                    state.overlay,
+                    codypendent_tui::Overlay::AddModelQuerying { .. }
+                        | codypendent_tui::Overlay::AddModelPick { .. }
+                )
+            {
                 state.overlay = codypendent_tui::Overlay::None;
             }
             match result {
@@ -1832,6 +1965,8 @@ async fn event_loop<P: Presentation>(
                         Ok(()) => {
                             let mut warnings = Vec::new();
                             state.models = load_model_cards(paths, &mut warnings).await;
+                            refresh_runnable_models(state, Some(model_id));
+                            state.providers = load_provider_cards(paths, &mut warnings).await;
                             for warning in warnings {
                                 reduce(state, Action::Issue(warning));
                             }
@@ -1857,16 +1992,34 @@ async fn event_loop<P: Presentation>(
                                 )),
                             );
                         }
-                        Err(error) => reduce(
-                            state,
-                            Action::Notice(format!("could not save ACP profile: {error}")),
-                        ),
+                        Err(error) => {
+                            reduce(
+                                state,
+                                Action::OnboardModelAddFailed {
+                                    model_id: model_id.clone(),
+                                    reason: error.to_string(),
+                                },
+                            );
+                            reduce(
+                                state,
+                                Action::Notice(format!("could not save ACP profile: {error}")),
+                            );
+                        }
                     }
                 }
-                Err(error) => reduce(
-                    state,
-                    Action::Notice(format!("could not connect ACP agent: {error}")),
-                ),
+                Err(error) => {
+                    reduce(
+                        state,
+                        Action::OnboardModelAddFailed {
+                            model_id,
+                            reason: error.to_string(),
+                        },
+                    );
+                    reduce(
+                        state,
+                        Action::Notice(format!("could not connect ACP agent: {error}")),
+                    );
+                }
             }
         }
         // A steady shell has no frame-based animation, so most ticks need no
@@ -1902,6 +2055,27 @@ async fn event_loop<P: Presentation>(
         }
 
         for intent in state.drain_outbox() {
+            if let Intent::LoadCouncilResults { selector } = &intent {
+                let loaded = match selector {
+                    Some(selector) => crate::council::result_by_name_or_id(paths, &selector)
+                        .map(|result| result.into_iter().map(council_stored_summary).collect()),
+                    None => {
+                        let mut warnings = Vec::new();
+                        Ok(load_council_result_cards(paths, &mut warnings))
+                    }
+                };
+                reduce(
+                    state,
+                    match loaded {
+                        Ok(results) if !results.is_empty() => Action::CouncilResultsLoaded(results),
+                        Ok(_) => Action::CouncilResultsFailed(
+                            "no matching durable council result".to_owned(),
+                        ),
+                        Err(error) => Action::CouncilResultsFailed(format!("{error:#}")),
+                    },
+                );
+                continue;
+            }
             if let Intent::RemoteUiMessage(message) = intent {
                 if live
                     .out_tx
@@ -1934,6 +2108,7 @@ async fn event_loop<P: Presentation>(
                     let paths = paths.clone();
                     let repository = PathBuf::from(repository);
                     let provider_id = provider_id.clone();
+                    let request_id = provider_requests.begin(&provider_id);
                     let tx = live.query_tx.clone();
                     tokio::spawn(async move {
                         let result =
@@ -1944,6 +2119,7 @@ async fn event_loop<P: Presentation>(
                             .send(ReaderSignal::AcpConnected {
                                 display_id,
                                 provider_id,
+                                request_id,
                                 result,
                             })
                             .await;
@@ -1983,6 +2159,7 @@ async fn event_loop<P: Presentation>(
                 refresh,
             } = &intent
             {
+                let request_id = provider_requests.begin(provider_id);
                 // An ACP agent has no `/models` endpoint: its model list comes
                 // from the session-config handshake, so listing means spawning
                 // it. Same off-thread shape, same return signal — the pick
@@ -2001,10 +2178,12 @@ async fn event_loop<P: Presentation>(
                             Ok(probe) if probe.models.is_empty() => ReaderSignal::AcpConnected {
                                 display_id: acp_profile_id(&provider_id, None),
                                 provider_id,
+                                request_id,
                                 result: Ok(probe.coordinate(None)),
                             },
                             Ok(probe) => ReaderSignal::ProviderModels {
                                 provider_id,
+                                request_id,
                                 // An agent advertises ids only — there is no
                                 // catalog metadata for a model that lives
                                 // inside someone else's agent.
@@ -2015,6 +2194,7 @@ async fn event_loop<P: Presentation>(
                             },
                             Err(error) => ReaderSignal::ProviderModels {
                                 provider_id,
+                                request_id,
                                 result: Err(error.to_string()),
                             },
                         };
@@ -2027,24 +2207,46 @@ async fn event_loop<P: Presentation>(
                     Catalog::load_with_user_overrides(&paths.data_dir.join("providers.toml"))
                         .unwrap_or_else(|_| Catalog::builtin());
                 let curated = catalog_rows_for(&catalog, provider_id);
-                let (base_url, header, prefix, listable) = match catalog.get(provider_id) {
-                    Some(provider) => {
-                        let base = provider.base_url.clone().unwrap_or_default();
-                        let (header, prefix) = match provider.auth.first() {
-                            Some(AuthMethod::ApiKey { header, prefix, .. }) => {
-                                (header.clone(), prefix.clone())
-                            }
-                            _ => ("Authorization".to_string(), "Bearer ".to_string()),
-                        };
-                        (base, header, prefix, provider_can_list_models(provider))
-                    }
-                    None => (
-                        String::new(),
-                        "Authorization".to_string(),
-                        "Bearer ".to_string(),
-                        false,
-                    ),
-                };
+                let (base_url, header, prefix, env_names, extra_headers, listable) =
+                    match catalog.get(provider_id) {
+                        Some(provider) => {
+                            let base = provider.base_url.clone().unwrap_or_default();
+                            let (header, prefix, env_names) = provider
+                                .auth
+                                .iter()
+                                .find_map(|auth| match auth {
+                                    AuthMethod::ApiKey {
+                                        env,
+                                        header,
+                                        prefix,
+                                    } => Some((header.clone(), prefix.clone(), env.clone())),
+                                    _ => None,
+                                })
+                                .unwrap_or_else(|| {
+                                    (
+                                        "Authorization".to_string(),
+                                        "Bearer ".to_string(),
+                                        Vec::new(),
+                                    )
+                                });
+                            (
+                                base,
+                                header,
+                                prefix,
+                                env_names,
+                                provider.extra_headers.clone(),
+                                provider_can_list_models(provider),
+                            )
+                        }
+                        None => (
+                            String::new(),
+                            "Authorization".to_string(),
+                            "Bearer ".to_string(),
+                            Vec::new(),
+                            BTreeMap::new(),
+                            false,
+                        ),
+                    };
                 // Instant seed: the cached listing, catalog metadata merged in.
                 if !*refresh {
                     if let Some((cached, age)) = read_model_list_cache(&paths.data_dir, provider_id)
@@ -2082,33 +2284,44 @@ async fn event_loop<P: Presentation>(
                 let provider_id = provider_id.clone();
                 // No key in hand: fall back to the provider-wide key a previous
                 // add already stored, so the same key is never asked for twice.
-                let key = api_key.as_ref().map(|k| k.0.clone()).or_else(|| {
-                    stored_provider_key(&paths.data_dir, &provider_id).filter(|k| !k.is_empty())
-                });
+                let auth =
+                    codypendent_runtime::auth::AuthStore::load(&paths.data_dir).unwrap_or_default();
+                let key = api_key
+                    .as_ref()
+                    .map(|key| key.0.trim())
+                    .filter(|key| !key.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| resolve_provider_api_key(&provider_id, &auth, &env_names));
                 let tx = live.query_tx.clone();
                 let data_dir = paths.data_dir.clone();
                 tokio::spawn(async move {
-                    let result =
-                        match query_provider_models(&base_url, &header, &prefix, key.as_deref())
-                            .await
-                        {
-                            Ok(live_rows) => {
-                                write_model_list_cache(&data_dir, &provider_id, &live_rows);
-                                Ok((
-                                    merge_catalog_rows(live_rows, &curated),
-                                    ModelListOrigin::Live,
-                                ))
-                            }
-                            // A failed fetch still has the curated rows to
-                            // offer — the picker never becomes a dead end.
-                            Err(reason) if !curated.is_empty() => {
-                                Ok((curated, ModelListOrigin::Catalog(reason)))
-                            }
-                            Err(reason) => Err(reason),
-                        };
+                    let result = match query_provider_models(
+                        &base_url,
+                        &header,
+                        &prefix,
+                        &extra_headers,
+                        key.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(live_rows) => {
+                            write_model_list_cache(&data_dir, &provider_id, &live_rows);
+                            Ok((
+                                merge_catalog_rows(live_rows, &curated),
+                                ModelListOrigin::Live,
+                            ))
+                        }
+                        // A failed fetch still has the curated rows to
+                        // offer — the picker never becomes a dead end.
+                        Err(reason) if !curated.is_empty() => {
+                            Ok((curated, ModelListOrigin::Catalog(reason)))
+                        }
+                        Err(reason) => Err(reason),
+                    };
                     let _ = tx
                         .send(ReaderSignal::ProviderModels {
                             provider_id,
+                            request_id,
                             result,
                         })
                         .await;
@@ -2258,6 +2471,14 @@ async fn event_loop<P: Presentation>(
                 store.save(paths);
                 continue;
             }
+            // Onboarding preferences are local presentation state. Successful
+            // completion clears a prior skip, but needs no separate
+            // `onboarded` bit: the freshly-resolved runnable set is the source
+            // of truth on every launch.
+            if apply_onboard_preference(store, &intent) {
+                store.save(paths);
+                continue;
+            }
             // Council creation is local, private configuration just like the
             // model/key flows above. Keep it off the daemon wire and reuse the
             // CLI council module's exact validation + atomic 0600 persistence.
@@ -2359,9 +2580,9 @@ async fn event_loop<P: Presentation>(
                 tokio::spawn(async move {
                     let active_subagents =
                         std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                    let progress = move |event: crate::council::CouncilEvent| {
+                    let progress = move |progress: crate::council::CouncilProgress| {
                         use std::sync::atomic::Ordering;
-                        let active = match &event {
+                        let active = match &progress.event {
                             crate::council::CouncilEvent::RoundStarted { members, .. } => {
                                 active_subagents.store(*members, Ordering::Relaxed);
                                 *members
@@ -2383,21 +2604,52 @@ async fn event_loop<P: Presentation>(
                         };
                         let _ = progress_tx.try_send(ReaderSignal::CouncilProgress {
                             name: progress_name.clone(),
-                            message: council_progress_message(&event),
+                            result_id: progress.result_id.to_string(),
+                            phase: council_progress_phase(&progress.event),
+                            occurred_at: progress.occurred_at,
+                            message: council_progress_message(&progress.event),
                             active_subagents: active,
                         });
                     };
-                    let result = crate::council::run_with_progress(
-                        &paths, &name, objective, repository, false, progress,
+                    let result = crate::council::run_with_progress_linked(
+                        &paths,
+                        &name,
+                        objective,
+                        repository,
+                        Some(session_id),
+                        false,
+                        progress,
                     )
                     .await;
-                    let result = result
-                        .map(|run| Box::new(council_run_summary(run)))
-                        .map_err(|error| format!("{error:#}"));
+                    let result = match result {
+                        Ok(run) => match crate::council::result_by_id(&paths, run.handle.result_id)
+                        {
+                            Ok(Some(stored)) => Ok(Box::new(council_stored_summary(stored))),
+                            _ => Ok(Box::new(council_run_summary(run))),
+                        },
+                        Err(error) => {
+                            let handle = error
+                                .downcast_ref::<crate::council::CouncilRunFailure>()
+                                .map(|failure| failure.handle.clone());
+                            Err(CouncilTerminalFailure {
+                                message: format!("{error:#}"),
+                                handle,
+                            })
+                        }
+                    };
                     let _ = tx
                         .send(ReaderSignal::CouncilRunFinished { name, result })
                         .await;
                 });
+                continue;
+            }
+            if let Intent::CopyText { text } = &intent {
+                if let Err(error) = presentation.copy_text(text) {
+                    reduce(
+                        state,
+                        Action::Issue(format!("could not copy focused card: {error}")),
+                    );
+                }
                 continue;
             }
             // Create and attach to a genuinely fresh session without tearing
@@ -2543,6 +2795,28 @@ async fn event_loop<P: Presentation>(
                             }
                         }
                     }
+                    ProjectionKind::Journey => {
+                        let selected = state.focused_learning().map(|card| card.id.clone());
+                        match load_journey(pool, Path::new(repository)).await {
+                            Ok(cards) => {
+                                state.learnings = cards;
+                                state.selected_learning = selected
+                                    .as_deref()
+                                    .and_then(|id| {
+                                        state.learnings.iter().position(|card| card.id == id)
+                                    })
+                                    .unwrap_or(0);
+                                state.pending_learning_review = state
+                                    .learnings
+                                    .iter()
+                                    .filter(|card| card.state == "proposed")
+                                    .count()
+                                    as u32;
+                            }
+                            Err(error) => warnings
+                                .push(format!("could not refresh learning journey: {error}")),
+                        }
+                    }
                     ProjectionKind::Docs => {
                         let selected = state
                             .pending_document_selection
@@ -2599,6 +2873,61 @@ async fn event_loop<P: Presentation>(
                 }
                 for warning in warnings {
                     reduce(state, Action::Issue(warning));
+                }
+                continue;
+            }
+            if let Intent::MutateLearning {
+                id,
+                revision,
+                mutation,
+            } = &intent
+            {
+                let Some(pool) = docs_pool.as_ref() else {
+                    reduce(
+                        state,
+                        Action::Issue(
+                            "learning journey unavailable: knowledge database is closed".into(),
+                        ),
+                    );
+                    continue;
+                };
+                let result = mutate_learning(pool, id, *revision, mutation).await;
+                match result {
+                    Ok(message) => {
+                        let selected = state.focused_learning().map(|card| card.id.clone());
+                        match load_journey(pool, Path::new(repository)).await {
+                            Ok(cards) => {
+                                state.learnings = cards;
+                                state.selected_learning = selected
+                                    .as_deref()
+                                    .and_then(|id| {
+                                        state.learnings.iter().position(|card| card.id == id)
+                                    })
+                                    .unwrap_or_else(|| {
+                                        state
+                                            .selected_learning
+                                            .min(state.learnings.len().saturating_sub(1))
+                                    });
+                                state.pending_learning_review = state
+                                    .learnings
+                                    .iter()
+                                    .filter(|card| card.state == "proposed")
+                                    .count()
+                                    as u32;
+                                reduce(state, Action::Notice(message));
+                            }
+                            Err(error) => reduce(
+                                state,
+                                Action::Issue(format!(
+                                    "learning changed but refresh failed: {error}"
+                                )),
+                            ),
+                        }
+                    }
+                    Err(error) => reduce(
+                        state,
+                        Action::Issue(format!("learning change failed: {error}")),
+                    ),
                 }
                 continue;
             }
@@ -2847,6 +3176,38 @@ enum PendingActions {
     Many(Vec<Action>),
 }
 
+/// Structured terminal failure retained between the off-thread council runner
+/// and the reducer-facing summary. The current reducer still accepts a string;
+/// the durable handle is folded into that string until the richer council
+/// results browser adds its own Action/projection.
+struct CouncilTerminalFailure {
+    message: String,
+    handle: Option<crate::council::CouncilReportHandle>,
+}
+
+/// Monotonic correlation for all provider-owned background work. Kept in the
+/// I/O harness so neither ids nor credential-bearing requests leak into the
+/// pure presentation state. The latest generation is authoritative for model
+/// listing and ACP terminal completion alike.
+#[derive(Default)]
+struct ProviderRequestGenerations {
+    next: u64,
+    latest: HashMap<String, u64>,
+}
+
+impl ProviderRequestGenerations {
+    fn begin(&mut self, provider_id: &str) -> u64 {
+        self.next = self.next.saturating_add(1);
+        let request_id = self.next;
+        self.latest.insert(provider_id.to_owned(), request_id);
+        request_id
+    }
+
+    fn is_current(&self, provider_id: &str, request_id: u64) -> bool {
+        self.next == request_id && self.latest.get(provider_id).copied() == Some(request_id)
+    }
+}
+
 /// What the reader task forwards to the loop.
 enum ReaderSignal {
     /// A validated Remote UI frame for the reducer-owned host session.
@@ -2903,6 +3264,7 @@ enum ReaderSignal {
     /// nothing for this provider). Carries NO key.
     ProviderModels {
         provider_id: String,
+        request_id: u64,
         result: Result<(Vec<AddModelRow>, ModelListOrigin), String>,
     },
     /// The result of a one-shot `/keys` key verification (`Ctrl-T`): `Ok` when
@@ -2917,6 +3279,7 @@ enum ReaderSignal {
     AcpConnected {
         display_id: String,
         provider_id: String,
+        request_id: u64,
         /// Immutable `registry-id@version` persisted after a successful handshake.
         result: Result<String, String>,
     },
@@ -2938,6 +3301,9 @@ enum ReaderSignal {
     /// folds it into the active run's transcript as a Note.
     CouncilProgress {
         name: String,
+        result_id: String,
+        phase: CouncilProgressPhase,
+        occurred_at: String,
         message: String,
         active_subagents: usize,
     },
@@ -2948,7 +3314,7 @@ enum ReaderSignal {
     /// — the synthesis text can be large and every other signal here is tiny.
     CouncilRunFinished {
         name: String,
-        result: Result<Box<codypendent_tui::state::CouncilRunSummary>, String>,
+        result: Result<Box<codypendent_tui::state::CouncilRunSummary>, CouncilTerminalFailure>,
     },
     /// The Unsloth org's GGUF repo listing, fetched from the Hugging Face Hub
     /// (Local models catalog browse). Mapped by the loop's `select!` to
@@ -3584,6 +3950,9 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::RefreshProjection { .. } => unreachable!(
             "RefreshProjection is applied locally by the harness, never sent to the daemon"
         ),
+        Intent::MutateLearning { .. } => unreachable!(
+            "MutateLearning is applied locally by the harness, never sent to the daemon"
+        ),
         Intent::StartWorkflow {
             workflow_id,
             inputs,
@@ -3611,6 +3980,35 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             assignee: None,
             ordinal: None,
             payload: None,
+        },
+        Intent::CreateBoardCard { title } => CommandBody::PostBlackboardItem {
+            scope: BlackboardScope::RepositoryBoard {
+                repository: repository.to_owned(),
+            },
+            item: BlackboardItemDraft {
+                kind: "task".to_owned(),
+                payload: serde_json::json!({ "title": title, "description": "" }),
+                confidence: None,
+                evidence: Vec::new(),
+                status: Some("todo".to_owned()),
+                assignee: None,
+                ordinal: None,
+            },
+        },
+        Intent::PostBlackboardQuestion {
+            workflow_run_id,
+            text,
+        } => CommandBody::PostBlackboardItem {
+            scope: BlackboardScope::WorkflowRun { workflow_run_id },
+            item: BlackboardItemDraft {
+                kind: "open_question".to_owned(),
+                payload: serde_json::json!({ "question": text }),
+                confidence: None,
+                evidence: Vec::new(),
+                status: None,
+                assignee: None,
+                ordinal: None,
+            },
         },
         Intent::PauseWorkflow { workflow_run_id } => {
             CommandBody::PauseWorkflow { workflow_run_id }
@@ -3652,6 +4050,9 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::SetTheme { .. } => unreachable!(
             "SetTheme is a local display preference persisted by the harness, never sent to the daemon"
         ),
+        Intent::SetOnboardComplete | Intent::SetOnboardSkipped => unreachable!(
+            "onboarding preferences are persisted locally by the harness, never sent to the daemon"
+        ),
         Intent::CreateCouncil { .. } => unreachable!(
             "CreateCouncil is validated and persisted locally by the harness, never sent to the daemon"
         ),
@@ -3660,6 +4061,12 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         ),
         Intent::RunCouncil { .. } => unreachable!(
             "RunCouncil is driven off-thread by the harness over its own connection, never sent to the daemon"
+        ),
+        Intent::CopyText { .. } => unreachable!(
+            "CopyText is applied by the terminal presentation, never sent to the daemon"
+        ),
+        Intent::LoadCouncilResults { .. } => unreachable!(
+            "council result reads are applied locally by the TUI harness"
         ),
         Intent::NewConversation => unreachable!(
             "NewConversation is applied locally by the harness, never sent to the daemon"
@@ -3897,14 +4304,35 @@ fn normalize_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_string()
 }
 
-/// The provider-wide key a previous add stored in `auth.json`
-/// (`provider/<catalog-id>`), if any. Read so the add flow never asks for a key
-/// it already holds; a missing or corrupt store is simply "no key".
-fn stored_provider_key(data_dir: &Path, provider_id: &str) -> Option<String> {
-    codypendent_runtime::auth::AuthStore::load(data_dir)
-        .ok()?
+/// Resolve provider discovery credentials without leaking them into TUI state.
+/// Precedence mirrors the provider-wide portion of the live model runtime:
+/// `auth.json[provider/<id>]`, then the first configured non-blank environment
+/// value. Empty and whitespace-only values are absent, never valid headers.
+fn resolve_provider_api_key(
+    provider_id: &str,
+    auth: &codypendent_runtime::auth::AuthStore,
+    env_names: &[String],
+) -> Option<String> {
+    if let Some(key) = auth
         .get(&provider_auth_id(provider_id))
-        .map(str::to_owned)
+        .filter(|key| !key.trim().is_empty())
+    {
+        return Some(key.to_owned());
+    }
+    env_names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+    })
+}
+
+/// Non-secret provider-card projection of [`resolve_provider_api_key`].
+fn provider_has_resolvable_key(
+    provider_id: &str,
+    auth: &codypendent_runtime::auth::AuthStore,
+    env_names: &[String],
+) -> bool {
+    resolve_provider_api_key(provider_id, auth, env_names).is_some()
 }
 
 /// One-shot verification of a configured model's credentials (`/keys`,
@@ -4060,6 +4488,7 @@ async fn apply_add_model(
             // Re-seed the model picker so the new model shows immediately.
             let mut warnings = Vec::new();
             state.models = load_model_cards(paths, &mut warnings).await;
+            refresh_runnable_models(state, Some(ModelId(display_id.to_owned())));
             for warning in warnings {
                 reduce(state, Action::Issue(warning));
             }
@@ -4067,6 +4496,13 @@ async fn apply_add_model(
             reduce(state, Action::Notice(format!("added model {display_id}")));
         }
         Err(error) => {
+            reduce(
+                state,
+                Action::OnboardModelAddFailed {
+                    model_id: ModelId(display_id.to_owned()),
+                    reason: error.to_string(),
+                },
+            );
             reduce(
                 state,
                 Action::Notice(format!("could not add model: {error}")),
@@ -4192,6 +4628,7 @@ async fn apply_remove_model(state: &mut AppState, paths: &RuntimePaths, model_id
             }
             let mut warnings = Vec::new();
             state.models = load_model_cards(paths, &mut warnings).await;
+            refresh_runnable_models(state, None);
             for warning in warnings {
                 reduce(state, Action::Issue(warning));
             }
@@ -4715,6 +5152,7 @@ async fn query_provider_models(
     base_url: &str,
     header: &str,
     prefix: &str,
+    extra_headers: &BTreeMap<String, String>,
     api_key: Option<&str>,
 ) -> Result<Vec<AddModelRow>, String> {
     let url = models_url(base_url);
@@ -4723,6 +5161,13 @@ async fn query_provider_models(
         .build()
         .map_err(|_| "could not build the HTTP client".to_string())?;
     let mut request = client.get(&url);
+    for (name, value) in extra_headers {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| "the provider has an invalid extra-header name".to_string())?;
+        let value = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| "the provider has an invalid extra-header value".to_string())?;
+        request = request.header(name, value);
+    }
     if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
         // Mark the auth value sensitive so reqwest redacts it from any error /
         // debug (mirrors the GitHub client). The key never appears in a reason.
@@ -5552,7 +5997,18 @@ async fn load_model_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> V
     }
 
     let auth = codypendent_runtime::auth::AuthStore::load(&paths.data_dir).unwrap_or_default();
-    let registry = codypendent_runtime::models::ModelRegistry::new(configs.clone()).with_auth(auth);
+    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+        &paths.data_dir.join("providers.toml"),
+    )
+    .unwrap_or_else(|error| {
+        warnings.push(format!(
+            "model auth catalog fell back to built-ins ({error})"
+        ));
+        codypendent_providers::Catalog::builtin()
+    });
+    let registry = codypendent_runtime::models::ModelRegistry::new(configs.clone())
+        .with_auth(auth)
+        .with_catalog(catalog);
     let acp_store = codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir);
     let mut cards = Vec::with_capacity(configs.len());
     for config in configs {
@@ -5570,11 +6026,45 @@ async fn load_model_cards(paths: &RuntimePaths, warnings: &mut Vec<String>) -> V
                 Err(error) => ModelReadiness::Unavailable(error.to_string()),
             }
         } else {
-            ModelReadiness::Unverified
+            // Hosted models are not probed during boot, but their auth and
+            // protocol must resolve exactly as a real StartRun would. This
+            // makes `Unverified` mean runnable-but-not-network-verified;
+            // `Unavailable` is therefore an authoritative zero-runnable gate.
+            match registry.credentials_resolvable(&config.id).await {
+                Ok(true) => ModelReadiness::Unverified,
+                Ok(false) => ModelReadiness::Unavailable("API key is not configured".to_owned()),
+                Err(error) => ModelReadiness::Unavailable(error.to_string()),
+            }
         };
         cards.push(model_card(config, &profiles, readiness, local));
     }
     cards
+}
+
+/// The authoritative non-secret runnable projection emitted after boot and
+/// every model reload. `load_model_cards` has already resolved protocol,
+/// credentials, local availability, and ACP launchability in the harness, so
+/// the pure TUI only needs these ids and never re-implements I/O policy.
+fn runnable_model_ids(cards: &[ModelCard]) -> Vec<ModelId> {
+    cards
+        .iter()
+        .filter(|card| !matches!(card.readiness, ModelReadiness::Unavailable(_)))
+        .map(|card| card.id.clone())
+        .collect()
+}
+
+/// Fold the current authoritative harness projection into reducer state. The
+/// optional id correlates an add/ACP attempt; background/boot/removal refreshes
+/// update the set without completing any onboarding attempt.
+fn refresh_runnable_models(state: &mut AppState, onboard_attempt: Option<ModelId>) {
+    let model_ids = runnable_model_ids(&state.models);
+    reduce(
+        state,
+        Action::RunnableModelsRefreshed {
+            model_ids,
+            onboard_attempt,
+        },
+    );
 }
 
 fn local_model_endpoint(url: &str) -> bool {
@@ -5641,6 +6131,17 @@ fn council_progress_message(event: &crate::council::CouncilEvent) -> String {
     }
 }
 
+fn council_progress_phase(event: &crate::council::CouncilEvent) -> CouncilProgressPhase {
+    use crate::council::CouncilEvent;
+    match event {
+        CouncilEvent::RoundStarted { .. } => CouncilProgressPhase::RoundStarted,
+        CouncilEvent::MemberCompleted { .. } => CouncilProgressPhase::MemberCompleted,
+        CouncilEvent::MemberFailed { .. } => CouncilProgressPhase::MemberFailed,
+        CouncilEvent::ChairStarted { .. } => CouncilProgressPhase::ChairStarted,
+        CouncilEvent::Warning { .. } => CouncilProgressPhase::Warning,
+    }
+}
+
 /// Reduce a completed [`crate::council::CouncilRunOutcome`] to the plain,
 /// dependency-free summary the TUI crate can render (it cannot name
 /// `codypendent-cli`'s own `council` module types without a dependency cycle —
@@ -5656,11 +6157,116 @@ fn council_run_summary(
         .collect();
     participants.push(crate::council::participant_line(&run.outcome.chair));
     codypendent_tui::state::CouncilRunSummary {
+        result_id: run.handle.result_id.to_string(),
+        council: run.outcome.council,
+        status: "completed".to_owned(),
+        objective: run.outcome.objective,
+        started_at: run.handle.started_at,
+        finished_at: run.handle.finished_at,
+        repository: run.handle.repository,
+        origin_session_id: run.handle.origin_session_id.map(|id| id.to_string()),
+        evidence: false,
+        warnings: run.warnings,
+        rounds: Vec::new(),
+        failure: None,
         synthesis: run.outcome.chair.response,
         participants,
         cost_line: crate::council::cost_line(&run.costs),
-        report_markdown: run.report_markdown.display().to_string(),
+        report_markdown: format!(
+            "{} · result {}",
+            run.report_markdown.display(),
+            run.handle.result_id
+        ),
     }
+}
+
+fn council_stored_summary(stored: crate::council::StoredCouncilResult) -> CouncilRunSummary {
+    let report = stored.report;
+    let mut participants = report
+        .rounds
+        .iter()
+        .flat_map(|round| round.members.iter())
+        .map(crate::council::participant_line)
+        .collect::<Vec<_>>();
+    if let Some(chair) = &report.chair {
+        participants.push(crate::council::participant_line(chair));
+    }
+    let synthesis = report
+        .chair
+        .as_ref()
+        .map_or_else(String::new, |chair| chair.response.clone());
+    let rounds = report
+        .rounds
+        .into_iter()
+        .map(|round| CouncilRoundSummary {
+            round: round.round,
+            members: round
+                .members
+                .into_iter()
+                .map(|member| CouncilMemberSummary {
+                    model: member.model,
+                    role: member.role,
+                    session_id: member.session_id.to_string(),
+                    run_id: member.run_id.to_string(),
+                    response: member.response,
+                    tokens: member.tokens,
+                    cost_micros: member.cost_micros,
+                })
+                .collect(),
+            failures: round.failures,
+        })
+        .collect();
+    CouncilRunSummary {
+        result_id: stored.handle.result_id.to_string(),
+        council: report.council,
+        status: report.status,
+        objective: report.objective,
+        started_at: report.started_at,
+        finished_at: report.finished_at,
+        repository: report.repository,
+        origin_session_id: report.origin_session_id.map(|id| id.to_string()),
+        evidence: report.evidence,
+        warnings: report.warnings,
+        rounds,
+        failure: report.failure,
+        synthesis,
+        participants,
+        cost_line: crate::council::cost_line(&report.costs),
+        report_markdown: stored.handle.markdown_path.display().to_string(),
+    }
+}
+
+fn load_council_result_cards(
+    paths: &RuntimePaths,
+    warnings: &mut Vec<String>,
+) -> Vec<CouncilRunSummary> {
+    let root = paths.data_dir.join("councils");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            warnings.push(format!("council results unavailable: {error}"));
+            return Vec::new();
+        }
+    };
+    let mut cards = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        match crate::council::latest_result(paths, &name) {
+            Ok(Some(stored)) => cards.push(council_stored_summary(stored)),
+            Ok(None) => {}
+            Err(error) => {
+                warnings.push(format!("could not load council result `{name}`: {error:#}"))
+            }
+        }
+    }
+    cards.sort_by(|left, right| right.finished_at.cmp(&left.finished_at));
+    cards
 }
 
 /// Map one configured [`ModelConfig`](codypendent_runtime::models::ModelConfig)
@@ -5781,11 +6387,20 @@ async fn load_provider_cards(
                 .get(p.id.as_str())
                 .copied()
                 .unwrap_or_default(),
-            // A provider-wide key already in `auth.json` means the add flow
-            // can skip straight to the pick-list.
-            has_key: auth
-                .get(&provider_auth_id(&p.id))
-                .is_some_and(|key| !key.is_empty()),
+            // A provider-wide key in `auth.json` OR a documented provider env
+            // means the add flow can skip straight to the pick-list. Values
+            // stay in the harness; only this boolean reaches the pure TUI.
+            has_key: provider_has_resolvable_key(
+                &p.id,
+                &auth,
+                &p.auth
+                    .iter()
+                    .find_map(|method| match method {
+                        AuthMethod::ApiKey { env, .. } => Some(env.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+            ),
         })
         .collect();
     let acp_store = AcpRegistryStore::new(&paths.data_dir);
@@ -6103,6 +6718,158 @@ fn memory_card(record: &MemoryRecord) -> MemoryCard {
         observed: record.observed_at.date_naive().to_string(),
         confidence: record.confidence,
         source,
+    }
+}
+
+async fn load_journey(
+    pool: &sqlx::SqlitePool,
+    repository: &Path,
+) -> Result<Vec<LearningCard>, codypendent_knowledge::LearningError> {
+    let records = LearningStore::new()
+        .query(
+            pool,
+            &LearningQuery {
+                scopes: vec![
+                    LearningScope::User(UserId("local".to_owned())),
+                    LearningScope::Repository(codypendent_knowledge::stable_repository_id(
+                        repository,
+                    )),
+                ],
+                states: vec![LearningState::Proposed, LearningState::Active],
+                ..LearningQuery::default()
+            },
+        )
+        .await?;
+    Ok(records.iter().map(learning_card).collect())
+}
+
+fn learning_card(record: &LearningRecord) -> LearningCard {
+    let scope = match &record.scope {
+        LearningScope::User(_) => "user".to_owned(),
+        LearningScope::Repository(id) => format!(
+            "repository {}",
+            id.to_string().chars().take(8).collect::<String>()
+        ),
+        LearningScope::Provider(_) => "provider".to_owned(),
+        LearningScope::Council(_) => "council".to_owned(),
+    };
+    let mut provenance = record
+        .provenance
+        .iter()
+        .map(|source| match source {
+            LearningProvenance::UserStatement { .. } => "user-confirmed",
+            LearningProvenance::SuccessfulCommand { .. } => "locally verified",
+            LearningProvenance::RepositoryObservation { .. } => "repository observation",
+            LearningProvenance::AgentInference { .. } => "agent proposal",
+            LearningProvenance::ToolOutput { .. } => "untrusted tool proposal",
+            LearningProvenance::ExternalContent { .. } => "external proposal",
+            LearningProvenance::CouncilResult { .. } => "council proposal",
+        })
+        .collect::<Vec<_>>();
+    provenance.sort_unstable();
+    provenance.dedup();
+    LearningCard {
+        id: record.id.to_string(),
+        statement: record.content.summary().to_owned(),
+        kind: match record.content.kind() {
+            codypendent_knowledge::LearningKind::Fact => "fact".to_owned(),
+            codypendent_knowledge::LearningKind::Procedure => "procedure".to_owned(),
+        },
+        state: match record.state {
+            LearningState::Proposed => "proposed",
+            LearningState::Active => "active",
+            LearningState::Rejected => "rejected",
+        }
+        .to_owned(),
+        scope,
+        provenance: provenance.join(" + "),
+        confidence: record.confidence,
+        pinned: record.pinned,
+        revision: record.revision,
+    }
+}
+
+async fn mutate_learning(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    revision: u64,
+    mutation: &LearningMutation,
+) -> anyhow::Result<String> {
+    let id: LearningId = id.parse().context("invalid learning id")?;
+    let store = LearningStore::new();
+    match mutation {
+        LearningMutation::Activate => match store
+            .activate(
+                pool,
+                id,
+                revision,
+                Verification::UserConfirmed {
+                    user: UserId("local".to_owned()),
+                },
+            )
+            .await?
+        {
+            ActivationOutcome::Activated(_) => Ok("learning activated".to_owned()),
+            ActivationOutcome::Conflict { .. } => {
+                bail!("resolve the conflicting active learning first")
+            }
+        },
+        LearningMutation::Reject => {
+            store
+                .reject(pool, id, revision, "rejected in learning journey")
+                .await?;
+            Ok("learning rejected".to_owned())
+        }
+        LearningMutation::SetPinned(pinned) => {
+            store.set_pinned(pool, id, revision, *pinned).await?;
+            Ok(if *pinned {
+                "learning pinned"
+            } else {
+                "learning unpinned"
+            }
+            .to_owned())
+        }
+        LearningMutation::EditStatement(statement) => {
+            let record = store.get(pool, id).await?.context("learning disappeared")?;
+            let content = match record.content {
+                LearningContent::Fact {
+                    structured_value, ..
+                } => LearningContent::Fact {
+                    statement: statement.clone(),
+                    structured_value,
+                },
+                LearningContent::Procedure(mut procedure) => {
+                    procedure.summary = statement.clone();
+                    LearningContent::Procedure(procedure)
+                }
+            };
+            match store
+                .edit(
+                    pool,
+                    id,
+                    revision,
+                    LearningPatch {
+                        content: Some(content),
+                        ..LearningPatch::default()
+                    },
+                )
+                .await?
+            {
+                LearningMutationOutcome::Updated(_) => Ok("learning updated".to_owned()),
+                LearningMutationOutcome::Duplicate { .. } => bail!("that learning already exists"),
+                LearningMutationOutcome::Conflict { .. } => {
+                    Ok("learning updated and returned to review".to_owned())
+                }
+            }
+        }
+        LearningMutation::Delete => {
+            let deleted = store.delete(pool, id).await?;
+            if deleted.id.is_some() {
+                Ok("learning permanently deleted".to_owned())
+            } else {
+                bail!("learning was already deleted")
+            }
+        }
     }
 }
 
@@ -6847,6 +7614,15 @@ struct SessionStore {
     /// to detection, so a removed pack cannot wedge the TUI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     theme: Option<String>,
+    /// The operator explicitly chose to enter Chat without a runnable model.
+    /// This is the only onboarding preference: successful completion is
+    /// derived from the authoritative runnable-model projection at each boot.
+    #[serde(default, skip_serializing_if = "is_false")]
+    onboard_skipped: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One remembered session: its id and the workspace it belongs to.
@@ -6876,6 +7652,23 @@ impl SessionStore {
     }
 }
 
+/// Apply one reducer-owned onboarding preference intent. Returning whether it
+/// was handled keeps persistence testable without constructing the socket event
+/// loop and makes completion/skip share one authoritative mutation site.
+fn apply_onboard_preference(store: &mut SessionStore, intent: &Intent) -> bool {
+    match intent {
+        Intent::SetOnboardComplete => {
+            store.onboard_skipped = false;
+            true
+        }
+        Intent::SetOnboardSkipped => {
+            store.onboard_skipped = true;
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6883,6 +7676,8 @@ mod tests {
         AgentMode, ApprovalDecision, ApprovalId, ApprovalScope, ModelId, RunId,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn ui_plugin_pending_commands_cover_only_lifecycle_mutations() {
@@ -7478,12 +8273,98 @@ mod tests {
             workspace_id: WorkspaceId::new(),
         };
         store.sessions.insert("/repo/one".into(), stored);
+        store.onboard_skipped = true;
         store.save(&paths);
 
         let loaded = SessionStore::load(&paths);
         let got = loaded.sessions.get("/repo/one").expect("entry persisted");
         assert_eq!(got.session_id, stored.session_id);
         assert_eq!(got.workspace_id, stored.workspace_id);
+        assert!(loaded.onboard_skipped);
+    }
+
+    #[test]
+    fn onboarding_preferences_have_one_authoritative_skip_semantics() {
+        let mut store = SessionStore::default();
+        assert!(apply_onboard_preference(
+            &mut store,
+            &Intent::SetOnboardSkipped
+        ));
+        assert!(store.onboard_skipped);
+
+        assert!(apply_onboard_preference(
+            &mut store,
+            &Intent::SetOnboardComplete
+        ));
+        assert!(
+            !store.onboard_skipped,
+            "a verified completion clears a prior skip"
+        );
+        assert!(!apply_onboard_preference(
+            &mut store,
+            &Intent::SetTheme {
+                id: "dark".to_owned()
+            }
+        ));
+    }
+
+    #[test]
+    fn post_boot_gate_is_shared_and_uses_runnable_projection_not_model_count() {
+        use codypendent_tui::state::OnboardStep;
+
+        let mut state = AppState::new();
+        state.models.push(ModelCard {
+            id: ModelId("configured/but-unrunnable".to_owned()),
+            provider: "openai-compatible".to_owned(),
+            readiness: ModelReadiness::Unavailable("missing API key".to_owned()),
+            location: Some(ModelLocationLabel::Hosted),
+            cost_per_1k_usd: None,
+            context_tokens: None,
+        });
+        let store = SessionStore::default();
+
+        assert_eq!(splash_ready_stage("repo", 0), "set up a model to continue");
+        assert!(apply_post_boot_onboard_gate(&mut state, &store));
+        assert!(matches!(
+            state.overlay,
+            codypendent_tui::Overlay::Onboard {
+                step: OnboardStep::Triage { .. }
+            }
+        ));
+
+        let mut skipped_state = AppState::new();
+        let skipped_store = SessionStore {
+            onboard_skipped: true,
+            ..SessionStore::default()
+        };
+        assert!(!apply_post_boot_onboard_gate(
+            &mut skipped_state,
+            &skipped_store
+        ));
+        assert_eq!(skipped_state.overlay, codypendent_tui::Overlay::None);
+
+        let mut ready_state = AppState::new();
+        ready_state
+            .runnable_models
+            .push(ModelId("ready/model".to_owned()));
+        assert_eq!(splash_ready_stage("repo", 1), "repo is ready");
+        assert!(!apply_post_boot_onboard_gate(&mut ready_state, &store));
+    }
+
+    #[test]
+    fn provider_request_generation_rejects_stale_model_and_acp_terminals() {
+        let mut requests = ProviderRequestGenerations::default();
+        let stale_acp = requests.begin("claude-acp");
+        let latest_acp = requests.begin("claude-acp");
+        assert!(!requests.is_current("claude-acp", stale_acp));
+        assert!(requests.is_current("claude-acp", latest_acp));
+
+        let moved_to_codex = requests.begin("codex-acp");
+        assert!(requests.is_current("codex-acp", moved_to_codex));
+        assert!(
+            !requests.is_current("claude-acp", latest_acp),
+            "moving to another provider invalidates a late ACP completion"
+        );
     }
 
     #[test]
@@ -9001,6 +9882,87 @@ model = "qwen2.5-coder:14b"
         );
     }
 
+    #[tokio::test]
+    async fn onboarding_completes_only_after_added_profile_reloads_as_runnable() {
+        use codypendent_tui::state::{OnboardFlow, OnboardProviderClass, OnboardStep};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        let id = ModelId("groq/onboard-model".to_owned());
+        let mut state = AppState::new();
+        state.onboard_flow = Some(OnboardFlow {
+            class: OnboardProviderClass::Hosted,
+            provider_id: Some("groq".to_owned()),
+            awaiting_model: Some(id.clone()),
+        });
+        state.overlay = codypendent_tui::Overlay::Onboard {
+            step: OnboardStep::Validating {
+                model_id: id.clone(),
+            },
+        };
+
+        apply_add_model(
+            &mut state,
+            &paths,
+            &id.0,
+            "groq",
+            "llama-3.3-70b-versatile",
+            Some("sk-secret"),
+            None,
+        )
+        .await;
+
+        assert!(state.runnable_models.contains(&id));
+        assert_eq!(state.pending_model, Some(id));
+        assert!(state.onboard_flow.is_none());
+        assert_eq!(state.overlay, codypendent_tui::Overlay::None);
+        assert!(state
+            .drain_outbox()
+            .iter()
+            .any(|intent| matches!(intent, Intent::SetOnboardComplete)));
+    }
+
+    #[tokio::test]
+    async fn failed_onboarding_add_stays_inside_onboarding() {
+        use codypendent_tui::state::{OnboardFlow, OnboardProviderClass, OnboardStep};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::write(paths.data_dir.join("auth.json"), b"not-json")
+            .expect("corrupt auth fixture");
+        let id = ModelId("groq/onboard-model".to_owned());
+        let mut state = AppState::new();
+        state.onboard_flow = Some(OnboardFlow {
+            class: OnboardProviderClass::Hosted,
+            provider_id: Some("groq".to_owned()),
+            awaiting_model: Some(id.clone()),
+        });
+        state.overlay = codypendent_tui::Overlay::Onboard {
+            step: OnboardStep::Validating {
+                model_id: id.clone(),
+            },
+        };
+
+        apply_add_model(
+            &mut state,
+            &paths,
+            &id.0,
+            "groq",
+            "llama-3.3-70b-versatile",
+            Some("sk-secret"),
+            None,
+        )
+        .await;
+
+        assert!(!matches!(state.overlay, codypendent_tui::Overlay::None));
+        assert!(state.pending_model.is_none());
+        assert!(!paths.data_dir.join("models.toml").exists());
+        assert!(!state
+            .drain_outbox()
+            .iter()
+            .any(|intent| matches!(intent, Intent::SetOnboardComplete)));
+    }
+
     #[test]
     fn boot_warnings_survive_the_watch_channel_and_notice_post_boot() {
         // What `warn_stage` does: the stage channel keeps only the LATEST
@@ -9106,6 +10068,136 @@ model = "qwen2.5-coder:14b"
     fn provider_requires_key_is_false_for_an_empty_auth_list() {
         let p = provider_with_auth(vec![]);
         assert!(!provider_requires_key(&p));
+    }
+
+    #[test]
+    fn provider_key_resolution_prefers_auth_then_non_blank_environment() {
+        use codypendent_runtime::auth::AuthStore;
+
+        const ENV: &str = "CODYPENDENT_TEST_PROVIDER_CARD_KEY_43ca";
+        std::env::set_var(ENV, "from-environment");
+        let env_names = vec![ENV.to_owned()];
+
+        let empty = AuthStore::default();
+        assert_eq!(
+            resolve_provider_api_key("test", &empty, &env_names).as_deref(),
+            Some("from-environment")
+        );
+        assert!(provider_has_resolvable_key("test", &empty, &env_names));
+
+        let mut stored = AuthStore::default();
+        stored.set(provider_auth_id("test"), "from-auth-json");
+        assert_eq!(
+            resolve_provider_api_key("test", &stored, &env_names).as_deref(),
+            Some("from-auth-json")
+        );
+
+        let mut blank = AuthStore::default();
+        blank.set(provider_auth_id("test"), "   ");
+        assert_eq!(
+            resolve_provider_api_key("test", &blank, &env_names).as_deref(),
+            Some("from-environment"),
+            "a blank stored value must not shadow a usable environment key"
+        );
+        std::env::remove_var(ENV);
+    }
+
+    /// One-request server for asserting discovery headers without involving a
+    /// real provider or ever printing a credential.
+    async fn capture_model_list_request() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 8192];
+            let n = stream.read(&mut request).await.unwrap();
+            let body = r#"{"data":[{"id":"listed-model"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request[..n]).into_owned()
+        });
+        (format!("http://{address}/v1"), task)
+    }
+
+    #[tokio::test]
+    async fn provider_model_query_sends_catalog_auth_and_extra_headers() {
+        let (base_url, server) = capture_model_list_request().await;
+        let extra_headers =
+            BTreeMap::from([("x-provider-version".to_owned(), "2026-08-12".to_owned())]);
+        let rows = query_provider_models(
+            &base_url,
+            "api-key",
+            "",
+            &extra_headers,
+            Some("discovery-secret"),
+        )
+        .await
+        .expect("model list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "listed-model");
+
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("api-key: discovery-secret"));
+        assert!(request.contains("x-provider-version: 2026-08-12"));
+        assert!(!request.contains("authorization:"));
+    }
+
+    #[tokio::test]
+    async fn hosted_model_projection_is_unavailable_until_catalog_env_resolves() {
+        const ENV: &str = "CODYPENDENT_TEST_RUNNABLE_MODEL_KEY_846f";
+        std::env::remove_var(ENV);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::write(
+            paths.data_dir.join("providers.toml"),
+            format!(
+                r#"
+[[provider]]
+id = "runnable-test"
+name = "Runnable test"
+protocol = "openai-chat"
+base_url = "https://example.invalid/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["{ENV}"]
+header = "Authorization"
+prefix = "Bearer "
+"#
+            ),
+        )
+        .expect("provider config");
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            r#"
+[[model]]
+id = "runnable-test/model"
+provider = "openai-compatible"
+provider_id = "runnable-test"
+base_url = "https://example.invalid/v1"
+model = "model"
+api_key_env = ""
+"#,
+        )
+        .expect("model config");
+
+        let mut warnings = Vec::new();
+        let cards = load_model_cards(&paths, &mut warnings).await;
+        assert_eq!(cards.len(), 1);
+        assert!(matches!(cards[0].readiness, ModelReadiness::Unavailable(_)));
+        assert!(runnable_model_ids(&cards).is_empty());
+
+        std::env::set_var(ENV, "resolved-secret");
+        let cards = load_model_cards(&paths, &mut warnings).await;
+        assert_eq!(cards[0].readiness, ModelReadiness::Unverified);
+        assert_eq!(
+            runnable_model_ids(&cards),
+            vec![ModelId("runnable-test/model".to_owned())]
+        );
+        std::env::remove_var(ENV);
     }
 
     // -- provider_can_list_models (model-discovery gate) ----------------------

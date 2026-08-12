@@ -63,6 +63,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use codypendent_council::FileCouncilService;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -1174,7 +1176,8 @@ impl AgentLoopNodeExecutor {
             .with_task_board(Arc::new(AssemblyTaskBoardChannel::new(
                 self.pool.clone(),
                 self.blackboards.clone(),
-            )));
+            )))
+            .with_councils(Arc::new(FileCouncilService::new(self.paths.clone())));
         // The agent operates ENTIRELY within `worktree`: the policy read/search
         // root (`$REPOSITORY`) and the write root (`$WORKTREE`) are BOTH the
         // worktree, so a write and its read-back hit the same tree (read-your-

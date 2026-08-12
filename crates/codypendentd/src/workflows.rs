@@ -35,7 +35,9 @@
 //! `AgentLoopNodeExecutor` — lives in [`crate::workflow_exec`] and drives an agent
 //! node through the agent loop.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -54,10 +56,18 @@ use codypendent_protocol::{
 use codypendent_runtime::blackboard::{
     BlackboardChannelError, WorkflowQueryChannel, WorkflowRunSummary,
 };
+use codypendent_runtime::workflow_control::{
+    WorkflowAgentDraft, WorkflowApprovalDraft, WorkflowControlChannel, WorkflowControlError,
+    WorkflowCreateRequest, WorkflowCreated, WorkflowDraft, WorkflowInputDraft,
+    WorkflowOrchestrationReasonDraft, WorkflowRetryDraft, WorkflowRunRequest, WorkflowRunTarget,
+    WorkflowStarted, WorkflowStepDraft, WorkflowWorkspaceDraft,
+};
 use codypendent_workflow::{
-    compile_yaml, BudgetWarning, ConductorError, NodeExecutor, NodeObserver, NodeState,
-    NodeTransition, WorkflowConductor, WorkflowNodeRecord, WorkflowRunState,
-    WorkflowSourceRegistry, WorkflowStore, WorkflowStoreError,
+    compile_yaml, AgentRef, ApprovalPolicy, BudgetWarning, ConductorError, NodeExecutor,
+    NodeObserver, NodeState, NodeTransition, OrchestrationReason, RetryPolicy, WorkflowBudget,
+    WorkflowConductor, WorkflowDefinition, WorkflowInput, WorkflowNodeRecord, WorkflowRunState,
+    WorkflowSourceRegistry, WorkflowStep, WorkflowStore, WorkflowStoreError, WorkspaceMode,
+    WorkspaceSpec,
 };
 use sqlx::SqlitePool;
 use tracing::{info, warn};
@@ -526,6 +536,208 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
             Ok(run_id)
         })
     }
+}
+
+#[async_trait::async_trait]
+impl<E: NodeExecutor + 'static> WorkflowControlChannel for WorkflowConductorHost<E> {
+    async fn create(
+        &self,
+        request: WorkflowCreateRequest,
+    ) -> Result<WorkflowCreated, WorkflowControlError> {
+        let definition = workflow_definition(request.workflow)?;
+        let manifest = validated_manifest(&definition)?;
+        let directory = self.user_workflow_dir.clone().ok_or_else(|| {
+            WorkflowControlError::Backend(
+                "the user workflow directory is not configured on this daemon".to_string(),
+            )
+        })?;
+        let workflow_id = definition.id.clone();
+        let version = definition.version;
+        let handle = persist_user_workflow(&directory, &workflow_id, manifest.as_bytes())?;
+        Ok(WorkflowCreated {
+            workflow_id,
+            version,
+            handle: handle.display().to_string(),
+        })
+    }
+
+    async fn run(
+        &self,
+        request: WorkflowRunRequest,
+    ) -> Result<WorkflowStarted, WorkflowControlError> {
+        let WorkflowRunRequest {
+            target,
+            inputs,
+            repository,
+            session_id: _,
+            idempotency_key,
+        } = request;
+        let (workflow_id, manifest, named_id) = match target {
+            WorkflowRunTarget::Named(id) => (id.clone(), String::new(), Some(id)),
+            WorkflowRunTarget::Inline(draft) => {
+                let definition = workflow_definition(draft)?;
+                let id = definition.id.clone();
+                (id, validated_manifest(&definition)?, None)
+            }
+        };
+        let workflow_run_id = WorkflowStarter::start(
+            self,
+            StartWorkflowRequest {
+                manifest,
+                workflow_id: named_id,
+                inputs,
+                idempotency_key,
+                repository: Some(repository),
+                client_id: codypendent_protocol::ClientId::new(),
+            },
+        )
+        .await
+        .map_err(|error| {
+            WorkflowControlError::Backend(format!("{}: {}", error.code, error.message))
+        })?;
+        Ok(WorkflowStarted {
+            workflow_id,
+            workflow_run_id,
+        })
+    }
+}
+
+fn validated_manifest(definition: &WorkflowDefinition) -> Result<String, WorkflowControlError> {
+    let manifest = serde_yaml::to_string(definition).map_err(|error| {
+        WorkflowControlError::Invalid(format!("could not encode workflow manifest: {error}"))
+    })?;
+    compile_yaml(&manifest).map_err(|error| {
+        WorkflowControlError::Invalid(format!("workflow manifest does not compile: {error}"))
+    })?;
+    Ok(manifest)
+}
+
+fn workflow_definition(draft: WorkflowDraft) -> Result<WorkflowDefinition, WorkflowControlError> {
+    let inputs = draft
+        .inputs
+        .into_iter()
+        .map(|(name, input)| (name, workflow_input(input)))
+        .collect::<BTreeMap<_, _>>();
+    let steps = draft
+        .steps
+        .into_iter()
+        .map(workflow_step)
+        .collect::<Vec<_>>();
+    Ok(WorkflowDefinition {
+        schema_version: 1,
+        id: draft.id,
+        version: draft.version,
+        description: draft.description,
+        inputs,
+        budget: WorkflowBudget {
+            maximum_cost_usd: draft.budget.maximum_cost_usd,
+            maximum_duration_seconds: draft.budget.maximum_duration_seconds,
+            maximum_agents: draft.budget.maximum_agents,
+        },
+        steps,
+        orchestration_reason: draft.orchestration_reason.map(|reason| match reason {
+            WorkflowOrchestrationReasonDraft::Parallelism => OrchestrationReason::Parallelism,
+            WorkflowOrchestrationReasonDraft::IndependentReview => {
+                OrchestrationReason::IndependentReview
+            }
+            WorkflowOrchestrationReasonDraft::AccessSeparation => {
+                OrchestrationReason::AccessSeparation
+            }
+            WorkflowOrchestrationReasonDraft::Specialist => OrchestrationReason::Specialist,
+        }),
+    })
+}
+
+fn workflow_input(input: WorkflowInputDraft) -> WorkflowInput {
+    WorkflowInput {
+        input_type: input.input_type,
+        required: input.required,
+    }
+}
+
+fn workflow_step(step: WorkflowStepDraft) -> WorkflowStep {
+    WorkflowStep {
+        id: step.id,
+        depends_on: step.depends_on,
+        agent: step.agent.map(workflow_agent),
+        tool: step.tool,
+        with: step.with,
+        skill: step.skill,
+        workspace: step.workspace.map(|mode| WorkspaceSpec {
+            mode: match mode {
+                WorkflowWorkspaceDraft::SharedWorktree => WorkspaceMode::SharedWorktree,
+                WorkflowWorkspaceDraft::IsolatedWorktree => WorkspaceMode::IsolatedWorktree,
+            },
+        }),
+        approval: step.approval.map(|approval| match approval {
+            WorkflowApprovalDraft::BeforeWrite => ApprovalPolicy::BeforeWrite,
+            WorkflowApprovalDraft::Always => ApprovalPolicy::Always,
+        }),
+        retry: step.retry.map(workflow_retry),
+        outputs: step.outputs,
+    }
+}
+
+fn workflow_agent(agent: WorkflowAgentDraft) -> AgentRef {
+    AgentRef {
+        role: agent.role,
+        model_policy: agent.model_policy,
+    }
+}
+
+fn workflow_retry(retry: WorkflowRetryDraft) -> RetryPolicy {
+    RetryPolicy {
+        attempts: retry.attempts,
+        backoff_seconds: retry.backoff_seconds,
+    }
+}
+
+fn persist_user_workflow(
+    directory: &Path,
+    workflow_id: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, WorkflowControlError> {
+    std::fs::create_dir_all(directory).map_err(|error| {
+        WorkflowControlError::Backend(format!(
+            "could not create workflow directory `{}`: {error}",
+            directory.display()
+        ))
+    })?;
+    let target = directory.join(format!("{workflow_id}.yaml"));
+    if target.exists() {
+        return Err(WorkflowControlError::Conflict(format!(
+            "workflow `{workflow_id}` already exists at `{}`",
+            target.display()
+        )));
+    }
+    let temporary = directory.join(format!(
+        ".{workflow_id}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &target)?;
+        if let Ok(directory_file) = std::fs::File::open(directory) {
+            let _ = directory_file.sync_all();
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(WorkflowControlError::Backend(format!(
+            "could not atomically save workflow `{workflow_id}`: {error}"
+        )));
+    }
+    Ok(target)
 }
 
 impl<E: NodeExecutor + 'static> WorkflowLifecycle for WorkflowConductorHost<E> {

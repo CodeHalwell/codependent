@@ -5,6 +5,7 @@ members = [
     "crates/daemon",
     "crates/codypendentd",
     "crates/cli",
+    "crates/council",
     "crates/tui",
     "crates/runtime",
     "crates/knowledge",
@@ -25,7 +26,7 @@ members = [
 exclude = ["benches/crdt-bench"]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 # 1.88 is the effective MSRV: the `agent-client-protocol` dep (ACP client) is
 # edition-2024 / requires Rust 1.88. The pinned toolchain (rust-toolchain.toml)
@@ -40,6 +41,7 @@ codypendent-protocol = { path = "crates/protocol" }
 codypendent-daemon = { path = "crates/daemon" }
 codypendent-codypendentd = { path = "crates/codypendentd" }
 codypendent-tui = { path = "crates/tui" }
+codypendent-council = { path = "crates/council" }
 codypendent-runtime = { path = "crates/runtime" }
 codypendent-knowledge = { path = "crates/knowledge" }
 codypendent-integrations = { path = "crates/integrations" }

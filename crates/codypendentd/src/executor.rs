@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use codypendent_council::FileCouncilService;
 use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
 use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader, BlackboardWriter};
@@ -814,10 +815,12 @@ impl RuntimeExecutor {
         // set below.
         runtime = runtime
             .with_workflow_query(Arc::new(AssemblyWorkflowQuery::new(self.pool.clone())))
+            .with_workflow_control(Arc::new(self.workflow_host.clone()))
             .with_task_board(Arc::new(AssemblyTaskBoardChannel::new(
                 self.pool.clone(),
                 self.blackboards.clone(),
-            )));
+            )))
+            .with_councils(Arc::new(FileCouncilService::new(self.paths.clone())));
 
         // Bind the run's worktree (STEP 1.8, the Phase-1 follow-up): a writing
         // mode (`Build`) gets a DEDICATED, isolated worktree carved from the
@@ -1596,6 +1599,59 @@ impl RuntimeExecutor {
             .await;
     }
 
+    /// Fold a successful run into the governed learning ledger. This is
+    /// intentionally separate from `harvest_memories`: the legacy harvest is a
+    /// broad compatibility path, while learning capture accepts only explicit
+    /// user preferences/corrections and locally successful allow-listed checks.
+    /// Failure is observational and never changes a terminal run disposition.
+    async fn harvest_learnings(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        repository: RepositoryId,
+    ) {
+        let events = match ledger::load_events(&self.pool, session_id).await {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(%session_id, %run_id, %error, "could not load events for learning capture");
+                return;
+            }
+        };
+        let report = match crate::learning_capture::capture_completed_run(
+            &self.pool, &events, session_id, run_id, repository,
+        )
+        .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                warn!(%session_id, %run_id, %error, "curated learning capture failed");
+                return;
+            }
+        };
+        if report.is_empty() {
+            return;
+        }
+
+        let body = EventBody::LearningsCaptured {
+            run_id,
+            proposed_count: report.proposed_ids.len() as u32,
+            proposed_ids: report.proposed_ids,
+            activated_count: report.activated_ids.len() as u32,
+            activated_ids: report.activated_ids,
+        };
+        match ledger::append_next_event(&self.pool, session_id, &Actor::System, &body, Utc::now())
+            .await
+        {
+            Ok(event) => self.subscriptions.publish(session_id, event),
+            Err(error) => {
+                // Records are already durable. A missing projection can be
+                // reconstructed from the learning store and must not roll them
+                // back or fail the completed run.
+                warn!(%session_id, %run_id, %error, "could not project captured learnings");
+            }
+        }
+    }
+
     /// M3b: the extractor this run's harvest is injected with, per the D2
     /// selection order: (1) a configured `memory_extraction_model` (from
     /// `routing.toml`), when set AND resolvable in the model registry;
@@ -2275,6 +2331,9 @@ impl RunExecutor for RuntimeExecutor {
             // these appends never race it either.
             executor
                 .harvest_memories(session_id, run_id, repository, mode)
+                .await;
+            executor
+                .harvest_learnings(session_id, run_id, repository)
                 .await;
         });
     }

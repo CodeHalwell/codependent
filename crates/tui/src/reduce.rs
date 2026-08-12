@@ -9,27 +9,31 @@
 
 use chrono::Utc;
 use codypendent_protocol::{
-    Actor, ApprovalDecision, ApprovalScope, BudgetDimension, DocumentId, DocumentMutation,
-    EventBody, ProposedAction, Risk, RiskLevel, RunDisposition, RunState, SessionEvent,
-    ToolOutcome, UiActionBinding, UiDocumentId, UiEvent, UiEventId, UiEventModifiers, UiEventType,
-    UiNodeId, UiProtocolVersion, UiResyncRequest, UiRevision, UiWireMessage,
+    Actor, AgentMode, ApprovalDecision, ApprovalScope, BudgetDimension, DocumentId,
+    DocumentMutation, EventBody, ModelId, ProposedAction, Risk, RiskLevel, RunDisposition,
+    RunState, SessionEvent, ToolOutcome, UiActionBinding, UiDocumentId, UiEvent, UiEventId,
+    UiEventModifiers, UiEventType, UiNodeId, UiProtocolVersion, UiResyncRequest, UiRevision,
+    UiWireMessage,
 };
 use codypendent_ui_host::UiSessionUpdate;
 use serde_json::{Map, Value};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, WorkflowNodeUpdate};
+use crate::action::{
+    Action, Intent, KeyTarget, LearningMutation, ProjectionKind, SecretKey, WorkflowNodeUpdate,
+};
 use crate::remote_ui::{RemoteKey, RemoteUiRenderOutput};
 use crate::remote_ui_host::{empty_message, terminal_viewport_message};
 use crate::state::{
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
-    filter_providers, filter_themes, filter_unsloth_quants, filter_unsloth_repos, key_row_target,
-    AddModelRow, AppState, CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft,
-    DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView, KeyStatus, ModelListOrigin,
-    ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, PendingRunStart, RunActivity,
-    RunStartDraftTarget, RunView, ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard,
-    UnslothRepoCard, EDGE_PAGE_SIZE,
+    filter_onboard_providers, filter_providers, filter_themes, filter_unsloth_quants,
+    filter_unsloth_repos, key_row_target, AddModelRow, AppState, CouncilBuilderState,
+    CouncilBuilderStep, CouncilMemberDraft, DocBlockView, DocEdit, DocFocus, DocLeaseState,
+    DocSuggestionView, KeyStatus, ModelListOrigin, ModelReadiness, OnboardFlow,
+    OnboardProviderClass, OnboardStep, Overlay, Pane, PatchSummary, PendingApproval,
+    PendingRunStart, RunActivity, RunStartDraftTarget, RunView, ToolCard, ToolStatus,
+    TranscriptEntry, UnslothQuantCard, UnslothRepoCard, EDGE_PAGE_SIZE,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -129,6 +133,14 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         // ~5 seconds at the 5 fps tick.
         Action::Notice(text) => state.notice = Some((text, state.tick + 25)),
+        Action::OpenOnboard => open_onboard(state),
+        Action::RunnableModelsRefreshed {
+            model_ids,
+            onboard_attempt,
+        } => on_runnable_models_refreshed(state, model_ids, onboard_attempt),
+        Action::OnboardModelAddFailed { model_id, reason } => {
+            on_onboard_model_add_failed(state, model_id, reason);
+        }
         Action::RunStartRejected { reason } => {
             if let Some(pending) = state.pending_run_start.take() {
                 match pending.target {
@@ -290,11 +302,45 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::CouncilProgress {
             name,
+            result_id,
+            phase,
+            occurred_at,
             message,
             active_subagents,
         } => {
             state.council_subagents = active_subagents;
-            let text = format!("council `{name}`: {message}");
+            if !state
+                .council_results
+                .iter()
+                .any(|result| result.result_id == result_id)
+            {
+                state.council_results.insert(
+                    0,
+                    crate::state::CouncilRunSummary {
+                        result_id: result_id.clone(),
+                        council: name.clone(),
+                        status: "running".to_owned(),
+                        objective: String::new(),
+                        started_at: occurred_at.clone(),
+                        finished_at: String::new(),
+                        repository: String::new(),
+                        origin_session_id: None,
+                        evidence: false,
+                        warnings: Vec::new(),
+                        rounds: Vec::new(),
+                        failure: None,
+                        synthesis: String::new(),
+                        participants: Vec::new(),
+                        cost_line: "measured cost pending".to_owned(),
+                        report_markdown: "report persists when the run terminates".to_owned(),
+                    },
+                );
+                state.selected_council_result = 0;
+            }
+            let text = format!(
+                "council `{name}` · {} · result {result_id} · {occurred_at}: {message}",
+                phase.label()
+            );
             if let Some(run) = state.selected_run_mut() {
                 AppState::push_entry(
                     run,
@@ -312,8 +358,23 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.council_subagents = 0;
             match result {
                 Ok(summary) => {
+                    if let Some(index) = state
+                        .council_results
+                        .iter()
+                        .position(|stored| stored.result_id == summary.result_id)
+                    {
+                        state.council_results[index] = (*summary).clone();
+                        state.selected_council_result = index;
+                    } else {
+                        state.council_results.insert(0, (*summary).clone());
+                        state.selected_council_result = 0;
+                    }
+                    state.council_result_scroll = 0;
+                    state.council_result_expanded = false;
                     let mut text = format!(
-                        "Council `{name}` — chair synthesis\n\n{}",
+                        "Council `{name}` — {} · result {}\n\n{}",
+                        summary.status.to_uppercase(),
+                        summary.result_id,
                         summary.synthesis.trim()
                     );
                     if !summary.participants.is_empty() {
@@ -336,7 +397,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
                             Utc::now(),
                         );
                     }
-                    state.notice = Some((format!("council `{name}` finished"), state.tick + 60));
+                    state.overlay = Overlay::CouncilResults;
+                    state.notice = Some((
+                        format!("council `{name}` {} · durable result ready", summary.status),
+                        state.tick + 60,
+                    ));
                 }
                 Err(error) => {
                     if let Some(run) = state.selected_run_mut() {
@@ -354,13 +419,41 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 }
             }
         }
+        Action::CouncilResultsLoaded(results) => {
+            state.council_results = results;
+            clamp(
+                &mut state.selected_council_result,
+                state.council_results.len(),
+            );
+            state.council_result_scroll = 0;
+            state.council_result_expanded = false;
+            state.overlay = Overlay::CouncilResults;
+        }
+        Action::CouncilResultsFailed(error) => {
+            state.notice = Some((
+                format!("could not load council result: {error}"),
+                state.tick + 80,
+            ));
+        }
         Action::OpenCouncils => {
             state.overlay = match state.overlay {
                 Overlay::CouncilBrowser => Overlay::None,
                 _ => Overlay::CouncilBrowser,
             };
         }
-        Action::DeleteCouncil => begin_delete_council(state),
+        Action::DeleteCouncil => {
+            if matches!(state.overlay, Overlay::Journey) {
+                if let Some(card) = state.focused_learning() {
+                    state.overlay = Overlay::ConfirmLearningDelete {
+                        id: card.id.clone(),
+                        revision: card.revision,
+                        label: card.statement.clone(),
+                    };
+                }
+            } else {
+                begin_delete_council(state)
+            }
+        }
         Action::RemoteUiActivate {
             document_id,
             revision,
@@ -438,6 +531,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::Expand => expand_selected(state),
         Action::BrowseFoldPrev => browse_fold(state, -1),
         Action::BrowseFoldNext => browse_fold(state, 1),
+        Action::CopyFocusedCard => copy_focused_card(state),
+        Action::RetryFailedRun => retry_failed_run(state),
+        Action::ReauthenticateFailedModel => reauthenticate_failed_model(state),
+        Action::ChooseFailureModel => open_failure_model_picker(state),
+        Action::DisableFailureModel => disable_failed_model(state),
         Action::RemoveSelected => begin_remove_selected(state),
         Action::VerifyApiKey => begin_verify_key(state),
         Action::RefreshProviderModels => refresh_provider_models(state),
@@ -447,6 +545,12 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::NewRun => {
             if matches!(state.overlay, Overlay::Workflow) {
                 start_focused_workflow(state);
+            } else if matches!(state.overlay, Overlay::Kanban) {
+                state.overlay = Overlay::KanbanNew {
+                    buffer: String::new(),
+                };
+            } else if matches!(state.overlay, Overlay::Blackboard) {
+                begin_blackboard_post(state);
             } else if matches!(state.overlay, Overlay::CouncilBrowser) {
                 state.overlay = Overlay::CouncilBuilder(CouncilBuilderState::default());
                 state.notice = None;
@@ -461,6 +565,14 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::Pause => {
             if matches!(state.overlay, Overlay::Workflow) {
                 pause_or_resume_workflow(state);
+            } else if matches!(state.overlay, Overlay::Journey) {
+                if let Some(card) = state.focused_learning() {
+                    state.outbox.push(Intent::MutateLearning {
+                        id: card.id.clone(),
+                        revision: card.revision,
+                        mutation: LearningMutation::SetPinned(!card.pinned),
+                    });
+                }
             } else {
                 pause_or_resume(state);
             }
@@ -468,6 +580,17 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::Cancel => {
             if matches!(state.overlay, Overlay::Workflow) {
                 request_workflow_cancel(state);
+            } else if matches!(state.overlay, Overlay::CouncilResults) {
+                if let Some((text, result_id)) = state
+                    .focused_council_result()
+                    .map(|result| (result.synthesis.clone(), result.result_id.clone()))
+                {
+                    state.outbox.push(Intent::CopyText { text });
+                    state.notice = Some((
+                        format!("copied chair synthesis · result {result_id}"),
+                        state.tick + 30,
+                    ));
+                }
             } else {
                 request_cancel(state);
             }
@@ -486,7 +609,15 @@ pub fn reduce(state: &mut AppState, action: Action) {
         // gates on the Approver/Controller role); otherwise they resolve a pending
         // approval, exactly as before.
         Action::Approve(scope) => {
-            if !state.pending_approvals.is_empty() {
+            if matches!(state.overlay, Overlay::Journey) {
+                if let Some(card) = state.focused_learning() {
+                    state.outbox.push(Intent::MutateLearning {
+                        id: card.id.clone(),
+                        revision: card.revision,
+                        mutation: LearningMutation::Activate,
+                    });
+                }
+            } else if !state.pending_approvals.is_empty() {
                 resolve_focused(state, ApprovalDecision::Approve, scope);
             } else if matches!(state.overlay, Overlay::UiPlugins) {
                 begin_approve_ui_plugin(state);
@@ -497,7 +628,15 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::Reject => {
-            if !state.pending_approvals.is_empty() {
+            if matches!(state.overlay, Overlay::Journey) {
+                if let Some(card) = state.focused_learning() {
+                    state.outbox.push(Intent::MutateLearning {
+                        id: card.id.clone(),
+                        revision: card.revision,
+                        mutation: LearningMutation::Reject,
+                    });
+                }
+            } else if !state.pending_approvals.is_empty() {
                 resolve_focused(state, ApprovalDecision::Reject, ApprovalScope::Once);
             } else if matches!(state.overlay, Overlay::Workflow) {
                 retry_focused_workflow_node(state);
@@ -565,6 +704,16 @@ pub fn reduce(state: &mut AppState, action: Action) {
             };
             if matches!(state.overlay, Overlay::Memory { .. }) {
                 request_projection(state, ProjectionKind::Memory);
+            }
+        }
+        Action::OpenJourney => {
+            state.overlay = if matches!(state.overlay, Overlay::Journey) {
+                Overlay::None
+            } else {
+                Overlay::Journey
+            };
+            if matches!(state.overlay, Overlay::Journey) {
+                request_projection(state, ProjectionKind::Journey);
             }
         }
         Action::OpenSource => open_source(state),
@@ -673,6 +822,9 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 | Overlay::ConfirmUiPluginEnable { .. }
                 | Overlay::ConfirmUiPluginRevoke { .. } => Overlay::UiPlugins,
                 Overlay::ConfirmCouncilDelete { .. } => Overlay::CouncilBrowser,
+                Overlay::ConfirmLearningDelete { .. } | Overlay::LearningEdit { .. } => {
+                    Overlay::Journey
+                }
                 Overlay::ConfirmModelRemove {
                     query, selected, ..
                 } => Overlay::ModelPicker { query, selected },
@@ -688,7 +840,19 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
 
         // --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
-        Action::EditDoc => begin_doc_edit(state),
+        Action::EditDoc => {
+            if matches!(state.overlay, Overlay::Journey) {
+                if let Some(card) = state.focused_learning() {
+                    state.overlay = Overlay::LearningEdit {
+                        id: card.id.clone(),
+                        revision: card.revision,
+                        buffer: card.statement.clone(),
+                    };
+                }
+            } else {
+                begin_doc_edit(state)
+            }
+        }
         Action::NewDoc => begin_doc_new(state),
         Action::InsertDocBlock => begin_doc_insert(state),
         Action::DeleteDocBlock => begin_doc_delete(state),
@@ -1746,6 +1910,21 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 run.activity = RunActivity::Idle;
             }
         }
+        // Capture is intentionally emitted after RunCompleted. Keep it quiet
+        // (no transcript card), but always preserve the review count and
+        // refresh an already-open Journey even though the run is terminal.
+        EventBody::LearningsCaptured {
+            proposed_count,
+            activated_count,
+            ..
+        } => {
+            state.pending_learning_review =
+                state.pending_learning_review.saturating_add(proposed_count);
+            if matches!(state.overlay, Overlay::Journey) {
+                request_projection(state, ProjectionKind::Journey);
+            }
+            let _ = activated_count;
+        }
 
         // Presence: another client joined or left this session (STEP 3.7). A
         // transient status notice, not a transcript entry — presence is
@@ -1911,6 +2090,10 @@ fn tool_matches_action(tool: &str, action: &ProposedAction) -> bool {
             server, tool: name, ..
         } => tool == format!("mcp.{server}.{name}"),
         ProposedAction::PublishDocument { .. } => tool == "document.publish",
+        ProposedAction::CouncilCreate { .. } => tool == "council.create",
+        ProposedAction::CouncilRun { .. } => tool == "council.run",
+        ProposedAction::WorkflowCreate { .. } => tool == "workflow.create",
+        ProposedAction::WorkflowRun { .. } => tool == "workflow.run",
         _ => false,
     }
 }
@@ -1955,6 +2138,10 @@ fn nav(state: &mut AppState, delta: i32) {
             step(&mut state.selected_memory, state.memories.len(), delta);
             // Moving to a different memory collapses any revealed source.
             state.overlay = Overlay::Memory { source_open: false };
+            return;
+        }
+        Overlay::Journey => {
+            step(&mut state.selected_learning, state.learnings.len(), delta);
             return;
         }
         Overlay::Docs => {
@@ -2006,6 +2193,36 @@ fn nav(state: &mut AppState, delta: i32) {
         }
         Overlay::CouncilBrowser => {
             step(&mut state.selected_council, state.councils.len(), delta);
+            return;
+        }
+        Overlay::CouncilResults => {
+            step(
+                &mut state.selected_council_result,
+                state.council_results.len(),
+                delta,
+            );
+            state.council_result_scroll = 0;
+            return;
+        }
+        Overlay::Onboard {
+            step: ref mut onboard,
+        } => {
+            match onboard {
+                OnboardStep::Triage { selected } | OnboardStep::SkipConfirm { selected } => {
+                    step(selected, 3, delta);
+                }
+                OnboardStep::Validating { .. } => {}
+            }
+            return;
+        }
+        Overlay::OnboardProviderPicker {
+            class,
+            ref query,
+            ref mut selected,
+        } => {
+            let indices = filter_onboard_providers(&state.providers, class, query);
+            step(selected, indices.len(), delta);
+            state.selected_provider = indices.get(*selected).copied().unwrap_or(0);
             return;
         }
         Overlay::Palette {
@@ -2171,6 +2388,21 @@ fn nav(state: &mut AppState, delta: i32) {
 fn nav_to_edge(state: &mut AppState, last: bool) {
     let edge = |len: usize| if last { len.saturating_sub(1) } else { 0 };
     match &mut state.overlay {
+        Overlay::Onboard { step } => match step {
+            OnboardStep::Triage { selected } | OnboardStep::SkipConfirm { selected } => {
+                *selected = edge(3);
+            }
+            OnboardStep::Validating { .. } => {}
+        },
+        Overlay::OnboardProviderPicker {
+            class,
+            query,
+            selected,
+        } => {
+            let indices = filter_onboard_providers(&state.providers, *class, query);
+            *selected = edge(indices.len());
+            state.selected_provider = indices.get(*selected).copied().unwrap_or(0);
+        }
         Overlay::Palette { query, selected } => {
             *selected = edge(crate::palette::filtered_len(query));
         }
@@ -2257,6 +2489,14 @@ const PAGE: u16 = 10;
 const WHEEL_LINES: u16 = 3;
 
 fn scroll_page(state: &mut AppState, up: bool) {
+    if matches!(state.overlay, Overlay::CouncilResults) {
+        state.council_result_scroll = if up {
+            state.council_result_scroll.saturating_sub(PAGE)
+        } else {
+            state.council_result_scroll.saturating_add(PAGE)
+        };
+        return;
+    }
     // A workspace side pane owns page navigation just as it owns ↑/↓. Those
     // panes are selection-backed rather than pixel-scroll-backed; jumping the
     // selection makes the renderer bring the landing row into view. Chat mode
@@ -2374,6 +2614,19 @@ fn end_browse(state: &mut AppState) {
 }
 
 fn expand_selected(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::CouncilResults) {
+        state.council_result_expanded = !state.council_result_expanded;
+        state.council_result_scroll = 0;
+        return;
+    }
+    if matches!(state.overlay, Overlay::CouncilBrowser) {
+        if let Some(name) = state.focused_council().map(|council| council.name.clone()) {
+            state.outbox.push(Intent::LoadCouncilResults {
+                selector: Some(name),
+            });
+        }
+        return;
+    }
     // In the memory browser, `Enter` opens the focused memory's source.
     if matches!(state.overlay, Overlay::Memory { .. }) {
         open_source(state);
@@ -2407,6 +2660,203 @@ fn expand_selected(state: &mut AppState) {
     }
 }
 
+fn focused_transcript_entry(state: &AppState) -> Option<(&RunView, &TranscriptEntry)> {
+    let run = state.selected_run()?;
+    run.transcript
+        .get(run.transcript_selected)
+        .map(|entry| (run, entry))
+}
+
+/// Exact safe text for clipboard export. This deliberately does not include
+/// argument values or raw failure chains: cards expose digests and sanitized
+/// provider causes, matching the visual/cooked projections.
+fn focused_card_copy_text(state: &AppState) -> Option<String> {
+    let (run, entry) = focused_transcript_entry(state)?;
+    match entry {
+        TranscriptEntry::Tool(card) => {
+            let mut fields = vec![format!("tool: {}", card.tool)];
+            if let Some(label) = &card.label {
+                fields.push(format!("target: {label}"));
+            }
+            if let Some(digest) = &card.args_digest {
+                fields.push(format!("args digest: {digest}"));
+            }
+            if let Some(ToolOutcome::Failed { message }) = &card.outcome {
+                fields.push(format!(
+                    "failure: {}",
+                    crate::state::sanitize_failure_text(message)
+                ));
+            }
+            Some(fields.join("\n"))
+        }
+        TranscriptEntry::Patch(patch) => {
+            Some(format!("{}\n\n{}", patch.files.join("\n"), patch.preview))
+        }
+        TranscriptEntry::Note { text, .. } => Some(text.clone()),
+        TranscriptEntry::Backstage { raw, .. } => Some(raw.join("\n")),
+        TranscriptEntry::Completed {
+            disposition: RunDisposition::Failed { reason },
+            ..
+        } => crate::state::acp_failure_summary(run.model.as_ref(), reason).map_or_else(
+            || Some(crate::state::sanitize_failure_text(reason)),
+            |failure| {
+                Some(format!(
+                    "ACP failure\nprovider: {}\nmodel: {}\nphase: {}\ncause: {}",
+                    failure.provider, failure.model, failure.phase, failure.cause
+                ))
+            },
+        ),
+        _ => None,
+    }
+}
+
+fn copy_focused_card(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::CouncilResults) {
+        let Some((text, result_id)) = state
+            .focused_council_result()
+            .map(|result| (result.synthesis.clone(), result.result_id.clone()))
+        else {
+            state.notice = Some(("no council result selected".to_owned(), state.tick + 25));
+            return;
+        };
+        state.outbox.push(Intent::CopyText { text });
+        state.notice = Some((
+            format!("copied chair synthesis · result {result_id}"),
+            state.tick + 25,
+        ));
+        return;
+    }
+    if !state.transcript_browse || !matches!(state.overlay, Overlay::None) {
+        state.notice = Some((
+            "browse a card with Alt-↑/↓ before copying".to_owned(),
+            state.tick + 25,
+        ));
+        return;
+    }
+    let Some(text) = focused_card_copy_text(state) else {
+        state.notice = Some((
+            "this transcript row has no card text to copy".to_owned(),
+            state.tick + 25,
+        ));
+        return;
+    };
+    state.outbox.push(Intent::CopyText { text });
+    state.notice = Some(("copied focused card".to_owned(), state.tick + 25));
+}
+
+fn failed_run_context(state: &AppState) -> Option<(String, AgentMode, Option<ModelId>, usize)> {
+    let run = state.selected_run()?;
+    let entry = run.transcript.get(run.transcript_selected)?;
+    matches!(
+        entry,
+        TranscriptEntry::Completed {
+            disposition: RunDisposition::Failed { .. },
+            ..
+        }
+    )
+    .then(|| {
+        (
+            run.objective.clone(),
+            run.mode,
+            run.model.clone(),
+            state.selected_run,
+        )
+    })
+}
+
+fn retry_failed_run(state: &mut AppState) {
+    let Some((objective, mode, model, _)) = failed_run_context(state) else {
+        return;
+    };
+    if objective.trim().is_empty() || state.pending_run_start.is_some() {
+        state.notice = Some((
+            "cannot retry while another run is starting".to_owned(),
+            state.tick + 25,
+        ));
+        return;
+    }
+    state.pending_model = model.clone().or_else(|| state.pending_model.clone());
+    state.outbox.push(Intent::StartRun {
+        objective: objective.clone(),
+        mode,
+        model,
+    });
+    state.pending_run_start = Some(PendingRunStart {
+        draft: objective,
+        target: RunStartDraftTarget::NewRunPrompt,
+    });
+    state.notice = Some((
+        "retrying failed run with the same model".to_owned(),
+        state.tick + 40,
+    ));
+    end_browse(state);
+}
+
+fn failed_model_id(state: &AppState) -> Option<String> {
+    let (_, _, model, _) = failed_run_context(state)?;
+    model.map(|model| model.0)
+}
+
+fn reauthenticate_failed_model(state: &mut AppState) {
+    let Some(model_id) = failed_model_id(state) else {
+        return;
+    };
+    if model_id.starts_with("acp/") {
+        let supplier = model_id
+            .strip_prefix("acp/")
+            .and_then(|coordinate| coordinate.split('#').next())
+            .unwrap_or("ACP agent");
+        state.notice = Some((
+            format!("sign in with `{supplier}` in a terminal, then use Alt-R retry"),
+            state.tick + 60,
+        ));
+    } else {
+        state.overlay = Overlay::ApiKeySet {
+            target: KeyTarget::Model(model_id),
+            buffer: SecretKey(String::new()),
+        };
+        end_browse(state);
+    }
+}
+
+fn open_failure_model_picker(state: &mut AppState) {
+    if failed_run_context(state).is_some() {
+        state.overlay = Overlay::ModelPicker {
+            query: String::new(),
+            selected: 0,
+        };
+        state.selected_model = 0;
+        end_browse(state);
+    }
+}
+
+fn disable_failed_model(state: &mut AppState) {
+    let Some(model_id) = failed_model_id(state) else {
+        return;
+    };
+    let Some(index) = state.models.iter().position(|card| card.id.0 == model_id) else {
+        state.notice = Some((
+            "this failed model is not a user-configured profile".to_owned(),
+            state.tick + 30,
+        ));
+        return;
+    };
+    if state
+        .pending_model
+        .as_ref()
+        .is_some_and(|pending| pending.0 == model_id)
+    {
+        state.pending_model = None;
+    }
+    state.selected_model = index;
+    state.overlay = Overlay::ModelPicker {
+        query: model_id,
+        selected: 0,
+    };
+    begin_remove_selected(state);
+    end_browse(state);
+}
+
 /// Reveal the focused memory's source in the memory browser. A no-op unless the
 /// memory browser is open with at least one memory to open. The TUI does no I/O,
 /// so "open" flips the overlay's `source_open` flag; the renderer then surfaces
@@ -2436,13 +2886,43 @@ fn pause_or_resume(state: &mut AppState) {
 
 fn start_focused_workflow(state: &mut AppState) {
     let Some(workflow_id) = state.focused_node().map(|card| card.workflow_id.clone()) else {
-        state.notice = Some(("no workflow selected".to_owned(), state.tick + 20));
+        state.overlay = Overlay::None;
+        state.composer = "Create an executable workflow manifest at .codypendent/workflows/example.yaml with inspect, implement, and verify nodes. Then show me how to run it.".to_owned();
+        state.composer_cursor = state.composer.len();
+        state.notice = Some((
+            "example workflow request drafted — review it, then press Enter".to_owned(),
+            state.tick + 40,
+        ));
         return;
     };
     state.overlay = Overlay::WorkflowInputs {
         workflow_id,
         buffer: String::new(),
     };
+}
+
+fn begin_blackboard_post(state: &mut AppState) {
+    let workflow_run_id = state
+        .focused_item()
+        .map(|item| item.workflow_run_id.clone())
+        .or_else(|| {
+            state
+                .workflow
+                .iter()
+                .find_map(|node| node.workflow_run_id.clone())
+        });
+    if let Some(workflow_run_id) = workflow_run_id {
+        state.overlay = Overlay::BlackboardPost {
+            workflow_run_id,
+            buffer: String::new(),
+        };
+    } else {
+        state.overlay = Overlay::Workflow;
+        state.notice = Some((
+            "start a persisted workflow first; its evidence stream will open here".to_owned(),
+            state.tick + 40,
+        ));
+    }
 }
 
 fn pause_or_resume_workflow(state: &mut AppState) {
@@ -2588,6 +3068,18 @@ fn confirm_top(state: &mut AppState) {
                 state.overlay = Overlay::CouncilBrowser;
             }
         }
+        Overlay::ConfirmLearningDelete { .. } => {
+            if let Overlay::ConfirmLearningDelete { id, revision, .. } =
+                std::mem::take(&mut state.overlay)
+            {
+                state.outbox.push(Intent::MutateLearning {
+                    id,
+                    revision,
+                    mutation: LearningMutation::Delete,
+                });
+                state.overlay = Overlay::Journey;
+            }
+        }
         Overlay::ConfirmModelRemove { .. } => {
             if let Overlay::ConfirmModelRemove {
                 model_id,
@@ -2596,7 +3088,16 @@ fn confirm_top(state: &mut AppState) {
                 ..
             } = std::mem::take(&mut state.overlay)
             {
-                state.outbox.push(Intent::RemoveModel { model_id });
+                // Re-check after the prompt: another client can stage this
+                // model or start a run while the confirmation is visible.
+                if let Some(reason) = state.model_removal_blocker(&model_id) {
+                    state.notice = Some((
+                        format!("cannot remove {model_id}: {reason}"),
+                        state.tick + 40,
+                    ));
+                } else {
+                    state.outbox.push(Intent::RemoveModel { model_id });
+                }
                 state.overlay = Overlay::ModelPicker { query, selected };
             }
         }
@@ -3202,11 +3703,15 @@ fn edit_prompt(state: &mut AppState, edit: &Edit) {
     match &mut state.overlay {
         Overlay::NewRun(buf) | Overlay::Steering(buf) => append(buf, edit),
         Overlay::WorkflowInputs { buffer, .. } => append(buffer, edit),
+        Overlay::KanbanNew { buffer } | Overlay::BlackboardPost { buffer, .. } => {
+            append(buffer, edit)
+        }
         Overlay::CouncilRunObjective { buffer, .. } => append(buffer, edit),
         Overlay::EdgeSearch(buffer) => append(buffer, edit),
         Overlay::DocNew { buffer } => append(buffer, edit),
         Overlay::DocInsert { buffer, .. } => append(buffer, edit),
         Overlay::DocEdit { buffer, .. } => append(buffer, edit),
+        Overlay::LearningEdit { buffer, .. } => append(buffer, edit),
         Overlay::DocPublishPath { buffer, .. } => append(buffer, edit),
         Overlay::AddModelId { buffer, .. } => append(buffer, edit),
         // The key buffer is a redacting newtype; edit its inner String.
@@ -3253,6 +3758,12 @@ fn edit_prompt(state: &mut AppState, edit: &Edit) {
         // picker's query changes the filtered set, so the selection returns
         // to the top.
         Overlay::ProviderPicker { query, selected } => {
+            append(query, edit);
+            *selected = 0;
+        }
+        Overlay::OnboardProviderPicker {
+            query, selected, ..
+        } => {
             append(query, edit);
             *selected = 0;
         }
@@ -3338,9 +3849,18 @@ fn begin_remove_selected(state: &mut AppState) {
         let Some(card) = state.models.get(idx) else {
             return;
         };
+        let model_id = card.id.0.clone();
+        let provider = card.provider.clone();
+        if let Some(reason) = state.model_removal_blocker(&model_id) {
+            state.notice = Some((
+                format!("cannot remove {model_id}: {reason}"),
+                state.tick + 40,
+            ));
+            return;
+        }
         state.overlay = Overlay::ConfirmModelRemove {
-            model_id: card.id.0.clone(),
-            provider: card.provider.clone(),
+            model_id,
+            provider,
             query,
             selected,
         };
@@ -3418,6 +3938,148 @@ fn history_next(state: &mut AppState) {
     state.composer_cursor = state.composer.len();
 }
 
+fn open_onboard(state: &mut AppState) {
+    state.onboard_flow = None;
+    state.overlay = Overlay::Onboard {
+        step: OnboardStep::Triage { selected: 0 },
+    };
+}
+
+fn open_onboard_provider_picker(
+    state: &mut AppState,
+    class: OnboardProviderClass,
+    preferred_provider: Option<&str>,
+) {
+    let indices = filter_onboard_providers(&state.providers, class, "");
+    if indices.is_empty() {
+        let class_label = match class {
+            OnboardProviderClass::Hosted => "hosted",
+            OnboardProviderClass::LocalEndpoint => "local endpoint",
+            OnboardProviderClass::AcpAgent => "ACP agent",
+        };
+        state.onboard_flow = None;
+        state.notice = Some((
+            format!("no available {class_label} providers were discovered"),
+            state.tick + 50,
+        ));
+        state.overlay = Overlay::Onboard {
+            step: OnboardStep::Triage {
+                selected: match class {
+                    OnboardProviderClass::Hosted => 0,
+                    OnboardProviderClass::LocalEndpoint => 1,
+                    OnboardProviderClass::AcpAgent => 2,
+                },
+            },
+        };
+        return;
+    }
+    let selected = preferred_provider
+        .and_then(|id| {
+            indices
+                .iter()
+                .position(|idx| state.providers.get(*idx).is_some_and(|card| card.id == id))
+        })
+        .unwrap_or(0);
+    state.selected_provider = indices[selected];
+    state.onboard_flow = Some(OnboardFlow::new(class));
+    state.overlay = Overlay::OnboardProviderPicker {
+        class,
+        query: String::new(),
+        selected,
+    };
+}
+
+fn restore_onboard_provider_picker(state: &mut AppState) {
+    let Some(flow) = state.onboard_flow.clone() else {
+        open_onboard(state);
+        return;
+    };
+    open_onboard_provider_picker(state, flow.class, flow.provider_id.as_deref());
+}
+
+fn on_runnable_models_refreshed(
+    state: &mut AppState,
+    model_ids: Vec<codypendent_protocol::ModelId>,
+    onboard_attempt: Option<codypendent_protocol::ModelId>,
+) {
+    state.runnable_models = model_ids;
+    let Some(attempted) = onboard_attempt else {
+        return;
+    };
+    let matches_attempt = state
+        .onboard_flow
+        .as_ref()
+        .and_then(|flow| flow.awaiting_model.as_ref())
+        == Some(&attempted);
+    if !matches_attempt {
+        return;
+    }
+    if state.runnable_models.iter().any(|id| id == &attempted) {
+        state.pending_model = Some(attempted.clone());
+        state.onboard_flow = None;
+        state.overlay = Overlay::None;
+        state.outbox.push(Intent::SetOnboardComplete);
+        state.notice = Some((
+            format!("connected {attempted} — ready for your first message"),
+            state.tick + 50,
+        ));
+    } else {
+        state.notice = Some((
+            format!("{attempted} was saved but is not runnable yet"),
+            state.tick + 60,
+        ));
+        restore_onboard_provider_picker(state);
+    }
+}
+
+fn on_onboard_model_add_failed(
+    state: &mut AppState,
+    model_id: codypendent_protocol::ModelId,
+    reason: String,
+) {
+    let matches_attempt = state
+        .onboard_flow
+        .as_ref()
+        .and_then(|flow| flow.awaiting_model.as_ref())
+        == Some(&model_id);
+    if !matches_attempt {
+        return;
+    }
+    state.notice = Some((
+        format!("could not connect {model_id}: {reason}"),
+        state.tick + 80,
+    ));
+    restore_onboard_provider_picker(state);
+}
+
+fn queue_add_model(
+    state: &mut AppState,
+    display_id: String,
+    provider_id: String,
+    model: String,
+    api_key: Option<SecretKey>,
+    context_tokens: Option<u64>,
+) {
+    let model_id = codypendent_protocol::ModelId(display_id.clone());
+    state.outbox.push(Intent::AddModel {
+        display_id,
+        provider_id,
+        model,
+        api_key,
+        context_tokens,
+    });
+    if let Some(flow) = &mut state.onboard_flow {
+        flow.awaiting_model = Some(model_id.clone());
+        state.overlay = Overlay::Onboard {
+            step: OnboardStep::Validating { model_id },
+        };
+    } else {
+        // The normal provider/model flow has handed the mutation to the host;
+        // do not leave its picker sitting open over the resulting notice.
+        state.overlay = Overlay::None;
+    }
+}
+
 /// `Esc`: clear the composer draft in the base view, return the block-edit prompt
 /// to the Docs browser it opened from, or close whatever other overlay is active.
 fn input_cancel(state: &mut AppState) {
@@ -3466,6 +4128,31 @@ fn input_cancel(state: &mut AppState) {
             state.composer.clear();
             state.composer_cursor = 0;
         }
+        Overlay::Onboard {
+            step: OnboardStep::Triage { .. },
+        } => {
+            state.overlay = Overlay::Onboard {
+                step: OnboardStep::SkipConfirm { selected: 0 },
+            };
+        }
+        Overlay::Onboard {
+            step: OnboardStep::SkipConfirm { .. },
+        } => open_onboard(state),
+        // The host may already be writing/connecting. Esc cannot safely cancel
+        // that operation, and closing the wait would expose dead Chat.
+        Overlay::Onboard {
+            step: OnboardStep::Validating { .. },
+        } => {}
+        Overlay::OnboardProviderPicker { .. } => open_onboard(state),
+        Overlay::AddModelId { .. }
+        | Overlay::AddModelKey { .. }
+        | Overlay::AddModelProviderKey { .. }
+        | Overlay::AddModelQuerying { .. }
+        | Overlay::AddModelPick { .. }
+            if state.onboard_flow.is_some() =>
+        {
+            restore_onboard_provider_picker(state);
+        }
         // Abandoning the block-edit prompt returns to the browser, not the base
         // view (no lease was taken yet — the acquire only fires on submit).
         Overlay::DocEdit { .. }
@@ -3475,6 +4162,8 @@ fn input_cancel(state: &mut AppState) {
         Overlay::DocPublishPath { .. } => state.overlay = Overlay::Docs,
         Overlay::EdgeSearch(_) => state.overlay = Overlay::Edges,
         Overlay::WorkflowInputs { .. } => state.overlay = Overlay::Workflow,
+        Overlay::KanbanNew { .. } => state.overlay = Overlay::Kanban,
+        Overlay::BlackboardPost { .. } => state.overlay = Overlay::Blackboard,
         Overlay::ConfirmWorkflowCancel { .. } => state.overlay = Overlay::Workflow,
         Overlay::CouncilRunObjective { .. } => state.overlay = Overlay::CouncilBrowser,
         _ => state.overlay = Overlay::None,
@@ -3493,6 +4182,12 @@ fn cycle_run(state: &mut AppState, delta: i32) {
 /// filtered card). A no-op for a non-list overlay.
 fn set_overlay_selected(state: &mut AppState, n: usize) {
     match state.overlay {
+        Overlay::Onboard { ref mut step } => match step {
+            OnboardStep::Triage { selected } | OnboardStep::SkipConfirm { selected } => {
+                *selected = n.min(2);
+            }
+            OnboardStep::Validating { .. } => {}
+        },
         Overlay::Palette {
             ref mut selected, ..
         }
@@ -3523,6 +4218,15 @@ fn set_overlay_selected(state: &mut AppState, n: usize) {
         } => {
             *selected = n;
             let indices = filter_providers(&state.providers, query);
+            state.selected_provider = indices.get(n).copied().unwrap_or(0);
+        }
+        Overlay::OnboardProviderPicker {
+            class,
+            ref query,
+            ref mut selected,
+        } => {
+            *selected = n;
+            let indices = filter_onboard_providers(&state.providers, class, query);
             state.selected_provider = indices.get(n).copied().unwrap_or(0);
         }
         // The mode picker keeps no resolved `AppState` index (PR C2) — the
@@ -3572,6 +4276,11 @@ fn activate_row(state: &mut AppState, n: usize) {
             state.selected_memory = selected;
             state.overlay = Overlay::Memory { source_open: true };
         }
+        Overlay::Journey => {
+            let mut selected = n;
+            clamp(&mut selected, state.learnings.len());
+            state.selected_learning = selected;
+        }
         Overlay::Edges => {
             let mut selected = n;
             clamp(&mut selected, state.edges.len());
@@ -3604,7 +4313,17 @@ fn activate_row(state: &mut AppState, n: usize) {
             clamp(&mut selected, state.councils.len());
             state.selected_council = selected;
         }
+        Overlay::CouncilResults => {
+            let mut selected = n;
+            clamp(&mut selected, state.council_results.len());
+            state.selected_council_result = selected;
+            state.council_result_scroll = 0;
+        }
         Overlay::Palette { .. }
+        | Overlay::Onboard {
+            step: OnboardStep::Triage { .. } | OnboardStep::SkipConfirm { .. },
+        }
+        | Overlay::OnboardProviderPicker { .. }
         | Overlay::ModelPicker { .. }
         | Overlay::ProviderPicker { .. }
         | Overlay::ModePicker { .. }
@@ -3643,6 +4362,76 @@ fn submit_prompt(state: &mut AppState) {
         state.notice = None;
     }
     match std::mem::take(&mut state.overlay) {
+        Overlay::Onboard { step } => match step {
+            OnboardStep::Triage { selected } => {
+                let class = match selected.min(2) {
+                    0 => OnboardProviderClass::Hosted,
+                    1 => OnboardProviderClass::LocalEndpoint,
+                    _ => OnboardProviderClass::AcpAgent,
+                };
+                open_onboard_provider_picker(state, class, None);
+            }
+            OnboardStep::SkipConfirm { selected } => {
+                if selected == 0 {
+                    state.onboard_flow = None;
+                    state.outbox.push(Intent::SetOnboardSkipped);
+                    state.notice = Some((
+                        "setup skipped — press Enter here whenever you want to connect a model"
+                            .to_owned(),
+                        state.tick + 50,
+                    ));
+                } else {
+                    // Both "Continue setup" and "Cancel" are deliberately
+                    // safe returns. Neither persists nor clears a prior skip.
+                    open_onboard(state);
+                }
+            }
+            OnboardStep::Validating { model_id } => {
+                state.overlay = Overlay::Onboard {
+                    step: OnboardStep::Validating { model_id },
+                };
+            }
+        },
+        Overlay::OnboardProviderPicker {
+            class,
+            query,
+            selected,
+        } => {
+            let indices = filter_onboard_providers(&state.providers, class, &query);
+            let Some(&idx) = indices.get(selected) else {
+                state.overlay = Overlay::OnboardProviderPicker {
+                    class,
+                    query,
+                    selected: 0,
+                };
+                return;
+            };
+            let Some(card) = state.providers.get(idx) else {
+                open_onboard_provider_picker(state, class, None);
+                return;
+            };
+            let provider_id = card.id.clone();
+            let protocol = card.protocol.clone();
+            let requires_key = card.requires_key;
+            let can_list_models = card.can_list_models;
+            let catalog_models = card.catalog_models;
+            let has_key = card.has_key;
+            state.selected_provider = idx;
+            state.onboard_flow = Some(OnboardFlow {
+                class,
+                provider_id: Some(provider_id.clone()),
+                awaiting_model: None,
+            });
+            enter_add_model_flow(
+                state,
+                provider_id,
+                protocol,
+                requires_key,
+                can_list_models,
+                catalog_models,
+                has_key,
+            );
+        }
         Overlay::NewRun(text) => {
             let objective = text.trim().to_owned();
             if !objective.is_empty() {
@@ -3667,6 +4456,31 @@ fn submit_prompt(state: &mut AppState) {
                     draft: objective,
                     target: RunStartDraftTarget::NewRunPrompt,
                 });
+            }
+        }
+        Overlay::LearningEdit {
+            id,
+            revision,
+            buffer,
+        } => {
+            let statement = buffer.split_whitespace().collect::<Vec<_>>().join(" ");
+            if statement.is_empty() {
+                state.overlay = Overlay::LearningEdit {
+                    id,
+                    revision,
+                    buffer,
+                };
+                state.notice = Some((
+                    "a learning statement cannot be empty".into(),
+                    state.tick + 30,
+                ));
+            } else {
+                state.outbox.push(Intent::MutateLearning {
+                    id,
+                    revision,
+                    mutation: LearningMutation::EditStatement(statement),
+                });
+                state.overlay = Overlay::Journey;
             }
         }
         Overlay::Steering(text) => {
@@ -3732,6 +4546,35 @@ fn submit_prompt(state: &mut AppState) {
                         state.tick + 30,
                     ));
                 }
+            }
+        }
+        Overlay::KanbanNew { buffer } => {
+            let title = buffer.trim().to_owned();
+            state.overlay = Overlay::Kanban;
+            if title.is_empty() {
+                state.notice = Some(("task title must not be empty".to_owned(), state.tick + 30));
+            } else {
+                state.outbox.push(Intent::CreateBoardCard { title });
+                state.notice = Some(("creating Kanban task…".to_owned(), state.tick + 30));
+            }
+        }
+        Overlay::BlackboardPost {
+            workflow_run_id,
+            buffer,
+        } => {
+            let text = buffer.trim().to_owned();
+            state.overlay = Overlay::Blackboard;
+            if text.is_empty() {
+                state.notice = Some(("question must not be empty".to_owned(), state.tick + 30));
+            } else {
+                state.outbox.push(Intent::PostBlackboardQuestion {
+                    workflow_run_id,
+                    text,
+                });
+                state.notice = Some((
+                    "posting open question to Blackboard…".to_owned(),
+                    state.tick + 30,
+                ));
             }
         }
         Overlay::EdgeSearch(query) => {
@@ -3828,7 +4671,10 @@ fn submit_prompt(state: &mut AppState) {
         // `mem::take` already closed the palette (left `None`); run the
         // highlighted command, which may open its own overlay.
         Overlay::Palette { query, selected } => {
-            if let Some(entry) = crate::palette::filtered(&query).get(selected) {
+            if let Some(selector) = parse_council_result_query(&query) {
+                state.overlay = Overlay::CouncilResults;
+                state.outbox.push(Intent::LoadCouncilResults { selector });
+            } else if let Some(entry) = crate::palette::filtered(&query).get(selected) {
                 run_palette_command(state, entry.command);
             }
         }
@@ -4159,6 +5005,10 @@ fn submit_prompt(state: &mut AppState) {
         // session's first one. The draft clears either way.
         Overlay::None => {
             let text = state.composer.trim().to_owned();
+            if text.is_empty() && state.selected_run().is_none() && !state.has_runnable_models() {
+                open_onboard(state);
+                return;
+            }
             if !text.is_empty() {
                 // An empty session has no durable run id with which to route a
                 // second message. Retain it as a draft until the first
@@ -4259,13 +5109,7 @@ fn submit_prompt(state: &mut AppState) {
                     Some(SecretKey(inner))
                 };
                 state.notice = Some((format!("adding model {display_id}"), state.tick + 25));
-                state.outbox.push(Intent::AddModel {
-                    display_id,
-                    provider_id,
-                    model,
-                    api_key,
-                    context_tokens: None,
-                });
+                queue_add_model(state, display_id, provider_id, model, api_key, None);
             } else if requires_key {
                 state.overlay = Overlay::AddModelKey {
                     provider_id,
@@ -4275,13 +5119,7 @@ fn submit_prompt(state: &mut AppState) {
             } else {
                 let display_id = format!("{provider_id}/{model}");
                 state.notice = Some((format!("adding model {display_id}"), state.tick + 25));
-                state.outbox.push(Intent::AddModel {
-                    display_id,
-                    provider_id,
-                    model,
-                    api_key: None,
-                    context_tokens: None,
-                });
+                queue_add_model(state, display_id, provider_id, model, None, None);
             }
         }
         // Add-model flow step 3 (masked key): emit `Intent::AddModel` with the key
@@ -4293,19 +5131,24 @@ fn submit_prompt(state: &mut AppState) {
         } => {
             let key = buffer.0.trim().to_owned();
             let display_id = format!("{provider_id}/{model}");
-            let api_key = if key.is_empty() {
-                None
-            } else {
-                Some(SecretKey(key))
-            };
+            if key.is_empty() {
+                state.notice = Some(("API key cannot be blank".to_owned(), state.tick + 30));
+                state.overlay = Overlay::AddModelKey {
+                    provider_id,
+                    model,
+                    buffer: SecretKey(String::new()),
+                };
+                return;
+            }
             state.notice = Some((format!("adding model {display_id}"), state.tick + 25));
-            state.outbox.push(Intent::AddModel {
+            queue_add_model(
+                state,
                 display_id,
                 provider_id,
                 model,
-                api_key,
-                context_tokens: None,
-            });
+                Some(SecretKey(key)),
+                None,
+            );
         }
         // Key-first prompt (can-list hosted): emit the query with the entered key
         // (blank → no key) and open the transient "Fetching…" state, keeping the
@@ -4315,11 +5158,15 @@ fn submit_prompt(state: &mut AppState) {
             buffer,
         } => {
             let key = buffer.0.trim().to_owned();
-            let api_key = if key.is_empty() {
-                None
-            } else {
-                Some(SecretKey(key))
-            };
+            if key.is_empty() {
+                state.notice = Some(("API key cannot be blank".to_owned(), state.tick + 30));
+                state.overlay = Overlay::AddModelProviderKey {
+                    provider_id,
+                    buffer: SecretKey(String::new()),
+                };
+                return;
+            }
+            let api_key = Some(SecretKey(key));
             state.outbox.push(Intent::QueryProviderModels {
                 provider_id: provider_id.clone(),
                 api_key: api_key.clone(),
@@ -4347,13 +5194,14 @@ fn submit_prompt(state: &mut AppState) {
                     let context_tokens = row.context_tokens;
                     let display_id = format!("{provider_id}/{model}");
                     state.notice = Some((format!("adding model {display_id}"), state.tick + 25));
-                    state.outbox.push(Intent::AddModel {
+                    queue_add_model(
+                        state,
                         display_id,
                         provider_id,
                         model,
                         api_key,
                         context_tokens,
-                    });
+                    );
                 }
             }
         }
@@ -4482,15 +5330,15 @@ fn enter_add_model_flow(
             return;
         }
         let display_id = format!("acp/{provider_id}");
-        state.outbox.push(Intent::AddModel {
-            display_id: display_id.clone(),
-            model: provider_id.clone(),
-            provider_id,
-            api_key: None,
-            context_tokens: None,
-        });
         state.notice = Some((format!("connecting {display_id}"), state.tick + 25));
-        state.overlay = Overlay::None;
+        queue_add_model(
+            state,
+            display_id,
+            provider_id.clone(),
+            provider_id,
+            None,
+            None,
+        );
         return;
     }
     let can_offer = can_list_models || catalog_models > 0;
@@ -4739,11 +5587,38 @@ fn on_provider_models_failed(state: &mut AppState, provider_id: String, reason: 
     if !matched {
         return;
     }
+    let is_acp_supplier = state
+        .providers
+        .iter()
+        .any(|card| card.id == provider_id && card.protocol == "acp")
+        || state
+            .models
+            .iter()
+            .any(|card| card.acp_supplier() == Some(provider_id.as_str()));
     if let Overlay::AddModelQuerying {
         provider_id: pid,
         api_key,
     } = std::mem::replace(&mut state.overlay, Overlay::None)
     {
+        // ACP model ids are agent-owned and cannot be guessed honestly. Keep
+        // a failed supplier handshake on a retryable catalogue surface instead
+        // of falling through to the generic free-text model-name prompt.
+        if is_acp_supplier {
+            state.notice = Some((
+                format!("{provider_id} model discovery failed ({reason}); Ctrl-R retries"),
+                state.tick + 40,
+            ));
+            state.overlay = Overlay::AddModelPick {
+                provider_id: pid,
+                api_key,
+                models: Vec::new(),
+                query: String::new(),
+                selected: 0,
+                origin: ModelListOrigin::Catalog(format!("connection failed · {reason}")),
+                refreshing: false,
+            };
+            return;
+        }
         let requires_key = state
             .providers
             .iter()
@@ -4895,6 +5770,23 @@ fn on_unsloth_pull_finished(
 /// single-key binding produces — the palette is a front door to the existing
 /// commands, not a second code path. The palette overlay is already closed when
 /// this runs, so a command that opens its own overlay simply sets it.
+/// Recognize the natural slash-command form while the palette owns the input.
+/// `Some(None)` means "all latest results"; `Some(Some(_))` is a direct
+/// council-name/result-id lookup. No workflow or Blackboard fallback exists.
+fn parse_council_result_query(query: &str) -> Option<Option<String>> {
+    let mut words = query.trim().trim_start_matches('/').split_whitespace();
+    if !words
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("council"))
+        || !words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("result"))
+    {
+        return None;
+    }
+    Some(words.next().map(str::to_owned))
+}
+
 fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCommand) {
     use crate::palette::PaletteCommand;
     match command {
@@ -4910,6 +5802,10 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         PaletteCommand::Memory => {
             state.overlay = Overlay::Memory { source_open: false };
             request_projection(state, ProjectionKind::Memory);
+        }
+        PaletteCommand::Journey => {
+            state.overlay = Overlay::Journey;
+            request_projection(state, ProjectionKind::Journey);
         }
         PaletteCommand::Docs => {
             state.overlay = Overlay::Docs;
@@ -4979,6 +5875,12 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         PaletteCommand::Council => {
             state.overlay = Overlay::CouncilBrowser;
         }
+        PaletteCommand::CouncilResults => {
+            state.overlay = Overlay::CouncilResults;
+            state
+                .outbox
+                .push(Intent::LoadCouncilResults { selector: None });
+        }
         PaletteCommand::UnslothCatalog => open_unsloth_catalog(state),
         // Voice v1 (rubric 8). The toggle only flips the flag the CLI's voice
         // host reads — the host owns the synthesis and playback subprocesses,
@@ -5029,6 +5931,9 @@ fn refresh_open_projection(state: &mut AppState) {
     let kind = match state.overlay {
         Overlay::Skills => Some(ProjectionKind::Skills),
         Overlay::Memory { .. } => Some(ProjectionKind::Memory),
+        Overlay::Journey | Overlay::LearningEdit { .. } | Overlay::ConfirmLearningDelete { .. } => {
+            Some(ProjectionKind::Journey)
+        }
         Overlay::Docs
         | Overlay::DocEdit { .. }
         | Overlay::DocNew { .. }
@@ -5162,6 +6067,14 @@ pub(crate) fn capability_label(action: &ProposedAction) -> String {
         ProposedAction::PublishDocument { target, .. } => format!("GitCommit ({target})"),
         ProposedAction::McpToolCall { server, tool, .. } => {
             format!("McpToolCall ({server}.{tool})")
+        }
+        ProposedAction::CouncilCreate { name, .. } => format!("CouncilCreate ({name})"),
+        ProposedAction::CouncilRun { name, .. } => format!("CouncilRun ({name})"),
+        ProposedAction::WorkflowCreate { workflow_id, .. } => {
+            format!("WorkflowCreate ({workflow_id})")
+        }
+        ProposedAction::WorkflowRun { workflow_id, .. } => {
+            format!("WorkflowRun ({workflow_id})")
         }
         _ => "unsupported capability".to_owned(),
     }
@@ -5625,6 +6538,78 @@ mod tests {
             }),
         );
         assert_eq!(s.runs[0].state, RunState::Running);
+    }
+
+    #[test]
+    fn post_terminal_learning_capture_is_kept_quiet_and_refreshes_open_journey() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "remember this preference".into(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed { summary: None },
+                chronicle: artifact(),
+            }),
+        );
+        let transcript_len = s.runs[0].transcript.len();
+        s.overlay = Overlay::Journey;
+        reduce(
+            &mut s,
+            system_ev(EventBody::LearningsCaptured {
+                run_id,
+                proposed_count: 1,
+                proposed_ids: vec![codypendent_protocol::LearningId::new()],
+                activated_count: 0,
+                activated_ids: Vec::new(),
+            }),
+        );
+        assert_eq!(s.pending_learning_review, 1);
+        assert_eq!(
+            s.runs[0].transcript.len(),
+            transcript_len,
+            "capture stays out of chat"
+        );
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::RefreshProjection {
+                kind: ProjectionKind::Journey
+            }]
+        );
+    }
+
+    #[test]
+    fn journey_review_actions_are_optimistic_and_typed() {
+        let mut s = AppState::new();
+        s.learnings.push(crate::state::LearningCard {
+            id: codypendent_protocol::LearningId::new().to_string(),
+            statement: "Prefer focused tests".into(),
+            kind: "fact".into(),
+            state: "proposed".into(),
+            scope: "user".into(),
+            provenance: "user-confirmed".into(),
+            confidence: 0.95,
+            pinned: false,
+            revision: 3,
+        });
+        s.overlay = Overlay::Journey;
+        reduce(&mut s, Action::Approve(ApprovalScope::Once));
+        assert!(matches!(
+            s.drain_outbox().as_slice(),
+            [Intent::MutateLearning {
+                revision: 3,
+                mutation: LearningMutation::Activate,
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -8057,6 +9042,26 @@ mod tests {
     }
 
     #[test]
+    fn empty_kanban_create_prompt_emits_a_typed_card_intent() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::Kanban;
+        reduce(&mut s, Action::NewRun);
+        assert!(matches!(s.overlay, Overlay::KanbanNew { .. }));
+        reduce(
+            &mut s,
+            Action::InputPaste("Add a regression test for ACP reconnects".to_owned()),
+        );
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::Kanban);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::CreateBoardCard {
+                title: "Add a regression test for ACP reconnects".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn open_workflow_toggles_the_workflow_view() {
         let mut s = AppState::new();
         s.workflow = vec![node("inspect")];
@@ -8065,6 +9070,17 @@ mod tests {
         assert_eq!(s.input_mode(), crate::state::InputMode::Normal);
         reduce(&mut s, Action::OpenWorkflow);
         assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn empty_workflow_primary_action_drafts_a_reviewable_example() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::Workflow;
+        reduce(&mut s, Action::NewRun);
+        assert_eq!(s.overlay, Overlay::None);
+        assert!(s.composer.contains(".codypendent/workflows/example.yaml"));
+        assert!(s.composer.contains("inspect, implement, and verify"));
+        assert!(s.outbox.is_empty(), "drafting must never auto-submit");
     }
 
     #[test]
@@ -8276,6 +9292,27 @@ mod tests {
         assert_eq!(s.input_mode(), crate::state::InputMode::Normal);
         reduce(&mut s, Action::OpenBlackboard);
         assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn blackboard_primary_action_posts_only_an_explicit_open_question() {
+        let mut s = AppState::new();
+        s.blackboard = vec![item("finding")];
+        s.overlay = Overlay::Blackboard;
+        reduce(&mut s, Action::NewRun);
+        assert!(matches!(s.overlay, Overlay::BlackboardPost { .. }));
+        reduce(
+            &mut s,
+            Action::InputPaste("What should independent review verify?".to_owned()),
+        );
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::PostBlackboardQuestion {
+                workflow_run_id: "workflow-run-1".to_owned(),
+                text: "What should independent review verify?".to_owned(),
+            }]
+        );
     }
 
     #[test]
@@ -9169,6 +10206,48 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_blocks_pending_and_active_model_removal_and_rechecks_confirmation() {
+        let mut pending = AppState::new();
+        pending.models = vec![model_card("ollama/qwen", "openai-compatible")];
+        pending.pending_model = Some(ModelId("ollama/qwen".to_owned()));
+        open_model_picker(&mut pending);
+        reduce(&mut pending, Action::RemoveSelected);
+        assert!(matches!(pending.overlay, Overlay::ModelPicker { .. }));
+        assert!(pending
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("switch models first")));
+        assert!(pending.outbox.is_empty());
+
+        let mut active = AppState::new();
+        active.models = vec![model_card("acp/codex-acp#gpt", "acp")];
+        let run = active.ensure_run(RunId::new(), "work".to_owned(), AgentMode::Build);
+        run.state = RunState::Running;
+        run.model = Some(ModelId("acp/codex-acp#gpt".to_owned()));
+        open_model_picker(&mut active);
+        reduce(&mut active, Action::RemoveSelected);
+        assert!(matches!(active.overlay, Overlay::ModelPicker { .. }));
+        assert!(active
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("active run")));
+        assert!(active.outbox.is_empty());
+
+        let mut raced = AppState::new();
+        raced.models = vec![model_card("ollama/coder", "openai-compatible")];
+        open_model_picker(&mut raced);
+        reduce(&mut raced, Action::RemoveSelected);
+        assert!(matches!(raced.overlay, Overlay::ConfirmModelRemove { .. }));
+        raced.pending_model = Some(ModelId("ollama/coder".to_owned()));
+        reduce(&mut raced, Action::ConfirmCancel);
+        assert!(
+            raced.outbox.is_empty(),
+            "the confirmation must re-check live routing"
+        );
+        assert!(matches!(raced.overlay, Overlay::ModelPicker { .. }));
+    }
+
+    #[test]
     fn bare_acp_model_row_opens_the_supplier_model_catalogue() {
         let mut state = AppState::new();
         state.models = vec![model_card("acp/codex-acp", "acp")];
@@ -9192,6 +10271,60 @@ mod tests {
             } if provider_id == "codex-acp"
         ));
         assert_eq!(state.pending_model, None);
+    }
+
+    #[test]
+    fn acp_supplier_failure_stays_retryable_and_live_choice_adds_concrete_model() {
+        let mut state = AppState::new();
+        state.models = vec![model_card("acp/kimi-code", "acp")];
+        open_model_picker(&mut state);
+        reduce(&mut state, Action::InputSubmit);
+        state.drain_outbox();
+
+        reduce(
+            &mut state,
+            Action::ProviderModelsFailed {
+                provider_id: "kimi-code".to_owned(),
+                reason: "login required".to_owned(),
+            },
+        );
+        assert!(matches!(
+            state.overlay,
+            Overlay::AddModelPick {
+                ref provider_id,
+                ref models,
+                ..
+            } if provider_id == "kimi-code" && models.is_empty()
+        ));
+        reduce(&mut state, Action::RefreshProviderModels);
+        assert_eq!(
+            state.drain_outbox(),
+            vec![Intent::QueryProviderModels {
+                provider_id: "kimi-code".to_owned(),
+                api_key: None,
+                refresh: true,
+            }]
+        );
+        reduce(
+            &mut state,
+            Action::ProviderModelsLoaded {
+                provider_id: "kimi-code".to_owned(),
+                models: vec![AddModelRow::live("kimi-k2.5")],
+                origin: ModelListOrigin::Live,
+            },
+        );
+        reduce(&mut state, Action::InputSubmit);
+        assert!(matches!(
+            state.drain_outbox().as_slice(),
+            [Intent::AddModel {
+                display_id,
+                provider_id,
+                model,
+                ..
+            }] if display_id == "kimi-code/kimi-k2.5"
+                && provider_id == "kimi-code"
+                && model == "kimi-k2.5"
+        ));
     }
 
     #[test]
@@ -9614,6 +10747,9 @@ mod tests {
             &mut s,
             Action::CouncilProgress {
                 name: "review-board".to_owned(),
+                result_id: "result-1".to_owned(),
+                phase: crate::state::CouncilProgressPhase::RoundStarted,
+                occurred_at: "2026-08-12T12:00:00Z".to_owned(),
                 message: "round 1/1 — launching 2 member(s)".to_owned(),
                 active_subagents: 2,
             },
@@ -9648,6 +10784,18 @@ mod tests {
             Action::CouncilRunFinished {
                 name: "review-board".to_owned(),
                 result: Ok(Box::new(crate::state::CouncilRunSummary {
+                    result_id: "result-1".to_owned(),
+                    council: "review-board".to_owned(),
+                    status: "completed".to_owned(),
+                    objective: "choose storage".to_owned(),
+                    started_at: "2026-08-12T12:00:00Z".to_owned(),
+                    finished_at: "2026-08-12T12:01:00Z".to_owned(),
+                    repository: "/repo".to_owned(),
+                    origin_session_id: Some("s0".to_owned()),
+                    evidence: false,
+                    warnings: Vec::new(),
+                    rounds: Vec::new(),
+                    failure: None,
                     synthesis: "Adopt sqlite with a WAL-mode connection pool.".to_owned(),
                     participants: vec!["claude · architect · session s1 · run r1".to_owned()],
                     cost_line: "cost: 1200 tokens measured across 2/2 runs".to_owned(),
@@ -9670,7 +10818,8 @@ mod tests {
         assert!(s
             .notice
             .as_ref()
-            .is_some_and(|(notice, _)| notice.contains("finished")));
+            .is_some_and(|(notice, _)| notice.contains("completed")
+                && notice.contains("durable result ready")));
 
         // A failed run still surfaces the failure in the transcript rather
         // than being silently lost.
@@ -9914,6 +11063,225 @@ mod tests {
             reduce(s, Action::InputChar(c));
         }
         reduce(s, Action::InputSubmit);
+    }
+
+    #[test]
+    fn onboard_triage_and_skip_confirm_are_palette_navigable() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenOnboard);
+        assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
+        assert!(matches!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 0 }
+            }
+        ));
+
+        reduce(&mut s, Action::SelectNext);
+        assert!(matches!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { selected: 1 }
+            }
+        ));
+        reduce(&mut s, Action::InputCancel);
+        assert!(matches!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::SkipConfirm { selected: 0 }
+            }
+        ));
+        assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
+
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::None);
+        assert_eq!(s.drain_outbox(), vec![Intent::SetOnboardSkipped]);
+    }
+
+    #[test]
+    fn onboard_provider_classes_are_mutually_exclusive_and_cannot_roam() {
+        let mut hosted = provider_card("groq", "Groq", "openai-chat", "api-key: GROQ", false);
+        hosted.available = true;
+        let mut local = provider_card("ollama", "Ollama", "openai-chat", "none", true);
+        local.available = true;
+        let mut kimi = provider_card("kimi-code", "Kimi Code", "acp", "acp: local", true);
+        kimi.available = true;
+        s_assert_class(&hosted, OnboardProviderClass::Hosted);
+        s_assert_class(&local, OnboardProviderClass::LocalEndpoint);
+        s_assert_class(&kimi, OnboardProviderClass::AcpAgent);
+
+        let mut s = AppState::new();
+        s.providers = vec![hosted, local, kimi];
+        reduce(&mut s, Action::OpenOnboard);
+        // Select Local Endpoint. The scoped picker has exactly Ollama, even
+        // though Kimi also advertises `local=true`.
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::InputSubmit);
+        assert!(matches!(
+            s.overlay,
+            Overlay::OnboardProviderPicker {
+                class: OnboardProviderClass::LocalEndpoint,
+                selected: 0,
+                ..
+            }
+        ));
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(s.selected_provider, 1, "selection stays on Ollama");
+        for c in "kimi".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert!(matches!(
+            s.overlay,
+            Overlay::OnboardProviderPicker {
+                class: OnboardProviderClass::LocalEndpoint,
+                ..
+            }
+        ));
+    }
+
+    fn s_assert_class(card: &crate::state::ProviderCard, expected: OnboardProviderClass) {
+        for class in [
+            OnboardProviderClass::Hosted,
+            OnboardProviderClass::LocalEndpoint,
+            OnboardProviderClass::AcpAgent,
+        ] {
+            assert_eq!(card.is_onboard_class(class), class == expected);
+        }
+    }
+
+    #[test]
+    fn esc_from_reused_add_model_flow_returns_to_onboard_provider_class() {
+        let mut s = AppState::new();
+        let mut hosted = provider_card("groq", "Groq", "openai-chat", "api-key: GROQ", false);
+        hosted.available = true;
+        s.providers = vec![hosted];
+        reduce(&mut s, Action::OpenOnboard);
+        reduce(&mut s, Action::InputSubmit); // Hosted -> scoped provider picker
+        reduce(&mut s, Action::InputSubmit); // Groq -> key prompt
+        assert!(matches!(s.overlay, Overlay::AddModelProviderKey { .. }));
+        assert!(s.onboard_flow.is_some());
+
+        reduce(&mut s, Action::InputCancel);
+        assert!(matches!(
+            s.overlay,
+            Overlay::OnboardProviderPicker {
+                class: OnboardProviderClass::Hosted,
+                ..
+            }
+        ));
+        assert!(s.onboard_flow.is_some());
+    }
+
+    #[test]
+    fn onboard_completion_waits_for_matching_authoritative_runnable_refresh() {
+        let mut s = AppState::new();
+        let expected = ModelId("acp/kimi-code".to_owned());
+        s.onboard_flow = Some(OnboardFlow {
+            class: OnboardProviderClass::AcpAgent,
+            provider_id: Some("kimi-code".to_owned()),
+            awaiting_model: Some(expected.clone()),
+        });
+        s.overlay = Overlay::Onboard {
+            step: OnboardStep::Validating {
+                model_id: expected.clone(),
+            },
+        };
+
+        reduce(
+            &mut s,
+            Action::RunnableModelsRefreshed {
+                model_ids: vec![expected.clone()],
+                onboard_attempt: Some(ModelId("acp/old-attempt".to_owned())),
+            },
+        );
+        assert!(s.onboard_flow.is_some(), "stale refresh is ignored");
+        assert!(s.drain_outbox().is_empty());
+
+        reduce(
+            &mut s,
+            Action::RunnableModelsRefreshed {
+                model_ids: vec![expected.clone()],
+                onboard_attempt: Some(expected.clone()),
+            },
+        );
+        assert_eq!(s.overlay, Overlay::None);
+        assert_eq!(s.pending_model, Some(expected));
+        assert_eq!(s.drain_outbox(), vec![Intent::SetOnboardComplete]);
+    }
+
+    #[test]
+    fn failed_or_non_runnable_onboard_attempt_returns_to_scoped_picker() {
+        let mut s = AppState::new();
+        let mut kimi = provider_card("kimi-code", "Kimi Code", "acp", "acp: local", true);
+        kimi.available = true;
+        s.providers = vec![kimi];
+        let expected = ModelId("acp/kimi-code".to_owned());
+        s.onboard_flow = Some(OnboardFlow {
+            class: OnboardProviderClass::AcpAgent,
+            provider_id: Some("kimi-code".to_owned()),
+            awaiting_model: Some(expected.clone()),
+        });
+        s.overlay = Overlay::Onboard {
+            step: OnboardStep::Validating {
+                model_id: expected.clone(),
+            },
+        };
+
+        reduce(
+            &mut s,
+            Action::RunnableModelsRefreshed {
+                model_ids: vec![],
+                onboard_attempt: Some(expected.clone()),
+            },
+        );
+        assert!(matches!(
+            s.overlay,
+            Overlay::OnboardProviderPicker {
+                class: OnboardProviderClass::AcpAgent,
+                ..
+            }
+        ));
+        assert!(s.drain_outbox().is_empty());
+
+        // Start another correlated attempt and verify a host write/connect
+        // failure takes the same safe return path.
+        if let Some(flow) = &mut s.onboard_flow {
+            flow.awaiting_model = Some(expected.clone());
+        }
+        reduce(
+            &mut s,
+            Action::OnboardModelAddFailed {
+                model_id: expected,
+                reason: "agent exited during handshake".to_owned(),
+            },
+        );
+        assert!(matches!(
+            s.overlay,
+            Overlay::OnboardProviderPicker {
+                class: OnboardProviderClass::AcpAgent,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_submit_reopens_onboard_for_configured_but_unrunnable_models() {
+        let mut s = AppState::new();
+        s.models = vec![model_card(
+            "configured-but-missing-key",
+            "openai-compatible",
+        )];
+        assert!(s.runnable_models.is_empty());
+
+        reduce(&mut s, Action::InputSubmit);
+
+        assert!(matches!(
+            s.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { .. }
+            }
+        ));
     }
 
     #[test]
@@ -11035,28 +12403,25 @@ mod tests {
     }
 
     #[test]
-    fn add_model_provider_key_blank_queries_with_no_key() {
+    fn add_model_provider_key_blank_stays_in_the_required_key_prompt() {
         let mut s = AppState::new();
         s.overlay = Overlay::AddModelProviderKey {
             provider_id: "groq".to_owned(),
             buffer: SecretKey(String::new()),
         };
         reduce(&mut s, Action::InputSubmit);
-        assert_eq!(
-            s.outbox,
-            vec![Intent::QueryProviderModels {
-                provider_id: "groq".to_owned(),
-                api_key: None,
-                refresh: false,
-            }]
-        );
+        assert!(s.outbox.is_empty());
         assert_eq!(
             s.overlay,
-            Overlay::AddModelQuerying {
+            Overlay::AddModelProviderKey {
                 provider_id: "groq".to_owned(),
-                api_key: None,
+                buffer: SecretKey(String::new()),
             }
         );
+        assert!(s
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("cannot be blank")));
     }
 
     #[test]

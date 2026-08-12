@@ -42,7 +42,9 @@ pub mod theme;
 pub mod theme_pack;
 
 pub use accessible::{accessible_snapshot, map_accessible_input, sanitize_accessible_text};
-pub use action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, WorkflowNodeUpdate};
+pub use action::{
+    Action, Intent, KeyTarget, LearningMutation, ProjectionKind, SecretKey, WorkflowNodeUpdate,
+};
 pub use input::{map_event, pane_at, KeyBinding, KEY_BINDINGS};
 pub use markdown::{RichLine, RichSpan, SpanRole, SyntaxRole};
 pub use reduce::reduce;
@@ -58,12 +60,13 @@ pub use remote_ui_host::{
 pub use render::{render, render_splash};
 pub use state::{
     AddModelRow, AppState, BlackboardItemCard, CouncilBuilderState, CouncilBuilderStep,
-    CouncilCard, CouncilMemberDraft, CouncilRunSummary, DocBlockView, DocCard, DocEdit, DocFocus,
+    CouncilCard, CouncilMemberDraft, CouncilMemberSummary, CouncilProgressPhase,
+    CouncilRoundSummary, CouncilRunSummary, DocBlockView, DocCard, DocEdit, DocFocus,
     DocLeaseState, DocSuggestionView, GraphEdgeCard, InputMode, KanbanCard, KeyStatus, LayoutMode,
-    MemoryCard, ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness, Overlay, Pane,
-    PatchSummary, PendingApproval, ProviderCard, RunView, SkillCard, StatusProjection, ThemeChoice,
-    ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard, UnslothRepoCard, WorkflowNodeCard,
-    EDGE_PAGE_SIZE,
+    LearningCard, MemoryCard, ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness,
+    Overlay, Pane, PatchSummary, PendingApproval, ProviderCard, RunView, SkillCard,
+    StatusProjection, ThemeChoice, ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard,
+    UnslothRepoCard, WorkflowNodeCard, EDGE_PAGE_SIZE,
 };
 pub use terminal::TerminalGuard;
 pub use theme::{ColorDepth, Theme, ThemePreferences, ThemeVariant};

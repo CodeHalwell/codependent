@@ -331,7 +331,30 @@ impl PolicyEngine {
             | ProposedAction::BlackboardQuery { .. }
             | ProposedAction::WorkflowQuery { .. }
             | ProposedAction::TaskWrite { .. }
-            | ProposedAction::TaskRead { .. } => self.eval_blackboard(),
+            | ProposedAction::TaskRead { .. }
+            | ProposedAction::CouncilResultRead { .. } => self.eval_blackboard(),
+            // Council creation changes durable configuration, and running one
+            // fans out model requests with potentially material cost. Both are
+            // deliberately fresh approvals; the ProposedAction is the preview.
+            ProposedAction::CouncilCreate { .. } | ProposedAction::CouncilRun { .. } => self
+                .require_once(
+                    Capability::CouncilManage,
+                    PolicyReason::new(
+                        "policy.council-requires-approval",
+                        "creating or running an agent council requires explicit approval",
+                    ),
+                ),
+            // Creating a workflow writes durable user configuration; running one
+            // can fan out model/tool work and incur cost. Both require a fresh,
+            // non-reusable approval with the typed manifest preview.
+            ProposedAction::WorkflowCreate { .. } | ProposedAction::WorkflowRun { .. } => self
+                .require_once(
+                    Capability::WorkflowManage,
+                    PolicyReason::new(
+                        "policy.workflow-requires-approval",
+                        "creating or running a workflow requires explicit approval",
+                    ),
+                ),
             ProposedAction::RecordMemory => self.eval_record_memory(),
             ProposedAction::SearchRegistry => self.eval_search_registry(),
             ProposedAction::DocumentEdit { .. } => self.eval_document_edit(),

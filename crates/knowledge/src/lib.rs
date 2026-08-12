@@ -19,6 +19,7 @@ pub mod context;
 pub mod db;
 pub mod docs;
 pub mod extractor;
+pub mod learning;
 pub mod manifest;
 pub mod memory;
 pub mod observer;
@@ -42,6 +43,12 @@ pub use outbox::KnowledgeIndexEvent;
 pub use extractor::{ExtractionInput, FactExtractor, NoopExtractor};
 
 pub use builtin::{builtin_tools, register_builtins};
+pub use learning::{
+    ActivationIntent, ActivationOutcome, CaptureOutcome, DeletedLearning, LearningContent,
+    LearningError, LearningKind, LearningPatch, LearningProcedure, LearningProvenance,
+    LearningQuery, LearningRecord, LearningScope, LearningState, LearningStore,
+    MutationOutcome as LearningMutationOutcome, NewLearning, Verification,
+};
 pub use manifest::{
     load_package, ManifestError, SkillEntrypoints, SkillLimits, SkillManifest, SkillPermissions,
     SkillTrust,

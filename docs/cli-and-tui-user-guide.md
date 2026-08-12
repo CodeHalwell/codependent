@@ -1,7 +1,7 @@
 # Codypendent CLI & TUI User Guide
 
 > **Product:** Codypendent — The local-first agentic developer environment
-> **Version:** 0.3.2
+> **Version:** 0.4.3
 > **Documentation Target:** CLI reference, Ratatui TUI shortcuts, environment setup, and workflow operations.
 
 ---
@@ -32,6 +32,27 @@ codypendent run --objective "Fix failing unit tests in crates/runtime" --mode bu
 codypendent workflow validate path/to/workflow.yaml
 ```
 
+### Install and upgrade
+
+Release archives contain `codypendent`, the mandatory UI worker launcher, the
+sealed Node runtime used by Remote UI, and (when built) the optional standalone
+daemon. The unified `codypendent` binary can run its daemon itself.
+
+```bash
+# Check without changing the installation.
+codypendent update --check
+
+# Install the newest published release, or pin an exact tag.
+codypendent update
+codypendent update v0.4.3
+```
+
+Updating never kills an active run. An idle daemon restarts immediately; a busy
+daemon keeps serving its current build until the runs finish or the next
+launch. Database migrations are embedded in the binary and apply on open. They
+preserve existing sessions and configuration; migration files are immutable
+once released.
+
 ---
 
 ## 2. Daemon Management (`codypendent daemon`)
@@ -50,6 +71,23 @@ codypendent daemon stop          # Gracefully shut down the daemon
 ## 3. Interactive TUI Reference (`codypendent`)
 
 Running `codypendent` with no subcommands opens the interactive Ratatui terminal user interface attached to the current directory's repository session. Startup finishes on a welcome screen so you can read any diagnostics and confirm the workspace; press `Enter` to proceed or `Esc` to quit.
+
+If no saved profile is runnable, Codypendent opens guided setup after the
+splash. Choose a hosted API, local endpoint, or ACP coding agent, then choose a
+provider and concrete model. A saved row is not called ready until the host has
+reloaded it into the runnable projection. You may skip setup, but the dialog
+states plainly that agent runs cannot start until a runnable model is connected.
+
+During chat, the bottom session strip keeps the most useful durable state
+visible. Wide terminals show model/provider, mode and reasoning posture,
+context used/remaining, measured cost, permissions, branch/worktree, active and
+queued subagents or council members, and integration health. Narrow terminals
+prioritize model, mode, context, and agents. Transient notices use a separate
+row and do not erase a pending approval, failure, or activity state.
+
+The composer reserves at least three visible text rows at normal terminal
+heights and grows with Unicode-aware wrapping. Tiny terminals use a compact
+layout rather than hiding the send/queue/steer/interrupt state.
 
 ### 3.1 Theme Selection & Accessibility
 
@@ -119,6 +157,9 @@ equivalent and the key is the only way in.
 | | `Ctrl-↑` / `Ctrl-↓` | Switch to previous / next active run | - |
 | | `Alt-↑` / `Alt-↓` | Browse transcript folds (tool cards, diffs, long notes) | Click a fold line |
 | | `Alt-Enter` | Expand / collapse the browsed fold, else insert a line break | Click a fold line |
+| | `Alt-Y` | Copy the focused transcript card's safe projection | Click the focused card's copy chip |
+| | `Alt-R` / `Alt-A` | Retry a focused failed run / show re-authentication guidance | Click the corresponding failure-card chip |
+| | `Alt-M` / `Alt-D` | Choose another model / open guarded model disable | Click the corresponding failure-card chip |
 | **Composer** | `←` / `→` / `Home` / `End` | Move the draft cursor (within its own line) | - |
 | | `Ctrl-W` / `Ctrl-U` | Delete the word before the cursor / to the line start | - |
 | | `↑` / `↓` | Move between the draft's lines; recall history at its edges | - |
@@ -139,11 +180,14 @@ equivalent and the key is the only way in.
 | | `Delete` / `Ctrl-D` in `/model` | Remove the highlighted configured model after confirmation; its provider remains available in `/provider` | - |
 | | `S` | Open Skills Studio | Palette row "Skills" (or the `S skills` chip in Memory) |
 | | `M` | Open Memory & Knowledge Fabric Browser | Palette row "Memory" (or the `M memory` chip in Skills) |
+| | `J` | Open Learning Journey review (activate, reject, pin, edit, or delete curated learning) | Palette row "Learning review" |
+| | `C` | Open persisted agent councils (`n` creates, `Enter` runs, `d` removes) | Palette row "Agent council" |
 | | `o` | Reveal the focused memory's source | Click the `o source` chip in Memory |
 | | `D` | Open Collaborative Docs Studio | Palette row "Docs Studio" |
 | | `G` | Open Code Graph Edge Inspector | Palette row "Code graph" |
-| | `W` | Open Workflow Conductor View | Palette row "Workflows" |
-| | `B` | Open Agent Blackboard / Claims View | Palette row "Blackboard" |
+| | `W`, then `n` | Open the persisted executable Workflow graph; run the selected manifest, or draft an example when empty | Palette row "Executable workflow graph" |
+| | `B`, then `n` | Open the workflow Blackboard evidence/decision/artifact stream; post an explicit open question | Palette row "Blackboard evidence stream" |
+| | `K`, then `n` | Open the repository Kanban task board; create a task (`←` / `→` moves its column) | Palette row "Kanban task board" |
 | | `/theme` | Switch the colour theme (previews live) | Palette row "/theme  Theme picker" |
 | | `?` | Toggle Help Overlay | Palette row "Help" |
 | | `Esc` | Clear draft, exit prompt, or close overlay | Click outside an overlay, or its `Esc close` chip |
@@ -170,10 +214,13 @@ Input is one command per line:
 | `tab` | In Remote UI, move semantic focus forward; otherwise follow the active surface's Tab behavior (ignored by confirmation and approval dialogs) |
 | `backtab` | In Remote UI, move semantic focus backward; ignored elsewhere |
 | `enter` / `space` | In Remote UI, activate the focused control (`enter` submits or chooses on other input surfaces) |
+| `new`, `create`, `run`, `post` | Activate the primary action in a Workflow, Kanban, or Blackboard browser |
 | `up`, `down` | Recall composer history, move the current list/approval selection, or forward the semantic key to Remote UI; ignored by text-entry and confirmation dialogs |
 | `pageup`, `pagedown` | Page the palette/approval selection or conversation, or forward the semantic key to Remote UI; ignored by text-entry and confirmation dialogs |
 | `home`, `end` | Move to the first/last palette item, move within a composer line, or forward the key to Remote UI |
 | `delete` | In `/model` or `/keys`, open the highlighted item's removal confirmation; in Remote UI, forward the semantic Delete key |
+| `copy` / `alt-y` | Copy the selected council synthesis or focused transcript card; cooked mode prints a sanitized fallback when no clipboard is available |
+| `alt-r`, `alt-a`, `alt-m`, `alt-d` | Retry, show re-authentication guidance, choose a model, or open guarded disable for the focused failure card |
 | `approve`, `approve-run`, `reject` | Resolve the selected approval |
 | `quit` | Detach; the daemon keeps active runs alive |
 
@@ -421,6 +468,13 @@ codypendent acp --repo /path/to/repo
 codypendent acp serve --repo /path/to/repo
 ```
 
+`acp status` verifies that the saved launch coordinate can be resolved; it does
+not prove that the vendor's own login is current. Use `acp probe` for a real
+session/prompt check. If Cline reports that it requires re-authentication,
+complete Cline's normal sign-in flow in a terminal and retry the focused TUI
+failure with `Alt-R`; `Alt-A` shows the same guidance without reading or storing
+the vendor credential.
+
 The registry is discovered from ACP's curated v1 endpoint on first use, cached
 under the Codypendent data directory, and refreshed automatically after 24
 hours (with a validated stale-cache fallback when offline). NPM and Python
@@ -478,6 +532,8 @@ codypendent council create release-board \
 
 codypendent council list
 codypendent council show release-board
+codypendent council result release-board
+codypendent council result <COUNCIL_RESULT_ID> --json
 codypendent council run release-board \
   --objective "Should this change ship, and what must be fixed first?"
 codypendent council run release-board --objective "..." --json
@@ -490,6 +546,13 @@ and the chair receives its own durable session/run, with the selected profile
 pinned explicitly. A failed participant is reported; a surviving quorum may
 continue. Responses, dossiers, concurrency, rounds, and time are bounded.
 `councils.toml` is written atomically with user-only permissions.
+
+Agent-initiated `council.create` and `council.run` calls always require a fresh,
+non-reusable approval because they change durable configuration or fan out paid
+model requests. Member reports are untrusted input: the chair prompt frames
+each report as evidence rather than instructions, and a retrieved synthesis is
+again labeled before another model consumes it. Every attempt receives a stable
+result id and persists completed member work even when quorum or the chair fails.
 
 The normal TUI includes the same creation flow. Press `/`, select
 `/council  Agent council`, and complete these pages:
@@ -505,7 +568,29 @@ first page). The final write is performed by the CLI host through the same
 validation and private atomic store as `codypendent council create`; the TUI
 renderer itself never performs filesystem I/O.
 
-### 4.7 Knowledge Index Maintenance (`codypendent index`)
+### 4.7 Learning Journey (`/journey`)
+
+Press `J` or choose `/journey  Learning review` in the palette. This surface is
+separate from the legacy Memory browser: it contains compact, governed facts or
+procedures that can improve a future run without retaining the whole transcript.
+
+| Key | Effect |
+| :--- | :--- |
+| `a` | Activate a reviewed proposal |
+| `r` | Reject it while retaining the audit record |
+| `p` | Pin or unpin the selected learning |
+| `e` | Edit through the same secret and quality policy as capture |
+| `d` | Open permanent-delete confirmation |
+
+Automatic capture accepts only explicit user preferences/corrections and a
+small allow-list of local verification commands that actually succeeded.
+Untrusted repository text, model inference, council synthesis, tool output, or
+external content can never auto-activate a learning. Greetings, generic run
+receipts, raw logs, temporary paths, URLs, and secret-shaped text are rejected.
+Every record carries scope, provenance, confidence, lifecycle state, expiry,
+and an optimistic revision so concurrent edits fail rather than overwrite.
+
+### 4.8 Knowledge Index Maintenance (`codypendent index`)
 
 ```bash
 # Rebuild Tantivy search and tree-sitter code graph indexes from SQLite

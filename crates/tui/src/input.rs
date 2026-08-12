@@ -18,6 +18,48 @@ use crate::action::Action;
 use crate::remote_ui::RemoteKey;
 use crate::state::{InputMode, Pane};
 
+/// Maximum text accepted from one bracketed paste. This is deliberately much
+/// larger than a normal prompt while still preventing a clipboard accident
+/// from allocating/rendering an unbounded composer draft.
+const MAX_PASTE_BYTES: usize = 64 * 1024;
+
+/// Normalize clipboard text at the terminal boundary: keep useful Unicode and
+/// multiline structure, normalize platform newlines, expand tabs to stable
+/// cells, and remove terminal/control/bidi characters that must never become
+/// invisible composer instructions. The byte cap always ends on a UTF-8
+/// boundary.
+fn sanitized_paste(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut clean = String::with_capacity(normalized.len().min(MAX_PASTE_BYTES));
+    for character in normalized.chars() {
+        let fragment = match character {
+            '\n' => "\n",
+            '\t' => "    ",
+            character
+                if character.is_control()
+                    || matches!(
+                        character as u32,
+                        0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069
+                    ) =>
+            {
+                continue;
+            }
+            character => {
+                if clean.len().saturating_add(character.len_utf8()) > MAX_PASTE_BYTES {
+                    break;
+                }
+                clean.push(character);
+                continue;
+            }
+        };
+        if clean.len().saturating_add(fragment.len()) > MAX_PASTE_BYTES {
+            break;
+        }
+        clean.push_str(fragment);
+    }
+    clean
+}
+
 /// One documented key binding. Feeds both the help overlay and the
 /// keyboard/mouse equivalence test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,9 +177,19 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: None,
     },
     KeyBinding {
-        keys: "n / p / r / c (Workflow)",
-        description: "start · pause/resume · retry from node · cancel workflow",
+        keys: "W · n / p / r / c",
+        description: "executable persisted workflow: open · run/create · pause · retry · cancel",
         mouse: Some("click a workflow control"),
+    },
+    KeyBinding {
+        keys: "B · n (Blackboard)",
+        description: "open the workflow evidence/decision/artifact stream · post a question",
+        mouse: Some("click post question"),
+    },
+    KeyBinding {
+        keys: "K · n · ← / → (Kanban)",
+        description: "open the repository task board · create a task · move its column",
+        mouse: Some("click create or a move control"),
     },
     KeyBinding {
         keys: "P (Docs)",
@@ -196,14 +248,16 @@ pub fn map_event(event: &Event, mode: InputMode, width: u16, hit_map: &[(Rect, A
         Event::Mouse(mouse) => map_mouse(mouse, mode, width, hit_map),
         // Bracketed paste lands in whichever text buffer is capturing: the
         // composer, a prompt, or the palette filter.
-        Event::Paste(text) if mode == InputMode::RemoteUi => Action::RemoteUiPaste(text.clone()),
+        Event::Paste(text) if mode == InputMode::RemoteUi => {
+            Action::RemoteUiPaste(sanitized_paste(text))
+        }
         Event::Paste(text)
             if matches!(
                 mode,
                 InputMode::Editing | InputMode::Composer | InputMode::Palette
             ) =>
         {
-            Action::InputPaste(text.clone())
+            Action::InputPaste(sanitized_paste(text))
         }
         Event::Resize(width, height) => Action::RemoteUiViewport {
             width: *width,
@@ -307,6 +361,7 @@ fn map_normal_char(c: char) -> Action {
         'r' => Action::Reject,
         'S' => Action::OpenSkills,
         'M' => Action::OpenMemory,
+        'J' => Action::OpenJourney,
         'o' => Action::OpenSource,
         'e' => Action::EditDoc,
         'i' => Action::InsertDocBlock,
@@ -328,6 +383,9 @@ fn map_normal_char(c: char) -> Action {
         // n/p/r/c); `d` is meaningful only while `/council` is open — the
         // reducer ignores it elsewhere.
         'd' => Action::DeleteCouncil,
+        // Result workbench: copy the exact focused chair synthesis. The
+        // reducer scopes this to that overlay, so `y` is inert elsewhere.
+        'y' => Action::CopyFocusedCard,
         'X' => Action::DeleteDocBlock,
         '/' => Action::OpenPalette,
         _ => Action::NoOp,
@@ -407,6 +465,11 @@ fn map_composer_key(key: &KeyEvent) -> Action {
         KeyCode::Down if ctrl(key) => Action::NextRun,
         KeyCode::Up if alt(key) => Action::BrowseFoldPrev,
         KeyCode::Down if alt(key) => Action::BrowseFoldNext,
+        KeyCode::Char('y') if alt(key) => Action::CopyFocusedCard,
+        KeyCode::Char('r') if alt(key) => Action::RetryFailedRun,
+        KeyCode::Char('a') if alt(key) => Action::ReauthenticateFailedModel,
+        KeyCode::Char('m') if alt(key) => Action::ChooseFailureModel,
+        KeyCode::Char('d') if alt(key) => Action::DisableFailureModel,
         // ↑/↓ move between the draft's own lines first and only recall history
         // at the draft's top/bottom edge (see `reduce::composer_up`).
         KeyCode::Up => Action::HistoryPrev,
@@ -466,6 +529,13 @@ fn map_mouse(
     _width: u16,
     hit_map: &[(Rect, Action)],
 ) -> Action {
+    // Mouse tracking makes rows clickable, but Shift is the conventional
+    // terminal-native selection modifier. Never turn a Shift press/drag into
+    // an application action; supported terminals intercept it for ordinary
+    // selection/copy, and the NoOp fallback remains safe elsewhere.
+    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+        return Action::NoOp;
+    }
     match mode {
         // A text prompt / confirm captures nothing from the mouse.
         InputMode::Editing | InputMode::Confirm => Action::NoOp,
@@ -736,6 +806,50 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_paste_is_multiline_sanitized_and_bounded() {
+        assert_eq!(
+            map_event(
+                &Event::Paste("first\r\nsecond\t\u{1b}[31m\u{202e}ok".to_owned()),
+                InputMode::Composer,
+                W,
+                &[],
+            ),
+            Action::InputPaste("first\nsecond    [31mok".to_owned())
+        );
+
+        let oversized = format!("{}🚀tail", "x".repeat(MAX_PASTE_BYTES + 32));
+        let Action::InputPaste(pasted) =
+            map_event(&Event::Paste(oversized), InputMode::Composer, W, &[])
+        else {
+            panic!("composer paste must remain paste input")
+        };
+        assert!(pasted.len() <= MAX_PASTE_BYTES);
+        assert!(std::str::from_utf8(pasted.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn shift_mouse_gestures_are_reserved_for_native_text_selection() {
+        let map = vec![(Rect::new(0, 0, 40, 10), Action::ActivateRow(3))];
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let event = Event::Mouse(MouseEvent {
+                kind,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::SHIFT,
+            });
+            assert_eq!(
+                map_event(&event, InputMode::Composer, W, &map),
+                Action::NoOp,
+                "Shift selection must never activate transcript rows"
+            );
+        }
+    }
+
+    #[test]
     fn confirm_mode_yes_no() {
         assert_eq!(
             map_event(&ch('y'), InputMode::Confirm, W, &[]),
@@ -936,6 +1050,18 @@ mod tests {
             map_event(&alt(KeyCode::Enter), InputMode::Composer, W, &[]),
             Action::InputNewline
         );
+        for (key, action) in [
+            ('y', Action::CopyFocusedCard),
+            ('r', Action::RetryFailedRun),
+            ('a', Action::ReauthenticateFailedModel),
+            ('m', Action::ChooseFailureModel),
+            ('d', Action::DisableFailureModel),
+        ] {
+            assert_eq!(
+                map_event(&alt(KeyCode::Char(key)), InputMode::Composer, W, &[]),
+                action
+            );
+        }
     }
 
     /// The composer is a real text field: motion and word/line kill keys map

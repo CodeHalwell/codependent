@@ -427,6 +427,14 @@ enum CouncilCommand {
         #[arg(long)]
         last: bool,
     },
+    /// Retrieve a durable council outcome by result id, or the latest outcome
+    /// for a council name. Council results are not workflow/blackboard items.
+    Result {
+        /// A terminal `result ID`, or a configured council name.
+        selector: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a council definition. Its prior durable sessions remain.
     Remove { name: String },
     /// Run member deliberation in parallel, then ask the chair to synthesize.
@@ -1259,6 +1267,9 @@ async fn main() -> anyhow::Result<()> {
             CouncilCommand::Show { name, json, last } => {
                 codypendent_cli::council::show(&paths, &name, json, last)
             }
+            CouncilCommand::Result { selector, json } => {
+                codypendent_cli::council::show_result(&paths, &selector, json)
+            }
             CouncilCommand::Remove { name } => codypendent_cli::council::remove(&paths, &name),
             CouncilCommand::Run {
                 name,
@@ -1467,6 +1478,21 @@ mod tests {
             run.command,
             Some(TopCommand::Council {
                 command: CouncilCommand::Run { json: true, .. }
+            })
+        ));
+
+        let result = Cli::try_parse_from([
+            "codypendent",
+            "council",
+            "result",
+            "019ff6cd-c6a6-7572-a91c-3c3caadd05a0",
+            "--json",
+        ])
+        .expect("council result must parse");
+        assert!(matches!(
+            result.command,
+            Some(TopCommand::Council {
+                command: CouncilCommand::Result { json: true, .. }
             })
         ));
     }

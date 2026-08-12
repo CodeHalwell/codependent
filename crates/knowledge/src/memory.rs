@@ -454,6 +454,9 @@ fn memory_is_retained(record: &MemoryRecord, now: DateTime<Utc>) -> bool {
 }
 
 fn low_value_memory_reason(class: MemoryClass, statement: &str) -> Option<String> {
+    if let Some(reason) = crate::learning::strict_text_rejection_reason(statement) {
+        return Some(reason);
+    }
     let lower = statement.trim().to_ascii_lowercase();
     let automatic_run_breadcrumb = class == MemoryClass::Episodic
         && ((lower.starts_with("run ")

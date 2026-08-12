@@ -14,8 +14,9 @@ use codypendent_protocol::{
 
 use crate::remote_ui::RemoteKey;
 use crate::state::{
-    AddModelRow, BlackboardItemCard, DocBlockView, DocSuggestionView, KanbanCard, KeyStatus,
-    ModelListOrigin, Pane, UnslothQuantCard, UnslothRepoCard,
+    AddModelRow, BlackboardItemCard, CouncilProgressPhase, CouncilRunSummary, DocBlockView,
+    DocSuggestionView, KanbanCard, KeyStatus, ModelListOrigin, Pane, UnslothQuantCard,
+    UnslothRepoCard,
 };
 
 /// One live workflow-node projection carried from the socket-owning harness to
@@ -52,10 +53,30 @@ pub enum Action {
     /// A transient status-line notice from the harness (e.g. a rejected
     /// command's code + message). Cleared automatically a few seconds later.
     Notice(String),
+    /// Open (or explicitly reopen) first-run setup at its triage screen. Used by
+    /// both the post-splash gate and the zero-runnable Chat CTA.
+    OpenOnboard,
+    /// Replace the harness-authoritative set of model profiles that can start a
+    /// run without another setup/auth step. `onboard_attempt` correlates the
+    /// refresh caused by one onboarding `AddModel`; only a matching runnable id
+    /// may complete and persist onboarding. Boot/background refreshes use None.
+    RunnableModelsRefreshed {
+        model_ids: Vec<codypendent_protocol::ModelId>,
+        onboard_attempt: Option<codypendent_protocol::ModelId>,
+    },
+    /// Persistence/connection failed before the host could perform a runnable
+    /// refresh. Correlated by model id so an old ACP/write failure cannot kick a
+    /// newer onboarding attempt backwards.
+    OnboardModelAddFailed {
+        model_id: codypendent_protocol::ModelId,
+        reason: String,
+    },
     /// The daemon rejected the exact in-flight first-run command. The reducer
     /// clears its admission guard and restores the submitted draft instead of
     /// leaving the composer blank or silently reopening admission.
-    RunStartRejected { reason: String },
+    RunStartRejected {
+        reason: String,
+    },
     /// Push-to-talk capture started (`true`) or stopped (`false`), reported by
     /// the CLI's voice host (voice v1, rubric 8). Purely presentational: it
     /// drives the status-line recording indicator so a hot microphone is always
@@ -91,12 +112,17 @@ pub enum Action {
         binding: Box<UiActionBinding>,
     },
     /// Advertise a changed terminal viewport.
-    RemoteUiViewport { width: u16, height: u16 },
+    RemoteUiViewport {
+        width: u16,
+        height: u16,
+    },
     /// Authoritative lifecycle rows returned by a host-owned plugin command.
     UiPluginsLoaded(Vec<codypendent_protocol::UiPluginLifecycleStatus>),
     /// The daemon created a document. The reducer refreshes the Docs projection
     /// so the new row lands in the tree instead of dropping this reply.
-    DocumentCreated { document_id: DocumentId },
+    DocumentCreated {
+        document_id: DocumentId,
+    },
     /// A document publish plan is durably parked for approval. Unlike a notice,
     /// this preserves every field the ordinary approval card needs, including
     /// the originating document id correlated by the CLI command host.
@@ -115,11 +141,19 @@ pub enum Action {
     },
     /// Council persistence failed. The reducer keeps the reviewed draft open so
     /// the operator can go back, correct it, and retry without starting over.
-    CouncilCreateFailed { name: String, error: String },
+    CouncilCreateFailed {
+        name: String,
+        error: String,
+    },
     /// The CLI host removed a council definition. Its saved run reports remain.
-    CouncilDeleted { name: String },
+    CouncilDeleted {
+        name: String,
+    },
     /// Council removal failed (e.g. the store could not be rewritten).
-    CouncilDeleteFailed { name: String, error: String },
+    CouncilDeleteFailed {
+        name: String,
+        error: String,
+    },
     /// One pre-formatted progress line from an off-thread council run (a round
     /// starting, a member completing/failing, or the chair beginning
     /// synthesis), pre-formatted host-side since this dependency-free crate
@@ -127,6 +161,9 @@ pub enum Action {
     /// into the active run's transcript as a Note.
     CouncilProgress {
         name: String,
+        result_id: String,
+        phase: CouncilProgressPhase,
+        occurred_at: String,
         message: String,
         /// Council members/chair currently executing as independent agent runs.
         /// Kept explicit so shared UI telemetry treats council workers and
@@ -139,8 +176,11 @@ pub enum Action {
     /// partial report path the run managed to save).
     CouncilRunFinished {
         name: String,
-        result: Result<Box<crate::state::CouncilRunSummary>, String>,
+        result: Result<Box<CouncilRunSummary>, String>,
     },
+    /// Replace the dedicated result-browser projection from durable storage.
+    CouncilResultsLoaded(Vec<CouncilRunSummary>),
+    CouncilResultsFailed(String),
 
     // --- navigation (from keys / mouse) ---
     /// Move keyboard focus to the next pane (`Tab`).
@@ -192,6 +232,19 @@ pub enum Action {
     /// Move the transcript fold selection to the next foldable entry
     /// (`Alt-↓`). Client-only.
     BrowseFoldNext,
+    /// Copy the exact safe projection of the browsed transcript card. The
+    /// harness owns the clipboard; failures use the same redacted text shown
+    /// on screen, never the raw provider payload.
+    CopyFocusedCard,
+    /// Retry the failed selected run with its original objective/model/mode.
+    RetryFailedRun,
+    /// Open the masked auth editor for the failed model when applicable.
+    ReauthenticateFailedModel,
+    /// Open the model picker from a failed card so routing can be switched.
+    ChooseFailureModel,
+    /// Disable/remove the failed configured profile through the ordinary
+    /// guarded model-removal confirmation.
+    DisableFailureModel,
 
     // --- run control ---
     /// Switch the conversation to the previous run (`Ctrl-↑`).
@@ -260,6 +313,8 @@ pub enum Action {
     OpenSkills,
     /// Toggle the memory browser (`M`).
     OpenMemory,
+    /// Open the curated learning journey/review surface.
+    OpenJourney,
     /// Reveal the focused memory's source in full (`o`, or `Enter` in the memory
     /// browser). The TUI does no I/O, so this surfaces the source string rather
     /// than opening a file.
@@ -399,7 +454,10 @@ pub enum Action {
     /// the replacement a move produced. A card carrying a supersession is dropped
     /// rather than merged: its replacement arrives as its own delivery, so the
     /// board never shows both revisions of one card.
-    BoardCardUpdated { card: KanbanCard, superseded: bool },
+    BoardCardUpdated {
+        card: KanbanCard,
+        superseded: bool,
+    },
 
     /// A provider's model list, fetched (or cache-seeded) by the harness
     /// (client-only add-model flow). Folds into the in-flight
@@ -420,7 +478,10 @@ pub enum Action {
     /// free-text `Overlay::AddModelId` fallback (carrying any already-entered
     /// key). A failure with catalog rows available arrives as
     /// `ProviderModelsLoaded` with a `Catalog` origin instead.
-    ProviderModelsFailed { provider_id: String, reason: String },
+    ProviderModelsFailed {
+        provider_id: String,
+        reason: String,
+    },
     /// The result of a one-shot `/keys` key verification (`Ctrl-T`): a single
     /// `/models` call against the model's endpoint with the stored key.
     /// `reason` is key-free. Upgrades that model's card readiness from
@@ -449,7 +510,10 @@ pub enum Action {
     },
     /// The quant-variant listing failed. `repo_id` guards exactly like
     /// [`Action::UnslothQuantsLoaded`].
-    UnslothQuantsFailed { repo_id: String, reason: String },
+    UnslothQuantsFailed {
+        repo_id: String,
+        reason: String,
+    },
     /// One parsed line of `ollama pull` output. Appended to the in-flight
     /// `Overlay::UnslothPulling` only when `repo_id`/`quant` still match (a
     /// late line after the operator dismissed the overlay is dropped).
@@ -563,6 +627,7 @@ pub enum KeyTarget {
 pub enum ProjectionKind {
     Skills,
     Memory,
+    Journey,
     Docs,
     Workflow,
 }
@@ -701,6 +766,13 @@ pub enum Intent {
     RefreshProjection {
         kind: ProjectionKind,
     },
+    /// Apply one local governed-learning mutation. The CLI validates the
+    /// optimistic revision and refreshes the projection after success.
+    MutateLearning {
+        id: String,
+        revision: u64,
+        mutation: LearningMutation,
+    },
 
     // --- durable workflow control + live observation ---
     /// Start the named workflow from the repository/user workflow registry.
@@ -740,6 +812,15 @@ pub enum Intent {
     MoveBoardCard {
         item_id: String,
         status: String,
+    },
+    /// Create one operator-authored task in the repository Kanban board.
+    CreateBoardCard {
+        title: String,
+    },
+    /// Post an operator-authored open question to a workflow Blackboard.
+    PostBlackboardQuestion {
+        workflow_run_id: String,
+        text: String,
     },
 
     /// Add a usable model from the TUI (client-only — NOT a daemon command). The
@@ -800,6 +881,11 @@ pub enum Intent {
     SetTheme {
         id: String,
     },
+    /// Persist successful first-run setup. Emitted only after a correlated,
+    /// authoritative runnable-model refresh confirms the submitted profile.
+    SetOnboardComplete,
+    /// Persist the explicit "skip forever" choice from the onboarding shell.
+    SetOnboardSkipped,
     /// Set (or replace) an API key from the `/keys` overlay (D1; client-only —
     /// NOT a daemon command, keeping the key off the wire exactly like
     /// `AddModel`). The harness writes it to `auth.json` (load-before-write,
@@ -844,6 +930,15 @@ pub enum Intent {
         name: String,
         objective: String,
     },
+    /// Read council outcomes only from the durable council store. `None` loads
+    /// the newest result for every council; a selector is a council name or id.
+    LoadCouncilResults {
+        selector: Option<String>,
+    },
+    /// Ask the host terminal to put exact report text on the clipboard.
+    CopyText {
+        text: String,
+    },
     /// Create and attach to a fresh session without leaving the TUI. Client-only:
     /// the harness creates the session, swaps this connection's attachment, and
     /// updates the repo→session continuity store while the old run continues.
@@ -869,6 +964,15 @@ pub enum Intent {
         repo_id: String,
         quant: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LearningMutation {
+    Activate,
+    Reject,
+    SetPinned(bool),
+    EditStatement(String),
+    Delete,
 }
 
 #[cfg(test)]

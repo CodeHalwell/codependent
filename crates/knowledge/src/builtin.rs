@@ -172,6 +172,92 @@ pub fn builtin_tools() -> Vec<RegistryItem> {
             ],
             Vec::new(),
         ),
+        // Durable coordination tools already implemented by the runtime. These
+        // registry cards make natural-language chat retrieval surface the same
+        // typed capabilities as the TUI; agents should use them instead of
+        // telling the operator to open a pane.
+        tool(
+            "workflow.query",
+            "Inspect a persisted executable workflow run: list recent repository runs, or read one run's DAG, node state, dependencies, and cost. This reads coordination state; it does not create or start a workflow.",
+            &[
+                "show workflow progress",
+                "inspect the executable workflow graph",
+                "list recent workflow runs",
+            ],
+            &["workflow", "query", "dag", "graph", "persisted", "run"],
+            Vec::new(),
+        ),
+        tool(
+            "workflow.create",
+            "Create and compile a structured workflow manifest, preview it for explicit approval, then atomically save it in the user's workflow library. The tool accepts typed fields, never raw YAML or an arbitrary path.",
+            &[
+                "create a workflow",
+                "save an automation",
+                "turn this process into a reusable workflow",
+            ],
+            &["workflow", "create", "automation", "manifest", "persist"],
+            Vec::new(),
+        ),
+        tool(
+            "workflow.run",
+            "Start a named saved workflow or a structured inline workflow in the current repository. The validated launch is explicitly approval-gated and returns a durable run id for workflow.query.",
+            &[
+                "run the workflow",
+                "start an automation",
+                "execute this workflow here",
+            ],
+            &["workflow", "run", "start", "automation", "durable"],
+            Vec::new(),
+        ),
+        tool(
+            "task.create",
+            "Create a typed task card on the repository Kanban board. Gather the title and any assignee/status first; the policy trace previews the board write before persistence.",
+            &["create a Kanban task", "add this to the backlog", "make a task card"],
+            &["task", "create", "kanban", "board", "backlog"],
+            Vec::new(),
+        ),
+        tool(
+            "task.update",
+            "Update a repository Kanban task's title, description, assignee, or ordering through a typed, policy-traced supersession.",
+            &["edit a task", "assign a Kanban card", "update the backlog item"],
+            &["task", "update", "kanban", "assign", "board"],
+            Vec::new(),
+        ),
+        tool(
+            "task.move",
+            "Move a repository Kanban task between todo, doing, review, or done while preserving its revision history.",
+            &["move the task to doing", "mark the card done", "advance a Kanban task"],
+            &["task", "move", "kanban", "status", "column"],
+            Vec::new(),
+        ),
+        tool(
+            "task.list",
+            "List the repository Kanban task board. This is distinct from a Workflow DAG and from a workflow Blackboard evidence stream.",
+            &["show the Kanban board", "list backlog tasks", "what work is in progress"],
+            &["task", "list", "kanban", "board", "backlog"],
+            Vec::new(),
+        ),
+        tool(
+            "council.create",
+            "Create a persisted multi-model agent council from typed member model/role pairs, chair, rounds, and evidence mode. Missing fields must be gathered first; a policy preview requires explicit approval before persistence.",
+            &["create an agent council", "assemble models to deliberate", "save a review council"],
+            &["council", "create", "models", "collaboration", "deliberation"],
+            Vec::new(),
+        ),
+        tool(
+            "council.run",
+            "Run a named persisted agent council for an objective. Fan-out model requests are previewed for explicit approval; the result is persisted with a stable id and report link.",
+            &["ask the council", "run the agent council", "have multiple models deliberate"],
+            &["council", "run", "models", "deliberation", "result"],
+            Vec::new(),
+        ),
+        tool(
+            "council.result",
+            "Retrieve a durable council result by stable result id or council name (latest), including its persisted report link.",
+            &["show the council result", "open the latest council report", "retrieve council synthesis"],
+            &["council", "result", "report", "synthesis", "retrieve"],
+            Vec::new(),
+        ),
         // The smarter-memory M2 core tool: an agent's only way to save a fact in its
         // own words. Its only effect is a `NoteAppended` on the run's own ledger — not
         // the filesystem, a command, the network, or a secret — so it requests no
@@ -320,5 +406,39 @@ fn tool(
         executable: true,
         created_at: now,
         updated_at: now,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coordination_tools_are_discoverable_with_distinct_language() {
+        let tools = builtin_tools();
+        let find = |name: &str| {
+            tools
+                .iter()
+                .find(|item| item.name == name)
+                .unwrap_or_else(|| panic!("missing built-in `{name}`"))
+        };
+        assert!(find("workflow.query")
+            .description
+            .contains("executable workflow"));
+        for name in ["task.create", "task.update", "task.move", "task.list"] {
+            assert!(find(name)
+                .keywords
+                .iter()
+                .any(|keyword| keyword == "kanban"));
+        }
+        for name in ["council.create", "council.run", "council.result"] {
+            assert!(find(name)
+                .keywords
+                .iter()
+                .any(|keyword| keyword == "council"));
+        }
+        assert!(find("blackboard.post")
+            .description
+            .contains("typed artifact"));
     }
 }

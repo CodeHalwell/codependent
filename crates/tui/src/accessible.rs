@@ -12,9 +12,10 @@ use crate::action::Action;
 use crate::input::KEY_BINDINGS;
 use crate::remote_ui::{project_accessibility, render_remote_ui, RemoteKey, RemoteUiRenderOptions};
 use crate::state::{
-    filter_council_member_models, filter_models, filter_modes, filter_providers, AppState,
-    CouncilBuilderStep, InputMode, ModelReadiness, Overlay, RunActivity, TranscriptEntry,
-    MODE_CARDS,
+    filter_council_member_models, filter_model_names, filter_models, filter_modes,
+    filter_onboard_providers, filter_providers, AppState, CouncilBuilderStep, InputMode,
+    ModelListOrigin, ModelReadiness, OnboardProviderClass, OnboardStep, Overlay, RunActivity,
+    TranscriptEntry, MODE_CARDS,
 };
 use crate::Theme;
 
@@ -38,6 +39,19 @@ pub fn accessible_snapshot(state: &AppState) -> String {
 
     if state.runs.is_empty() {
         lines.push("Conversation: no runs yet".to_owned());
+        if !state.has_runnable_models() {
+            lines.push(if state.models.is_empty() {
+                "Setup required: no model is configured. A verified model is required to start a run."
+                    .to_owned()
+            } else {
+                "Setup required: saved models exist, but none is runnable. A credential, endpoint, or supported adapter may be missing."
+                    .to_owned()
+            });
+            lines.push(
+                "Setup control: submit an empty composer to open guided model setup, or enter slash for all commands."
+                    .to_owned(),
+            );
+        }
     } else {
         lines.push(format!(
             "Conversation: {} run(s); selected {}",
@@ -70,7 +84,7 @@ pub fn accessible_snapshot(state: &AppState) -> String {
                 }
             }
             for entry in &run.transcript {
-                append_transcript(&mut lines, entry);
+                append_transcript(&mut lines, entry, run.model.as_ref());
             }
         }
     }
@@ -129,17 +143,21 @@ fn refresh_remote_ui_render_cache(state: &AppState) {
     }
 }
 
-fn append_transcript(lines: &mut Vec<String>, entry: &TranscriptEntry) {
+fn append_transcript(
+    lines: &mut Vec<String>,
+    entry: &TranscriptEntry,
+    model: Option<&codypendent_protocol::ModelId>,
+) {
     match entry {
         TranscriptEntry::User { text } => lines.push(format!("You: {}", clean(text))),
         TranscriptEntry::Model { text, .. } => {
             lines.push(format!("Assistant: {}", clean(text)));
         }
         TranscriptEntry::Tool(tool) => {
-            let status = if tool.outcome.is_some() {
-                "completed"
-            } else {
-                "running"
+            let status = match tool.status {
+                crate::state::ToolStatus::Proposed => "awaiting review",
+                crate::state::ToolStatus::Running => "running",
+                crate::state::ToolStatus::Completed => "completed",
             };
             let label = tool
                 .label
@@ -147,6 +165,13 @@ fn append_transcript(lines: &mut Vec<String>, entry: &TranscriptEntry) {
                 .map(|label| format!("; {}", clean(label)))
                 .unwrap_or_default();
             lines.push(format!("Tool: {}; {status}{label}", clean(&tool.tool)));
+            if let Some(codypendent_protocol::ToolOutcome::Failed { message }) = &tool.outcome {
+                lines.push(format!(
+                    "Tool failure: {}",
+                    crate::state::sanitize_failure_text(message)
+                ));
+            }
+            lines.push("Tool card controls: browse with alt up or alt down; alt Enter expands; alt Y copies its safe projection.".to_owned());
         }
         TranscriptEntry::Patch(patch) => lines.push(format!(
             "Patch: {} file(s), {} additions, {} deletions",
@@ -170,7 +195,25 @@ fn append_transcript(lines: &mut Vec<String>, entry: &TranscriptEntry) {
                 clean(summary.as_deref().unwrap_or("success"))
             )),
             RunDisposition::Failed { reason } => {
-                lines.push(format!("Failed: {}", clean(reason)));
+                if let Some(failure) = crate::state::acp_failure_summary(model, reason) {
+                    lines.push(format!(
+                        "ACP failure: provider {}; model {}; phase {}; cause {}",
+                        clean(&failure.provider),
+                        clean(&failure.model),
+                        failure.phase,
+                        clean(&failure.cause)
+                    ));
+                    lines.push(format!(
+                        "ACP recovery controls: alt R retries; {}alt M chooses another model; diagnostics opens setup diagnostics; alt D disables the configured profile; alt Y copies this safe card.",
+                        if failure.auth_related { "alt A explains re-authentication; " } else { "" }
+                    ));
+                } else {
+                    lines.push(format!(
+                        "Failed: {}",
+                        crate::state::sanitize_failure_text(reason)
+                    ));
+                    lines.push("Failure controls: alt R retries; alt M chooses another model; diagnostics opens setup diagnostics; alt Y copies this safe card.".to_owned());
+                }
             }
             RunDisposition::Cancelled { reason } => lines.push(format!(
                 "Cancelled: {}",
@@ -288,6 +331,85 @@ fn append_remote_ui(lines: &mut Vec<String>, state: &AppState) {
 fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
     match &state.overlay {
         Overlay::None => {}
+        Overlay::Onboard { step } => match step {
+            OnboardStep::Triage { selected } => {
+                lines.push("Model setup: choose a connection route. Nothing is saved until a provider and model are selected.".to_owned());
+                let rows = vec![
+                    "Hosted API; use a provider API key from the environment or save one locally"
+                        .to_owned(),
+                    "Local endpoint; connect Ollama, LM Studio, or vLLM already running on this machine"
+                        .to_owned(),
+                    "ACP coding agent; connect an installed agent such as Claude Code, Codex, Kimi, Amp, or Cline"
+                        .to_owned(),
+                ];
+                append_picker_rows(lines, "connection route", rows, *selected);
+                lines.push(
+                    "Setup controls: up or down selects a route, Enter continues, Esc opens skip choices."
+                        .to_owned(),
+                );
+            }
+            OnboardStep::SkipConfirm { selected } => {
+                lines.push("Skip model setup? Codypendent cannot start agent runs without a runnable model.".to_owned());
+                let rows = vec![
+                    "Skip future startup setup; do not open setup automatically again"
+                        .to_owned(),
+                    "Continue setup; return to the connection routes".to_owned(),
+                    "Cancel; return to setup without changing providers, models, or credentials"
+                        .to_owned(),
+                ];
+                append_picker_rows(lines, "skip choice", rows, *selected);
+                lines.push(
+                    "Skip controls: up or down selects, Enter chooses, Esc returns to setup."
+                        .to_owned(),
+                );
+            }
+            OnboardStep::Validating { model_id } => {
+                lines.push(format!(
+                    "Model setup validating: {}. The profile was saved; credentials, protocol support, and availability are being checked.",
+                    clean(&model_id.0)
+                ));
+                lines.push(
+                    "Setup completes only when this exact model can start a run. Please wait; this operation cannot be cancelled safely."
+                        .to_owned(),
+                );
+            }
+        },
+        Overlay::OnboardProviderPicker {
+            class,
+            query,
+            selected,
+        } => {
+            let label = onboard_class_accessible_label(*class);
+            lines.push(format!(
+                "Model setup, {label} providers: query {}. Only providers in this connection route are shown.",
+                clean(query)
+            ));
+            let rows = filter_onboard_providers(&state.providers, *class, query)
+                .into_iter()
+                .filter_map(|index| state.providers.get(index))
+                .map(|card| {
+                    format!(
+                        "{} ({}); protocol {}; authentication {}; model discovery {}",
+                        clean(&card.name),
+                        clean(&card.id),
+                        clean(&card.protocol),
+                        clean(&card.auth),
+                        if card.can_list_models {
+                            "live listing"
+                        } else if card.catalog_models > 0 {
+                            "catalog"
+                        } else {
+                            "manual model name"
+                        }
+                    )
+                })
+                .collect();
+            append_picker_rows(lines, "setup provider", rows, *selected);
+            lines.push(
+                "Provider controls: type text to filter, up or down selects, Enter opens model discovery, Esc returns to connection routes."
+                    .to_owned(),
+            );
+        }
         Overlay::Help => {
             lines.push("Help:".to_owned());
             lines.extend(KEY_BINDINGS.iter().map(|binding| {
@@ -298,22 +420,43 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
                 )
             }));
         }
-        Overlay::Palette { query, selected } => lines.push(format!(
-            "Command palette: query {}; selected result {}",
-            clean(query),
-            selected + 1
-        )),
+        Overlay::Palette { query, selected } => {
+            lines.push(format!("Command palette: query {}", clean(query)));
+            let rows = crate::palette::filtered(query)
+                .into_iter()
+                .map(|entry| {
+                    let shortcut = if entry.key == "—" {
+                        "no direct shortcut".to_owned()
+                    } else {
+                        format!("shortcut {}", clean(entry.key))
+                    };
+                    format!(
+                        "{}; {}; {}",
+                        clean(entry.title),
+                        clean(entry.description),
+                        shortcut
+                    )
+                })
+                .collect();
+            append_picker_rows(lines, "command", rows, *selected);
+        }
         Overlay::ModelPicker { query, selected } => {
             lines.push(format!("Model picker: query {}", clean(query)));
             let rows = filter_models(&state.models, query)
                 .into_iter()
                 .filter_map(|index| state.models.get(index))
                 .map(|card| {
+                    let kind = if card.acp_supplier().is_some() {
+                        "ACP supplier; Enter connects, tests, and browses its live models"
+                    } else {
+                        "concrete configured model; Enter stages it"
+                    };
                     format!(
-                        "{}; provider {}; {}",
+                        "{}; provider {}; {}; {}",
                         clean(&card.id.0),
                         clean(&card.provider),
-                        model_readiness_label(&card.readiness)
+                        model_readiness_label(&card.readiness),
+                        kind
                     )
                 })
                 .collect();
@@ -339,6 +482,53 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
                 })
                 .collect();
             append_picker_rows(lines, "provider", rows, *selected);
+            lines.push(
+                "Provider control: Enter continues to step 2, the concrete model catalogue."
+                    .to_owned(),
+            );
+        }
+        Overlay::AddModelPick {
+            provider_id,
+            models,
+            query,
+            selected,
+            origin,
+            refreshing,
+            ..
+        } => {
+            let source = match origin {
+                ModelListOrigin::Live => "live supplier listing".to_owned(),
+                ModelListOrigin::Cached(age) => format!("cached supplier listing, {age}"),
+                ModelListOrigin::Catalog(reason) if reason.is_empty() => {
+                    "curated catalogue".to_owned()
+                }
+                ModelListOrigin::Catalog(reason) => {
+                    format!("curated catalogue because {}", clean(reason))
+                }
+            };
+            lines.push(format!(
+                "Choose model, step 2 of 2, provider {}; source {}{}; query {}",
+                clean(provider_id),
+                source,
+                if *refreshing { "; retry in progress" } else { "" },
+                clean(query)
+            ));
+            let rows = filter_model_names(models, query)
+                .into_iter()
+                .filter_map(|index| models.get(index))
+                .map(|row| {
+                    format!(
+                        "{}; {}; context {}; input cost {}; output cost {}",
+                        clean(&row.id),
+                        if row.live { "live" } else { "catalogue only" },
+                        row.context_tokens.map_or("unknown".to_owned(), |value| value.to_string()),
+                        row.cost_per_1m_input_usd.map_or("unknown".to_owned(), |value| format!("${value} per million")),
+                        row.cost_per_1m_output_usd.map_or("unknown".to_owned(), |value| format!("${value} per million")),
+                    )
+                })
+                .collect();
+            append_picker_rows(lines, "supplier model", rows, *selected);
+            lines.push("Model controls: arrows, page, Home, or End move; Enter adds the concrete model; control R reconnects and tests the supplier; Escape closes.".to_owned());
         }
         Overlay::ModePicker { query, selected } => {
             lines.push(format!("Mode picker: query {}", clean(query)));
@@ -354,6 +544,43 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
         }
         Overlay::Steering(buffer) => {
             lines.push(format!("Steering prompt: {}", clean(buffer)));
+        }
+        Overlay::KanbanNew { buffer } => lines.push(format!(
+            "Create Kanban task. Title: {}. Example: Add a regression test for ACP reconnects.",
+            clean(buffer)
+        )),
+        Overlay::BlackboardPost {
+            workflow_run_id,
+            buffer,
+        } => lines.push(format!(
+            "Post open question to Blackboard run {}: {}",
+            clean(workflow_run_id),
+            clean(buffer)
+        )),
+        Overlay::Workflow => {
+            lines.push(format!(
+                "Executable persisted workflow graph: {} nodes.",
+                state.workflow.len()
+            ));
+            if state.workflow.is_empty() {
+                lines.push("No workflow manifests. Press n to draft an inspect, implement, verify example; review it before sending.".to_owned());
+            } else {
+                lines.push("Press n to run the selected workflow; p pauses, r retries, c cancels.".to_owned());
+            }
+        }
+        Overlay::Blackboard => {
+            lines.push(format!(
+                "Blackboard evidence, decision, and artifact stream: {} items.",
+                state.blackboard.len()
+            ));
+            lines.push("Press n to post an open question. A workflow run is required; council handoff is never automatic.".to_owned());
+        }
+        Overlay::Kanban => {
+            lines.push(format!(
+                "Kanban repository task board: {} cards.",
+                state.kanban.len()
+            ));
+            lines.push("Press n to create a task; left or right moves the selected card between columns.".to_owned());
         }
         Overlay::ConfirmCancel => lines.push("Confirmation: cancel this run?".to_owned()),
         Overlay::ConfirmWorkflowCancel { workflow_run_id } => lines.push(format!(
@@ -374,7 +601,7 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
         Overlay::ConfirmModelRemove {
             model_id, provider, ..
         } => lines.push(format!(
-            "Confirmation: remove configured model {} (provider {}) and its model-specific saved key? The provider catalogue remains available.",
+            "Confirmation: remove user-configured model {} (provider {}) and its model-specific saved key? Comments and ordering in models.toml, and the provider catalogue, remain available.",
             clean(model_id),
             clean(provider)
         )),
@@ -397,6 +624,59 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
                     }
                 ));
             }
+        }
+        Overlay::CouncilResults => {
+            lines.push(format!(
+                "Council results: {} durable outcome(s).",
+                state.council_results.len()
+            ));
+            if let Some(result) = state.focused_council_result() {
+                lines.push(format!(
+                    "{} council result {}; handle {}; started {}; finished {}; repository {}; origin session {}.",
+                    clean(&result.status), clean(&result.council), clean(&result.result_id),
+                    clean(&result.started_at), clean(&result.finished_at), clean(&result.repository),
+                    clean(result.origin_session_id.as_deref().unwrap_or("none")),
+                ));
+                lines.push(format!("Objective: {}", clean(&result.objective)));
+                lines.push(format!("Chair synthesis: {}", clean(&result.synthesis)));
+                for warning in &result.warnings {
+                    lines.push(format!("Warning: {}", clean(warning)));
+                }
+                if state.council_result_expanded {
+                    for round in &result.rounds {
+                        lines.push(format!("Round {}.", round.round));
+                        for member in &round.members {
+                            lines.push(format!(
+                                "Member {} using {}; session {}; run {}; report: {}",
+                                clean(&member.role), clean(&member.model), clean(&member.session_id),
+                                clean(&member.run_id), clean(&member.response)
+                            ));
+                        }
+                        for failure in &round.failures {
+                            lines.push(format!("Member failure: {}", clean(failure)));
+                        }
+                    }
+                }
+                lines.push("Press Enter to expand member reports; type copy to copy the full chair synthesis; Escape closes.".to_owned());
+            }
+        }
+        Overlay::Journey => {
+            lines.push(format!("Learning journey: {} useful curated entries; {} awaiting review.", state.learnings.len(), state.pending_learning_review));
+            let rows = state.learnings.iter().map(|card| format!(
+                "{}; {}; {}; scope {}; confidence {:.2}; provenance {}{}",
+                clean(&card.statement), clean(&card.state), clean(&card.kind), clean(&card.scope),
+                card.confidence, clean(&card.provenance), if card.pinned { "; pinned" } else { "" }
+            )).collect();
+            append_picker_rows(lines, "learning", rows, state.selected_learning);
+            lines.push("Learning controls: a activates; r rejects; p pins or unpins; e edits; d asks before permanent deletion; Escape closes. Raw logs, tool output, URLs, and secrets are not exposed.".to_owned());
+        }
+        Overlay::LearningEdit { buffer, .. } => {
+            lines.push(format!("Edit curated learning: {}", clean(buffer)));
+            lines.push("Edit controls: Enter saves through learning policy; Escape returns without changing it.".to_owned());
+        }
+        Overlay::ConfirmLearningDelete { label, .. } => {
+            lines.push(format!("Permanently delete learning: {}. The learning store has no undo.", clean(label)));
+            lines.push("Delete controls: Enter or y confirms; Escape cancels.".to_owned());
         }
         Overlay::CouncilBuilder(builder) => {
             lines.push(format!(
@@ -528,12 +808,19 @@ fn model_readiness_label(readiness: &ModelReadiness) -> &'static str {
 
 fn overlay_name(overlay: &Overlay) -> &'static str {
     match overlay {
+        Overlay::Onboard { .. } => "guided model setup",
+        Overlay::OnboardProviderPicker { .. } => "guided provider picker",
         Overlay::Issues => "setup and diagnostics",
         Overlay::Skills => "skills",
         Overlay::Memory { .. } => "memory",
+        Overlay::Journey => "learning journey",
+        Overlay::LearningEdit { .. } => "edit curated learning",
+        Overlay::ConfirmLearningDelete { .. } => "delete learning confirmation",
         Overlay::Docs => "documents",
         Overlay::Edges | Overlay::EdgeSearch(_) => "code graph",
         Overlay::Workflow | Overlay::WorkflowInputs { .. } => "workflow",
+        Overlay::KanbanNew { .. } => "new Kanban task",
+        Overlay::BlackboardPost { .. } => "Blackboard post",
         Overlay::Blackboard => "blackboard",
         Overlay::Kanban => "task board",
         Overlay::UiPlugins => "Remote UI plugins",
@@ -543,6 +830,7 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::ApiKeyRemoveConfirm { .. } => "remove API key confirmation",
         Overlay::CouncilBuilder(_) => "council builder",
         Overlay::CouncilBrowser => "agent councils",
+        Overlay::CouncilResults => "council results",
         Overlay::CouncilRunObjective { .. } => "council objective",
         Overlay::ConfirmCouncilDelete { .. } => "remove council confirmation",
         Overlay::ConfirmModelRemove { .. } => "remove model confirmation",
@@ -573,6 +861,14 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         | Overlay::ModelPicker { .. }
         | Overlay::ProviderPicker { .. }
         | Overlay::ModePicker { .. } => "dialog",
+    }
+}
+
+fn onboard_class_accessible_label(class: OnboardProviderClass) -> &'static str {
+    match class {
+        OnboardProviderClass::Hosted => "hosted API",
+        OnboardProviderClass::LocalEndpoint => "local endpoint",
+        OnboardProviderClass::AcpAgent => "ACP coding agent",
     }
 }
 
@@ -613,6 +909,9 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
         "shift-f6" | "next-document" => return vec![Action::RemoteUiNextDocument],
         "esc" | "escape" | "cancel" => return vec![cancel_action(mode)],
         "enter" | "choose" | "yes" => return vec![submit_action(mode)],
+        "new" | "create" | "run" | "post" if mode == InputMode::Normal => {
+            return vec![Action::NewRun];
+        }
         "space" if mode == InputMode::RemoteUi => {
             return vec![Action::RemoteUiKey {
                 key: RemoteKey::Space,
@@ -627,6 +926,16 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
         "pagedown" | "page-down" => return vec![page_action(mode, false)],
         "home" => return vec![edge_action(mode, true)],
         "end" => return vec![edge_action(mode, false)],
+        "alt-up" | "previous-card" => return vec![Action::BrowseFoldPrev],
+        "alt-down" | "next-card" => return vec![Action::BrowseFoldNext],
+        "alt-enter" | "expand-card" => return vec![Action::Expand],
+        "alt-y" | "copy-card" => return vec![Action::CopyFocusedCard],
+        "copy" | "copy-result" => return vec![Action::CopyFocusedCard],
+        "alt-r" | "retry-card" => return vec![Action::RetryFailedRun],
+        "alt-a" | "reauthenticate" => return vec![Action::ReauthenticateFailedModel],
+        "alt-m" | "choose-model" => return vec![Action::ChooseFailureModel],
+        "diagnostics" => return vec![Action::OpenIssues],
+        "alt-d" | "disable-model" => return vec![Action::DisableFailureModel],
         "delete" => {
             return vec![match mode {
                 InputMode::RemoteUi => Action::RemoteUiKey {
@@ -1012,6 +1321,77 @@ mod tests {
                 character: None,
             }]
         );
+    }
+
+    #[test]
+    fn cooked_onboarding_announces_routes_scope_and_keyboard_controls() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::Onboard {
+            step: OnboardStep::Triage { selected: 2 },
+        };
+        let triage = accessible_snapshot(&state);
+        assert!(triage.contains("Highlighted connection route 3 of 3: ACP coding agent"));
+        assert!(triage.contains("Enter continues, Esc opens skip choices"));
+        assert_eq!(
+            map_accessible_input("up", state.input_mode()),
+            vec![Action::SelectPrev]
+        );
+        assert_eq!(
+            map_accessible_input("enter", state.input_mode()),
+            vec![Action::InputSubmit]
+        );
+
+        state.providers = vec![
+            ProviderCard {
+                id: "openai".to_owned(),
+                name: "OpenAI".to_owned(),
+                protocol: "openai-chat".to_owned(),
+                auth: "api-key: OPENAI_API_KEY".to_owned(),
+                local: false,
+                requires_key: true,
+                can_list_models: true,
+                available: true,
+                catalog_models: 3,
+                has_key: false,
+            },
+            ProviderCard {
+                id: "kimi-code".to_owned(),
+                name: "Kimi Code".to_owned(),
+                protocol: "acp".to_owned(),
+                auth: "acp: installed executable".to_owned(),
+                local: true,
+                requires_key: false,
+                can_list_models: false,
+                available: true,
+                catalog_models: 0,
+                has_key: false,
+            },
+        ];
+        state.overlay = Overlay::OnboardProviderPicker {
+            class: OnboardProviderClass::Hosted,
+            query: String::new(),
+            selected: 0,
+        };
+        let providers = accessible_snapshot(&state);
+        assert!(providers.contains("Highlighted setup provider 1 of 1: OpenAI"));
+        assert!(!providers.contains("Kimi Code"));
+        assert!(providers.contains("Enter opens model discovery"));
+    }
+
+    #[test]
+    fn cooked_empty_chat_distinguishes_configured_but_unrunnable_models() {
+        let mut state = AppState::new();
+        state.models = vec![ModelCard {
+            id: ModelId("saved-but-unavailable".to_owned()),
+            provider: "openai-compatible".to_owned(),
+            readiness: ModelReadiness::Unavailable("missing key".to_owned()),
+            location: None,
+            cost_per_1k_usd: None,
+            context_tokens: None,
+        }];
+        let snapshot = accessible_snapshot(&state);
+        assert!(snapshot.contains("saved models exist, but none is runnable"));
+        assert!(snapshot.contains("submit an empty composer to open guided model setup"));
     }
 
     #[test]

@@ -552,6 +552,15 @@ function reconstructEventBody(r: Record<string, unknown>): EventBody {
         disposition: reconstructRunDisposition(rec(r, "disposition")),
         chronicle: reconstructArtifactRef(rec(r, "chronicle")),
       };
+    case "LearningsCaptured":
+      return {
+        type: "LearningsCaptured",
+        run_id: str(r, "run_id"),
+        proposed_count: num(r, "proposed_count"),
+        proposed_ids: optStrArr(r, "proposed_ids"),
+        activated_count: num(r, "activated_count"),
+        activated_ids: optStrArr(r, "activated_ids"),
+      };
     case "ClientPresenceChanged":
       return {
         type: "ClientPresenceChanged",
@@ -919,7 +928,7 @@ describe("envelope.json against Payload (src/protocol/types.ts)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// events.json: Actor (5/5, full coverage) and EventBody (17/17, full
+// events.json: Actor (5/5, full coverage) and EventBody (18/18, full
 // coverage — this is where ProposedAction::ExecuteCommand's S1 fields are
 // exercised inside a realistic ApprovalRequested event).
 // ---------------------------------------------------------------------------

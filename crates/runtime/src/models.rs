@@ -629,6 +629,10 @@ struct EndpointAuth {
     /// wins) only when the model has no `auth.json` key and no explicit
     /// `api_key_env` of its own.
     provider_env: Vec<String>,
+    /// The catalog provider declares API-key auth, even when its env-name
+    /// list is empty. Kept separately from `provider_env` so readiness never
+    /// mistakes a malformed key-auth provider for a deliberately keyless one.
+    requires_api_key: bool,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -645,14 +649,14 @@ impl EndpointAuth {
 #[cfg(feature = "provider-openai")]
 fn endpoint_auth_for(cfg: &ModelConfig, catalog: &Catalog) -> EndpointAuth {
     let provider = cfg.provider_id.as_deref().and_then(|id| catalog.get(id));
-    let (header, prefix, provider_env) = provider
+    let (header, prefix, provider_env, requires_api_key) = provider
         .and_then(|p| {
             p.auth.iter().find_map(|method| match method {
                 AuthMethod::ApiKey {
                     env,
                     header,
                     prefix,
-                } => Some((header.clone(), prefix.clone(), env.clone())),
+                } => Some((header.clone(), prefix.clone(), env.clone(), true)),
                 _ => None,
             })
         })
@@ -661,6 +665,7 @@ fn endpoint_auth_for(cfg: &ModelConfig, catalog: &Catalog) -> EndpointAuth {
                 "Authorization".to_string(),
                 "Bearer ".to_string(),
                 Vec::new(),
+                false,
             )
         });
     EndpointAuth {
@@ -670,6 +675,7 @@ fn endpoint_auth_for(cfg: &ModelConfig, catalog: &Catalog) -> EndpointAuth {
             .map(|p| p.extra_headers.clone())
             .unwrap_or_default(),
         provider_env,
+        requires_api_key,
     }
 }
 
@@ -730,7 +736,7 @@ impl ModelRegistry {
         if let Some(key) = self
             .auth
             .get(cfg.id.0.as_str())
-            .filter(|key| !key.is_empty())
+            .filter(|key| !key.trim().is_empty())
         {
             return Ok(key.to_string());
         }
@@ -738,7 +744,7 @@ impl ModelRegistry {
             .provider_id
             .as_deref()
             .and_then(|pid| self.auth.get(&provider_auth_id(pid)))
-            .filter(|key| !key.is_empty())
+            .filter(|key| !key.trim().is_empty())
         {
             return Ok(key.to_string());
         }
@@ -770,6 +776,35 @@ impl ModelRegistry {
                 protocol: other.to_string(),
             }),
         }
+    }
+
+    /// Whether the configured model can resolve every credential required to
+    /// start a run, without exposing the credential itself.
+    ///
+    /// This deliberately delegates to [`Self::api_key_for`] so discovery and
+    /// the live client share one precedence rule: model `auth.json`, provider
+    /// `auth.json`, explicit model env, then catalog provider env. A keyless
+    /// endpoint is ready when neither the model nor its catalog provider
+    /// declares API-key authentication. ACP launchability is checked by its
+    /// owning integration; it has no chat credential to resolve here.
+    pub async fn credentials_resolvable(&self, id: &ModelId) -> Result<bool> {
+        let cfg = self
+            .get(id)
+            .ok_or_else(|| ModelsError::UnknownModel(id.clone()))?;
+        let (protocol, _) = config_to_protocol_auth(cfg, self.catalog())?;
+        if matches!(protocol, Protocol::Acp) {
+            return Ok(true);
+        }
+
+        let endpoint = endpoint_auth_for(cfg, self.catalog());
+        let requires_api_key = !cfg.api_key_env.trim().is_empty() || endpoint.requires_api_key;
+        if !requires_api_key {
+            return Ok(true);
+        }
+
+        self.api_key_for(cfg)
+            .await
+            .map(|key| !key.trim().is_empty())
     }
 
     /// Verify that a configured model is genuinely usable enough to select:
@@ -2793,6 +2828,107 @@ prefix = ""
             registry.client_for(&id).await.is_ok(),
             "a provider-wide stored key must satisfy the model"
         );
+    }
+
+    /// The discovery readiness check and the live client both delegate to
+    /// `api_key_for`; pin the complete precedence here so neither side can
+    /// silently drift as more credential sources are added.
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn model_credentials_follow_model_provider_explicit_and_catalog_env_precedence() {
+        use crate::auth::AuthStore;
+
+        const MODEL_ENV: &str = "CODYPENDENT_TEST_MODEL_PRECEDENCE_KEY_17d9";
+        const PROVIDER_ENV: &str = "CODYPENDENT_TEST_PROVIDER_PRECEDENCE_KEY_17d9";
+        std::env::set_var(MODEL_ENV, "from-model-env");
+        std::env::set_var(PROVIDER_ENV, "from-provider-env");
+
+        let provider_toml = format!(
+            r#"
+[[provider]]
+id = "precedence-test"
+name = "Precedence test"
+protocol = "openai-chat"
+base_url = "https://example.invalid/v1"
+[[provider.auth]]
+kind = "api_key"
+env = ["{PROVIDER_ENV}"]
+header = "Authorization"
+prefix = "Bearer "
+"#
+        );
+        let file: codypendent_providers::ProvidersFile =
+            toml::from_str(&provider_toml).expect("provider toml");
+        let catalog = Catalog::from_providers(file.providers);
+        let id = model_id("precedence/model");
+        let cfg = ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://example.invalid/v1".to_string(),
+            model: "model".to_string(),
+            api_key_env: MODEL_ENV.to_string(),
+            provider_id: Some("precedence-test".to_string()),
+            context_tokens: None,
+        };
+
+        let mut auth = AuthStore::default();
+        auth.set(id.0.as_str(), "from-model-auth");
+        auth.set(provider_auth_id("precedence-test"), "from-provider-auth");
+        let registry = ModelRegistry::new([cfg.clone()])
+            .with_auth(auth)
+            .with_catalog(catalog.clone());
+        assert_eq!(
+            registry.api_key_for(&cfg).await.expect("model auth"),
+            "from-model-auth"
+        );
+
+        let mut auth = AuthStore::default();
+        auth.set(provider_auth_id("precedence-test"), "from-provider-auth");
+        let registry = ModelRegistry::new([cfg.clone()])
+            .with_auth(auth)
+            .with_catalog(catalog.clone());
+        assert_eq!(
+            registry.api_key_for(&cfg).await.expect("provider auth"),
+            "from-provider-auth"
+        );
+
+        let registry = ModelRegistry::new([cfg.clone()]).with_catalog(catalog.clone());
+        assert_eq!(
+            registry.api_key_for(&cfg).await.expect("model env"),
+            "from-model-env"
+        );
+
+        let provider_env_cfg = ModelConfig {
+            api_key_env: String::new(),
+            ..cfg.clone()
+        };
+        let registry = ModelRegistry::new([provider_env_cfg.clone()]).with_catalog(catalog.clone());
+        assert_eq!(
+            registry
+                .api_key_for(&provider_env_cfg)
+                .await
+                .expect("provider env"),
+            "from-provider-env"
+        );
+        assert!(registry
+            .credentials_resolvable(&id)
+            .await
+            .expect("readiness uses the same resolver"));
+
+        // An explicit model env is authoritative: if it is missing, do not
+        // silently switch to the provider env and run with a different key.
+        let missing_explicit = ModelConfig {
+            api_key_env: "CODYPENDENT_TEST_EXPLICIT_MISSING_KEY_17d9".to_string(),
+            ..cfg
+        };
+        let registry = ModelRegistry::new([missing_explicit.clone()]).with_catalog(catalog);
+        assert!(matches!(
+            registry.api_key_for(&missing_explicit).await,
+            Err(ModelsError::MissingApiKeyEnv { .. })
+        ));
+
+        std::env::remove_var(MODEL_ENV);
+        std::env::remove_var(PROVIDER_ENV);
     }
 
     // -- authority_from_base_url -------------------------------------------

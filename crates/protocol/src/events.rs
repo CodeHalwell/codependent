@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::artifact::ArtifactRef;
 use crate::handshake::ClientRole;
 use crate::ids::{
-    AgentId, ApprovalId, ChangeSetId, ClientId, CommandId, CorrelationId, ModelId, RunId, UserId,
+    AgentId, ApprovalId, ChangeSetId, ClientId, CommandId, CorrelationId, LearningId, ModelId,
+    RunId, UserId,
 };
 use crate::run::{
     AgentMode, ApprovalDecision, BudgetDimension, ProposedAction, Risk, RunDisposition, RunState,
@@ -189,6 +190,18 @@ pub enum EventBody {
         /// The run chronicle, stored as a JSON artifact.
         chronicle: ArtifactRef,
     },
+    /// A content-free projection of newly curated learning after a successful
+    /// run. Facts, provenance, and confidence stay in the governed learning
+    /// store; clients receive only counts and opaque ids for review affordances.
+    LearningsCaptured {
+        run_id: RunId,
+        proposed_count: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        proposed_ids: Vec<LearningId>,
+        activated_count: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        activated_ids: Vec<LearningId>,
+    },
 
     /// A client attached to or detached from the session (Phase 3 STEP 3.7).
     /// Emitted so every attached client can show who else is present — e.g. the
@@ -351,6 +364,13 @@ mod tests {
                 summary: Some("fixed".to_string()),
             },
             chronicle: artifact_ref(),
+        });
+        round_trip(EventBody::LearningsCaptured {
+            run_id: RunId::new(),
+            proposed_count: 1,
+            proposed_ids: vec![LearningId::new()],
+            activated_count: 1,
+            activated_ids: vec![LearningId::new()],
         });
         round_trip(EventBody::ClientPresenceChanged {
             client_id: crate::ids::ClientId::new(),
