@@ -379,8 +379,37 @@ async fn semantic_vectors(
     let query_vector = vectors.pop().expect("batch always includes the query");
 
     let mut index = VectorIndex::new();
-    for (id, vector) in fresh {
+    // A persisted row is only usable if it is the SAME WIDTH as the query we
+    // will score it against. An endpoint that changes output width while
+    // keeping its model name passes `is_fresh` (each row's recorded dims match
+    // its own blob), and `VectorIndex` scores a width mismatch as zero rather
+    // than failing — silently draining the dense signal out of the ranking.
+    // Comparing against the live query width turns that into a re-embed.
+    let width = query_vector.len();
+    let (usable, stale_width): (Vec<_>, Vec<_>) = fresh
+        .into_iter()
+        .partition(|(_, vector)| vector.len() == width);
+    for (id, vector) in usable {
         index.insert(id, vector);
+    }
+    if !stale_width.is_empty() {
+        // Re-embed exactly the rows whose stored width no longer matches, so a
+        // width change costs one extra batch rather than a degraded ranking.
+        let widened: Vec<String> = stale_width
+            .iter()
+            .filter_map(|(id, _)| items.iter().find(|item| item.id == *id))
+            .map(embedding_text)
+            .collect();
+        let refreshed = embedder.embed_batch(&widened).await?;
+        let now = Utc::now();
+        for ((id, _), vector) in stale_width.iter().zip(refreshed) {
+            if let Some(item) = items.iter().find(|item| item.id == *id) {
+                let text = embedding_text(item);
+                let hash = embedding_content_hash(&text);
+                upsert_embedding(pool, item.id, &hash, embedder.model(), &vector, now).await?;
+                index.insert(item.id, vector);
+            }
+        }
     }
     let now = Utc::now();
     for ((item, _text, hash), vector) in missing.iter().zip(vectors) {

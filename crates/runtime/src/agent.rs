@@ -3839,9 +3839,11 @@ impl FrameworkAgentRuntime {
         };
         let author = self.docs_author(run, run_actor);
         let block_id = input.block_id.clone();
+        let repository = run.repository.to_string_lossy().into_owned();
         match docs
             .edit(
                 &author,
+                &repository,
                 DocsEdit {
                     document_id: input.document_id,
                     block_id: input.block_id,
@@ -3871,9 +3873,11 @@ impl FrameworkAgentRuntime {
         };
         let author = self.docs_author(run, run_actor);
         let block_id = input.block_id.clone();
+        let repository = run.repository.to_string_lossy().into_owned();
         match docs
             .suggest(
                 &author,
+                &repository,
                 DocsSuggest {
                     document_id: input.document_id,
                     block_id: input.block_id,

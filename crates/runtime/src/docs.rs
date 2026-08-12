@@ -161,9 +161,14 @@ pub trait DocsChannel: Send + Sync {
     /// Replace a block's text, attributed to `author` and routed through the
     /// document's collaboration mode (so an organization document's default
     /// `Suggest` turns this into a reviewable suggestion).
+    ///
+    /// `repository` is the run's checkout: the implementation enforces document
+    /// scope against it, so holding an id from another repository is not enough
+    /// to write there.
     async fn edit(
         &self,
         author: &DocsAuthor,
+        repository: &str,
         request: DocsEdit,
     ) -> Result<DocsWriteEffect, DocsChannelError>;
 
@@ -171,6 +176,7 @@ pub trait DocsChannel: Send + Sync {
     async fn suggest(
         &self,
         author: &DocsAuthor,
+        repository: &str,
         request: DocsSuggest,
     ) -> Result<DocsWriteEffect, DocsChannelError>;
 }

@@ -238,7 +238,15 @@ impl RegistrySearch for PoolRegistrySearch {
         // context would have disclosed for this repository.
         let mut query = RetrievalQuery::new(
             request.query,
-            vec![Scope::System, Scope::Repository(repository)],
+            // The same three scopes context assembly discloses. Omitting the
+            // local user scope made a globally installed skill visible as a
+            // context card yet unreachable through `skills.search` — it would
+            // report the skill "not disclosed" and never open its SKILL.md.
+            vec![
+                Scope::System,
+                codypendent_knowledge::local_user_scope(),
+                Scope::Repository(repository),
+            ],
             RiskClass::Medium,
         );
         query.query_vector = query_vector;

@@ -63,16 +63,44 @@ impl AssemblyDocsChannel {
 
     /// Load the document and the collaboration mode its scope implies — the gate
     /// every agent write passes through.
+    ///
+    /// `repository` is the run's checkout. Scope isolation is enforced HERE and
+    /// not only in [`list`](Self::list): a caller holding a document id from
+    /// another repository would otherwise reach it by naming it directly,
+    /// turning the listing's scope filter into a discovery inconvenience rather
+    /// than a boundary. A document outside the run's scope is reported as
+    /// `NotFound` — the same answer as an id that does not exist, so the id
+    /// space of other repositories cannot be probed.
     async fn load_mode(
         &self,
         document_id: DocumentId,
+        repository: &str,
     ) -> Result<CollaborationMode, DocsChannelError> {
         let scope = DocumentStore::new()
             .scope(&self.pool, document_id)
             .await
             .map_err(map_store_error)?
             .ok_or_else(|| DocsChannelError::NotFound(document_id.to_string()))?;
+        if !self.scope_is_visible(&scope, repository) {
+            return Err(DocsChannelError::NotFound(document_id.to_string()));
+        }
         Ok(CollaborationMode::default_for_scope(&scope))
+    }
+
+    /// Whether a document in `scope` is reachable from the run's `repository` —
+    /// the same set [`list`](Self::list) shows: this repository, plus the
+    /// genuinely global scopes that are not repository-partitioned.
+    fn scope_is_visible(&self, scope: &Scope, repository: &str) -> bool {
+        match scope {
+            Scope::Repository(id) => *id == repository_id_for(&self.root(repository)),
+            // Not repository-partitioned: an org/system doc is shared by design,
+            // and the Docs Studio lists System alongside the repository's own.
+            Scope::System | Scope::Organization(_) | Scope::User(_) => true,
+            // Narrower-than-repository scopes belong to one workspace, branch,
+            // session or task; an agent addressing them by id from a plain run
+            // has no scope to check against, so they stay out of reach.
+            _ => false,
+        }
     }
 
     /// Apply `mutation` through the knowledge engine under `document_id`'s mode,
@@ -80,10 +108,11 @@ impl AssemblyDocsChannel {
     async fn apply(
         &self,
         author: &DocsAuthor,
+        repository: &str,
         document_id: DocumentId,
         mutation: DocumentMutation,
     ) -> Result<DocsWriteEffect, DocsChannelError> {
-        let mode = self.load_mode(document_id).await?;
+        let mode = self.load_mode(document_id, repository).await?;
         let outcome = apply_mutation(
             &self.pool,
             document_id,
@@ -160,6 +189,10 @@ impl DocsChannel for AssemblyDocsChannel {
             return self.list(&store, &self.root(repository)).await;
         };
         let id = parse_document_id(document_id)?;
+        // Scope-gate the direct-id read exactly as a write is gated, so naming a
+        // document from another repository is no more revealing than naming one
+        // that does not exist.
+        self.load_mode(id, repository).await?;
         let document = store
             .snapshot_document(&self.pool, id)
             .await
@@ -189,6 +222,7 @@ impl DocsChannel for AssemblyDocsChannel {
     async fn edit(
         &self,
         author: &DocsAuthor,
+        repository: &str,
         request: DocsEdit,
     ) -> Result<DocsWriteEffect, DocsChannelError> {
         let id = parse_document_id(&request.document_id)?;
@@ -199,6 +233,7 @@ impl DocsChannel for AssemblyDocsChannel {
         let current = self.block_text(id, &request.block_id).await?;
         self.apply(
             author,
+            repository,
             id,
             DocumentMutation::EditText {
                 block_id: request.block_id,
@@ -213,11 +248,13 @@ impl DocsChannel for AssemblyDocsChannel {
     async fn suggest(
         &self,
         author: &DocsAuthor,
+        repository: &str,
         request: DocsSuggest,
     ) -> Result<DocsWriteEffect, DocsChannelError> {
         let id = parse_document_id(&request.document_id)?;
         self.apply(
             author,
+            repository,
             id,
             DocumentMutation::Annotate {
                 suggestion: SuggestionInput {
@@ -366,6 +403,42 @@ mod tests {
             .id
     }
 
+    /// Scope isolation is a boundary, not just a listing filter: holding a
+    /// document id from ANOTHER repository must not grant a read or a write.
+    /// Both answer `NotFound`, so the other repository's id space cannot be
+    /// probed by the shape of the error.
+    #[tokio::test]
+    async fn a_document_from_another_repository_is_not_reachable_by_id() {
+        let (tmp, pool) = temp_pool().await;
+        let channel = AssemblyDocsChannel::new(pool.clone(), tmp.path().to_path_buf());
+        // Seeded into a DIFFERENT checkout's repository scope.
+        let other = tmp.path().join("other-checkout");
+        std::fs::create_dir_all(&other).expect("other checkout");
+        let doc = seed(&pool, Scope::Repository(repository_id_for(&other))).await;
+
+        let read = channel.read(Some(&doc.to_string()), "").await;
+        assert!(
+            matches!(read, Err(DocsChannelError::NotFound(_))),
+            "a cross-repository read must report NotFound, got {read:?}"
+        );
+
+        let write = channel
+            .edit(
+                &author(),
+                "",
+                DocsEdit {
+                    document_id: doc.to_string(),
+                    block_id: "p".into(),
+                    text: "trespass".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(write, Err(DocsChannelError::NotFound(_))),
+            "a cross-repository write must report NotFound, got {write:?}"
+        );
+    }
+
     /// THE safety property: in an organization-scope document (Suggest by
     /// default) an agent `docs.edit` does not change content — it files a
     /// reviewable suggestion attributed to the agent.
@@ -379,6 +452,7 @@ mod tests {
         let effect = channel
             .edit(
                 &author,
+                "",
                 DocsEdit {
                     document_id: doc.to_string(),
                     block_id: "p".into(),
@@ -431,6 +505,7 @@ mod tests {
         let effect = channel
             .edit(
                 &author(),
+                "",
                 DocsEdit {
                     document_id: doc.to_string(),
                     block_id: "p".into(),
@@ -460,6 +535,7 @@ mod tests {
         let effect = channel
             .suggest(
                 &author(),
+                "",
                 DocsSuggest {
                     document_id: doc.to_string(),
                     block_id: "p".into(),
@@ -517,6 +593,7 @@ mod tests {
         let error = channel
             .edit(
                 &author(),
+                "",
                 DocsEdit {
                     document_id: doc.to_string(),
                     block_id: "nope".into(),

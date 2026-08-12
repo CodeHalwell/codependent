@@ -258,13 +258,25 @@ pub fn register_pulled_model(
         provider_id: Some("ollama".to_string()),
     });
 
-    #[derive(serde::Serialize)]
-    struct ModelsToml {
-        #[serde(rename = "model")]
-        model: Vec<ModelConfig>,
+    // `models.toml` is not only `[[model]]`: it also carries `[voice]`,
+    // `[transcription]`, `[speech]`, `[embedding]` and `[retrieval]`. Serializing
+    // a struct that knows only about models would silently delete every one of
+    // them, disabling a user's voice and retrieval setup on the next load. So
+    // edit the parsed document in place — replacing just the `model` array —
+    // and leave every other table (and any table a later version adds) exactly
+    // as written.
+    let existing = std::fs::read_to_string(&models_path).unwrap_or_default();
+    let mut document: toml::Value =
+        toml::from_str(&existing).unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+    if !document.is_table() {
+        document = toml::Value::Table(toml::map::Map::new());
     }
-    let rendered = toml::to_string_pretty(&ModelsToml { model: configs })
-        .context("serializing models.toml")?;
+    let models = toml::Value::try_from(&configs).context("serializing models.toml")?;
+    document
+        .as_table_mut()
+        .expect("document is a table")
+        .insert("model".to_string(), models);
+    let rendered = toml::to_string_pretty(&document).context("serializing models.toml")?;
     let tmp = data_dir.join("models.toml.tmp");
     std::fs::write(&tmp, rendered.as_bytes())
         .with_context(|| format!("writing {}", tmp.display()))?;

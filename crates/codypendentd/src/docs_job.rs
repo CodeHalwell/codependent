@@ -230,10 +230,16 @@ impl DocumentMaintainer for KnowledgeDocumentMaintainer {
     }
 }
 
-/// Run one documentation staleness sweep over every stored document, against
-/// the code graph of the checkout at `root`. See the module docs for the
+/// Run one documentation staleness sweep over the documents in scope for the
+/// checkout at `root`, against its code graph. See the module docs for the
 /// detect → propose → re-anchor ordering (and why the first sweep only
 /// establishes the baseline).
+///
+/// Scoped, not global: a daemon serving several checkouts calls this once per
+/// repository, and resolving another repository's documents against THIS
+/// repository's symbol snapshot would file false stale suggestions and
+/// overwrite their link baselines, so later sweeps oscillate. Only this
+/// repository's documents plus the genuinely global scopes are swept.
 ///
 /// A per-document failure is logged and skipped: one corrupt or concurrently
 /// edited document must not abort the whole sweep.
@@ -248,7 +254,8 @@ pub async fn run_docs_check(pool: &SqlitePool, root: &Path) -> anyhow::Result<Do
     let suggestions = SuggestionStore::new();
 
     let mut report = DocsCheckReport::default();
-    for summary in store.list_all(pool).await? {
+    let scopes = [Scope::Repository(repository), Scope::System];
+    for summary in store.list(pool, &scopes).await? {
         let Some(mut doc) = store.load(pool, summary.id).await? else {
             continue;
         };

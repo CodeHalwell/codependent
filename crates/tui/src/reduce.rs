@@ -7980,7 +7980,15 @@ mod tests {
         for c in "council".chars() {
             reduce(s, Action::InputChar(c));
         }
+        // `/council` now opens the BROWSER (list / run / delete); the builder is
+        // reached from it with `n`, the same overlay-contextual "new" the
+        // workflow and docs browsers use.
         reduce(s, Action::InputSubmit);
+        assert!(
+            matches!(s.overlay, Overlay::CouncilBrowser),
+            "the palette's council command should open the browser"
+        );
+        reduce(s, Action::NewRun);
     }
 
     #[test]
