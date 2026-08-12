@@ -10,6 +10,12 @@ export type UiChild = UiNode | string | number | boolean | null | undefined | re
 export type Tone = "neutral" | "muted" | "positive" | "warning" | "critical" | "info";
 export type Size = "xs" | "sm" | "md" | "lg" | "xl";
 export type Align = "start" | "center" | "end" | "stretch" | "spaceBetween" | "spaceAround";
+/**
+ * A `Grid` track template: an equal-track count (`3` → three `1fr` tracks) or
+ * an explicit track list (`"2fr"`, `"40%"`, `"auto"`, or a plain cell count).
+ * Both hosts normalize it the same way; counts above 24 are clamped.
+ */
+export type GridTracks = number | readonly (number | string)[];
 
 export interface PrimitiveProps {
   id?: string;
@@ -34,6 +40,8 @@ export interface LayoutProps extends PrimitiveProps {
   wrap?: boolean;
   border?: boolean | "single" | "double" | "rounded";
   title?: string;
+  /** `Grid` only — see {@link GridTracks}. Ignored by every other layout primitive. */
+  columns?: GridTracks;
 }
 
 export interface TextProps extends PrimitiveProps {

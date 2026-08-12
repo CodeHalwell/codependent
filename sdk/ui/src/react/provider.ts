@@ -15,6 +15,8 @@ import type { UiCapabilities, UiJsonValue, UiViewport } from "../protocol.js";
 import type {
   ArtifactView,
   ArtifactProjectionOptions,
+  BlackboardProjectionOptions,
+  BlackboardView,
   CommandDescriptor,
   ExternalProjection,
   IdeContextView,
@@ -79,6 +81,20 @@ export function useContext(sessionId: string): IdeContextView | undefined {
 export function useWorkflow(id: string): WorkflowView | undefined {
   const store = useUiState();
   return useProjection(useMemo(() => store.workflow(id), [store, id]));
+}
+
+/** A workflow run's blackboard, read-only. `id` is a workflow run id. */
+export function useBlackboard(id: string, options?: BlackboardProjectionOptions): BlackboardView | undefined {
+  const store = useUiState();
+  const kind = options?.kind;
+  const includeSuperseded = options?.includeSuperseded;
+  return useProjection(useMemo(
+    () => store.blackboard(id, {
+      ...(kind === undefined ? {} : { kind }),
+      ...(includeSuperseded === undefined ? {} : { includeSuperseded }),
+    }),
+    [store, id, kind, includeSuperseded],
+  ));
 }
 
 export function useArtifact<T extends UiJsonValue = UiJsonValue>(id: string, options?: ArtifactProjectionOptions): ArtifactView<T> | undefined {

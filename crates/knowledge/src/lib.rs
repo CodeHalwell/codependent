@@ -27,6 +27,7 @@ pub mod registry;
 pub mod repomap;
 pub mod retrieval;
 pub mod skill_exec;
+pub mod skills;
 pub mod types;
 
 pub use types::{
@@ -47,11 +48,17 @@ pub use manifest::{
 };
 pub use registry::{resolve_shadowed, Registry, RegistryError};
 pub use skill_exec::{profile_for_permissions, run_script, SkillExecError};
+pub use skills::{
+    anchor_repository_id, install_package, is_retrievable_status, local_user_scope,
+    repository_skills_root, scan_skill_root, user_skills_root, SkillInstallError, SkillScanOutcome,
+};
 
 pub use retrieval::{
-    embedding_text, retrieve, Bm25Error, Bm25Index, Embedder, HashingEmbedder, RerankWeights,
-    RetrievalConfig, RetrievalError, RetrievalIndexes, RetrievalQuery, RetrievalResult,
-    RetrievalTrace, VectorIndex, EMBEDDING_DIMENSION,
+    drain_outbox, embedding_content_hash, embedding_text, reconcile_embeddings, retrieve,
+    semantic_indexes, Bm25Error, Bm25Index, DrainReport, EmbedError, Embedder, HashingEmbedder,
+    PersistError, RerankWeights, RetrievalConfig, RetrievalError, RetrievalIndexes, RetrievalQuery,
+    RetrievalResult, RetrievalTrace, SemanticEmbedder, StoredEmbedding, VectorIndex,
+    EMBEDDING_DIMENSION,
 };
 
 pub use adapter::{
@@ -73,7 +80,9 @@ pub use memory::{
 };
 pub use observer::{chronicle_candidates, extract_candidates};
 
-pub use context::{assemble_context, ContextCard, ContextError, ContextManifest, ContextMemory};
+pub use context::{
+    assemble_context, ContextAssembler, ContextCard, ContextError, ContextManifest, ContextMemory,
+};
 
 pub use docs::apply::{apply_mutation, ApplyError, MutationEffect, MutationOutcome};
 pub use docs::collab::{
@@ -81,6 +90,7 @@ pub use docs::collab::{
     SuggestionStore,
 };
 pub use docs::crdt::{DocCrdtError, DocumentCrdt};
+pub use docs::import::{import_markdown, markdown_to_blocks};
 pub use docs::leases::{DocumentLease, DocumentLeaseStore, LeaseError};
 pub use docs::model::{
     AuthorshipRecord, BlockContent, ChecklistItem, Citation, DocumentAuthor, DocumentBlock,

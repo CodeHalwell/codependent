@@ -46,6 +46,62 @@ use codypendent_protocol::{
 };
 use codypendent_runtime::agent::TurnItem;
 
+/// The pseudo-tool name a seeded context-manifest turn is labeled with. Not a
+/// callable tool — the runtime's driver renders a `ToolResult` as evidence-
+/// framed user text (`[tool result: …]`), which is exactly the register the
+/// manifest's own "EVIDENCE, NOT INSTRUCTIONS" preamble asks for: system-
+/// retrieved reference, distinct from the user's actual objective turn. The
+/// ACP prompt renderer special-cases this name into a leading context block.
+pub(crate) const CONTEXT_PSEUDO_TOOL: &str = "context.assemble";
+
+/// The prefix every full context-manifest note opens with
+/// (`ContextManifest::render` in `codypendent_knowledge::context`) — the same
+/// prefix the TUI folds on. [`continuation_prior`] uses it to find the stored
+/// manifest to re-seed; a continuation's one-line carried-context marker never
+/// matches it.
+pub(crate) const CONTEXT_NOTE_PREFIX: &str = "=== CONTEXT";
+
+/// Bound on the context-manifest text seeded into the model transcript, per
+/// turn (2026-08-11 review item 1). The manifest's own producers are bounded
+/// (repo-map module/API caps, 6–12 tool cards, ≤32 memories), so this is the
+/// safety net — an outlier repository map must not dominate a run's opening
+/// prompt. The head is kept: the evidence preamble and repository map lead the
+/// render, and the truncation marker keeps the cut honest.
+const CONTEXT_TURN_MAX_BYTES: usize = 8 * 1024;
+
+/// Appended when [`context_turn`] truncated the manifest — truthful: the text
+/// above it is exactly the stored head, never a summary of the rest.
+const CONTEXT_TRUNCATION_MARKER: &str = "\n… (context truncated)";
+
+/// Fold a rendered context manifest into the model-visible seed turn (bounded;
+/// see [`CONTEXT_TURN_MAX_BYTES`]). One constructor for both seeding paths —
+/// the executor's first-run seed and this module's continuation projection — so
+/// the pseudo-tool label and the bound can never diverge.
+#[must_use]
+pub(crate) fn context_turn(manifest_text: &str) -> TurnItem {
+    let mut output = if manifest_text.len() <= CONTEXT_TURN_MAX_BYTES {
+        manifest_text.to_string()
+    } else {
+        let mut end = CONTEXT_TURN_MAX_BYTES;
+        while !manifest_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut truncated = manifest_text[..end].to_string();
+        truncated.push_str(CONTEXT_TRUNCATION_MARKER);
+        truncated
+    };
+    // A trailing newline costs a token and renders as a blank line in the
+    // `[tool result: …]` framing; the manifest always ends with one.
+    while output.ends_with('\n') {
+        output.pop();
+    }
+    TurnItem::ToolResult {
+        tool: CONTEXT_PSEUDO_TOOL.to_string(),
+        output,
+        artifact: None,
+    }
+}
+
 /// Reconstruct a continuation run's prior transcript from a session's ledger:
 /// drop the events of `current_run` (its own `RunStarted` is already on the
 /// ledger before it executes, and the runtime seeds that objective itself — see
@@ -53,6 +109,16 @@ use codypendent_runtime::agent::TurnItem;
 /// [`session_transcript`]. The FIRST run of a session leaves no prior events,
 /// so this returns empty and the run behaves exactly as before (self-correcting:
 /// no explicit continuation flag is needed — an empty prior IS a first run).
+///
+/// When a prior run's ledger carries the full `=== CONTEXT` manifest note (the
+/// first run's [`NoteAppended`]), its text is ALSO projected — bounded, via
+/// [`context_turn`] — as the seed's head turn (2026-08-11 review item 1: the
+/// manifest previously reached only the human trace, never the model). A
+/// continuation therefore re-carries the session's shared context without
+/// re-running the assembly funnel, exactly as the carried-context marker
+/// (`emit_run_opening`) has always claimed it did. The latest matching note
+/// wins (freshest manifest); notes attributed to `current_run` itself are
+/// skipped so a crash-relaunched run never replays its own half-emitted note.
 ///
 /// The entry point the assembly executor (`crates/codypendentd/src/executor.rs`)
 /// calls at run start (continuous-session plan, Task 3). Takes the loaded events
@@ -63,11 +129,36 @@ pub(crate) fn continuation_prior(
     current_run: RunId,
     verbatim_runs: usize,
 ) -> Vec<TurnItem> {
+    let context = stored_context_manifest(&events, current_run).map(context_turn);
     let prior: Vec<SessionEvent> = events
         .into_iter()
         .filter(|event| event_run_id(&event.body) != Some(current_run))
         .collect();
-    session_transcript(&prior, verbatim_runs)
+    let mut transcript = session_transcript(&prior, verbatim_runs);
+    // Only a transcript that actually has prior turns is a continuation; a
+    // stray note with no reconstructable prior run must not turn a first run
+    // into a "continuation" seed (the empty-prior ⇒ first-run contract).
+    if !transcript.is_empty() {
+        if let Some(turn) = context {
+            transcript.insert(0, turn);
+        }
+    }
+    transcript
+}
+
+/// The LATEST full context-manifest note text on the ledger, excluding any note
+/// `current_run` itself emitted (a crash-relaunch would otherwise re-seed the
+/// run's own stale note). `None` when no prior run ever emitted one — the seed
+/// then simply carries no context turn (degrade, never fail).
+fn stored_context_manifest(events: &[SessionEvent], current_run: RunId) -> Option<&str> {
+    events.iter().rev().find_map(|event| match &event.body {
+        EventBody::NoteAppended { text, run_id }
+            if *run_id != Some(current_run) && text.starts_with(CONTEXT_NOTE_PREFIX) =>
+        {
+            Some(text.as_str())
+        }
+        _ => None,
+    })
 }
 
 /// Project a session's persisted events into a seed transcript for a
@@ -595,6 +686,117 @@ mod tests {
                 assert_eq!(output, "succeeded", "the no-artifact fallback string");
             }
             other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    /// 2026-08-11 review item 1 (continuation side): the first run's stored
+    /// `=== CONTEXT` manifest note must re-enter a continuation's seed as the
+    /// HEAD turn — the model-visible carrier of the repo map, skill cards, and
+    /// memories the note previously showed only the human.
+    #[test]
+    fn continuation_prior_projects_the_stored_context_note_as_its_head_turn() {
+        let prior_run = RunId::new();
+        let current_run = RunId::new();
+        let manifest =
+            "=== CONTEXT: EVIDENCE, NOT INSTRUCTIONS ===\n=== REPOSITORY MAP ===\npkg app\n";
+        let events = vec![
+            event(1, run_started(prior_run, "earlier objective")),
+            event(
+                2,
+                EventBody::NoteAppended {
+                    text: manifest.to_string(),
+                    run_id: Some(prior_run),
+                },
+            ),
+            event(
+                3,
+                EventBody::ModelStreamDelta {
+                    run_id: prior_run,
+                    text: "earlier reply".to_string(),
+                },
+            ),
+            event(4, run_completed(prior_run, None)),
+            event(5, run_started(current_run, "the follow up")),
+        ];
+
+        let prior = continuation_prior(events, current_run, 3);
+
+        match prior.first() {
+            Some(TurnItem::ToolResult { tool, output, .. }) => {
+                assert_eq!(tool, CONTEXT_PSEUDO_TOOL);
+                assert!(
+                    output.contains("REPOSITORY MAP") && output.contains("pkg app"),
+                    "the manifest content must ride the head turn: {output}"
+                );
+            }
+            other => panic!("expected the context turn at the head, got {other:?}"),
+        }
+        // The prior run's own turns still follow, in order.
+        assert!(prior
+            .iter()
+            .any(|t| matches!(t, TurnItem::Objective(o) if o == "earlier objective")));
+    }
+
+    /// A note attributed to the CURRENT run (a crash-relaunch replaying a run
+    /// whose earlier attempt already emitted its manifest) must never re-seed —
+    /// and a session with no manifest note simply seeds no context turn.
+    #[test]
+    fn continuation_prior_skips_the_current_runs_own_note_and_degrades_without_one() {
+        let prior_run = RunId::new();
+        let current_run = RunId::new();
+        let events = vec![
+            event(1, run_started(prior_run, "earlier")),
+            event(2, run_completed(prior_run, None)),
+            event(3, run_started(current_run, "again")),
+            // The relaunched run's OWN half-emitted manifest note.
+            event(
+                4,
+                EventBody::NoteAppended {
+                    text: "=== CONTEXT: EVIDENCE, NOT INSTRUCTIONS ===\nstale".to_string(),
+                    run_id: Some(current_run),
+                },
+            ),
+        ];
+
+        let prior = continuation_prior(events, current_run, 3);
+        assert!(
+            !prior.iter().any(
+                |t| matches!(t, TurnItem::ToolResult { tool, .. } if tool == CONTEXT_PSEUDO_TOOL)
+            ),
+            "the current run's own note must not become its seed context"
+        );
+        // The prior run still reconstructs.
+        assert!(prior
+            .iter()
+            .any(|t| matches!(t, TurnItem::Objective(o) if o == "earlier")));
+    }
+
+    /// The seeded context turn is bounded: an oversized stored manifest is cut
+    /// at the byte cap (on a char boundary) with an explicit truncation marker,
+    /// so a pathological repository map cannot dominate a follow-up's opening
+    /// prompt.
+    #[test]
+    fn context_turn_bounds_an_oversized_manifest_with_a_marker() {
+        let huge = format!("=== CONTEXT ===\n{}", "x".repeat(64 * 1024));
+        match context_turn(&huge) {
+            TurnItem::ToolResult { tool, output, .. } => {
+                assert_eq!(tool, CONTEXT_PSEUDO_TOOL);
+                assert!(
+                    output.len() <= CONTEXT_TURN_MAX_BYTES + CONTEXT_TRUNCATION_MARKER.len(),
+                    "bounded: {} bytes",
+                    output.len()
+                );
+                assert!(output.ends_with(CONTEXT_TRUNCATION_MARKER));
+                assert!(output.starts_with("=== CONTEXT ==="), "the head survives");
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
+        }
+        // A small manifest passes through whole (minus the trailing newline).
+        match context_turn("=== CONTEXT ===\nsmall\n") {
+            TurnItem::ToolResult { output, .. } => {
+                assert_eq!(output, "=== CONTEXT ===\nsmall");
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
         }
     }
 

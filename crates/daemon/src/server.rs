@@ -21,9 +21,10 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    read_envelope, write_envelope, Catchup, ClientId, ClientRole, CommandBody, DaemonStatus,
-    Envelope, FrameError, Payload, ProtocolError, ServerHello, SessionEvent, SessionId,
-    Subscription, BUILD_ID, PROTOCOL_V1,
+    read_envelope, write_envelope, Actor, Catchup, ClientId, ClientRole, Command, CommandBody,
+    CommandId, DaemonStatus, DataClassification, Envelope, EventBody, FrameError, InputBlock,
+    Payload, ProtocolError, ServerHello, SessionEvent, SessionId, Subscription, BUILD_ID,
+    PROTOCOL_V1,
 };
 use codypendent_sandbox::{LifecycleState, UiTarget};
 use sqlx::SqlitePool;
@@ -36,10 +37,14 @@ use tracing::{error, info, warn};
 
 use crate::approvals::ApprovalBroker;
 use crate::artifacts::ArtifactStore;
-use crate::blackboard::{BlackboardHub, BlackboardReader, ReadBlackboardRequest};
+use crate::blackboard::{
+    BlackboardHub, BlackboardReader, BlackboardWriter, BoardTarget, PostBlackboardRequest,
+    ReadBlackboardRequest, UpdateBlackboardRequest,
+};
 use crate::commands::{ApplyContext, CommandProcessor};
 use crate::documents::{
-    DocumentHub, DocumentLeaseReleaseRequest, DocumentLeaseRequest, DocumentLeaser,
+    DocsCheckRequest, DocumentCreateRequest, DocumentCreator, DocumentHub,
+    DocumentLeaseReleaseRequest, DocumentLeaseRequest, DocumentLeaser, DocumentMaintainer,
     DocumentMutationRequest, DocumentMutator, DocumentPublisher, PublishDocumentRequest,
 };
 use crate::executor::{RunExecutor, RunLaunch};
@@ -57,6 +62,7 @@ use crate::remote_ui::{
 use crate::remote_ui_plugins::{system_remote_ui_runtime, RemoteUiPluginStore};
 use crate::remote_ui_workers::{RemoteUiWorkerService, UiWorkerRequest};
 use crate::subscriptions::SubscriptionHub;
+use crate::transcription::Transcriber;
 use crate::workflow_stream::{ReadWorkflowRunRequest, WorkflowHub, WorkflowReader};
 use crate::workflows::{
     CancelWorkflowRequest, PauseWorkflowRequest, ResumeWorkflowRequest, RetryWorkflowNodeRequest,
@@ -121,6 +127,15 @@ pub struct ServerState {
     /// `document.transport-unavailable`); injected together with `mutator` by the
     /// assembly.
     pub leaser: Option<Arc<dyn DocumentLeaser>>,
+    /// Creates a collaborative document from an accepted `CreateDocument` (rubric
+    /// #4 doc-writer). `None` in a lib-only / test embedding (the command is then
+    /// rejected `document.transport-unavailable`); injected together with
+    /// `mutator`/`leaser` by the assembly.
+    pub creator: Option<Arc<dyn DocumentCreator>>,
+    /// Runs the documentation staleness sweep for an accepted `CheckDocuments`
+    /// (`/update-docs`, Phase 4 STEP 4.6). `None` in a lib-only / test embedding
+    /// (the command is then rejected `document.transport-unavailable`).
+    pub maintainer: Option<Arc<dyn DocumentMaintainer>>,
     /// Creates a durable run from an accepted `StartWorkflow` (Phase 5 STEP 5.2).
     /// `None` in a lib-only / test embedding (the command is then rejected
     /// `workflow.transport-unavailable`); the assembly injects a
@@ -142,6 +157,11 @@ pub struct ServerState {
     /// rejected `workflow.transport-unavailable`); the assembly injects a
     /// `codypendent-workflow`-backed implementation over the pool.
     pub blackboard_reader: Option<Arc<dyn BlackboardReader>>,
+    /// Stores a `Controller` client's `PostBlackboardItem` / `UpdateBlackboardItem`
+    /// (Phase B kanban). `None` in a lib-only / test embedding (both commands are
+    /// then rejected `workflow.transport-unavailable`); the assembly injects a
+    /// `codypendent-workflow`-backed implementation over the pool.
+    pub blackboard_writer: Option<Arc<dyn BlackboardWriter>>,
     /// Per-workflow-run node-lifecycle fan-out: the workflow host publishes each
     /// node transition (and run-phase change) here, and a client's
     /// `Subscription::Workflow` forwarder delivers from it (Phase 5 STEP 5.2 / T9).
@@ -165,6 +185,13 @@ pub struct ServerState {
     /// `promotion.transport-unavailable`); the assembly injects a
     /// `codypendent-eval`-backed implementation over the pool.
     pub promotion: Option<Arc<dyn PromotionGateway>>,
+    /// Turns a `SubmitUserInput`'s stored audio into text (voice v1, rubric 8).
+    /// `None` in a lib-only / test embedding (an un-transcribed audio envelope is
+    /// then rejected `voice.transport-unavailable`); the assembly injects an
+    /// implementation over an OpenAI-compatible `/audio/transcriptions` endpoint
+    /// (dependency inversion — see [`crate::transcription`]). The classification
+    /// gate itself lives in the daemon, never in the implementation.
+    pub transcriber: Option<Arc<dyn Transcriber>>,
     /// Serializes run admission against an idle-guarded shutdown
     /// (`Payload::ShutdownIfIdle`), closing the auto-restart TOCTOU window. Every
     /// write-path command apply is held under a `read()` guard; the idle-guarded
@@ -277,6 +304,8 @@ pub async fn run_with_executor_on(
     let mutator = executor.as_ref().and_then(|e| e.document_mutator());
     let leaser = executor.as_ref().and_then(|e| e.document_leaser());
     let publisher = executor.as_ref().and_then(|e| e.document_publisher());
+    let creator = executor.as_ref().and_then(|e| e.document_creator());
+    let maintainer = executor.as_ref().and_then(|e| e.document_maintainer());
     let starter = executor.as_ref().and_then(|e| e.workflow_starter());
     let lifecycle = executor.as_ref().and_then(|e| e.workflow_lifecycle());
     let promotion = executor.as_ref().and_then(|e| e.promotion_gateway());
@@ -287,6 +316,7 @@ pub async fn run_with_executor_on(
     // so both sides must share one hub — exactly as `collaborators` shares the
     // `SubscriptionHub`. Absent an executor, a fresh empty hub (never published to).
     let blackboard_reader = executor.as_ref().and_then(|e| e.blackboard_reader());
+    let blackboard_writer = executor.as_ref().and_then(|e| e.blackboard_writer());
     let blackboards = executor
         .as_ref()
         .and_then(|e| e.blackboard_hub())
@@ -300,6 +330,11 @@ pub async fn run_with_executor_on(
         .as_ref()
         .and_then(|e| e.workflow_hub())
         .unwrap_or_default();
+    // The speech-to-text seam (voice v1, rubric 8), bundled with the executor by
+    // the assembly exactly like the document/workflow seams. Absent, an audio
+    // `InputEnvelope` is refused `voice.transport-unavailable`; plain-text
+    // `SubmitUserInput` is untouched.
+    let transcriber = executor.as_ref().and_then(|e| e.transcriber());
 
     // Drive approval expiry: without a periodic caller, `expires_at` deadlines
     // are dead machinery — an approval with a deadline would simply never
@@ -387,14 +422,18 @@ pub async fn run_with_executor_on(
         documents,
         mutator,
         leaser,
+        creator,
+        maintainer,
         starter,
         lifecycle,
         publisher,
         promotion,
         blackboards,
         blackboard_reader,
+        blackboard_writer,
         workflows,
         workflow_reader,
+        transcriber,
         run_admission: Arc::new(tokio::sync::RwLock::new(())),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         scanned_repos: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -704,6 +743,199 @@ fn resolve_run_repository(repository: Option<&str>) -> std::path::PathBuf {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Voice v1 (rubric 8): client-uploaded artifacts + the transcription seam.
+// ---------------------------------------------------------------------------
+
+/// Cap on one `PutArtifact` upload's DECODED bytes.
+///
+/// The transport already bounds a frame at
+/// [`MAX_FRAME_BYTES`](codypendent_protocol::MAX_FRAME_BYTES) (16 MiB), which is
+/// ample for the target case — roughly a minute of 16 kHz mono PCM WAV is ~2 MB.
+/// This lower decoded cap leaves headroom for base64's 4/3 expansion plus the
+/// enclosing JSON, so an upload that would not survive framing is refused with a
+/// legible error instead of tearing the connection down. Mirrors the
+/// `InstallUiPlugin` precedent, which bounds its own base64 payload the same way.
+const MAX_PUT_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Store one client-uploaded blob in the content-addressed artifact store and
+/// reply with the minted [`ArtifactRef`](codypendent_protocol::ArtifactRef).
+///
+/// Controller-gated: an upload is operator-supplied *input*, so an Observer (or
+/// a connection that never asserted a role) must not be able to write bytes into
+/// the daemon's store. The classification travels on the command and is recorded
+/// verbatim on the occurrence row — the store never guesses it from the bytes,
+/// and a later occurrence of the same bytes never inherits an earlier row's
+/// (lower) classification.
+async fn handle_put_artifact(
+    state: &Arc<ServerState>,
+    role: ClientRole,
+    command_id: CommandId,
+    media_type: &str,
+    bytes_base64: &str,
+    sensitivity: DataClassification,
+) -> Payload {
+    if role != ClientRole::Controller {
+        return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "artifact.role-denied",
+            "storing an artifact requires the Controller role",
+            false,
+        ));
+    }
+    // Refuse on the ENCODED length first: decoding a hostile payload to learn it
+    // is too big would allocate the very memory the cap exists to bound.
+    if bytes_base64.len() > MAX_PUT_ARTIFACT_BYTES / 3 * 4 + 4 {
+        return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "artifact.too-large",
+            format!("an uploaded artifact may not exceed {MAX_PUT_ARTIFACT_BYTES} bytes"),
+            false,
+        ));
+    }
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(bytes_base64) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "artifact.malformed-base64",
+                format!("uploaded bytes are not valid base64: {error}"),
+                false,
+            ));
+        }
+    };
+    if bytes.len() > MAX_PUT_ARTIFACT_BYTES {
+        return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "artifact.too-large",
+            format!("an uploaded artifact may not exceed {MAX_PUT_ARTIFACT_BYTES} bytes"),
+            false,
+        ));
+    }
+    match state
+        .artifacts
+        .put(
+            &state.pool,
+            media_type,
+            sensitivity,
+            crate::artifacts::Provenance::user_upload(),
+            &bytes,
+        )
+        .await
+    {
+        Ok(artifact) => Payload::ArtifactStored {
+            command_id,
+            artifact,
+        },
+        Err(error) => Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "artifact.store-failed",
+            format!("could not store the uploaded artifact: {error}"),
+            true,
+        )),
+    }
+}
+
+/// What [`resolve_voice_input`] decided about one command.
+#[derive(Default)]
+struct ResolvedVoiceInput {
+    /// The command to apply INSTEAD of the client's, when transcription (or an
+    /// envelope-derived objective) changed it. `None` — the overwhelmingly
+    /// common case — means "apply exactly what the client sent".
+    rewritten: Option<Command>,
+    /// What was transcribed, for the note the server appends after the apply.
+    transcribed: Option<crate::transcription::TranscribedAudio>,
+}
+
+/// Resolve a `SubmitUserInput`'s [`InputEnvelope`](codypendent_protocol::InputEnvelope)
+/// into the text the run will actually execute (voice v1, rubric 8).
+///
+/// Runs BEFORE the write path so the ledger records the transcript as the run's
+/// objective: a run recovered after a crash re-executes text, never silent
+/// audio. Un-transcribed [`InputBlock::Audio`] blocks are sent through the
+/// daemon's [`transcription`](crate::transcription) seam, whose classification
+/// gate refuses off-device transcription of media above the operator's ceiling;
+/// that refusal surfaces to the client as an ordinary `CommandRejected`.
+///
+/// Everything else — every non-`SubmitUserInput` command, and a plain-text
+/// submission with no envelope — returns [`ResolvedVoiceInput::default`] and is
+/// applied byte-for-byte as the client sent it.
+///
+/// A duplicate delivery of a voice submission re-transcribes before the write
+/// path's idempotency check replays the recorded outcome, so the second delivery
+/// pays a redundant transcription. That is deliberate: the alternative (peeking
+/// at the idempotency table from out here) would duplicate the write path's
+/// claim logic for a case that costs one wasted request on an already-rare retry.
+async fn resolve_voice_input(
+    state: &Arc<ServerState>,
+    command: &Command,
+) -> Result<ResolvedVoiceInput, codypendent_protocol::CodypendentError> {
+    let CommandBody::SubmitUserInput {
+        session_id,
+        text,
+        mode,
+        model,
+        envelope: Some(envelope),
+    } = &command.body
+    else {
+        return Ok(ResolvedVoiceInput::default());
+    };
+
+    let untranscribed = envelope
+        .blocks
+        .iter()
+        .any(|block| matches!(block, InputBlock::Audio(audio) if audio.transcript.is_none()));
+    let mut envelope = envelope.clone();
+    let transcribed = if untranscribed {
+        let Some(transcriber) = state.transcriber.as_ref() else {
+            return Err(codypendent_protocol::CodypendentError::new(
+                "voice.transport-unavailable",
+                "this daemon has no transcriber configured; \
+                 add a [transcription] entry to models.toml and restart it",
+                true,
+            ));
+        };
+        crate::transcription::transcribe_envelope(
+            &state.artifacts,
+            &state.pool,
+            transcriber.as_ref(),
+            &mut envelope,
+        )
+        .await?
+    } else {
+        None
+    };
+
+    // The objective: whatever the client typed, else everything the (now
+    // resolved) envelope says. A client that sends BOTH keeps its own text as
+    // the objective — the transcript still rides along on the envelope, linked
+    // to its original audio.
+    let objective = if text.trim().is_empty() {
+        crate::transcription::envelope_text(&envelope)
+    } else {
+        text.clone()
+    };
+    if objective.trim().is_empty() {
+        return Err(codypendent_protocol::CodypendentError::new(
+            "voice.empty-transcript",
+            "the submitted input produced no text to run",
+            false,
+        ));
+    }
+    if transcribed.is_none() && objective == *text {
+        // Nothing changed — leave the client's command exactly as it was.
+        return Ok(ResolvedVoiceInput::default());
+    }
+    Ok(ResolvedVoiceInput {
+        rewritten: Some(Command {
+            body: CommandBody::SubmitUserInput {
+                session_id: *session_id,
+                text: objective,
+                mode: *mode,
+                model: model.clone(),
+                envelope: Some(envelope),
+            },
+            ..command.clone()
+        }),
+        transcribed,
+    })
+}
+
 /// Whether a command, when applied, can admit a NEW non-terminal run (raise
 /// `active_run_count`). Both `StartRun` and `SubmitUserInput` route through the
 /// same run-creating transaction (`commands.rs`), so both count; every other
@@ -994,6 +1226,110 @@ async fn handle_request(
                                 true,
                             )),
                         ),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Creating a collaborative document goes to the knowledge fabric,
+                // not the session ledger, so it is intercepted here exactly like
+                // `MutateDocument` below. Creating is a write, so — as with a
+                // non-resolving mutation — an Observer may not do it.
+                CommandBody::CreateDocument {
+                    title,
+                    scope,
+                    repository,
+                    initial_markdown,
+                } => {
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not create documents".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(creator) = state.creator.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "document.transport-unavailable",
+                                "document transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let create = DocumentCreateRequest {
+                        title: title.clone(),
+                        scope: scope.clone(),
+                        repository: repository.clone(),
+                        initial_markdown: initial_markdown.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match creator.create(create).await {
+                        Ok(document_id) => Envelope::reply_to(
+                            &request,
+                            Payload::DocumentCreated {
+                                command_id: command.command_id,
+                                document_id,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // The `/update-docs` staleness sweep: it FILES SUGGESTIONS (never
+                // direct edits), so it is a write and an Observer may not run it.
+                // Intercepted here like the other document commands.
+                CommandBody::CheckDocuments {
+                    repository,
+                    session_id,
+                } => {
+                    if conn.role == ClientRole::Observer {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "an Observer may not run the documentation check".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(maintainer) = state.maintainer.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "document.transport-unavailable",
+                                "document transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let check = DocsCheckRequest {
+                        repository: repository.clone(),
+                        session_id: *session_id,
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match maintainer.check(check).await {
+                        Ok(report) => Envelope::reply_to(
+                            &request,
+                            Payload::DocsCheckCompleted {
+                                command_id: command.command_id,
+                                documents_checked: report.documents_checked,
+                                links_resolved: report.links_resolved,
+                                stale_findings: report.stale_findings,
+                                suggestions_filed: report.suggestions_filed,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
                     };
                     send(writer, &reply).await?;
                 }
@@ -1663,14 +1999,17 @@ async fn handle_request(
                 // Reading a workflow run's blackboard is intercepted at the
                 // connection level like `StartWorkflow` (the board lives in its own
                 // durable store outside the session ledger). Unlike the lifecycle
-                // commands this is a READ — an Observer may issue it (there is no
-                // client-facing post command; only the workflow executor writes the
-                // board) — so it carries no role gate, only the transport check
-                // (Phase 5 STEP 5.3).
+                // commands this is a READ — an Observer may issue it (only a
+                // Controller writes, through `PostBlackboardItem` below) — so it
+                // carries no role gate, only the transport check (Phase 5 STEP 5.3).
+                // `board_repository` re-points the same read at a repository task
+                // board (Phase B kanban); the assembly resolves it to the synthetic
+                // board run, and an unwritten board reads empty.
                 CommandBody::ReadBlackboard {
                     workflow_run_id,
                     kind,
                     include_superseded,
+                    board_repository,
                 } => {
                     let Some(reader) = state.blackboard_reader.as_ref() else {
                         let reply = Envelope::reply_to(
@@ -1686,6 +2025,7 @@ async fn handle_request(
                     };
                     let read = ReadBlackboardRequest {
                         workflow_run_id: workflow_run_id.clone(),
+                        board_repository: board_repository.clone(),
                         kind: kind.clone(),
                         include_superseded: *include_superseded,
                         client_id: conn.client_id_or(request.client_id),
@@ -1696,6 +2036,119 @@ async fn handle_request(
                             Payload::BlackboardItems {
                                 command_id: command.command_id,
                                 items,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // The two client-facing board WRITES (Phase B kanban), intercepted
+                // alongside the read because the board lives outside the session
+                // ledger. Unlike the read they are `Controller`-only: a board write
+                // is the trusted local operator's, an Observer stays read-only, and
+                // an agent writes through its own `blackboard.*` / `task.*` tools
+                // (which carry server-built agent attribution) rather than here.
+                CommandBody::PostBlackboardItem { scope, item } => {
+                    let Some(target) = board_target(scope) else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(unknown_board_scope()),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let Some(writer_seam) =
+                        board_writer_or_reject(state, conn, &request, writer).await?
+                    else {
+                        return Ok(false);
+                    };
+                    let post = PostBlackboardRequest {
+                        target,
+                        item: item.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match writer_seam.post(post).await {
+                        Ok(item) => Envelope::reply_to(
+                            &request,
+                            Payload::BlackboardItemApplied {
+                                command_id: command.command_id,
+                                item,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::UpdateBlackboardItem {
+                    scope,
+                    item_id,
+                    status,
+                    assignee,
+                    ordinal,
+                    payload,
+                } => {
+                    let Some(target) = board_target(scope) else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(unknown_board_scope()),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let Some(writer_seam) =
+                        board_writer_or_reject(state, conn, &request, writer).await?
+                    else {
+                        return Ok(false);
+                    };
+                    let update = UpdateBlackboardRequest {
+                        target,
+                        item_id: item_id.clone(),
+                        status: status.clone(),
+                        assignee: assignee.clone(),
+                        ordinal: *ordinal,
+                        payload: payload.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match writer_seam.update(update).await {
+                        Ok(item) => Envelope::reply_to(
+                            &request,
+                            Payload::BlackboardItemApplied {
+                                command_id: command.command_id,
+                                item,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // One page of a session's durable history. Intercepted here (not run
+                // through the command write path) for the same reason as every read:
+                // it appends nothing to the ledger. Any attached client — an
+                // Observer included — may page; the daemon serves it from the same
+                // windowed `(session_id, sequence)` read the attach catch-up uses, so
+                // a client >500 events behind can rebuild its transcript instead of
+                // being handed a `Catchup::Snapshot` with no history at all.
+                CommandBody::ReadSessionEvents {
+                    session_id,
+                    after_sequence,
+                    limit,
+                } => {
+                    let reply = match read_session_events_page(
+                        &state.pool,
+                        *session_id,
+                        *after_sequence,
+                        *limit,
+                    )
+                    .await
+                    {
+                        Ok((events, through, has_more)) => Envelope::reply_to(
+                            &request,
+                            Payload::SessionEventsPage {
+                                command_id: command.command_id,
+                                session_id: *session_id,
+                                events,
+                                through,
+                                has_more,
                             },
                         ),
                         Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
@@ -1737,6 +2190,29 @@ async fn handle_request(
                     };
                     send(writer, &reply).await?;
                 }
+                // Uploading client-captured bytes (voice v1, rubric 8) is a
+                // connection-level concern, intercepted here like `AttachSession`:
+                // artifacts live in the content-addressed store OUTSIDE the
+                // session ledger, so there is no session to append to and no
+                // sequence to allocate. The reply carries the minted
+                // `ArtifactRef` because the client needs it back — it is what the
+                // next `SubmitUserInput`'s audio block references.
+                CommandBody::PutArtifact {
+                    media_type,
+                    bytes_base64,
+                    sensitivity,
+                } => {
+                    let reply = handle_put_artifact(
+                        state,
+                        conn.role,
+                        command.command_id,
+                        media_type,
+                        bytes_base64,
+                        *sensitivity,
+                    )
+                    .await;
+                    send(writer, &Envelope::reply_to(&request, reply)).await?;
+                }
                 // Every other command flows through the crash-consistent write
                 // path under the role recorded at attach (role enforcement is
                 // inherited from the pipeline).
@@ -1768,12 +2244,70 @@ async fn handle_request(
                         send(writer, &reply).await?;
                         return Ok(false);
                     }
+                    // Voice v1 (rubric 8): a `SubmitUserInput` carrying an audio
+                    // `InputEnvelope` is RESOLVED before it is applied. The
+                    // transcript has to be what the ledger records as the run's
+                    // objective — otherwise a recovered/replayed run would re-run
+                    // silent audio — so transcription happens on this side of the
+                    // write path and its refusals are ordinary `CommandRejected`s.
+                    // Every non-voice command falls straight through untouched.
+                    let resolved = match resolve_voice_input(state, command).await {
+                        Ok(resolved) => resolved,
+                        Err(error) => {
+                            send(
+                                writer,
+                                &Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                            )
+                            .await?;
+                            return Ok(false);
+                        }
+                    };
+                    let transcribed = resolved.transcribed;
+                    // The rewritten body (transcript as objective, envelope with
+                    // its transcript attached) is what gets persisted and applied;
+                    // absent a voice envelope this is the client's exact command.
+                    let command = resolved.rewritten.as_ref().unwrap_or(command);
                     let reply_envelope = match state
                         .commands
                         .apply(&state.pool, ctx, command.clone())
                         .await
                     {
                         Ok(outcome) => {
+                            // Voice v1: surface the transcription on the session
+                            // ledger, so a reader of the transcript sees that this
+                            // turn's text came from audio and which model produced
+                            // it. Appended BEFORE the executor dispatch below so it
+                            // lands immediately after the run's `RunStarted`, and
+                            // gated on `newly_applied` so a duplicate delivery does
+                            // not double-note. Best-effort: a ledger hiccup must
+                            // never fail a run that was already accepted.
+                            if let (true, Some(note)) =
+                                (outcome.newly_applied, transcribed.as_ref())
+                            {
+                                if let CommandBody::SubmitUserInput { session_id, .. } =
+                                    &command.body
+                                {
+                                    match ledger::append_next_event(
+                                        &state.pool,
+                                        *session_id,
+                                        &Actor::System,
+                                        &EventBody::NoteAppended {
+                                            text: note.note(),
+                                            run_id: outcome.created_run,
+                                        },
+                                        Utc::now(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(event) => {
+                                            state.subscriptions.publish(*session_id, event)
+                                        }
+                                        Err(error) => {
+                                            warn!(%error, "could not record the transcription note")
+                                        }
+                                    }
+                                }
+                            }
                             // A freshly accepted `StartRun` is handed to the
                             // executor so the run actually EXECUTES rather than
                             // sitting `Queued` forever. Fire-and-forget: the
@@ -1846,11 +2380,16 @@ async fn handle_request(
                                     // persisted command ledger; a load failure (or
                                     // a session with no `StartRun`) degrades to the
                                     // legacy `current_dir()` / unpinned fallback.
+                                    // `envelope` is deliberately ignored here: by
+                                    // this point `resolve_voice_input` has already
+                                    // folded any transcript into `text`, which is
+                                    // what the run's objective must be.
                                     CommandBody::SubmitUserInput {
                                         session_id,
                                         text,
                                         mode,
                                         model,
+                                        ..
                                     } => {
                                         let provenance = crate::commands::session_run_provenance(
                                             &state.pool,
@@ -2618,6 +3157,41 @@ async fn run_remote_ui_projection(
                 )?;
             }
         }
+        "blackboard" => {
+            let resource = request
+                .resource_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("blackboard subscription requires resourceId"))?;
+            authorize_workflow_resource(&state.pool, session_id, resource).await?;
+            // Subscribe before the baseline read: a post racing the read is
+            // either already in it or arrives as the next revision.
+            let mut live = state.blackboards.subscribe(resource.to_owned());
+            let mut revision = 1_u64;
+            deliver_remote_ui_projection(
+                &state,
+                session_id,
+                &subscription.producer,
+                &request.subscription_id,
+                Some(revision),
+                read_remote_ui_projection(&state, session_id, &request).await?,
+            )?;
+            loop {
+                match live.recv().await {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+                revision = revision.saturating_add(1);
+                let value = read_remote_ui_projection(&state, session_id, &request).await?;
+                deliver_remote_ui_projection(
+                    &state,
+                    session_id,
+                    &subscription.producer,
+                    &request.subscription_id,
+                    Some(revision),
+                    value,
+                )?;
+            }
+        }
         "session" | "run" | "artifact" => {
             // Subscribe before reading the baseline: a persisted event racing
             // the read is either reflected by it or delivered afterward.
@@ -2874,6 +3448,46 @@ async fn read_remote_ui_projection(
                 })?,
             ))
         }
+        "blackboard" => {
+            let resource = request
+                .resource_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("blackboard subscription requires resourceId"))?;
+            authorize_workflow_resource(&state.pool, session_id, resource).await?;
+            let Some(reader) = &state.blackboard_reader else {
+                anyhow::bail!("blackboard projection transport is unavailable");
+            };
+            // Read-only: a Remote UI producer observes the board, it never
+            // posts to it (only the workflow executor writes).
+            let items = reader
+                .read(ReadBlackboardRequest {
+                    workflow_run_id: resource.to_owned(),
+                    // A Remote UI producer addresses a workflow run's board by
+                    // its run id; the repository task board is a different
+                    // projection kind, so never resolved here.
+                    board_repository: None,
+                    kind: request
+                        .parameters
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    include_superseded: request
+                        .parameters
+                        .get("includeSuperseded")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    client_id: ClientId::new(),
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+            Ok((
+                false,
+                serde_json::to_value(codypendent_protocol::UiBlackboardProjection {
+                    workflow_run_id: resource.to_owned(),
+                    items,
+                })?,
+            ))
+        }
         "command" => {
             let command_id = request
                 .resource_id
@@ -2922,7 +3536,8 @@ async fn authorize_workflow_resource(
     .bind(workflow_run_id)
     .fetch_optional(pool)
     .await?;
-    if !owner.is_some_and(|(owner,)| owner == session_id.to_string()) {
+    // Deny-first: no row, or a row owned by another session, both fail.
+    if owner.is_none_or(|(owner,)| owner != session_id.to_string()) {
         anyhow::bail!("workflow resource does not belong to the broker session");
     }
     Ok(())
@@ -3067,6 +3682,12 @@ async fn mediate_remote_ui_action(
                     "component commands require an attached user renderer",
                     false,
                 )),
+                // Workflow lifecycle control lives outside the session ledger
+                // and is served by the `WorkflowLifecycle` seam, exactly as the
+                // connection-level `PauseWorkflow`/`CancelWorkflow` path does.
+                Some((_, role)) if is_remote_ui_workflow_control(&body) => {
+                    apply_remote_ui_workflow_control(state, role, &body).await
+                }
                 Some((client_id, role)) => {
                     let command_id = codypendent_protocol::CommandId::new();
                     let body_digest = {
@@ -3151,6 +3772,24 @@ async fn ensure_remote_ui_command_session(
         CommandBody::PauseRun { run_id }
         | CommandBody::ResumeRun { run_id }
         | CommandBody::CancelRun { run_id } => *run_id,
+        // A workflow run is owned through the agent run that started it; the
+        // same join the `workflow` projection authorizes with.
+        CommandBody::PauseWorkflow { workflow_run_id }
+        | CommandBody::ResumeWorkflow { workflow_run_id }
+        | CommandBody::RetryWorkflowNode {
+            workflow_run_id, ..
+        }
+        | CommandBody::CancelWorkflow { workflow_run_id } => {
+            return authorize_workflow_resource(pool, session_id, workflow_run_id)
+                .await
+                .map_err(|_| {
+                    codypendent_protocol::CodypendentError::new(
+                        "ui.action.cross-session",
+                        "the requested workflow run does not belong to the Remote UI broker session",
+                        false,
+                    )
+                });
+        }
         _ => return Ok(()),
     };
     match projections::run_session(pool, run_id).await {
@@ -3168,40 +3807,228 @@ async fn ensure_remote_ui_command_session(
     }
 }
 
+/// One allowlisted Remote UI action: the canonical action id a component may
+/// invoke and the daemon command it lowers to.
+///
+/// This table *is* the mediation boundary — an action id absent from it can
+/// never reach a command, whatever a component declares. Adding a mediated
+/// action is one row; every row still passes through the same ownership check
+/// ([`ensure_remote_ui_command_session`]) and the same role gate the equivalent
+/// socket command uses.
+struct RemoteUiAction {
+    /// Canonical action id. The `core.`-prefixed spelling is also accepted, so
+    /// `run.pause` and `core.run.pause` name the same command.
+    action_id: &'static str,
+    lower: fn(
+        &codypendent_protocol::UiActionInvocation,
+    ) -> Result<CommandBody, codypendent_protocol::CodypendentError>,
+}
+
+const REMOTE_UI_ACTIONS: &[RemoteUiAction] = &[
+    RemoteUiAction {
+        action_id: "run.pause",
+        lower: |invocation| {
+            Ok(CommandBody::PauseRun {
+                run_id: remote_ui_run_id(invocation)?,
+            })
+        },
+    },
+    RemoteUiAction {
+        action_id: "run.resume",
+        lower: |invocation| {
+            Ok(CommandBody::ResumeRun {
+                run_id: remote_ui_run_id(invocation)?,
+            })
+        },
+    },
+    RemoteUiAction {
+        action_id: "run.cancel",
+        lower: |invocation| {
+            Ok(CommandBody::CancelRun {
+                run_id: remote_ui_run_id(invocation)?,
+            })
+        },
+    },
+    RemoteUiAction {
+        action_id: "workflow.pause",
+        lower: |invocation| {
+            Ok(CommandBody::PauseWorkflow {
+                workflow_run_id: remote_ui_workflow_run_id(invocation)?,
+            })
+        },
+    },
+    RemoteUiAction {
+        action_id: "workflow.resume",
+        lower: |invocation| {
+            Ok(CommandBody::ResumeWorkflow {
+                workflow_run_id: remote_ui_workflow_run_id(invocation)?,
+            })
+        },
+    },
+    RemoteUiAction {
+        action_id: "workflow.retry_node",
+        lower: |invocation| {
+            Ok(CommandBody::RetryWorkflowNode {
+                workflow_run_id: remote_ui_workflow_run_id(invocation)?,
+                node_id: remote_ui_payload_string(invocation, "nodeId")?,
+            })
+        },
+    },
+    RemoteUiAction {
+        action_id: "workflow.cancel",
+        lower: |invocation| {
+            Ok(CommandBody::CancelWorkflow {
+                workflow_run_id: remote_ui_workflow_run_id(invocation)?,
+            })
+        },
+    },
+];
+
+fn remote_ui_payload_string(
+    invocation: &codypendent_protocol::UiActionInvocation,
+    field: &str,
+) -> Result<String, codypendent_protocol::CodypendentError> {
+    invocation
+        .payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            codypendent_protocol::CodypendentError::new(
+                "ui.action.invalid-payload",
+                format!(
+                    "Remote UI action {:?} requires a {field}",
+                    invocation.action_id
+                ),
+                false,
+            )
+        })
+}
+
+fn remote_ui_run_id(
+    invocation: &codypendent_protocol::UiActionInvocation,
+) -> Result<codypendent_protocol::RunId, codypendent_protocol::CodypendentError> {
+    remote_ui_payload_string(invocation, "runId")?
+        .parse::<codypendent_protocol::RunId>()
+        .map_err(|_| {
+            codypendent_protocol::CodypendentError::new(
+                "ui.action.invalid-payload",
+                "runId is not a valid run identifier",
+                false,
+            )
+        })
+}
+
+fn remote_ui_workflow_run_id(
+    invocation: &codypendent_protocol::UiActionInvocation,
+) -> Result<String, codypendent_protocol::CodypendentError> {
+    remote_ui_payload_string(invocation, "workflowRunId")
+}
+
 fn remote_ui_command(
     invocation: &codypendent_protocol::UiActionInvocation,
 ) -> Result<CommandBody, codypendent_protocol::CodypendentError> {
-    let run_id = || {
-        invocation
-            .payload
-            .get("runId")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                codypendent_protocol::CodypendentError::new(
-                    "ui.action.invalid-payload",
-                    "run command requires a runId",
-                    false,
-                )
-            })?
-            .parse::<codypendent_protocol::RunId>()
-            .map_err(|_| {
-                codypendent_protocol::CodypendentError::new(
-                    "ui.action.invalid-payload",
-                    "runId is not a valid run identifier",
-                    false,
-                )
-            })
+    let action_id = invocation.action_id.as_str();
+    let canonical = action_id.strip_prefix("core.").unwrap_or(action_id);
+    REMOTE_UI_ACTIONS
+        .iter()
+        .find(|action| action.action_id == canonical)
+        .ok_or_else(|| {
+            codypendent_protocol::CodypendentError::new(
+                "ui.action.not-authorized",
+                format!("Remote UI action {action_id:?} is not a mediated daemon command"),
+                false,
+            )
+        })
+        .and_then(|action| (action.lower)(invocation))
+}
+
+fn is_remote_ui_workflow_control(body: &CommandBody) -> bool {
+    matches!(
+        body,
+        CommandBody::PauseWorkflow { .. }
+            | CommandBody::ResumeWorkflow { .. }
+            | CommandBody::RetryWorkflowNode { .. }
+            | CommandBody::CancelWorkflow { .. }
+    )
+}
+
+/// Drive an allowlisted `workflow.*` action through the same
+/// [`WorkflowLifecycle`] seam and the same `Controller`-only gate the
+/// connection-level workflow commands use. A workflow run lives outside the
+/// session ledger, so there is no `CommandService` write path to reuse; the
+/// reply mirrors the connection path's fast accept/reject.
+async fn apply_remote_ui_workflow_control(
+    state: &Arc<ServerState>,
+    role: ClientRole,
+    body: &CommandBody,
+) -> Result<crate::commands::CommandOutcome, codypendent_protocol::CodypendentError> {
+    if role != ClientRole::Controller {
+        return Err(codypendent_protocol::CodypendentError::new(
+            "protocol.role-denied",
+            format!("role {role:?} may not control a workflow run"),
+            false,
+        ));
+    }
+    let Some(lifecycle) = state.lifecycle.as_ref() else {
+        return Err(codypendent_protocol::CodypendentError::new(
+            "workflow.transport-unavailable",
+            "workflow transport is not enabled on this daemon",
+            false,
+        ));
     };
-    match invocation.action_id.as_str() {
-        "run.pause" | "core.run.pause" => Ok(CommandBody::PauseRun { run_id: run_id()? }),
-        "run.resume" | "core.run.resume" => Ok(CommandBody::ResumeRun { run_id: run_id()? }),
-        "run.cancel" | "core.run.cancel" => Ok(CommandBody::CancelRun { run_id: run_id()? }),
-        action_id => Err(codypendent_protocol::CodypendentError::new(
+    let client_id = ClientId::new();
+    match body {
+        CommandBody::PauseWorkflow { workflow_run_id } => {
+            lifecycle
+                .pause(PauseWorkflowRequest {
+                    workflow_run_id: workflow_run_id.clone(),
+                    client_id,
+                })
+                .await
+        }
+        CommandBody::ResumeWorkflow { workflow_run_id } => {
+            lifecycle
+                .resume(ResumeWorkflowRequest {
+                    workflow_run_id: workflow_run_id.clone(),
+                    client_id,
+                })
+                .await
+        }
+        CommandBody::RetryWorkflowNode {
+            workflow_run_id,
+            node_id,
+        } => {
+            lifecycle
+                .retry_node(RetryWorkflowNodeRequest {
+                    workflow_run_id: workflow_run_id.clone(),
+                    node_id: node_id.clone(),
+                    client_id,
+                })
+                .await
+        }
+        CommandBody::CancelWorkflow { workflow_run_id } => {
+            lifecycle
+                .cancel(CancelWorkflowRequest {
+                    workflow_run_id: workflow_run_id.clone(),
+                    client_id,
+                })
+                .await
+        }
+        _ => Err(codypendent_protocol::CodypendentError::new(
             "ui.action.not-authorized",
-            format!("Remote UI action {action_id:?} is not a mediated daemon command"),
+            "not a workflow lifecycle command",
             false,
         )),
     }
+    .map(|()| crate::commands::CommandOutcome {
+        command_id: codypendent_protocol::CommandId::new(),
+        created_session: None,
+        created_run: None,
+        last_sequence: None,
+        newly_applied: true,
+    })
 }
 
 async fn attach_remote_ui(
@@ -3644,6 +4471,125 @@ async fn workflow_control_seam<'a>(
     Ok(Some(lifecycle))
 }
 
+/// Lower a wire [`BlackboardScope`] to the daemon's [`BoardTarget`], or `None`
+/// for the `Unknown` variant a newer client's scope parses into — rejected
+/// structurally at the edge rather than guessed at (Phase B kanban).
+fn board_target(scope: &codypendent_protocol::BlackboardScope) -> Option<BoardTarget> {
+    match scope {
+        codypendent_protocol::BlackboardScope::WorkflowRun { workflow_run_id } => {
+            Some(BoardTarget::WorkflowRun(workflow_run_id.clone()))
+        }
+        codypendent_protocol::BlackboardScope::RepositoryBoard { repository } => {
+            Some(BoardTarget::Repository(repository.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// The rejection for a board scope this daemon does not understand.
+fn unknown_board_scope() -> codypendent_protocol::CodypendentError {
+    codypendent_protocol::CodypendentError::new(
+        "blackboard.unknown-scope",
+        "this daemon does not understand the requested board scope".to_string(),
+        false,
+    )
+}
+
+/// The `Controller` role gate + transport check both board writes share: replies
+/// the rejection itself and yields `None` when either fails, mirroring
+/// [`workflow_control_seam`].
+async fn board_writer_or_reject<'a>(
+    state: &'a Arc<ServerState>,
+    conn: &ConnState,
+    request: &Envelope,
+    writer: &SharedWriter,
+) -> anyhow::Result<Option<&'a Arc<dyn BlackboardWriter>>> {
+    if conn.role != ClientRole::Controller {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "protocol.role-denied",
+                "only a Controller may write the blackboard".to_string(),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    }
+    let Some(seam) = state.blackboard_writer.as_ref() else {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "workflow.transport-unavailable",
+                "workflow transport is not enabled on this daemon".to_string(),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    };
+    Ok(Some(seam))
+}
+
+/// The largest page `ReadSessionEvents` serves, and the page size a request that
+/// names none gets. Bounded so one command can never be asked to materialize a
+/// 100k-event session into a single frame (the 16 MiB frame limit is a wall, not
+/// a policy) — a pager simply walks forward instead.
+const MAX_SESSION_EVENTS_PAGE: u32 = 500;
+
+/// Serve one ascending page of a session's durable history: events with
+/// `after_sequence < sequence <= after_sequence + limit`, the page's highest
+/// sequence, and whether anything existed beyond it at read time. An unknown
+/// session is rejected rather than answered with an empty page, so a typo'd id
+/// never reads as "empty session" (the same discipline the attach catch-up uses).
+async fn read_session_events_page(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    after_sequence: u64,
+    limit: u32,
+) -> Result<(Vec<SessionEvent>, u64, bool), codypendent_protocol::CodypendentError> {
+    let store_error = |error: anyhow::Error| {
+        codypendent_protocol::CodypendentError::new(
+            "protocol.store-error",
+            format!("could not read the session history: {error}"),
+            true,
+        )
+    };
+    match ledger::session_exists(pool, session_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(codypendent_protocol::CodypendentError::new(
+                "protocol.session-not-found",
+                format!("no session {session_id}"),
+                false,
+            ));
+        }
+        Err(error) => return Err(store_error(error)),
+    }
+    // 0 (or absent) asks for the server default; anything larger is clamped to
+    // the ceiling rather than refused, so a client never has to know the limit.
+    let limit = if limit == 0 {
+        MAX_SESSION_EVENTS_PAGE
+    } else {
+        limit.min(MAX_SESSION_EVENTS_PAGE)
+    };
+    let through = after_sequence.saturating_add(u64::from(limit));
+    let events = ledger::load_events_between(pool, session_id, after_sequence, through)
+        .await
+        .map_err(store_error)?;
+    // `next_sequence` is the sequence the NEXT append will take, so the highest
+    // one that exists is one below it — comparing against the next would report
+    // `has_more` on a fully drained ledger and spin a pager forever.
+    let highest = ledger::next_sequence(pool, session_id)
+        .await
+        .map_err(store_error)?
+        .saturating_sub(1);
+    // An empty page keeps the caller's cursor where it was, so paging is a fixed
+    // point once drained rather than silently skipping the requested window.
+    let reached = events.last().map_or(after_sequence, |event| event.sequence);
+    Ok((events, reached, highest > reached))
+}
+
 async fn send(writer: &SharedWriter, envelope: &Envelope) -> Result<(), FrameError> {
     let mut guard = writer.lock().await;
     write_envelope(&mut *guard, envelope).await
@@ -3809,13 +4755,130 @@ mod resume {
 #[cfg(test)]
 mod tests {
     use super::{
-        admits_run, claim_ui_plugin_command, persist_ui_plugin_command_result,
-        remote_ui_artifact_range, resume,
+        admits_run, claim_ui_plugin_command, is_remote_ui_workflow_control,
+        persist_ui_plugin_command_result, remote_ui_artifact_range, remote_ui_command, resume,
+        REMOTE_UI_ACTIONS,
     };
     use chrono::Utc;
     use codypendent_protocol::{
         AgentMode, ClientId, CommandBody, CommandId, Payload, RunId, SessionId,
     };
+
+    fn invocation(
+        action_id: &str,
+        payload: serde_json::Value,
+    ) -> codypendent_protocol::UiActionInvocation {
+        codypendent_protocol::UiActionInvocation {
+            invocation_id: "invocation-1".into(),
+            document_id: codypendent_protocol::UiDocumentId::from("document-1"),
+            revision: codypendent_protocol::UiRevision(1),
+            source_node_id: codypendent_protocol::UiNodeId::from("node-1"),
+            action_id: codypendent_protocol::UiActionId::from(action_id),
+            payload,
+            form_data: Default::default(),
+            interaction_token: None,
+            interaction_event_type: None,
+        }
+    }
+
+    #[test]
+    fn the_mediated_action_table_is_the_whole_allowlist() {
+        // Adding a mediated action must be one table row and nothing else.
+        let ids = REMOTE_UI_ACTIONS
+            .iter()
+            .map(|action| action.action_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "run.pause",
+                "run.resume",
+                "run.cancel",
+                "workflow.pause",
+                "workflow.resume",
+                "workflow.retry_node",
+                "workflow.cancel",
+            ]
+        );
+
+        let run_id = RunId::new();
+        assert!(matches!(
+            remote_ui_command(&invocation("run.pause", serde_json::json!({ "runId": run_id.to_string() }))),
+            Ok(CommandBody::PauseRun { run_id: lowered }) if lowered == run_id
+        ));
+        // The `core.` spelling names the same command.
+        assert!(matches!(
+            remote_ui_command(&invocation(
+                "core.run.cancel",
+                serde_json::json!({ "runId": run_id.to_string() })
+            )),
+            Ok(CommandBody::CancelRun { .. })
+        ));
+        assert!(matches!(
+            remote_ui_command(&invocation("workflow.retry_node", serde_json::json!({ "workflowRunId": "wf-1", "nodeId": "build" }))),
+            Ok(CommandBody::RetryWorkflowNode { workflow_run_id, node_id }) if workflow_run_id == "wf-1" && node_id == "build"
+        ));
+        assert!(matches!(
+            remote_ui_command(&invocation("workflow.cancel", serde_json::json!({ "workflowRunId": "wf-1" }))),
+            Ok(CommandBody::CancelWorkflow { workflow_run_id }) if workflow_run_id == "wf-1"
+        ));
+
+        // Everything outside the table is refused, including near-misses and
+        // commands the daemon has but never mediates.
+        for action_id in [
+            "workflow.start",
+            "session.close",
+            "run.pause.extra",
+            "core.core.run.pause",
+            "blackboard.post",
+            "",
+        ] {
+            let error = remote_ui_command(&invocation(
+                action_id,
+                serde_json::json!({ "runId": run_id.to_string() }),
+            ))
+            .expect_err("unlisted action is not mediated");
+            assert_eq!(error.code, "ui.action.not-authorized", "{action_id}");
+        }
+
+        // A listed action with an unusable payload is a payload error, never a
+        // command with a fabricated resource.
+        let error = remote_ui_command(&invocation(
+            "workflow.retry_node",
+            serde_json::json!({ "workflowRunId": "wf-1" }),
+        ))
+        .expect_err("retry needs a node id");
+        assert_eq!(error.code, "ui.action.invalid-payload");
+        let error = remote_ui_command(&invocation("run.pause", serde_json::json!({ "runId": "" })))
+            .expect_err("an empty run id is not a run id");
+        assert_eq!(error.code, "ui.action.invalid-payload");
+    }
+
+    #[test]
+    fn workflow_control_is_routed_off_the_session_ledger() {
+        // Workflow lifecycle lives in its own durable store, so these bodies go
+        // to the `WorkflowLifecycle` seam rather than `CommandService::apply`.
+        for body in [
+            CommandBody::PauseWorkflow {
+                workflow_run_id: "wf-1".into(),
+            },
+            CommandBody::ResumeWorkflow {
+                workflow_run_id: "wf-1".into(),
+            },
+            CommandBody::RetryWorkflowNode {
+                workflow_run_id: "wf-1".into(),
+                node_id: "build".into(),
+            },
+            CommandBody::CancelWorkflow {
+                workflow_run_id: "wf-1".into(),
+            },
+        ] {
+            assert!(is_remote_ui_workflow_control(&body), "{body:?}");
+        }
+        assert!(!is_remote_ui_workflow_control(&CommandBody::PauseRun {
+            run_id: RunId::new()
+        }));
+    }
 
     const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 
@@ -3835,6 +4898,7 @@ mod tests {
             text: "x".to_string(),
             mode: AgentMode::Build,
             model: None,
+            envelope: None,
         }));
         // A run-state transition mutates an existing run — it never admits a
         // new one, so it stays allowed even mid-shutdown.

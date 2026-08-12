@@ -7,6 +7,8 @@
 
 use std::cell::{Cell, RefCell};
 
+use chrono::{DateTime, Utc};
+
 use ratatui::layout::Rect;
 
 use codypendent_protocol::{
@@ -16,6 +18,7 @@ use codypendent_protocol::{
 
 use crate::action::{Action, Intent, KeyTarget, SecretKey};
 use crate::remote_ui_host::RemoteUiHostState;
+use crate::theme::{Theme, ThemeVariant};
 
 /// Maximum code-graph rows held in UI state at once. Shared by the renderer,
 /// reducer paging logic, and the CLI's SQLite query so range labels and page
@@ -151,7 +154,11 @@ impl Default for CouncilBuilderState {
 }
 
 /// The top-most modal / overlay, if any. Text prompts carry their buffer inline.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// `PartialEq` but NOT `Eq`: the add-model pick-list carries catalog prices as
+/// floats, which have no total equality. Every comparison in the codebase is a
+/// structural `==` / `assert_eq!`, which `PartialEq` alone serves.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Overlay {
     /// No overlay; the base layout is interactive.
     #[default]
@@ -201,6 +208,12 @@ pub enum Overlay {
     /// item — its kind, author, confidence, evidence, revision, and payload
     /// summary. The focused workflow run is subscribed while this view is open.
     Blackboard,
+    /// The repository task board (rubric 10): the [`AppState::kanban`] cards laid
+    /// out in status columns, with keyboard moves that supersede a card into its
+    /// new column through the daemon. The repository's board channel is
+    /// subscribed while this view is open, so a card an agent creates with
+    /// `task.create` appears live.
+    Kanban,
     /// Host-owned management surface for verified Remote UI plugins. Plugin
     /// code can never draw or intercept its own trust or revocation controls.
     UiPlugins,
@@ -223,13 +236,46 @@ pub enum Overlay {
     /// Host-owned council creation wizard. It selects only configured model
     /// profiles; persistence and final validation happen in the CLI harness.
     CouncilBuilder(CouncilBuilderState),
+    /// The council browser (rubric 6 TUI wiring): the [`AppState::councils`]
+    /// list on the left and, for the focused council, its chair/rounds/
+    /// evidence/members on the right — the same list+detail shape as
+    /// [`Overlay::Skills`]/[`Overlay::UiPlugins`]. `n` opens
+    /// [`Overlay::CouncilBuilder`] to create a new one; `r` prompts for an
+    /// objective and runs the focused council; `d` asks to remove it.
+    CouncilBrowser,
+    /// The council run-objective prompt (`r` from the browser): a free-text
+    /// buffer for what the focused council should deliberate. Submitting
+    /// emits `Intent::RunCouncil` and returns to the browser, which shows
+    /// progress as it streams back until the host-driven run completes.
+    CouncilRunObjective { name: String, buffer: String },
+    /// Confirm removal of a council definition (`d` from the browser). Its
+    /// prior saved run reports remain on disk — only the definition goes.
+    ConfirmCouncilDelete { name: String },
     /// The Docs Studio block-edit prompt (Phase 4 STEP 4.3 client wiring): a
     /// single-line buffer for the text to insert into the focused block. On submit
     /// the reducer acquires the block's edit lease and, once granted, sends the
     /// `MutateDocument`; the daemon's collaboration mode decides whether it applies
     /// directly (Edit) or lands as a suggestion (Suggest). `block_id` is the block
     /// the edit targets, captured when the prompt opened.
-    DocEdit { block_id: String, buffer: String },
+    DocEdit {
+        block_id: String,
+        buffer: String,
+        /// The block's text as it was when the prompt opened, prefilled into
+        /// `buffer`. Submit sends a FULL REPLACE — delete exactly this many
+        /// characters, then insert the buffer — so `e` is a real editor rather
+        /// than the prepend-only insertion it used to be.
+        original: String,
+    },
+    /// The Docs Studio new-document prompt: a single-line title buffer. Submit
+    /// sends `CreateDocument` (rubric #4 — before this the Docs Studio browsed a
+    /// set nothing could populate).
+    DocNew { buffer: String },
+    /// The Docs Studio new-block prompt: text for a paragraph inserted directly
+    /// below the focused block (or at the top of an empty document).
+    DocInsert { index: u32, buffer: String },
+    /// Confirm deleting the focused block. Destructive and un-undoable from the
+    /// TUI, so it never fires straight off a keypress.
+    DocDeleteConfirm { block_id: String, label: String },
     /// Repository-relative Markdown path for publishing the focused document.
     DocPublishPath {
         document_id: DocumentId,
@@ -260,6 +306,13 @@ pub enum Overlay {
     /// `Enter` sets [`AppState::default_mode`]; the current default is marked
     /// in the list.
     ModePicker { query: String, selected: usize },
+    /// The theme picker, opened from the command palette's `/theme` entry: the
+    /// seven built-in variants plus any data-only packs the CLI loaded at boot
+    /// ([`AppState::themes`]). The same filter/selection shape as
+    /// [`Overlay::ModePicker`]; moving the cursor previews the focused theme
+    /// across the WHOLE shell (see [`AppState::effective_theme`]), and `Enter`
+    /// keeps it and asks the harness to persist it.
+    ThemePicker { query: String, selected: usize },
     /// Add-model flow, free-text fallback (step 2): the provider-side model name,
     /// for the catalog provider chosen in step 1 (`provider_id`). `requires_key`
     /// was read from that provider's card. `api_key`:
@@ -303,15 +356,21 @@ pub enum Overlay {
     },
     /// Add-model flow, the model pick-list — fuzzy-filterable like the
     /// model/provider pickers. `Enter` on a row → `Intent::AddModel { display_id:
-    /// "<provider>/<picked>", provider_id, model: <picked>, api_key }`; `Esc`
-    /// closes. `query` filters `models` by substring; `selected` indexes the
-    /// filtered results (reset to 0 when the query changes).
+    /// "<provider>/<picked>", provider_id, model: <picked>, api_key,
+    /// context_tokens }`; `Esc` closes. `query` filters `models` by substring;
+    /// `selected` indexes the filtered results (reset to 0 when the query
+    /// changes). Rows carry the catalog metadata the harness merged onto the
+    /// live listing (or the catalog rows alone when there is no listing);
+    /// `origin` says which, so the header can be honest about it, and
+    /// `refreshing` marks a manual `Ctrl-R` re-fetch still in flight.
     AddModelPick {
         provider_id: String,
         api_key: Option<SecretKey>,
-        models: Vec<String>,
+        models: Vec<AddModelRow>,
         query: String,
         selected: usize,
+        origin: ModelListOrigin,
+        refreshing: bool,
     },
     /// The `/keys` overlay (D1): a fuzzy-filterable list of every configured
     /// model (see [`AppState::models`]) plus a final `Tavily (web.search)` row,
@@ -335,6 +394,62 @@ pub enum Overlay {
     /// [`Intent::RemoveApiKey`]; `n`/`Esc` dismisses. Opened by `Delete` on a row
     /// whose status is [`KeyStatus::Stored`].
     ApiKeyRemoveConfirm { target: KeyTarget },
+
+    /// Local models: browse the Unsloth GGUF catalog, step 1 of 4 — a
+    /// fuzzy-filterable list of repos fetched from the Hugging Face Hub,
+    /// opened from the command palette's "Local models: browse Unsloth
+    /// catalog" entry. `loading` is `true` from the moment the palette
+    /// command fires (`repos` empty, non-interactive — see
+    /// [`AppState::input_mode`]) until the harness's
+    /// [`crate::action::Intent::ListUnslothRepos`] round trip lands; `query`/
+    /// `selected` are the same filterable-list shape as
+    /// [`Overlay::ProviderPicker`]. `Enter` on a row begins step 2
+    /// ([`Overlay::UnslothQuants`]).
+    UnslothRepos {
+        repos: Vec<UnslothRepoCard>,
+        query: String,
+        selected: usize,
+        loading: bool,
+    },
+    /// Step 2: the quant variants (with sizes) for the repo chosen in
+    /// [`Overlay::UnslothRepos`], fetched from the Hub's file tree. Same
+    /// loading/filterable shape as step 1. `Enter` on a row begins step 3
+    /// ([`Overlay::UnslothConfirmPull`]).
+    UnslothQuants {
+        repo_id: String,
+        quants: Vec<UnslothQuantCard>,
+        query: String,
+        selected: usize,
+        loading: bool,
+    },
+    /// Step 3: confirm the pull before it drives `ollama pull` (a real
+    /// multi-gigabyte download) — the same y/n confirm shape as
+    /// [`Overlay::ConfirmWorkflowCancel`]. `y`/`Enter` begins step 4
+    /// ([`Overlay::UnslothPulling`]); `n`/`Esc` backs out to
+    /// [`Overlay::None`] (mirrors every other confirm overlay here — none of
+    /// them return to the picker they were opened from).
+    UnslothConfirmPull {
+        repo_id: String,
+        quant: String,
+        size_label: String,
+    },
+    /// Step 4: live `ollama pull` progress, then the registered-model notice
+    /// once it completes. `lines` is the tail of parsed progress output
+    /// (oldest first); `done` flips once the harness's pull task finishes
+    /// (success or failure), at which point exactly one of `error` /
+    /// `registered_id` is `Some`. Non-interactive except `Esc` (dismiss —
+    /// the pull itself is NOT cancelled: it keeps running detached, and a
+    /// late [`crate::action::Action::UnslothPullFinished`] is dropped by the
+    /// same repo_id/quant match guard [`Overlay::AddModelQuerying`]'s docs
+    /// describe for its own late-result case).
+    UnslothPulling {
+        repo_id: String,
+        quant: String,
+        lines: Vec<String>,
+        done: bool,
+        error: Option<String>,
+        registered_id: Option<String>,
+    },
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -451,6 +566,34 @@ pub enum TranscriptEntry {
     Unsupported { label: String },
 }
 
+/// Notes at or under this many lines render inline; a longer note folds
+/// (mirroring [`ToolCard`]/[`PatchSummary`]). Lives here, next to
+/// [`TranscriptEntry::is_foldable`], so the renderer's click targets and the
+/// reducer's keyboard walk can never disagree about which notes fold.
+pub(crate) const NOTE_INLINE_LINE_THRESHOLD: usize = 2;
+
+impl TranscriptEntry {
+    /// Whether this entry renders a collapsible head — a tool card, a patch
+    /// diff, the backstage fold, a long note, or a failed run's raw error
+    /// chain. The single source of truth for RULE 3 parity here: the renderer
+    /// registers a click target on exactly these entries, and `Alt-↑`/`Alt-↓`
+    /// walk exactly these entries, so every fold reachable by mouse is
+    /// reachable by keyboard and vice versa.
+    #[must_use]
+    pub fn is_foldable(&self) -> bool {
+        match self {
+            TranscriptEntry::Tool(_)
+            | TranscriptEntry::Patch(_)
+            | TranscriptEntry::Backstage { .. } => true,
+            TranscriptEntry::Note { text, .. } => text.lines().count() > NOTE_INLINE_LINE_THRESHOLD,
+            TranscriptEntry::Completed { disposition, .. } => {
+                matches!(disposition, RunDisposition::Failed { .. })
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A pending approval awaiting a decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApproval {
@@ -506,6 +649,14 @@ pub struct RunView {
     pub disposition: Option<RunDisposition>,
     /// The ordered transcript.
     pub transcript: Vec<TranscriptEntry>,
+    /// When each transcript entry's originating event occurred
+    /// (`SessionEvent.occurred_at`), parallel to `transcript` — index `i` is
+    /// entry `i`'s time. Kept in lockstep by [`AppState::push_entry`], the one
+    /// writer of both, and read only through [`RunView::entry_time`]. Carried
+    /// as a side vector rather than a field on every `TranscriptEntry` variant
+    /// so that folding a time onto an entry costs nothing at the ~30 match
+    /// sites that do not care about it.
+    pub entry_times: Vec<DateTime<Utc>>,
     /// Selected transcript entry (for expand / detail).
     pub transcript_selected: usize,
     /// Transcript scroll offset in rows (used only when not following).
@@ -531,10 +682,19 @@ impl RunView {
             cost_minor: None,
             disposition: None,
             transcript: Vec::new(),
+            entry_times: Vec::new(),
             transcript_selected: 0,
             scroll: 0,
             follow: true,
         }
+    }
+
+    /// When transcript entry `idx` arrived, if known. `None` for an entry
+    /// pushed by a test straight into `transcript` (the reducer always goes
+    /// through [`AppState::push_entry`]).
+    #[must_use]
+    pub fn entry_time(&self, idx: usize) -> Option<DateTime<Utc>> {
+        self.entry_times.get(idx).copied()
     }
 }
 
@@ -566,6 +726,42 @@ pub struct SkillCard {
     pub description: String,
     /// The requested capabilities, one verbatim string per capability.
     pub permissions: Vec<String>,
+}
+
+/// A council browser row (rubric 6 TUI wiring): one persisted council
+/// definition projected for the `/council` browser. Self-contained — the CLI
+/// maps a `councils.toml` entry (`crate::council::CouncilDefinition`, a
+/// cli-crate-only type this dependency-free crate cannot name) into this
+/// plain struct, exactly like [`SkillCard`]/[`ModelCard`] above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CouncilCard {
+    pub name: String,
+    pub description: String,
+    pub chair: String,
+    pub rounds: u8,
+    /// Evidence mode (rubric 6): members explore the repository read-only and
+    /// cite `file:line` instead of reasoning with no tools.
+    pub evidence: bool,
+    /// `(model, role)` per member, in the order they deliberate.
+    pub members: Vec<(String, String)>,
+}
+
+/// The plain, host-formatted result of one off-thread council run (rubric 6
+/// TUI wiring), handed back through `ReaderSignal::CouncilRunFinished` and
+/// folded into the transcript by [`crate::reduce::reduce`]. Pre-formatted
+/// host-side (participant lines, cost line) so this dependency-free crate
+/// never needs to name `crate::council`'s types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CouncilRunSummary {
+    /// The chair's final synthesis text, verbatim.
+    pub synthesis: String,
+    /// One attributed line per member plus the chair (model, role, session,
+    /// run id, and measured usage where measured).
+    pub participants: Vec<String>,
+    /// The measured-only aggregate cost line (never a fabricated estimate).
+    pub cost_line: String,
+    /// Where the durable JSON+Markdown report landed, for the transcript note.
+    pub report_markdown: String,
 }
 
 /// A memory provenance card (STEP 2.6): one curated memory projected for the
@@ -637,6 +833,11 @@ pub struct DocBlockView {
     pub kind: String,
     /// A one-line human rendering of the block's content.
     pub text: String,
+    /// The block's primary text VERBATIM (newlines included), or `None` for a
+    /// structured/embed block that has no single editable text container. This
+    /// is what the `e` prompt prefills and what its full-replace deletes — the
+    /// one-line `text` above is display-only and lossy.
+    pub editable: Option<String>,
 }
 
 /// One pending suggestion on a document (the review rail): a proposed
@@ -793,6 +994,12 @@ pub struct WorkflowNodeCard {
     pub retry: String,
     /// The nodes this one depends on, pre-rendered (comma-joined, or `"—"`).
     pub depends_on: String,
+    /// The same dependencies as raw node ids — the graph's **edges** (rubric 5),
+    /// which the pre-rendered [`depends_on`](Self::depends_on) string above cannot
+    /// be parsed back out of. The workflow pane lays these out into ASCII lanes;
+    /// empty means a root node (or a projection that predates edges, which simply
+    /// renders the flat list it always did).
+    pub depends_on_ids: Vec<String>,
     /// The blackboard artifact kinds the node declares to produce, pre-rendered
     /// (comma-joined, or `"—"`).
     pub outputs: String,
@@ -838,6 +1045,44 @@ pub struct BlackboardItemCard {
     /// Whether this item has been superseded by a later revision (the review
     /// rail shows the live item; a superseded one is dimmed).
     pub superseded: bool,
+}
+
+/// The board columns the kanban pane renders, in display order (rubric 10).
+///
+/// A card's `status` is a free string in the store — a team may grow its own
+/// columns — but these four are the defaults every write lands in and every
+/// client renders first. A card whose status is none of them is shown in the
+/// first column rather than dropped, so an unknown column never hides work.
+pub const KANBAN_COLUMNS: [&str; 4] = ["todo", "doing", "review", "done"];
+
+/// One backlog card projected for the kanban board (rubric 10).
+///
+/// Self-contained, like [`BlackboardItemCard`]: the TUI never depends on
+/// `codypendent-workflow`, so the CLI renders the stored item's opaque JSON
+/// payload into these strings. A card IS a blackboard item of kind `task` living
+/// on the repository's board, so it carries the same id and supersession-aware
+/// identity — a move republishes the card at a new revision and the pane merges
+/// it by id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KanbanCard {
+    /// Stable card id — what a move/update command names, and the merge key for
+    /// a live delivery.
+    pub id: String,
+    /// The card's one-line title, rendered from the stored payload.
+    pub title: String,
+    /// The column the card sits in (one of [`KANBAN_COLUMNS`], or a team's own).
+    pub status: String,
+    /// Who the card is assigned to, pre-rendered (`"—"` when nobody).
+    pub assignee: String,
+    /// The artifact kind, pre-rendered — `task` for a backlog card, but a board
+    /// can also hold a promoted `decision` or `open_question`, so the kind is
+    /// shown rather than assumed.
+    pub kind: String,
+    /// Who created (or last revised) it, pre-rendered (e.g. `"agent"` /
+    /// `"operator"`), so a human can see which cards the model wrote.
+    pub author: String,
+    /// The card's position within its column (lower sorts first).
+    pub ordinal: i64,
 }
 
 /// Where a model-picker card's model runs (MP1). A tui-local mirror of just
@@ -933,18 +1178,82 @@ pub(crate) fn filter_council_member_models(
         .collect()
 }
 
-/// The indices into `models` whose name case-insensitively contains `query` —
-/// the add-model pick-list's substring filter, in list order. Mirrors
-/// [`filter_models`] adapted to plain `String` model names (the provider's
-/// `/models` ids are bare strings, not [`ModelCard`]s). An empty query matches
-/// every name.
+/// One offerable model in the add-model pick-list: the provider-side id plus
+/// whatever metadata could be attached to it. The id is the only required
+/// field — a provider that answers `/models` with bare ids still produces a
+/// complete row, just with empty columns. The CLI harness builds these by
+/// merging the live `/models` response with the built-in catalog's `[[model]]`
+/// rows for that provider (catalog metadata attached where ids match, and
+/// catalog-only rows offered when the provider has no listing endpoint or the
+/// request failed), so the picker is never a dead end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddModelRow {
+    /// The provider-side model id, exactly as it must be sent on the wire.
+    pub id: String,
+    /// A human display name, when the catalog or the provider supplied one.
+    pub name: Option<String>,
+    /// The model's context window in tokens, when known.
+    pub context_tokens: Option<u64>,
+    /// USD per 1M input tokens, when known. DISPLAY-ONLY — never summed into
+    /// a budget (the catalog's own honesty rule).
+    pub cost_per_1m_input_usd: Option<f64>,
+    /// USD per 1M output tokens, when known. Display-only, as above.
+    pub cost_per_1m_output_usd: Option<f64>,
+    /// Whether the provider itself listed this model just now. `false` marks a
+    /// catalog-only row: offerable, but unconfirmed against the live endpoint.
+    pub live: bool,
+}
+
+impl AddModelRow {
+    /// A bare live row — the shape a provider that answers with ids only
+    /// produces, before any catalog metadata is merged onto it.
+    #[must_use]
+    pub fn live(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: None,
+            context_tokens: None,
+            cost_per_1m_input_usd: None,
+            cost_per_1m_output_usd: None,
+            live: true,
+        }
+    }
+}
+
+/// Where an add-model pick-list's rows came from, for an honest header: the
+/// operator must be able to tell a confirmed live listing from a catalog-only
+/// offering (which may name a model this account cannot actually reach).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelListOrigin {
+    /// Fetched from the provider's `/models` endpoint just now.
+    Live,
+    /// Seeded from `<data_dir>/model_lists/<provider>.json`; the string is a
+    /// human age label ("4m ago"), never a raw timestamp to parse.
+    Cached(String),
+    /// The built-in catalog only — the provider has no listing endpoint, or
+    /// the request failed. The string is the key-free reason, when there was
+    /// one.
+    Catalog(String),
+}
+
+/// The indices into `models` whose id or display name case-insensitively
+/// contains `query` — the add-model pick-list's substring filter, in list
+/// order. Mirrors [`filter_models`] adapted to [`AddModelRow`]. An empty query
+/// matches every row.
 #[must_use]
-pub(crate) fn filter_model_names(models: &[String], query: &str) -> Vec<usize> {
+pub(crate) fn filter_model_names(models: &[AddModelRow], query: &str) -> Vec<usize> {
     let needle = query.trim().to_lowercase();
     models
         .iter()
         .enumerate()
-        .filter(|(_, name)| needle.is_empty() || name.to_lowercase().contains(&needle))
+        .filter(|(_, row)| {
+            needle.is_empty()
+                || row.id.to_lowercase().contains(&needle)
+                || row
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.to_lowercase().contains(&needle))
+        })
         .map(|(idx, _)| idx)
         .collect()
 }
@@ -1036,6 +1345,15 @@ pub struct ProviderCard {
     /// cloud-IAM remain discoverable, but are disabled until their runtime
     /// adapter/auth flow is wired — never presented as a successful add.
     pub available: bool,
+    /// How many curated `[[model]]` rows the provider catalog ships for this
+    /// provider. Non-zero means the add flow has something to offer even when
+    /// the provider has no `/models` endpoint (Perplexity) or the request
+    /// fails — the picker is never a free-text dead end.
+    pub catalog_models: usize,
+    /// Whether a key for this provider is already stored in `auth.json` (under
+    /// the provider-wide `provider/<id>` entry). Set by the harness; the
+    /// add-model flow uses it to skip re-prompting for a key it already holds.
+    pub has_key: bool,
 }
 
 /// The indices into `providers` whose id/name/protocol case-insensitively
@@ -1054,6 +1372,70 @@ pub(crate) fn filter_providers(providers: &[ProviderCard], query: &str) -> Vec<u
                 || card.name.to_lowercase().contains(&needle)
                 || card.protocol.to_lowercase().contains(&needle)
         })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// One Unsloth GGUF repo row for the "Local models: browse Unsloth catalog"
+/// overlay ([`Overlay::UnslothRepos`]). Every field is pre-rendered by the
+/// CLI harness from the Hugging Face Hub discovery client
+/// (`codypendent_integrations::unsloth`) — the tui crate performs no
+/// formatting, mirroring [`ModelCard`]/[`ProviderCard`]'s convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnslothRepoCard {
+    /// The full repo id, e.g. `unsloth/Qwen3-32B-GGUF`.
+    pub id: String,
+    /// Pre-rendered download count, e.g. `"6.6M downloads"`.
+    pub downloads_label: String,
+    /// Pre-rendered like count, e.g. `"891 likes"`.
+    pub likes_label: String,
+    /// Pre-rendered last-updated date, or `"updated unknown"` when the Hub
+    /// reported none — never a fabricated date.
+    pub updated_label: String,
+}
+
+/// The indices into `repos` whose id case-insensitively contains `query` —
+/// the Unsloth repo browser's substring filter, in list order. Mirrors
+/// [`filter_providers`]. An empty query matches every repo.
+#[must_use]
+pub(crate) fn filter_unsloth_repos(repos: &[UnslothRepoCard], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    repos
+        .iter()
+        .enumerate()
+        .filter(|(_, card)| needle.is_empty() || card.id.to_lowercase().contains(&needle))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+/// One quant-variant row for a chosen Unsloth repo
+/// ([`Overlay::UnslothQuants`]). Pre-rendered by the CLI harness from
+/// `codypendent_integrations::unsloth::QuantVariant`; `size_bytes` rides
+/// alongside the label so a later step (the confirm dialog) can reuse it
+/// without re-parsing the display string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnslothQuantCard {
+    /// The quant tag, e.g. `UD-Q4_K_XL` — passed verbatim to `ollama pull
+    /// hf.co/<repo>:<quant>` and then used as the registered model id.
+    pub quant: String,
+    /// Pre-rendered download size, e.g. `"18.7 GB"`.
+    pub size_label: String,
+    /// How many split files make up this quant (`1` for the common case).
+    pub file_count: usize,
+    /// The raw combined size, carried through for the confirm step.
+    pub size_bytes: u64,
+}
+
+/// The indices into `quants` whose quant tag case-insensitively contains
+/// `query`. Mirrors [`filter_unsloth_repos`]. An empty query matches every
+/// quant.
+#[must_use]
+pub(crate) fn filter_unsloth_quants(quants: &[UnslothQuantCard], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    quants
+        .iter()
+        .enumerate()
+        .filter(|(_, card)| needle.is_empty() || card.quant.to_lowercase().contains(&needle))
         .map(|(idx, _)| idx)
         .collect()
 }
@@ -1103,6 +1485,84 @@ pub(crate) const MODE_CARDS: &[ModeCard] = &[
         summary: "read-only verification with commands — no writes or network",
     },
 ];
+
+/// One selectable theme: a built-in variant, or a data-only theme pack the CLI
+/// loaded from `<data-dir>/themes/<id>.toml` at boot. The resolved [`Theme`]
+/// travels with the row so the picker can preview it live — the TUI crate
+/// performs no I/O, so a pack's colours must arrive already parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeChoice {
+    /// The id `--theme`/`CODYPENDENT_THEME` and the persisted preference use.
+    pub id: String,
+    /// What this theme is for, in one line.
+    pub summary: String,
+    /// The colours themselves.
+    pub theme: Theme,
+    /// `true` for a data-only pack, `false` for a built-in variant.
+    pub pack: bool,
+}
+
+/// The seven built-in variants, in the order the picker lists them: the two
+/// everyday themes first, then the accessibility variants, then the
+/// reduced-depth fallbacks.
+#[must_use]
+pub fn builtin_theme_choices() -> Vec<ThemeChoice> {
+    [
+        ("dark", "true-colour dark — the default", ThemeVariant::Dark),
+        ("light", "true-colour light terminals", ThemeVariant::Light),
+        (
+            "high-contrast",
+            "pure black on white, maximum contrast",
+            ThemeVariant::HighContrast,
+        ),
+        (
+            "color-blind-safe",
+            "Okabe–Ito hues, safe for all common colour vision",
+            ThemeVariant::ColorBlindSafe,
+        ),
+        (
+            "ansi256",
+            "xterm-256 indexed palette",
+            ThemeVariant::Ansi256,
+        ),
+        (
+            "ansi16",
+            "basic ANSI palette for 16-colour terminals",
+            ThemeVariant::Ansi16,
+        ),
+        (
+            "monochrome",
+            "no colour at all — white, grey, black",
+            ThemeVariant::Monochrome,
+        ),
+    ]
+    .into_iter()
+    .map(|(id, summary, variant)| ThemeChoice {
+        id: id.to_owned(),
+        summary: summary.to_owned(),
+        theme: Theme::variant(variant),
+        pack: false,
+    })
+    .collect()
+}
+
+/// The indices into `themes` whose id or summary case-insensitively contains
+/// `query`, in list order — the theme picker's substring filter, the same
+/// shape as [`filter_models`]. An empty query matches every theme.
+#[must_use]
+pub fn filter_themes(themes: &[ThemeChoice], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    themes
+        .iter()
+        .enumerate()
+        .filter(|(_, choice)| {
+            needle.is_empty()
+                || choice.id.to_lowercase().contains(&needle)
+                || choice.summary.to_lowercase().contains(&needle)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
 
 /// The indices into [`MODE_CARDS`] whose label or summary case-insensitively
 /// contains `query` — the mode picker's substring filter, in table order.
@@ -1229,6 +1689,22 @@ pub struct AppState {
     pub blackboard: Vec<BlackboardItemCard>,
     /// Index into `blackboard` of the focused item.
     pub selected_item: usize,
+    /// The council browser projection (rubric 6 TUI wiring): every council
+    /// persisted in `councils.toml`, mapped to a self-contained
+    /// [`CouncilCard`] by the CLI harness. Populated at attach and reloaded
+    /// after every create/run/delete. The [`Overlay::CouncilBrowser`] reads it.
+    pub councils: Vec<CouncilCard>,
+    /// Index into `councils` of the focused council.
+    pub selected_council: usize,
+    /// The repository task board (rubric 10): every live `task` card on the
+    /// repository's board, mapped to self-contained [`KanbanCard`]s by the CLI.
+    /// The [`Overlay::Kanban`] view reads it; a live `BlackboardPosted` on the
+    /// board's channel merges into it by id, so an agent's `task.create` appears
+    /// in the pane without a refresh.
+    pub kanban: Vec<KanbanCard>,
+    /// Index into the board's DISPLAY order (column-major, the order the pane
+    /// walks columns and cards) of the focused card.
+    pub selected_card: usize,
     /// The model-picker projection (MP1): every model configured in
     /// `models.toml`, enriched with its measured profile from
     /// `model_profiles` when one exists, mapped to a self-contained
@@ -1275,6 +1751,12 @@ pub struct AppState {
     /// text lands here; Enter sends it (starting a run, or steering the active
     /// one). Empty by default.
     pub composer: String,
+    /// The insertion point in [`AppState::composer`], as a **byte** offset that
+    /// is always on a `char` boundary and never past `composer.len()`. Every
+    /// composer mutation goes through the splice helpers in [`crate::reduce`],
+    /// which maintain both invariants; `Left`/`Right` step whole graphemes, so
+    /// a multi-byte character or a combining sequence is never split.
+    pub composer_cursor: usize,
     /// Prior composer submissions (shell-style history), oldest first. `Up`
     /// (`HistoryPrev`) walks backward from the newest entry; `Down`
     /// (`HistoryNext`) walks forward. Populated by `InputSubmit` on a
@@ -1293,6 +1775,23 @@ pub struct AppState {
     /// `HistoryNext` walking back past the newest entry can restore it
     /// verbatim. The in-progress text is never lost.
     pub composer_stash: Option<String>,
+    /// Whether the transcript fold selection is live: the base view is
+    /// *browsing* its folds (`Alt-↑`/`Alt-↓`) rather than purely composing.
+    /// While set, the selected run's `transcript_selected` entry renders
+    /// highlighted, the viewport keeps it in sight, and `Alt-Enter` toggles it
+    /// instead of inserting a line break. Cleared by typing, scrolling, or
+    /// `Esc` — every gesture that means "I am driving the composer/view
+    /// again". Client-only view state; never on the wire.
+    pub transcript_browse: bool,
+    /// Every theme the `/theme` picker offers: the seven built-in variants,
+    /// plus any data-only packs the CLI loaded from `<data-dir>/themes/` at
+    /// boot (the TUI crate does no I/O, so a pack arrives already parsed).
+    pub themes: Vec<ThemeChoice>,
+    /// Index into [`AppState::themes`] of the theme in force, once the operator
+    /// has picked one. `None` means "whatever the harness resolved at boot"
+    /// (the `--theme` flag, `CODYPENDENT_THEME`, a persisted preference, or
+    /// terminal detection) — see [`AppState::effective_theme`].
+    pub theme_selected: Option<usize>,
     /// Which base layout is rendered (chat single-column vs. workspace panes).
     /// Toggled with `F2`; defaults to [`LayoutMode::Chat`].
     pub layout: LayoutMode,
@@ -1322,9 +1821,28 @@ pub struct AppState {
     pub tick: u64,
     /// A transient status-line notice and the tick at which it expires.
     pub notice: Option<(String, u64)>,
+    /// Voice input/output state (voice v1, rubric 8). Purely presentational
+    /// here: the capture and speech work itself lives in the CLI's voice host
+    /// (`codypendent_cli::voice`), which owns the recorder/player subprocesses.
+    /// This state is what the status line renders and what the host reads to
+    /// decide whether to speak a finalized reply.
+    pub voice: VoiceState,
     /// Semantic commands the CLI must send to the daemon. Drained by the CLI
     /// after every reduce; never touched by the renderer.
     pub outbox: Vec<Intent>,
+}
+
+/// Voice input/output state (voice v1, rubric 8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VoiceState {
+    /// Whether push-to-talk capture is running right now. Rendered as a
+    /// prominent status-line indicator: a hot microphone must never be
+    /// invisible.
+    pub recording: bool,
+    /// Whether finalized assistant turns are spoken aloud. Toggled from the
+    /// palette; read by the CLI's voice host, which does the synthesis
+    /// off-thread so a slow provider never stalls the UI.
+    pub speak_replies: bool,
 }
 
 impl Default for AppState {
@@ -1368,6 +1886,10 @@ impl AppState {
             selected_node: 0,
             blackboard: Vec::new(),
             selected_item: 0,
+            councils: Vec::new(),
+            selected_council: 0,
+            kanban: Vec::new(),
+            selected_card: 0,
             models: Vec::new(),
             selected_model: 0,
             pending_model: None,
@@ -1379,9 +1901,13 @@ impl AppState {
             selected_issue: 0,
             focus: Pane::Sessions,
             composer: String::new(),
+            composer_cursor: 0,
             composer_history: Vec::new(),
             history_cursor: None,
             composer_stash: None,
+            transcript_browse: false,
+            themes: builtin_theme_choices(),
+            theme_selected: None,
             layout: LayoutMode::Chat,
             transcript_max_scroll: Cell::new(0),
             hit_map: RefCell::new(Vec::new()),
@@ -1390,6 +1916,7 @@ impl AppState {
             should_detach: false,
             tick: 0,
             notice: None,
+            voice: VoiceState::default(),
             outbox: Vec::new(),
         }
     }
@@ -1408,23 +1935,47 @@ impl AppState {
                 | CouncilBuilderStep::Review => InputMode::Palette,
             };
         }
+        // The Unsloth repo/quant browsers share one overlay each across their
+        // loading and loaded sub-states (mirrors the CouncilBuilder
+        // resolution above): non-interactive while fetching, filterable once
+        // loaded.
+        if let Overlay::UnslothRepos { loading, .. } = &self.overlay {
+            return if *loading {
+                InputMode::Normal
+            } else {
+                InputMode::Palette
+            };
+        }
+        if let Overlay::UnslothQuants { loading, .. } = &self.overlay {
+            return if *loading {
+                InputMode::Normal
+            } else {
+                InputMode::Palette
+            };
+        }
         match self.overlay {
             Overlay::NewRun(_)
             | Overlay::Steering(_)
             | Overlay::WorkflowInputs { .. }
             | Overlay::EdgeSearch(_)
             | Overlay::DocEdit { .. }
+            | Overlay::DocNew { .. }
+            | Overlay::DocInsert { .. }
             | Overlay::DocPublishPath { .. }
             | Overlay::AddModelId { .. }
             | Overlay::AddModelKey { .. }
             | Overlay::AddModelProviderKey { .. }
-            | Overlay::ApiKeySet { .. } => InputMode::Editing,
+            | Overlay::ApiKeySet { .. }
+            | Overlay::CouncilRunObjective { .. } => InputMode::Editing,
             Overlay::ConfirmCancel
             | Overlay::ConfirmWorkflowCancel { .. }
             | Overlay::ApiKeyRemoveConfirm { .. }
             | Overlay::ConfirmUiPluginApprove { .. }
             | Overlay::ConfirmUiPluginReject { .. }
-            | Overlay::ConfirmUiPluginRevoke { .. } => InputMode::Confirm,
+            | Overlay::ConfirmUiPluginRevoke { .. }
+            | Overlay::ConfirmCouncilDelete { .. }
+            | Overlay::UnslothConfirmPull { .. }
+            | Overlay::DocDeleteConfirm { .. } => InputMode::Confirm,
             // The palette, the model picker, the provider picker, the mode
             // picker, the `/keys` overlay, and the add-model pick-list all
             // filter on printable keys while staying arrow-navigable, so they
@@ -1433,6 +1984,7 @@ impl AppState {
             | Overlay::ModelPicker { .. }
             | Overlay::ProviderPicker { .. }
             | Overlay::ModePicker { .. }
+            | Overlay::ThemePicker { .. }
             | Overlay::ApiKeys { .. }
             | Overlay::AddModelPick { .. } => InputMode::Palette,
             // The Skills / Memory / Docs / Edges / Workflow / Help browsers are
@@ -1447,10 +1999,16 @@ impl AppState {
             | Overlay::Edges
             | Overlay::Workflow
             | Overlay::Blackboard
+            | Overlay::Kanban
             | Overlay::UiPlugins
-            | Overlay::AddModelQuerying { .. } => InputMode::Normal,
+            | Overlay::CouncilBrowser
+            | Overlay::AddModelQuerying { .. }
+            | Overlay::UnslothPulling { .. } => InputMode::Normal,
             Overlay::CouncilBuilder(_) => {
                 unreachable!("council builder input mode is resolved above")
+            }
+            Overlay::UnslothRepos { .. } | Overlay::UnslothQuants { .. } => {
+                unreachable!("unsloth repo/quant browser input mode is resolved above")
             }
             // The base conversation view: an unresolved approval owns the screen
             // (decision keys only); otherwise the composer captures typed text.
@@ -1549,10 +2107,68 @@ impl AppState {
         self.blackboard.get(self.selected_item)
     }
 
+    /// The board's cards in DISPLAY order: column by column in
+    /// [`KANBAN_COLUMNS`] order, each column sorted by `ordinal` then title.
+    ///
+    /// One ordering serves the renderer, the keyboard selection, and the hit
+    /// regions, so "the third card" means the same thing to all three. A card
+    /// whose status matches no known column is shown in the FIRST column rather
+    /// than dropped — an unrecognized column must never hide work.
+    #[must_use]
+    pub fn kanban_columns(&self) -> Vec<(&'static str, Vec<&KanbanCard>)> {
+        KANBAN_COLUMNS
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                let mut cards: Vec<&KanbanCard> = self
+                    .kanban
+                    .iter()
+                    .filter(|card| {
+                        card.status.eq_ignore_ascii_case(column)
+                            || (index == 0
+                                && !KANBAN_COLUMNS
+                                    .iter()
+                                    .any(|known| card.status.eq_ignore_ascii_case(known)))
+                    })
+                    .collect();
+                cards.sort_by(|a, b| {
+                    a.ordinal
+                        .cmp(&b.ordinal)
+                        .then_with(|| a.title.cmp(&b.title))
+                });
+                (*column, cards)
+            })
+            .collect()
+    }
+
+    /// The board's cards flattened in display order — the sequence
+    /// [`selected_card`](Self::selected_card) indexes.
+    #[must_use]
+    pub fn kanban_in_display_order(&self) -> Vec<&KanbanCard> {
+        self.kanban_columns()
+            .into_iter()
+            .flat_map(|(_, cards)| cards)
+            .collect()
+    }
+
+    /// The focused board card, if any.
+    #[must_use]
+    pub fn focused_card(&self) -> Option<&KanbanCard> {
+        self.kanban_in_display_order()
+            .get(self.selected_card)
+            .copied()
+    }
+
     /// The focused host-managed Remote UI plugin, if one is installed.
     #[must_use]
     pub fn focused_ui_plugin(&self) -> Option<&codypendent_protocol::UiPluginLifecycleStatus> {
         self.ui_plugins.get(self.selected_ui_plugin)
+    }
+
+    /// The focused council browser card, if any (rubric 6 TUI wiring).
+    #[must_use]
+    pub fn focused_council(&self) -> Option<&CouncilCard> {
+        self.councils.get(self.selected_council)
     }
 
     /// The focused model-picker card, if any.
@@ -1580,6 +2196,46 @@ impl AppState {
             worktree: run.and_then(|r| r.worktree.clone()),
             pending_approvals: self.pending_approvals.len(),
         }
+    }
+
+    /// The theme this frame draws in: the row the `/theme` picker is focused on
+    /// (so moving the cursor previews the whole shell in that theme), else the
+    /// operator's kept choice, else `boot` — whatever the harness resolved from
+    /// `--theme`/`CODYPENDENT_THEME`/the persisted preference/terminal
+    /// detection. Pure, so the renderer stays a projection of state.
+    #[must_use]
+    pub fn effective_theme(&self, boot: &Theme) -> Theme {
+        if let Overlay::ThemePicker { query, selected } = &self.overlay {
+            let filtered = filter_themes(&self.themes, query);
+            if let Some(choice) = filtered
+                .get(*selected)
+                .and_then(|&idx| self.themes.get(idx))
+            {
+                return choice.theme;
+            }
+        }
+        self.theme_selected
+            .and_then(|idx| self.themes.get(idx))
+            .map_or(*boot, |choice| choice.theme)
+    }
+
+    /// Whether any surface on screen right now has a moving part — a run that
+    /// is thinking or executing a tool, a code-graph page in flight, or a
+    /// provider's model list being fetched.
+    ///
+    /// The interactive client redraws on every tick while this holds, and
+    /// falls back to its sparse keep-alive redraw otherwise. Without it, the
+    /// spinners were repainted once every 25 ticks (~5s) — a "spinner" that
+    /// changes frame once every five seconds reads as a frozen UI, which is
+    /// the exact opposite of what it is there to say.
+    #[must_use]
+    pub fn is_animating(&self) -> bool {
+        self.edge_loading
+            || matches!(self.overlay, Overlay::AddModelQuerying { .. })
+            || self
+                .runs
+                .iter()
+                .any(|run| !matches!(run.activity, RunActivity::Idle))
     }
 
     /// Drain the outbox of intents accumulated since the last call. The CLI's
@@ -1650,8 +2306,10 @@ impl AppState {
         self.runs.get_mut(self.selected_run)
     }
 
-    /// Append model text, coalescing into a trailing `Model` entry.
-    pub(crate) fn append_model_text(run: &mut RunView, text: &str) {
+    /// Append model text, coalescing into a trailing `Model` entry. The
+    /// coalesced entry keeps the timestamp of its FIRST delta — that is when
+    /// the turn began, which is what the turn header shows.
+    pub(crate) fn append_model_text(run: &mut RunView, text: &str, at: DateTime<Utc>) {
         if let Some(TranscriptEntry::Model {
             text: existing,
             rendered,
@@ -1675,17 +2333,25 @@ impl AppState {
                 text: text.to_owned(),
                 rendered: None,
             },
+            at,
         );
     }
 
-    /// Append a transcript entry, holding the transcript to
-    /// [`MAX_TRANSCRIPT_ENTRIES`] by dropping the oldest — the ledger, not this
-    /// view, is the durable record. Selection/scroll indices shift with the
-    /// drop so the focused entry stays the same one.
-    pub(crate) fn push_entry(run: &mut RunView, entry: TranscriptEntry) {
+    /// Append a transcript entry and the wall-clock time of the event that
+    /// produced it, holding the transcript to [`MAX_TRANSCRIPT_ENTRIES`] by
+    /// dropping the oldest — the ledger, not this view, is the durable record.
+    /// Selection/scroll indices shift with the drop so the focused entry stays
+    /// the same one.
+    ///
+    /// This is the ONLY writer of [`RunView::entry_times`]; keeping the push
+    /// and the timestamp in one call is what holds the two vectors in lockstep
+    /// (asserted by `transcript_and_entry_times_stay_in_lockstep`).
+    pub(crate) fn push_entry(run: &mut RunView, entry: TranscriptEntry, at: DateTime<Utc>) {
         run.transcript.push(entry);
+        run.entry_times.push(at);
         while run.transcript.len() > MAX_TRANSCRIPT_ENTRIES {
             run.transcript.remove(0);
+            run.entry_times.remove(0);
             run.transcript_selected = run.transcript_selected.saturating_sub(1);
             run.scroll = run.scroll.saturating_sub(1);
         }
@@ -1697,11 +2363,14 @@ mod tests {
     use super::*;
 
     /// [`filter_model_names`] mirrors [`filter_models`]/[`filter_providers`]'s
-    /// substring-match shape, adapted to bare `String` model ids (the
-    /// add-model pick-list's fetched names have no [`ModelCard`] wrapper).
+    /// substring-match shape, adapted to the add-model pick-list's
+    /// [`AddModelRow`] cards.
     #[test]
     fn filter_model_names_matches_case_insensitive_substrings() {
-        let models = vec!["llama-3.1-8b".to_owned(), "gpt-oss-20b".to_owned()];
+        let models = vec![
+            AddModelRow::live("llama-3.1-8b"),
+            AddModelRow::live("gpt-oss-20b"),
+        ];
         assert_eq!(
             filter_model_names(&models, ""),
             vec![0, 1],
@@ -1721,6 +2390,23 @@ mod tests {
             filter_model_names(&models, "zzz-no-such-model").is_empty(),
             "no match returns an empty list"
         );
+    }
+
+    /// A catalog row's display NAME is searchable too: an operator who knows a
+    /// model as "Llama 3.3 70B" should not have to guess the provider's id
+    /// spelling to find it.
+    #[test]
+    fn filter_model_names_also_matches_the_display_name() {
+        let models = vec![AddModelRow {
+            id: "meta-llama/Llama-3.3-70B-Instruct".to_owned(),
+            name: Some("Llama 3.3 70B Instruct".to_owned()),
+            context_tokens: Some(128_000),
+            cost_per_1m_input_usd: Some(0.13),
+            cost_per_1m_output_usd: Some(0.4),
+            live: false,
+        }];
+        assert_eq!(filter_model_names(&models, "3.3 70b"), vec![0]);
+        assert_eq!(filter_model_names(&models, "META-LLAMA"), vec![0]);
     }
 
     /// Secret hygiene (model discovery): every new overlay that carries a
@@ -1752,9 +2438,11 @@ mod tests {
                 Overlay::AddModelPick {
                     provider_id: "groq".to_owned(),
                     api_key: Some(SecretKey("sk-secret".to_owned())),
-                    models: vec!["llama-3.1-8b".to_owned()],
+                    models: vec![AddModelRow::live("llama-3.1-8b")],
                     query: String::new(),
                     selected: 0,
+                    origin: ModelListOrigin::Live,
+                    refreshing: false,
                 }
             ),
             format!(

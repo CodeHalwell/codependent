@@ -1,5 +1,7 @@
 import {
   DEFAULT_UI_HARD_LIMITS,
+  UI_WORKER_MESSAGE_BURST,
+  UI_WORKER_MESSAGE_RATE_PER_SECOND,
   type UiCapabilities,
   type UiCapabilitySelection,
   type UiContributionPoint,
@@ -114,7 +116,9 @@ export interface UiWorkerRuntimeOptions {
   sessionId?: string;
   handshakeTimeoutMs?: number;
   maximumMessages?: number;
+  /** Defaults to the host's own ceiling, {@link UI_WORKER_MESSAGE_RATE_PER_SECOND}. */
   messagesPerSecond?: number;
+  /** Defaults to the host's own ceiling, {@link UI_WORKER_MESSAGE_BURST}. Raising it past the host's budget turns a burst into a worker kill. */
   messageBurst?: number;
   actionTimeoutMs?: number;
   /** Opt-in JSON state transferred by the development workbench. */
@@ -362,8 +366,8 @@ export class UiWorkerRuntime {
     assertUiWireMessage(message, handshake ? "handshake" : "worker-to-host", this.#selection?.limits);
     const now = Date.now();
     this.#recent = this.#recent.filter((time) => now - time < 1_000);
-    const rate = this.options.messagesPerSecond ?? 240;
-    const burst = this.options.messageBurst ?? 1_000;
+    const rate = this.options.messagesPerSecond ?? UI_WORKER_MESSAGE_RATE_PER_SECOND;
+    const burst = this.options.messageBurst ?? UI_WORKER_MESSAGE_BURST;
     if (this.#recent.length >= rate + burst) throw new Error(`UI worker exceeded ${rate}/s + ${burst} burst message budget`);
     this.#recent.push(now);
     this.#sent += 1;

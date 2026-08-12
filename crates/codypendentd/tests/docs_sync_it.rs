@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use codypendent_daemon::db;
 use codypendent_knowledge::{
-    render_document, BlockContent, CollaborationMode, DocumentAuthor, DocumentBlock,
+    render_document, BlockContent, ChecklistItem, CollaborationMode, DocumentAuthor, DocumentBlock,
     DocumentMetadata, DocumentReplica, DocumentStore, NewDocument, Scope, SuggestionStore,
 };
 use codypendent_protocol::discovery::RuntimePaths;
@@ -575,4 +575,142 @@ fn blocks_text(replica: &DocumentReplica) -> String {
         BlockContent::Paragraph { text } => text.clone(),
         other => panic!("expected a paragraph block, got {other:?}"),
     }
+}
+
+/// Read frames until the reply to a `CreateDocument`: the new id, or the
+/// structured rejection code.
+async fn recv_document_created(stream: &mut UnixStream) -> Result<DocumentId, String> {
+    for _ in 0..16 {
+        match read_frame(stream).await.payload {
+            Payload::DocumentCreated { document_id, .. } => return Ok(document_id),
+            Payload::CommandRejected(error) => return Err(error.code),
+            Payload::Ping | Payload::Event(_) => continue,
+            other => panic!("expected a CreateDocument reply, got {other:?}"),
+        }
+    }
+    panic!("no CreateDocument reply arrived");
+}
+
+/// `CreateDocument` over the real socket: the daemon's connection-level
+/// interception, the assembly's `DocumentCreator` seam, the Markdown importer,
+/// and the `DocumentCreated` reply carrying the new id — the path that did not
+/// exist at all before (the Docs Studio browsed a set nothing could populate).
+/// Then `CheckDocuments` runs the `/update-docs` sweep over the same socket.
+#[tokio::test]
+async fn a_document_is_created_over_the_socket_and_then_swept_for_staleness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir: PathBuf = tmp.path().to_path_buf();
+    let paths = RuntimePaths::from_data_dir(data_dir.clone());
+    paths.ensure_directories().expect("create directories");
+
+    let _daemon = spawn_daemon(&data_dir);
+    let client = ClientId::new();
+    let mut stream = wait_for_socket(&paths).await;
+    handshake(&mut stream, client).await;
+
+    // Create from Markdown: the importer turns it into typed blocks, and the
+    // leading H1 repeating the title is dropped.
+    send(
+        &mut stream,
+        client,
+        CommandBody::CreateDocument {
+            title: "Payments Runbook".to_string(),
+            scope: Some("system".to_string()),
+            repository: None,
+            initial_markdown: Some(
+                "# Payments Runbook\n\nCharging is documented here.\n\n## Steps\n\n\
+                 - [x] rotate keys\n- [ ] add alerting\n"
+                    .to_string(),
+            ),
+        },
+        "create-doc",
+    )
+    .await;
+    let document_id = recv_document_created(&mut stream)
+        .await
+        .expect("the daemon creates the document");
+
+    // The document really exists, at revision 1, with the imported blocks.
+    let pool = open_pool(&paths).await;
+    let doc = DocumentStore::new()
+        .snapshot_document(&pool, document_id)
+        .await
+        .expect("load")
+        .expect("the created document is durable");
+    assert_eq!(doc.title, "Payments Runbook");
+    assert_eq!(doc.revision, 1);
+    assert_eq!(
+        doc.blocks
+            .iter()
+            .map(|b| b.content.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            BlockContent::Paragraph {
+                text: "Charging is documented here.".to_string(),
+            },
+            BlockContent::Heading {
+                level: 2,
+                text: "Steps".to_string(),
+            },
+            BlockContent::Checklist {
+                items: vec![
+                    ChecklistItem {
+                        text: "rotate keys".to_string(),
+                        checked: true,
+                    },
+                    ChecklistItem {
+                        text: "add alerting".to_string(),
+                        checked: false,
+                    },
+                ],
+            },
+        ]
+    );
+
+    // A blank title is refused structurally rather than creating a nameless doc.
+    send(
+        &mut stream,
+        client,
+        CommandBody::CreateDocument {
+            title: "   ".to_string(),
+            scope: None,
+            repository: None,
+            initial_markdown: None,
+        },
+        "create-blank",
+    )
+    .await;
+    assert_eq!(
+        recv_document_created(&mut stream).await.unwrap_err(),
+        "document.invalid-title"
+    );
+
+    // `CheckDocuments` runs the `/update-docs` sweep and reports its counts. The
+    // document embeds no symbols, so the sweep is quiet — what matters here is
+    // that the command is wired end to end.
+    send(
+        &mut stream,
+        client,
+        CommandBody::CheckDocuments {
+            repository: None,
+            session_id: None,
+        },
+        "check-docs",
+    )
+    .await;
+    let report = loop {
+        match read_frame(&mut stream).await.payload {
+            Payload::DocsCheckCompleted {
+                documents_checked,
+                stale_findings,
+                suggestions_filed,
+                ..
+            } => break (documents_checked, stale_findings, suggestions_filed),
+            Payload::Ping | Payload::Event(_) => continue,
+            other => panic!("expected DocsCheckCompleted, got {other:?}"),
+        }
+    };
+    assert_eq!(report, (1, 0, 0), "one document checked, nothing stale");
+
+    pool.close().await;
 }

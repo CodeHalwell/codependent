@@ -15,7 +15,8 @@ use crate::error::CodypendentError;
 use crate::events::SessionEvent;
 use crate::handshake::{ClientHello, ServerHello};
 use crate::ids::{
-    ApprovalId, ClientId, CommandId, DaemonInstanceId, MessageId, RunId, SessionId, WorkspaceId,
+    ApprovalId, ClientId, CommandId, DaemonInstanceId, DocumentId, MessageId, RunId, SessionId,
+    WorkspaceId,
 };
 use crate::remote_ui::UiWireMessage;
 use crate::version::{ProtocolVersion, PROTOCOL_V1};
@@ -128,6 +129,30 @@ pub enum Payload {
         command_id: CommandId,
         grant: DocumentLeaseGrant,
     },
+    /// A `CreateDocument` command was accepted; carries the new document's id
+    /// (Docs Studio creation). A distinct reply from `CommandAccepted` for the
+    /// same reason as `WorkflowRunStarted`: the client needs the id back to
+    /// select, subscribe to, and edit the document it just created.
+    DocumentCreated {
+        command_id: CommandId,
+        document_id: DocumentId,
+    },
+    /// A `CheckDocuments` command's reply: the staleness sweep's counts
+    /// (`/update-docs` glue over the Phase 4 STEP 4.6 engine). A distinct
+    /// reply from `CommandAccepted` because the client reports the counts to
+    /// the operator, not just an acknowledgement.
+    DocsCheckCompleted {
+        command_id: CommandId,
+        /// Documents the sweep examined.
+        documents_checked: u64,
+        /// Symbol links resolved (and persisted) against the code graph.
+        links_resolved: u64,
+        /// Staleness findings (signature changed / symbol disappeared).
+        stale_findings: u64,
+        /// Maintain-mode suggestions filed from those findings (never direct
+        /// edits; each still needs a human accept).
+        suggestions_filed: u64,
+    },
     /// A `StartWorkflow` command was accepted; carries the new durable workflow-run
     /// id (Phase 5 STEP 5.2). A distinct reply from `CommandAccepted` because the
     /// client needs the run id back to track / show the run it just started.
@@ -164,6 +189,15 @@ pub enum Payload {
         command_id: CommandId,
         plugins: Vec<crate::command::UiPluginLifecycleStatus>,
     },
+    /// A `PutArtifact` command's reply (voice v1, rubric 8): the freshly minted
+    /// [`ArtifactRef`](crate::artifact::ArtifactRef) for the stored bytes. A
+    /// distinct reply from `CommandAccepted` because the client needs the ref
+    /// back — it is what an [`InputEnvelope`](crate::input::InputEnvelope)
+    /// audio block references on the next `SubmitUserInput`.
+    ArtifactStored {
+        command_id: CommandId,
+        artifact: crate::artifact::ArtifactRef,
+    },
     /// A `ReadBlackboard` command's reply (Phase 5 STEP 5.3): the matching typed
     /// artifacts on the workflow run's board. A distinct reply from
     /// `CommandAccepted` because the client needs the items back, not just an
@@ -179,6 +213,27 @@ pub enum Payload {
     /// frame is not session-scoped; a receiver merges it into the run's board by id
     /// (a superseding revision arrives as its own delivery).
     BlackboardPosted(BlackboardItemView),
+    /// A `PostBlackboardItem` / `UpdateBlackboardItem` command's reply (Phase B
+    /// kanban): the stored (or superseding) item. A distinct reply from
+    /// `CommandAccepted` because the writing client needs the minted item id and
+    /// revision back — e.g. to select the card it just created.
+    BlackboardItemApplied {
+        command_id: CommandId,
+        item: BlackboardItemView,
+    },
+    /// A `ReadSessionEvents` command's reply: one ascending page of the
+    /// session's durable event history. `through` is the highest sequence in
+    /// the page (equal to the request's `after_sequence` when the page is
+    /// empty) — the client passes it back as the next `after_sequence`;
+    /// `has_more` says whether events beyond `through` existed at read time, so
+    /// a pager knows when to stop without a probe read.
+    SessionEventsPage {
+        command_id: CommandId,
+        session_id: SessionId,
+        events: Vec<SessionEvent>,
+        through: u64,
+        has_more: bool,
+    },
     /// A `ReadWorkflowRun` command's reply (Phase 5 STEP 5.2 / T9): the run's
     /// observability snapshot — its current phase plus every node's full current
     /// view. A distinct reply from `CommandAccepted` because the client needs the
@@ -470,6 +525,52 @@ mod tests {
     }
 
     #[test]
+    fn document_created_payload_round_trips() {
+        let command_id = CommandId::new();
+        let document_id = DocumentId::new();
+        match round_trip_payload(Payload::DocumentCreated {
+            command_id,
+            document_id,
+        }) {
+            Payload::DocumentCreated {
+                command_id: id,
+                document_id: doc,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(doc, document_id);
+            }
+            other => panic!("expected DocumentCreated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn docs_check_completed_payload_round_trips() {
+        let command_id = CommandId::new();
+        match round_trip_payload(Payload::DocsCheckCompleted {
+            command_id,
+            documents_checked: 4,
+            links_resolved: 9,
+            stale_findings: 2,
+            suggestions_filed: 2,
+        }) {
+            Payload::DocsCheckCompleted {
+                command_id: id,
+                documents_checked,
+                links_resolved,
+                stale_findings,
+                suggestions_filed,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(documents_checked, 4);
+                assert_eq!(links_resolved, 9);
+                assert_eq!(stale_findings, 2);
+                assert_eq!(suggestions_filed, 2);
+            }
+            other => panic!("expected DocsCheckCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn workflow_run_started_payload_round_trips() {
         let command_id = CommandId::new();
         let started = Payload::WorkflowRunStarted {
@@ -520,6 +621,35 @@ mod tests {
     }
 
     #[test]
+    fn artifact_stored_payload_round_trips() {
+        use crate::artifact::{ArtifactRef, DataClassification};
+        use crate::ids::ArtifactId;
+
+        let command_id = CommandId::new();
+        let artifact = ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "audio/wav".to_string(),
+            byte_length: 64_000,
+            sha256: "c".repeat(64),
+            sensitivity: DataClassification::Confidential,
+        };
+        let stored = Payload::ArtifactStored {
+            command_id,
+            artifact: artifact.clone(),
+        };
+        match round_trip_payload(stored) {
+            Payload::ArtifactStored {
+                command_id: id,
+                artifact: got,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(got, artifact);
+            }
+            other => panic!("expected ArtifactStored, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn promotion_proposed_payload_round_trips() {
         let command_id = CommandId::new();
         let proposed = Payload::PromotionProposed {
@@ -553,6 +683,10 @@ mod tests {
             evidence: vec![json!({ "path": "src/lib.rs", "line": 7 })],
             revision: 2,
             superseded_by: None,
+            board_scope: None,
+            status: None,
+            assignee: None,
+            ordinal: None,
         };
 
         // The read-command reply carries a list of items.
@@ -576,6 +710,61 @@ mod tests {
             Payload::BlackboardPosted(delivered) => assert_eq!(delivered, item),
             other => panic!("expected BlackboardPosted, got {other:?}"),
         }
+
+        // The client-write reply carries the stored item back (Phase B kanban).
+        let command_id = CommandId::new();
+        match round_trip_payload(Payload::BlackboardItemApplied {
+            command_id,
+            item: item.clone(),
+        }) {
+            Payload::BlackboardItemApplied {
+                command_id: id,
+                item: applied,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(applied, item);
+            }
+            other => panic!("expected BlackboardItemApplied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_events_page_payload_round_trips() {
+        use crate::events::{Actor, EventBody, SessionEvent};
+        use chrono::Utc;
+
+        let command_id = CommandId::new();
+        let session_id = SessionId::new();
+        let page = Payload::SessionEventsPage {
+            command_id,
+            session_id,
+            events: vec![SessionEvent {
+                sequence: 501,
+                occurred_at: Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::SessionClosed,
+            }],
+            through: 501,
+            has_more: true,
+        };
+        match round_trip_payload(page) {
+            Payload::SessionEventsPage {
+                command_id: id,
+                session_id: sid,
+                events,
+                through,
+                has_more,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(sid, session_id);
+                assert_eq!(events.len(), 1);
+                assert_eq!(through, 501);
+                assert!(has_more);
+            }
+            other => panic!("expected SessionEventsPage, got {other:?}"),
+        }
     }
 
     #[test]
@@ -594,6 +783,7 @@ mod tests {
             cost: Some(json!({ "wall_time_secs": 3, "tool_calls": 1 })),
             error: None,
             warnings: Vec::new(),
+            depends_on: Vec::new(),
         };
 
         // The read-command reply carries a run snapshot.

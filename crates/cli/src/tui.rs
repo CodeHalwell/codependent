@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
+use codypendent_integrations::unsloth::HfCatalogApi;
 use codypendent_knowledge::{
     db as knowledge_db, BlockContent, CapabilityRequest, CollaborationMode, DocumentAuthor,
     DocumentBlock, DocumentReplica, DocumentStore, EvidenceRef, KnowledgeDocument, MemoryClass,
@@ -45,13 +46,15 @@ use codypendent_protocol::{
     DocumentEditLease, DocumentId, DocumentSync, Envelope, ModelId, Payload, RepositoryId,
     SessionEvent, SessionId, Subscription, WorkspaceId,
 };
+use codypendent_runtime::models::provider_auth_id;
 use codypendent_tui::{
     accessible_snapshot, accessible_terminal_capabilities_message, map_accessible_input, map_event,
     reduce, render, render_splash, sanitize_accessible_text, terminal_capabilities_message, Action,
-    AppState, BlackboardItemCard, ColorDepth, DocBlockView, DocCard, DocSuggestionView,
-    GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard, ModelLocationLabel,
-    ModelReadiness, ProjectionKind, ProviderCard, SkillCard, TerminalGuard, Theme,
-    WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
+    AddModelRow, AppState, BlackboardItemCard, ColorDepth, DocBlockView, DocCard,
+    DocSuggestionView, GraphEdgeCard, Intent, KanbanCard, KeyStatus, KeyTarget, MemoryCard,
+    ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness, ProjectionKind, ProviderCard,
+    SkillCard, TerminalGuard, Theme, UnslothQuantCard, UnslothRepoCard, WorkflowNodeCard,
+    WorkflowNodeUpdate, EDGE_PAGE_SIZE,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -251,8 +254,15 @@ pub async fn run(
 
     // STEP 6.6 wiring: terminal color-depth detection (NO_COLOR/COLORTERM/TERM)
     // with a manual override that always wins, replacing the old hardcoded
-    // `Theme::dark()`.
-    let theme = crate::theme_select::resolve_theme(paths, theme_override.as_deref())?;
+    // `Theme::dark()`. The session store is loaded first so the theme the
+    // operator last kept in `/theme` participates in that resolution (below an
+    // explicit `--theme`/`CODYPENDENT_THEME`, above detection).
+    let mut store = SessionStore::load(paths);
+    let theme = crate::theme_select::resolve_theme(
+        paths,
+        theme_override.as_deref(),
+        store.theme.as_deref(),
+    )?;
 
     // D2: enter raw mode + the alternate screen EARLY — before any daemon
     // work — so the (possibly multi-second) boot draws a splash instead of
@@ -277,7 +287,29 @@ pub async fn run(
     let boot_warnings: BootWarnings = BootWarnings::default();
 
     let mut state = AppState::new();
-    let mut store = SessionStore::load(paths);
+    // The `/theme` picker's rows: the built-in variants `AppState::new` seeds,
+    // plus every installed data-only pack (the TUI crate does no I/O, so packs
+    // are parsed out here). The row matching the theme actually in force is
+    // marked current, so the picker opens on what is already on screen.
+    state.themes.extend(
+        crate::theme_select::discover_theme_packs(paths)
+            .into_iter()
+            .map(|(id, theme)| codypendent_tui::ThemeChoice {
+                id,
+                summary: "installed theme pack".to_owned(),
+                theme,
+                pack: true,
+            }),
+    );
+    state.theme_selected = theme_override
+        .as_deref()
+        .or(store.theme.as_deref())
+        .and_then(|id| {
+            state
+                .themes
+                .iter()
+                .position(|choice| choice.id.eq_ignore_ascii_case(id))
+        });
 
     // Drive boot and the splash concurrently: poll the pinned boot future to
     // completion while redrawing the splash on each tick. Once boot is ready,
@@ -827,6 +859,9 @@ async fn boot_phase(
     // Task 8: seed the provider-catalog picker projection (the built-in
     // catalog + any user `providers.toml`), exactly like `load_model_cards`.
     state.providers = load_provider_cards(paths, &mut loader_warnings).await;
+    // Rubric 6 TUI wiring: seed the `/council` browser projection (persisted
+    // councils.toml definitions), exactly like `load_model_cards` above.
+    state.councils = load_council_cards(paths, &mut loader_warnings);
     // D1 (/keys): seed the API-key status projection — auth.json entries +
     // models.toml `api_key_env` declarations (the tui crate does no I/O, so
     // the harness reads the files and folds the projection as an Action, the
@@ -1142,6 +1177,19 @@ async fn event_loop<P: Presentation>(
     // Correlate empty blackboard baselines back to the run they were requested
     // for (the reply carries only command_id when `items` is empty).
     let mut blackboard_reads: HashMap<CommandId, String> = HashMap::new();
+    // --- voice host (voice v1, rubric 8) -----------------------------------
+    // Probes for a recorder ONCE here (the result is cached for the process)
+    // and owns every subprocess voice needs, so `codypendent-tui` stays a pure
+    // render/reduce crate. With nothing configured this is entirely inert.
+    let mut voice = crate::voice::VoiceHost::new(paths);
+    // Captured voice notes awaiting their `ArtifactStored` reply, keyed by the
+    // `PutArtifact` command that uploaded them; the value is the measured
+    // capture duration, carried into the audio block.
+    let mut pending_voice: HashMap<CommandId, u64> = HashMap::new();
+    // Command ids of board-scoped `ReadBlackboard`s, so an EMPTY board baseline
+    // (a repository whose board has never been written) still clears the pane
+    // rather than being mistaken for a workflow-run read.
+    let mut board_reads: std::collections::HashSet<CommandId> = std::collections::HashSet::new();
 
     loop {
         // A CRDT sync needs an async merge (+ a suggestion re-read) that cannot run
@@ -1153,6 +1201,12 @@ async fn event_loop<P: Presentation>(
         let selected = tokio::select! {
             signal = live.event_rx.recv() => PendingActions::One(match signal {
                 Some(ReaderSignal::Event(event)) => {
+                    // Voice v1 (rubric 8): the host watches the same durable
+                    // stream the reducer folds, accumulating each run's
+                    // assistant text and speaking it only once that run is
+                    // FINISHED. Reading half a sentence aloud is worse than
+                    // silence, so nothing is spoken mid-stream.
+                    voice.observe_event(&event, state.voice.speak_replies);
                     match tracker.on_event(*event, Instant::now()) {
                         GapAction::Ignore => Action::NoOp,
                         GapAction::Apply(event) => Action::DaemonEvent(event),
@@ -1200,8 +1254,43 @@ async fn event_loop<P: Presentation>(
                     "publish plan ready: {target} · {changed_files} file(s) · {git_action}"
                 )),
                 Some(ReaderSignal::ProviderModels { provider_id, result }) => match result {
-                    Ok(models) => Action::ProviderModelsLoaded { provider_id, models },
+                    Ok((models, origin)) => Action::ProviderModelsLoaded { provider_id, models, origin },
                     Err(reason) => Action::ProviderModelsFailed { provider_id, reason },
+                },
+                Some(ReaderSignal::UnslothRepos(result)) => match result {
+                    Ok(repos) => Action::UnslothReposLoaded(
+                        repos.into_iter().map(unsloth_repo_card).collect(),
+                    ),
+                    Err(reason) => Action::UnslothReposFailed(reason),
+                },
+                Some(ReaderSignal::UnslothQuants { repo_id, result }) => match result {
+                    Ok(quants) => Action::UnslothQuantsLoaded {
+                        repo_id,
+                        quants: quants.into_iter().map(unsloth_quant_card).collect(),
+                    },
+                    Err(reason) => Action::UnslothQuantsFailed { repo_id, reason },
+                },
+                Some(ReaderSignal::UnslothPullProgress {
+                    repo_id,
+                    quant,
+                    line,
+                }) => Action::UnslothPullProgress {
+                    repo_id,
+                    quant,
+                    line,
+                },
+                Some(ReaderSignal::UnslothPullFinished {
+                    repo_id,
+                    quant,
+                    result,
+                }) => Action::UnslothPullFinished {
+                    repo_id,
+                    quant,
+                    result,
+                },
+                Some(ReaderSignal::ModelKeyVerified { model_id, result }) => match result {
+                    Ok(()) => Action::ModelKeyVerified { model_id, ok: true, reason: String::new() },
+                    Err(reason) => Action::ModelKeyVerified { model_id, ok: false, reason },
                 },
                 Some(ReaderSignal::AcpConnected { display_id, provider_id, result }) => {
                     connected_acp = Some((display_id, provider_id, result));
@@ -1216,21 +1305,74 @@ async fn event_loop<P: Presentation>(
                 }
                 Some(ReaderSignal::WorkflowEvent(event)) => workflow_event_action(event),
                 Some(ReaderSignal::BlackboardItems { command_id, items }) => {
-                    let workflow_run_id = blackboard_reads
-                        .remove(&command_id)
-                        .or_else(|| items.first().map(|item| item.workflow_run_id.clone()));
-                    match workflow_run_id {
-                        Some(workflow_run_id) => Action::BlackboardLoaded {
-                            items: wire_blackboard_cards(state, &items),
-                            workflow_run_id,
-                        },
-                        None => Action::NoOp,
+                    if board_reads.remove(&command_id) {
+                        // The repository task board (rubric 10): the same command
+                        // and the same rows, read at board scope.
+                        Action::BoardLoaded(wire_board_cards(&items))
+                    } else {
+                        let workflow_run_id = blackboard_reads
+                            .remove(&command_id)
+                            .or_else(|| items.first().map(|item| item.workflow_run_id.clone()));
+                        match workflow_run_id {
+                            Some(workflow_run_id) => Action::BlackboardLoaded {
+                                items: wire_blackboard_cards(state, &items),
+                                workflow_run_id,
+                            },
+                            None => Action::NoOp,
+                        }
                     }
                 }
                 Some(ReaderSignal::BlackboardPosted(item)) => {
-                    let label = workflow_label_for_run(state, &item.workflow_run_id);
-                    Action::BlackboardItemUpdated(wire_blackboard_item_card(label, &item))
+                    // One live channel serves both surfaces: a board card carries
+                    // `board_scope`, a workflow artifact does not, so the delivery
+                    // routes itself without a second subscription kind.
+                    if item.board_scope.is_some() {
+                        Action::BoardCardUpdated {
+                            card: wire_board_card(&item),
+                            superseded: item.superseded_by.is_some(),
+                        }
+                    } else {
+                        let label = workflow_label_for_run(state, &item.workflow_run_id);
+                        Action::BlackboardItemUpdated(wire_blackboard_item_card(label, &item))
+                    }
                 }
+                Some(ReaderSignal::CouncilProgress { name, message }) => {
+                    Action::CouncilProgress { name, message }
+                }
+                Some(ReaderSignal::CouncilRunFinished { name, result }) => {
+                    Action::CouncilRunFinished { name, result }
+                }
+                // Voice v1 (rubric 8): the upload landed, so submit the turn
+                // that references it. The envelope carries NO transcript — the
+                // daemon produces one behind its classification gate, and the
+                // client must never pretend to know what was said.
+                Some(ReaderSignal::ArtifactStored {
+                    command_id,
+                    artifact,
+                }) => match pending_voice.remove(&command_id) {
+                    Some(duration_ms) => {
+                        let envelope = crate::voice::voice_envelope(artifact, duration_ms);
+                        let submit = command_envelope(
+                            live.client_id,
+                            CommandBody::SubmitUserInput {
+                                session_id,
+                                // Empty on purpose: the transcript the daemon
+                                // produces becomes the run's objective.
+                                text: String::new(),
+                                mode: state.default_mode,
+                                model: state.pending_model.clone(),
+                                envelope: Some(envelope),
+                            },
+                        );
+                        if live.out_tx.send(submit).await.is_err() {
+                            return Ok(());
+                        }
+                        Action::Notice("voice note sent \u{2014} transcribing\u{2026}".to_owned())
+                    }
+                    // An artifact this loop did not upload (or a duplicate
+                    // reply): nothing to submit, and nothing to complain about.
+                    None => Action::NoOp,
+                },
                 Some(ReaderSignal::Catchup(catchup)) => {
                     // Fold the gap replay (the daemon already windowed it to
                     // `(last_seen, through]`, and a too-large gap arrives as a
@@ -1268,6 +1410,47 @@ async fn event_loop<P: Presentation>(
                 Some(ClientInput::Terminal(CrosstermEvent::Resize(w, h))) => {
                     *width = w;
                     PendingActions::One(Action::RemoteUiViewport { width: w, height: h })
+                }
+                // Voice v1 (rubric 8): push-to-talk is intercepted BEFORE the
+                // key reaches the reducer, so `codypendent-tui` never has to
+                // know about recorders, subprocesses, or audio. A stop reads
+                // the captured WAV, uploads it with `PutArtifact`, and remembers
+                // the command so the reply can carry the submission (see the
+                // `ArtifactStored` arm above). Every failure becomes a visible,
+                // actionable notice — the one thing a dead microphone must not
+                // do is nothing.
+                Some(ClientInput::Terminal(event)) if voice.is_push_to_talk(&event) => {
+                    match voice.toggle().await {
+                        crate::voice::CaptureOutcome::Started => {
+                            PendingActions::One(Action::VoiceRecording(true))
+                        }
+                        crate::voice::CaptureOutcome::Captured { bytes, duration_ms } => {
+                            let upload = command_envelope(
+                                live.client_id,
+                                CommandBody::PutArtifact {
+                                    media_type: crate::voice::CAPTURE_MEDIA_TYPE.to_owned(),
+                                    bytes_base64: {
+                                        use base64::Engine as _;
+                                        base64::engine::general_purpose::STANDARD.encode(&bytes)
+                                    },
+                                    // Captured media is Confidential by default,
+                                    // so a recording never leaves the device
+                                    // unless the operator's ceiling allows it.
+                                    sensitivity: crate::voice::capture_classification(),
+                                },
+                            );
+                            if let Payload::Command(command) = &upload.payload {
+                                pending_voice.insert(command.command_id, duration_ms);
+                            }
+                            if live.out_tx.send(upload).await.is_err() {
+                                return Ok(());
+                            }
+                            PendingActions::One(Action::VoiceRecording(false))
+                        }
+                        crate::voice::CaptureOutcome::Failed(message) => PendingActions::Many(
+                            vec![Action::VoiceRecording(false), Action::Notice(message)],
+                        ),
+                    }
                 }
                 Some(ClientInput::Terminal(event)) => PendingActions::One(map_event(
                     &event,
@@ -1318,10 +1501,35 @@ async fn event_loop<P: Presentation>(
         for action in actions {
             reduce(state, action);
         }
+        // Voice v1 (rubric 8). A TUI cannot log — stderr would corrupt the
+        // display — so the off-thread speech worker's failures surface as
+        // status-line notices here rather than vanishing. And turning the
+        // palette toggle on with nothing configured says exactly what is
+        // missing instead of appearing to work and staying silent.
+        if let Some(message) = voice.take_speech_error() {
+            reduce(state, Action::Notice(message));
+        }
+        if state.voice.speak_replies && !voice.can_speak() {
+            state.voice.speak_replies = false;
+            reduce(state, Action::Notice(voice.speech_unavailable_message()));
+        }
         if let Some((display_id, provider_id, result)) = connected_acp.take() {
+            // A connect can land while an add-model overlay is still open —
+            // either the "connecting…" step or the "fetching models…" step an
+            // agent with no model selector short-circuits out of. The flow is
+            // over either way, so close it rather than leaving the user parked
+            // on a step that will never resolve.
+            if matches!(
+                state.overlay,
+                codypendent_tui::Overlay::AddModelQuerying { .. }
+                    | codypendent_tui::Overlay::AddModelPick { .. }
+            ) {
+                state.overlay = codypendent_tui::Overlay::None;
+            }
             match result {
                 Ok(coordinate) => {
-                    match write_add_model(paths, &display_id, &provider_id, &coordinate, None) {
+                    match write_add_model(paths, &display_id, &provider_id, &coordinate, None, None)
+                    {
                         Ok(()) => {
                             let mut warnings = Vec::new();
                             state.models = load_model_cards(paths, &mut warnings).await;
@@ -1343,12 +1551,16 @@ async fn event_loop<P: Presentation>(
                 ),
             }
         }
-        // The steady shell has no frame-based animation. Wakeups still drive
-        // repair and reducer time, but only notice expiry and the periodic
-        // projection refresh need a new frame; input and daemon events redraw
-        // immediately through the non-tick path.
+        // A steady shell has no frame-based animation, so most ticks need no
+        // frame: input and daemon events redraw immediately through the
+        // non-tick path. But while a spinner is on screen — a run thinking or
+        // running a tool, a graph page loading, a model list being fetched —
+        // every tick must draw, or the "spinner" advances one frame per 25
+        // ticks (~5s) and reads as a frozen UI. The 25-tick beat stays as the
+        // keep-alive for notice expiry and the periodic projection refresh.
         let redraw = !tick_action
             || state.notice != notice_before
+            || state.is_animating()
             || state.tick.is_multiple_of(25)
             || presentation.wants_periodic_draw();
 
@@ -1390,23 +1602,24 @@ async fn event_loop<P: Presentation>(
                 provider_id,
                 model,
                 api_key,
+                context_tokens,
             } = &intent
             {
-                let acp =
-                    codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir)
-                        .load_cached()
-                        .ok()
-                        .is_some_and(|registry| registry.get(provider_id).is_some());
-                if acp {
+                if is_acp_provider(paths, provider_id) {
+                    // The picker sends `model == provider_id` when the agent
+                    // exposed no model list; anything else is one of the
+                    // agent's OWN model ids, chosen from the pick overlay.
+                    let pin = (model != provider_id).then(|| model.clone());
+                    let display_id = acp_profile_id(provider_id, pin.as_deref());
                     let paths = paths.clone();
                     let repository = PathBuf::from(repository);
-                    let display_id = display_id.clone();
                     let provider_id = provider_id.clone();
                     let tx = live.query_tx.clone();
                     tokio::spawn(async move {
-                        let result = connect_acp_agent(&paths, &provider_id, &repository)
-                            .await
-                            .map_err(|error| error.to_string());
+                        let result =
+                            connect_acp_agent(&paths, &provider_id, &repository, pin.as_deref())
+                                .await
+                                .map_err(|error| error.to_string());
                         let _ = tx
                             .send(ReaderSignal::AcpConnected {
                                 display_id,
@@ -1424,27 +1637,70 @@ async fn event_loop<P: Presentation>(
                     provider_id,
                     model,
                     api_key.as_ref().map(|k| k.0.as_str()),
+                    *context_tokens,
                 )
                 .await;
                 continue;
             }
             // `QueryProviderModels` is the other client-only intent (model
-            // discovery): resolve the catalog provider's base_url + first
-            // api-key header/prefix, then spawn the `<base_url>/models` GET off
-            // the UI thread and feed the result back as
-            // `ReaderSignal::ProviderModels`. Never a daemon command. The spawned
-            // task owns the key for the request and drops it — it is never sent
-            // back.
+            // discovery). Three steps, none of them on the UI thread beyond a
+            // cache read: seed the pick-list from `<data_dir>/model_lists/`
+            // when a previous fetch left one there (instant), then spawn the
+            // `<base_url>/models` GET and feed its merged result back as
+            // `ReaderSignal::ProviderModels`. Never a daemon command. The
+            // spawned task owns the key for the request and drops it — it is
+            // never sent back.
             if let Intent::QueryProviderModels {
                 provider_id,
                 api_key,
+                refresh,
             } = &intent
             {
+                // An ACP agent has no `/models` endpoint: its model list comes
+                // from the session-config handshake, so listing means spawning
+                // it. Same off-thread shape, same return signal — the pick
+                // overlay never learns the difference.
+                if is_acp_provider(paths, provider_id) {
+                    let paths = paths.clone();
+                    let repository = PathBuf::from(repository);
+                    let provider_id = provider_id.clone();
+                    let tx = live.query_tx.clone();
+                    tokio::spawn(async move {
+                        let signal = match probe_acp_agent(&paths, &provider_id, &repository).await
+                        {
+                            // No model selector: there is nothing to pick,
+                            // so connect the bare profile directly rather
+                            // than opening an empty list.
+                            Ok(probe) if probe.models.is_empty() => ReaderSignal::AcpConnected {
+                                display_id: acp_profile_id(&provider_id, None),
+                                provider_id,
+                                result: Ok(probe.coordinate(None)),
+                            },
+                            Ok(probe) => ReaderSignal::ProviderModels {
+                                provider_id,
+                                // An agent advertises ids only — there is no
+                                // catalog metadata for a model that lives
+                                // inside someone else's agent.
+                                result: Ok((
+                                    probe.models.into_iter().map(AddModelRow::live).collect(),
+                                    ModelListOrigin::Live,
+                                )),
+                            },
+                            Err(error) => ReaderSignal::ProviderModels {
+                                provider_id,
+                                result: Err(error.to_string()),
+                            },
+                        };
+                        let _ = tx.send(signal).await;
+                    });
+                    continue;
+                }
                 use codypendent_providers::{AuthMethod, Catalog};
                 let catalog =
                     Catalog::load_with_user_overrides(&paths.data_dir.join("providers.toml"))
                         .unwrap_or_else(|_| Catalog::builtin());
-                let (base_url, header, prefix) = match catalog.get(provider_id) {
+                let curated = catalog_rows_for(&catalog, provider_id);
+                let (base_url, header, prefix, listable) = match catalog.get(provider_id) {
                     Some(provider) => {
                         let base = provider.base_url.clone().unwrap_or_default();
                         let (header, prefix) = match provider.auth.first() {
@@ -1453,25 +1709,202 @@ async fn event_loop<P: Presentation>(
                             }
                             _ => ("Authorization".to_string(), "Bearer ".to_string()),
                         };
-                        (base, header, prefix)
+                        (base, header, prefix, provider_can_list_models(provider))
                     }
                     None => (
                         String::new(),
                         "Authorization".to_string(),
                         "Bearer ".to_string(),
+                        false,
                     ),
                 };
+                // Instant seed: the cached listing, catalog metadata merged in.
+                if !*refresh {
+                    if let Some((cached, age)) = read_model_list_cache(&paths.data_dir, provider_id)
+                    {
+                        reduce(
+                            state,
+                            Action::ProviderModelsLoaded {
+                                provider_id: provider_id.clone(),
+                                models: merge_catalog_rows(cached, &curated),
+                                origin: ModelListOrigin::Cached(age),
+                            },
+                        );
+                    }
+                }
+                // A provider with no listing endpoint (Perplexity) never
+                // reaches the network at all: its curated rows ARE the answer.
+                if !listable {
+                    reduce(
+                        state,
+                        if curated.is_empty() {
+                            Action::ProviderModelsFailed {
+                                provider_id: provider_id.clone(),
+                                reason: "this provider has no model-list endpoint".to_owned(),
+                            }
+                        } else {
+                            Action::ProviderModelsLoaded {
+                                provider_id: provider_id.clone(),
+                                models: curated,
+                                origin: ModelListOrigin::Catalog("no listing endpoint".to_owned()),
+                            }
+                        },
+                    );
+                    continue;
+                }
                 let provider_id = provider_id.clone();
-                let key = api_key.as_ref().map(|k| k.0.clone());
+                // No key in hand: fall back to the provider-wide key a previous
+                // add already stored, so the same key is never asked for twice.
+                let key = api_key.as_ref().map(|k| k.0.clone()).or_else(|| {
+                    stored_provider_key(&paths.data_dir, &provider_id).filter(|k| !k.is_empty())
+                });
                 let tx = live.query_tx.clone();
+                let data_dir = paths.data_dir.clone();
                 tokio::spawn(async move {
                     let result =
-                        query_provider_models(&base_url, &header, &prefix, key.as_deref()).await;
+                        match query_provider_models(&base_url, &header, &prefix, key.as_deref())
+                            .await
+                        {
+                            Ok(live_rows) => {
+                                write_model_list_cache(&data_dir, &provider_id, &live_rows);
+                                Ok((
+                                    merge_catalog_rows(live_rows, &curated),
+                                    ModelListOrigin::Live,
+                                ))
+                            }
+                            // A failed fetch still has the curated rows to
+                            // offer — the picker never becomes a dead end.
+                            Err(reason) if !curated.is_empty() => {
+                                Ok((curated, ModelListOrigin::Catalog(reason)))
+                            }
+                            Err(reason) => Err(reason),
+                        };
                     let _ = tx
                         .send(ReaderSignal::ProviderModels {
                             provider_id,
                             result,
                         })
+                        .await;
+                });
+                continue;
+            }
+            // Local models: Unsloth catalog (client-only intents, off-thread —
+            // the same `tokio::spawn` + `ReaderSignal` round trip as
+            // `QueryProviderModels` above). `ListUnslothRepos`/
+            // `ListUnslothQuants` are read-only Hub GETs; `PullUnslothModel`
+            // drives the real `ollama pull` subprocess via
+            // `codypendent_cli::models_pull`, streaming each parsed line back
+            // before the terminal result.
+            if let Intent::ListUnslothRepos = &intent {
+                let tx = live.query_tx.clone();
+                tokio::spawn(async move {
+                    let result = match codypendent_integrations::unsloth::HfHubClient::hub() {
+                        Ok(client) => client
+                            .list_gguf_repos(
+                                codypendent_integrations::unsloth::DEFAULT_UNSLOTH_ORG,
+                                30,
+                            )
+                            .await
+                            .map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    let _ = tx.send(ReaderSignal::UnslothRepos(result)).await;
+                });
+                continue;
+            }
+            if let Intent::ListUnslothQuants { repo_id } = &intent {
+                let repo_id = repo_id.clone();
+                let tx = live.query_tx.clone();
+                tokio::spawn(async move {
+                    let result = match codypendent_integrations::unsloth::HfHubClient::hub() {
+                        Ok(client) => client
+                            .list_quant_variants(&repo_id)
+                            .await
+                            .map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    let _ = tx
+                        .send(ReaderSignal::UnslothQuants { repo_id, result })
+                        .await;
+                });
+                continue;
+            }
+            if let Intent::PullUnslothModel { repo_id, quant } = &intent {
+                let repo_id = repo_id.clone();
+                let quant = quant.clone();
+                let paths = paths.clone();
+                let tx = live.query_tx.clone();
+                tokio::spawn(async move {
+                    let (progress_tx, mut progress_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<String>();
+                    let pull_repo = repo_id.clone();
+                    let pull_quant = quant.clone();
+                    let pull_task = tokio::spawn(async move {
+                        crate::models_pull::pull_via_ollama(
+                            crate::models_pull::OLLAMA_BIN,
+                            &pull_repo,
+                            &pull_quant,
+                            progress_tx,
+                        )
+                        .await
+                    });
+                    while let Some(line) = progress_rx.recv().await {
+                        let _ = tx
+                            .send(ReaderSignal::UnslothPullProgress {
+                                repo_id: repo_id.clone(),
+                                quant: quant.clone(),
+                                line,
+                            })
+                            .await;
+                    }
+                    let result = match pull_task.await {
+                        Ok(Ok(())) => {
+                            // Best-effort: a failed/absent metadata lookup
+                            // registers with `context_tokens: None` rather
+                            // than losing an otherwise-successful pull.
+                            let context_tokens =
+                                match codypendent_integrations::unsloth::HfHubClient::hub() {
+                                    Ok(client) => client
+                                        .repo_metadata(&repo_id)
+                                        .await
+                                        .ok()
+                                        .and_then(|metadata| metadata.context_length),
+                                    Err(_) => None,
+                                };
+                            crate::models_pull::register_pulled_model(
+                                &paths,
+                                &repo_id,
+                                &quant,
+                                context_tokens,
+                            )
+                            .map_err(|error| error.to_string())
+                        }
+                        Ok(Err(pull_error)) => Err(pull_error.to_string()),
+                        Err(join_error) => Err(format!("pull task panicked: {join_error}")),
+                    };
+                    let _ = tx
+                        .send(ReaderSignal::UnslothPullFinished {
+                            repo_id,
+                            quant,
+                            result,
+                        })
+                        .await;
+                });
+                continue;
+            }
+            // `VerifyApiKey` (`/keys`, `Ctrl-T`) is client-only for the same
+            // reason `SetApiKey` is: the key stays on this machine. One
+            // `/models` call through the real registry — the same credential
+            // precedence and headers a run would use — answered back as
+            // `Action::ModelKeyVerified`.
+            if let Intent::VerifyApiKey { model_id } = &intent {
+                let model_id = model_id.clone();
+                let data_dir = paths.data_dir.clone();
+                let tx = live.query_tx.clone();
+                tokio::spawn(async move {
+                    let result = verify_model_key(&data_dir, &model_id).await;
+                    let _ = tx
+                        .send(ReaderSignal::ModelKeyVerified { model_id, result })
                         .await;
                 });
                 continue;
@@ -1487,6 +1920,15 @@ async fn event_loop<P: Presentation>(
             }
             if let Intent::RemoveApiKey { target } = &intent {
                 apply_remove_api_key(state, paths, target);
+                continue;
+            }
+            // `/theme` is a display preference, not a daemon command: the live
+            // switch already happened (the renderer draws in the picked theme),
+            // so all that remains is to remember it for the next launch.
+            // `theme_select` reads it back below `--theme`/`CODYPENDENT_THEME`.
+            if let Intent::SetTheme { id } = &intent {
+                store.theme = Some(id.clone());
+                store.save(paths);
                 continue;
             }
             // Council creation is local, private configuration just like the
@@ -1505,6 +1947,12 @@ async fn event_loop<P: Presentation>(
                     description: description.clone(),
                     chair: chair.clone(),
                     rounds: *rounds,
+                    // The host-owned wizard has no evidence-mode step yet; a
+                    // council created this way keeps rubric 6's "default
+                    // behavior unchanged" and can still be flipped on later by
+                    // editing councils.toml or recreating via the CLI's
+                    // `--evidence` flag.
+                    evidence: false,
                     members: members
                         .iter()
                         .map(|(model, role)| crate::council::CouncilMember {
@@ -1514,14 +1962,21 @@ async fn event_loop<P: Presentation>(
                         .collect(),
                 };
                 match crate::council::persist_definition(paths, definition) {
-                    Ok(created) => reduce(
-                        state,
-                        Action::CouncilCreated {
-                            name: created.name,
-                            members: created.members.len(),
-                            rounds: created.rounds,
-                        },
-                    ),
+                    Ok(created) => {
+                        let mut warnings = Vec::new();
+                        state.councils = load_council_cards(paths, &mut warnings);
+                        for warning in warnings {
+                            reduce(state, Action::Issue(warning));
+                        }
+                        reduce(
+                            state,
+                            Action::CouncilCreated {
+                                name: created.name,
+                                members: created.members.len(),
+                                rounds: created.rounds,
+                            },
+                        );
+                    }
                     Err(error) => reduce(
                         state,
                         Action::CouncilCreateFailed {
@@ -1530,6 +1985,68 @@ async fn event_loop<P: Presentation>(
                         },
                     ),
                 }
+                continue;
+            }
+            // Council removal (rubric 6 TUI wiring): same client-only shape as
+            // creation above — apply locally, reload the browser projection,
+            // and skip the daemon-command mapping entirely. Saved run reports
+            // are left on disk (only the definition is removed).
+            if let Intent::DeleteCouncil { name } = &intent {
+                match crate::council::remove_definition(paths, name) {
+                    Ok(()) => {
+                        let mut warnings = Vec::new();
+                        state.councils = load_council_cards(paths, &mut warnings);
+                        for warning in warnings {
+                            reduce(state, Action::Issue(warning));
+                        }
+                        reduce(state, Action::CouncilDeleted { name: name.clone() });
+                    }
+                    Err(error) => reduce(
+                        state,
+                        Action::CouncilDeleteFailed {
+                            name: name.clone(),
+                            error: error.to_string(),
+                        },
+                    ),
+                }
+                continue;
+            }
+            // Run a persisted council's deliberation (rubric 6 TUI wiring).
+            // Member/chair runs are independent daemon sessions the base
+            // transcript never subscribes to, so `council::run_with_progress`
+            // is driven off-thread over its OWN connection — exactly the
+            // `AddModel`/ACP-connect off-thread shape above — streaming each
+            // round/member/chair transition back as `ReaderSignal::CouncilProgress`
+            // and the final outcome (or a formatted failure) as
+            // `ReaderSignal::CouncilRunFinished`. `evidence: false` here always
+            // defers to the council's OWN stored flag (`run_with_progress` ORs
+            // the two) — there is no per-run override from this prompt.
+            if let Intent::RunCouncil { name, objective } = &intent {
+                let paths = paths.clone();
+                let name = name.clone();
+                let objective = objective.clone();
+                let repository = PathBuf::from(repository);
+                let tx = live.query_tx.clone();
+                let progress_tx = tx.clone();
+                let progress_name = name.clone();
+                tokio::spawn(async move {
+                    let progress = move |event: crate::council::CouncilEvent| {
+                        let _ = progress_tx.try_send(ReaderSignal::CouncilProgress {
+                            name: progress_name.clone(),
+                            message: council_progress_message(&event),
+                        });
+                    };
+                    let result = crate::council::run_with_progress(
+                        &paths, &name, objective, repository, false, progress,
+                    )
+                    .await;
+                    let result = result
+                        .map(|run| Box::new(council_run_summary(run)))
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = tx
+                        .send(ReaderSignal::CouncilRunFinished { name, result })
+                        .await;
+                });
                 continue;
             }
             // Create and attach to a genuinely fresh session without tearing
@@ -1791,12 +2308,61 @@ async fn event_loop<P: Presentation>(
                         workflow_run_id: workflow_run_id.clone(),
                         kind: None,
                         include_superseded: true,
+                        board_repository: None,
                     },
                 );
                 if let Payload::Command(command) = &board.payload {
                     blackboard_reads.insert(command.command_id, workflow_run_id.clone());
                 }
                 if live.out_tx.send(board).await.is_err() {
+                    return Ok(());
+                }
+                continue;
+            }
+            // Opening the task board grows this connection's subscription to the
+            // repository BOARD's channel and reads its baseline (rubric 10). The
+            // board rides the existing per-run blackboard machinery: its channel
+            // key is the synthetic board run id, so nothing new is needed on the
+            // wire beyond the board-scoped read.
+            if matches!(intent, Intent::WatchBoard) {
+                let board_id = codypendent_protocol::board_scope_id(repository);
+                let subscribed = subscriptions.iter().any(|subscription| {
+                    matches!(
+                        subscription,
+                        Subscription::Blackboard { workflow_run_id: id } if *id == board_id
+                    )
+                });
+                if !subscribed {
+                    subscriptions.push(Subscription::Blackboard {
+                        workflow_run_id: board_id,
+                    });
+                    let attach = command_envelope(
+                        live.client_id,
+                        CommandBody::AttachSession {
+                            session_id,
+                            last_seen_sequence: Some(tracker.last_seen()),
+                            subscriptions: subscriptions.clone(),
+                            requested_role: ClientRole::Controller,
+                            repository: None,
+                        },
+                    );
+                    if live.out_tx.send(attach).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                let read = command_envelope(
+                    live.client_id,
+                    CommandBody::ReadBlackboard {
+                        workflow_run_id: String::new(),
+                        kind: Some("task".to_owned()),
+                        include_superseded: false,
+                        board_repository: Some(repository.to_owned()),
+                    },
+                );
+                if let Payload::Command(command) = &read.payload {
+                    board_reads.insert(command.command_id);
+                }
+                if live.out_tx.send(read).await.is_err() {
                     return Ok(());
                 }
                 continue;
@@ -1893,12 +2459,21 @@ enum ReaderSignal {
         git_action: String,
     },
     /// A provider's fetched model list (model-discovery): the result of the
-    /// spawned `<base_url>/models` GET, keyed by `provider_id`. Mapped by the
+    /// spawned `<base_url>/models` GET merged with the curated catalog rows,
+    /// keyed by `provider_id`, plus where the rows came from. Mapped by the
     /// loop's `select!` to `Action::ProviderModelsLoaded` (Ok) /
-    /// `ProviderModelsFailed` (Err). Carries NO key.
+    /// `ProviderModelsFailed` (Err — the fetch failed AND the catalog had
+    /// nothing for this provider). Carries NO key.
     ProviderModels {
         provider_id: String,
-        result: Result<Vec<String>, String>,
+        result: Result<(Vec<AddModelRow>, ModelListOrigin), String>,
+    },
+    /// The result of a one-shot `/keys` key verification (`Ctrl-T`): `Ok` when
+    /// the provider listed the configured model with the stored key, `Err`
+    /// with a key-free reason otherwise.
+    ModelKeyVerified {
+        model_id: String,
+        result: Result<(), String>,
     },
     /// Completion of an off-UI-thread ACP install + handshake + typed profile
     /// write. The loop refreshes model/key projections after success.
@@ -1920,6 +2495,55 @@ enum ReaderSignal {
         items: Vec<codypendent_protocol::BlackboardItemView>,
     },
     BlackboardPosted(codypendent_protocol::BlackboardItemView),
+    /// One pre-formatted progress line from an off-thread council run (rubric
+    /// 6 TUI wiring): a round starting, a member completing/failing, or the
+    /// chair beginning synthesis. Mapped to `Action::CouncilProgress`, which
+    /// folds it into the active run's transcript as a Note.
+    CouncilProgress {
+        name: String,
+        message: String,
+    },
+    /// An off-thread council run finished. `Ok` carries the pre-formatted
+    /// chair synthesis, attributed participants, and measured-cost line;
+    /// `Err` is a human-readable failure (already naming any partial report
+    /// path `run_with_progress` managed to save). Boxed like `WorkflowSnapshot`
+    /// — the synthesis text can be large and every other signal here is tiny.
+    CouncilRunFinished {
+        name: String,
+        result: Result<Box<codypendent_tui::state::CouncilRunSummary>, String>,
+    },
+    /// The Unsloth org's GGUF repo listing, fetched from the Hugging Face Hub
+    /// (Local models catalog browse). Mapped by the loop's `select!` to
+    /// `Action::UnslothReposLoaded` (Ok, pre-rendered into `UnslothRepoCard`s)
+    /// / `UnslothReposFailed` (Err).
+    UnslothRepos(Result<Vec<codypendent_integrations::unsloth::HfRepoSummary>, String>),
+    /// A repo's quant-variant listing, keyed by `repo_id` so a stale reply
+    /// (the operator navigated to a different repo before it landed) is
+    /// dropped — mirrors `ProviderModels`'s `provider_id` guard.
+    UnslothQuants {
+        repo_id: String,
+        result: Result<Vec<codypendent_integrations::unsloth::QuantVariant>, String>,
+    },
+    /// One parsed line of `ollama pull` output.
+    UnslothPullProgress {
+        repo_id: String,
+        quant: String,
+        line: String,
+    },
+    /// The pull (and, on success, the `models.toml` registration) finished.
+    UnslothPullFinished {
+        repo_id: String,
+        quant: String,
+        result: Result<String, String>,
+    },
+    /// A `PutArtifact` reply (voice v1, rubric 8): the daemon stored a captured
+    /// voice note and minted its ref. The loop turns this into the follow-up
+    /// `SubmitUserInput` whose audio envelope references it — the second half of
+    /// the two-step upload-then-submit the audio path requires.
+    ArtifactStored {
+        command_id: CommandId,
+        artifact: codypendent_protocol::ArtifactRef,
+    },
     /// The daemon closed the connection.
     Closed,
 }
@@ -2018,6 +2642,71 @@ fn wire_blackboard_cards(
             wire_blackboard_item_card(workflow_label_for_run(state, &item.workflow_run_id), item)
         })
         .collect()
+}
+
+/// Project one Hub-fetched repo summary into its pre-rendered display card
+/// (Local models: Unsloth catalog) — the tui crate performs no formatting, so
+/// this happens here, mirroring `model_card`/`load_provider_cards`.
+fn unsloth_repo_card(repo: codypendent_integrations::unsloth::HfRepoSummary) -> UnslothRepoCard {
+    UnslothRepoCard {
+        id: repo.id,
+        downloads_label: format!("{} downloads", human_count(repo.downloads)),
+        likes_label: format!("{} likes", human_count(repo.likes)),
+        // The Hub reports an ISO-8601 timestamp; only the date is shown. A
+        // missing value renders as "unknown" — never a fabricated date.
+        updated_label: match repo.updated_at.as_deref().and_then(|s| s.split('T').next()) {
+            Some(date) if !date.is_empty() => format!("updated {date}"),
+            _ => "updated unknown".to_string(),
+        },
+    }
+}
+
+/// Project one Hub-fetched quant variant into its pre-rendered display card,
+/// mirroring [`unsloth_repo_card`].
+fn unsloth_quant_card(
+    variant: codypendent_integrations::unsloth::QuantVariant,
+) -> UnslothQuantCard {
+    UnslothQuantCard {
+        quant: variant.quant,
+        size_label: human_bytes(variant.total_size_bytes),
+        file_count: variant.files.len(),
+        size_bytes: variant.total_size_bytes,
+    }
+}
+
+/// A compact human count (`891` / `6.6K` / `6.6M`), for the catalog browser's
+/// downloads/likes columns. Display-only, matching `render_node_cost`'s own
+/// "the harness pre-renders" convention.
+fn human_count(n: u64) -> String {
+    const THOUSAND: f64 = 1_000.0;
+    const MILLION: f64 = 1_000_000.0;
+    let n = n as f64;
+    if n >= MILLION {
+        format!("{:.1}M", n / MILLION)
+    } else if n >= THOUSAND {
+        format!("{:.1}K", n / THOUSAND)
+    } else {
+        format!("{n:.0}")
+    }
+}
+
+/// A human-readable byte size (`18.7 GB` / `512.0 MB` / `900 B`), for a
+/// quant's download size. Binary (1024-based) units, matching how disk/RAM
+/// capacity is conventionally reported.
+fn human_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Own the read half: forward each live [`SessionEvent`], answer heartbeat
@@ -2152,6 +2841,23 @@ async fn read_loop(
                 Payload::BlackboardItems { command_id, items } => {
                     if event_tx
                         .send(ReaderSignal::BlackboardItems { command_id, items })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                // Voice v1 (rubric 8): a stored voice note's ref comes back so
+                // the loop can submit the envelope that references it.
+                Payload::ArtifactStored {
+                    command_id,
+                    artifact,
+                } => {
+                    if event_tx
+                        .send(ReaderSignal::ArtifactStored {
+                            command_id,
+                            artifact,
+                        })
                         .await
                         .is_err()
                     {
@@ -2344,6 +3050,10 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             text,
             mode,
             model,
+            // The composer path submits plain text; the voice host builds its
+            // audio-envelope submission directly (see `crate::voice`), never
+            // through this intent mapping.
+            envelope: None,
         },
         Intent::ResolveApproval {
             approval_id,
@@ -2386,6 +3096,15 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             document_id,
             target,
         },
+        // Creation names no document (there is none yet), so the scope defaults
+        // to this checkout's repository — the created document lives with the
+        // code it documents.
+        Intent::CreateDocument { title } => CommandBody::CreateDocument {
+            title,
+            scope: None,
+            repository: Some(repository.to_owned()),
+            initial_markdown: None,
+        },
         Intent::WatchDocument { .. } => unreachable!(
             "WatchDocument is applied locally by the harness, never sent to the daemon"
         ),
@@ -2407,6 +3126,22 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::WatchWorkflow { .. } => unreachable!(
             "WatchWorkflow is applied locally by the harness, never sent to the daemon"
         ),
+        Intent::WatchBoard => unreachable!(
+            "WatchBoard is applied locally by the harness, never sent to the daemon"
+        ),
+        // A column move is a SUPERSESSION server-side: the daemon carries the
+        // card's body forward, re-ordinals it to the end of its new column, and
+        // publishes the replacement — so the pane never edits its own copy.
+        Intent::MoveBoardCard { item_id, status } => CommandBody::UpdateBlackboardItem {
+            scope: codypendent_protocol::BlackboardScope::RepositoryBoard {
+                repository: repository.to_owned(),
+            },
+            item_id,
+            status: Some(status),
+            assignee: None,
+            ordinal: None,
+            payload: None,
+        },
         Intent::PauseWorkflow { workflow_run_id } => {
             CommandBody::PauseWorkflow { workflow_run_id }
         }
@@ -2438,11 +3173,36 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::SetApiKey { .. } | Intent::RemoveApiKey { .. } => unreachable!(
             "SetApiKey/RemoveApiKey are applied locally by the harness (write_api_key), never sent to the daemon"
         ),
+        Intent::VerifyApiKey { .. } => unreachable!(
+            "VerifyApiKey is probed locally by the harness (verify_model_key), never sent to the daemon"
+        ),
+        Intent::SetTheme { .. } => unreachable!(
+            "SetTheme is a local display preference persisted by the harness, never sent to the daemon"
+        ),
         Intent::CreateCouncil { .. } => unreachable!(
             "CreateCouncil is validated and persisted locally by the harness, never sent to the daemon"
         ),
+        Intent::DeleteCouncil { .. } => unreachable!(
+            "DeleteCouncil is applied locally by the harness (council::remove_definition), never sent to the daemon"
+        ),
+        Intent::RunCouncil { .. } => unreachable!(
+            "RunCouncil is driven off-thread by the harness over its own connection, never sent to the daemon"
+        ),
         Intent::NewConversation => unreachable!(
             "NewConversation is applied locally by the harness, never sent to the daemon"
+        ),
+        // Local models: Unsloth catalog — CLIENT-ONLY for the same reason as
+        // `AddModel`/`QueryProviderModels` above (Hub GETs and the `ollama
+        // pull` subprocess run off-thread in the harness; intercepted in the
+        // drain loop, never mapped to a daemon command).
+        Intent::ListUnslothRepos => unreachable!(
+            "ListUnslothRepos is applied locally by the harness (background Hub GET), never sent to the daemon"
+        ),
+        Intent::ListUnslothQuants { .. } => unreachable!(
+            "ListUnslothQuants is applied locally by the harness (background Hub GET), never sent to the daemon"
+        ),
+        Intent::PullUnslothModel { .. } => unreachable!(
+            "PullUnslothModel is applied locally by the harness (ollama pull subprocess), never sent to the daemon"
         ),
     }
 }
@@ -2477,12 +3237,22 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
 /// the whole add before anything is written, rather than leaving a keyless
 /// `models.toml` entry behind while the key silently fails to save. A keyless
 /// add never loads `auth.json` at all, exactly as before.
+///
+/// The entry also records `provider_id`, so the runtime resolves this
+/// provider's auth header/prefix and extra headers from the catalog instead of
+/// flattening every provider to `Authorization: Bearer` (Azure OpenAI's
+/// `api-key` header would otherwise 401 on the first run), and
+/// `context_tokens` when the picked row knew it — never a guess. The key is
+/// stored twice: under the model's display id (today's behavior) and under the
+/// provider-wide `provider/<id>` entry, so the next model added from the same
+/// provider does not re-prompt for the same key.
 fn write_add_model(
     paths: &RuntimePaths,
     display_id: &str,
     provider_id: &str,
     model: &str,
     api_key: Option<&str>,
+    context_tokens: Option<u64>,
 ) -> anyhow::Result<()> {
     use codypendent_providers::Catalog;
     use codypendent_runtime::auth::AuthStore;
@@ -2524,7 +3294,9 @@ fn write_add_model(
         .and_then(|registry| registry.get(provider_id).cloned());
     let catalog = Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
         .unwrap_or_else(|_| Catalog::builtin());
-    let (runtime_provider, base_url, provider_model) = if let Some(agent) = acp_agent {
+    let (runtime_provider, base_url, provider_model, catalog_provider) = if let Some(agent) =
+        acp_agent
+    {
         let coordinate = if codypendent_integrations::acp_registry::agent_id_from_coordinate(model)
             == agent.id
         {
@@ -2535,7 +3307,7 @@ fn write_add_model(
         acp_store
             .launch_spec(&coordinate)
             .with_context(|| format!("ACP agent `{}` is not launchable", agent.id))?;
-        ("acp".to_string(), String::new(), coordinate)
+        ("acp".to_string(), String::new(), coordinate, false)
     } else {
         let provider = catalog
             .get(provider_id)
@@ -2548,13 +3320,26 @@ fn write_add_model(
         }
         (
             "openai-compatible".to_string(),
-            provider
-                .base_url
-                .clone()
-                .expect("runtime-supported providers have a non-blank base URL"),
+            // Normalized on persist: a catalog `base_url` written with a
+            // trailing slash (`…/v1/`) would otherwise reach the chat client
+            // as `…/v1//chat/completions`.
+            normalize_base_url(
+                provider
+                    .base_url
+                    .as_deref()
+                    .expect("runtime-supported providers have a non-blank base URL"),
+            ),
             model.to_string(),
+            true,
         )
     };
+    // A catalog row for this exact model fills in the context window when the
+    // caller did not already know it (the picker passes what it displayed).
+    let context_tokens = context_tokens.or_else(|| {
+        catalog
+            .model(provider_id, model)
+            .and_then(|row| row.context_tokens)
+    });
 
     // Read the existing models.toml (absent ⇒ start empty) through the real
     // loader, drop any entry sharing the new display id (update-in-place), then
@@ -2572,7 +3357,10 @@ fn write_add_model(
         base_url,
         model: provider_model,
         api_key_env: String::new(),
-        context_tokens: None,
+        // Only a catalog provider's auth is resolvable from the catalog; an
+        // ACP agent's provider id names a registry agent, not a provider.
+        provider_id: catalog_provider.then(|| provider_id.to_string()),
+        context_tokens,
     });
 
     // Serialize back to `[[model]]` tables and write atomically.
@@ -2597,21 +3385,91 @@ fn write_add_model(
             .as_mut()
             .expect("loaded above because `key` is Some (M3 ordering)");
         auth.set(display_id, key);
+        // Also store it provider-wide, so adding a second model from the same
+        // provider needs no second paste of the same key. The runtime reads
+        // this entry after the per-model one (`provider_auth_id`).
+        if catalog_provider {
+            auth.set(provider_auth_id(provider_id), key);
+        }
         auth.save(data_dir)
             .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     }
     Ok(())
 }
 
-/// Install (when necessary) and handshake one official ACP agent away from the
-/// render loop. The caller writes `models.toml` only after this succeeds, so a
-/// bad archive, missing runner, or incompatible agent never leaves a broken
-/// selectable profile behind.
-async fn connect_acp_agent(
+/// A provider `base_url` as it should be persisted: trailing slashes trimmed.
+/// The catalog stores a few with one (`…/v1/`), and the chat client joins
+/// `{base}/chat/completions` — the raw value would produce a double slash on
+/// every request. A blank/whitespace-only URL is returned as an empty string
+/// (the caller's own validation reports it).
+fn normalize_base_url(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_string()
+}
+
+/// The provider-wide key a previous add stored in `auth.json`
+/// (`provider/<catalog-id>`), if any. Read so the add flow never asks for a key
+/// it already holds; a missing or corrupt store is simply "no key".
+fn stored_provider_key(data_dir: &Path, provider_id: &str) -> Option<String> {
+    codypendent_runtime::auth::AuthStore::load(data_dir)
+        .ok()?
+        .get(&provider_auth_id(provider_id))
+        .map(str::to_owned)
+}
+
+/// One-shot verification of a configured model's credentials (`/keys`,
+/// `Ctrl-T`): run the real [`ModelRegistry::check_model`], which resolves the
+/// key through the same precedence a run uses and sends the same
+/// catalog-declared headers, so an "ok" here means the run would authenticate.
+/// The returned reason is the registry's own error text, which never contains
+/// key material.
+async fn verify_model_key(data_dir: &Path, model_id: &str) -> Result<(), String> {
+    use codypendent_runtime::models::{load_models, ModelRegistry};
+
+    let models_path = data_dir.join("models.toml");
+    let configs = load_models(&models_path).map_err(|error| error.to_string())?;
+    let auth = codypendent_runtime::auth::AuthStore::load(data_dir).unwrap_or_default();
+    let catalog =
+        codypendent_providers::Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
+            .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+    ModelRegistry::new(configs)
+        .with_auth(auth)
+        .with_catalog(catalog)
+        .check_model(&ModelId(model_id.to_owned()))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Whether `provider_id` names an agent from the official ACP registry (rather
+/// than a catalog provider). Read from the CACHED registry only: the picker
+/// already refreshed it when it built its cards, and the intent-drain loop must
+/// never block on the network.
+fn is_acp_provider(paths: &RuntimePaths, provider_id: &str) -> bool {
+    codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir)
+        .load_cached()
+        .ok()
+        .is_some_and(|registry| registry.get(provider_id).is_some())
+}
+
+/// The `models.toml` profile id for a connected ACP agent — `acp/<agent>`, or
+/// `acp/<agent>#<model>` when pinned to one of the agent's own models, mirroring
+/// the coordinate the profile stores.
+fn acp_profile_id(provider_id: &str, model: Option<&str>) -> String {
+    match model {
+        Some(model) => format!("acp/{provider_id}#{model}"),
+        None => format!("acp/{provider_id}"),
+    }
+}
+
+/// One official ACP agent, installed (when necessary) and handshaken away from
+/// the render loop: its pinned coordinate plus the models it advertises over
+/// the session-config handshake. The single place the TUI talks to a live
+/// agent — both the add-model model list and the connect itself go through it,
+/// so neither can disagree with the other about what the agent offers.
+async fn probe_acp_agent(
     paths: &RuntimePaths,
     provider_id: &str,
     repository: &Path,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AcpProbe> {
     let store = codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir);
     let spec = store.install(provider_id, false).await?;
     let command = spec.command.to_string_lossy().into_owned();
@@ -2623,11 +3481,64 @@ async fn connect_acp_agent(
     )
     .await
     .with_context(|| format!("ACP handshake with `{provider_id}` failed"))?;
+    let models = client
+        .discovered_models()
+        .into_iter()
+        .map(|model| model.id)
+        .collect();
     drop(client);
-    Ok(codypendent_integrations::acp_registry::agent_coordinate(
-        &spec.registry_id,
-        &spec.version,
-    ))
+    Ok(AcpProbe {
+        registry_id: spec.registry_id,
+        version: spec.version,
+        models,
+    })
+}
+
+/// What a live handshake with an ACP agent taught the TUI.
+struct AcpProbe {
+    registry_id: String,
+    version: String,
+    /// The agent's own model ids, in the agent's order. Empty when it exposes
+    /// no model selector — its default model then applies, as before.
+    models: Vec<String>,
+}
+
+impl AcpProbe {
+    /// The coordinate a profile stores: `id@version`, or `id@version#model`
+    /// when the user picked one of the agent's own models.
+    fn coordinate(&self, model: Option<&str>) -> String {
+        match model {
+            Some(model) => codypendent_integrations::acp_registry::agent_coordinate_with_model(
+                &self.registry_id,
+                &self.version,
+                model,
+            ),
+            None => codypendent_integrations::acp_registry::agent_coordinate(
+                &self.registry_id,
+                &self.version,
+            ),
+        }
+    }
+}
+
+/// Install, handshake, and resolve the coordinate one ACP profile stores. The
+/// caller writes `models.toml` only after this succeeds, so a bad archive,
+/// missing runner, or incompatible agent never leaves a broken selectable
+/// profile behind. A `model` pin is verified against what the agent actually
+/// advertised — a pin it would not honor is never persisted.
+async fn connect_acp_agent(
+    paths: &RuntimePaths,
+    provider_id: &str,
+    repository: &Path,
+    model: Option<&str>,
+) -> anyhow::Result<String> {
+    let probe = probe_acp_agent(paths, provider_id, repository).await?;
+    if let Some(model) = model {
+        if !probe.models.iter().any(|advertised| advertised == model) {
+            bail!("`{provider_id}` does not advertise a model called `{model}`");
+        }
+    }
+    Ok(probe.coordinate(model))
 }
 
 /// Apply the client-only `Intent::AddModel` (the event-loop drain arm,
@@ -2642,8 +3553,16 @@ async fn apply_add_model(
     provider_id: &str,
     model: &str,
     api_key: Option<&str>,
+    context_tokens: Option<u64>,
 ) {
-    match write_add_model(paths, display_id, provider_id, model, api_key) {
+    match write_add_model(
+        paths,
+        display_id,
+        provider_id,
+        model,
+        api_key,
+        context_tokens,
+    ) {
         Ok(()) => {
             // Re-seed the model picker so the new model shows immediately.
             let mut warnings = Vec::new();
@@ -2866,37 +3785,279 @@ fn models_url(base_url: &str) -> String {
     format!("{}/models", base_url.trim_end_matches('/'))
 }
 
+/// One entry of a provider's `/models` response, keeping the OPTIONAL metadata
+/// several OpenAI-compatible providers ship alongside the id. Every field but
+/// `id` is best-effort: a provider that answers with bare ids parses exactly as
+/// before, and a provider that answers with a shape this build does not know
+/// simply contributes nothing extra.
+///
+/// The known spellings, all observed in the wild on the same endpoint the add
+/// flow already calls: `context_length` (OpenRouter, Nebius `?verbose=true`),
+/// `max_model_len` (vLLM-derived: DeepInfra, Novita, SambaNova),
+/// `max_context_length`/`context_window` (Venice and friends), and a nested
+/// `pricing.{prompt,completion}` object priced per TOKEN (OpenRouter's
+/// convention) which is scaled to per-1M for display.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct DiscoveredModel {
+    #[serde(default)]
+    id: String,
+    #[serde(default, alias = "display_name", alias = "name")]
+    name: Option<String>,
+    #[serde(
+        default,
+        alias = "context_length",
+        alias = "max_model_len",
+        alias = "max_context_length",
+        alias = "context_window"
+    )]
+    context_tokens: Option<u64>,
+    #[serde(default)]
+    pricing: Option<DiscoveredPricing>,
+}
+
+/// A `/models` entry's optional pricing object. The values arrive as strings on
+/// OpenRouter (`"0.0000004"`) and as numbers elsewhere, so both are accepted
+/// and anything unparseable is simply dropped.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct DiscoveredPricing {
+    #[serde(default, alias = "input")]
+    prompt: Option<serde_json::Value>,
+    #[serde(default, alias = "output")]
+    completion: Option<serde_json::Value>,
+}
+
+/// A per-token price as USD per 1M tokens, accepting the string and number
+/// spellings providers use. `None` for anything that is not a finite,
+/// non-negative number — a fabricated price is worse than a blank column.
+fn price_per_1m(value: Option<&serde_json::Value>) -> Option<f64> {
+    let raw = match value? {
+        serde_json::Value::String(text) => text.trim().parse::<f64>().ok()?,
+        other => other.as_f64()?,
+    };
+    (raw.is_finite() && raw >= 0.0).then_some(raw * 1_000_000.0)
+}
+
 /// Parse an OpenAI/Ollama `/models` response body (`{ "object": "list", "data":
-/// [ { "id": "…" }, … ] }`) into the model ids: trim each, skip blank/missing,
-/// dedup preserving order. An empty result is an `Err` so the reducer's failure
-/// arm routes to the free-text fallback uniformly. A pure function over the body
-/// string — the network GET is in `query_provider_models` — so it is directly
-/// unit-testable. The error strings are generic and never carry a key.
-fn parse_models_response(body: &str) -> Result<Vec<String>, String> {
+/// [ { "id": "…" }, … ] }`) into rows: trim each id, skip blank/missing, dedup
+/// preserving order, and keep any optional metadata the provider volunteered.
+/// An empty result is an `Err` so the caller can fall back to the catalog
+/// uniformly. A pure function over the body string — the network GET is in
+/// `query_provider_models` — so it is directly unit-testable. The error strings
+/// are generic and never carry a key.
+fn parse_models_response(body: &str) -> Result<Vec<AddModelRow>, String> {
     #[derive(serde::Deserialize)]
     struct ModelsResponse {
         #[serde(default)]
-        data: Vec<ModelEntry>,
-    }
-    #[derive(serde::Deserialize)]
-    struct ModelEntry {
-        #[serde(default)]
-        id: String,
+        data: Vec<DiscoveredModel>,
     }
     let parsed: ModelsResponse = serde_json::from_str(body)
         .map_err(|_| "the provider returned an unexpected response".to_string())?;
-    let mut ids: Vec<String> = Vec::new();
+    let mut rows: Vec<AddModelRow> = Vec::new();
     for entry in parsed.data {
         let id = entry.id.trim().to_string();
-        if id.is_empty() || ids.contains(&id) {
+        if id.is_empty() || rows.iter().any(|row| row.id == id) {
             continue;
         }
-        ids.push(id);
+        let pricing = entry.pricing.unwrap_or_default();
+        rows.push(AddModelRow {
+            id,
+            name: entry
+                .name
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty()),
+            context_tokens: entry.context_tokens.filter(|tokens| *tokens > 0),
+            cost_per_1m_input_usd: price_per_1m(pricing.prompt.as_ref()),
+            cost_per_1m_output_usd: price_per_1m(pricing.completion.as_ref()),
+            live: true,
+        });
     }
-    if ids.is_empty() {
+    if rows.is_empty() {
         return Err("provider returned no models".to_string());
     }
-    Ok(ids)
+    Ok(rows)
+}
+
+/// Merge a provider's live listing with the curated catalog rows for the same
+/// provider: catalog metadata fills any gap a live row left (never overwriting
+/// what the provider itself said), and catalog models the listing did not name
+/// are appended as unconfirmed (`live: false`) rows — the offline/no-listing
+/// path. Live rows keep their listing order; catalog-only rows follow in
+/// catalog order, so the provider's own ranking survives.
+fn merge_catalog_rows(live: Vec<AddModelRow>, catalog: &[AddModelRow]) -> Vec<AddModelRow> {
+    let mut rows = live;
+    for row in &mut rows {
+        let Some(known) = catalog.iter().find(|entry| entry.id == row.id) else {
+            continue;
+        };
+        if row.name.is_none() {
+            row.name.clone_from(&known.name);
+        }
+        if row.context_tokens.is_none() {
+            row.context_tokens = known.context_tokens;
+        }
+        if row.cost_per_1m_input_usd.is_none() {
+            row.cost_per_1m_input_usd = known.cost_per_1m_input_usd;
+        }
+        if row.cost_per_1m_output_usd.is_none() {
+            row.cost_per_1m_output_usd = known.cost_per_1m_output_usd;
+        }
+    }
+    for known in catalog {
+        if !rows.iter().any(|row| row.id == known.id) {
+            rows.push(known.clone());
+        }
+    }
+    rows
+}
+
+/// The catalog's curated `[[model]]` rows for one provider, as pick-list rows.
+/// `live: false` — these are offerable, but nothing has confirmed this account
+/// can reach them.
+fn catalog_rows_for(
+    catalog: &codypendent_providers::Catalog,
+    provider_id: &str,
+) -> Vec<AddModelRow> {
+    catalog
+        .models()
+        .filter(|model| model.provider_id == provider_id)
+        .map(|model| AddModelRow {
+            id: model.id.clone(),
+            name: model.name.clone(),
+            context_tokens: model.context_tokens,
+            cost_per_1m_input_usd: model.cost_per_1m_input_usd,
+            cost_per_1m_output_usd: model.cost_per_1m_output_usd,
+            live: false,
+        })
+        .collect()
+}
+
+/// The on-disk shape of one cached provider listing
+/// (`<data_dir>/model_lists/<provider>.json`). Plain data, no key material: it
+/// holds exactly what the pick-list shows. `fetched_at_unix` is seconds since
+/// the epoch — the same dependency-free stamp `humantime_now` uses, rather
+/// than pulling a time-formatting crate into this crate's build.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedModelList {
+    provider_id: String,
+    fetched_at_unix: u64,
+    models: Vec<CachedModelRow>,
+}
+
+/// One cached row. Mirrors [`AddModelRow`] minus `live` — everything in the
+/// cache came from a live listing at `fetched_at`, and is re-marked as such
+/// when it is read back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedModelRow {
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_per_1m_input_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_per_1m_output_usd: Option<f64>,
+}
+
+/// Where one provider's cached listing lives.
+fn model_list_cache_path(data_dir: &Path, provider_id: &str) -> PathBuf {
+    // Provider ids are catalog identifiers (`azure-openai`, `nebius`), but the
+    // value reaches here from a user-editable `providers.toml`, so any path
+    // separator is neutralized before it becomes a file name.
+    let safe: String = provider_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    data_dir.join("model_lists").join(format!("{safe}.json"))
+}
+
+/// Read a provider's cached listing, if one is on disk and parseable. Returns
+/// the rows (re-marked `live`, since they were a live listing when written)
+/// and a human age label for the header. A missing/corrupt cache is simply
+/// `None` — the cache is an accelerator, never a source of truth.
+fn read_model_list_cache(data_dir: &Path, provider_id: &str) -> Option<(Vec<AddModelRow>, String)> {
+    let text = std::fs::read_to_string(model_list_cache_path(data_dir, provider_id)).ok()?;
+    let cached: CachedModelList = serde_json::from_str(&text).ok()?;
+    if cached.models.is_empty() {
+        return None;
+    }
+    let rows = cached
+        .models
+        .into_iter()
+        .map(|row| AddModelRow {
+            id: row.id,
+            name: row.name,
+            context_tokens: row.context_tokens,
+            cost_per_1m_input_usd: row.cost_per_1m_input_usd,
+            cost_per_1m_output_usd: row.cost_per_1m_output_usd,
+            live: true,
+        })
+        .collect();
+    Some((rows, cache_age_label(cached.fetched_at_unix, unix_now())))
+}
+
+/// Seconds since the Unix epoch, or `0` when the clock is before it (the same
+/// dependency-free stamp the crash log uses).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// A human age for a cached listing ("4m ago"). A stamp from the future (a
+/// clock that moved backwards) reads as "just now" rather than as a negative
+/// age — the label is a hint, and `Ctrl-R` is always available.
+fn cache_age_label(fetched_at_unix: u64, now_unix: u64) -> String {
+    let minutes = now_unix.saturating_sub(fetched_at_unix) / 60;
+    match minutes {
+        m if m < 1 => "just now".to_owned(),
+        m if m < 60 => format!("{m}m ago"),
+        m if m < 60 * 24 => format!("{}h ago", m / 60),
+        m => format!("{}d ago", m / (60 * 24)),
+    }
+}
+
+/// Persist a provider's live listing for the next add (instant seed). Failures
+/// are ignored: a cache that cannot be written must never break the add flow.
+fn write_model_list_cache(data_dir: &Path, provider_id: &str, rows: &[AddModelRow]) {
+    let path = model_list_cache_path(data_dir, provider_id);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let cached = CachedModelList {
+        provider_id: provider_id.to_owned(),
+        fetched_at_unix: unix_now(),
+        models: rows
+            .iter()
+            .filter(|row| row.live)
+            .map(|row| CachedModelRow {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                context_tokens: row.context_tokens,
+                cost_per_1m_input_usd: row.cost_per_1m_input_usd,
+                cost_per_1m_output_usd: row.cost_per_1m_output_usd,
+            })
+            .collect(),
+    };
+    if cached.models.is_empty() {
+        return;
+    }
+    let Ok(rendered) = serde_json::to_string_pretty(&cached) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, rendered.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// GET `<base_url>/models` for the add-model flow (model-discovery), applying the
@@ -2912,7 +4073,7 @@ async fn query_provider_models(
     header: &str,
     prefix: &str,
     api_key: Option<&str>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<AddModelRow>, String> {
     let url = models_url(base_url);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -3511,6 +4672,85 @@ fn local_model_endpoint(url: &str) -> bool {
         .any(|host| lower.contains(host))
 }
 
+/// Seed (and re-seed after create/run/delete) the `/council` browser's
+/// projection: every council persisted in `<config_dir>/councils.toml`,
+/// mapped into a self-contained [`codypendent_tui::state::CouncilCard`] — the
+/// TUI crate performs no I/O, so the mapping happens here exactly like
+/// [`load_model_cards`] and the knowledge-fabric loaders above. Never fails
+/// the TUI: an unreadable/unparsable store degrades to an empty browser with
+/// a diagnostic in `warnings`.
+fn load_council_cards(
+    paths: &RuntimePaths,
+    warnings: &mut Vec<String>,
+) -> Vec<codypendent_tui::state::CouncilCard> {
+    match crate::council::list_definitions(paths) {
+        Ok(definitions) => definitions
+            .into_iter()
+            .map(|definition| codypendent_tui::state::CouncilCard {
+                name: definition.name,
+                description: definition.description,
+                chair: definition.chair,
+                rounds: definition.rounds,
+                evidence: definition.evidence,
+                members: definition
+                    .members
+                    .into_iter()
+                    .map(|member| (member.model, member.role))
+                    .collect(),
+            })
+            .collect(),
+        Err(error) => {
+            warnings.push(format!("council browser unavailable: {error}"));
+            Vec::new()
+        }
+    }
+}
+
+/// Format one [`crate::council::CouncilEvent`] as a single display line for the
+/// off-thread council run's progress stream (rubric 6 TUI wiring) — the same
+/// wording the CLI's own non-interactive `council run` prints via `eprintln!`,
+/// so behavior reads identically in both surfaces.
+fn council_progress_message(event: &crate::council::CouncilEvent) -> String {
+    use crate::council::CouncilEvent;
+    match event {
+        CouncilEvent::RoundStarted {
+            round,
+            rounds,
+            members,
+        } => format!("round {round}/{rounds} — launching {members} member(s)"),
+        CouncilEvent::MemberCompleted { round, role, model } => {
+            format!("round {round} — {role} ({model}) completed")
+        }
+        CouncilEvent::MemberFailed { round, error } => {
+            format!("round {round} — member failed: {error}")
+        }
+        CouncilEvent::ChairStarted { chair } => format!("asking chair `{chair}` to synthesize"),
+        CouncilEvent::Warning { message } => format!("warning: {message}"),
+    }
+}
+
+/// Reduce a completed [`crate::council::CouncilRunOutcome`] to the plain,
+/// dependency-free summary the TUI crate can render (it cannot name
+/// `codypendent-cli`'s own `council` module types without a dependency cycle —
+/// `cli` already depends on `tui`).
+fn council_run_summary(
+    run: crate::council::CouncilRunOutcome,
+) -> codypendent_tui::state::CouncilRunSummary {
+    let mut participants: Vec<String> = run
+        .outcome
+        .members
+        .iter()
+        .map(crate::council::participant_line)
+        .collect();
+    participants.push(crate::council::participant_line(&run.outcome.chair));
+    codypendent_tui::state::CouncilRunSummary {
+        synthesis: run.outcome.chair.response,
+        participants,
+        cost_line: crate::council::cost_line(&run.costs),
+        report_markdown: run.report_markdown.display().to_string(),
+    }
+}
+
 /// Map one configured [`ModelConfig`](codypendent_runtime::models::ModelConfig)
 /// into a [`ModelCard`], enriching it with its measured profile (matched by
 /// `(id, base_url)`) when `profiles` has one — an id-only fallback (every
@@ -3579,6 +4819,15 @@ async fn load_provider_cards(
             Catalog::builtin()
         }
     };
+    // How many curated models the catalog ships per provider, counted once
+    // rather than re-scanning for every card.
+    let mut catalog_model_counts: HashMap<&str, usize> = HashMap::new();
+    for model in catalog.models() {
+        *catalog_model_counts
+            .entry(model.provider_id.as_str())
+            .or_default() += 1;
+    }
+    let auth = codypendent_runtime::auth::AuthStore::load(&paths.data_dir).unwrap_or_default();
     let mut cards: Vec<_> = catalog
         .providers()
         // ACP entries come from the official live registry below. Keeping the
@@ -3614,6 +4863,17 @@ async fn load_provider_cards(
             // tested against the real enums.
             can_list_models: provider_can_list_models(p),
             available: provider_runtime_supported(p),
+            // The curated `[[model]]` rows this provider ships: what the add
+            // flow can offer with no network at all.
+            catalog_models: catalog_model_counts
+                .get(p.id.as_str())
+                .copied()
+                .unwrap_or_default(),
+            // A provider-wide key already in `auth.json` means the add flow
+            // can skip straight to the pick-list.
+            has_key: auth
+                .get(&provider_auth_id(&p.id))
+                .is_some_and(|key| !key.is_empty()),
         })
         .collect();
     let acp_store = AcpRegistryStore::new(&paths.data_dir);
@@ -3638,6 +4898,7 @@ async fn load_provider_cards(
                 .binary
                 .get(codypendent_integrations::acp_registry::current_platform())
                 .is_some_and(|binary| binary.sha256.is_some());
+            let ready = acp_store.launch_spec(&agent.id).is_ok();
             ProviderCard {
                 id: agent.id.clone(),
                 name: agent.name.clone(),
@@ -3645,11 +4906,20 @@ async fn load_provider_cards(
                 auth: format!("acp: {distribution} · {}", agent.version),
                 local: false,
                 requires_key: false,
-                can_list_models: false,
+                // An ACP agent's models come from its session-config
+                // handshake, so listing them means spawning it — offered only
+                // for an agent already installed and launchable. One that
+                // would first have to be downloaded takes the connect-then-see
+                // path rather than stalling the picker on an install.
+                can_list_models: ready,
                 // Verified platform binaries can be installed in the
                 // background when selected. Package entries are selectable
                 // only when their runner is actually present.
-                available: acp_store.launch_spec(&agent.id).is_ok() || binary_installable,
+                available: ready || binary_installable,
+                // An ACP agent owns its own model; there is nothing for the
+                // catalog to curate and no provider key to hold.
+                catalog_models: 0,
+                has_key: false,
             }
         }));
     }
@@ -3662,8 +4932,11 @@ async fn load_provider_cards(
                 auth: format!("acp: local · {}", spec.version),
                 local: true,
                 requires_key: false,
-                can_list_models: false,
+                // Locally installed, so it can be handshaken for its models.
+                can_list_models: true,
                 available: true,
+                catalog_models: 0,
+                has_key: false,
             });
         }
     }
@@ -4062,11 +5335,15 @@ fn block_view(block: &DocumentBlock) -> DocBlockView {
         }
         BlockContent::EmbeddedSkill { skill } => ("embed-skill".to_owned(), skill.clone()),
     };
-    // Collapse to one line — the editor rail renders a block per row.
+    // Collapse to one line — the editor rail renders a block per row. The raw
+    // primary text rides alongside it so `e` can prefill the edit prompt with
+    // exactly what the block holds (and replace exactly that many characters);
+    // a structured/embed block has none, and the rail says so instead.
     DocBlockView {
         id: block.id.clone(),
         kind,
         text: text.replace('\n', " "),
+        editable: block.primary_text().map(str::to_owned),
     }
 }
 
@@ -4388,6 +5665,10 @@ fn workflow_node_card(
         approval,
         retry,
         depends_on: join(&node.depends_on),
+        // The raw edge ids the pane lays out into ASCII lanes (rubric 5) — the
+        // comma-joined string above is for the detail rail and cannot be parsed
+        // back into a graph.
+        depends_on_ids: node.depends_on.clone(),
         outputs: join(&node.outputs),
         cost,
         error,
@@ -4509,6 +5790,36 @@ fn wire_blackboard_item_card(
     }
 }
 
+/// Project one stored board item into a self-contained [`KanbanCard`] (rubric
+/// 10). The board's rows ARE blackboard items — the card view just renders the
+/// board-specific fields the artifact view has no place for.
+fn wire_board_card(item: &codypendent_protocol::BlackboardItemView) -> KanbanCard {
+    KanbanCard {
+        id: item.id.clone(),
+        title: summarize_json(&item.payload),
+        status: item.status.clone().unwrap_or_else(|| "todo".to_owned()),
+        assignee: item
+            .assignee
+            .clone()
+            .unwrap_or_else(|| "\u{2014}".to_owned()),
+        kind: item.kind.clone(),
+        author: summarize_author(&item.author),
+        // A card with no recorded position sorts to the top of its column rather
+        // than to an arbitrary place.
+        ordinal: item.ordinal.unwrap_or(0),
+    }
+}
+
+/// Project a board read's items into cards, dropping any superseded revision
+/// that slipped into the reply — the board shows the live card only.
+fn wire_board_cards(items: &[codypendent_protocol::BlackboardItemView]) -> Vec<KanbanCard> {
+    items
+        .iter()
+        .filter(|item| item.superseded_by.is_none())
+        .map(wire_board_card)
+        .collect()
+}
+
 /// The first 8 characters of a run id, for a compact run label.
 fn short_run_id(id: &str) -> String {
     id.chars().take(8).collect()
@@ -4614,6 +5925,13 @@ struct SessionStore {
     /// on the next launch so this client keeps one identity across restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume_token: Option<String>,
+    /// The theme id last kept in the TUI's `/theme` picker — a built-in variant
+    /// name or an installed pack id. Read at boot by `theme_select`, BELOW an
+    /// explicit `--theme`/`CODYPENDENT_THEME` (an explicit override always
+    /// wins) and above terminal detection. An unknown id simply falls through
+    /// to detection, so a removed pack cannot wedge the TUI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
 }
 
 /// One remembered session: its id and the workspace it belongs to.
@@ -4860,6 +6178,7 @@ mod tests {
                 text: "also add tests".into(),
                 mode: AgentMode::Build,
                 model: Some(codypendent_protocol::ModelId("pinned-model-x".into())),
+                envelope: None,
             }
         );
         // And an unpinned follow-up carries no model on the wire (inherit).
@@ -4878,6 +6197,7 @@ mod tests {
                 text: "keep going".into(),
                 mode: AgentMode::Build,
                 model: None,
+                envelope: None,
             }
         );
 
@@ -4995,6 +6315,7 @@ mod tests {
             model: "gpt-5.1-codex".to_owned(),
             api_key_env: "OPENAI_API_KEY".to_owned(),
             context_tokens: None,
+            provider_id: None,
         };
         // Same id, but the profile below is measured against a DIFFERENT
         // endpoint — must not match (proves the lookup keys on the pair, not
@@ -5006,6 +6327,7 @@ mod tests {
             model: "gpt-5.1-codex".to_owned(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         };
         let unprofiled = codypendent_runtime::models::ModelConfig {
             id: ModelId("local-default".into()),
@@ -5014,6 +6336,7 @@ mod tests {
             model: "qwen2.5-coder:14b".to_owned(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         };
 
         let profile = ModelProfile {
@@ -5392,6 +6715,7 @@ steps:
             evidence: vec![json!({ "artifact": "a1" }), json!({ "artifact": "a2" })],
             revision: 1,
             superseded_by: None,
+            board: Default::default(),
         };
         let card = blackboard_item_card(
             "workflow-run-1",
@@ -5428,6 +6752,7 @@ steps:
             evidence: vec![],
             revision: 3,
             superseded_by: Some("2".to_owned()),
+            board: Default::default(),
         };
         let card = blackboard_item_card("workflow-run-1", "run", &item);
         assert_eq!(card.summary, "a guess");
@@ -5744,6 +7069,7 @@ steps:
             "groq",
             "llama-3.1-8b",
             Some("sk-secret"),
+            None,
         )
         .expect("write_add_model");
 
@@ -5764,10 +7090,248 @@ steps:
             "the key lives in auth.json, not api_key_env"
         );
 
-        // The key landed in auth.json.
+        // The key landed in auth.json, per model AND provider-wide (so the
+        // next model from this provider needs no second paste).
         let auth =
             codypendent_runtime::auth::AuthStore::load(&paths.data_dir).expect("auth.json loads");
         assert_eq!(auth.get("groq/llama"), Some("sk-secret"));
+        assert_eq!(auth.get(&provider_auth_id("groq")), Some("sk-secret"));
+    }
+
+    /// The HIGH-severity auth-flatten regression, from the add side: the entry
+    /// must record which catalog provider it came from, so the runtime sends
+    /// that provider's real auth header (`api-key` for Azure OpenAI) instead
+    /// of a hardcoded bearer. Without this the add "succeeds" and every run
+    /// 401s.
+    #[test]
+    fn write_add_model_records_the_provider_so_azure_auth_survives() {
+        use codypendent_providers::{AuthMethod, Catalog};
+        use codypendent_runtime::models::load_models;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).expect("create data dir");
+
+        // The built-in `azure-openai` entry declares the non-bearer header but
+        // deliberately carries no base_url (it is per-resource), so a real user
+        // sets theirs in `providers.toml` — exactly what this fixture does. The
+        // built-in's header is asserted so this fails loudly if it ever changes.
+        let builtin = Catalog::builtin();
+        assert!(
+            builtin
+                .get("azure-openai")
+                .expect("azure-openai is a built-in provider")
+                .auth
+                .iter()
+                .any(|method| matches!(
+                    method,
+                    AuthMethod::ApiKey { header, .. } if header == "api-key"
+                )),
+            "the azure-openai catalog entry must declare the `api-key` header"
+        );
+        std::fs::write(
+            paths.data_dir.join("providers.toml"),
+            br#"
+[[provider]]
+id = "azure-openai"
+name = "Azure OpenAI (my resource)"
+protocol = "openai-chat"
+base_url = "https://my-resource.openai.azure.com/openai/v1/"
+[[provider.auth]]
+kind = "api_key"
+env = ["AZURE_OPENAI_API_KEY"]
+header = "api-key"
+prefix = ""
+"#,
+        )
+        .expect("seed providers.toml");
+
+        write_add_model(
+            &paths,
+            "azure-openai/gpt-5.1",
+            "azure-openai",
+            "gpt-5.1",
+            Some("azure-secret"),
+            None,
+        )
+        .expect("write_add_model");
+
+        let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
+        let entry = configs
+            .iter()
+            .find(|c| c.id.0 == "azure-openai/gpt-5.1")
+            .expect("the entry is present");
+        assert_eq!(
+            entry.provider_id.as_deref(),
+            Some("azure-openai"),
+            "the provider id is what the runtime resolves the `api-key` header from"
+        );
+        assert_eq!(
+            entry.base_url, "https://my-resource.openai.azure.com/openai/v1",
+            "the catalog's trailing slash is normalized on persist"
+        );
+    }
+
+    /// A catalog base URL written with a trailing slash would otherwise reach
+    /// the chat client as `…/v1//chat/completions`.
+    #[test]
+    fn normalize_base_url_trims_trailing_slashes() {
+        assert_eq!(
+            normalize_base_url("https://api.tokenfactory.nebius.com/v1/"),
+            "https://api.tokenfactory.nebius.com/v1"
+        );
+        assert_eq!(
+            normalize_base_url("  http://localhost:11434/v1  "),
+            "http://localhost:11434/v1"
+        );
+    }
+
+    /// The context window the picker showed is what gets persisted, so the
+    /// context gauge and the `num_ctx` hint work from the first run.
+    #[test]
+    fn write_add_model_persists_the_context_window_it_was_given() {
+        use codypendent_runtime::models::load_models;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            None,
+            Some(131_072),
+        )
+        .expect("write");
+        let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
+        assert_eq!(configs[0].context_tokens, Some(131_072));
+    }
+
+    /// The merge is what makes a catalog-only provider usable and a bare live
+    /// listing informative: live rows keep their order and gain the catalog's
+    /// metadata, catalog-only models follow as unconfirmed rows, and anything
+    /// the provider itself stated wins over the catalog.
+    #[test]
+    fn merge_catalog_rows_enriches_live_rows_and_appends_catalog_only_ones() {
+        let live = vec![
+            AddModelRow::live("llama-3.1-8b"),
+            AddModelRow {
+                id: "llama-3.3-70b".to_owned(),
+                name: None,
+                context_tokens: Some(999),
+                cost_per_1m_input_usd: None,
+                cost_per_1m_output_usd: None,
+                live: true,
+            },
+        ];
+        let catalog = vec![
+            AddModelRow {
+                id: "llama-3.1-8b".to_owned(),
+                name: Some("Llama 3.1 8B".to_owned()),
+                context_tokens: Some(128_000),
+                cost_per_1m_input_usd: Some(0.05),
+                cost_per_1m_output_usd: Some(0.08),
+                live: false,
+            },
+            AddModelRow {
+                id: "llama-3.3-70b".to_owned(),
+                name: Some("Llama 3.3 70B".to_owned()),
+                context_tokens: Some(128_000),
+                cost_per_1m_input_usd: None,
+                cost_per_1m_output_usd: None,
+                live: false,
+            },
+            AddModelRow {
+                id: "not-listed-today".to_owned(),
+                name: Some("Retired?".to_owned()),
+                context_tokens: Some(8_192),
+                cost_per_1m_input_usd: None,
+                cost_per_1m_output_usd: None,
+                live: false,
+            },
+        ];
+        let merged = merge_catalog_rows(live, &catalog);
+        assert_eq!(
+            merged.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["llama-3.1-8b", "llama-3.3-70b", "not-listed-today"],
+            "live order first, catalog-only rows appended"
+        );
+        assert_eq!(merged[0].name.as_deref(), Some("Llama 3.1 8B"));
+        assert_eq!(merged[0].context_tokens, Some(128_000));
+        assert!(merged[0].live);
+        assert_eq!(
+            merged[1].context_tokens,
+            Some(999),
+            "what the provider itself said is never overwritten by the catalog"
+        );
+        assert!(
+            !merged[2].live,
+            "a model the provider did not list stays marked unconfirmed"
+        );
+    }
+
+    /// The discovery cache: a live listing is written, read back as live rows,
+    /// and labelled with its age — the instant seed the next add gets.
+    #[test]
+    fn model_list_cache_round_trips_with_an_age_label() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+        let rows = vec![
+            AddModelRow {
+                id: "llama-3.1-8b".to_owned(),
+                name: Some("Llama 3.1 8B".to_owned()),
+                context_tokens: Some(128_000),
+                cost_per_1m_input_usd: Some(0.05),
+                cost_per_1m_output_usd: None,
+                live: true,
+            },
+            // Catalog-only rows are not cached: the cache records what the
+            // provider actually served.
+            AddModelRow {
+                id: "catalog-only".to_owned(),
+                name: None,
+                context_tokens: None,
+                cost_per_1m_input_usd: None,
+                cost_per_1m_output_usd: None,
+                live: false,
+            },
+        ];
+        write_model_list_cache(&data_dir, "groq", &rows);
+        assert!(model_list_cache_path(&data_dir, "groq").exists());
+
+        let (cached, age) = read_model_list_cache(&data_dir, "groq").expect("a cache was written");
+        assert_eq!(cached.len(), 1, "only the live rows are cached");
+        assert_eq!(cached[0].id, "llama-3.1-8b");
+        assert_eq!(cached[0].context_tokens, Some(128_000));
+        assert!(cached[0].live, "cached rows were live when written");
+        assert_eq!(age, "just now");
+
+        // A provider with no cache is simply `None` — never an error.
+        assert!(read_model_list_cache(&data_dir, "nebius").is_none());
+    }
+
+    /// A provider id from a user-editable `providers.toml` must never escape
+    /// the cache directory.
+    #[test]
+    fn model_list_cache_path_neutralizes_path_separators() {
+        let path = model_list_cache_path(Path::new("/data"), "../../etc/passwd");
+        assert_eq!(
+            path,
+            Path::new("/data/model_lists/______etc_passwd.json"),
+            "no path traversal survives into the cache file name"
+        );
+    }
+
+    #[test]
+    fn cache_age_label_reads_in_human_units() {
+        let now = 10_000_000;
+        assert_eq!(cache_age_label(now, now), "just now");
+        assert_eq!(cache_age_label(now - 240, now), "4m ago");
+        assert_eq!(cache_age_label(now - 7_200, now), "2h ago");
+        assert_eq!(cache_age_label(now - 172_800, now), "2d ago");
+        assert_eq!(
+            cache_age_label(now + 600, now),
+            "just now",
+            "a clock that moved backwards never reads as a negative age"
+        );
     }
 
     #[cfg(unix)]
@@ -5782,6 +7346,7 @@ steps:
             "groq",
             "llama-3.1-8b",
             Some("sk-secret"),
+            None,
         )
         .expect("write");
         let meta = std::fs::metadata(paths.data_dir.join("auth.json")).expect("metadata");
@@ -5795,7 +7360,15 @@ steps:
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
 
         // "ollama" is a built-in LOCAL provider (auth none) — no key entered.
-        write_add_model(&paths, "ollama/qwen", "ollama", "qwen2.5-coder:14b", None).expect("write");
+        write_add_model(
+            &paths,
+            "ollama/qwen",
+            "ollama",
+            "qwen2.5-coder:14b",
+            None,
+            None,
+        )
+        .expect("write");
 
         let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
         assert!(configs.iter().any(|c| c.id.0 == "ollama/qwen"));
@@ -5814,7 +7387,15 @@ steps:
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
 
-        write_add_model(&paths, "groq/llama", "groq", "llama-3.1-8b", Some("   ")).expect("write");
+        write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            Some("   "),
+            None,
+        )
+        .expect("write");
 
         assert!(
             !paths.data_dir.join("auth.json").exists(),
@@ -5828,9 +7409,24 @@ steps:
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
 
-        write_add_model(&paths, "groq/llama", "groq", "llama-3.1-8b", Some("k1")).expect("write 1");
-        write_add_model(&paths, "groq/llama", "groq", "llama-3.3-70b", Some("k2"))
-            .expect("write 2");
+        write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            Some("k1"),
+            None,
+        )
+        .expect("write 1");
+        write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.3-70b",
+            Some("k2"),
+            None,
+        )
+        .expect("write 2");
 
         let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
         let matching: Vec<_> = configs.iter().filter(|c| c.id.0 == "groq/llama").collect();
@@ -5861,10 +7457,24 @@ steps:
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
 
-        write_add_model(&paths, "groq/llama", "groq", "llama-3.1-8b", Some("k1"))
-            .expect("write first model");
-        write_add_model(&paths, "ollama/qwen", "ollama", "qwen2.5-coder:14b", None)
-            .expect("write second model");
+        write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            Some("k1"),
+            None,
+        )
+        .expect("write first model");
+        write_add_model(
+            &paths,
+            "ollama/qwen",
+            "ollama",
+            "qwen2.5-coder:14b",
+            None,
+            None,
+        )
+        .expect("write second model");
 
         let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
         assert_eq!(configs.len(), 2, "both entries survive: {configs:?}");
@@ -5887,8 +7497,15 @@ steps:
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
 
-        let error = write_add_model(&paths, "   ", "groq", "llama-3.1-8b", Some("sk-secret"))
-            .expect_err("a blank display id must be rejected");
+        let error = write_add_model(
+            &paths,
+            "   ",
+            "groq",
+            "llama-3.1-8b",
+            Some("sk-secret"),
+            None,
+        )
+        .expect_err("a blank display id must be rejected");
         assert!(
             !error.to_string().is_empty(),
             "the error must carry a user-visible message"
@@ -5923,6 +7540,7 @@ steps:
             "groq",
             "llama-3.1-8b",
             Some("sk-secret"),
+            None,
         )
         .expect_err("a corrupt pre-existing auth.json must abort the whole add");
         assert!(
@@ -6219,6 +7837,7 @@ model = "qwen2.5-coder:14b"
             "groq",
             "llama-3.1-8b",
             Some("sk-secret"),
+            None,
         )
         .await;
 
@@ -6475,6 +8094,43 @@ model = "qwen2.5-coder:14b"
         assert!(!provider_can_list_models(&oauth));
     }
 
+    // -- ACP model discovery (the picker's agent-model plumbing) --------------
+
+    #[test]
+    fn acp_profile_ids_mirror_the_coordinate_they_store() {
+        assert_eq!(acp_profile_id("demo-acp", None), "acp/demo-acp");
+        assert_eq!(
+            acp_profile_id("demo-acp", Some("agent-model-1")),
+            "acp/demo-acp#agent-model-1"
+        );
+    }
+
+    #[test]
+    fn an_acp_probe_pins_only_a_model_that_was_asked_for() {
+        let probe = AcpProbe {
+            registry_id: "demo-acp".to_string(),
+            version: "1.2.3".to_string(),
+            models: vec!["agent-model-1".to_string()],
+        };
+        assert_eq!(probe.coordinate(None), "demo-acp@1.2.3");
+        assert_eq!(
+            probe.coordinate(Some("agent-model-1")),
+            "demo-acp@1.2.3#agent-model-1"
+        );
+        // A profile id and its coordinate must agree on the pin, so the
+        // executor asks the agent for the model the picker showed.
+        let coordinate = probe.coordinate(Some("agent-model-1"));
+        assert_eq!(
+            codypendent_integrations::acp_registry::agent_model_from_coordinate(&coordinate),
+            Some("agent-model-1")
+        );
+        assert_eq!(
+            codypendent_integrations::acp_registry::agent_id_from_coordinate(&coordinate),
+            "demo-acp",
+            "a pinned coordinate must still resolve to the same launchable agent"
+        );
+    }
+
     // -- models_url + parse_models_response (model-discovery, pure) -----------
 
     #[test]
@@ -6501,22 +8157,72 @@ model = "qwen2.5-coder:14b"
         );
     }
 
+    /// Ids of the parsed rows, in order — most parse tests only care about
+    /// which models came back, not the optional metadata.
+    fn parsed_ids(body: &str) -> Vec<String> {
+        parse_models_response(body)
+            .expect("parse")
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    }
+
     #[test]
     fn parse_models_response_extracts_ids_from_the_openai_shape() {
         let body = r#"{"object":"list","data":[{"id":"llama-3.1-8b"},{"id":"llama-3.3-70b"}]}"#;
-        assert_eq!(
-            parse_models_response(body).expect("parse"),
-            vec!["llama-3.1-8b".to_string(), "llama-3.3-70b".to_string()]
-        );
+        assert_eq!(parsed_ids(body), vec!["llama-3.1-8b", "llama-3.3-70b"]);
     }
 
     #[test]
     fn parse_models_response_skips_blank_and_dedups_preserving_order() {
         let body = r#"{"data":[{"id":"a"},{"id":"  "},{"id":""},{"id":"a"},{"id":"b"}]}"#;
-        assert_eq!(
-            parse_models_response(body).expect("parse"),
-            vec!["a".to_string(), "b".to_string()]
-        );
+        assert_eq!(parsed_ids(body), vec!["a", "b"]);
+    }
+
+    /// A bare-id response (Ollama, Groq, most providers) parses to rows with
+    /// every optional column empty — the metadata is never required.
+    #[test]
+    fn parse_models_response_leaves_metadata_empty_when_the_provider_sends_none() {
+        let body = r#"{"data":[{"id":"qwen2.5-coder:14b"}]}"#;
+        let rows = parse_models_response(body).expect("parse");
+        assert_eq!(rows[0].id, "qwen2.5-coder:14b");
+        assert!(rows[0].name.is_none());
+        assert!(rows[0].context_tokens.is_none());
+        assert!(rows[0].cost_per_1m_input_usd.is_none());
+        assert!(rows[0].live, "a listed model is a live row");
+    }
+
+    /// The richer shapes several OpenAI-compatible providers already return on
+    /// the same endpoint: OpenRouter's `context_length` + per-TOKEN string
+    /// prices (scaled to per-1M here), and the vLLM-derived `max_model_len`
+    /// numeric spelling.
+    #[test]
+    fn parse_models_response_keeps_context_and_pricing_when_present() {
+        let body = r#"{"data":[
+            {"id":"meta-llama/llama-3.3-70b","name":"Llama 3.3 70B",
+             "context_length":131072,
+             "pricing":{"prompt":"0.00000013","completion":"0.0000004"}},
+            {"id":"deepseek-v3","max_model_len":163840,
+             "pricing":{"input":0.0000005,"output":0.0000015}}
+        ]}"#;
+        let rows = parse_models_response(body).expect("parse");
+        assert_eq!(rows[0].name.as_deref(), Some("Llama 3.3 70B"));
+        assert_eq!(rows[0].context_tokens, Some(131_072));
+        // Per-token prices are scaled to the per-1M column the picker shows.
+        assert!((rows[0].cost_per_1m_input_usd.expect("input price") - 0.13).abs() < 1e-9);
+        assert!((rows[0].cost_per_1m_output_usd.expect("output price") - 0.4).abs() < 1e-9);
+        assert_eq!(rows[1].context_tokens, Some(163_840));
+        assert!((rows[1].cost_per_1m_input_usd.expect("input price") - 0.5).abs() < 1e-9);
+    }
+
+    /// A price this build cannot make sense of is dropped, not guessed: a
+    /// fabricated number in a cost column is worse than a blank one.
+    #[test]
+    fn parse_models_response_drops_unparseable_prices() {
+        let body = r#"{"data":[{"id":"m","pricing":{"prompt":"free","completion":null}}]}"#;
+        let rows = parse_models_response(body).expect("parse");
+        assert!(rows[0].cost_per_1m_input_usd.is_none());
+        assert!(rows[0].cost_per_1m_output_usd.is_none());
     }
 
     #[test]

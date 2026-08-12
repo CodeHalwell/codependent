@@ -10,19 +10,18 @@
 
 use std::path::PathBuf;
 
+use crate::connection::Connection;
 use async_trait::async_trait;
 use codypendent_integrations::acp::{
-    serve as acp_serve, AcpBackend, AcpError, PermissionOption, PermissionOutcome, PromptSink,
-    StopReason,
+    agent_message_chunk, agent_thought_chunk, permission_tool_call, serve as acp_serve,
+    tool_call_pending, tool_call_started, AcpBackend, AcpError, PermissionOption,
+    PermissionOutcome, PromptSink, StopReason,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     AgentMode, ApprovalDecision, ApprovalScope, ClientRole, CommandBody, EventBody, Payload,
     ProposedAction, RunDisposition, RunId, SessionId, Subscription, WorkspaceId,
 };
-use serde_json::json;
-
-use crate::connection::Connection;
 
 /// Run the ACP server on this process's stdio until the client disconnects.
 pub async fn serve(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
@@ -157,6 +156,9 @@ impl AcpBackend for DaemonAcpBackend {
             Payload::CommandAccepted { created_run, .. } => created_run,
             _ => unreachable!("require_accepted checked payload"),
         };
+        // Mints the `toolCallId`s this turn's ACP tool calls are referred to by
+        // (see the `ToolStarted` arm).
+        let mut tool_calls = 0_u64;
         loop {
             tokio::select! {
                 // The client cancelled this turn: stop the run and report it.
@@ -196,13 +198,20 @@ impl AcpBackend for DaemonAcpBackend {
                     match event.body {
                         EventBody::RunStarted { run_id: run, .. } => run_id = Some(run),
                         EventBody::ModelStreamDelta { text, .. } => {
-                            ctx.update(json!({ "type": "agent_text", "text": text })).await;
+                            ctx.update(agent_message_chunk(text)).await;
                         }
                         EventBody::ToolStarted { tool, .. } => {
-                            ctx.update(json!({ "type": "tool", "tool": tool })).await;
+                            // ACP requires a `toolCallId` on every tool call.
+                            // The daemon event carries none (its tools are
+                            // named, not id'd), so the bridge mints the id this
+                            // ACP session uses to refer to the call.
+                            tool_calls += 1;
+                            ctx.update(tool_call_started(format!("tool-{tool_calls}"), tool)).await;
                         }
+                        // A run note is host commentary, not model output, so it
+                        // must not arrive as an agent message chunk.
                         EventBody::NoteAppended { text, .. } => {
-                            ctx.update(json!({ "type": "note", "text": text })).await;
+                            ctx.update(agent_thought_chunk(text)).await;
                         }
                         // A single approval surfaces as BOTH `ApprovalRequested`
                         // (from the broker) and `ToolProposed` (from the runtime).
@@ -210,7 +219,12 @@ impl AcpBackend for DaemonAcpBackend {
                         // client sees one permission request and we send one
                         // `ResolveApproval`; `ToolProposed` is display-only.
                         EventBody::ToolProposed { run_id: _, action, .. } => {
-                            ctx.update(json!({ "type": "tool_proposed", "action": action })).await;
+                            tool_calls += 1;
+                            ctx.update(tool_call_pending(
+                                format!("tool-{tool_calls}"),
+                                action_title(&action),
+                            ))
+                            .await;
                         }
                         EventBody::ApprovalRequested { approval_id, action, .. } => {
                             resolve(&mut conn, ctx, approval_id, &action).await?;
@@ -229,6 +243,30 @@ impl AcpBackend for DaemonAcpBackend {
     }
 }
 
+/// A short, human-readable title for the action a permission request covers.
+/// Derived from the action's own typed fields — never invented, and never the
+/// raw serialized action, which a client renders as opaque JSON. A variant this
+/// build does not know (`ProposedAction` is `#[non_exhaustive]`) still gets an
+/// honest generic title rather than failing to compile or panicking.
+fn action_title(action: &ProposedAction) -> String {
+    match action {
+        ProposedAction::ReadFiles { paths } => format!("read {} file(s)", paths.len()),
+        ProposedAction::WritePatch { .. } => "apply a patch".to_string(),
+        ProposedAction::ExecuteCommand { program, .. } => format!("run {program}"),
+        ProposedAction::NetworkRequest { destination } => {
+            format!("network request to {destination}")
+        }
+        ProposedAction::GitCommit { repository } => format!("git commit in {repository}"),
+        ProposedAction::GitPush { remote, branch } => format!("git push {branch} to {remote}"),
+        ProposedAction::GitHubMutation { summary, .. } => summary.clone(),
+        ProposedAction::PublishDocument { target, .. } => format!("publish to {target}"),
+        ProposedAction::BlackboardPost { kind, .. } => format!("post {kind} to the blackboard"),
+        ProposedAction::BlackboardQuery { .. } => "query the blackboard".to_string(),
+        ProposedAction::McpToolCall { summary, .. } => summary.clone(),
+        _ => "tool call".to_string(),
+    }
+}
+
 /// Surface a pending approval as an ACP permission request and resolve it with
 /// the client's answer.
 async fn resolve(
@@ -237,8 +275,14 @@ async fn resolve(
     approval_id: codypendent_protocol::ApprovalId,
     action: &ProposedAction,
 ) -> Result<(), AcpError> {
+    // The approval id makes a stable, real `toolCallId` for the call this
+    // request authorizes — the field a spec-strict client needs to correlate
+    // the two, and which the previous `{"action": …}` payload lacked entirely.
     let outcome = ctx
-        .request_permission(json!({ "action": action }), permission_options())
+        .request_permission(
+            permission_tool_call(format!("approval-{approval_id}"), action_title(action)),
+            permission_options(),
+        )
         .await;
     let decision = match outcome {
         PermissionOutcome::Selected(id) if id == "allow" => ApprovalDecision::Approve,

@@ -7,10 +7,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::artifact::DataClassification;
+use crate::blackboard::{BlackboardItemDraft, BlackboardScope};
 use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
 use crate::ids::{ApprovalId, CommandId, DocumentId, ModelId, RunId, SessionId, WorkspaceId};
+use crate::input::InputEnvelope;
 use crate::run::{AgentMode, ApprovalDecision, ApprovalScope};
 
 /// An idempotent, optionally revision-guarded request.
@@ -133,6 +136,21 @@ pub enum CommandBody {
         /// resolves the model exactly as before this field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<ModelId>,
+        /// The full multimodal input this submission normalizes (voice v1,
+        /// rubric 8): a typed [`InputEnvelope`] whose blocks may reference
+        /// artifacts previously stored via
+        /// [`PutArtifact`](CommandBody::PutArtifact) — e.g. an
+        /// [`InputBlock::Audio`](crate::input::InputBlock::Audio) carrying a
+        /// recorded voice note. When the envelope carries audio without a
+        /// transcript, the daemon transcribes it (through its transcription
+        /// seam, gated by the [`transcription_allowed`](crate::input::transcription_allowed)
+        /// classification math) and the transcript text becomes the run input;
+        /// the original audio stays linked to its transcript (the
+        /// original-is-never-replaced invariant). Additive
+        /// (`#[serde(default)]`): an older client omits it and `text` alone
+        /// drives the run, exactly as before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        envelope: Option<InputEnvelope>,
     },
     StartRun {
         session_id: SessionId,
@@ -184,6 +202,63 @@ pub enum CommandBody {
     UpdateIdeContext {
         session_id: SessionId,
         update: IdeContextUpdate,
+    },
+    /// Create a new collaborative document (Docs Studio, rubric #4 — before
+    /// this command existed the Docs Studio browsed a set nothing could ever
+    /// populate). Handled at the connection level like `MutateDocument`
+    /// (documents live outside the session ledger): the daemon creates the
+    /// document at revision 1 through its `DocumentCreator` seam — importing
+    /// `initial_markdown` into typed blocks when present, else an empty block
+    /// list — and replies
+    /// [`DocumentCreated`](crate::envelope::Payload::DocumentCreated) carrying
+    /// the new document id. An Observer is role-denied; a daemon assembled
+    /// without a creator rejects it `document.transport-unavailable`.
+    CreateDocument {
+        /// The document title (non-empty; the daemon rejects a blank one).
+        title: String,
+        /// The scope to create the document in: `"repository"` (the default
+        /// when absent — the document lives with the checkout),
+        /// `"system"`, or `"organization:<id>"` (organization docs default to
+        /// suggest-only agent collaboration). An unrecognized value is
+        /// rejected `document.invalid-scope`, never guessed at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        /// The canonical filesystem root of the repository a
+        /// repository-scoped document belongs to. Mirrors
+        /// [`StartRun.repository`](CommandBody::StartRun::repository):
+        /// `#[serde(default)]` keeps an older client working — the daemon then
+        /// falls back to its own startup root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository: Option<String>,
+        /// Markdown to seed the document's blocks from (`docs new --from
+        /// file.md`, the agent's `docs.create`). Imported lossily-but-
+        /// reasonably at block granularity; absent creates an empty document.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_markdown: Option<String>,
+    },
+    /// Run the documentation staleness check (`/update-docs` glue, Phase 4
+    /// STEP 4.6 finally wired): resolve every document's `{{ symbol:… }}`
+    /// links against the code graph, persist them, diff for signature
+    /// changes/disappearances, and file each finding as a Maintain-mode
+    /// suggestion (never a direct edit). Handled at the connection level like
+    /// `MutateDocument`; the daemon replies
+    /// [`DocsCheckCompleted`](crate::envelope::Payload::DocsCheckCompleted)
+    /// with the sweep's counts. An Observer is role-denied (the sweep files
+    /// suggestions); a daemon assembled without a checker rejects it
+    /// `document.transport-unavailable`.
+    CheckDocuments {
+        /// The canonical filesystem root of the repository whose code graph
+        /// the links resolve against. Mirrors
+        /// [`StartRun.repository`](CommandBody::StartRun::repository); absent
+        /// falls back to the daemon's startup root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository: Option<String>,
+        /// A session to surface the result into: when set and the sweep found
+        /// anything stale, the daemon appends a `NoteAppended` to this
+        /// session's ledger so the finding count reaches the active
+        /// conversation. Absent, the counts ride only on the reply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
     },
     /// Apply a semantic mutation to a collaborative document (Phase 4 STEP 4.3).
     ///
@@ -416,9 +491,117 @@ pub enum CommandBody {
         /// live board (the "live-only" view the TUI shows).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         include_superseded: bool,
+        /// Read a **repository task board** instead of a workflow run's board
+        /// (Phase B kanban). When set, `workflow_run_id` is ignored: the daemon
+        /// resolves the board to the synthetic run
+        /// [`board_scope_id`](crate::blackboard::board_scope_id) names (an empty
+        /// board for a repository never written to — a read creates nothing).
+        /// Additive (`#[serde(default)]`): an older client omits it and reads a
+        /// run board exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        board_repository: Option<String>,
+    },
+    /// Post a blackboard artifact from a **client** (Phase B kanban — the write
+    /// path the board and NL backlog need; the review's "deliberately no client
+    /// post command" stance is revised here for board use). Handled at the
+    /// connection level like `ReadBlackboard` (the board lives outside the
+    /// session ledger) through the assembly's `BlackboardWriter` seam, and gated
+    /// to the [`Controller`](crate::handshake::ClientRole::Controller) role — the
+    /// local human operator; an agent still writes only through its
+    /// `blackboard.*`/`task.*` tools, and an Observer stays read-only. The
+    /// daemon builds the item's author from the issuing connection (never from a
+    /// client-supplied identity) and replies
+    /// [`BlackboardItemApplied`](crate::envelope::Payload::BlackboardItemApplied)
+    /// with the stored item. A daemon without workflow transport rejects it
+    /// `workflow.transport-unavailable`.
+    PostBlackboardItem {
+        /// The board to post onto: a workflow run's, or a repository's task
+        /// board (created on first write).
+        scope: BlackboardScope,
+        /// The artifact to store (kind, payload, evidence, board fields).
+        item: BlackboardItemDraft,
+    },
+    /// Update (supersede) a blackboard item from a client (Phase B kanban): a
+    /// status/column move, a re-assignment, a re-order, or a payload edit. The
+    /// same supersession discipline as an agent's correction — the store posts
+    /// the replacement at the next revision and stamps the old row, never
+    /// editing in place — so board history is preserved. Fields left `None`
+    /// carry the old item's values forward. Role-gated and routed exactly like
+    /// [`PostBlackboardItem`](CommandBody::PostBlackboardItem); replies
+    /// [`BlackboardItemApplied`](crate::envelope::Payload::BlackboardItemApplied)
+    /// with the replacement item.
+    UpdateBlackboardItem {
+        /// The board holding the item.
+        scope: BlackboardScope,
+        /// The live item to supersede. An already-superseded item is refused
+        /// (`blackboard.already-superseded`), so concurrent moves never fork.
+        item_id: String,
+        /// The new column, when moving.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        /// The new assignee, when re-assigning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assignee: Option<String>,
+        /// The new within-column position, when re-ordering. When only `status`
+        /// changes, the daemon appends to the end of the target column.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ordinal: Option<i64>,
+        /// A replacement payload, when editing the card body.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+    },
+    /// Read one page of a session's durable event history (fixing the >500-event
+    /// catch-up gap: a `Catchup::Snapshot` carries no transcript, and no paged
+    /// read existed). A **read** — any attached client, an Observer included,
+    /// may issue it. The daemon replies
+    /// [`SessionEventsPage`](crate::envelope::Payload::SessionEventsPage) with
+    /// events `after_sequence < sequence <= after_sequence + limit` in ascending
+    /// order; the client pages forward by passing the reply's `through` back as
+    /// the next `after_sequence`. An unknown session is rejected
+    /// `protocol.session-not-found`.
+    ReadSessionEvents {
+        session_id: SessionId,
+        /// Return events strictly **after** this sequence (0 = from the start).
+        #[serde(default, skip_serializing_if = "u64_is_zero")]
+        after_sequence: u64,
+        /// Maximum events in the page. 0 (or absent) asks for the server
+        /// default; the server clamps any request to its own page ceiling.
+        #[serde(default, skip_serializing_if = "u32_is_zero")]
+        limit: u32,
+    },
+    /// Upload client-captured bytes into the daemon's content-addressed
+    /// artifact store (voice v1, rubric 8): the client→daemon half of the
+    /// multimodal input path. `bytes_base64` is base64 because JSON framing
+    /// has no byte-string scalar (the `InstallUiPlugin` precedent) and is
+    /// bounded by the ordinary 16 MiB daemon frame limit — comfortably enough
+    /// for ~1 minute of 16 kHz mono WAV (~2 MB). `sensitivity` classifies the
+    /// stored bytes (captured media should default to
+    /// [`DEFAULT_MEDIA_CLASSIFICATION`](crate::input::DEFAULT_MEDIA_CLASSIFICATION),
+    /// i.e. `Confidential`, so audio never leaves the device by accident);
+    /// classification checks downstream always read the ref returned in
+    /// [`ArtifactStored`](crate::envelope::Payload::ArtifactStored). Handled
+    /// at the connection level (artifacts live outside the session ledger) and
+    /// gated to the [`Controller`](crate::handshake::ClientRole::Controller)
+    /// role — an upload is operator-supplied input, not an observer surface.
+    PutArtifact {
+        /// IANA media type of the bytes, e.g. `audio/wav`.
+        media_type: String,
+        /// The raw bytes, base64-encoded (standard alphabet, with padding).
+        bytes_base64: String,
+        /// The stored occurrence's data classification.
+        sensitivity: DataClassification,
     },
     #[serde(other)]
     Unknown,
+}
+
+/// `skip_serializing_if` helpers for the paged-history defaults: a zero is the
+/// field's default, so it is omitted on the wire (an older peer's exact shape).
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
+}
+fn u32_is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// One legal state-machine transition to attempt via `AdvancePromotion`
@@ -549,6 +732,7 @@ mod tests {
             text: "switch to the big model".to_string(),
             mode: AgentMode::Build,
             model: Some(ModelId("claude-sonnet-5".to_string())),
+            envelope: None,
         };
         let json = serde_json::to_string(&pinned).expect("serialize");
         assert!(
@@ -565,16 +749,90 @@ mod tests {
             text: "keep going".to_string(),
             mode: AgentMode::Build,
             model: None,
+            envelope: None,
         };
         let json = serde_json::to_string(&unpinned).expect("serialize");
         assert!(
             !json.contains("model"),
             "an absent pinned model is skipped on the wire: {json}"
         );
+        assert!(
+            !json.contains("envelope"),
+            "an absent envelope is skipped on the wire (an older client's exact bytes): {json}"
+        );
         assert_eq!(
             serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
             unpinned,
             "a payload without the key defaults to None (an older client's shape)"
+        );
+    }
+
+    #[test]
+    fn submit_user_input_carries_an_audio_envelope_when_present() {
+        // Voice v1 (rubric 8): a follow-up may normalize its input as a full
+        // InputEnvelope. Here the common voice shape — one Audio block
+        // referencing a stored artifact, no transcript yet (the daemon
+        // produces it) — round-trips exactly, and an older payload without
+        // the key still parses to None (covered by the test above).
+        use crate::artifact::{ArtifactRef, DataClassification};
+        use crate::input::{AudioArtifact, InputBlock, InputSource, ScopeLevel};
+
+        let audio = AudioArtifact {
+            original: ArtifactRef {
+                id: crate::ids::ArtifactId::new(),
+                media_type: "audio/wav".to_string(),
+                byte_length: 64_000,
+                sha256: "b".repeat(64),
+                sensitivity: DataClassification::Confidential,
+            },
+            transcript: None,
+            duration_ms: Some(2_000),
+            sample_rate_hz: Some(16_000),
+        };
+        let body = CommandBody::SubmitUserInput {
+            session_id: SessionId::new(),
+            text: String::new(),
+            mode: AgentMode::Build,
+            model: None,
+            envelope: Some(InputEnvelope {
+                source: crate::input::InputSource::Voice,
+                blocks: vec![InputBlock::Audio(audio)],
+                scope: ScopeLevel::Session,
+                attachments: vec![],
+            }),
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(json.contains("envelope"), "envelope on the wire: {json}");
+        assert_eq!(
+            serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
+            body
+        );
+        // The source survives verbatim (voice capture is attributed as such).
+        let CommandBody::SubmitUserInput {
+            envelope: Some(envelope),
+            ..
+        } = serde_json::from_str::<CommandBody>(&json).expect("deserialize")
+        else {
+            panic!("expected SubmitUserInput with an envelope");
+        };
+        assert_eq!(envelope.source, InputSource::Voice);
+    }
+
+    #[test]
+    fn put_artifact_round_trips_and_classification_is_explicit() {
+        // Voice v1 (rubric 8): the upload command carries its classification
+        // explicitly — nothing downstream may guess it from the bytes.
+        let body = CommandBody::PutArtifact {
+            media_type: "audio/wav".to_string(),
+            bytes_base64: "UklGRg==".to_string(),
+            sensitivity: DataClassification::Confidential,
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(json.contains("audio/wav"));
+        assert!(json.contains("Confidential"));
+        assert_eq!(
+            serde_json::from_str::<CommandBody>(&json).expect("deserialize"),
+            body
         );
     }
 
@@ -597,6 +855,7 @@ mod tests {
             text: "try again".to_string(),
             mode: AgentMode::Build,
             model: Some(ModelId("claude-sonnet-5".to_string())),
+            envelope: None,
         });
         // Also round-trip the unpinned continuation (no mid-conversation switch):
         // the field is absent on the wire and reparses to None.
@@ -605,6 +864,13 @@ mod tests {
             text: "try again".to_string(),
             mode: AgentMode::Build,
             model: None,
+            envelope: None,
+        });
+        // Voice v1 (rubric 8): the upload half of the multimodal input path.
+        round_trip(CommandBody::PutArtifact {
+            media_type: "audio/wav".to_string(),
+            bytes_base64: "UklGRg==".to_string(),
+            sensitivity: DataClassification::Confidential,
         });
         round_trip(CommandBody::StartRun {
             session_id: SessionId::new(),
@@ -642,6 +908,27 @@ mod tests {
                 }],
                 ..Default::default()
             },
+        });
+        round_trip(CommandBody::CreateDocument {
+            title: "Payments Runbook".to_string(),
+            scope: Some("repository".to_string()),
+            repository: Some("/home/user/project".to_string()),
+            initial_markdown: Some("# Payments Runbook\n\nBody.\n".to_string()),
+        });
+        // The minimal create (an older client's shape): only the title.
+        round_trip(CommandBody::CreateDocument {
+            title: "Notes".to_string(),
+            scope: None,
+            repository: None,
+            initial_markdown: None,
+        });
+        round_trip(CommandBody::CheckDocuments {
+            repository: Some("/home/user/project".to_string()),
+            session_id: Some(SessionId::new()),
+        });
+        round_trip(CommandBody::CheckDocuments {
+            repository: None,
+            session_id: None,
         });
         round_trip(CommandBody::MutateDocument {
             document_id: DocumentId::new(),
@@ -746,7 +1033,65 @@ mod tests {
             workflow_run_id: "wfrun-abc123".to_string(),
             kind: Some("finding".to_string()),
             include_superseded: true,
+            board_repository: None,
         });
+        // The repository-board read (Phase B kanban): board_repository set, the
+        // run id left empty for the daemon to resolve.
+        round_trip(CommandBody::ReadBlackboard {
+            workflow_run_id: String::new(),
+            kind: Some("task".to_string()),
+            include_superseded: false,
+            board_repository: Some("/home/user/project".to_string()),
+        });
+        round_trip(CommandBody::PostBlackboardItem {
+            scope: crate::blackboard::BlackboardScope::RepositoryBoard {
+                repository: "/home/user/project".to_string(),
+            },
+            item: crate::blackboard::BlackboardItemDraft {
+                kind: "task".to_string(),
+                payload: serde_json::json!({ "title": "wire the DAG viewer" }),
+                confidence: None,
+                evidence: Vec::new(),
+                status: Some("todo".to_string()),
+                assignee: Some("dana".to_string()),
+                ordinal: Some(1),
+            },
+        });
+        round_trip(CommandBody::UpdateBlackboardItem {
+            scope: crate::blackboard::BlackboardScope::RepositoryBoard {
+                repository: "/home/user/project".to_string(),
+            },
+            item_id: "0192-item".to_string(),
+            status: Some("doing".to_string()),
+            assignee: None,
+            ordinal: Some(2),
+            payload: None,
+        });
+        round_trip(CommandBody::ReadSessionEvents {
+            session_id: SessionId::new(),
+            after_sequence: 500,
+            limit: 200,
+        });
+    }
+
+    #[test]
+    fn read_session_events_omits_zero_defaults_and_reparses() {
+        // The from-the-start read sends neither optional key, and such a payload
+        // (also what a minimal encoder emits) reparses with both zeroed — the
+        // server then applies its own default page size.
+        let body = CommandBody::ReadSessionEvents {
+            session_id: SessionId::new(),
+            after_sequence: 0,
+            limit: 0,
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(
+            !json.contains("after_sequence"),
+            "zero after_sequence skipped: {json}"
+        );
+        assert!(!json.contains("limit"), "zero limit skipped: {json}");
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body);
     }
 
     #[test]
@@ -791,12 +1136,17 @@ mod tests {
             workflow_run_id: "wfrun-abc123".to_string(),
             kind: None,
             include_superseded: false,
+            board_repository: None,
         };
         let json = serde_json::to_string(&body).expect("serialize");
         assert!(!json.contains("kind"), "absent kind is skipped: {json}");
         assert!(
             !json.contains("include_superseded"),
             "default (false) include_superseded is skipped: {json}"
+        );
+        assert!(
+            !json.contains("board_repository"),
+            "absent board_repository is skipped (an older client's shape): {json}"
         );
         let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, body);
@@ -842,6 +1192,31 @@ mod tests {
         assert!(
             json.contains("/home/user/project"),
             "repository on the wire: {json}"
+        );
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body);
+    }
+
+    #[test]
+    fn create_document_omits_absent_optionals() {
+        // A title-only create sends none of the optional keys, and such a
+        // payload (also what an older client emits) reparses with all three
+        // defaulted to None.
+        let body = CommandBody::CreateDocument {
+            title: "Notes".to_string(),
+            scope: None,
+            repository: None,
+            initial_markdown: None,
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(!json.contains("scope"), "absent scope is skipped: {json}");
+        assert!(
+            !json.contains("repository"),
+            "absent repository is skipped: {json}"
+        );
+        assert!(
+            !json.contains("initial_markdown"),
+            "absent markdown is skipped: {json}"
         );
         let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, body);

@@ -294,4 +294,96 @@ describe("RemoteUiRenderer DOM", () => {
     expect(visible.length).toBeLessThan(50);
     expect(visible[0]?.getAttribute("aria-setsize")).toBe("1000");
   });
+  it("draws a layered SVG DAG with per-node selection and a list fallback", () => {
+    store.apply({ type: "snapshot", document: documentWith({
+      kind: "element",
+      id: "graph",
+      type: "Graph",
+      props: {
+        accessibleLabel: "Workflow graph",
+        selectedKey: "test",
+        nodes: [
+          { id: "build", label: "build", status: "completed" },
+          { id: "test", label: "test", status: "running" },
+          { id: "deploy", label: "deploy", status: "failed" },
+        ],
+        edges: [
+          { id: "e1", from: "build", to: "test" },
+          { id: "e2", from: "test", to: "deploy" },
+          { id: "e3", from: "build", to: "deploy", label: "on failure" },
+        ],
+      },
+      children: [],
+    }) }, ATTESTED_PLACEMENT);
+    render();
+
+    const svg = container.querySelector("svg.ui-graph-canvas");
+    expect(svg).not.toBeNull();
+    expect(svg?.getAttribute("aria-label")).toBe("Workflow graph: 3 nodes, 3 connections");
+    expect(container.querySelectorAll("path.ui-graph-edge")).toHaveLength(3);
+
+    const nodes = [...container.querySelectorAll<SVGGElement>("g.ui-graph-node")];
+    expect(nodes.map((entry) => entry.dataset.uiGraphNode)).toEqual(["build", "test", "deploy"]);
+    expect(nodes[1]?.getAttribute("aria-pressed")).toBe("true");
+    expect(nodes[0]?.getAttribute("aria-label")).toBe("build, completed");
+
+    // Longest-path layering: build ranks above test, which ranks above deploy,
+    // even though build also reaches deploy directly.
+    const y = (entry: SVGGElement): number => Number(entry.querySelector("rect")?.getAttribute("y"));
+    expect(y(nodes[0])).toBeLessThan(y(nodes[1]));
+    expect(y(nodes[1])).toBeLessThan(y(nodes[2]));
+
+    act(() => nodes[2]?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ targetId: "graph", type: "select", payload: { nodeId: "deploy", index: 2 } });
+
+    // The textual node/edge lists survive as the accessible fallback rung.
+    expect(container.querySelector(".ui-graph-detail .ui-graph-nodes")).not.toBeNull();
+    expect(container.querySelector(".ui-graph-detail .ui-graph-edges")).not.toBeNull();
+  });
+
+  it("lays a horizontal graph out in columns and lists an unrankable one", () => {
+    store.apply({ type: "snapshot", document: documentWith({
+      kind: "element", id: "graph", type: "Graph",
+      props: {
+        accessibleLabel: "Pipeline", direction: "horizontal",
+        nodes: [{ id: "a", label: "a" }, { id: "b", label: "b" }],
+        edges: [{ from: "a", to: "b" }],
+      },
+      children: [],
+    }) }, ATTESTED_PLACEMENT);
+    render();
+    const columns = [...container.querySelectorAll<SVGGElement>("g.ui-graph-node")]
+      .map((entry) => Number(entry.querySelector("rect")?.getAttribute("x")));
+    expect(columns[0]).toBeLessThan(columns[1]);
+
+    store.apply({ type: "snapshot", document: documentWith({
+      kind: "element", id: "graph", type: "Graph",
+      props: { accessibleLabel: "Unlinked", nodes: [{ id: "a", label: "a" }], edges: [] },
+      children: [],
+    }, 2) }, ATTESTED_PLACEMENT);
+    render();
+    expect(container.querySelector("svg.ui-graph-canvas")).toBeNull();
+    expect(container.querySelector(".ui-graph .ui-graph-nodes")?.textContent).toContain("a");
+  });
+
+  it("accepts a Grid track count or an explicit track list", () => {
+    const grid = (columns: unknown, revision: number): UiDocument => documentWith({
+      kind: "element", id: "grid", type: "Grid",
+      props: { columns } as UiElementNode["props"],
+      children: [{ kind: "element", id: "cell", type: "Text", props: { value: "A" }, children: [] }],
+    }, revision);
+    store.apply({ type: "snapshot", document: grid(3, 1) }, ATTESTED_PLACEMENT);
+    render();
+    const style = (): string => container.querySelector<HTMLElement>('[data-ui-primitive="Grid"] > div')?.style.gridTemplateColumns ?? "";
+    expect(style()).toBe("repeat(3, minmax(0, 1fr))");
+
+    store.apply({ type: "snapshot", document: grid(["2fr", "40%", 120, "url(evil)"], 2) }, ATTESTED_PLACEMENT);
+    render();
+    expect(style()).toBe("2fr minmax(0, 40%) 120px");
+
+    store.apply({ type: "snapshot", document: grid(undefined, 3) }, ATTESTED_PLACEMENT);
+    render();
+    expect(style()).toBe("repeat(2, minmax(0, 1fr))");
+  });
 });

@@ -1,0 +1,100 @@
+{
+  "BlackboardItemDraft": {
+    "assignee": "dana",
+    "kind": "task",
+    "ordinal": 1,
+    "payload": {
+      "title": "wire the DAG viewer"
+    },
+    "status": "todo"
+  },
+  "BlackboardItemView_board_card": {
+    "assignee": "dana",
+    "author": {
+      "client_id": "60000000-0000-0000-0000-000000000001",
+      "role": "operator"
+    },
+    "board_scope": "/home/user/project",
+    "id": "0192-card",
+    "kind": "task",
+    "ordinal": 1,
+    "payload": {
+      "description": "edges on the wire",
+      "title": "wire the DAG viewer"
+    },
+    "revision": 1,
+    "status": "todo",
+    "workflow_run_id": "board:/home/user/project"
+  },
+  "BlackboardScope_RepositoryBoard": {
+    "repository": "/home/user/project",
+    "type": "RepositoryBoard"
+  },
+  "BlackboardScope_WorkflowRun": {
+    "type": "WorkflowRun",
+    "workflow_run_id": "wfrun-abc123"
+  },
+  "CommandBody_PostBlackboardItem": {
+    "item": {
+      "assignee": "dana",
+      "kind": "task",
+      "ordinal": 1,
+      "payload": {
+        "title": "wire the DAG viewer"
+      },
+      "status": "todo"
+    },
+    "scope": {
+      "repository": "/home/user/project",
+      "type": "RepositoryBoard"
+    },
+    "type": "PostBlackboardItem"
+  },
+  "CommandBody_ReadBlackboard_board": {
+    "board_repository": "/home/user/project",
+    "kind": "task",
+    "type": "ReadBlackboard",
+    "workflow_run_id": ""
+  },
+  "CommandBody_UpdateBlackboardItem": {
+    "item_id": "0192-card",
+    "ordinal": 2,
+    "scope": {
+      "repository": "/home/user/project",
+      "type": "RepositoryBoard"
+    },
+    "status": "doing",
+    "type": "UpdateBlackboardItem"
+  },
+  "Payload_BlackboardItemApplied": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "item": {
+      "assignee": "dana",
+      "author": {
+        "client_id": "60000000-0000-0000-0000-000000000001",
+        "role": "operator"
+      },
+      "board_scope": "/home/user/project",
+      "id": "0192-card",
+      "kind": "task",
+      "ordinal": 1,
+      "payload": {
+        "description": "edges on the wire",
+        "title": "wire the DAG viewer"
+      },
+      "revision": 1,
+      "status": "todo",
+      "workflow_run_id": "board:/home/user/project"
+    },
+    "type": "BlackboardItemApplied"
+  },
+  "ProposedAction_TaskRead": {
+    "repository": "/home/user/project",
+    "type": "TaskRead"
+  },
+  "ProposedAction_TaskWrite": {
+    "repository": "/home/user/project",
+    "summary": "create \"wire the DAG viewer\"",
+    "type": "TaskWrite"
+  }
+}

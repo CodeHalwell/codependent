@@ -18,23 +18,33 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use codypendent_protocol::{
-    AgentMode, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition, RunState, BUILD_ID,
+    AgentMode, ApprovalScope, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition,
+    RunState, BUILD_ID,
 };
 
 use crate::action::{Action, KeyTarget};
+use crate::dag::DagLayout;
 use crate::reduce::capability_label;
 use crate::remote_ui_host::{TERMINAL_CENTRAL_SLOTS, TERMINAL_OVERLAY_SLOTS};
 use crate::state::{
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
-    filter_providers, AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus, DocLeaseState,
-    KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, ModelReadiness, Overlay, Pane,
-    PatchSummary, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    filter_providers, filter_themes, filter_unsloth_quants, filter_unsloth_repos, AddModelRow,
+    AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus, DocLeaseState, KeyStatus,
+    LayoutMode, ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness, Overlay, Pane,
+    PatchSummary, ProviderCard, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    UnslothQuantCard, UnslothRepoCard, NOTE_INLINE_LINE_THRESHOLD,
 };
 use crate::theme::Theme;
 use crate::{render_remote_ui, RemoteUiRenderOptions};
 
 /// Draw the whole UI for the current frame.
 pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    // `theme` is what the harness resolved at boot; the operator's `/theme`
+    // choice — and, while the picker is open, the row the cursor is on — takes
+    // precedence, so the WHOLE shell previews live as the cursor moves. Purely
+    // derived: no cache to invalidate, and the next frame follows the state.
+    let previewed = state.effective_theme(theme);
+    let theme = &previewed;
     let area = frame.area();
     // Rebuilt fresh every frame (mirrors `transcript_max_scroll`): a stale hit
     // from a previous layout must never survive to resolve this frame's clicks.
@@ -314,12 +324,25 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             )]);
         }
         if show_mode {
-            groups.push(vec![Span::styled(
-                mode_label(state.default_mode).to_owned(),
+            // The mode the selected run is ACTUALLY running in — showing only
+            // `default_mode` let the chip contradict the run right under it.
+            // When the next submission would use a different mode (a `/mode`
+            // pick mid-run), both are shown as `live → next` so the pick is
+            // still confirmed on screen without lying about the live run.
+            let live = status.mode.unwrap_or(state.default_mode);
+            let mut chip = vec![Span::styled(
+                mode_label(live).to_owned(),
                 Style::default()
                     .fg(theme.focus.active)
                     .add_modifier(Modifier::BOLD),
-            )]);
+            )];
+            if status.mode.is_some_and(|mode| mode != state.default_mode) {
+                chip.push(Span::styled(
+                    format!(" → {}", mode_label(state.default_mode)),
+                    Style::default().fg(theme.text.muted),
+                ));
+            }
+            groups.push(chip);
         }
         if show_context {
             groups.push(vec![Span::styled(
@@ -816,28 +839,106 @@ fn composer_rendered_rows(composer: &str, width: u16) -> u16 {
     if composer.is_empty() {
         return 1;
     }
-    let segments = composer.split('\n').collect::<Vec<_>>();
-    let last = segments.len().saturating_sub(1);
-    segments
-        .iter()
-        .enumerate()
-        .fold(0_u16, |rows, (index, segment)| {
-            let columns = 2 + UnicodeWidthStr::width(*segment) + usize::from(index == last);
-            rows.saturating_add(line_rows(columns, usize::from(width.max(1))))
+    // Measured with the same `CellWrap` rule `render_composer` pre-splits its
+    // rows with, so the box is never a row too short for what is drawn. The
+    // trailing `" "` is the cursor cell: it only adds a column when the cursor
+    // sits at a line's end, and charging every line for it can at most make
+    // the box one row taller than strictly needed — never shorter.
+    composer
+        .split('\n')
+        .fold(0_u16, |rows, segment| {
+            rows.saturating_add(cell_wrap_rows(["  ", segment, " "].into_iter(), width))
         })
         .max(1)
 }
 
-/// Wrapped-row height of a line `columns` display-columns wide in an
-/// `inner_width` viewport: ceil(columns/inner_width), min 1.
-fn line_rows(columns: usize, inner_width: usize) -> u16 {
-    let iw = inner_width.max(1);
-    let rows = if columns == 0 {
-        1
-    } else {
-        columns.div_ceil(iw)
+/// The one cell-granularity wrapping rule the transcript's measure pass and
+/// its draw pass share: a row breaks BEFORE the grapheme that would overflow
+/// `width`, and a grapheme wider than the whole viewport is force-placed
+/// alone (progress guarantee; the terminal clips it). [`cell_wrap_rows`]
+/// counts rows and [`split_line_cells`] materializes them by driving this
+/// same state machine, so measurement and drawing can never disagree — the
+/// old ceil-based measure under ratatui's word-wrap drew MORE rows than were
+/// measured on wrap-heavy content, under-estimating `max_scroll` and leaving
+/// follow mode clipping the newest lines.
+struct CellWrap {
+    width: usize,
+    col: usize,
+    rows: u16,
+}
+
+impl CellWrap {
+    fn new(width: u16) -> Self {
+        Self {
+            width: usize::from(width).max(1),
+            col: 0,
+            rows: 1,
+        }
+    }
+
+    /// Feed one grapheme of display width `w`; returns `true` when it starts
+    /// a new visual row. Zero-width graphemes join the current cell.
+    fn push(&mut self, w: usize) -> bool {
+        if w == 0 {
+            return false;
+        }
+        if self.col + w > self.width && self.col > 0 {
+            self.rows = self.rows.saturating_add(1);
+            self.col = w.min(self.width);
+            true
+        } else {
+            self.col += w;
+            false
+        }
+    }
+}
+
+/// Visual row count of one logical line (its text in span order) cell-wrapped
+/// into `width` columns. Exactly `split_line_cells(..).len()` — both drive
+/// [`CellWrap`].
+fn cell_wrap_rows<'x>(texts: impl Iterator<Item = &'x str>, width: u16) -> u16 {
+    let mut wrap = CellWrap::new(width);
+    for text in texts {
+        for grapheme in UnicodeSegmentation::graphemes(text, true) {
+            wrap.push(UnicodeWidthStr::width(grapheme));
+        }
+    }
+    wrap.rows
+}
+
+/// Split one styled `Line` into its visual rows at cell granularity (see
+/// [`CellWrap`]), preserving span styles across break points. The transcript
+/// `Paragraph` renders these rows UNwrapped, so the drawn geometry equals the
+/// measured geometry by construction.
+fn split_line_cells(line: &Line<'_>, width: u16) -> Vec<Line<'static>> {
+    let mut wrap = CellWrap::new(width);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut row: Vec<Span<'static>> = Vec::new();
+    let mut fragment = String::new();
+    let mut fragment_style = Style::default();
+    let flush_fragment = |row: &mut Vec<Span<'static>>, fragment: &mut String, style: Style| {
+        if !fragment.is_empty() {
+            row.push(Span::styled(std::mem::take(fragment), style));
+        }
     };
-    u16::try_from(rows).unwrap_or(u16::MAX)
+    for span in &line.spans {
+        flush_fragment(&mut row, &mut fragment, fragment_style);
+        fragment_style = span.style;
+        for grapheme in UnicodeSegmentation::graphemes(span.content.as_ref(), true) {
+            if wrap.push(UnicodeWidthStr::width(grapheme)) {
+                flush_fragment(&mut row, &mut fragment, fragment_style);
+                let mut visual = Line::from(std::mem::take(&mut row));
+                visual.style = line.style;
+                out.push(visual);
+            }
+            fragment.push_str(grapheme);
+        }
+    }
+    flush_fragment(&mut row, &mut fragment, fragment_style);
+    let mut visual = Line::from(row);
+    visual.style = line.style;
+    out.push(visual);
+    out
 }
 
 /// One transcript row before placement (see module-level virtualization note).
@@ -849,6 +950,10 @@ struct Row<'a> {
     /// A full-width background for this row (the `You` container). Cosmetic —
     /// `columns()`/`rows()` ignore it; applied only to visible rows at build.
     bg: Option<Color>,
+    /// Whether this row belongs to the browsed (`Alt-↑`/`Alt-↓`) transcript
+    /// entry. The measure pass sums these rows' offsets so the viewport can
+    /// keep the browsed fold in sight.
+    selected: bool,
 }
 
 enum RowKind<'a> {
@@ -871,6 +976,7 @@ impl<'a> Row<'a> {
             kind: RowKind::Built(line),
             hit_entry: None,
             bg: None,
+            selected: false,
         }
     }
     fn model(prefix: &'static str, text: &'a str, caret: bool, style: Style) -> Self {
@@ -883,6 +989,7 @@ impl<'a> Row<'a> {
             },
             hit_entry: None,
             bg: None,
+            selected: false,
         }
     }
     fn rich(rl: &'a crate::markdown::RichLine) -> Self {
@@ -890,27 +997,29 @@ impl<'a> Row<'a> {
             kind: RowKind::Rich(rl),
             hit_entry: None,
             bg: None,
+            selected: false,
         }
     }
-    /// Display width, allocation-free (`Span::raw` borrows; `.width()` is unicode width).
-    fn columns(&self) -> usize {
+    /// Wrapped visual-row height, allocation-free: drives the same
+    /// [`CellWrap`] rule the draw pass splits with, so measure == draw.
+    fn rows(&self, inner_width: u16) -> u16 {
         match &self.kind {
-            RowKind::Built(line) => line.width(),
+            RowKind::Built(line) => {
+                cell_wrap_rows(line.spans.iter().map(|s| s.content.as_ref()), inner_width)
+            }
             RowKind::Model {
                 prefix,
                 text,
                 caret,
                 ..
-            } => Span::raw(*prefix).width() + Span::raw(*text).width() + usize::from(*caret),
-            RowKind::Rich(rl) => rl
-                .spans
-                .iter()
-                .map(|s| Span::raw(s.text.as_str()).width())
-                .sum(),
+            } => {
+                let caret = if *caret { "▋" } else { "" };
+                cell_wrap_rows([*prefix, *text, caret].into_iter(), inner_width)
+            }
+            RowKind::Rich(rl) => {
+                cell_wrap_rows(rl.spans.iter().map(|s| s.text.as_str()), inner_width)
+            }
         }
-    }
-    fn rows(&self, inner_width: u16) -> u16 {
-        line_rows(self.columns(), inner_width as usize)
     }
     fn into_line(self, theme: &Theme) -> Line<'a> {
         match self.kind {
@@ -986,16 +1095,33 @@ fn style_for(role: SpanRole, theme: &Theme) -> Style {
     }
 }
 
+/// The frame-constant inputs the transcript walk needs beyond the runs
+/// themselves: the live theme, which run owns this frame's click targets,
+/// which fold (if any) is being browsed, the reading width rows are measured
+/// against, and the animation tick its spinners turn on. Passed as one value
+/// so the measure pass and the build pass provably walk with identical
+/// parameters.
+#[derive(Clone, Copy)]
+struct TranscriptView<'t> {
+    theme: &'t Theme,
+    selected_run: usize,
+    browsed: Option<usize>,
+    inner_width: u16,
+    tick: u64,
+}
+
 /// Walk the whole session transcript in scroll order, emitting one `Row` per
 /// logical line. Mirrors the old `conversation_lines` walk exactly; the `Model`
 /// entry is emitted as borrowed `Row::Model` rows (measured cheaply, built only
 /// when visible), every other entry reuses the existing `entry_lines` builders.
-fn for_each_row<'a>(
-    runs: &'a [RunView],
-    theme: &Theme,
-    selected_run: usize,
-    mut visit: impl FnMut(Row<'a>),
-) {
+fn for_each_row<'a>(runs: &'a [RunView], view: TranscriptView<'_>, mut visit: impl FnMut(Row<'a>)) {
+    let TranscriptView {
+        theme,
+        selected_run,
+        browsed,
+        inner_width,
+        tick,
+    } = view;
     let mut awaiting_header = false;
     let mut seen_user_turn = false;
     let last_run_idx = runs.len().checked_sub(1);
@@ -1052,6 +1178,7 @@ fn for_each_row<'a>(
                         Style::default().fg(theme.text.muted),
                     ));
                 }
+                push_turn_time(&mut spans, run.entry_time(idx), inner_width, theme);
                 visit(Row::built(Line::from(spans)));
                 produced = true;
                 awaiting_header = false;
@@ -1082,19 +1209,46 @@ fn for_each_row<'a>(
                 },
                 other => {
                     scratch.clear();
-                    entry_lines(other, theme, false, false, &mut scratch);
+                    // Highlighted only while the transcript is being BROWSED
+                    // (`Alt-↑`/`Alt-↓`); a stale `transcript_selected` from an
+                    // earlier click must not paint a selection nobody asked for.
+                    let selected = run_idx == selected_run && browsed == Some(idx);
+                    entry_lines(other, theme, selected, false, &mut scratch);
                     let hit = if run_idx == selected_run {
                         fold_hit_entry(other, idx)
                     } else {
                         None
                     };
                     let is_user = matches!(other, TranscriptEntry::User { .. });
-                    for (j, line) in scratch.drain(..).enumerate() {
+                    // No distinct raised surface (ansi16/monochrome): mark the
+                    // You container with a leading accent bar instead of a
+                    // background. Inserted HERE — before measurement — so the
+                    // bar's column is part of the measured geometry.
+                    let user_accent_bar = is_user && theme.surface.user == theme.surface.panel;
+                    for (j, mut line) in scratch.drain(..).enumerate() {
+                        if user_accent_bar {
+                            line.spans.insert(
+                                0,
+                                Span::styled("▎", Style::default().fg(theme.focus.active)),
+                            );
+                        }
+                        // The `You` header carries the turn's clock, mirroring
+                        // the agent header above. Added before measurement, so
+                        // the padded width is the measured width.
+                        if is_user && j == 0 {
+                            push_turn_time(
+                                &mut line.spans,
+                                run.entry_time(idx),
+                                inner_width,
+                                theme,
+                            );
+                        }
                         let mut row = Row::built(line);
+                        row.selected = selected;
                         if j == 0 {
                             row.hit_entry = hit;
                         }
-                        if is_user {
+                        if is_user && !user_accent_bar {
                             row.bg = Some(theme.surface.user);
                         }
                         visit(row);
@@ -1110,53 +1264,187 @@ fn for_each_row<'a>(
                 Style::default().fg(theme.text.muted),
             )));
         }
-        if let Some(status) = activity_status_line(&run.activity, theme) {
+        if let Some(status) = activity_status_line(&run.activity, tick, theme) {
             visit(Row::built(status));
         }
     }
 }
 
-/// The entry index if this entry renders a clickable fold HEAD (its first line):
-/// a backstage summary, a folded (multi-line) note, or a failed-run summary.
-fn fold_hit_entry(entry: &TranscriptEntry, idx: usize) -> Option<usize> {
-    match entry {
-        TranscriptEntry::Backstage { .. } => Some(idx),
-        TranscriptEntry::Note { text, .. } if text.lines().count() > NOTE_INLINE_LINE_THRESHOLD => {
-            Some(idx)
-        }
-        TranscriptEntry::Completed {
-            disposition: RunDisposition::Failed { .. },
-            ..
-        } => Some(idx),
-        _ => None,
+/// One labelled control chip: a key cap, what it does, and the `Action` a
+/// click on it fires — the same `Action` its key produces, so mouse/keyboard
+/// parity is structural (RULE 3) rather than something a comment claims.
+struct Chip {
+    key: &'static str,
+    label: &'static str,
+    action: Action,
+}
+
+impl Chip {
+    fn new(key: &'static str, label: &'static str, action: Action) -> Self {
+        Chip { key, label, action }
     }
 }
 
-/// Total wrapped-row height of the whole transcript (the measure pass).
+/// Lay a chip row out into spans, returning each chip's MEASURED `(offset,
+/// width)` in columns from the row's first cell.
+///
+/// Every chip-row footer used to register its click targets from
+/// hand-counted offsets (`x + 14`, width 8, …) that had to be kept in step
+/// with the label string by eye — and some had already drifted. Callers now
+/// place the returned spans and register hits from these measurements, so a
+/// label edit moves the click target with it, always.
+///
+/// Chips are dropped whole once the row runs out of columns; a half-drawn
+/// chip with a live hit region would be worse than an absent one.
+fn chip_row(chips: &[Chip], width: u16, theme: &Theme) -> (Vec<Span<'static>>, Vec<(u16, u16)>) {
+    let key_style = Style::default().fg(theme.focus.active);
+    let label_style = Style::default().fg(theme.text.muted);
+    let mut spans = vec![Span::raw("  ")];
+    let mut placed: Vec<(u16, u16)> = Vec::new();
+    let mut cursor: u16 = 2;
+    for (index, chip) in chips.iter().enumerate() {
+        let separator = if index == 0 { "" } else { " · " };
+        let text = format!("{separator}{} ", chip.key);
+        let chip_width = u16::try_from(
+            UnicodeWidthStr::width(text.as_str()) + UnicodeWidthStr::width(chip.label),
+        )
+        .unwrap_or(u16::MAX);
+        if cursor.saturating_add(chip_width) > width {
+            break;
+        }
+        let lead = u16::try_from(UnicodeWidthStr::width(separator)).unwrap_or(0);
+        spans.push(Span::styled(text, key_style));
+        spans.push(Span::styled(chip.label, label_style));
+        // The hit region covers the key cap and its label, not the separator.
+        placed.push((cursor + lead, chip_width - lead));
+        cursor = cursor.saturating_add(chip_width);
+    }
+    (spans, placed)
+}
+
+/// Register the measured chip rects of a row whose first cell is at `(x, y)`.
+fn register_chip_hits(state: &AppState, x: u16, y: u16, placed: &[(u16, u16)], chips: &[Chip]) {
+    for ((offset, width), chip) in placed.iter().zip(chips) {
+        state.register_hit(
+            Rect {
+                x: x.saturating_add(*offset),
+                y,
+                width: *width,
+                height: 1,
+            },
+            chip.action.clone(),
+        );
+    }
+}
+
+/// The braille-dot spinner frames CLI spinners conventionally use. One table
+/// for every animated surface, so they all turn at the same rate and in the
+/// same direction.
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// This tick's spinner glyph. Pure: the caller supplies `AppState::tick`, and
+/// the CLI keeps redrawing while [`AppState::is_animating`] holds, so every
+/// spinner actually turns.
+fn spinner_frame(tick: u64) -> char {
+    SPINNER_FRAMES[(tick % SPINNER_FRAMES.len() as u64) as usize]
+}
+
+/// Right-align a turn header's wall-clock time in dim text, if the row is wide
+/// enough to carry it without crowding the header (a narrow terminal keeps the
+/// header and drops the clock — it is the least valuable field on the row).
+///
+/// The time is shown in the viewer's LOCAL zone: `occurred_at` is UTC on the
+/// wire, and a clock the user cannot compare with their own is worse than no
+/// clock. This timezone lookup is the only environment read in the renderer;
+/// it touches no session state, so the projection stays pure with respect to
+/// [`AppState`].
+fn push_turn_time<'a>(
+    spans: &mut Vec<Span<'a>>,
+    at: Option<chrono::DateTime<chrono::Utc>>,
+    inner_width: u16,
+    theme: &Theme,
+) {
+    let Some(at) = at else { return };
+    let label = at.with_timezone(&chrono::Local).format("%H:%M").to_string();
+    let used: usize = spans.iter().map(Span::width).sum();
+    // The clock has to read as its own right-hand field, not as text jammed
+    // onto the end of the header, so it needs a visible gap before it.
+    const TURN_TIME_MIN_GAP: usize = 4;
+    let needed = used + label.len() + TURN_TIME_MIN_GAP;
+    if usize::from(inner_width) < needed {
+        return;
+    }
+    let pad = usize::from(inner_width) - used - label.len();
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(label, Style::default().fg(theme.text.muted)));
+}
+
+/// The entry index if this entry renders a clickable fold HEAD (its first
+/// line): a tool card, a patch diff, a backstage summary, a folded
+/// (multi-line) note, or a failed-run summary. Delegates to
+/// [`TranscriptEntry::is_foldable`], the same predicate `Alt-↑`/`Alt-↓` walk,
+/// so click targets and the keyboard walk cover exactly the same entries
+/// (RULE 3).
+fn fold_hit_entry(entry: &TranscriptEntry, idx: usize) -> Option<usize> {
+    entry.is_foldable().then_some(idx)
+}
+
+/// Total wrapped-row height of the whole transcript — [`measure_transcript`]
+/// without a browsed entry. Test-facing shorthand for the many virtualization
+/// tests that only care about the height.
+#[cfg(test)]
 fn transcript_rows(runs: &[RunView], theme: &Theme, inner_width: u16) -> u16 {
+    measure_transcript(
+        runs,
+        TranscriptView {
+            theme,
+            selected_run: usize::MAX,
+            browsed: None,
+            inner_width,
+            tick: 0,
+        },
+    )
+    .0
+}
+
+/// The measure pass: the transcript's total wrapped height and, when the
+/// transcript is being browsed, the `[start, end)` row range of the browsed
+/// entry's rows in that same coordinate space. `render_conversation` uses the
+/// range to keep the browsed fold inside the viewport — a pure projection of
+/// the selection, not a mutation of `run.scroll`.
+fn measure_transcript(runs: &[RunView], view: TranscriptView<'_>) -> (u16, Option<(u16, u16)>) {
     let mut total: u16 = 0;
-    for_each_row(runs, theme, usize::MAX, |row| {
-        total = total.saturating_add(row.rows(inner_width));
+    let mut span: Option<(u16, u16)> = None;
+    for_each_row(runs, view, |row| {
+        let start = total;
+        total = total.saturating_add(row.rows(view.inner_width));
+        if row.selected {
+            span = Some(match span {
+                Some((first, _)) => (first, total),
+                None => (start, total),
+            });
+        }
     });
-    total
+    (total, span)
 }
 
 /// Build only the rows whose wrapped range intersects `[first_row, first_row+height)`.
 fn build_transcript_window<'a>(
     runs: &'a [RunView],
-    theme: &Theme,
-    inner_width: u16,
+    view: TranscriptView<'_>,
     first_row: u16,
     height: u16,
-    selected_run: usize,
 ) -> (Vec<Line<'a>>, u16, Vec<(usize, usize)>) {
+    let TranscriptView {
+        theme, inner_width, ..
+    } = view;
     let last_row = first_row.saturating_add(height);
     let mut out: Vec<Line> = Vec::with_capacity(height as usize + 2);
     let mut hits: Vec<(usize, usize)> = Vec::new();
     let mut cursor: u16 = 0;
     let mut scroll: u16 = 0;
     let mut first_seen = false;
-    for_each_row(runs, theme, selected_run, |row| {
+    for_each_row(runs, view, |row| {
         let h = row.rows(inner_width);
         let row_start = cursor;
         let row_end = cursor.saturating_add(h);
@@ -1169,24 +1457,22 @@ fn build_transcript_window<'a>(
             let hit = row.hit_entry;
             let bg = row.bg;
             let index = out.len();
-            let mut line = row.into_line(theme);
-            if let Some(c) = bg {
-                if c == theme.surface.panel {
-                    // No distinct raised surface (ansi16/monochrome): a leading accent bar.
-                    line.spans.insert(
-                        0,
-                        Span::styled("▎", Style::default().fg(theme.focus.active)),
-                    );
-                } else {
-                    line.style = line.style.bg(c);
-                    let pad = (inner_width as usize).saturating_sub(line.width());
+            let line = row.into_line(theme);
+            // Pre-split at cell granularity via the SAME rule the measure
+            // pass counted with (`CellWrap`), so the Paragraph below renders
+            // unwrapped and the drawn geometry equals the measured geometry.
+            for mut visual in split_line_cells(&line, inner_width) {
+                if let Some(c) = bg {
+                    visual.style = visual.style.bg(c);
+                    let pad = (inner_width as usize).saturating_sub(visual.width());
                     if pad > 0 {
-                        line.spans
+                        visual
+                            .spans
                             .push(Span::styled(" ".repeat(pad), Style::default().bg(c)));
                     }
                 }
+                out.push(visual);
             }
-            out.push(line);
             if let Some(entry) = hit {
                 hits.push((index, entry));
             }
@@ -1274,7 +1560,20 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     // reducer's paging leaves/enters follow mode precisely), then BUILD only the
     // visible window — per-frame allocation is bounded by the viewport, not the
     // transcript length (the crash fix).
-    let content_rows = transcript_rows(&state.runs, theme, inner_width);
+    // The browsed (`Alt-↑`/`Alt-↓`) fold, if any: highlighted, and kept inside
+    // the viewport below.
+    let browsed = state
+        .transcript_browse
+        .then(|| state.selected_run().map(|run| run.transcript_selected))
+        .flatten();
+    let view = TranscriptView {
+        theme,
+        selected_run: state.selected_run,
+        browsed,
+        inner_width,
+        tick: state.tick,
+    };
+    let (content_rows, browsed_span) = measure_transcript(&state.runs, view);
     let max_scroll = content_rows.saturating_sub(inner.height);
     state.transcript_max_scroll.set(max_scroll);
     let (follow, scroll) = state
@@ -1285,18 +1584,23 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     } else {
         scroll.min(max_scroll)
     };
+    // Browsing pins the view to the selection: an `Alt-↑` walk far above the
+    // tail must show the fold it lands on (and the detail an `Alt-Enter`
+    // reveals), not silently move an off-screen cursor. Only the local draw
+    // offset moves — `run.scroll`/`run.follow` are untouched, so the view
+    // returns to the tail the moment browsing ends.
+    if let Some((start, end)) = browsed_span {
+        if start < offset {
+            offset = start;
+        } else if end > offset.saturating_add(inner.height) {
+            offset = end.saturating_sub(inner.height).min(max_scroll);
+        }
+    }
     // Guard the u16 handed to `Paragraph::scroll` — the rewrite must not
     // reintroduce the overflow the old implicit coupling merely avoided.
     offset = offset.min(u16::MAX.saturating_sub(inner.height));
 
-    let (mut lines, r0, hits) = build_transcript_window(
-        &state.runs,
-        theme,
-        inner_width,
-        offset,
-        inner.height,
-        state.selected_run,
-    );
+    let (mut lines, r0, hits) = build_transcript_window(&state.runs, view, offset, inner.height);
 
     // A new conversation starts near the top of its reading canvas. Keeping
     // hundreds of empty rows above the first exchange made the timeline feel
@@ -1333,9 +1637,10 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         }
     }
 
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((r0, 0));
+    // No `Wrap`: every line was pre-split at cell granularity by
+    // `build_transcript_window`, so wrapping here would re-wrap rows the
+    // measure pass already accounted for (the follow-mode clipping bug).
+    let paragraph = Paragraph::new(lines).scroll((r0, 0));
     frame.render_widget(paragraph, inner);
 }
 
@@ -1376,41 +1681,75 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         // A manual line break (`Alt+Enter`) or a multi-line paste puts a `\n`
         // in the draft: render each segment as its own `Line` (a raw `\n`
         // inside one `Line`'s text does not itself wrap) rather than a single
-        // wrapped line — only the first gets the `› ` prompt, and only the
-        // last gets the cursor.
-        let segments: Vec<&str> = state.composer.split('\n').collect();
-        let last = segments.len() - 1;
-        segments
-            .into_iter()
-            .enumerate()
-            .map(|(i, segment)| {
-                let mut spans = vec![Span::styled(if i == 0 { "❯ " } else { "  " }, prompt_style)];
-                spans.push(Span::styled(
-                    segment,
-                    Style::default().fg(theme.text.primary),
-                ));
-                if i == last {
-                    spans.push(Span::styled("▏", Style::default().fg(theme.focus.active)));
+        // wrapped line — only the first gets the `❯ ` prompt, and the cursor
+        // is drawn wherever `composer_cursor` actually is, not always at the
+        // end.
+        let cursor = state.composer_cursor.min(state.composer.len());
+        let text_style = Style::default().fg(theme.text.primary);
+        // A reversed cell IS the cursor: it inverts whatever character it sits
+        // on (or a trailing space at end-of-line), so it never displaces the
+        // text around it and stays visible on every theme depth.
+        let cursor_style = text_style.add_modifier(Modifier::REVERSED);
+        let mut lines = Vec::new();
+        let mut offset = 0_usize;
+        for (i, segment) in state.composer.split('\n').enumerate() {
+            let mut spans = vec![Span::styled(if i == 0 { "❯ " } else { "  " }, prompt_style)];
+            let end = offset + segment.len();
+            if (offset..=end).contains(&cursor) {
+                let at = cursor - offset;
+                let (before, rest) = segment.split_at(at);
+                let under = UnicodeSegmentation::graphemes(rest, true).next();
+                if !before.is_empty() {
+                    spans.push(Span::styled(before, text_style));
                 }
-                Line::from(spans)
-            })
-            .collect()
+                match under {
+                    Some(grapheme) => {
+                        spans.push(Span::styled(grapheme, cursor_style));
+                        spans.push(Span::styled(&rest[grapheme.len()..], text_style));
+                    }
+                    // At end-of-line: the cursor is a reversed blank cell.
+                    None => spans.push(Span::styled(" ", cursor_style)),
+                }
+            } else {
+                spans.push(Span::styled(segment, text_style));
+            }
+            // +1 for the `\n` that `split` consumed.
+            offset = end + 1;
+            lines.push(Line::from(spans));
+        }
+        lines
     };
 
-    // Keep the cursor (the last line) in view once the draft has more lines
-    // than the box shows — the box already grew toward `COMPOSER_MAX_HEIGHT`
-    // (see `composer_box_height`); this only matters once it's capped there.
+    // Keep the cursor's row in view once the draft has more rows than the box
+    // shows — the box already grew toward `COMPOSER_MAX_HEIGHT` (see
+    // `composer_box_height`); this only matters once it's capped there. Rows
+    // are counted with the same cell-wrap rule the pre-split below draws with,
+    // so the count and the drawing cannot disagree.
     let visible_rows = area.height.saturating_sub(1).max(1);
-    let total_rows = lines.iter().fold(0_u16, |rows, line| {
-        rows.saturating_add(line_rows(line.width(), usize::from(area.width.max(1))))
-    });
-    let scroll_y = total_rows.saturating_sub(visible_rows);
+    let inner_width = area.width.max(1);
+    let mut rows: Vec<Line> = Vec::with_capacity(lines.len());
+    let mut cursor_row = 0_u16;
+    for line in &lines {
+        for visual in split_line_cells(line, inner_width) {
+            if visual
+                .spans
+                .iter()
+                .any(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            {
+                cursor_row = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+            }
+            rows.push(visual);
+        }
+    }
+    // Scroll exactly enough to keep the cursor's row inside the box: 0 while it
+    // fits, otherwise the cursor's row sits on the bottom visible line (which
+    // is the old "pin to the last row" behaviour when the cursor is at the end).
+    let scroll_y = cursor_row.saturating_sub(visible_rows.saturating_sub(1));
 
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll_y, 0)),
+        // No `Wrap`: the rows above were pre-split at cell granularity, so
+        // wrapping again would double-fold them (and move the cursor row).
+        Paragraph::new(rows).block(block).scroll((scroll_y, 0)),
         area,
     );
     // Belt-and-braces: the full-screen scrim (`render_overlays`) already
@@ -1438,13 +1777,21 @@ fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
 /// between visible transcript updates never looks silently paused.
 /// `Streaming` needs no row of its own (the growing model text is itself the
 /// live signal) and `Idle` renders nothing.
-fn activity_status_line(activity: &RunActivity, theme: &Theme) -> Option<Line<'static>> {
+fn activity_status_line(activity: &RunActivity, tick: u64, theme: &Theme) -> Option<Line<'static>> {
     let text = match activity {
         RunActivity::Thinking => "working…".to_owned(),
         RunActivity::RunningTool(tool) => format!("running {tool}…"),
         RunActivity::Streaming | RunActivity::Idle => return None,
     };
-    Some(Line::styled(text, Style::default().fg(theme.text.muted)))
+    // A turning spinner distinguishes "the agent is thinking" from "the UI is
+    // stuck" — this row is on screen precisely when nothing else is moving.
+    Some(Line::from(vec![
+        Span::styled(
+            format!("{} ", spinner_frame(tick)),
+            Style::default().fg(theme.agent.tool),
+        ),
+        Span::styled(text, Style::default().fg(theme.text.muted)),
+    ]))
 }
 
 fn entry_lines<'a>(
@@ -1608,7 +1955,7 @@ fn summarize_error(raw: &str) -> String {
 /// call starting, a thinking pause, or the run completing).
 ///
 /// Folding the caret into the same `Line` that both the transcript
-/// `Paragraph` and [`transcript_rows`]'s measurement read (see
+/// `Paragraph` and [`measure_transcript`]'s measurement read (see
 /// `render_conversation`) means the measured bottom already accounts for it —
 /// "follow latest" pins to the caret's row with no separate adjustment.
 fn model_entry_lines<'a>(
@@ -1799,12 +2146,6 @@ fn patch_lines<'a>(
     }
 }
 
-/// Notes at or under this many lines render inline, unchanged; a longer note
-/// folds (mirrors [`ToolCard`]/[`PatchSummary`] — the Chapter 07
-/// transcript-declutter fix). Applies to ANY note generically — nothing here
-/// special-cases the run-context manifest or a curated-memory note.
-const NOTE_INLINE_LINE_THRESHOLD: usize = 2;
-
 fn note_lines<'a>(
     text: &'a str,
     expanded: bool,
@@ -1896,6 +2237,32 @@ fn backstage_lines<'a>(
 
 fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let bg = Style::default().bg(theme.surface.background);
+    // Voice v1 (rubric 8): a hot microphone outranks every other status,
+    // including a transient notice — the one thing a user must never fail to
+    // notice is that they are being recorded.
+    if state.voice.recording {
+        let line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "◉ ",
+                Style::default()
+                    .fg(theme.status.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Recording",
+                Style::default()
+                    .fg(theme.status.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  ·  press the push-to-talk key again to stop and send",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line).style(bg), area);
+        return;
+    }
     if let Some((notice, _)) = &state.notice {
         let line = Line::from(vec![
             Span::raw("  "),
@@ -1907,10 +2274,12 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     }
 
     let status = state.status();
-    let key = |text: &'static str| Span::styled(text, Style::default().fg(theme.focus.active));
-    let hint = |text: &'static str| Span::styled(text, Style::default().fg(theme.text.muted));
 
-    let (left, right): (Vec<Span>, Vec<Span>) = if status.pending_approvals > 0 {
+    // The right-hand hints are real chips: each one measured, each one a click
+    // target for the very Action its key produces. (The old curated
+    // `FOOTER_HINTS` table was never rendered at all; these contextual chips
+    // supersede it.)
+    let (left, right): (Vec<Span>, Vec<Chip>) = if status.pending_approvals > 0 {
         (
             vec![
                 Span::raw("  "),
@@ -1923,12 +2292,9 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                 ),
             ],
             vec![
-                key("a"),
-                hint(" once  "),
-                key("A"),
-                hint(" run  "),
-                key("r"),
-                hint(" reject"),
+                Chip::new("a", "once", Action::Approve(ApprovalScope::Once)),
+                Chip::new("A", "run", Action::Approve(ApprovalScope::Run)),
+                Chip::new("r", "reject", Action::Reject),
             ],
         )
     } else if !state.issues.is_empty() {
@@ -1942,7 +2308,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     Style::default().fg(theme.status.warning),
                 ),
             ],
-            vec![key("/"), hint(" diagnostics")],
+            vec![Chip::new("/", "diagnostics", Action::OpenIssues)],
         )
     } else if !state.composer.is_empty() {
         (
@@ -1952,12 +2318,9 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                 Span::styled("Draft ready", Style::default().fg(theme.text.secondary)),
             ],
             vec![
-                key("Enter"),
-                hint(" send  "),
-                key("⌥Enter"),
-                hint(" newline  "),
-                key("Esc"),
-                hint(" clear"),
+                Chip::new("Enter", "send", Action::InputSubmit),
+                Chip::new("⌥Enter", "newline", Action::InputNewline),
+                Chip::new("Esc", "clear", Action::InputCancel),
             ],
         )
     } else if !central_remote_ui_is_active(state)
@@ -1976,7 +2339,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     Style::default().fg(theme.text.secondary),
                 ),
             ],
-            vec![key("F6"), hint(" focus")],
+            vec![Chip::new("F6", "focus", Action::RemoteUiSetActive(true))],
         )
     } else if state.selected_run().is_some_and(|run| !run.follow) {
         (
@@ -1988,7 +2351,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     Style::default().fg(theme.text.secondary),
                 ),
             ],
-            vec![key("PgDn"), hint(" latest")],
+            vec![Chip::new("PgDn", "latest", Action::ScrollPageDown)],
         )
     } else if let Some(run_state) = status.run_state {
         state.register_hit(area, Action::OpenPalette);
@@ -2009,7 +2372,10 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     Style::default().fg(theme.text.secondary),
                 ),
             ],
-            vec![key("/"), hint(" commands  "), key("F2"), hint(" workspace")],
+            vec![
+                Chip::new("/", "commands", Action::OpenPalette),
+                Chip::new("F2", "workspace", Action::ToggleLayout),
+            ],
         )
     } else {
         state.register_hit(area, Action::OpenPalette);
@@ -2020,34 +2386,37 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                 Span::styled("Ready", Style::default().fg(theme.text.secondary)),
             ],
             vec![
-                key("Enter"),
-                hint(" send  "),
-                key("⌥Enter"),
-                hint(" newline  "),
-                key("/"),
-                hint(" commands"),
+                Chip::new("Enter", "send", Action::InputSubmit),
+                Chip::new("⌥Enter", "newline", Action::InputNewline),
+                Chip::new("/", "commands", Action::OpenPalette),
             ],
         )
     };
 
-    let left_width: usize = left.iter().map(|span| span.width()).sum();
-    // Footer hints are emitted as key/description pairs in priority order.
-    // Keep only complete pairs that fit; clipping half a shortcut is noisier
-    // than omitting its lower-priority hint on a compact terminal.
-    let mut packed_right = Vec::new();
-    let mut packed_width = 0_usize;
-    for pair in right.chunks(2) {
-        let pair_width = pair.iter().map(Span::width).sum::<usize>();
-        if left_width + packed_width + pair_width + 2 > usize::from(area.width) {
-            break;
-        }
-        packed_right.extend(pair.iter().cloned());
-        packed_width += pair_width;
-    }
-    let pad = usize::from(area.width).saturating_sub(left_width + packed_width + 2);
+    let left_width = u16::try_from(left.iter().map(Span::width).sum::<usize>()).unwrap_or(u16::MAX);
+    // Chips are laid out into whatever columns the status text leaves, and
+    // dropped whole once they run out — clipping half a shortcut is noisier
+    // than omitting the lowest-priority one on a compact terminal.
+    let room = area.width.saturating_sub(left_width).saturating_sub(2);
+    let (chip_spans, placed) = chip_row(&right, room, theme);
+    let chips_width =
+        u16::try_from(chip_spans.iter().map(Span::width).sum::<usize>()).unwrap_or(u16::MAX);
+    let pad = area
+        .width
+        .saturating_sub(left_width)
+        .saturating_sub(chips_width)
+        .saturating_sub(2);
+    // Register from the MEASURED offsets, at the row's real origin.
+    register_chip_hits(
+        state,
+        area.x + left_width + pad,
+        area.y,
+        &placed,
+        &right[..placed.len()],
+    );
     let mut spans = left;
-    spans.push(Span::raw(" ".repeat(pad)));
-    spans.extend(packed_right);
+    spans.push(Span::raw(" ".repeat(usize::from(pad))));
+    spans.extend(chip_spans);
     spans.push(Span::raw("  "));
 
     frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
@@ -2130,6 +2499,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         }
         Overlay::Workflow => render_workflow(frame, area, state, theme),
         Overlay::Blackboard => render_blackboard(frame, area, state, theme),
+        Overlay::Kanban => render_kanban(frame, area, state, theme),
         Overlay::UiPlugins => render_ui_plugins(frame, area, state, theme),
         Overlay::ConfirmUiPluginApprove { plugin_id, receipt } => render_confirm_box(
             frame,
@@ -2161,6 +2531,23 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::CouncilBuilder(builder) => {
             render_council_builder(frame, area, state, theme, builder);
         }
+        Overlay::CouncilBrowser => render_council_browser(frame, area, state, theme),
+        Overlay::CouncilRunObjective { name, buffer } => render_prompt(
+            frame,
+            area,
+            state,
+            theme,
+            &format!("Objective for council `{name}`"),
+            buffer,
+        ),
+        Overlay::ConfirmCouncilDelete { name } => render_confirm_box(
+            frame,
+            area,
+            state,
+            theme,
+            "Remove this council?",
+            &format!("`{name}` · saved run reports remain on disk"),
+        ),
         Overlay::ModelPicker { query, selected } => {
             render_model_picker(frame, area, state, theme, query, *selected);
         }
@@ -2169,6 +2556,9 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         }
         Overlay::ModePicker { query, selected } => {
             render_mode_picker(frame, area, state, theme, query, *selected);
+        }
+        Overlay::ThemePicker { query, selected } => {
+            render_theme_picker(frame, area, state, theme, query, *selected);
         }
         // D1: the `/keys` overlay, its masked set/replace prompt, and its two
         // confirms. The set prompt reuses `render_masked_prompt` (the key can
@@ -2210,8 +2600,34 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 area,
                 state,
                 theme,
-                "Insert text into the focused block",
+                "Edit the focused block (replaces its text)",
                 buffer,
+            );
+        }
+        Overlay::DocNew { buffer } => {
+            render_docs(frame, area, state, theme);
+            render_prompt(frame, area, state, theme, "New document title", buffer);
+        }
+        Overlay::DocInsert { buffer, .. } => {
+            render_docs(frame, area, state, theme);
+            render_prompt(
+                frame,
+                area,
+                state,
+                theme,
+                "New paragraph below the focused block",
+                buffer,
+            );
+        }
+        Overlay::DocDeleteConfirm { label, .. } => {
+            render_docs(frame, area, state, theme);
+            render_confirm_box(
+                frame,
+                area,
+                state,
+                theme,
+                &format!("Delete this block? ({label})"),
+                "The block and its text are removed from the document.",
             );
         }
         Overlay::DocPublishPath { buffer, .. } => {
@@ -2268,6 +2684,8 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             models,
             query,
             selected,
+            origin,
+            refreshing,
             ..
         } => {
             render_add_model_pick(
@@ -2279,6 +2697,64 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 models,
                 query,
                 *selected,
+                origin,
+                *refreshing,
+            );
+        }
+        // Local models: browse the Unsloth GGUF catalog (steps 1-4).
+        Overlay::UnslothRepos {
+            repos,
+            query,
+            selected,
+            loading,
+        } => {
+            render_unsloth_repos(frame, area, state, theme, repos, query, *selected, *loading);
+        }
+        Overlay::UnslothQuants {
+            repo_id,
+            quants,
+            query,
+            selected,
+            loading,
+        } => {
+            render_unsloth_quants(
+                frame, area, state, theme, repo_id, quants, query, *selected, *loading,
+            );
+        }
+        Overlay::UnslothConfirmPull {
+            repo_id,
+            quant,
+            size_label,
+        } => render_confirm_box(
+            frame,
+            area,
+            state,
+            theme,
+            &format!("Pull {repo_id}:{quant} via ollama?"),
+            &format!(
+                "Downloads ~{size_label} through `ollama pull hf.co/{repo_id}:{quant}`, then \
+                 registers it as a local model."
+            ),
+        ),
+        Overlay::UnslothPulling {
+            repo_id,
+            quant,
+            lines,
+            done,
+            error,
+            registered_id,
+        } => {
+            render_unsloth_pulling(
+                frame,
+                area,
+                state,
+                theme,
+                repo_id,
+                quant,
+                lines,
+                *done,
+                error.as_deref(),
+                registered_id.as_deref(),
             );
         }
         Overlay::None => {
@@ -2754,26 +3230,23 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         detail_rows[0],
     );
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            "  ↑/↓ skill · M memory · Esc close",
-            Style::default().fg(theme.text.muted),
-        )),
-        detail_rows[1],
-    );
-
+    // Measured chips, not hand-counted offsets: the `M memory` target used to
+    // be declared at x+14 width 8 over a label whose real span is elsewhere.
+    let chips = [
+        Chip::new("↑/↓", "skill", Action::SelectNext),
+        Chip::new("M", "memory", Action::OpenMemory),
+        Chip::new("Esc", "close", Action::Dismiss),
+    ];
+    let (spans, placed) = chip_row(&chips, detail_rows[1].width, theme);
+    frame.render_widget(Paragraph::new(Line::from(spans)), detail_rows[1]);
     if detail_rows[1].height >= 1 {
-        for (offset, width, action) in [(14, 8, Action::OpenMemory), (25, 9, Action::Dismiss)] {
-            state.register_hit(
-                Rect {
-                    x: detail_rows[1].x.saturating_add(offset),
-                    y: detail_rows[1].y,
-                    width: width.min(detail_rows[1].width.saturating_sub(offset)),
-                    height: 1,
-                },
-                action,
-            );
-        }
+        register_chip_hits(
+            state,
+            detail_rows[1].x,
+            detail_rows[1].y,
+            &placed,
+            &chips[..placed.len()],
+        );
     }
 }
 
@@ -3035,6 +3508,16 @@ fn context_label(context_tokens: Option<u64>) -> String {
     }
 }
 
+/// A catalog price column: USD per 1M tokens, or an em dash when the catalog
+/// (and the provider's own listing) said nothing. Display-only — these numbers
+/// are never summed into a spend figure.
+fn price_per_1m_label(cost_per_1m_usd: Option<f64>) -> String {
+    match cost_per_1m_usd {
+        Some(cost) => format!("${cost}"),
+        None => "—".to_owned(),
+    }
+}
+
 /// The provider-catalog picker (Task 8): the same filter-line + list/detail
 /// shape as [`render_model_picker`], over [`AppState::providers`] instead of
 /// `models`. `Enter` (or `Tab`) begins the add-model flow for the focused
@@ -3124,9 +3607,10 @@ fn render_provider_picker(
         );
         let metadata_line = Line::styled(
             format!(
-                "      {} · {}",
+                "      {} · {} · {}",
                 provider_location_label(card.local),
-                card.auth
+                card.auth,
+                provider_listing_label(card),
             ),
             theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
@@ -3177,6 +3661,13 @@ fn render_provider_picker(
         lines.push(field(
             "location",
             provider_location_label(card.local).to_owned(),
+            theme.status.info,
+        ));
+        // What the add flow can actually offer here — a live listing, curated
+        // catalog rows, or (only when there is neither) a typed model name.
+        lines.push(field(
+            "models",
+            provider_listing_label(card),
             theme.status.info,
         ));
         lines.push(field(
@@ -3338,6 +3829,130 @@ fn render_mode_picker(
     );
 }
 
+/// The `/theme` picker: the same filter-line + list shape as
+/// [`render_mode_picker`], over the seven built-in variants plus any installed
+/// packs.
+///
+/// `theme` here is already the FOCUSED row's theme — `render` resolves it
+/// through [`AppState::effective_theme`] before drawing anything — so the
+/// whole shell behind this modal, and the modal itself, are the live preview.
+/// Moving the cursor is the preview; `Enter` only makes it stick.
+fn render_theme_picker(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    query: &str,
+    selected: usize,
+) {
+    let matches = filter_themes(&state.themes, query);
+    // Tall enough for all seven built-ins at two lines each, plus the search
+    // line, the panel/modal borders, and the footer — so the list needs no
+    // scrolling on an ordinary 80x24 terminal.
+    let rect = centered_modal(area, 72, 22);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!(
+            "Theme picker  ·  {} of {} themes",
+            matches.len(),
+            state.themes.len()
+        ),
+        state,
+        theme,
+    );
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    render_modal_search(frame, rows[0], query, theme);
+
+    const ROW_LINES: usize = 2;
+    let list_block = modal_panel(
+        format!("Themes  ·  {} of {}", matches.len(), state.themes.len()),
+        theme,
+    );
+    let list_area = list_block.inner(rows[1]);
+    frame.render_widget(list_block, rows[1]);
+    let visible_rows = (usize::from(list_area.height) / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
+    let mut items: Vec<ListItem> = Vec::new();
+    if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching theme",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate().skip(first) {
+        let choice = &state.themes[idx];
+        let is_selected = row == selected;
+        let is_current = state.theme_selected == Some(idx);
+        let mut head = vec![
+            Span::styled(
+                if is_selected { "▎ " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.focus.active),
+            ),
+            Span::styled(
+                if is_current { "● " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.status.success),
+            ),
+            Span::styled(
+                choice.id.clone(),
+                theme.selection_aware_text_style(is_selected, theme.text.primary),
+            ),
+        ];
+        if choice.pack {
+            head.push(Span::styled(
+                "  pack",
+                theme.selection_aware_text_style(is_selected, theme.text.muted),
+            ));
+        }
+        // A row's own swatch, drawn in ITS colours rather than the previewed
+        // theme's: the list is the comparison, so each row has to show what it
+        // would look like even while another row is previewing.
+        let swatch = Line::from(vec![
+            Span::raw("      "),
+            Span::styled("███", Style::default().fg(choice.theme.focus.active)),
+            Span::styled("███", Style::default().fg(choice.theme.agent.tool)),
+            Span::styled("███", Style::default().fg(choice.theme.status.success)),
+            Span::styled("███", Style::default().fg(choice.theme.status.error)),
+            Span::styled(
+                format!("  {}", choice.summary),
+                theme.selection_aware_text_style(is_selected, theme.text.muted),
+            ),
+        ]);
+        let item = ListItem::new(vec![Line::from(head), swatch]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
+        list_area,
+    );
+    for (row, _) in matches.iter().enumerate().skip(first) {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
+            break;
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ preview  ·  Enter keep  ·  Esc cancel",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
+}
+
 /// The `/keys` overlay (D1): the same filter-line + list shape as
 /// [`render_mode_picker`], over one row per configured model plus a final
 /// `Tavily (web.search)` row. Each row shows a status GLYPH (● saved in
@@ -3429,8 +4044,22 @@ fn render_api_keys(
                 theme.selection_aware_text_style(is_selected, theme.text.primary),
             ),
         ]);
+        // A model row that has actually been probed reports the result here,
+        // so a verified key reads as verified rather than staying "Unverified"
+        // forever. `Ctrl-T` is what fills this in.
+        let verified = state
+            .models
+            .get(idx)
+            .map(|card| match &card.readiness {
+                ModelReadiness::Ready => " · verified ✓".to_owned(),
+                ModelReadiness::Unavailable(reason) => {
+                    format!(" · {}", truncate_display_width(reason, 40))
+                }
+                ModelReadiness::Unverified => String::new(),
+            })
+            .unwrap_or_default();
         let detail_line = Line::styled(
-            format!("      {provider} · {detail}"),
+            format!("      {provider} · {detail}{verified}"),
             theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, detail_line]);
@@ -3455,7 +4084,7 @@ fn render_api_keys(
     }
 
     let hint = Line::styled(
-        "↑/↓ select · Enter set/replace · Delete remove · Esc close",
+        "↑/↓ select · Enter set/replace · Ctrl-T verify · Delete remove · Esc close",
         Style::default().fg(theme.text.muted),
     )
     .alignment(Alignment::Center);
@@ -3529,6 +4158,19 @@ fn provider_location_label(local: bool) -> &'static str {
         "local ✓"
     } else {
         "hosted"
+    }
+}
+
+/// What the add-model flow can offer for this provider: a live `/models`
+/// listing, the curated catalog rows, both, or neither (free-text). Stated on
+/// the card so the operator knows before pressing Enter whether they are about
+/// to browse or to type.
+fn provider_listing_label(card: &ProviderCard) -> String {
+    match (card.can_list_models, card.catalog_models) {
+        (true, 0) => "live list ✓".to_owned(),
+        (true, n) => format!("live list ✓ · catalog {n}"),
+        (false, 0) => "type the model name".to_owned(),
+        (false, n) => format!("catalog {n} models"),
     }
 }
 
@@ -3688,43 +4330,39 @@ fn render_memory(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         card_rows[0],
     );
+    // Two measured chip rows (see `chip_row`), replacing per-row offsets that
+    // had to be re-counted by hand whenever a label changed.
+    let primary = [
+        Chip::new("↑/↓", "memory", Action::SelectNext),
+        Chip::new("o", "source", Action::OpenSource),
+    ];
+    let secondary = [
+        Chip::new("S", "skills", Action::OpenSkills),
+        Chip::new("Esc", "close", Action::Dismiss),
+    ];
+    let (primary_spans, primary_placed) = chip_row(&primary, card_rows[1].width, theme);
+    let (secondary_spans, secondary_placed) = chip_row(&secondary, card_rows[1].width, theme);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                "  ↑/↓ memory · o source",
-                Style::default().fg(theme.focus.active),
-            ),
-            Line::styled(
-                "  S skills · Esc close",
-                Style::default().fg(theme.text.muted),
-            ),
-        ]),
+        Paragraph::new(vec![Line::from(primary_spans), Line::from(secondary_spans)]),
         card_rows[1],
     );
-
     if card_rows[1].height >= 1 {
-        state.register_hit(
-            Rect {
-                x: card_rows[1].x.saturating_add(15),
-                y: card_rows[1].y,
-                width: 8.min(card_rows[1].width.saturating_sub(15)),
-                height: 1,
-            },
-            Action::OpenSource,
+        register_chip_hits(
+            state,
+            card_rows[1].x,
+            card_rows[1].y,
+            &primary_placed,
+            &primary[..primary_placed.len()],
         );
     }
     if card_rows[1].height >= 2 {
-        for (offset, width, action) in [(2, 8, Action::OpenSkills), (13, 9, Action::Dismiss)] {
-            state.register_hit(
-                Rect {
-                    x: card_rows[1].x.saturating_add(offset),
-                    y: card_rows[1].y.saturating_add(1),
-                    width: width.min(card_rows[1].width.saturating_sub(offset)),
-                    height: 1,
-                },
-                action,
-            );
-        }
+        register_chip_hits(
+            state,
+            card_rows[1].x,
+            card_rows[1].y + 1,
+            &secondary_placed,
+            &secondary[..secondary_placed.len()],
+        );
     }
 }
 
@@ -3990,12 +4628,15 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     );
     frame.render_widget(
         Paragraph::new(vec![
+            // Both lines are sized to the narrowest rail this footer is pinned
+            // in (43 columns at an 80-wide terminal), so no control is silently
+            // truncated away.
             Line::styled(
-                " Tab rail · ↑/↓ select · Esc close",
+                " Tab rail · ↑/↓ · a accept · r reject · Esc",
                 Style::default().fg(theme.text.muted),
             ),
             Line::styled(
-                " e edit · a accept · r reject · P publish",
+                " n new · e edit · i ins · X del · P publish",
                 Style::default().fg(theme.focus.active),
             ),
         ]),
@@ -4241,10 +4882,9 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
 }
 
 fn render_loading_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let rect = centered_modal(area, 64, 11);
     let inner = modal_surface(frame, rect, "Code graph", state, theme);
-    let spinner = SPINNER[(state.tick as usize) % SPINNER.len()];
+    let spinner = spinner_frame(state.tick);
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(spinner.to_string(), Style::default().fg(theme.agent.tool)),
@@ -4379,6 +5019,13 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let list_area = cols[0];
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(state.selected_node, state.workflow.len(), visible_rows);
+    // Rubric 5: lay the topological list out as layered lanes with box-drawing
+    // connectors, so the DAG's EDGES are visible instead of only its order. The
+    // lanes are an addition to the same rows — selection, scrolling, and hit
+    // regions are untouched — and `None` here degrades to exactly the list this
+    // pane rendered before: a graph with no edges, too many lanes to fit, or a
+    // pane too narrow to spare the columns.
+    let graph = workflow_lanes(&state.workflow, list_area.width);
     let mut items: Vec<ListItem> = Vec::new();
     if state.workflow.is_empty() {
         items.push(ListItem::new(vec![
@@ -4401,13 +5048,36 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     {
         let selected = idx == state.selected_node;
         let marker = if selected { "› " } else { "  " };
-        let mut lines = vec![Line::styled(
-            truncate(&node.workflow, 36),
-            theme
-                .selection_aware_text_style(selected, theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        )];
+        let row = graph.as_ref().and_then(|layout| layout.rows.get(idx));
+        // The lane art takes the node's own STATE color, so an edge reads as
+        // "this is what `verify` is waiting on" at a glance — the same color key
+        // the list and the detail rail already use (RULE 7: theme tokens only).
+        let lane_style =
+            theme.selection_aware_text_style(selected, node_state_color(&node.state, theme));
+        // Line 1 is the workflow label, prefixed by the connector when this node
+        // joins dependencies living in other lanes.
+        let mut lines = vec![match row.filter(|row| !row.connector.is_empty()) {
+            Some(row) => Line::from(vec![
+                Span::styled(format!("{} ", row.connector), lane_style),
+                Span::styled(
+                    truncate(&node.workflow, 30),
+                    theme
+                        .selection_aware_text_style(selected, theme.text.heading)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            None => Line::styled(
+                truncate(&node.workflow, 36),
+                theme
+                    .selection_aware_text_style(selected, theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        }];
         lines.push(Line::from(vec![
+            Span::styled(
+                row.map_or_else(String::new, |row| format!("{} ", row.node)),
+                lane_style,
+            ),
             Span::styled(
                 marker,
                 theme.selection_aware_text_style(selected, theme.focus.active),
@@ -4425,10 +5095,16 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 theme.selection_aware_text_style(selected, node_state_color(&node.state, theme)),
             ),
         ]));
-        lines.push(Line::styled(
-            format!("    {}", truncate(&node.action, 34)),
-            theme.selection_aware_text_style(selected, theme.text.muted),
-        ));
+        lines.push(Line::from(vec![
+            Span::styled(
+                row.map_or_else(String::new, |row| format!("{} ", row.trail)),
+                lane_style,
+            ),
+            Span::styled(
+                format!("    {}", truncate(&node.action, 34)),
+                theme.selection_aware_text_style(selected, theme.text.muted),
+            ),
+        ]));
         let item = ListItem::new(lines);
         items.push(if selected {
             item.style(theme.selection_style())
@@ -4558,6 +5234,41 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     }
 }
 
+/// The narrowest node list that still has room for lane art. Below this the
+/// columns the lanes would consume come straight out of the node id, so the pane
+/// keeps the plain topological list instead (rubric 5's explicit degradation).
+const MIN_DAG_LIST_WIDTH: u16 = 30;
+
+/// Lay the workflow node list out into ASCII DAG lanes, or `None` to keep the
+/// flat list.
+///
+/// Returns `None` when there is nothing to gain or no room to draw: a graph with
+/// no edges at all, more lanes than [`crate::dag::MAX_LANES`], or a list column
+/// too narrow to spare the lane characters. Nodes carrying no `depends_on_ids`
+/// (a projection from before edges existed) fall into the no-edges case, so an
+/// older client degrades to exactly what it rendered before.
+fn workflow_lanes(nodes: &[crate::state::WorkflowNodeCard], width: u16) -> Option<DagLayout> {
+    if nodes.is_empty() || width < MIN_DAG_LIST_WIDTH {
+        return None;
+    }
+    let layout = crate::dag::lay_out(
+        &nodes
+            .iter()
+            .map(|node| crate::dag::DagNode {
+                id: node.id.clone(),
+                depends_on: node.depends_on_ids.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    // The lane prefix costs `lanes + 1` columns on every line; refuse when that
+    // would eat into the node id rather than truncating the graph into a lie.
+    let affordable = u16::try_from(layout.lanes + 1).unwrap_or(u16::MAX);
+    (layout.has_edges
+        && layout.lanes <= crate::dag::MAX_LANES
+        && width.saturating_sub(affordable) >= MIN_DAG_LIST_WIDTH - affordable)
+        .then_some(layout)
+}
+
 /// Color for a workflow node's lifecycle state. Terminal-success reads calm;
 /// active states draw the eye; failure/blocked read as error; not-yet-run
 /// (`pending`) and `skipped` stay quiet.
@@ -4569,6 +5280,180 @@ fn node_state_color(state: &str, theme: &Theme) -> Color {
         "failed" | "blocked" => theme.status.error,
         "pending" => theme.status.info,
         _ => theme.text.muted,
+    }
+}
+
+/// Lines a board card occupies: title, then assignee/kind.
+const CARD_LINES: u16 = 2;
+
+/// Color for a board column, so the eye reads progress left to right — the same
+/// status palette the workflow pane uses, applied to columns instead of nodes.
+fn kanban_column_color(status: &str, theme: &Theme) -> Color {
+    match status {
+        "done" => theme.status.success,
+        "doing" => theme.status.running,
+        "review" => theme.status.warning,
+        _ => theme.status.info,
+    }
+}
+
+/// The repository task board (rubric 10): backlog cards laid out in status
+/// columns, live over the board's blackboard channel.
+///
+/// The counterpart of [`render_blackboard`] — the same durable rows, the same
+/// live channel — but arranged as a board rather than a feed, and *writable*: the
+/// focused card moves between columns with `→`/`←`, which the daemon applies as a
+/// supersession. Colors are Theme tokens only (RULE 7).
+fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(90, 86, area);
+    shield_modal(state, rect);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Task board ({} card(s)) ", state.kanban.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+
+    let columns = state.kanban_columns();
+    let lanes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(
+            columns
+                .iter()
+                .map(|_| Constraint::Ratio(1, columns.len() as u32))
+                .collect::<Vec<_>>(),
+        )
+        .split(rows[0]);
+
+    // `selected_card` indexes the board's flattened DISPLAY order, so the running
+    // offset below turns it back into "which card in which column" — one ordering
+    // shared by the renderer, the keyboard, and the hit regions.
+    let mut display_index = 0usize;
+    for (lane_index, (status, cards)) in columns.iter().enumerate() {
+        let lane = lanes[lane_index];
+        let column_color = kanban_column_color(status, theme);
+        let block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(theme.focus.inactive))
+            .title(Span::styled(
+                format!(" {status} ({}) ", cards.len()),
+                Style::default()
+                    .fg(column_color)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(theme.surface.overlay));
+        let body = block.inner(lane);
+        frame.render_widget(block, lane);
+
+        let capacity = (body.height / CARD_LINES) as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        if cards.is_empty() {
+            lines.push(Line::styled("  —", Style::default().fg(theme.text.muted)));
+        }
+        for (slot, card) in cards.iter().enumerate().take(capacity) {
+            let index = display_index + slot;
+            let selected = index == state.selected_card;
+            let marker = if selected { "\u{203a} " } else { "  " };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    marker,
+                    theme.selection_aware_text_style(selected, theme.focus.active),
+                ),
+                Span::styled(
+                    truncate(&card.title, lane.width.saturating_sub(4) as usize),
+                    theme.selection_aware_text_style(selected, theme.text.primary),
+                ),
+            ]));
+            lines.push(Line::styled(
+                format!("    {} \u{b7} {}", card.assignee, card.kind),
+                theme.selection_aware_text_style(selected, theme.text.muted),
+            ));
+            if let Some(hit) = visible_row_hit(body, slot, CARD_LINES) {
+                state.register_hit(hit, Action::ActivateRow(index));
+            }
+        }
+        // A column taller than the pane says so rather than silently hiding work.
+        if cards.len() > capacity {
+            lines.push(Line::styled(
+                format!("  +{} more", cards.len() - capacity),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(theme.surface.overlay)),
+            body,
+        );
+        display_index += cards.len();
+    }
+
+    let footer = match state.focused_card() {
+        Some(card) => vec![
+            Line::from(vec![
+                Span::styled("  card: ", Style::default().fg(theme.text.muted)),
+                Span::styled(
+                    truncate(&card.title, 48),
+                    Style::default().fg(theme.text.primary),
+                ),
+                Span::styled(
+                    format!("  by {}", card.author),
+                    Style::default().fg(theme.text.secondary),
+                ),
+            ]),
+            Line::styled(
+                "  \u{2190}/\u{2192} move column \u{b7} \u{2191}/\u{2193} card \u{b7} Esc close",
+                Style::default().fg(theme.focus.active),
+            ),
+        ],
+        None => vec![
+            Line::styled("  No cards yet", Style::default().fg(theme.text.secondary)),
+            Line::styled(
+                "  Ask an agent to break a feature into backlog cards, or add one from chat.",
+                Style::default().fg(theme.text.muted),
+            ),
+        ],
+    };
+    frame.render_widget(Paragraph::new(footer), rows[1]);
+
+    // Mouse parity for the two column-move affordances named on the footer line.
+    if rows[1].height >= 2 && state.focused_card().is_some() {
+        let y = rows[1].y.saturating_add(1);
+        let x = rows[1].x.saturating_add(2);
+        state.register_hit(
+            Rect {
+                x,
+                y,
+                width: 1.min(rows[1].right().saturating_sub(x)),
+                height: 1,
+            },
+            Action::MoveCardBack,
+        );
+        let forward = x.saturating_add(2);
+        state.register_hit(
+            Rect {
+                x: forward,
+                y,
+                width: 1.min(rows[1].right().saturating_sub(forward)),
+                height: 1,
+            },
+            Action::MoveCardForward,
+        );
     }
 }
 
@@ -5201,10 +6086,19 @@ fn render_querying(
     // Compact two-line progress state; the absolute minimum keeps the content
     // visible on short terminals.
     let lines = vec![
-        Line::styled(
-            format!("Fetching models from {provider_id}…"),
-            Style::default().fg(theme.text.heading),
-        ),
+        // A turning spinner is the only signal that the fetch is still alive:
+        // this box has no other moving part, and a slow provider left it
+        // looking frozen.
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", spinner_frame(state.tick)),
+                Style::default().fg(theme.agent.tool),
+            ),
+            Span::styled(
+                format!("Fetching models from {provider_id}…"),
+                Style::default().fg(theme.text.heading),
+            ),
+        ]),
         Line::styled("Esc to cancel", Style::default().fg(theme.text.muted)),
     ];
     let rect = centered_rect_min(70, 20, 44, 5, area);
@@ -5227,9 +6121,13 @@ fn render_querying(
 }
 
 /// The add-model pick-list (model-discovery): a filter line over the provider's
-/// fetched model ids, the same shape as [`render_model_picker`] but over plain
-/// `String` names (there is no `ModelCard` detail to show). Colors are Theme
-/// tokens only (RULE 7). The key is NOT in scope here.
+/// offerable models, each row a card — id, display name, context window, and
+/// USD per 1M input/output tokens — merged by the harness from the live
+/// `/models` listing and the built-in catalog. A `~` marks a catalog-only row
+/// (offerable, but not confirmed by the provider just now), and the header
+/// states where the list came from, so a cached or catalog-only list is never
+/// mistaken for a live one. Prices are display-only (never summed). Colors are
+/// Theme tokens only (RULE 7). The key is NOT in scope here.
 #[allow(clippy::too_many_arguments)] // mirrors the model/provider picker signatures + `state` (Task 8)
 fn render_add_model_pick(
     frame: &mut Frame,
@@ -5237,20 +6135,30 @@ fn render_add_model_pick(
     state: &AppState,
     theme: &Theme,
     provider_id: &str,
-    models: &[String],
+    models: &[AddModelRow],
     query: &str,
     selected: usize,
+    origin: &ModelListOrigin,
+    refreshing: bool,
 ) {
     let matches = filter_model_names(models, query);
-    let rect = centered_modal(area, 84, 24);
+    let rect = centered_modal(area, 96, 26);
+    let source = match origin {
+        ModelListOrigin::Live => "live list".to_owned(),
+        ModelListOrigin::Cached(age) => format!("cached {age}"),
+        ModelListOrigin::Catalog(reason) if reason.is_empty() => "catalog".to_owned(),
+        ModelListOrigin::Catalog(reason) => format!("catalog · {reason}"),
+    };
     let inner = modal_surface(
         frame,
         rect,
         format!(
-            "Add model · {}  ·  {} of {} results",
+            "Add model · {}  ·  {} of {} results  ·  {}{}",
             truncate_display_width(provider_id, 24),
             matches.len(),
-            models.len()
+            models.len(),
+            source,
+            if refreshing { " · refreshing…" } else { "" }
         ),
         state,
         theme,
@@ -5267,13 +6175,15 @@ fn render_add_model_pick(
     render_modal_search(frame, rows[0], query, theme);
 
     let list_block = modal_panel(
-        format!("Models  ·  {} of {}", matches.len(), models.len()),
+        format!(
+            "Models  ·  {} of {}  ·  ctx · $/1M in · out",
+            matches.len(),
+            models.len()
+        ),
         theme,
     );
     let list_area = list_block.inner(rows[1]);
     frame.render_widget(list_block, rows[1]);
-    let visible_rows = usize::from(list_area.height).max(1);
-    let first = first_visible_row(selected, matches.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if models.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -5286,22 +6196,47 @@ fn render_add_model_pick(
             Style::default().fg(theme.text.muted),
         )));
     }
+    // Two lines per row: the id (with a live/catalog marker), then the
+    // metadata columns. A row whose metadata is entirely unknown still shows
+    // its dashes rather than collapsing, so the columns stay aligned.
+    const ROW_LINES: usize = 2;
+    let visible_rows = (usize::from(list_area.height) / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
     for (row, &idx) in matches.iter().enumerate().skip(first) {
         let is_selected = row == selected;
+        let card = &models[idx];
         let head = Line::from(vec![
             Span::styled(
                 if is_selected { "▎ " } else { "  " },
                 theme.selection_aware_text_style(is_selected, theme.focus.active),
             ),
             Span::styled(
-                truncate_display_width(
-                    &models[idx],
-                    usize::from(list_area.width.saturating_sub(2)),
+                if card.live { "✓ " } else { "~ " },
+                theme.selection_aware_text_style(
+                    is_selected,
+                    if card.live {
+                        theme.status.success
+                    } else {
+                        theme.text.muted
+                    },
                 ),
+            ),
+            Span::styled(
+                truncate_display_width(&card.id, usize::from(list_area.width.saturating_sub(4))),
                 theme.selection_aware_text_style(is_selected, theme.text.primary),
             ),
         ]);
-        let item = ListItem::new(vec![head]);
+        let detail = Line::styled(
+            format!(
+                "      {} · ctx {} · in {} · out {}",
+                card.name.as_deref().unwrap_or("—"),
+                context_label(card.context_tokens),
+                price_per_1m_label(card.cost_per_1m_input_usd),
+                price_per_1m_label(card.cost_per_1m_output_usd),
+            ),
+            theme.selection_aware_text_style(is_selected, theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, detail]);
         items.push(if is_selected {
             item.style(theme.selection_style())
         } else {
@@ -5312,20 +6247,376 @@ fn render_add_model_pick(
         List::new(items).style(Style::default().bg(theme.surface.panel)),
         list_area,
     );
-    // Each row is a single line — register a 1-row rect per filtered row.
+    // Each row is two lines tall — register a matching rect per filtered row.
     for (row, _) in matches.iter().enumerate().skip(first) {
-        let Some(hit) = visible_row_hit(list_area, row - first, 1) else {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
             break;
         };
         state.register_hit(hit, Action::ActivateRow(row));
     }
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "↑/↓ select  ·  Enter add  ·  Esc close",
+            "↑/↓ select  ·  Enter add  ·  Ctrl-R refresh  ·  Esc close",
             Style::default().fg(theme.text.muted),
         ))
         .alignment(Alignment::Center),
         rows[2],
+    );
+}
+
+/// Compact centered message for a loading step of the Unsloth catalog flow
+/// (repo listing / quant listing) — the same two-line shape as
+/// [`render_querying`], but a standalone function rather than a call into
+/// that sibling-owned one (it is specific to the add-model flow's wording).
+fn render_unsloth_loading(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    message: &str,
+) {
+    let rect = centered_rect_min(60, 20, 48, 6, area);
+    shield_modal(state, rect);
+    frame.render_widget(Clear, rect);
+    let lines = vec![
+        Line::styled(message.to_owned(), Style::default().fg(theme.text.heading)),
+        Line::styled("Esc to cancel", Style::default().fg(theme.text.muted)),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Local models: Unsloth catalog ")
+        .border_style(Style::default().fg(theme.surface.border))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
+
+/// Step 1: the Unsloth GGUF repo browser — a fuzzy-filterable list of repos
+/// (id, downloads, likes, last updated), the same shape as
+/// [`render_add_model_pick`]. `Enter` on a row moves to step 2 (its quant
+/// variants).
+#[allow(clippy::too_many_arguments)]
+fn render_unsloth_repos(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    repos: &[UnslothRepoCard],
+    query: &str,
+    selected: usize,
+    loading: bool,
+) {
+    if loading {
+        render_unsloth_loading(
+            frame,
+            area,
+            state,
+            theme,
+            "Fetching the Unsloth catalog from Hugging Face…",
+        );
+        return;
+    }
+    let matches = filter_unsloth_repos(repos, query);
+    let rect = centered_modal(area, 108, 30);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!(
+            "Local models: Unsloth catalog  ·  {} of {} repos",
+            matches.len(),
+            repos.len()
+        ),
+        state,
+        theme,
+    );
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    render_modal_search(frame, rows[0], query, theme);
+
+    const ROW_LINES: usize = 2;
+    let list_block = modal_panel("Repos (by downloads)", theme);
+    let list_area = list_block.inner(rows[1]);
+    frame.render_widget(list_block, rows[1]);
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
+    let mut items: Vec<ListItem> = Vec::new();
+    if repos.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no repos returned",
+            Style::default().fg(theme.text.muted),
+        )));
+    } else if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching repo",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate().skip(first) {
+        let card = &repos[idx];
+        let is_selected = row == selected;
+        let head = Line::from(vec![
+            Span::styled(
+                if is_selected { "▎ " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.focus.active),
+            ),
+            Span::styled(
+                truncate_display_width(&card.id, usize::from(list_area.width.saturating_sub(2))),
+                theme.selection_aware_text_style(is_selected, theme.text.primary),
+            ),
+        ]);
+        let metadata_line = Line::styled(
+            format!(
+                "      {} · {} · {}",
+                card.downloads_label, card.likes_label, card.updated_label
+            ),
+            theme.selection_aware_text_style(is_selected, theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, metadata_line]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
+        list_area,
+    );
+    for (row, _) in matches.iter().enumerate().skip(first) {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
+            break;
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ select  ·  Enter browse quants  ·  Esc close",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
+}
+
+/// Step 2: the quant-variant browser for the repo chosen in step 1 — the
+/// same fuzzy-filterable shape as [`render_unsloth_repos`], one row per quant
+/// with its download size. `Enter` on a row moves to step 3 (confirm pull).
+#[allow(clippy::too_many_arguments)]
+fn render_unsloth_quants(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    repo_id: &str,
+    quants: &[UnslothQuantCard],
+    query: &str,
+    selected: usize,
+    loading: bool,
+) {
+    if loading {
+        render_unsloth_loading(
+            frame,
+            area,
+            state,
+            theme,
+            &format!("Fetching quant variants for {repo_id}…"),
+        );
+        return;
+    }
+    let matches = filter_unsloth_quants(quants, query);
+    let rect = centered_modal(area, 90, 28);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!(
+            "{}  ·  {} of {} quants",
+            truncate_display_width(repo_id, 60),
+            matches.len(),
+            quants.len()
+        ),
+        state,
+        theme,
+    );
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    render_modal_search(frame, rows[0], query, theme);
+
+    const ROW_LINES: usize = 2;
+    let list_block = modal_panel("Quants (smallest first)", theme);
+    let list_area = list_block.inner(rows[1]);
+    frame.render_widget(list_block, rows[1]);
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
+    let mut items: Vec<ListItem> = Vec::new();
+    if quants.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no GGUF quants found in this repo",
+            Style::default().fg(theme.text.muted),
+        )));
+    } else if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching quant",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate().skip(first) {
+        let card = &quants[idx];
+        let is_selected = row == selected;
+        let head = Line::from(vec![
+            Span::styled(
+                if is_selected { "▎ " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.focus.active),
+            ),
+            Span::styled(
+                card.quant.clone(),
+                theme.selection_aware_text_style(is_selected, theme.text.primary),
+            ),
+        ]);
+        let files_label = if card.file_count == 1 {
+            "1 file".to_string()
+        } else {
+            format!("{} files", card.file_count)
+        };
+        let metadata_line = Line::styled(
+            format!("      {} · {files_label}", card.size_label),
+            theme.selection_aware_text_style(is_selected, theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, metadata_line]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
+        list_area,
+    );
+    for (row, _) in matches.iter().enumerate().skip(first) {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
+            break;
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ select  ·  Enter choose  ·  Esc close",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
+}
+
+/// Step 4: live `ollama pull` progress, then the registered-model (or
+/// failure) notice once it completes. Non-interactive except `Esc`: closing
+/// this view does NOT cancel the pull, which keeps running detached (see
+/// [`Overlay::UnslothPulling`]'s doc comment).
+#[allow(clippy::too_many_arguments)]
+fn render_unsloth_pulling(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    repo_id: &str,
+    quant: &str,
+    lines: &[String],
+    done: bool,
+    error: Option<&str>,
+    registered_id: Option<&str>,
+) {
+    let rect = centered_modal(area, 104, 26);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!("Pulling {repo_id}:{quant}"),
+        state,
+        theme,
+    );
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    let log_block = modal_panel("ollama pull output", theme);
+    let log_area = log_block.inner(rows[0]);
+    frame.render_widget(log_block, rows[0]);
+    let visible = usize::from(log_area.height).max(1);
+    let reserved = if done {
+        3.min(visible.saturating_sub(1))
+    } else {
+        0
+    };
+    let start = lines
+        .len()
+        .saturating_sub(visible.saturating_sub(reserved).max(1));
+    let mut text: Vec<Line> = if lines.is_empty() {
+        vec![Line::styled(
+            "waiting for ollama to start…",
+            Style::default().fg(theme.text.muted),
+        )]
+    } else {
+        lines[start..]
+            .iter()
+            .map(|l| Line::styled(l.clone(), Style::default().fg(theme.text.secondary)))
+            .collect()
+    };
+    if done {
+        text.push(Line::raw(""));
+        if let Some(id) = registered_id {
+            text.push(Line::styled(
+                format!("Registered as `{id}`."),
+                Style::default()
+                    .fg(theme.status.success)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            text.push(Line::styled(
+                format!("Run `codypendent models bench {id}` to measure it for routing."),
+                Style::default().fg(theme.text.muted),
+            ));
+        } else if let Some(error) = error {
+            text.push(Line::styled(
+                format!("Pull failed: {error}"),
+                Style::default()
+                    .fg(theme.status.error)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), log_area);
+
+    let footer = if done {
+        "pull finished  ·  Esc close"
+    } else {
+        "pulling…  ·  Esc closes this view (the pull keeps running)"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(footer, Style::default().fg(theme.text.muted)))
+            .alignment(Alignment::Center),
+        rows[1],
     );
 }
 
@@ -5514,6 +6805,152 @@ fn action_kind(action: &ProposedAction) -> &'static str {
         ProposedAction::AcpToolCall { .. } => "acp tool",
         _ => "unsupported",
     }
+}
+
+/// The council browser (rubric 6 TUI wiring): a scrollable list of persisted
+/// councils on the left, and a detail panel on the right showing the focused
+/// council's chair, rounds, evidence mode, and every member's model/role —
+/// the same list+detail shape as [`render_ui_plugins`]/[`render_skills`].
+fn render_council_browser(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(90, 86, area);
+    shield_modal(state, rect);
+    frame.render_widget(Clear, rect);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Agent councils ({}) ", state.councils.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(rows[0]);
+
+    const ROW_LINES: usize = 2;
+    let visible = (cols[0].height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(state.selected_council, state.councils.len(), visible);
+    let mut items = Vec::new();
+    if state.councils.is_empty() {
+        items.push(ListItem::new(vec![
+            Line::styled(
+                "  No councils configured",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  Press n to create one",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
+    }
+    for (index, council) in state.councils.iter().enumerate().skip(first).take(visible) {
+        let selected = index == state.selected_council;
+        let head = Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                theme.selection_aware_text_style(selected, theme.focus.active),
+            ),
+            Span::styled(
+                truncate(&council.name, 30),
+                theme.selection_aware_text_style(selected, theme.text.primary),
+            ),
+        ]);
+        let meta = Line::styled(
+            format!(
+                "    {} member(s) · {} round(s){}",
+                council.members.len(),
+                council.rounds,
+                if council.evidence { " · evidence" } else { "" }
+            ),
+            theme.selection_aware_text_style(selected, theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, meta]);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+    for (screen_row, index) in (first..state.councils.len()).take(visible).enumerate() {
+        if let Some(hit) = visible_row_hit(cols[0], screen_row, ROW_LINES as u16) {
+            state.register_hit(hit, Action::ActivateRow(index));
+        }
+    }
+
+    let detail = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive));
+    let detail_inner = detail.inner(cols[1]);
+    frame.render_widget(detail, cols[1]);
+    let mut lines = Vec::new();
+    if let Some(council) = state.focused_council() {
+        lines.push(Line::styled(
+            council.name.clone(),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if !council.description.is_empty() {
+            lines.push(Line::styled(
+                council.description.clone(),
+                Style::default().fg(theme.text.secondary),
+            ));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(format!("  chair: {}", council.chair)));
+        lines.push(Line::from(format!("  rounds: {}", council.rounds)));
+        lines.push(Line::from(format!(
+            "  evidence mode: {}",
+            if council.evidence { "on" } else { "off" }
+        )));
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "Members:",
+            Style::default().fg(theme.text.secondary),
+        ));
+        for (model, role) in &council.members {
+            lines.push(Line::from(format!("  - {model} · {role}")));
+        }
+    } else {
+        lines.push(Line::styled(
+            "No council selected.",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        detail_inner,
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "  ↑/↓ select · n new council",
+                Style::default().fg(theme.text.muted),
+            ),
+            Line::styled(
+                "  r run (prompts for objective) · d delete · Esc close",
+                Style::default().fg(theme.focus.active),
+            ),
+        ]),
+        rows[1],
+    );
 }
 
 fn render_council_builder(
@@ -6410,13 +7847,15 @@ fn format_cost(cost_minor: Option<u64>) -> String {
     }
 }
 
+/// Fit `text` into `max` **display columns** (not chars), ellipsing the tail.
+///
+/// Every caller here is fitting text into a column budget, so counting `char`s
+/// was wrong for any CJK or emoji content: a 26-char CJK name is 52 columns
+/// wide and overflowed its cell, shoving the rest of the row out of alignment.
+/// This is deliberately the very same function the pickers use — one
+/// implementation, so the two can never drift apart again.
 fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_owned()
-    } else {
-        let kept: String = text.chars().take(max.saturating_sub(1)).collect();
-        format!("{kept}…")
-    }
+    truncate_display_width(text, max)
 }
 
 fn short_id(id: &impl std::fmt::Display) -> String {
@@ -6549,6 +7988,18 @@ mod tests {
         })
     }
 
+    /// The default transcript walk parameters for the geometry tests: no run
+    /// owns click targets, nothing is browsed, tick 0.
+    fn test_view<'t>(theme: &'t Theme, inner_width: u16) -> TranscriptView<'t> {
+        TranscriptView {
+            theme,
+            selected_run: 0,
+            browsed: None,
+            inner_width,
+            tick: 0,
+        }
+    }
+
     fn render_to_string(state: &AppState, w: u16, h: u16) -> String {
         let theme = Theme::dark();
         buffer_text(&render_buffer(state, w, h, &theme))
@@ -6642,6 +8093,100 @@ mod tests {
         assert!(
             review.contains("Enter create council"),
             "review action:\n{review}"
+        );
+    }
+
+    fn council_card(name: &str, chair: &str, evidence: bool) -> crate::state::CouncilCard {
+        crate::state::CouncilCard {
+            name: name.to_owned(),
+            description: "Independent architecture review".to_owned(),
+            chair: chair.to_owned(),
+            rounds: 2,
+            evidence,
+            members: vec![
+                ("claude-reviewer".to_owned(), "security reviewer".to_owned()),
+                ("kimi-architect".to_owned(), "systems architect".to_owned()),
+            ],
+        }
+    }
+
+    /// Rubric 6 (TUI wiring): the browser's list + detail pane, and the run
+    /// objective / delete confirm overlays that hang off it.
+    #[test]
+    fn council_browser_renders_list_detail_and_its_sub_overlays() {
+        let mut state = AppState::new();
+        state.councils = vec![
+            council_card("design-council", "amp-chair", false),
+            council_card("grounded-council", "amp-chair", true),
+        ];
+        state.overlay = Overlay::CouncilBrowser;
+        let browser = render_to_string(&state, 100, 30);
+        assert!(browser.contains("Agent councils"), "title:\n{browser}");
+        assert!(browser.contains("design-council"), "list row:\n{browser}");
+        assert!(
+            browser.contains("grounded-council"),
+            "second list row:\n{browser}"
+        );
+        // The focused (first) council's detail pane.
+        assert!(browser.contains("amp-chair"), "chair detail:\n{browser}");
+        assert!(
+            browser.contains("security reviewer"),
+            "member detail:\n{browser}"
+        );
+        assert!(
+            browser.contains("evidence mode: off"),
+            "evidence off for the focused (first) council:\n{browser}"
+        );
+        assert!(
+            browser.contains("run") && browser.contains("delete"),
+            "footer hints:\n{browser}"
+        );
+        assert!(state
+            .hit_map
+            .borrow()
+            .iter()
+            .any(|(_, action)| matches!(action, Action::ActivateRow(1))));
+
+        state.overlay = Overlay::CouncilRunObjective {
+            name: "design-council".to_owned(),
+            buffer: "Choose a storage engine".to_owned(),
+        };
+        let prompt = render_to_string(&state, 100, 30);
+        assert!(
+            prompt.contains("design-council"),
+            "run prompt names the council:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Choose a storage engine"),
+            "run prompt shows the typed objective:\n{prompt}"
+        );
+
+        state.overlay = Overlay::ConfirmCouncilDelete {
+            name: "design-council".to_owned(),
+        };
+        let confirm = render_to_string(&state, 100, 30);
+        assert!(
+            confirm.contains("design-council"),
+            "delete confirm names the council:\n{confirm}"
+        );
+        assert!(
+            confirm.contains("remain on disk"),
+            "delete confirm reassures reports survive:\n{confirm}"
+        );
+    }
+
+    #[test]
+    fn council_browser_with_no_councils_prompts_to_create_one() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::CouncilBrowser;
+        let empty = render_to_string(&state, 100, 30);
+        assert!(
+            empty.contains("No councils configured"),
+            "empty state:\n{empty}"
+        );
+        assert!(
+            empty.contains("No council selected"),
+            "empty detail pane:\n{empty}"
         );
     }
 
@@ -6779,18 +8324,52 @@ mod tests {
         assert_eq!(resolve(0, 2), Some(Action::Dismiss));
     }
 
+    /// The cursor cell — a reversed cell, so it inverts the character it sits
+    /// on instead of displacing the text — as `(x, y)` positions in a frame.
+    fn cursor_cells(buffer: &Buffer) -> Vec<(u16, u16)> {
+        let area = *buffer.area();
+        let mut cells = Vec::new();
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                if buffer[(x, y)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+                {
+                    cells.push((x, y));
+                }
+            }
+        }
+        cells
+    }
+
     #[test]
     fn a_soft_wrapped_composer_keeps_its_cursor_visible() {
         let mut state = AppState::new();
         state.composer = "a long narrow draft ".repeat(12);
-        let text = render_to_string(&state, 40, 18);
+        state.composer_cursor = state.composer.len();
+        let theme = Theme::dark();
+        let buffer = render_buffer(&state, 40, 18, &theme);
+        let cells = cursor_cells(&buffer);
+        assert_eq!(cells.len(), 1, "exactly one cursor cell is painted");
+        // The draft overflows the capped box, so the cursor's row must have
+        // been scrolled to — it can never sit below the composer's last row.
         assert!(
-            text.contains('▏'),
-            "composer cursor scrolled out of view:\n{text}"
+            cells[0].1 < 18,
+            "composer cursor scrolled out of view: {cells:?}"
         );
         assert_eq!(
             composer_box_height(&state.composer, 40),
             COMPOSER_MAX_HEIGHT
+        );
+
+        // With the cursor moved to the very start, the composer scrolls back to
+        // the draft's first row and paints the cursor there instead.
+        state.composer_cursor = 0;
+        let top = cursor_cells(&render_buffer(&state, 40, 18, &theme));
+        assert_eq!(top.len(), 1);
+        assert!(
+            top[0].1 < cells[0].1,
+            "moving the cursor home scrolls the composer back up: {top:?} vs {cells:?}"
         );
     }
 
@@ -8671,11 +10250,13 @@ mod tests {
                     id: "b1".to_owned(),
                     kind: "heading".to_owned(),
                     text: "Charging a customer".to_owned(),
+                    editable: Some("Charging a customer".to_owned()),
                 },
                 DocBlockView {
                     id: "b2".to_owned(),
                     kind: "paragraph".to_owned(),
                     text: "Call charge_customer with an idempotency key.".to_owned(),
+                    editable: Some("Call charge_customer with an idempotency key.".to_owned()),
                 },
             ],
             suggestions: vec![DocSuggestionView {
@@ -8714,6 +10295,7 @@ mod tests {
                 id: format!("b{index}"),
                 kind: "paragraph".to_owned(),
                 text: format!("block-{index}"),
+                editable: Some(format!("block-{index}")),
             });
         }
         state.doc_focus = DocFocus::Editor;
@@ -8907,6 +10489,8 @@ mod tests {
                 requires_key: true,
                 can_list_models: true,
                 available: true,
+                catalog_models: 12,
+                has_key: false,
             },
             ProviderCard {
                 id: "ollama".to_owned(),
@@ -8917,6 +10501,8 @@ mod tests {
                 requires_key: false,
                 can_list_models: true,
                 available: true,
+                catalog_models: 0,
+                has_key: false,
             },
         ];
         reduce(&mut state, Action::OpenPalette);
@@ -8966,6 +10552,8 @@ mod tests {
             requires_key: true,
             can_list_models: true,
             available: true,
+            catalog_models: 0,
+            has_key: false,
         }];
         reduce(&mut state, Action::OpenPalette);
         for c in "provider".chars() {
@@ -9289,9 +10877,21 @@ mod tests {
         state.overlay = Overlay::AddModelPick {
             provider_id: "groq".to_owned(),
             api_key: None,
-            models: vec!["llama-3.1-8b".to_owned(), "gpt-oss-20b".to_owned()],
+            models: vec![
+                AddModelRow {
+                    id: "llama-3.1-8b".to_owned(),
+                    name: Some("Llama 3.1 8B".to_owned()),
+                    context_tokens: Some(128_000),
+                    cost_per_1m_input_usd: Some(0.05),
+                    cost_per_1m_output_usd: Some(0.08),
+                    live: true,
+                },
+                AddModelRow::live("gpt-oss-20b"),
+            ],
             query: "llama".to_owned(),
             selected: 0,
+            origin: ModelListOrigin::Live,
+            refreshing: false,
         };
         let text = render_to_string(&state, 100, 30);
         assert!(
@@ -9305,6 +10905,220 @@ mod tests {
         assert!(
             !text.contains("gpt-oss-20b"),
             "a non-matching model is filtered out:\n{text}"
+        );
+        // The catalog metadata columns are what make the pick-list a decision
+        // surface rather than a list of opaque ids.
+        assert!(
+            text.contains("Llama 3.1 8B"),
+            "the display name shows:\n{text}"
+        );
+        assert!(text.contains("ctx 128k"), "the context column:\n{text}");
+        assert!(
+            text.contains("in $0.05") && text.contains("out $0.08"),
+            "the per-1M price columns:\n{text}"
+        );
+        assert!(
+            text.contains("live list"),
+            "the header states where the rows came from:\n{text}"
+        );
+    }
+
+    /// A provider with no listing endpoint but curated catalog rows must say so
+    /// on its card — the operator needs to know the flow will still work.
+    #[test]
+    fn provider_card_badges_a_catalog_only_provider() {
+        let mut state = running_build_state();
+        state.providers = vec![ProviderCard {
+            id: "perplexity".to_owned(),
+            name: "Perplexity".to_owned(),
+            protocol: "openai-chat".to_owned(),
+            auth: "api-key: PERPLEXITY_API_KEY".to_owned(),
+            local: false,
+            requires_key: true,
+            can_list_models: false,
+            available: true,
+            catalog_models: 7,
+            has_key: false,
+        }];
+        reduce(&mut state, Action::OpenPalette);
+        for c in "provider".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputSubmit);
+        let text = render_to_string(&state, 120, 30);
+        assert!(
+            text.contains("catalog 7 models"),
+            "a provider with no live listing advertises its curated rows:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unsloth_repos_loading_shows_a_fetching_message() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothRepos {
+            repos: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+        };
+        let text = render_to_string(&state, 80, 24);
+        assert!(
+            text.contains("Fetching the Unsloth catalog"),
+            "the loading message:\n{text}"
+        );
+        assert!(text.contains("Esc to cancel"), "the cancel hint:\n{text}");
+    }
+
+    #[test]
+    fn unsloth_repos_lists_and_filters_by_id() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothRepos {
+            repos: vec![
+                UnslothRepoCard {
+                    id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                    downloads_label: "6.6M downloads".to_owned(),
+                    likes_label: "891 likes".to_owned(),
+                    updated_label: "updated 2026-01-30".to_owned(),
+                },
+                UnslothRepoCard {
+                    id: "unsloth/gpt-oss-20b-GGUF".to_owned(),
+                    downloads_label: "519.5K downloads".to_owned(),
+                    likes_label: "771 likes".to_owned(),
+                    updated_label: "updated 2025-12-19".to_owned(),
+                },
+            ],
+            query: "qwen3".to_owned(),
+            selected: 0,
+            loading: false,
+        };
+        let text = render_to_string(&state, 110, 30);
+        assert!(
+            text.contains("Local models: Unsloth catalog"),
+            "the browser title:\n{text}"
+        );
+        assert!(
+            text.contains("unsloth/Qwen3-32B-GGUF"),
+            "the matching repo lists:\n{text}"
+        );
+        assert!(
+            text.contains("6.6M downloads"),
+            "download count renders:\n{text}"
+        );
+        assert!(
+            !text.contains("gpt-oss-20b"),
+            "a non-matching repo is filtered out:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unsloth_quants_lists_sizes_and_file_counts() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothQuants {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quants: vec![
+                UnslothQuantCard {
+                    quant: "Q4_K_M".to_owned(),
+                    size_label: "19.8 GB".to_owned(),
+                    file_count: 1,
+                    size_bytes: 19_800_000_000,
+                },
+                UnslothQuantCard {
+                    quant: "BF16".to_owned(),
+                    size_label: "61.0 GB".to_owned(),
+                    file_count: 2,
+                    size_bytes: 61_000_000_000,
+                },
+            ],
+            query: String::new(),
+            selected: 0,
+            loading: false,
+        };
+        let text = render_to_string(&state, 90, 26);
+        assert!(
+            text.contains("unsloth/Qwen3-32B-GGUF"),
+            "the repo id is in the title:\n{text}"
+        );
+        assert!(text.contains("Q4_K_M"), "the quant tag:\n{text}");
+        assert!(text.contains("19.8 GB"), "the size label:\n{text}");
+        assert!(text.contains("2 files"), "the split-file count:\n{text}");
+    }
+
+    #[test]
+    fn unsloth_confirm_pull_names_the_repo_quant_and_size() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothConfirmPull {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            size_label: "18.7 GB".to_owned(),
+        };
+        let text = render_to_string(&state, 80, 24);
+        assert!(
+            text.contains("unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL"),
+            "the confirm names the exact pull reference:\n{text}"
+        );
+        assert!(text.contains("18.7 GB"), "the size estimate:\n{text}");
+    }
+
+    #[test]
+    fn unsloth_pulling_shows_progress_lines() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothPulling {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            lines: vec!["pulling manifest".to_owned(), "verifying sha256".to_owned()],
+            done: false,
+            error: None,
+            registered_id: None,
+        };
+        let text = render_to_string(&state, 90, 26);
+        assert!(text.contains("pulling manifest"), "progress line:\n{text}");
+        assert!(
+            text.contains("the pull keeps running"),
+            "the non-cancelling hint:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unsloth_pulling_done_shows_the_registered_id_and_bench_hint() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothPulling {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            lines: vec!["success".to_owned()],
+            done: true,
+            error: None,
+            registered_id: Some("hf.co/unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL".to_owned()),
+        };
+        let text = render_to_string(&state, 100, 26);
+        assert!(
+            text.contains("hf.co/unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL"),
+            "the registered id:\n{text}"
+        );
+        assert!(
+            text.contains("models bench"),
+            "the suggested next command:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unsloth_pulling_done_with_error_shows_the_failure() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothPulling {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            lines: Vec::new(),
+            done: true,
+            error: Some("ollama not found on PATH".to_owned()),
+            registered_id: None,
+        };
+        let text = render_to_string(&state, 100, 26);
+        assert!(
+            text.contains("Pull failed"),
+            "the failure is surfaced:\n{text}"
+        );
+        assert!(
+            text.contains("ollama not found on PATH"),
+            "the real error text:\n{text}"
         );
     }
 
@@ -9449,6 +11263,7 @@ mod tests {
                 approval: "before write".to_owned(),
                 retry: "1 attempt".to_owned(),
                 depends_on: "\u{2014}".to_owned(),
+                depends_on_ids: Vec::new(),
                 outputs: "proposed_patch".to_owned(),
                 cost: "\u{2014}".to_owned(),
                 error: "\u{2014}".to_owned(),
@@ -9469,6 +11284,7 @@ mod tests {
                 approval: "none".to_owned(),
                 retry: "2 attempts \u{b7} 5s backoff".to_owned(),
                 depends_on: "patch".to_owned(),
+                depends_on_ids: vec!["patch".to_owned()],
                 outputs: "test_result".to_owned(),
                 cost: "\u{2014}".to_owned(),
                 error: "\u{2014}".to_owned(),
@@ -9522,6 +11338,128 @@ mod tests {
                 .all(|(rect, _)| rect.width > 0),
             "cancel must never register a zero-width hit target"
         );
+    }
+
+    #[test]
+    fn workflow_view_draws_dag_lanes_and_degrades_to_the_plain_list() {
+        // Rubric 5: the pane must show the graph's EDGES, not just its order —
+        // `verify` depends on `patch`, so both sit in one lane joined by a
+        // node glyph and a trailing edge.
+        use crate::state::WorkflowNodeCard;
+        let mut state = running_build_state();
+        let card = |id: &str, deps: Vec<&str>| WorkflowNodeCard {
+            workflow_id: "repair-github-check".to_owned(),
+            workflow: "repair-github-check v1".to_owned(),
+            workflow_run_id: Some("workflow-run-1".to_owned()),
+            run_phase: "running".to_owned(),
+            inputs: "pull_request:github_pull_request*".to_owned(),
+            id: id.to_owned(),
+            action: "tool repository.test".to_owned(),
+            kind: "tool".to_owned(),
+            state: "pending".to_owned(),
+            agent: "\u{2014}".to_owned(),
+            model_policy: "\u{2014}".to_owned(),
+            workspace: "shared worktree".to_owned(),
+            approval: "none".to_owned(),
+            retry: "1 attempt".to_owned(),
+            depends_on: if deps.is_empty() {
+                "\u{2014}".to_owned()
+            } else {
+                deps.join(", ")
+            },
+            depends_on_ids: deps.iter().map(|d| (*d).to_owned()).collect(),
+            outputs: "test_result".to_owned(),
+            cost: "\u{2014}".to_owned(),
+            error: "\u{2014}".to_owned(),
+        };
+        state.workflow = vec![
+            card("patch", vec![]),
+            card("left", vec!["patch"]),
+            card("right", vec!["patch"]),
+            card("verify", vec!["left", "right"]),
+        ];
+        reduce(&mut state, Action::OpenWorkflow);
+        // The node's own row is the one carrying its selection marker; the lane
+        // art is the prefix in front of it.
+        let node_row = |text: &str, id: &str| -> String {
+            text.lines()
+                .find(|line| line.contains(&format!(" {id}  ")))
+                .unwrap_or_else(|| panic!("no row for `{id}`:\n{text}"))
+                .to_owned()
+        };
+        let wide = render_to_string(&state, 160, 40);
+        assert!(
+            node_row(&wide, "patch").contains('\u{25cf}'),
+            "the node glyph must prefix the node's row:\n{wide}"
+        );
+        assert!(
+            node_row(&wide, "right").contains('\u{2502}'),
+            "an edge in flight must be drawn as a vertical lane:\n{wide}"
+        );
+        assert!(
+            wide.contains('\u{2534}'),
+            "a fan-in must draw a join connector:\n{wide}"
+        );
+
+        // Degradation: with no edges at all there is nothing to draw, so the pane
+        // renders exactly the list it always did.
+        state.workflow = vec![card("patch", vec![]), card("verify", vec![])];
+        let flat = render_to_string(&state, 160, 40);
+        assert!(
+            !node_row(&flat, "patch").contains('\u{25cf}'),
+            "an edgeless graph must not paint lane art:\n{flat}"
+        );
+        assert!(
+            flat.contains("patch"),
+            "the plain list must survive:\n{flat}"
+        );
+    }
+
+    #[test]
+    fn kanban_view_renders_columns_and_offers_the_move_affordances() {
+        use crate::state::KanbanCard;
+        let mut state = running_build_state();
+        let card = |id: &str, title: &str, status: &str, assignee: &str| KanbanCard {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            status: status.to_owned(),
+            assignee: assignee.to_owned(),
+            kind: "task".to_owned(),
+            author: "agent".to_owned(),
+            ordinal: 0,
+        };
+        state.kanban = vec![
+            card("c1", "wire the DAG viewer", "todo", "dana"),
+            card("c2", "column-grouped board pane", "doing", "\u{2014}"),
+        ];
+        reduce(&mut state, Action::OpenKanban);
+        let text = render_to_string(&state, 140, 32);
+
+        assert!(text.contains("Task board"), "title missing:\n{text}");
+        for column in crate::state::KANBAN_COLUMNS {
+            assert!(text.contains(column), "column `{column}` missing:\n{text}");
+        }
+        assert!(
+            text.contains("wire the DAG viewer"),
+            "card title missing:\n{text}"
+        );
+        assert!(text.contains("dana"), "assignee missing:\n{text}");
+        assert!(text.contains("task"), "kind missing:\n{text}");
+
+        // Mouse parity: every card is clickable, and both column moves have a
+        // hit target (the keyboard-only affordance would otherwise be a gap).
+        let hits = state.hit_map.borrow();
+        for action in [
+            Action::ActivateRow(0),
+            Action::MoveCardForward,
+            Action::MoveCardBack,
+        ] {
+            assert!(
+                hits.iter()
+                    .any(|(rect, registered)| registered == &action && rect.width > 0),
+                "{action:?} needs a non-empty hit target"
+            );
+        }
     }
 
     #[test]
@@ -9648,11 +11586,9 @@ mod tests {
         assert!(total >= 5000, "measure sees the whole history: {total}");
         let (lines, _r0, _hits) = build_transcript_window(
             &s.runs,
-            &theme,
-            inner_width,
+            test_view(&theme, inner_width),
             total.saturating_sub(height),
             height,
-            0,
         );
         assert!(
             lines.len() <= height as usize + 4,
@@ -9696,7 +11632,7 @@ mod tests {
     fn finalized_model_renders_styled_heading() {
         let s = finalized_model_state("# Heading");
         let theme = Theme::dark();
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 0, 40, 0);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, test_view(&theme, 78), 0, 40);
         // A heading span is bold and coloured text.heading.
         let styled = lines.iter().flat_map(|l| l.spans.iter()).any(|sp| {
             sp.style.fg == Some(theme.text.heading)
@@ -9709,7 +11645,7 @@ mod tests {
     fn keyword_span_maps_to_syntax_keyword() {
         let s = finalized_model_state("```rust\nfn a() {}\n```");
         let theme = Theme::dark();
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 0, 40, 0);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, test_view(&theme, 78), 0, 40);
         let has_kw = lines
             .iter()
             .flat_map(|l| l.spans.iter())
@@ -9743,11 +11679,9 @@ mod tests {
         );
         let (lines, _r, _h) = build_transcript_window(
             &s.runs,
-            &theme,
-            inner_width,
+            test_view(&theme, inner_width),
             total.saturating_sub(height),
             height,
-            0,
         );
         assert!(
             lines.len() <= height as usize + 4,
@@ -9778,7 +11712,8 @@ mod tests {
         let s = user_turn_state();
         let theme = Theme::dark();
         let inner_width = 40u16;
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, inner_width, 0, 40, 0);
+        let (lines, _r, _h) =
+            build_transcript_window(&s.runs, test_view(&theme, inner_width), 0, 40);
         let user_line = lines
             .iter()
             .find(|l| l.spans.iter().any(|sp| sp.content.contains("my question")))
@@ -9799,7 +11734,7 @@ mod tests {
     fn ansi16_user_row_uses_an_accent_bar_not_a_bg() {
         let s = user_turn_state();
         let theme = Theme::ansi16(); // surface.user == surface.panel here
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 40, 0, 40, 0);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, test_view(&theme, 40), 0, 40);
         let user_line = lines
             .iter()
             .find(|l| l.spans.iter().any(|sp| sp.content.contains("my question")))
@@ -9827,7 +11762,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta { run_id, text: big }),
         );
         let theme = Theme::dark();
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 100, 20, 0);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, test_view(&theme, 78), 100, 20);
         assert!(
             lines.len() <= 24,
             "build still O(viewport): {}",
@@ -9839,8 +11774,9 @@ mod tests {
     fn theme_change_re_renders_without_re_parsing() {
         let s = finalized_model_state("# H");
         crate::markdown::reset_parse_calls();
-        let (dark, _r, _h) = build_transcript_window(&s.runs, &Theme::dark(), 78, 0, 40, 0);
-        let (light, _r, _h) = build_transcript_window(&s.runs, &Theme::light(), 78, 0, 40, 0);
+        let (dark, _r, _h) = build_transcript_window(&s.runs, test_view(&Theme::dark(), 78), 0, 40);
+        let (light, _r, _h) =
+            build_transcript_window(&s.runs, test_view(&Theme::light(), 78), 0, 40);
         assert_eq!(
             crate::markdown::parse_calls(),
             0,
@@ -9966,7 +11902,8 @@ mod tests {
         let rows: Vec<&str> = out.lines().collect();
         let user_header = rows
             .iter()
-            .position(|r| r.trim_matches('│').trim() == "You")
+            // (the header also carries its dim right-aligned turn clock)
+            .position(|r| r.trim_matches('│').trim_start().starts_with("You"))
             .expect("user turn header");
         assert!(
             !rows[user_header + 1].trim_matches('│').trim().is_empty(),
@@ -10081,7 +12018,7 @@ mod tests {
         // The viewport at the very TOP: the `You` header and the model-named
         // assistant header are among the first virtualized rows.
         let (top_lines, _r0, _hits) =
-            build_transcript_window(&s.runs, &theme, inner_width, 0, height, 0);
+            build_transcript_window(&s.runs, test_view(&theme, inner_width), 0, height);
         assert!(
             top_lines.len() <= height as usize + 4,
             "top-of-history build stays O(viewport), not O(history): {}",
@@ -10089,8 +12026,10 @@ mod tests {
         );
         assert!(
             // Task 8: the `You` row now carries the container bg, padded to
-            // `inner_width` — trim the trailing fill before the exact match.
-            top_lines.iter().any(|l| l.to_string().trim_end() == "You"),
+            // `inner_width`, and a right-aligned turn clock — match its head.
+            top_lines
+                .iter()
+                .any(|l| l.to_string().trim_start().starts_with("You")),
             "the user role header is one of the virtualized top rows"
         );
         assert!(
@@ -10104,16 +12043,118 @@ mod tests {
         // O(viewport), not O(history) — Task 2 must not undo Task 1's fix.
         let (tail_lines, _r0, _hits) = build_transcript_window(
             &s.runs,
-            &theme,
-            inner_width,
+            test_view(&theme, inner_width),
             total.saturating_sub(height),
             height,
-            0,
         );
         assert!(
             tail_lines.len() <= height as usize + 4,
             "tail-of-history build stays O(viewport), not O(history): {}",
             tail_lines.len()
+        );
+    }
+
+    /// The wrap-accounting contract: the measure pass (`cell_wrap_rows`, via
+    /// `Row::rows`) and the draw pass (`split_line_cells`) drive the same
+    /// `CellWrap` machine, so their row counts agree on EVERY input — plain
+    /// ASCII, long unbroken words, CJK/emoji wide glyphs straddling the row
+    /// boundary, zero-width combining marks, and empty lines.
+    #[test]
+    fn cell_wrap_measure_and_split_agree() {
+        let cases = [
+            "",
+            "short",
+            "a long sentence with several words that word-wrap would fold differently",
+            "one-unbreakable-hyphenless-word-longer-than-any-narrow-viewport-width",
+            "漢字が続く長い行はセル境界で折り返される必要がある",
+            "mixed 漢字 and ascii with emoji 🚀🚀🚀 straddling boundaries",
+            "e\u{301}e\u{301}e\u{301} combining marks join their base cell",
+        ];
+        for width in [1_u16, 2, 7, 10, 33] {
+            for case in cases {
+                let line = Line::from(vec![
+                    Span::styled("▌ ", Style::default()),
+                    Span::raw(case.to_owned()),
+                ]);
+                let measured = cell_wrap_rows(line.spans.iter().map(|s| s.content.as_ref()), width);
+                let split = split_line_cells(&line, width);
+                assert_eq!(
+                    measured as usize,
+                    split.len(),
+                    "measure/draw drift at width {width} for {case:?}"
+                );
+                // No visual row exceeds the viewport (except a single
+                // force-placed oversized grapheme, which cannot be split).
+                for visual in &split {
+                    let w: usize = visual.spans.iter().map(Span::width).sum();
+                    assert!(
+                        w <= usize::from(width) || visual.width() <= 2,
+                        "row overflows {width} cols: {visual:?}"
+                    );
+                }
+                // Nothing is lost across the split.
+                let rejoined: String = split
+                    .iter()
+                    .flat_map(|l| l.spans.iter())
+                    .map(|s| s.content.as_ref())
+                    .collect();
+                assert_eq!(rejoined, format!("▌ {case}"));
+            }
+        }
+    }
+
+    /// Follow mode must pin the TRUE bottom on wrap-heavy content. The old
+    /// measure assumed ceil cell-wrap while the draw used ratatui word-wrap,
+    /// which can produce MORE rows than measured — `max_scroll`
+    /// under-estimated, and the newest line(s) sat below the viewport.
+    #[test]
+    fn follow_mode_pins_the_true_bottom_on_wrap_heavy_content() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "wrap torture".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // Word-wrap-adversarial prose: many short words at a narrow width
+        // (word wrap breaks early, producing more visual rows than
+        // ceil(width/viewport)), followed by a sentinel tail line.
+        let mut text = String::new();
+        for i in 0..60 {
+            text.push_str(&format!("wrapping words drift apart badly here {i}\n"));
+        }
+        text.push_str("FINAL-SENTINEL-LINE");
+        reduce(
+            &mut s,
+            Action::daemon_event(SessionEvent {
+                sequence: 2,
+                occurred_at: Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::Agent {
+                    agent_id: codypendent_protocol::AgentId::new(),
+                    run_id,
+                    model: ModelId("m".to_owned()),
+                },
+                body: EventBody::ModelStreamDelta { run_id, text },
+            }),
+        );
+        // Finalize the stream so the rich cache renders (not the plain tail).
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+        assert!(s.runs[0].follow, "a fresh run follows the latest content");
+        let screen = render_to_string(&s, 34, 16);
+        assert!(
+            screen.contains("FINAL-SENTINEL-LINE"),
+            "follow mode must show the newest line on wrap-heavy content:\n{screen}"
         );
     }
 
@@ -10245,16 +12286,612 @@ mod tests {
         );
         let (lines, _r, _h) = build_transcript_window(
             &s.runs,
-            &theme,
-            inner_width,
+            test_view(&theme, inner_width),
             total.saturating_sub(height),
             height,
-            0,
         );
         assert!(
             lines.len() <= height as usize + 4,
             "full pipeline must still materialize O(viewport), not O(history): {}",
             lines.len()
         );
+    }
+
+    // --- Un-dead tool/patch expansion: click targets + browsed selection ---
+
+    /// A run whose transcript holds a tool card and a patch diff.
+    fn state_with_tool_and_patch() -> AppState {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "ship it".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc".to_owned(),
+                label: Some("cargo test".to_owned()),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::PatchProposed {
+                run_id,
+                changeset_id: ChangeSetId::new(),
+                artifact: ArtifactRef {
+                    id: ArtifactId::new(),
+                    media_type: "text/x-diff".to_owned(),
+                    byte_length: 42,
+                    sha256: "0".repeat(64),
+                    sensitivity: DataClassification::Internal,
+                },
+                files: vec!["src/lib.rs".to_owned()],
+                additions: 2,
+                deletions: 1,
+                preview: "@@ -1 +1 @@\n-old\n+new".to_owned(),
+                preview_truncated: false,
+            }),
+        );
+        s
+    }
+
+    /// The dead-feature fix: a tool card and a patch head each register a click
+    /// target, so the expanded detail and the diff renderer are reachable by
+    /// mouse — they registered nothing at all before.
+    #[test]
+    fn tool_and_patch_heads_register_click_targets() {
+        let state = state_with_tool_and_patch();
+        let _ = render_to_string(&state, 100, 30);
+        let map = state.hit_map.borrow();
+        let rows: Vec<usize> = map
+            .iter()
+            .filter_map(|(_, action)| match action {
+                Action::ActivateRow(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rows.contains(&1),
+            "the tool card's head must be clickable: {rows:?}"
+        );
+        assert!(
+            rows.contains(&2),
+            "the patch head must be clickable: {rows:?}"
+        );
+    }
+
+    /// Clicking (or `Alt-Enter`-ing) the patch fold reveals the diff renderer —
+    /// coloured +/- lines and the artifact footer — which no input could reach
+    /// before this change.
+    #[test]
+    fn expanding_a_patch_draws_the_diff_preview() {
+        let mut state = state_with_tool_and_patch();
+        let collapsed = render_to_string(&state, 100, 30);
+        assert!(
+            !collapsed.contains("+new"),
+            "a collapsed patch shows no diff body:\n{collapsed}"
+        );
+        reduce(&mut state, Action::ActivateRow(2));
+        let expanded = render_to_string(&state, 100, 30);
+        assert!(
+            expanded.contains("+new") && expanded.contains("-old"),
+            "the diff preview must render when expanded:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("full diff"),
+            "the artifact footer belongs to the expanded diff:\n{expanded}"
+        );
+    }
+
+    /// Expanding a tool card surfaces its args digest and label detail.
+    #[test]
+    fn expanding_a_tool_card_draws_its_detail() {
+        let mut state = state_with_tool_and_patch();
+        reduce(&mut state, Action::ActivateRow(1));
+        let expanded = render_to_string(&state, 100, 30);
+        assert!(
+            expanded.contains("args-digest: abc"),
+            "expanded tool detail missing:\n{expanded}"
+        );
+    }
+
+    /// The browsed fold is highlighted with the theme's selection colours, and
+    /// only while browsing — a stale `transcript_selected` left by an earlier
+    /// click must not paint a selection nobody asked for.
+    #[test]
+    fn only_the_browsed_fold_is_painted_as_selected() {
+        let mut state = state_with_tool_and_patch();
+        state.runs[0].transcript_selected = 1;
+        let theme = Theme::dark();
+
+        let idle = render_buffer(&state, 100, 30, &theme);
+        assert!(
+            !idle
+                .content()
+                .iter()
+                .any(|cell| cell.bg == theme.selection.background),
+            "nothing is selected until the transcript is browsed"
+        );
+
+        state.transcript_browse = true;
+        let browsing = render_buffer(&state, 100, 30, &theme);
+        assert!(
+            browsing
+                .content()
+                .iter()
+                .any(|cell| cell.bg == theme.selection.background),
+            "the browsed fold head must be visibly selected"
+        );
+    }
+
+    /// Browsing pins the viewport to the selection: a fold far above the tail
+    /// is scrolled into view (otherwise `Alt-Enter` would expand something the
+    /// user cannot see), without touching `run.scroll`/`run.follow`.
+    #[test]
+    fn browsing_scrolls_an_offscreen_fold_into_view() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "long".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "workspace.read_file".to_owned(),
+                args_digest: "d".to_owned(),
+                label: Some("NEEDLE-TOOL".to_owned()),
+            }),
+        );
+        // Enough prose after the tool card to push it far off the top.
+        let filler = (0..80)
+            .map(|i| format!("filler line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: filler,
+            }),
+        );
+        let tail = render_to_string(&s, 100, 20);
+        assert!(
+            !tail.contains("NEEDLE-TOOL"),
+            "the tool card starts off-screen at the tail:\n{tail}"
+        );
+
+        s.transcript_browse = true;
+        s.runs[0].transcript_selected = 1;
+        let browsed = render_to_string(&s, 100, 20);
+        assert!(
+            browsed.contains("NEEDLE-TOOL"),
+            "browsing must scroll the selected fold into view:\n{browsed}"
+        );
+        assert!(
+            s.runs[0].follow,
+            "the pin is a draw-time projection — follow mode is untouched"
+        );
+    }
+
+    /// The composer draws the cursor where `composer_cursor` actually is —
+    /// mid-line, not always at the tail — as a reversed cell over the character
+    /// it sits on, so the surrounding text never shifts.
+    #[test]
+    fn the_composer_cursor_is_drawn_at_its_real_position() {
+        let mut state = AppState::new();
+        state.composer = "hello world".to_owned();
+        state.composer_cursor = 0;
+        let theme = Theme::dark();
+        let head = cursor_cells(&render_buffer(&state, 60, 12, &theme));
+        assert_eq!(head.len(), 1);
+
+        state.composer_cursor = 5;
+        let middle = cursor_cells(&render_buffer(&state, 60, 12, &theme));
+        assert_eq!(middle.len(), 1);
+        assert_eq!(
+            middle[0].0,
+            head[0].0 + 5,
+            "the cursor moves five columns right, on the same row"
+        );
+        assert_eq!(middle[0].1, head[0].1);
+
+        // The draft itself is unchanged by where the cursor sits.
+        let text = render_to_string(&state, 60, 12);
+        assert!(text.contains("hello world"), "{text}");
+    }
+
+    /// A wide glyph is one cursor cell, not a half-covered pair, and a
+    /// multi-line draft puts the cursor on its own line.
+    #[test]
+    fn the_cursor_covers_a_wide_glyph_and_follows_multiline_drafts() {
+        let mut state = AppState::new();
+        state.composer = "日本語".to_owned();
+        state.composer_cursor = 0;
+        let theme = Theme::dark();
+        let cells = cursor_cells(&render_buffer(&state, 60, 12, &theme));
+        assert_eq!(
+            cells.len(),
+            1,
+            "a double-width glyph is one styled cell, never split: {cells:?}"
+        );
+
+        state.composer = "first\nsecond".to_owned();
+        state.composer_cursor = 2; // on the first line
+        let first = cursor_cells(&render_buffer(&state, 60, 12, &theme));
+        state.composer_cursor = state.composer.len(); // on the second line
+        let second = cursor_cells(&render_buffer(&state, 60, 12, &theme));
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second[0].1,
+            first[0].1 + 1,
+            "the cursor sits on its own draft line: {first:?} vs {second:?}"
+        );
+    }
+
+    /// `truncate` fits a COLUMN budget, not a char count — the browsers, the
+    /// runs pane, tool labels, and the header all size their cells in terminal
+    /// cells, so a CJK/emoji string counted by chars overflowed its column.
+    #[test]
+    fn truncate_fits_display_columns_for_wide_and_combining_text() {
+        for (text, budget) in [
+            ("日本語のタイトルはとても長い", 10_usize),
+            ("🚀🚀🚀🚀🚀🚀🚀🚀", 7),
+            ("plain ascii title that is long", 12),
+            ("e\u{301}e\u{301}e\u{301} combining", 6),
+        ] {
+            let fitted = truncate(text, budget);
+            assert!(
+                UnicodeWidthStr::width(fitted.as_str()) <= budget,
+                "{fitted:?} is {} columns, over the {budget}-column budget",
+                UnicodeWidthStr::width(fitted.as_str())
+            );
+            // Nothing is cut mid-grapheme: the result re-splits identically.
+            let rejoined: String = UnicodeSegmentation::graphemes(fitted.as_str(), true).collect();
+            assert_eq!(rejoined, fitted);
+        }
+        // Text already inside the budget is returned verbatim.
+        assert_eq!(truncate("日本", 4), "日本");
+    }
+
+    /// A wide session title must not push the header's other fields off the
+    /// row. Counted by `char`s, a 30-"char" CJK title is 60 columns wide and
+    /// ate the space the model/mode/context chips are laid out in.
+    #[test]
+    fn a_wide_session_title_does_not_crowd_out_the_header_fields() {
+        let mut state = running_build_state();
+        state.session_title = Some("日本語のとても長いセッション名前です".repeat(3));
+        // (`buffer_text` pads the cell after a double-width glyph, so the dumped
+        // string is not a column measure — assert on the fields instead.)
+        let text = render_to_string(&state, 100, 20);
+        let header = text.lines().next().expect("a header row");
+        assert!(
+            header.contains('…'),
+            "the title must be fitted, not left to overflow: {header:?}"
+        );
+        assert!(
+            header.contains("gpt-5.1-codex") && header.contains("Build"),
+            "a wide title must not crowd the model/mode chips off the header: {header:?}"
+        );
+    }
+
+    /// The header's mode chip names the mode the live run is ACTUALLY in — it
+    /// used to show the session default, which could contradict the run right
+    /// under it. A pending `/mode` pick is still confirmed, as `live → next`.
+    #[test]
+    fn the_header_mode_chip_names_the_live_runs_mode() {
+        let mut state = running_build_state();
+        assert_eq!(state.runs[0].mode, AgentMode::Build);
+        let same = header_line(&state, 120);
+        assert!(same.contains("Build"), "the live run's mode shows:\n{same}");
+        assert!(
+            !same.contains('→'),
+            "no pending arrow when the next run matches:\n{same}"
+        );
+
+        // Picking a different mode mid-run shows both, without lying about the
+        // run that is already going.
+        state.default_mode = AgentMode::Plan;
+        let pending = header_line(&state, 120);
+        assert!(
+            pending.contains("Build") && pending.contains("Plan"),
+            "the live mode and the pending pick both show:\n{pending}"
+        );
+
+        // With no run at all, the session default is all there is.
+        let fresh = AppState::new();
+        let empty = header_line(&fresh, 120);
+        assert!(
+            empty.contains("Build"),
+            "the session default stands in before the first run:\n{empty}"
+        );
+    }
+
+    /// Turn headers carry a dim, right-aligned clock in the viewer's own
+    /// timezone — the event time that used to be dropped at the fold.
+    #[test]
+    fn turn_headers_carry_a_right_aligned_clock() {
+        let at = Utc::now() - chrono::Duration::hours(2);
+        let expected = at.with_timezone(&chrono::Local).format("%H:%M").to_string();
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        for (sequence, body) in [
+            (
+                1,
+                EventBody::RunStarted {
+                    run_id,
+                    objective: "ship the clock".to_owned(),
+                    mode: codypendent_protocol::AgentMode::Build,
+                },
+            ),
+            (
+                2,
+                EventBody::ModelStreamDelta {
+                    run_id,
+                    text: "on it".to_owned(),
+                },
+            ),
+        ] {
+            reduce(
+                &mut s,
+                Action::daemon_event(SessionEvent {
+                    sequence,
+                    occurred_at: at,
+                    causation_id: None,
+                    correlation_id: None,
+                    actor: Actor::System,
+                    body,
+                }),
+            );
+        }
+
+        let text = render_to_string(&s, 110, 24);
+        let you = text
+            .lines()
+            .find(|row| row.trim_start().starts_with("You"))
+            .expect("the user turn header");
+        assert!(
+            you.trim_end().ends_with(&expected),
+            "the user turn header ends with its clock ({expected}): {you:?}"
+        );
+        let agent = text
+            .lines()
+            .find(|row| row.contains("⏺ codypendent"))
+            .expect("the agent turn header");
+        assert!(
+            agent.trim_end().ends_with(&expected),
+            "the agent turn header ends with its clock ({expected}): {agent:?}"
+        );
+
+        // A narrow terminal keeps the header and drops the clock rather than
+        // crowding the row.
+        let narrow = render_to_string(&s, 12, 24);
+        assert!(
+            narrow.contains("You"),
+            "the header survives at 12 columns:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains(&expected),
+            "the clock is the first field to go on a narrow screen:\n{narrow}"
+        );
+    }
+
+    /// Every waiting surface turns: the run-activity row and the model-fetch
+    /// box each advance a spinner frame with the tick, so a slow provider or a
+    /// thinking agent never reads as a frozen UI.
+    #[test]
+    fn waiting_surfaces_animate_with_the_tick() {
+        let mut state = running_build_state();
+        state.runs[0].activity = RunActivity::Thinking;
+        let working = render_to_string(&state, 100, 24);
+        assert!(working.contains("working…"), "{working}");
+        let first = spinner_frame(state.tick);
+        assert!(
+            working.contains(first),
+            "the working row carries a spinner frame:\n{working}"
+        );
+        state.tick += 1;
+        let later = render_to_string(&state, 100, 24);
+        assert!(
+            later.contains(spinner_frame(state.tick)) && spinner_frame(state.tick) != first,
+            "the working spinner advanced with the tick:\n{later}"
+        );
+
+        // The "Fetching models…" box had no moving part at all.
+        let mut state = AppState::new();
+        state.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+        };
+        let fetching = render_to_string(&state, 80, 24);
+        assert!(
+            fetching.contains("Fetching models from groq…"),
+            "{fetching}"
+        );
+        assert!(
+            fetching.contains(spinner_frame(0)),
+            "the fetch box spins while it waits:\n{fetching}"
+        );
+        state.tick = 3;
+        let spun = render_to_string(&state, 80, 24);
+        assert!(
+            spun.contains(spinner_frame(3)) && spinner_frame(3) != spinner_frame(0),
+            "the fetch spinner advanced with the tick:\n{spun}"
+        );
+    }
+
+    // --- measured chip rows replace hand-counted hit offsets ---
+
+    /// Resolve what a click at `(x, y)` would do, through the same topmost-wins
+    /// rule the input layer uses.
+    fn click_at(state: &AppState, x: u16, y: u16) -> Option<Action> {
+        state
+            .hit_map
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(r, _)| x >= r.x && x < r.right() && y >= r.y && y < r.bottom())
+            .map(|(_, action)| action.clone())
+    }
+
+    /// A chip's hit region is derived from its measured span, so it lands on
+    /// the label the user actually sees — not on an offset counted by hand.
+    #[test]
+    fn chip_hit_regions_are_measured_from_their_spans() {
+        let theme = Theme::dark();
+        let chips = [
+            Chip::new("↑/↓", "skill", Action::SelectNext),
+            Chip::new("M", "memory", Action::OpenMemory),
+            Chip::new("Esc", "close", Action::Dismiss),
+        ];
+        let (spans, placed) = chip_row(&chips, 80, &theme);
+        assert_eq!(placed.len(), 3, "all three chips fit in 80 columns");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "  ↑/↓ skill · M memory · Esc close");
+        for ((offset, width), chip) in placed.iter().zip(&chips) {
+            let slice: String = UnicodeSegmentation::graphemes(text.as_str(), true)
+                .skip(usize::from(*offset))
+                .take(usize::from(*width))
+                .collect();
+            assert_eq!(
+                slice.trim_end(),
+                format!("{} {}", chip.key, chip.label),
+                "chip {:?}'s region must cover exactly its own text",
+                chip.key
+            );
+        }
+
+        // A row too narrow for every chip drops whole chips, never half of one
+        // (a half-drawn chip with a live hit region is worse than none).
+        let (spans, placed) = chip_row(&chips, 16, &theme);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(placed.len() < 3, "the row cannot hold every chip");
+        for (offset, width) in &placed {
+            assert!(
+                usize::from(offset + width) <= UnicodeWidthStr::width(text.as_str()),
+                "a chip region must stay inside the drawn row"
+            );
+        }
+    }
+
+    /// The footer's contextual hints are now real, clickable chips. (The
+    /// curated `FOOTER_HINTS` table they replace was never rendered at all —
+    /// its drift-guard test protected a feature that did not exist.)
+    #[test]
+    fn the_status_footer_chips_are_clickable_where_they_are_drawn() {
+        let mut state = AppState::new();
+        state.composer = "a draft".to_owned();
+        state.composer_cursor = state.composer.len();
+        let text = render_to_string(&state, 100, 20);
+        let (row, footer) = text
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("Enter send"))
+            .expect("the draft footer");
+        let y = u16::try_from(row).expect("row fits");
+
+        // Every drawn chip resolves to the Action its key produces.
+        for (label, action) in [
+            ("Enter send", Action::InputSubmit),
+            ("⌥Enter newline", Action::InputNewline),
+            ("Esc clear", Action::InputCancel),
+        ] {
+            let column = footer
+                .find(label)
+                .map(|byte| UnicodeWidthStr::width(&footer[..byte]))
+                .unwrap_or_else(|| panic!("{label} is drawn in the footer: {footer:?}"));
+            let x = u16::try_from(column).expect("column fits");
+            assert_eq!(
+                click_at(&state, x, y),
+                Some(action.clone()),
+                "clicking {label:?} at column {x} must fire {action:?}: {footer:?}"
+            );
+        }
+    }
+
+    /// The Skills footer's `M memory` chip: its old hit region was declared at
+    /// x+14 width 8, which no longer matched the label it was meant to cover.
+    #[test]
+    fn the_skills_footer_chips_hit_their_own_labels() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::Skills;
+        let text = render_to_string(&state, 120, 40);
+        let (row, footer) = text
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("M memory"))
+            .expect("the skills footer");
+        let y = u16::try_from(row).expect("row fits");
+        let column = footer.find("M memory").expect("the memory chip");
+        let x = u16::try_from(UnicodeWidthStr::width(&footer[..column])).expect("column fits");
+        assert_eq!(click_at(&state, x, y), Some(Action::OpenMemory));
+        assert_eq!(
+            click_at(&state, x + 3, y),
+            Some(Action::OpenMemory),
+            "the whole label is the target, not just its first cell"
+        );
+    }
+
+    /// The `/theme` picker previews across the WHOLE shell, not just its own
+    /// modal: the frame is drawn in the focused row's theme, so what the
+    /// operator sees before pressing Enter is what they will get.
+    #[test]
+    fn the_theme_picker_previews_the_whole_shell_live() {
+        let mut state = running_build_state();
+        // The harness resolved dark at boot; the picker opens on it.
+        reduce(&mut state, Action::OpenPalette);
+        for c in "theme picker".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputSubmit);
+        let text = render_to_string(&state, 100, 30);
+        assert!(text.contains("Theme picker"), "the picker draws:\n{text}");
+        assert!(
+            text.contains("monochrome") && text.contains("high-contrast"),
+            "every built-in variant is listed:\n{text}"
+        );
+        assert!(
+            text.contains("↑/↓ preview"),
+            "the footer says what the arrows do:\n{text}"
+        );
+
+        let boot = Theme::dark();
+        let dark_frame = render_buffer(&state, 100, 30, &boot);
+        // Move to `light`: the frame's background must change even though the
+        // harness still passes the boot theme in.
+        reduce(&mut state, Action::SelectNext);
+        let light_frame = render_buffer(&state, 100, 30, &boot);
+        let background = |buffer: &Buffer| buffer[(0, 0)].bg;
+        assert_ne!(
+            background(&dark_frame),
+            background(&light_frame),
+            "moving the cursor repaints the whole shell in the focused theme"
+        );
+        // Keeping it holds after the picker closes — and the result is
+        // indistinguishable from having booted in that theme.
+        reduce(&mut state, Action::InputSubmit);
+        let kept = render_buffer(&state, 100, 30, &boot);
+        let mut booted_light = state.clone();
+        booted_light.theme_selected = None;
+        let direct = render_buffer(&booted_light, 100, 30, &Theme::light());
+        assert_eq!(
+            kept.content(),
+            direct.content(),
+            "a kept theme renders exactly as booting in it would"
+        );
+        assert_ne!(background(&kept), background(&dark_frame));
     }
 }

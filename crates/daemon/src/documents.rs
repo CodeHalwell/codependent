@@ -135,6 +135,96 @@ pub trait DocumentMutator: Send + Sync {
     fn apply_mutation(&self, request: DocumentMutationRequest) -> DocumentMutationFuture<'_>;
 }
 
+/// A client's request to create a new collaborative document (`CreateDocument`).
+/// Everything is expressed in protocol terms — the scope is the wire string
+/// (`"repository"` / `"system"` / `"organization:<id>"`), because the daemon
+/// cannot name `codypendent-knowledge`'s `Scope`; the seam parses it.
+#[derive(Debug, Clone)]
+pub struct DocumentCreateRequest {
+    pub title: String,
+    /// The requested scope, or `None` for the seam's default (repository).
+    pub scope: Option<String>,
+    /// The repository root a repository-scoped document belongs to, or `None`
+    /// to fall back to the daemon's startup root.
+    pub repository: Option<String>,
+    /// Markdown to seed the document's blocks from, or `None` for an empty one.
+    pub initial_markdown: Option<String>,
+    /// The identity of the creating client, for authorship attribution (mirrors
+    /// [`DocumentMutationRequest::client_id`]).
+    pub client_id: ClientId,
+}
+
+/// The future a [`DocumentCreator`] returns: the new document's id to reply
+/// with, or a structured error. Boxed so the trait stays object-safe without an
+/// `async-trait` dependency, matching [`DocumentMutationFuture`].
+pub type DocumentCreateFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<DocumentId, CodypendentError>> + Send + 'a>>;
+
+/// The daemon's seam for *creating* a collaborative document from an accepted
+/// `CreateDocument` command (rubric #4 — until this existed nothing could
+/// populate the Docs Studio: `DocumentStore::create` had no production caller).
+///
+/// Implemented by the assembly binary over `codypendent-knowledge`'s
+/// `DocumentStore::create` plus its Markdown importer, mirroring the
+/// [`DocumentMutator`]/[`DocumentLeaser`]/[`DocumentPublisher`] layout exactly.
+/// The default `None` leaves creation unwired — the executor-less server and
+/// the daemon's own tests then reject `CreateDocument` with
+/// `document.transport-unavailable`, exactly as `MutateDocument` is without a
+/// mutator.
+pub trait DocumentCreator: Send + Sync {
+    /// Create the document and return its id. Errors leave nothing behind (the
+    /// underlying create is one transaction) and are surfaced verbatim to the
+    /// requesting client as a `CommandRejected`.
+    fn create(&self, request: DocumentCreateRequest) -> DocumentCreateFuture<'_>;
+}
+
+/// A client's request to run the documentation staleness sweep
+/// (`CheckDocuments`, the `/update-docs` glue).
+#[derive(Debug, Clone)]
+pub struct DocsCheckRequest {
+    /// The repository root whose code graph links resolve against, or `None` to
+    /// fall back to the daemon's startup root.
+    pub repository: Option<String>,
+    /// A session to surface the finding count into, when the caller wants the
+    /// sweep's result to reach an active conversation's ledger.
+    pub session_id: Option<codypendent_protocol::SessionId>,
+    /// The identity of the requesting client, for suggestion attribution.
+    pub client_id: ClientId,
+}
+
+/// What one documentation staleness sweep found (the `CheckDocuments` reply).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DocsCheckReport {
+    /// Documents the sweep examined.
+    pub documents_checked: u64,
+    /// Symbol links resolved (and persisted) against the code graph.
+    pub links_resolved: u64,
+    /// Staleness findings (signature changed / symbol disappeared).
+    pub stale_findings: u64,
+    /// Maintain-mode suggestions filed from those findings.
+    pub suggestions_filed: u64,
+}
+
+/// The future a [`DocumentMaintainer`] returns: the sweep's counts, or a
+/// structured error.
+pub type DocsCheckFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<DocsCheckReport, CodypendentError>> + Send + 'a>>;
+
+/// The daemon's seam for the documentation *maintenance* sweep (Phase 4 STEP
+/// 4.6's `/update-docs`): resolve each document's `{{ symbol:… }}` links against
+/// the code graph, persist them, diff for staleness, and file each finding as a
+/// **Maintain-mode suggestion** — never a direct edit, so every proposed change
+/// still needs a human accept.
+///
+/// Implemented by the assembly binary over `codypendent-knowledge`'s
+/// `resolve_links` / `set_links` / `detect_staleness` / `as_suggestion`, which
+/// only the assembly can name. The default `None` leaves the sweep unwired
+/// (rejected `document.transport-unavailable`).
+pub trait DocumentMaintainer: Send + Sync {
+    /// Run one sweep and return its counts.
+    fn check(&self, request: DocsCheckRequest) -> DocsCheckFuture<'_>;
+}
+
 /// A client's request to acquire (or renew) an edit lease before mutating a
 /// document. The [`ClientId`] is the lease-holder identity, so the same client is
 /// later recognised as the writer that may mutate the leased range (the

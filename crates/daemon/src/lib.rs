@@ -26,6 +26,8 @@ pub mod projections;
 pub mod promotion;
 pub mod recovery;
 pub mod subscriptions;
+// Voice v1 (rubric 8): the speech-to-text seam the assembly implements.
+pub mod transcription;
 pub mod workflow_stream;
 pub mod workflows;
 pub mod worktrees;

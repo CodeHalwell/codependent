@@ -121,6 +121,12 @@ enum TopCommand {
         #[command(subcommand)]
         command: IndexCommand,
     },
+    /// Install skill packages into the governed registry, so retrieval can
+    /// disclose them to a run.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Work with declarative workflow manifests (Phase 5).
     Workflow {
         #[command(subcommand)]
@@ -227,6 +233,49 @@ enum TopCommand {
         /// Install a specific release tag instead of the latest.
         tag: Option<String>,
     },
+    /// Scaffold and check a local Unsloth QLoRA fine-tuning project.
+    /// Subprocess orchestration only — no Python in this workspace; the
+    /// scaffolded project is a standalone Python project you run yourself.
+    Finetune {
+        #[command(subcommand)]
+        command: FinetuneCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum FinetuneCommand {
+    /// Scaffold an Unsloth QLoRA project: pinned requirements, a `train.py`
+    /// for the chosen base model, a JSONL chat-transcript dataset stub, and a
+    /// README covering GPU requirements, training, GGUF export, and the
+    /// `ollama create` step. Refuses if the target directory already exists.
+    Init {
+        /// The Hugging Face base model to fine-tune. Defaults to a small,
+        /// popular Unsloth QLoRA-ready repo.
+        #[arg(long)]
+        model: Option<String>,
+        /// Directory to scaffold into (must not already exist). Defaults to
+        /// `./finetune`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Verify Python and CUDA are present for running the scaffolded
+    /// `train.py`. Read-only; exits non-zero only when Python itself is
+    /// missing (no GPU warns instead of failing — the scaffold is still
+    /// useful without one, e.g. editing the dataset).
+    Check,
+    /// Work with the fine-tuning dataset.
+    Dataset {
+        #[command(subcommand)]
+        command: FinetuneDatasetCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum FinetuneDatasetCommand {
+    /// Export the repo's own session/eval history into `dataset/train.jsonl`
+    /// as fine-tuning data, when a clean seam exists to do so. Today: prints
+    /// exactly why that seam doesn't exist yet rather than silently no-op'ing.
+    Export,
 }
 
 /// The IDEs `codypendent open --in <IDE>` knows how to launch.
@@ -254,6 +303,17 @@ enum IndexCommand {
     /// from the authoritative rows. Does NOT rebuild the code graph — that is
     /// built per-repository on session open / first run.
     Rebuild,
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Validate a skill package directory, copy it under `<data_dir>/skills/`,
+    /// and register it. Idempotent: re-adding the same package keeps its
+    /// registry identity, and the daemon re-verifies it on its next boot.
+    Add {
+        /// The package directory — the one holding `skill.toml`.
+        directory: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -346,6 +406,12 @@ enum CouncilCommand {
         /// Human-readable purpose for this council.
         #[arg(long)]
         description: Option<String>,
+        /// Evidence mode: members explore the repository with read-only tools
+        /// and cite `file:line`, instead of reasoning with no tools at all.
+        /// The chair then weighs cited evidence over unsupported assertion.
+        /// Stored on the definition; `council run` may also enable it per-run.
+        #[arg(long)]
+        evidence: bool,
     },
     /// List configured councils.
     List {
@@ -357,10 +423,16 @@ enum CouncilCommand {
         name: String,
         #[arg(long)]
         json: bool,
+        /// Render the most recently saved run report instead of the definition.
+        #[arg(long)]
+        last: bool,
     },
     /// Remove a council definition. Its prior durable sessions remain.
     Remove { name: String },
     /// Run member deliberation in parallel, then ask the chair to synthesize.
+    /// Every run — completed, quorum-failed, or chair-failed — persists a
+    /// JSON+Markdown report under the data dir; `council show <name> --last`
+    /// replays it.
     Run {
         name: String,
         /// Question or decision the council should deliberate.
@@ -372,6 +444,11 @@ enum CouncilCommand {
         /// Emit the complete attributed result as JSON.
         #[arg(long)]
         json: bool,
+        /// Run in evidence mode for this run even if the council was not
+        /// created with `--evidence` (ORed with the stored flag; never turns
+        /// evidence mode off for a council that already has it).
+        #[arg(long)]
+        evidence: bool,
     },
 }
 
@@ -454,6 +531,29 @@ enum WorkflowCommand {
 
 #[derive(Subcommand)]
 enum DocsCommand {
+    /// Create a collaborative document (rubric #4 doc-writer). Sends
+    /// `CreateDocument`; with `--from` the Markdown file is imported into typed
+    /// blocks (headings / paragraphs / code / lists / tables / callouts /
+    /// embeds), otherwise the document starts empty. Prints the new id.
+    New {
+        /// The document title.
+        title: String,
+        /// A Markdown file to seed the document's blocks from.
+        #[arg(long = "from", value_name = "FILE")]
+        from: Option<PathBuf>,
+        /// The scope to create it in: `repository` (default), `system`, or
+        /// `organization:<uuid>`.
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// List the documents this checkout can see (repository + system scope),
+    /// newest first, with their status and revision.
+    List,
+    /// Run the documentation staleness check (`/update-docs`): resolve every
+    /// document's `{{ symbol:… }}` links against the code graph, diff them for
+    /// signature changes and disappearances, and file each finding as a
+    /// reviewable Maintain-mode suggestion. Prints the finding counts.
+    Check,
     /// Publish a document's current revision to a Git target (Phase 4 STEP
     /// 4.4). Prints the computed plan (target / changed files / resulting Git
     /// action) and prompts for confirmation, then sends `PublishDocument`;
@@ -542,6 +642,36 @@ enum EvalCommand {
 
 #[derive(Subcommand)]
 enum ModelsCommand {
+    /// List the models configured in `models.toml`, with their provider,
+    /// endpoint, context window, and key status. The headless twin of the
+    /// TUI's `/model` picker.
+    List,
+    /// Add a model from a catalog provider to `models.toml`, exactly as the
+    /// TUI's add-model flow does (same catalog lookup, same auth header
+    /// resolution, same atomic write). With no `--key-env`, a key is read
+    /// from the provider's documented environment variable at call time.
+    Add {
+        /// The catalog provider id (`codypendent models list-providers`
+        /// spellings: `openai`, `nebius`, `azure-openai`, …).
+        provider: String,
+        /// The provider-side model id, as it must be sent on the wire.
+        model: String,
+        /// Store this environment variable NAME on the entry rather than
+        /// relying on the provider's documented default. The VALUE is never
+        /// written to disk — only the name.
+        #[arg(long, value_name = "NAME")]
+        key_env: Option<String>,
+        /// Override the `models.toml` id (defaults to `<provider>/<model>`).
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
+    },
+    /// Verify one configured model end to end: resolve its credentials the way
+    /// a run does, call the provider's `/models`, and confirm the configured
+    /// model is listed. Exits non-zero when it is not.
+    Check {
+        /// The `models.toml` model id to check.
+        id: String,
+    },
     /// Benchmark a local model configured in `models.toml` and persist its
     /// measured profile (Phase 7 STEP 7.2.2): tokens/sec, time-to-first-token,
     /// warm-up, memory, context limit, structured-output reliability, tool-call
@@ -551,6 +681,19 @@ enum ModelsCommand {
         /// The `models.toml` model id to benchmark (its `base_url` is the
         /// endpoint the profile + probe are keyed under).
         id: String,
+    },
+    /// Pull a GGUF model from the Unsloth catalog on Hugging Face and register
+    /// it against the `ollama` provider. Resolves `<hf-repo>[:<quant>]`
+    /// (defaulting a bare repo name to the `unsloth/` org and, with no
+    /// `:quant`, an auto-picked default), drives `ollama pull
+    /// hf.co/<org>/<repo>:<quant>` with streamed progress, then writes
+    /// `models.toml` using the exact reference `ollama list` shows. Requires
+    /// `ollama` on `PATH` (see https://ollama.com); this command never
+    /// downloads or runs model weights itself.
+    Pull {
+        /// `<hf-repo>[:<quant>]`, e.g. `Qwen3-32B-GGUF`,
+        /// `Qwen3-32B-GGUF:UD-Q4_K_XL`, or `some-org/Some-Model-GGUF:Q8_0`.
+        spec: String,
     },
 }
 
@@ -870,6 +1013,9 @@ async fn main() -> anyhow::Result<()> {
         TopCommand::Index {
             command: IndexCommand::Rebuild,
         } => commands::index_rebuild(&paths).await,
+        TopCommand::Skill {
+            command: SkillCommand::Add { directory },
+        } => commands::skill_add(&paths, &directory).await,
         TopCommand::Workflow { command } => match command {
             WorkflowCommand::Validate { file, agents } => {
                 commands::workflow_validate(&file, agents.as_deref())
@@ -907,6 +1053,11 @@ async fn main() -> anyhow::Result<()> {
             commands::fix_ci(&paths, pr, repo).await
         }
         TopCommand::Docs { command } => match command {
+            DocsCommand::New { title, from, scope } => {
+                commands::docs_new(&paths, &title, from.as_deref(), scope).await
+            }
+            DocsCommand::List => commands::docs_list(&paths).await,
+            DocsCommand::Check => commands::docs_check(&paths).await,
             DocsCommand::Publish {
                 document,
                 target,
@@ -928,7 +1079,25 @@ async fn main() -> anyhow::Result<()> {
             } => commands::eval_run(&paths, &suite, policy, candidate_id.as_deref(), &report).await,
         },
         TopCommand::Models { command } => match command {
+            ModelsCommand::List => commands::models_list(&paths),
+            ModelsCommand::Add {
+                provider,
+                model,
+                key_env,
+                id,
+            } => commands::models_add(&paths, &provider, &model, key_env.as_deref(), id.as_deref()),
+            ModelsCommand::Check { id } => commands::models_check(&paths, &id).await,
             ModelsCommand::Bench { id } => commands::models_bench(&paths, &id).await,
+            ModelsCommand::Pull { spec } => {
+                let hf = codypendent_integrations::unsloth::HfHubClient::hub()?;
+                codypendent_cli::models_pull::run(
+                    &paths,
+                    &spec,
+                    &hf,
+                    codypendent_cli::models_pull::OLLAMA_BIN,
+                )
+                .await
+            }
         },
         TopCommand::Promote { command } => match command {
             PromoteCommand::Propose {
@@ -1076,10 +1245,19 @@ async fn main() -> anyhow::Result<()> {
                 chair,
                 rounds,
                 description,
-            } => codypendent_cli::council::create(&paths, name, member, chair, rounds, description),
+                evidence,
+            } => codypendent_cli::council::create(
+                &paths,
+                name,
+                member,
+                chair,
+                rounds,
+                description,
+                evidence,
+            ),
             CouncilCommand::List { json } => codypendent_cli::council::list(&paths, json),
-            CouncilCommand::Show { name, json } => {
-                codypendent_cli::council::show(&paths, &name, json)
+            CouncilCommand::Show { name, json, last } => {
+                codypendent_cli::council::show(&paths, &name, json, last)
             }
             CouncilCommand::Remove { name } => codypendent_cli::council::remove(&paths, &name),
             CouncilCommand::Run {
@@ -1087,9 +1265,11 @@ async fn main() -> anyhow::Result<()> {
                 objective,
                 repo,
                 json,
+                evidence,
             } => {
                 let repository = repo.unwrap_or(std::env::current_dir()?);
-                codypendent_cli::council::run(&paths, &name, objective, repository, json).await
+                codypendent_cli::council::run(&paths, &name, objective, repository, json, evidence)
+                    .await
             }
         },
         TopCommand::Open {
@@ -1129,6 +1309,47 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        TopCommand::Finetune { command } => match command {
+            FinetuneCommand::Init { model, out } => {
+                let options = codypendent_cli::finetune::InitOptions {
+                    base_model: model.unwrap_or_else(|| {
+                        codypendent_cli::finetune::DEFAULT_BASE_MODEL.to_string()
+                    }),
+                    out_dir: out.unwrap_or_else(|| {
+                        PathBuf::from(codypendent_cli::finetune::DEFAULT_OUT_DIR)
+                    }),
+                };
+                let report = codypendent_cli::finetune::init(&options)?;
+                println!(
+                    "codypendent finetune init: scaffolded {} file(s) in {}",
+                    report.files_written.len(),
+                    report.out_dir.display()
+                );
+                println!(
+                    "next: cd {} && pip install -r requirements.txt",
+                    report.out_dir.display()
+                );
+                println!("      codypendent finetune check   # verify python/CUDA first");
+                Ok(())
+            }
+            FinetuneCommand::Check => {
+                // Same exit-decision-lives-in-main convention as `doctor`
+                // above: the library never calls `std::process::exit`. Only a
+                // missing Python fails the process; a missing GPU warns.
+                let report = codypendent_cli::finetune::check("python3", "nvidia-smi");
+                print!("{}", report.render_text());
+                if report.worst() == codypendent_cli::doctor::Status::Fail {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            FinetuneCommand::Dataset { command } => match command {
+                FinetuneDatasetCommand::Export => {
+                    println!("{}", codypendent_cli::finetune::dataset_export());
+                    Ok(())
+                }
+            },
+        },
     }
 }
 

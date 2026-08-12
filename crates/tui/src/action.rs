@@ -13,7 +13,10 @@ use codypendent_protocol::{
 };
 
 use crate::remote_ui::RemoteKey;
-use crate::state::{BlackboardItemCard, DocBlockView, DocSuggestionView, KeyStatus, Pane};
+use crate::state::{
+    AddModelRow, BlackboardItemCard, DocBlockView, DocSuggestionView, KanbanCard, KeyStatus,
+    ModelListOrigin, Pane, UnslothQuantCard, UnslothRepoCard,
+};
 
 /// One live workflow-node projection carried from the socket-owning harness to
 /// the pure reducer.
@@ -49,6 +52,11 @@ pub enum Action {
     /// A transient status-line notice from the harness (e.g. a rejected
     /// command's code + message). Cleared automatically a few seconds later.
     Notice(String),
+    /// Push-to-talk capture started (`true`) or stopped (`false`), reported by
+    /// the CLI's voice host (voice v1, rubric 8). Purely presentational: it
+    /// drives the status-line recording indicator so a hot microphone is always
+    /// visible. The capture itself is the host's subprocess, never the TUI's.
+    VoiceRecording(bool),
     /// A persistent setup/runtime diagnostic from the harness. De-duplicated by
     /// the reducer and available in the Issues overlay until explicitly cleared.
     Issue(String),
@@ -91,6 +99,24 @@ pub enum Action {
     /// Council persistence failed. The reducer keeps the reviewed draft open so
     /// the operator can go back, correct it, and retry without starting over.
     CouncilCreateFailed { name: String, error: String },
+    /// The CLI host removed a council definition. Its saved run reports remain.
+    CouncilDeleted { name: String },
+    /// Council removal failed (e.g. the store could not be rewritten).
+    CouncilDeleteFailed { name: String, error: String },
+    /// One pre-formatted progress line from an off-thread council run (a round
+    /// starting, a member completing/failing, or the chair beginning
+    /// synthesis), pre-formatted host-side since this dependency-free crate
+    /// cannot name `crate::council::CouncilEvent` (a cli-crate type). Folded
+    /// into the active run's transcript as a Note.
+    CouncilProgress { name: String, message: String },
+    /// An off-thread council run finished. `Ok` carries the chair synthesis,
+    /// attributed participants, and measured-cost line, pre-formatted
+    /// host-side; `Err` is a human-readable failure (already naming any
+    /// partial report path the run managed to save).
+    CouncilRunFinished {
+        name: String,
+        result: Result<Box<crate::state::CouncilRunSummary>, String>,
+    },
 
     // --- navigation (from keys / mouse) ---
     /// Move keyboard focus to the next pane (`Tab`).
@@ -118,8 +144,22 @@ pub enum Action {
     ScrollPageUp,
     /// Scroll the transcript down a page (`PageDown`).
     ScrollPageDown,
+    /// Scroll the transcript up a few lines (one wheel notch). The finer
+    /// sibling of [`Action::ScrollPageUp`]; a wheel notch that jumped ten rows
+    /// read as a page jump, not a scroll.
+    ScrollLinesUp,
+    /// Scroll the transcript down a few lines (one wheel notch).
+    ScrollLinesDown,
     /// Open / expand the selected item (`Enter`).
     Expand,
+    /// Move the transcript fold selection to the previous foldable entry of the
+    /// selected run (`Alt-↑` in the base conversation). Entering this browse
+    /// mode is what makes tool cards and patch diffs keyboard-reachable:
+    /// `Alt-Enter` then expands the browsed fold. Client-only.
+    BrowseFoldPrev,
+    /// Move the transcript fold selection to the next foldable entry
+    /// (`Alt-↓`). Client-only.
+    BrowseFoldNext,
 
     // --- run control ---
     /// Switch the conversation to the previous run (`Ctrl-↑`).
@@ -149,8 +189,22 @@ pub enum Action {
     InputChar(char),
     /// Insert bracketed-paste text into the open prompt.
     InputPaste(String),
-    /// Delete the last character of the open prompt.
+    /// Delete the character before the cursor of the open prompt.
     InputBackspace,
+    /// Move the composer cursor one grapheme left / right (`←`/`→`).
+    /// Client-only.
+    CursorLeft,
+    /// Move the composer cursor one grapheme right (`→`). Client-only.
+    CursorRight,
+    /// Move the composer cursor to the start of its current line (`Home`).
+    CursorLineStart,
+    /// Move the composer cursor to the end of its current line (`End`).
+    CursorLineEnd,
+    /// Delete the word before the composer cursor (`Ctrl-W`). Client-only.
+    DeleteWordBack,
+    /// Delete from the start of the current line to the composer cursor
+    /// (`Ctrl-U`). Client-only.
+    DeleteToLineStart,
     /// Insert a manual line break into the open prompt (`Alt+Enter`) without
     /// submitting — the composer/prompt buffer already renders embedded `\n`
     /// as separate lines, growing to fit.
@@ -197,8 +251,22 @@ pub enum Action {
     /// Toggle the blackboard view (`B`): the typed artifacts agents share within
     /// a workflow run, with author, confidence, evidence, and payload summary.
     OpenBlackboard,
+    /// Toggle the repository task board (rubric 10): backlog cards laid out in
+    /// status columns, live over the board's blackboard channel.
+    OpenKanban,
+    /// Move the focused board card one column to the right (`todo` → `doing` →
+    /// `review` → `done`). A no-op on the last column.
+    MoveCardForward,
+    /// Move the focused board card one column to the left. A no-op on the first.
+    MoveCardBack,
     /// Open the host-owned Remote UI plugin lifecycle surface.
     OpenUiPlugins,
+    /// Toggle the council browser (`C`, rubric 6 TUI wiring): list, run, and
+    /// manage persisted councils.
+    OpenCouncils,
+    /// Begin removal confirmation for the focused council (`d`, council
+    /// browser only).
+    DeleteCouncil,
     /// Smoke-test the selected plugin in the daemon sandbox.
     SmokeTestUiPlugin,
     /// Enable the selected plugin for only the attached session.
@@ -216,6 +284,17 @@ pub enum Action {
     /// Publish the focused document to a repository Markdown file (`P`). The
     /// daemon computes the plan and parks its ordinary human approval first.
     PublishDoc,
+    /// Open the new-document prompt in the Docs Studio. Reached from `n` while
+    /// the Docs Studio is open (see [`Action::NewRun`], which the reducer routes
+    /// by overlay exactly as it routes `n` to "start the focused workflow" in
+    /// the workflow browser), never bound to its own global key.
+    NewDoc,
+    /// Open the insert-block prompt for a new paragraph below the focused block
+    /// (`i`, editor rail).
+    InsertDocBlock,
+    /// Ask to delete the focused block (`x`, editor rail); routes through a
+    /// confirmation before any mutation is sent.
+    DeleteDocBlock,
     /// A merged replica update, projected by the CLI harness after it folded an
     /// incoming `DocumentSync` into the document's client replica and re-read its
     /// pending suggestions. Replaces the matching card's blocks/suggestions/revision
@@ -281,20 +360,80 @@ pub enum Action {
     },
     /// Merge one live `BlackboardPosted` delivery by stable artifact id.
     BlackboardItemUpdated(BlackboardItemCard),
+    /// Replace the repository task board's baseline after a board-scoped
+    /// `ReadBlackboard` (rubric 10).
+    BoardLoaded(Vec<KanbanCard>),
+    /// Merge one live board delivery by card id — an agent's `task.create`, or
+    /// the replacement a move produced. A card carrying a supersession is dropped
+    /// rather than merged: its replacement arrives as its own delivery, so the
+    /// board never shows both revisions of one card.
+    BoardCardUpdated { card: KanbanCard, superseded: bool },
 
-    /// A provider's model list, fetched by the harness (client-only add-model
-    /// flow). Folds into the in-flight `Overlay::AddModelQuerying` (matched by
-    /// `provider_id`) → `Overlay::AddModelPick`. Carries NO key — the key stays
-    /// in the reducer's `AddModelQuerying` overlay across the round trip.
+    /// A provider's model list, fetched (or cache-seeded) by the harness
+    /// (client-only add-model flow). Folds into the in-flight
+    /// `Overlay::AddModelQuerying` (matched by `provider_id`) →
+    /// `Overlay::AddModelPick`, and folds again into an already-open
+    /// `AddModelPick` for the same provider so a cached seed can be replaced
+    /// by the live refresh under the operator's fingers without losing their
+    /// filter. Carries NO key — the key stays in the reducer's overlay across
+    /// the round trip.
     ProviderModelsLoaded {
         provider_id: String,
-        models: Vec<String>,
+        models: Vec<AddModelRow>,
+        origin: ModelListOrigin,
     },
     /// The model-list query failed (unreachable / non-200 / unparseable / auth
-    /// rejected / empty). `reason` is a human, key-free message. Folds the
-    /// in-flight query into the free-text `Overlay::AddModelId` fallback (carrying
-    /// any already-entered key).
+    /// rejected / empty) AND the catalog had no rows to fall back on. `reason`
+    /// is a human, key-free message. Folds the in-flight query into the
+    /// free-text `Overlay::AddModelId` fallback (carrying any already-entered
+    /// key). A failure with catalog rows available arrives as
+    /// `ProviderModelsLoaded` with a `Catalog` origin instead.
     ProviderModelsFailed { provider_id: String, reason: String },
+    /// The result of a one-shot `/keys` key verification (`Ctrl-T`): a single
+    /// `/models` call against the model's endpoint with the stored key.
+    /// `reason` is key-free. Upgrades that model's card readiness from
+    /// `Unverified` to the honest answer.
+    ModelKeyVerified {
+        model_id: String,
+        ok: bool,
+        reason: String,
+    },
+
+    /// The Unsloth org's GGUF repo listing arrived (Hugging Face Hub
+    /// discovery). Folds into the in-flight `Overlay::UnslothRepos { loading:
+    /// true, .. }`, flipping `loading` false and filling `repos`.
+    UnslothReposLoaded(Vec<UnslothRepoCard>),
+    /// The repo listing failed (unreachable / non-200 / unparseable).
+    /// `reason` is a human message. Closes the overlay with a notice — this
+    /// flow has no free-text fallback to fall back to.
+    UnslothReposFailed(String),
+    /// The quant-variant listing for `repo_id` arrived. `repo_id` guards
+    /// against a stale reply landing after the operator picked a different
+    /// repo (mirrors `ProviderModelsLoaded`'s `provider_id` guard) — folds
+    /// into `Overlay::UnslothQuants` only when it still names this repo.
+    UnslothQuantsLoaded {
+        repo_id: String,
+        quants: Vec<UnslothQuantCard>,
+    },
+    /// The quant-variant listing failed. `repo_id` guards exactly like
+    /// [`Action::UnslothQuantsLoaded`].
+    UnslothQuantsFailed { repo_id: String, reason: String },
+    /// One parsed line of `ollama pull` output. Appended to the in-flight
+    /// `Overlay::UnslothPulling` only when `repo_id`/`quant` still match (a
+    /// late line after the operator dismissed the overlay is dropped).
+    UnslothPullProgress {
+        repo_id: String,
+        quant: String,
+        line: String,
+    },
+    /// The pull (and, on success, the `models.toml` registration) finished.
+    /// `result` is `Ok(registered_id)` or `Err(human message)`. Guarded by
+    /// `repo_id`/`quant` exactly like [`Action::UnslothPullProgress`].
+    UnslothPullFinished {
+        repo_id: String,
+        quant: String,
+        result: Result<String, String>,
+    },
 
     /// The `/keys` status projection (D1), loaded by the harness after the
     /// other projections (it reads `auth.json` + `models.toml` — the tui crate
@@ -317,6 +456,13 @@ pub enum Action {
     /// outside that overlay, or when the row is backed only by an environment
     /// variable / has no key.
     RemoveApiKey,
+    /// Verify the focused `/keys` row's key against its provider (`Ctrl-T`):
+    /// one `/models` call, then `ModelKeyVerified`. A no-op outside that
+    /// overlay, and on the Tavily row (it has no model endpoint to probe).
+    VerifyApiKey,
+    /// Re-fetch the open add-model pick-list from the provider, bypassing the
+    /// on-disk cache (`Ctrl-R`). A no-op outside `Overlay::AddModelPick`.
+    RefreshProviderModels,
     /// Flip between the chat single-column and the workspace panes (`F2`).
     ToggleLayout,
 
@@ -501,6 +647,12 @@ pub enum Intent {
         document_id: DocumentId,
         target: codypendent_protocol::PublishTarget,
     },
+    /// Create a collaborative document with `title` (rubric #4 doc-writer). The
+    /// harness sends `CreateDocument` and refreshes the Docs projection so the
+    /// new document appears in the tree.
+    CreateDocument {
+        title: String,
+    },
     /// Subscribe to a document's live sync stream without mutating it. This is
     /// client-only: opening/focusing a document should keep the Docs Studio
     /// projection current even when this client is only reviewing it.
@@ -543,6 +695,20 @@ pub enum Intent {
         workflow_run_id: String,
     },
 
+    // --- repository task board (rubric 10) ---
+    /// Subscribe to and read the repository's task board. Client-only, exactly
+    /// like [`WatchWorkflow`](Intent::WatchWorkflow): the harness grows the attach
+    /// subscriptions to the board's channel and issues the `ReadBlackboard`
+    /// baseline before swallowing the intent. The repository is supplied by the
+    /// harness (the client is not authoritative for it), so this carries nothing.
+    WatchBoard,
+    /// Move a board card into another column. Applied as a supersession by the
+    /// daemon, so the card's history survives the move.
+    MoveBoardCard {
+        item_id: String,
+        status: String,
+    },
+
     /// Add a usable model from the TUI (client-only — NOT a daemon command). The
     /// harness maps this to local `models.toml` + `auth.json` writes and never
     /// sends an envelope, so it is intercepted in the drain loop before
@@ -550,26 +716,48 @@ pub enum Intent {
     /// defaults it to `<provider>/<model>`); `provider_id` selects the catalog
     /// entry the harness reads `base_url` from; `model` is the provider-side model
     /// name. `api_key` is the entered key for a hosted provider (redacted in
-    /// `Debug`), or `None` for a local/no-auth provider.
+    /// `Debug`), or `None` for a local/no-auth provider. `context_tokens` is
+    /// the picked row's known context window (catalog or `/models` metadata),
+    /// persisted so the context gauge and the `num_ctx` hint work from the
+    /// first run; `None` when nothing is known — never a guess.
     AddModel {
         display_id: String,
         provider_id: String,
         model: String,
         api_key: Option<SecretKey>,
+        context_tokens: Option<u64>,
     },
 
     /// Query a provider's OpenAI-compatible model list (client-only — NOT a
-    /// daemon command). The harness GETs `<base_url>/models` with the provider's
-    /// auth header and feeds the result back as `Action::ProviderModelsLoaded` /
-    /// `ProviderModelsFailed`. `api_key` is the key the user entered for a hosted
-    /// provider (redacted in `Debug`), or `None` for a local/no-auth provider.
-    /// Intercepted in the harness drain loop, mirroring `AddModel`; never mapped
-    /// to a `CommandBody`.
+    /// daemon command). The harness seeds from `<data_dir>/model_lists/` and
+    /// GETs `<base_url>/models` with the provider's auth header, feeding both
+    /// back as `Action::ProviderModelsLoaded` / `ProviderModelsFailed`.
+    /// `api_key` is the key the user entered for a hosted provider (redacted
+    /// in `Debug`), or `None` — in which case the harness falls back to the
+    /// provider-wide key already in `auth.json`. `refresh` skips the cache
+    /// seed (the overlay's manual `Ctrl-R`). Intercepted in the harness drain
+    /// loop, mirroring `AddModel`; never mapped to a `CommandBody`.
     QueryProviderModels {
         provider_id: String,
         api_key: Option<SecretKey>,
+        refresh: bool,
     },
 
+    /// Verify one model's stored key with a single `/models` call (client-only
+    /// — the key never leaves the machine, exactly like [`Intent::SetApiKey`]).
+    /// The harness answers with `Action::ModelKeyVerified`.
+    VerifyApiKey {
+        model_id: String,
+    },
+
+    /// Remember the theme picked in `/theme` so the next launch starts in it
+    /// (client-only — a display preference, never a daemon command). The
+    /// harness persists the id beside its session store; `theme_select` reads
+    /// it at boot, below `--theme`/`CODYPENDENT_THEME`. The live switch does
+    /// not depend on this: the renderer already draws in the picked theme.
+    SetTheme {
+        id: String,
+    },
     /// Set (or replace) an API key from the `/keys` overlay (D1; client-only —
     /// NOT a daemon command, keeping the key off the wire exactly like
     /// `AddModel`). The harness writes it to `auth.json` (load-before-write,
@@ -596,10 +784,49 @@ pub enum Intent {
         chair: String,
         rounds: u8,
     },
+    /// Remove a persisted council definition (rubric 6 TUI wiring). Client-only,
+    /// exactly like `CreateCouncil`: the harness calls
+    /// `council::remove_definition` and reloads the browser projection. Saved
+    /// run reports are left on disk.
+    DeleteCouncil {
+        name: String,
+    },
+    /// Run a persisted council's deliberation for `objective` (rubric 6 TUI
+    /// wiring). Client-only: member/chair runs are independent daemon
+    /// sessions, so the harness drives `council::run_with_progress` off-thread
+    /// over its OWN connection, streaming progress and the final outcome back
+    /// through the `ReaderSignal` channel — never a single `CommandBody`. No
+    /// `repository` field: like `StartRun`, the harness fills it in from the
+    /// attached session's own repository, not from reducer-owned state.
+    RunCouncil {
+        name: String,
+        objective: String,
+    },
     /// Create and attach to a fresh session without leaving the TUI. Client-only:
     /// the harness creates the session, swaps this connection's attachment, and
     /// updates the repo→session continuity store while the old run continues.
     NewConversation,
+
+    /// List the Unsloth org's GGUF repos from the Hugging Face Hub
+    /// (client-only — NOT a daemon command, and never touches the network on
+    /// this thread). The harness fetches off the UI thread and feeds the
+    /// result back as `Action::UnslothReposLoaded` / `UnslothReposFailed`.
+    ListUnslothRepos,
+    /// List `repo_id`'s quant variants (client-only), mirroring
+    /// [`Intent::ListUnslothRepos`]. Feeds back as
+    /// `Action::UnslothQuantsLoaded` / `UnslothQuantsFailed`.
+    ListUnslothQuants {
+        repo_id: String,
+    },
+    /// Drive `ollama pull hf.co/<repo_id>:<quant>` and, on success, register
+    /// the model in `models.toml` against the `ollama` provider
+    /// (client-only). Feeds back zero or more `Action::UnslothPullProgress`
+    /// as the pull streams output, then exactly one
+    /// `Action::UnslothPullFinished`.
+    PullUnslothModel {
+        repo_id: String,
+        quant: String,
+    },
 }
 
 #[cfg(test)]
@@ -624,6 +851,7 @@ mod tests {
             provider_id: "groq".to_string(),
             model: "llama-3.1-8b".to_string(),
             api_key: Some(SecretKey("sk-secret".to_string())),
+            context_tokens: None,
         };
         assert!(
             !format!("{intent:?}").contains("sk-secret"),
@@ -636,6 +864,7 @@ mod tests {
         let intent = Intent::QueryProviderModels {
             provider_id: "groq".to_string(),
             api_key: Some(SecretKey("sk-secret".to_string())),
+            refresh: false,
         };
         assert!(
             !format!("{intent:?}").contains("sk-secret"),

@@ -172,6 +172,27 @@ pub trait RunExecutor: Send + Sync {
         None
     }
 
+    /// The assembly-provided [`DocumentCreator`](crate::documents::DocumentCreator)
+    /// that creates a collaborative document from an accepted `CreateDocument`
+    /// command (rubric #4 doc-writer). Bundled with the other document seams for
+    /// the same reason — it names `codypendent-knowledge`, which only the
+    /// assembly can. The default `None` leaves creation unwired (rejected
+    /// `document.transport-unavailable`).
+    fn document_creator(&self) -> Option<std::sync::Arc<dyn crate::documents::DocumentCreator>> {
+        None
+    }
+
+    /// The assembly-provided [`DocumentMaintainer`](crate::documents::DocumentMaintainer)
+    /// that runs the documentation staleness sweep for an accepted
+    /// `CheckDocuments` command (`/update-docs`, Phase 4 STEP 4.6). Bundled with
+    /// the other document seams; the default `None` leaves the sweep unwired
+    /// (rejected `document.transport-unavailable`).
+    fn document_maintainer(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::documents::DocumentMaintainer>> {
+        None
+    }
+
     /// The assembly-provided [`DocumentPublisher`](crate::documents::DocumentPublisher)
     /// that computes an accepted `PublishDocument` command's plan, parks its
     /// approval, and (once approved) executes it (Phase 4 STEP 4.4). Bundled with
@@ -232,6 +253,17 @@ pub trait RunExecutor: Send + Sync {
         None
     }
 
+    /// The assembly-provided [`BlackboardWriter`](crate::blackboard::BlackboardWriter)
+    /// that stores a `PostBlackboardItem` / `UpdateBlackboardItem` from a
+    /// `Controller` client (Phase B kanban — the human half of the task board).
+    /// Bundled with the executor for the same reason as the reader: only the
+    /// assembly can name `BlackboardStore` and the pool. The default `None`
+    /// leaves board writes unwired — the executor-less server rejects both
+    /// commands with `workflow.transport-unavailable`.
+    fn blackboard_writer(&self) -> Option<std::sync::Arc<dyn crate::blackboard::BlackboardWriter>> {
+        None
+    }
+
     /// The per-run blackboard fan-out ([`BlackboardHub`](crate::blackboard::BlackboardHub))
     /// the workflow executor publishes posted artifacts through and the server
     /// subscribes a client's `Subscription::Blackboard` forwarder to (Phase 5
@@ -283,6 +315,21 @@ pub trait RunExecutor: Send + Sync {
     /// executor-less server path (`server::run`, the daemon's own tests)
     /// exactly as before — nothing to scan without a runtime behind it.
     fn ensure_repository_scanned(&self, _root: std::path::PathBuf) {}
+
+    /// The assembly-provided [`Transcriber`](crate::transcription::Transcriber)
+    /// that turns a stored audio artifact into text for a `SubmitUserInput`
+    /// carrying a voice [`InputEnvelope`](codypendent_protocol::InputEnvelope)
+    /// (voice v1, rubric 8). Bundled with the executor like the document and
+    /// workflow seams — it names an HTTP speech-to-text client in
+    /// `codypendent-runtime`, which this crate cannot depend on (that edge runs
+    /// the other way). The default `None` leaves voice input unwired: the
+    /// executor-less server and the daemon's own tests then reject an
+    /// un-transcribed audio envelope with `voice.transport-unavailable`,
+    /// exactly as `StartWorkflow` is rejected without a starter. Plain-text
+    /// `SubmitUserInput` is completely unaffected.
+    fn transcriber(&self) -> Option<std::sync::Arc<dyn crate::transcription::Transcriber>> {
+        None
+    }
 }
 
 #[cfg(test)]

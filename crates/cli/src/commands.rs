@@ -11,7 +11,8 @@ use base64::Engine as _;
 use codypendent_daemon::policy::{ApprovalAction, MergedPolicy, PolicyEngine};
 use codypendent_integrations::mcp::{load_mcp_config, McpConfig};
 use codypendent_knowledge::{
-    db as knowledge_db, plan_publication, publications, register_builtins, retrieve, DocumentStore,
+    anchor_repository_id, db as knowledge_db, install_package, is_retrievable_status,
+    plan_publication, publications, register_builtins, retrieve, user_skills_root, DocumentStore,
     HashingEmbedder, Publication, PublishTarget as KnowledgePublishTarget, Registry,
     RetrievalConfig, RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
 };
@@ -597,6 +598,54 @@ pub async fn index_rebuild(paths: &RuntimePaths) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `codypendent skill add <dir>`: validate the skill package at `dir`, install a
+/// copy under `<data_dir>/skills/<id>/`, and register it into the governed
+/// registry so retrieval can disclose it to a run.
+///
+/// Self-contained like `index rebuild` — it opens the database directly rather
+/// than requiring a running daemon, and the daemon's own startup scan re-walks
+/// the same root on its next boot, so an install taken while the daemon is down
+/// is picked up rather than lost.
+///
+/// A package declaring `scope = "repository"` anchors to the checkout `dir`
+/// lives in (its Git toplevel), derived exactly as the daemon derives a run's
+/// repository identity — a mismatch there would register the skill under an
+/// identity no run ever queries, leaving it silently invisible.
+///
+/// A non-`active` package installs and registers, but is reported loudly: the
+/// retrieval funnel hard-filters everything but Active, so a draft skill is
+/// installed-but-never-disclosed, and that is precisely the failure mode the
+/// only shipped package spent its life in.
+pub async fn skill_add(paths: &RuntimePaths, dir: &std::path::Path) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = knowledge_db::open(&database_path)
+        .await
+        .with_context(|| format!("opening {}", database_path.display()))?;
+
+    let skills_root = user_skills_root(&paths.data_dir);
+    let anchor = anchor_repository_id(dir);
+    let (item, installed) = install_package(&pool, dir, &skills_root, anchor)
+        .await
+        .with_context(|| format!("installing the skill package at {}", dir.display()))?;
+
+    println!(
+        "installed skill {} {} ({}) -> {}",
+        item.name,
+        item.version.0,
+        item.scope.tier(),
+        installed.display()
+    );
+    if !is_retrievable_status(item.status) {
+        println!(
+            "warning: status is {:?}, so retrieval will never disclose this skill \
+             — set `status = \"active\"` in skill.toml and re-add it",
+            item.status
+        );
+    }
+    Ok(())
+}
+
 /// `codypendent open <session> --in <ide>` (STEP 3.7). Print how the IDE should
 /// attach to the session, then best-effort launch the editor with the session in
 /// its environment. The IDE joins as a *contributor* to the SAME session — the
@@ -627,6 +676,148 @@ pub async fn open(
         ),
     }
     Ok(())
+}
+
+/// `codypendent docs new <TITLE> [--from FILE] [--scope S]` — the CLI half of
+/// document creation (rubric #4). Ensures a daemon, sends `CreateDocument` with
+/// the current checkout as the repository (so a repository-scoped document
+/// lands with the code it documents), and prints the id the daemon minted.
+///
+/// `--from` reads the Markdown here rather than passing a path, so the daemon
+/// never opens a client-named file: the seed content crosses the socket as
+/// data, which also works when the daemon runs elsewhere.
+pub async fn docs_new(
+    paths: &RuntimePaths,
+    title: &str,
+    from: Option<&std::path::Path>,
+    scope: Option<String>,
+) -> anyhow::Result<()> {
+    let initial_markdown = match from {
+        Some(path) => Some(
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let repository = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned());
+
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(&mut conn).await?;
+
+    let reply = conn
+        .send_command(CommandBody::CreateDocument {
+            title: title.to_string(),
+            scope,
+            repository,
+            initial_markdown,
+        })
+        .await?;
+    match reply.payload {
+        Payload::DocumentCreated { document_id, .. } => {
+            println!("Created \"{title}\" ({document_id}).");
+            println!("Open it in the TUI's Docs Studio (D) to edit, review, or publish.");
+            Ok(())
+        }
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "daemon rejected the document: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to CreateDocument: {other:?}"),
+    }
+}
+
+/// `codypendent docs list` — the documents this checkout can see (repository +
+/// system scope), newest first. Reads the daemon's database directly, the same
+/// read-only projection seam `docs publish` and the TUI's Docs Studio use, so
+/// listing never needs a running daemon.
+pub async fn docs_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = knowledge_db::open(&database_path)
+        .await
+        .with_context(|| format!("opening {}", database_path.display()))?;
+
+    let repository =
+        codypendent_knowledge::stable_repository_id(&std::env::current_dir()?.canonicalize()?);
+    let scopes = [Scope::Repository(repository), Scope::System];
+    let summaries = DocumentStore::new().list(&pool, &scopes).await?;
+    if summaries.is_empty() {
+        println!("No documents yet. Create one with `codypendent docs new \"<title>\"`.");
+        return Ok(());
+    }
+    println!("{:<38} {:<10} {:>4}  TITLE", "ID", "STATUS", "REV");
+    for summary in &summaries {
+        println!(
+            "{:<38} {:<10} {:>4}  {}",
+            summary.id.to_string(),
+            summary.status.as_str(),
+            summary.revision,
+            summary.title
+        );
+    }
+    Ok(())
+}
+
+/// `codypendent docs check` — the on-demand `/update-docs` sweep. Ensures a
+/// daemon (the sweep runs there, against the code graph it maintains) and
+/// prints the finding counts it reports back.
+pub async fn docs_check(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let repository = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned());
+
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(&mut conn).await?;
+
+    let reply = conn
+        .send_command(CommandBody::CheckDocuments {
+            repository,
+            session_id: None,
+        })
+        .await?;
+    match reply.payload {
+        Payload::DocsCheckCompleted {
+            documents_checked,
+            links_resolved,
+            stale_findings,
+            suggestions_filed,
+            ..
+        } => {
+            println!("Checked {documents_checked} document(s); {links_resolved} symbol link(s) resolved.");
+            if stale_findings == 0 {
+                println!("No stale documentation found.");
+            } else {
+                println!(
+                    "{stale_findings} stale finding(s); {suggestions_filed} suggestion(s) filed \
+                     for review."
+                );
+                println!("Review them in the TUI's Docs Studio (D).");
+            }
+            Ok(())
+        }
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "daemon rejected the check: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to CheckDocuments: {other:?}"),
+    }
 }
 
 /// `codypendent docs publish --target <T>` (Phase 4 STEP 4.4). Which Git
@@ -2559,6 +2750,190 @@ steps:
             "github.update-pull-request"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// `codypendent models list | add | check` — headless parity with the TUI
+// ---------------------------------------------------------------------------
+
+/// `codypendent models list`: the configured models, one per line, with the
+/// same facts the TUI's `/model` picker shows — provider, endpoint, context
+/// window, and whether a key is stored. Never prints key material: only
+/// whether one exists, and for an env-backed entry, the variable NAME.
+///
+/// An absent `models.toml` is not an error: it prints the "none configured"
+/// line and the `models add` hint, since that is the true state of a fresh
+/// install rather than a failure.
+pub fn models_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+    use codypendent_runtime::auth::AuthStore;
+    use codypendent_runtime::models::load_models;
+
+    let models_path = paths.data_dir.join("models.toml");
+    if !models_path.exists() {
+        println!("no models configured ({})", models_path.display());
+        println!("add one with: codypendent models add <provider> <model-id>");
+        return Ok(());
+    }
+    let configs =
+        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?;
+    if configs.is_empty() {
+        println!("no models configured ({})", models_path.display());
+        return Ok(());
+    }
+    let auth = AuthStore::load(&paths.data_dir).unwrap_or_default();
+    for config in &configs {
+        let key = if auth.get(&config.id.0).is_some_and(|k| !k.is_empty()) {
+            "key: stored".to_string()
+        } else if !config.api_key_env.trim().is_empty() {
+            format!("key: env {}", config.api_key_env)
+        } else if config
+            .provider_id
+            .as_deref()
+            .and_then(|p| auth.get(&codypendent_runtime::models::provider_auth_id(p)))
+            .is_some_and(|k| !k.is_empty())
+        {
+            "key: stored (provider-wide)".to_string()
+        } else {
+            "key: none".to_string()
+        };
+        let context = config
+            .context_tokens
+            .map_or_else(|| "context: —".to_string(), |t| format!("context: {t}"));
+        let endpoint = if config.base_url.is_empty() {
+            config.model.clone()
+        } else {
+            config.base_url.clone()
+        };
+        println!(
+            "{}\n    {} · {} · {} · {}",
+            config.id.0,
+            config.provider_id.as_deref().unwrap_or(&config.provider),
+            endpoint,
+            context,
+            key
+        );
+    }
+    Ok(())
+}
+
+/// `codypendent models add <provider> <model-id> [--key-env NAME] [--id ID]`:
+/// the headless twin of the TUI's add-model flow. Resolves the provider from
+/// the same catalog (built-ins layered with the user's `providers.toml`),
+/// records `provider_id` so the runtime sends that provider's real auth header,
+/// carries the catalog row's context window when it has one, and writes
+/// `models.toml` atomically.
+///
+/// No key is ever read from an argument (a key on a command line lands in the
+/// shell history and the process table): `--key-env` names the environment
+/// variable to read at call time, and without it the provider's own documented
+/// variable — or a key already stored by the TUI — is used.
+pub fn models_add(
+    paths: &RuntimePaths,
+    provider_id: &str,
+    model: &str,
+    key_env: Option<&str>,
+    id: Option<&str>,
+) -> anyhow::Result<()> {
+    use codypendent_providers::Catalog;
+    use codypendent_runtime::models::{load_models, ModelConfig};
+
+    let data_dir = &paths.data_dir;
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating the data dir {}", data_dir.display()))?;
+    let catalog = Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
+        .unwrap_or_else(|_| Catalog::builtin());
+    let provider = catalog
+        .get(provider_id)
+        .ok_or_else(|| anyhow::anyhow!("provider `{provider_id}` is not in the catalog"))?;
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("provider `{provider_id}` has no base URL and cannot be added")
+        })?;
+    let display_id = id
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{provider_id}/{model}"));
+    if display_id.trim().is_empty() {
+        anyhow::bail!("model id must not be blank");
+    }
+
+    let models_path = data_dir.join("models.toml");
+    let mut configs = if models_path.exists() {
+        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?
+    } else {
+        Vec::new()
+    };
+    let replaced = configs.iter().any(|c| c.id.0 == display_id);
+    configs.retain(|c| c.id.0 != display_id);
+    configs.push(ModelConfig {
+        id: codypendent_protocol::ModelId(display_id.clone()),
+        provider: "openai-compatible".to_string(),
+        base_url,
+        model: model.to_string(),
+        api_key_env: key_env.unwrap_or_default().to_string(),
+        provider_id: Some(provider_id.to_string()),
+        context_tokens: catalog
+            .model(provider_id, model)
+            .and_then(|row| row.context_tokens),
+    });
+
+    #[derive(serde::Serialize)]
+    struct ModelsToml {
+        #[serde(rename = "model")]
+        model: Vec<ModelConfig>,
+    }
+    let rendered = toml::to_string_pretty(&ModelsToml { model: configs })
+        .context("serializing models.toml")?;
+    let tmp = data_dir.join("models.toml.tmp");
+    std::fs::write(&tmp, rendered.as_bytes())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &models_path)
+        .with_context(|| format!("replacing {}", models_path.display()))?;
+    println!(
+        "{} model {display_id} ({})",
+        if replaced { "updated" } else { "added" },
+        models_path.display()
+    );
+    if key_env.is_none() && !provider.local {
+        println!("verify it with: codypendent models check {display_id}");
+    }
+    Ok(())
+}
+
+/// `codypendent models check <id>`: the headless twin of the `/keys` verify
+/// action. Runs the real [`ModelRegistry::check_model`], so the credential
+/// precedence and the catalog-declared auth headers are exactly the ones a run
+/// would use — an "ok" here means a run authenticates. Exits non-zero when the
+/// provider does not list the configured model.
+pub async fn models_check(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
+    use codypendent_runtime::auth::AuthStore;
+    use codypendent_runtime::models::{load_models, ModelRegistry};
+
+    let models_path = paths.data_dir.join("models.toml");
+    let configs =
+        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?;
+    if !configs.iter().any(|c| c.id.0 == id) {
+        anyhow::bail!(
+            "model `{id}` is not configured in {}",
+            models_path.display()
+        );
+    }
+    let auth = AuthStore::load(&paths.data_dir).unwrap_or_default();
+    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+        &paths.data_dir.join("providers.toml"),
+    )
+    .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+    ModelRegistry::new(configs)
+        .with_auth(auth)
+        .with_catalog(catalog)
+        .check_model(&codypendent_protocol::ModelId(id.to_owned()))
+        .await
+        .with_context(|| format!("checking model `{id}`"))?;
+    println!("{id}: ok — the provider lists this model and the credentials resolve");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use codypendent_knowledge::retrieval::{
-    retrieve, HashingEmbedder, RetrievalConfig, RetrievalIndexes, RetrievalQuery,
+    retrieve, Embedder, HashingEmbedder, RetrievalConfig, RetrievalIndexes, RetrievalQuery,
 };
 use codypendent_knowledge::types::{
     CapabilityRequest, Provenance, RegistryItem, RegistryItemKind, RegistryStatus, RiskClass,
@@ -81,13 +81,75 @@ async fn seed() -> (tempfile::TempDir, Vec<RegistryItem>, RepositoryId) {
     (tmp, items, repo)
 }
 
+/// A deterministic stand-in for a *semantic* model behind the same [`Embedder`]
+/// seam: word-level unigram + bigram TF hashing into 384 buckets (FNV-1a),
+/// L2-normalized. Deliberately a DIFFERENT feature family and dimensionality
+/// than the char-trigram [`HashingEmbedder`], so running the eval over it
+/// asserts the funnel's gates hold independent of which embedding space fills
+/// the dense slot — the property that lets a real remote model plug in behind
+/// the trait without weakening the suite.
+struct WordHashEmbedder;
+
+impl WordHashEmbedder {
+    const DIMENSION: usize = 384;
+
+    fn bucket(token: &str) -> usize {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = FNV_OFFSET;
+        for byte in token.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        (hash % Self::DIMENSION as u64) as usize
+    }
+}
+
+impl Embedder for WordHashEmbedder {
+    fn embed(&self, text: &str) -> Vec<f32> {
+        let tokens: Vec<String> = text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let mut vector = vec![0.0_f32; Self::DIMENSION];
+        for token in &tokens {
+            vector[Self::bucket(token)] += 1.0;
+        }
+        for pair in tokens.windows(2) {
+            vector[Self::bucket(&format!("{} {}", pair[0], pair[1]))] += 1.0;
+        }
+        let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for value in &mut vector {
+                *value /= norm;
+            }
+        }
+        vector
+    }
+}
+
 #[tokio::test]
 async fn retrieval_beats_full_injection_recall_and_forbidden_exclusion() {
     let (_tmp, items, repo) = seed().await;
+    // The gates must hold for BOTH embedding spaces — the shipped offline
+    // hashing model and a distinct "semantic" stand-in — with the SAME recall
+    // floor. Neither run may weaken the other's gate.
+    let hashing = RetrievalIndexes::build(&items, HashingEmbedder::new()).unwrap();
+    run_eval_gates("hashing-trigram", &items, repo, &hashing);
+    let semantic = RetrievalIndexes::build(&items, WordHashEmbedder).unwrap();
+    run_eval_gates("word-hash-semantic", &items, repo, &semantic);
+}
 
-    // ---- Build the derived indexes over authority ---------------------------
-    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new()).unwrap();
-
+/// The full gate battery over one built index pair: mean recall@8 ≥ 0.8,
+/// 100 % forbidden exclusion, and top-k beating full injection under the token
+/// budget. `label` names the embedder in diagnostics and assertion messages.
+fn run_eval_gates(
+    label: &str,
+    items: &[RegistryItem],
+    repo: RepositoryId,
+    indexes: &RetrievalIndexes,
+) {
     // recall@8: disclose up to 8 tool cards (+ 1–3 skill cards).
     let config = RetrievalConfig {
         disclose_tools_max: 8,
@@ -109,8 +171,9 @@ async fn retrieval_beats_full_injection_recall_and_forbidden_exclusion() {
             risk_ceiling: RiskClass::Medium,
             min_trust: TrustTier::Untrusted,
             history: Vec::new(),
+            query_vector: None,
         };
-        let result = retrieve(&items, &indexes, &query, &config).unwrap();
+        let result = retrieve(items, indexes, &query, &config).unwrap();
 
         let disclosed: HashSet<&str> = result
             .tools
@@ -131,12 +194,14 @@ async fn retrieval_beats_full_injection_recall_and_forbidden_exclusion() {
         // Forbidden exclusion is HARD: no forbidden name, ever.
         for forbidden in &case.forbidden_ids {
             if disclosed.contains(forbidden.as_str()) {
-                forbidden_ever_disclosed.push(format!("{forbidden} for query: {}", case.query));
+                forbidden_ever_disclosed
+                    .push(format!("[{label}] {forbidden} for query: {}", case.query));
             }
         }
         for forbidden in FORBIDDEN {
             if disclosed.contains(forbidden) {
-                forbidden_ever_disclosed.push(format!("{forbidden} for query: {}", case.query));
+                forbidden_ever_disclosed
+                    .push(format!("[{label}] {forbidden} for query: {}", case.query));
             }
         }
 
@@ -160,30 +225,67 @@ async fn retrieval_beats_full_injection_recall_and_forbidden_exclusion() {
     let mean_recall = recalls.iter().map(|(_, r)| *r).sum::<f32>() / recalls.len() as f32;
     let mut worst = recalls.clone();
     worst.sort_by(|a, b| a.1.total_cmp(&b.1));
-    eprintln!("mean recall@8 = {mean_recall:.4}");
-    eprintln!("hardest cases:");
+    eprintln!("[{label}] mean recall@8 = {mean_recall:.4}");
+    eprintln!("[{label}] hardest cases:");
     for (query, recall) in worst.iter().take(5) {
         eprintln!("  {recall:.2}  {query}");
     }
     assert!(
         mean_recall >= 0.8,
-        "mean recall@8 {mean_recall:.4} < 0.8; hardest: {:?}",
+        "[{label}] mean recall@8 {mean_recall:.4} < 0.8; hardest: {:?}",
         &worst[..worst.len().min(5)]
     );
 
     // ---- Top-k beats full injection under the budget ------------------------
     let full_injection_tokens: usize = items.iter().map(full_definition_tokens).sum();
     eprintln!(
-        "disclosed peak = {disclosed_token_peak} tokens; budget = {BUDGET_TOKENS}; \
+        "[{label}] disclosed peak = {disclosed_token_peak} tokens; budget = {BUDGET_TOKENS}; \
          full injection = {full_injection_tokens} tokens"
     );
     assert!(
         disclosed_token_peak <= BUDGET_TOKENS,
-        "disclosed {disclosed_token_peak} tokens exceeds budget {BUDGET_TOKENS}"
+        "[{label}] disclosed {disclosed_token_peak} tokens exceeds budget {BUDGET_TOKENS}"
     );
     assert!(
         BUDGET_TOKENS < full_injection_tokens,
-        "full injection {full_injection_tokens} did not exceed budget {BUDGET_TOKENS}"
+        "[{label}] full injection {full_injection_tokens} did not exceed budget {BUDGET_TOKENS}"
+    );
+}
+
+/// Skill activation gate (2026-08-11 review): a CI-failure query MUST disclose
+/// the shipped `rust.fix-ci` skill card.
+///
+/// Before the reference package's `status` flipped to `active`, the funnel's
+/// non-Active hard filter (`retrieval/mod.rs`) dropped it from every selection,
+/// and the 0.8 *mean*-recall gate above quietly absorbed the per-case misses —
+/// the suite passed while skill disclosure was dead product-wide. This test
+/// asserts the disclosure DIRECTLY, per skill, so a regression to a
+/// never-selectable shipped skill turns the suite red instead of shaving the
+/// mean.
+#[tokio::test]
+async fn a_ci_failure_query_discloses_the_shipped_fix_ci_skill_card() {
+    let (_tmp, items, repo) = seed().await;
+    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new()).unwrap();
+
+    // The same shape the executor's `emit_context` queries under: System + the
+    // run's repository, a Medium risk ceiling (the skill is Medium — writes +
+    // commands + network, no secret — so the ceiling admits it).
+    let query = RetrievalQuery::new(
+        "the github actions ci is failing on the rust tests, diagnose and fix it",
+        vec![Scope::System, Scope::Repository(repo)],
+        RiskClass::Medium,
+    );
+    let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default()).unwrap();
+
+    assert!(
+        result.skills.iter().any(|card| card.name == "rust.fix-ci"),
+        "the shipped rust.fix-ci skill must be disclosed for a CI-failure query; \
+         disclosed skills: {:?} (is the package still status = \"active\"?)",
+        result
+            .skills
+            .iter()
+            .map(|card| card.name.as_str())
+            .collect::<Vec<_>>()
     );
 }
 

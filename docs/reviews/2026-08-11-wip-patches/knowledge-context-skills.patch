@@ -1,0 +1,1776 @@
+diff --git a/crates/codypendentd/src/executor.rs b/crates/codypendentd/src/executor.rs
+index 8f1d4e6..cc0593f 100644
+--- a/crates/codypendentd/src/executor.rs
++++ b/crates/codypendentd/src/executor.rs
+@@ -45,7 +45,7 @@ use codypendent_integrations::search::SearchApi;
+ #[cfg(test)]
+ use codypendent_integrations::search::TavilyClient;
+ use codypendent_knowledge::{
+-    assemble_context, chronicle_candidates, extract_candidates, Curation, ExtractionInput,
++    chronicle_candidates, extract_candidates, ContextAssembler, Curation, ExtractionInput,
+     FactExtractor, MemoryStore, NoopExtractor, Revision, Scope,
+ };
+ use codypendent_protocol::discovery::RuntimePaths;
+@@ -67,7 +67,7 @@ use crate::blackboard::WorkflowBlackboardReader;
+ use crate::promotion::PromotionStoreGateway;
+ use crate::routing::{estimate_input_tokens, RoutingConfig, RoutingCoordinator};
+ use crate::scan;
+-use crate::session_history::continuation_prior;
++use crate::session_history::{context_turn, continuation_prior, CONTEXT_PSEUDO_TOOL};
+ use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor, WorkflowRunCancellations};
+ use crate::workflows::{WorkflowConductorHost, WorkflowRunReader};
+ 
+@@ -204,6 +204,13 @@ pub struct RuntimeExecutor {
+     /// the run resolves a model exactly as before. Bound to the shared
+     /// subscription hub so a recorded routing note reaches attached clients live.
+     routing: RoutingCoordinator,
++    /// The caching context assembler (2026-08-11 review item 3): serves
++    /// [`emit_context`](Self::emit_context) the registry's derived retrieval
++    /// indexes from a registry-stamped cache instead of rebuilding dense+BM25
++    /// from scratch on every first run. `Arc` so every clone of this executor
++    /// shares ONE cache; invalidation is the stamp probe inside the assembler
++    /// (any registry write — a skill install, a builtin refresh — moves it).
++    context: Arc<ContextAssembler>,
+ }
+ 
+ impl RuntimeExecutor {
+@@ -282,6 +289,7 @@ impl RuntimeExecutor {
+             workflows,
+             workflow_cancellations,
+             routing,
++            context: Arc::new(ContextAssembler::new()),
+         }
+     }
+ 
+@@ -1142,29 +1150,49 @@ impl RuntimeExecutor {
+ 
+     /// Assemble the knowledge-fabric context (repository map + tool/skill cards +
+     /// cited memories) for `objective` and note its render into the trace, so
+-    /// every run opens with the three manifests.
++    /// every run opens with the three manifests. Returns the rendered manifest —
++    /// the SAME text the note carries — so the caller can also seed it into the
++    /// model-visible transcript (2026-08-11 review item 1: previously the
++    /// manifest reached only this trace note and the model started blind).
+     ///
+     /// Called **before** the agent loop, never concurrently with it — the note is
+     /// appended and published from the worker before `execute` spawns, so it can
+     /// never race the loop for a sequence. A fabric failure is warned and swallowed
+-    /// (context is an aid, never a gate on running).
++    /// (context is an aid, never a gate on running); a note-append failure still
++    /// returns the manifest — the model seed must not depend on the trace write.
+     async fn emit_context(
+         &self,
+         session_id: SessionId,
+         run_id: RunId,
+         repository: RepositoryId,
+         objective: &str,
+-    ) {
+-        // System (built-ins) + this repository (harvested run memories are stored
+-        // at repository visibility), so a memory a prior run curated resurfaces.
+-        let scopes = [Scope::System, Scope::Repository(repository)];
+-        match assemble_context(&self.pool, repository, objective, &scopes).await {
++    ) -> Option<String> {
++        // System (built-ins) + the operator's local user scope (data-dir skills
++        // installed via `codypendent skill add` / the startup scan register
++        // there) + this repository (harvested run memories are stored at
++        // repository visibility, and repo-local skills anchor here), so a memory
++        // a prior run curated — and every locally installed skill — resurfaces.
++        let scopes = [
++            Scope::System,
++            codypendent_knowledge::local_user_scope(),
++            Scope::Repository(repository),
++        ];
++        match self
++            .context
++            .assemble(&self.pool, repository, objective, &scopes)
++            .await
++        {
+             Ok(manifest) => {
+-                if let Err(error) = self.emit_note(session_id, run_id, manifest.render()).await {
++                let rendered = manifest.render();
++                if let Err(error) = self.emit_note(session_id, run_id, rendered.clone()).await {
+                     warn!(%session_id, %run_id, %error, "could not emit run context note");
+                 }
++                Some(rendered)
++            }
++            Err(error) => {
++                warn!(%session_id, %error, "could not assemble run context");
++                None
+             }
+-            Err(error) => warn!(%session_id, %error, "could not assemble run context"),
+         }
+     }
+ 
+@@ -1283,10 +1311,12 @@ impl RuntimeExecutor {
+ 
+     /// Open a run's trace. The FIRST run of a session (empty reconstructed
+     /// `prior`) gets the full knowledge-fabric context manifest via
+-    /// [`emit_context`](Self::emit_context); a CONTINUATION (non-empty prior)
+-    /// gets a one-line [`CONTINUATION_CONTEXT_NOTE`] marker instead — its shared
+-    /// context already rides in the seeded transcript, so re-emitting the full
+-    /// `=== CONTEXT` repo-map every follow-up would only re-pay tokens for
++    /// [`emit_context`](Self::emit_context) — returned so the caller seeds it
++    /// into the model transcript too; a CONTINUATION (non-empty prior) gets a
++    /// one-line [`CONTINUATION_CONTEXT_NOTE`] marker instead and returns `None`
++    /// — its shared context already rides in the seeded transcript (the stored
++    /// manifest note projected by `continuation_prior`), so re-assembling the
++    /// full `=== CONTEXT` repo-map every follow-up would only re-pay tokens for
+     /// nothing (continuous-session plan, Task 4).
+     async fn emit_run_opening(
+         &self,
+@@ -1295,16 +1325,53 @@ impl RuntimeExecutor {
+         repository: RepositoryId,
+         objective: &str,
+         prior: &[TurnItem],
+-    ) {
++    ) -> Option<String> {
+         if prior.is_empty() {
+-            self.emit_context(session_id, run_id, repository, objective)
++            return self
++                .emit_context(session_id, run_id, repository, objective)
+                 .await;
+-        } else if let Err(error) = self
++        }
++        if let Err(error) = self
+             .emit_note(session_id, run_id, CONTINUATION_CONTEXT_NOTE.to_string())
+             .await
+         {
+             warn!(%session_id, %run_id, %error, "could not emit the continuation context marker");
+         }
++        None
++    }
++
++    /// Build a run's model-visible seed transcript AND open its trace — the one
++    /// place both first runs and continuations decide what the model sees ahead
++    /// of the objective (2026-08-11 review item 1):
++    ///
++    /// - a FIRST run reconstructs an empty prior, emits the full manifest note,
++    ///   and seeds that SAME manifest as a bounded [`context_turn`] — so the
++    ///   repo map, disclosed skill cards, and curated memories reach the model,
++    ///   not just the human trace;
++    /// - a CONTINUATION reconstructs the prior runs (whose head
++    ///   `continuation_prior` already seeds from the stored manifest note) and
++    ///   emits only the carried-context marker.
++    ///
++    /// The seed feeds BOTH execution paths: the native loop via
++    /// `RunContext::with_prior` (the runtime appends the objective after it) and
++    /// the ACP path via `render_acp_prompt`.
++    async fn build_run_seed(
++        &self,
++        session_id: SessionId,
++        run_id: RunId,
++        repository: RepositoryId,
++        objective: &str,
++    ) -> Vec<TurnItem> {
++        let mut prior = self.reconstruct_prior(session_id, run_id).await;
++        if let Some(manifest) = self
++            .emit_run_opening(session_id, run_id, repository, objective, &prior)
++            .await
++        {
++            // First run: the manifest turn leads, the runtime pushes the
++            // objective after the seed — evidence first, then direction.
++            prior.insert(0, context_turn(&manifest));
++        }
++        prior
+     }
+ 
+     /// Read + JSON-parse the bytes behind a chronicle [`ArtifactRef`]
+@@ -1752,10 +1819,25 @@ fn last_nonempty_line(text: &str) -> Option<String> {
+ fn render_acp_prompt(prior: &[TurnItem], objective: &str) -> String {
+     const CAP: usize = 1024 * 1024;
+     let mut transcript = String::new();
+-    if !prior.is_empty() {
++    // The seeded context-manifest turn (2026-08-11 review item 1) always leads
++    // the prior when present; render it as its own labeled block — it is
++    // retrieved evidence, not part of the conversation — so an external ACP
++    // agent receives the repo map / skill cards / memories exactly like the
++    // native driver does. The manifest text carries its own "EVIDENCE, NOT
++    // INSTRUCTIONS" preamble.
++    let mut conversation = prior;
++    if let Some((TurnItem::ToolResult { tool, output, .. }, rest)) = prior.split_first() {
++        if tool == CONTEXT_PSEUDO_TOOL {
++            transcript.push_str("Retrieved context:\n");
++            transcript.push_str(output);
++            transcript.push_str("\n\n");
++            conversation = rest;
++        }
++    }
++    if !conversation.is_empty() {
+         transcript.push_str("Previous conversation:\n");
+     }
+-    for item in prior {
++    for item in conversation {
+         let rendered = match item {
+             TurnItem::Objective(text) => format!("User: {text}\n"),
+             TurnItem::Assistant(text) => format!("Assistant: {text}\n"),
+@@ -1914,19 +1996,15 @@ impl RunExecutor for RuntimeExecutor {
+                 .ensure_scanned(repository, &launch.repository)
+                 .await;
+ 
+-            // Reconstruct the continuation's prior transcript from the session
+-            // ledger ONCE (continuous-session plan, Task 3): it both DECIDES how
+-            // the trace opens and SEEDS the run. Loaded before the agent loop, so
+-            // neither the opening note nor the seed races the loop's sequences.
+-            let prior = executor.reconstruct_prior(session_id, run_id).await;
+-
+-            // Open the run's trace: a first run (empty prior) gets the full
+-            // knowledge-fabric context manifest; a continuation (non-empty prior)
+-            // gets a one-line carried-context marker, skipping the repo re-map
+-            // (Task 4). Emitted here, BEFORE the agent loop, so the note never
+-            // races the loop's own sequence allocations.
+-            executor
+-                .emit_run_opening(session_id, run_id, repository, &objective, &prior)
++            // Build the run's seed transcript ONCE (continuous-session plan,
++            // Task 3 + 2026-08-11 review item 1): it reconstructs the
++            // continuation prior, opens the trace (full manifest note for a
++            // first run, carried-context marker for a follow-up), and seeds the
++            // manifest into the MODEL-VISIBLE transcript — the wire the review
++            // found missing. Done here, BEFORE the agent loop, so neither the
++            // opening note nor the seed races the loop's sequences.
++            let prior = executor
++                .build_run_seed(session_id, run_id, repository, &objective)
+                 .await;
+ 
+             // Run the work in a CHILD task so even a panic in the agent loop
+@@ -2580,20 +2658,26 @@ mod tests {
+         let executor =
+             RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
+ 
+-        // First run: empty prior → the full context manifest lands on the ledger.
++        // First run: empty prior → the full context manifest lands on the ledger
++        // AND is returned for the model seed (2026-08-11 review item 1).
+         let first_session = SessionId::new();
+         ledger::create_session(&pool, first_session, "first")
+             .await
+             .expect("create session");
+-        executor
++        let manifest = executor
+             .emit_run_opening(first_session, RunId::new(), repository, "objective", &[])
+             .await;
+         assert!(
+             context_manifest_present(&pool, first_session).await,
+             "a first run must emit the full === CONTEXT manifest"
+         );
++        assert!(
++            manifest.is_some_and(|text| text.starts_with("=== CONTEXT")),
++            "the first run's opening must hand back the manifest for the model seed"
++        );
+ 
+-        // Continuation: non-empty prior → NO manifest, the marker instead.
++        // Continuation: non-empty prior → NO manifest, the marker instead — and
++        // nothing returned (the seed already carries the stored context turn).
+         let cont_session = SessionId::new();
+         ledger::create_session(&pool, cont_session, "cont")
+             .await
+@@ -2602,13 +2686,17 @@ mod tests {
+             TurnItem::Objective("earlier".to_string()),
+             TurnItem::Assistant("reply".to_string()),
+         ];
+-        executor
++        let continuation = executor
+             .emit_run_opening(cont_session, RunId::new(), repository, "follow up", &prior)
+             .await;
+         assert!(
+             !context_manifest_present(&pool, cont_session).await,
+             "a continuation must NOT emit the === CONTEXT manifest"
+         );
++        assert!(
++            continuation.is_none(),
++            "a continuation opening returns no manifest to seed"
++        );
+     }
+ 
+     /// M1: `harvest_memories` loads + parses the `RunCompleted` chronicle
+@@ -4258,4 +4346,362 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
+             "the beta.rs read must hydrate with its path header and content, got: {outputs:?}"
+         );
+     }
++
++    /// A [`codypendent_runtime::agent::ModelDriver`] that records every
++    /// transcript it is handed and immediately finishes — the probe for the
++    /// 2026-08-11 review's headline fix: what does the MODEL actually receive?
++    struct RecordingDriver {
++        transcripts: Arc<Mutex<Vec<Vec<TurnItem>>>>,
++    }
++
++    #[async_trait]
++    impl codypendent_runtime::agent::ModelDriver for RecordingDriver {
++        fn model_id(&self) -> ModelId {
++            ModelId("recording".to_string())
++        }
++
++        async fn next_step(
++            &self,
++            transcript: &[TurnItem],
++            _tools: &[codypendent_runtime::agent::ToolDefinition],
++            _sink: &mut dyn codypendent_runtime::agent::DeltaSink,
++        ) -> anyhow::Result<codypendent_runtime::agent::StepOutcome> {
++            use codypendent_runtime::agent::{ModelStep, StepOutcome};
++            self.transcripts
++                .lock()
++                .expect("recording lock")
++                .push(transcript.to_vec());
++            Ok(StepOutcome::new(
++                ModelStep::Finish {
++                    summary: "done".to_string(),
++                },
++                None,
++            ))
++        }
++    }
++
++    /// Write a minimal ACTIVE repository-scoped skill package at `dir`, with
++    /// intents matching a CI-failure objective.
++    fn write_ci_skill_package(dir: &std::path::Path) {
++        std::fs::create_dir_all(dir).expect("package dir");
++        std::fs::write(
++            dir.join("skill.toml"),
++            "schema_version = 1\n\
++             id = \"test.fix-flaky-ci\"\n\
++             name = \"Fix Flaky CI\"\n\
++             version = \"0.1.0\"\n\
++             scope = \"repository\"\n\
++             status = \"active\"\n\
++             description = \"Diagnose and repair flaky CI test failures.\"\n\
++             intents = [\"ci failure\", \"flaky test\"]\n\
++             \n\
++             [entrypoints]\n\
++             instructions = \"SKILL.md\"\n\
++             \n\
++             [trust]\n\
++             publisher = \"local-user\"\n\
++             signature_required = false\n",
++        )
++        .expect("write skill.toml");
++        std::fs::write(dir.join("SKILL.md"), "# Fix flaky CI\n").expect("write SKILL.md");
++    }
++
++    /// 2026-08-11 review item 1 (the CRITICAL "context never reaches the model"
++    /// finding), first-run side: the seed built by the REAL
++    /// [`RuntimeExecutor::build_run_seed`] — the exact code `spawn_run` runs —
++    /// must open with the context-manifest turn, and driving the REAL
++    /// [`FrameworkAgentRuntime::execute_run`] with that seed must hand the
++    /// DRIVER a transcript containing the repository map and the disclosed
++    /// skill card, ahead of the objective. Before the fix the manifest was a
++    /// `NoteAppended` trace event only and this transcript carried nothing but
++    /// the objective.
++    #[tokio::test]
++    async fn first_run_seed_reaches_the_model_driver_with_repo_map_and_skill_card() {
++        use codypendent_knowledge::{codegraph, register_builtins, GitRevision, Registry};
++
++        let dir = tempfile::tempdir().expect("tempdir");
++        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
++        paths.ensure_directories().expect("directories");
++        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
++            .await
++            .expect("open db");
++
++        let repo = tempfile::tempdir().expect("repo tempdir");
++        let repository = scan::repository_id_for(repo.path());
++        let executor =
++            RuntimeExecutor::new(pool.clone(), paths, repository, repo.path().to_path_buf());
++
++        // Seed all three manifest surfaces: builtins (tool cards), a real code
++        // graph (repository map), and an ACTIVE repository-scoped skill
++        // (skill card) registered through the real package path.
++        register_builtins(&pool).await.expect("register builtins");
++        codegraph::upsert_file_graph(
++            &pool,
++            repository,
++            &GitRevision("rev-1".to_string()),
++            "src/engine.rs",
++            "pub struct Engine;\n\nimpl Engine {\n    pub fn tick(&self) -> u32 {\n        1\n    }\n}\n",
++        )
++        .await
++        .expect("seed code graph");
++        let skill_dir = dir.path().join("skill-pkg");
++        write_ci_skill_package(&skill_dir);
++        Registry::new()
++            .register_package(&pool, &skill_dir, Scope::Repository(repository))
++            .await
++            .expect("register skill package");
++
++        // The live write path appends the run's own RunStarted BEFORE spawn.
++        let session = SessionId::new();
++        let run_id = RunId::new();
++        let objective = "the ci is failing with a flaky rust test, diagnose and fix it";
++        ledger::create_session(&pool, session, "ctx-seed")
++            .await
++            .expect("create session");
++        projections::insert_run(
++            &pool,
++            run_id,
++            session,
++            objective,
++            AgentMode::Explore,
++            "hosted",
++            "{}",
++        )
++        .await
++        .expect("insert run row");
++        let started = codypendent_protocol::SessionEvent {
++            sequence: ledger::next_sequence(&pool, session).await.expect("seq"),
++            occurred_at: Utc::now(),
++            causation_id: None,
++            correlation_id: None,
++            actor: Actor::System,
++            body: EventBody::RunStarted {
++                run_id,
++                objective: objective.to_string(),
++                mode: AgentMode::Explore,
++            },
++        };
++        ledger::append_event(&pool, session, &started)
++            .await
++            .expect("append RunStarted");
++
++        // THE SEAM UNDER TEST: the exact seed `spawn_run` builds.
++        let prior = executor
++            .build_run_seed(session, run_id, repository, objective)
++            .await;
++        match prior.first() {
++            Some(TurnItem::ToolResult { tool, output, .. }) => {
++                assert_eq!(tool, CONTEXT_PSEUDO_TOOL);
++                assert!(
++                    output.contains("=== REPOSITORY MAP ===") && output.contains("Engine"),
++                    "the seed turn must carry the repository map: {output}"
++                );
++                assert!(
++                    output.contains("test.fix-flaky-ci"),
++                    "the seed turn must carry the disclosed skill card: {output}"
++                );
++            }
++            other => panic!("a first run's seed must open with the context turn, got {other:?}"),
++        }
++
++        // Drive the REAL loop with the seed and record what the DRIVER sees —
++        // the transcript the model would receive.
++        let broker = ApprovalBroker::new();
++        let hub = SubscriptionHub::new();
++        let runtime = FrameworkAgentRuntime::new(
++            ModelRegistry::new(Vec::new()),
++            PolicyEngine::with_defaults(),
++            broker.clone(),
++            hub,
++            run_journal(&pool, &broker),
++            artifact_sink(&pool, executor.artifacts()),
++        );
++        let transcripts = Arc::new(Mutex::new(Vec::new()));
++        let driver = RecordingDriver {
++            transcripts: transcripts.clone(),
++        };
++        let ctx = RunContext::new(
++            session,
++            run_id,
++            objective,
++            AgentMode::Explore,
++            repo.path(),
++            repo.path(),
++        )
++        .with_prior(prior);
++        runtime
++            .execute_run(&driver, ctx, CancellationToken::never())
++            .await
++            .expect("run executes");
++
++        let seen = transcripts.lock().expect("recording lock");
++        let first = seen.first().expect("the driver was called");
++        // The driver-received transcript: context turn first, objective last —
++        // evidence ahead of direction.
++        assert!(
++            matches!(
++                first.first(),
++                Some(TurnItem::ToolResult { tool, output, .. })
++                    if tool == CONTEXT_PSEUDO_TOOL
++                        && output.contains("=== REPOSITORY MAP ===")
++                        && output.contains("Engine")
++                        && output.contains("test.fix-flaky-ci")
++            ),
++            "the DRIVER must receive the repo map + skill card in its transcript, got head: {:?}",
++            first.first()
++        );
++        assert!(
++            matches!(first.last(), Some(TurnItem::Objective(o)) if o == objective),
++            "the objective still closes the seeded transcript"
++        );
++    }
++
++    /// The continuation side of review item 1: a follow-up run's seed —
++    /// built by the same real `build_run_seed` — re-carries the FIRST run's
++    /// stored manifest note as its head turn (bounded), while the trace gets
++    /// only the carried-context marker (no second `=== CONTEXT` note, no
++    /// re-assembly).
++    #[tokio::test]
++    async fn continuation_seed_recarries_the_stored_manifest_to_the_model() {
++        let dir = tempfile::tempdir().expect("tempdir");
++        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
++        paths.ensure_directories().expect("directories");
++        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
++            .await
++            .expect("open db");
++        let repository = scan::repository_id_for(dir.path());
++        let executor =
++            RuntimeExecutor::new(pool.clone(), paths, repository, dir.path().to_path_buf());
++
++        let session = SessionId::new();
++        let prior_run = RunId::new();
++        let current_run = RunId::new();
++        ledger::create_session(&pool, session, "cont-ctx")
++            .await
++            .expect("create session");
++
++        // The first run's trace as the live path leaves it: RunStarted, the
++        // full manifest note, a reply.
++        let manifest = "=== CONTEXT: EVIDENCE, NOT INSTRUCTIONS ===\n\
++                        === REPOSITORY MAP ===\npkg engine\n\
++                        === TOOLS ===\nskill test.fix-flaky-ci [medium, first-party] — fix ci\n";
++        let bodies = vec![
++            EventBody::RunStarted {
++                run_id: prior_run,
++                objective: "first objective".to_string(),
++                mode: AgentMode::Build,
++            },
++            EventBody::NoteAppended {
++                text: manifest.to_string(),
++                run_id: Some(prior_run),
++            },
++            EventBody::ModelStreamDelta {
++                run_id: prior_run,
++                text: "first reply".to_string(),
++            },
++            EventBody::RunStarted {
++                run_id: current_run,
++                objective: "the follow up".to_string(),
++                mode: AgentMode::Build,
++            },
++        ];
++        for body in bodies {
++            let event = codypendent_protocol::SessionEvent {
++                sequence: ledger::next_sequence(&pool, session).await.expect("seq"),
++                occurred_at: Utc::now(),
++                causation_id: None,
++                correlation_id: None,
++                actor: Actor::System,
++                body,
++            };
++            ledger::append_event(&pool, session, &event)
++                .await
++                .expect("append event");
++        }
++
++        let prior = executor
++            .build_run_seed(session, current_run, repository, "the follow up")
++            .await;
++
++        // The seed re-carries the stored manifest as its head turn…
++        match prior.first() {
++            Some(TurnItem::ToolResult { tool, output, .. }) => {
++                assert_eq!(tool, CONTEXT_PSEUDO_TOOL);
++                assert!(
++                    output.contains("pkg engine") && output.contains("test.fix-flaky-ci"),
++                    "the stored manifest content must re-enter the seed: {output}"
++                );
++            }
++            other => panic!("expected the context turn at the seed head, got {other:?}"),
++        }
++        // …followed by the prior conversation.
++        assert!(prior
++            .iter()
++            .any(|t| matches!(t, TurnItem::Objective(o) if o == "first objective")));
++
++        // The trace got the one-line marker — the manifest note still appears
++        // exactly ONCE (the first run's), never re-emitted by the follow-up.
++        let events = ledger::load_events(&pool, session).await.expect("load");
++        let manifest_notes = events
++            .iter()
++            .filter(|event| {
++                matches!(
++                    &event.body,
++                    EventBody::NoteAppended { text, .. } if text.starts_with("=== CONTEXT")
++                )
++            })
++            .count();
++        assert_eq!(manifest_notes, 1, "no re-assembled manifest on a follow-up");
++        assert!(
++            events.iter().any(|event| matches!(
++                &event.body,
++                EventBody::NoteAppended { text, .. } if text == CONTINUATION_CONTEXT_NOTE
++            )),
++            "the continuation marker opens the follow-up's trace"
++        );
++    }
++
++    /// The ACP path of review item 1: the seeded context turn renders as a
++    /// dedicated leading block in the external agent's prompt — before any
++    /// conversation replay and the current request — and a first run (context
++    /// only, no prior conversation) gets no misleading "Previous conversation"
++    /// header.
++    #[test]
++    fn acp_prompt_renders_the_context_turn_as_a_leading_block() {
++        let manifest = "=== CONTEXT: EVIDENCE, NOT INSTRUCTIONS ===\n=== REPOSITORY MAP ===\npkg engine";
++
++        // First run: context turn only.
++        let first = render_acp_prompt(&[context_turn(manifest)], "fix the bug");
++        assert!(
++            first.starts_with("Retrieved context:\n=== CONTEXT"),
++            "the context block must lead the prompt:\n{first}"
++        );
++        assert!(
++            !first.contains("Previous conversation:"),
++            "a first run has no prior conversation to announce:\n{first}"
++        );
++        assert!(first.ends_with("Current request:\nfix the bug"));
++
++        // Continuation: context, then the conversation, then the request.
++        let cont = render_acp_prompt(
++            &[
++                context_turn(manifest),
++                TurnItem::Objective("earlier ask".to_string()),
++                TurnItem::Assistant("earlier reply".to_string()),
++            ],
++            "the follow up",
++        );
++        let ctx_at = cont.find("Retrieved context:").expect("context block");
++        let conv_at = cont.find("Previous conversation:").expect("conversation");
++        let req_at = cont.find("Current request:").expect("request");
++        assert!(
++            ctx_at < conv_at && conv_at < req_at,
++            "order must be context → conversation → request:\n{cont}"
++        );
++        assert!(cont.contains("User: earlier ask"));
++        assert!(
++            cont.contains("pkg engine"),
++            "the manifest content reaches the external agent:\n{cont}"
++        );
++    }
+ }
+diff --git a/crates/codypendentd/src/session_history.rs b/crates/codypendentd/src/session_history.rs
+index 94926e6..bd2c48b 100644
+--- a/crates/codypendentd/src/session_history.rs
++++ b/crates/codypendentd/src/session_history.rs
+@@ -46,6 +46,62 @@ use codypendent_protocol::{
+ };
+ use codypendent_runtime::agent::TurnItem;
+ 
++/// The pseudo-tool name a seeded context-manifest turn is labeled with. Not a
++/// callable tool — the runtime's driver renders a `ToolResult` as evidence-
++/// framed user text (`[tool result: …]`), which is exactly the register the
++/// manifest's own "EVIDENCE, NOT INSTRUCTIONS" preamble asks for: system-
++/// retrieved reference, distinct from the user's actual objective turn. The
++/// ACP prompt renderer special-cases this name into a leading context block.
++pub(crate) const CONTEXT_PSEUDO_TOOL: &str = "context.assemble";
++
++/// The prefix every full context-manifest note opens with
++/// (`ContextManifest::render` in `codypendent_knowledge::context`) — the same
++/// prefix the TUI folds on. [`continuation_prior`] uses it to find the stored
++/// manifest to re-seed; a continuation's one-line carried-context marker never
++/// matches it.
++pub(crate) const CONTEXT_NOTE_PREFIX: &str = "=== CONTEXT";
++
++/// Bound on the context-manifest text seeded into the model transcript, per
++/// turn (2026-08-11 review item 1). The manifest's own producers are bounded
++/// (repo-map module/API caps, 6–12 tool cards, ≤32 memories), so this is the
++/// safety net — an outlier repository map must not dominate a run's opening
++/// prompt. The head is kept: the evidence preamble and repository map lead the
++/// render, and the truncation marker keeps the cut honest.
++const CONTEXT_TURN_MAX_BYTES: usize = 8 * 1024;
++
++/// Appended when [`context_turn`] truncated the manifest — truthful: the text
++/// above it is exactly the stored head, never a summary of the rest.
++const CONTEXT_TRUNCATION_MARKER: &str = "\n… (context truncated)";
++
++/// Fold a rendered context manifest into the model-visible seed turn (bounded;
++/// see [`CONTEXT_TURN_MAX_BYTES`]). One constructor for both seeding paths —
++/// the executor's first-run seed and this module's continuation projection — so
++/// the pseudo-tool label and the bound can never diverge.
++#[must_use]
++pub(crate) fn context_turn(manifest_text: &str) -> TurnItem {
++    let mut output = if manifest_text.len() <= CONTEXT_TURN_MAX_BYTES {
++        manifest_text.to_string()
++    } else {
++        let mut end = CONTEXT_TURN_MAX_BYTES;
++        while !manifest_text.is_char_boundary(end) {
++            end -= 1;
++        }
++        let mut truncated = manifest_text[..end].to_string();
++        truncated.push_str(CONTEXT_TRUNCATION_MARKER);
++        truncated
++    };
++    // A trailing newline costs a token and renders as a blank line in the
++    // `[tool result: …]` framing; the manifest always ends with one.
++    while output.ends_with('\n') {
++        output.pop();
++    }
++    TurnItem::ToolResult {
++        tool: CONTEXT_PSEUDO_TOOL.to_string(),
++        output,
++        artifact: None,
++    }
++}
++
+ /// Reconstruct a continuation run's prior transcript from a session's ledger:
+ /// drop the events of `current_run` (its own `RunStarted` is already on the
+ /// ledger before it executes, and the runtime seeds that objective itself — see
+@@ -54,6 +110,16 @@ use codypendent_runtime::agent::TurnItem;
+ /// so this returns empty and the run behaves exactly as before (self-correcting:
+ /// no explicit continuation flag is needed — an empty prior IS a first run).
+ ///
++/// When a prior run's ledger carries the full `=== CONTEXT` manifest note (the
++/// first run's [`NoteAppended`]), its text is ALSO projected — bounded, via
++/// [`context_turn`] — as the seed's head turn (2026-08-11 review item 1: the
++/// manifest previously reached only the human trace, never the model). A
++/// continuation therefore re-carries the session's shared context without
++/// re-running the assembly funnel, exactly as the carried-context marker
++/// (`emit_run_opening`) has always claimed it did. The latest matching note
++/// wins (freshest manifest); notes attributed to `current_run` itself are
++/// skipped so a crash-relaunched run never replays its own half-emitted note.
++///
+ /// The entry point the assembly executor (`crates/codypendentd/src/executor.rs`)
+ /// calls at run start (continuous-session plan, Task 3). Takes the loaded events
+ /// by value so filtering needs no clone.
+@@ -63,11 +129,39 @@ pub(crate) fn continuation_prior(
+     current_run: RunId,
+     verbatim_runs: usize,
+ ) -> Vec<TurnItem> {
++    let context = stored_context_manifest(&events, current_run).map(context_turn);
+     let prior: Vec<SessionEvent> = events
+         .into_iter()
+         .filter(|event| event_run_id(&event.body) != Some(current_run))
+         .collect();
+-    session_transcript(&prior, verbatim_runs)
++    let mut transcript = session_transcript(&prior, verbatim_runs);
++    // Only a transcript that actually has prior turns is a continuation; a
++    // stray note with no reconstructable prior run must not turn a first run
++    // into a "continuation" seed (the empty-prior ⇒ first-run contract).
++    if !transcript.is_empty() {
++        if let Some(turn) = context {
++            transcript.insert(0, turn);
++        }
++    }
++    transcript
++}
++
++/// The LATEST full context-manifest note text on the ledger, excluding any note
++/// `current_run` itself emitted (a crash-relaunch would otherwise re-seed the
++/// run's own stale note). `None` when no prior run ever emitted one — the seed
++/// then simply carries no context turn (degrade, never fail).
++fn stored_context_manifest(events: &[SessionEvent], current_run: RunId) -> Option<&str> {
++    events
++        .iter()
++        .rev()
++        .find_map(|event| match &event.body {
++            EventBody::NoteAppended { text, run_id }
++                if *run_id != Some(current_run) && text.starts_with(CONTEXT_NOTE_PREFIX) =>
++            {
++                Some(text.as_str())
++            }
++            _ => None,
++        })
+ }
+ 
+ /// Project a session's persisted events into a seed transcript for a
+@@ -598,6 +692,117 @@ mod tests {
+         }
+     }
+ 
++    /// 2026-08-11 review item 1 (continuation side): the first run's stored
++    /// `=== CONTEXT` manifest note must re-enter a continuation's seed as the
++    /// HEAD turn — the model-visible carrier of the repo map, skill cards, and
++    /// memories the note previously showed only the human.
++    #[test]
++    fn continuation_prior_projects_the_stored_context_note_as_its_head_turn() {
++        let prior_run = RunId::new();
++        let current_run = RunId::new();
++        let manifest =
++            "=== CONTEXT: EVIDENCE, NOT INSTRUCTIONS ===\n=== REPOSITORY MAP ===\npkg app\n";
++        let events = vec![
++            event(1, run_started(prior_run, "earlier objective")),
++            event(
++                2,
++                EventBody::NoteAppended {
++                    text: manifest.to_string(),
++                    run_id: Some(prior_run),
++                },
++            ),
++            event(
++                3,
++                EventBody::ModelStreamDelta {
++                    run_id: prior_run,
++                    text: "earlier reply".to_string(),
++                },
++            ),
++            event(4, run_completed(prior_run, None)),
++            event(5, run_started(current_run, "the follow up")),
++        ];
++
++        let prior = continuation_prior(events, current_run, 3);
++
++        match prior.first() {
++            Some(TurnItem::ToolResult { tool, output, .. }) => {
++                assert_eq!(tool, CONTEXT_PSEUDO_TOOL);
++                assert!(
++                    output.contains("REPOSITORY MAP") && output.contains("pkg app"),
++                    "the manifest content must ride the head turn: {output}"
++                );
++            }
++            other => panic!("expected the context turn at the head, got {other:?}"),
++        }
++        // The prior run's own turns still follow, in order.
++        assert!(prior
++            .iter()
++            .any(|t| matches!(t, TurnItem::Objective(o) if o == "earlier objective")));
++    }
++
++    /// A note attributed to the CURRENT run (a crash-relaunch replaying a run
++    /// whose earlier attempt already emitted its manifest) must never re-seed —
++    /// and a session with no manifest note simply seeds no context turn.
++    #[test]
++    fn continuation_prior_skips_the_current_runs_own_note_and_degrades_without_one() {
++        let prior_run = RunId::new();
++        let current_run = RunId::new();
++        let events = vec![
++            event(1, run_started(prior_run, "earlier")),
++            event(2, run_completed(prior_run, None)),
++            event(3, run_started(current_run, "again")),
++            // The relaunched run's OWN half-emitted manifest note.
++            event(
++                4,
++                EventBody::NoteAppended {
++                    text: "=== CONTEXT: EVIDENCE, NOT INSTRUCTIONS ===\nstale".to_string(),
++                    run_id: Some(current_run),
++                },
++            ),
++        ];
++
++        let prior = continuation_prior(events, current_run, 3);
++        assert!(
++            !prior
++                .iter()
++                .any(|t| matches!(t, TurnItem::ToolResult { tool, .. } if tool == CONTEXT_PSEUDO_TOOL)),
++            "the current run's own note must not become its seed context"
++        );
++        // The prior run still reconstructs.
++        assert!(prior
++            .iter()
++            .any(|t| matches!(t, TurnItem::Objective(o) if o == "earlier")));
++    }
++
++    /// The seeded context turn is bounded: an oversized stored manifest is cut
++    /// at the byte cap (on a char boundary) with an explicit truncation marker,
++    /// so a pathological repository map cannot dominate a follow-up's opening
++    /// prompt.
++    #[test]
++    fn context_turn_bounds_an_oversized_manifest_with_a_marker() {
++        let huge = format!("=== CONTEXT ===\n{}", "x".repeat(64 * 1024));
++        match context_turn(&huge) {
++            TurnItem::ToolResult { tool, output, .. } => {
++                assert_eq!(tool, CONTEXT_PSEUDO_TOOL);
++                assert!(
++                    output.len() <= CONTEXT_TURN_MAX_BYTES + CONTEXT_TRUNCATION_MARKER.len(),
++                    "bounded: {} bytes",
++                    output.len()
++                );
++                assert!(output.ends_with(CONTEXT_TRUNCATION_MARKER));
++                assert!(output.starts_with("=== CONTEXT ==="), "the head survives");
++            }
++            other => panic!("expected a ToolResult, got {other:?}"),
++        }
++        // A small manifest passes through whole (minus the trailing newline).
++        match context_turn("=== CONTEXT ===\nsmall\n") {
++            TurnItem::ToolResult { output, .. } => {
++                assert_eq!(output, "=== CONTEXT ===\nsmall");
++            }
++            other => panic!("expected a ToolResult, got {other:?}"),
++        }
++    }
++
+     #[test]
+     fn steering_applied_projects_an_empty_marker_never_fabricated_text() {
+         let run_id = RunId::new();
+diff --git a/crates/knowledge/examples/skills/fix-ci/skill.toml b/crates/knowledge/examples/skills/fix-ci/skill.toml
+index 8c3d629..357e5bc 100644
+--- a/crates/knowledge/examples/skills/fix-ci/skill.toml
++++ b/crates/knowledge/examples/skills/fix-ci/skill.toml
+@@ -2,8 +2,13 @@ schema_version = 1
+ id = "rust.fix-ci"
+ name = "Fix Rust CI"
+ version = "0.1.0"
++# `active`, not `draft`: retrieval hard-filters non-Active items
++# (`retrieval/mod.rs`), so a draft skill can never be disclosed to a run. The
++# 2026-08-11 review found this package — the only shipped skill — silently dead
++# for that reason; the reference package must model the status a working skill
++# actually needs.
+ scope = "repository"
+-status = "draft"
++status = "active"
+ 
+ description = "Diagnose and repair Rust GitHub Actions failures."
+ intents = ["ci failure", "rust tests", "github actions", "clippy"]
+diff --git a/crates/knowledge/src/context.rs b/crates/knowledge/src/context.rs
+index 2e242aa..b9fe5fa 100644
+--- a/crates/knowledge/src/context.rs
++++ b/crates/knowledge/src/context.rs
+@@ -15,6 +15,7 @@
+ //! name the retrieval/memory/graph internals to display a manifest.
+ 
+ use std::fmt::Write as _;
++use std::sync::Arc;
+ 
+ use codypendent_protocol::RepositoryId;
+ use serde::{Deserialize, Serialize};
+@@ -26,7 +27,7 @@ use crate::registry::{Registry, RegistryError};
+ use crate::retrieval::{
+     retrieve, HashingEmbedder, RetrievalConfig, RetrievalError, RetrievalIndexes, RetrievalQuery,
+ };
+-use crate::types::{EvidenceRef, MemoryRecord, RiskClass, Scope, ToolCard, TrustTier};
++use crate::types::{EvidenceRef, MemoryRecord, RegistryItem, RiskClass, Scope, ToolCard, TrustTier};
+ 
+ /// A failure assembling the context manifest. Each underlying fabric error is
+ /// wrapped so the caller can log a cause without matching on the internals.
+@@ -220,6 +221,23 @@ pub async fn assemble_context(
+     repository: RepositoryId,
+     objective: &str,
+     scopes: &[Scope],
++) -> Result<ContextManifest, ContextError> {
++    let items = Registry::new().list(pool).await?;
++    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new())?;
++    assemble_with(pool, repository, objective, scopes, &items, &indexes).await
++}
++
++/// The assembly core beneath [`assemble_context`] and
++/// [`ContextAssembler::assemble`]: everything except sourcing the retrieval
++/// authority (`items`) and its derived `indexes`, which the stateless entry
++/// rebuilds per call and the assembler serves from its stamped cache.
++async fn assemble_with(
++    pool: &SqlitePool,
++    repository: RepositoryId,
++    objective: &str,
++    scopes: &[Scope],
++    items: &[RegistryItem],
++    indexes: &RetrievalIndexes,
+ ) -> Result<ContextManifest, ContextError> {
+     // 1. Repository map — fold the persisted graph into the compact tree.
+     let repository_map = crate::repomap::repository_map(pool, repository)
+@@ -227,14 +245,12 @@ pub async fn assemble_context(
+         .render();
+ 
+     // 2. Retrieve the disclosed tool + skill cards over the whole registry.
+-    let items = Registry::new().list(pool).await?;
+-    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new())?;
+     let query = RetrievalQuery::new(
+         objective,
+         visible_scopes(repository, scopes),
+         RiskClass::Medium,
+     );
+-    let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default())?;
++    let result = retrieve(items, indexes, &query, &RetrievalConfig::default())?;
+     let tool_cards = result.tools.iter().map(ContextCard::from_card).collect();
+     let skill_cards = result.skills.iter().map(ContextCard::from_card).collect();
+ 
+@@ -272,6 +288,112 @@ pub async fn assemble_context(
+ /// territory — until then recency is the only defensible ordering.
+ const MAX_CONTEXT_MEMORIES: usize = 32;
+ 
++/// A cheap content stamp over `registry_items`: row count + newest
++/// `updated_at`. Every [`Registry`] write path moves it — `upsert` re-stamps
++/// `updated_at = now` on every insert/replace (so edits and additions advance
++/// `MAX(updated_at)`), and `remove` changes the count (a removal alone can
++/// leave the max untouched, which is why the count rides along). An equal stamp
++/// therefore means the derived retrieval indexes built from the same authority
++/// are still current.
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct RegistryStamp {
++    rows: i64,
++    newest_updated_at: Option<String>,
++}
++
++/// Probe the current [`RegistryStamp`] — two aggregates over an indexed table,
++/// orders of magnitude cheaper than the full `list` + index build it guards.
++async fn registry_stamp(pool: &SqlitePool) -> Result<RegistryStamp, RegistryError> {
++    let (rows, newest_updated_at): (i64, Option<String>) =
++        sqlx::query_as("SELECT COUNT(*), MAX(updated_at) FROM registry_items")
++            .fetch_one(pool)
++            .await?;
++    Ok(RegistryStamp {
++        rows,
++        newest_updated_at,
++    })
++}
++
++/// The cached retrieval authority: the listed items and their derived indexes,
++/// pinned to the [`RegistryStamp`] they were built from. `Arc`s so a cache hit
++/// hands out shared views without cloning a Tantivy index.
++struct CachedRetrieval {
++    stamp: RegistryStamp,
++    items: Arc<Vec<RegistryItem>>,
++    indexes: Arc<RetrievalIndexes>,
++}
++
++/// A caching front for [`assemble_context`] (2026-08-11 review item:
++/// "assemble_context rebuilds dense+BM25 indexes from scratch every call").
++///
++/// The repository map and memory query are per-repository reads that must stay
++/// live, but the retrieval authority — `Registry::list` plus the
++/// [`RetrievalIndexes`] build (a full Tantivy index + an embedding per item) —
++/// is registry-global and only changes when the registry does. This assembler
++/// keys that pair on a [`RegistryStamp`] probe and rebuilds ONLY when the stamp
++/// moves, so repeat runs (and every continuation across a long session) reuse
++/// one build. A registry write from anywhere — a daemon skill scan, a CLI
++/// `skill add` against the same database, a builtin refresh — moves the stamp
++/// and invalidates the cache on the next call; no explicit invalidation hook is
++/// needed.
++///
++/// Held by the daemon's run executor (one per process, shared across its
++/// clones); the stateless [`assemble_context`] remains for one-shot callers.
++#[derive(Default)]
++pub struct ContextAssembler {
++    /// The stamped build, replaced wholesale on a stamp miss. A `tokio` mutex —
++    /// not `std` — because the rebuild inside the critical section awaits (the
++    /// registry list), and serializing concurrent rebuilds is exactly the
++    /// point: two racing first runs should build the indexes once, not twice.
++    cache: tokio::sync::Mutex<Option<CachedRetrieval>>,
++}
++
++impl ContextAssembler {
++    /// A fresh assembler with an empty cache.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// [`assemble_context`], but serving the retrieval authority from the
++    /// stamped cache (rebuilding it only when the registry changed).
++    pub async fn assemble(
++        &self,
++        pool: &SqlitePool,
++        repository: RepositoryId,
++        objective: &str,
++        scopes: &[Scope],
++    ) -> Result<ContextManifest, ContextError> {
++        let (items, indexes) = self.retrieval_authority(pool).await?;
++        assemble_with(pool, repository, objective, scopes, &items, &indexes).await
++    }
++
++    /// The current `(items, indexes)` pair: the cached build when the registry
++    /// stamp still matches, otherwise a fresh list + build stored under the new
++    /// stamp. The stamp is probed BEFORE taking the lock's cached value as
++    /// truth, so a write between two runs is always observed.
++    async fn retrieval_authority(
++        &self,
++        pool: &SqlitePool,
++    ) -> Result<(Arc<Vec<RegistryItem>>, Arc<RetrievalIndexes>), ContextError> {
++        let stamp = registry_stamp(pool).await?;
++        let mut cache = self.cache.lock().await;
++        if let Some(cached) = cache.as_ref() {
++            if cached.stamp == stamp {
++                return Ok((Arc::clone(&cached.items), Arc::clone(&cached.indexes)));
++            }
++        }
++        let items = Arc::new(Registry::new().list(pool).await?);
++        let indexes = Arc::new(RetrievalIndexes::build(&items, HashingEmbedder::new())?);
++        *cache = Some(CachedRetrieval {
++            stamp,
++            items: Arc::clone(&items),
++            indexes: Arc::clone(&indexes),
++        });
++        Ok((items, indexes))
++    }
++}
++
+ /// The visibility chain the retrieval funnel filters against: the caller's
+ /// `scopes`, always widened with [`System`](Scope::System) (built-ins live there)
+ /// and the active `repository` (so repository-scoped skills are visible), deduped.
+@@ -394,4 +516,93 @@ mod tests {
+         assert_eq!(tier_label(TrustTier::FirstParty), "first-party");
+         assert_eq!(risk_label(RiskClass::High), "high");
+     }
++
++    /// A minimal Active tool item for exercising the assembler cache.
++    fn tool_item(name: &str) -> RegistryItem {
++        let now = chrono::Utc::now();
++        RegistryItem {
++            id: codypendent_protocol::RegistryItemId::new(),
++            kind: crate::types::RegistryItemKind::Tool,
++            name: name.to_string(),
++            version: crate::types::Version("1.0.0".to_string()),
++            scope: Scope::System,
++            description: format!("test tool {name}"),
++            intents: Vec::new(),
++            keywords: Vec::new(),
++            examples: Vec::new(),
++            input_schema: None,
++            output_schema: None,
++            dependencies: Vec::new(),
++            permissions: Vec::new(),
++            risk: RiskClass::Safe,
++            provenance: crate::types::Provenance::BuiltIn,
++            trust: crate::types::TrustMetadata {
++                publisher: "test".to_string(),
++                signature_required: false,
++                signature: None,
++                tier: TrustTier::FirstParty,
++            },
++            status: crate::types::RegistryStatus::Active,
++            content_hash: String::new(),
++            executable: true,
++            created_at: now,
++            updated_at: now,
++        }
++    }
++
++    /// The assembler's cache contract: an unchanged registry serves the SAME
++    /// index build (pointer-identical, so repeat runs pay no rebuild), and any
++    /// registry write — observed through the count/updated_at stamp — replaces
++    /// it with a build that includes the new authority.
++    #[tokio::test]
++    async fn assembler_reuses_indexes_until_the_registry_stamp_moves() {
++        let tmp = tempfile::tempdir().unwrap();
++        let pool = crate::db::open(&tmp.path().join("t.db")).await.unwrap();
++        let registry = Registry::new();
++        registry.upsert(&pool, &tool_item("test.alpha")).await.unwrap();
++
++        let assembler = ContextAssembler::new();
++        let (items_a, indexes_a) = assembler.retrieval_authority(&pool).await.unwrap();
++        let (items_b, indexes_b) = assembler.retrieval_authority(&pool).await.unwrap();
++        assert!(
++            Arc::ptr_eq(&indexes_a, &indexes_b) && Arc::ptr_eq(&items_a, &items_b),
++            "an unchanged registry must serve the cached build"
++        );
++
++        // A registry write moves the stamp; the next call rebuilds and sees it.
++        registry.upsert(&pool, &tool_item("test.beta")).await.unwrap();
++        let (items_c, indexes_c) = assembler.retrieval_authority(&pool).await.unwrap();
++        assert!(
++            !Arc::ptr_eq(&indexes_b, &indexes_c),
++            "a registry change must invalidate the cached indexes"
++        );
++        assert!(
++            items_c.iter().any(|item| item.name == "test.beta"),
++            "the rebuilt authority includes the new item"
++        );
++    }
++
++    /// A REMOVAL alone may leave `MAX(updated_at)` untouched (the newest row can
++    /// survive), which is exactly why the stamp carries the row count too — the
++    /// assembler must never serve an index that still ranks a deleted item.
++    #[tokio::test]
++    async fn assembler_invalidates_on_removal_via_the_row_count() {
++        let tmp = tempfile::tempdir().unwrap();
++        let pool = crate::db::open(&tmp.path().join("t.db")).await.unwrap();
++        let registry = Registry::new();
++        let doomed = tool_item("test.doomed");
++        registry.upsert(&pool, &doomed).await.unwrap();
++        registry.upsert(&pool, &tool_item("test.keeper")).await.unwrap();
++
++        let assembler = ContextAssembler::new();
++        let (items_before, _) = assembler.retrieval_authority(&pool).await.unwrap();
++        assert!(items_before.iter().any(|item| item.name == "test.doomed"));
++
++        assert!(registry.remove(&pool, doomed.id).await.unwrap());
++        let (items_after, _) = assembler.retrieval_authority(&pool).await.unwrap();
++        assert!(
++            !items_after.iter().any(|item| item.name == "test.doomed"),
++            "a removed item must vanish from the cached authority"
++        );
++    }
+ }
+diff --git a/crates/knowledge/src/lib.rs b/crates/knowledge/src/lib.rs
+index d70f032..a789b5f 100644
+--- a/crates/knowledge/src/lib.rs
++++ b/crates/knowledge/src/lib.rs
+@@ -27,6 +27,7 @@ pub mod registry;
+ pub mod repomap;
+ pub mod retrieval;
+ pub mod skill_exec;
++pub mod skills;
+ pub mod types;
+ 
+ pub use types::{
+@@ -47,6 +48,10 @@ pub use manifest::{
+ };
+ pub use registry::{resolve_shadowed, Registry, RegistryError};
+ pub use skill_exec::{profile_for_permissions, run_script, SkillExecError};
++pub use skills::{
++    anchor_repository_id, install_package, is_retrievable_status, local_user_scope,
++    scan_skill_root, SkillInstallError, SkillScanOutcome,
++};
+ 
+ pub use retrieval::{
+     embedding_text, retrieve, Bm25Error, Bm25Index, Embedder, HashingEmbedder, RerankWeights,
+@@ -73,7 +78,9 @@ pub use memory::{
+ };
+ pub use observer::{chronicle_candidates, extract_candidates};
+ 
+-pub use context::{assemble_context, ContextCard, ContextError, ContextManifest, ContextMemory};
++pub use context::{
++    assemble_context, ContextAssembler, ContextCard, ContextError, ContextManifest, ContextMemory,
++};
+ 
+ pub use docs::apply::{apply_mutation, ApplyError, MutationEffect, MutationOutcome};
+ pub use docs::collab::{
+diff --git a/crates/knowledge/src/skills.rs b/crates/knowledge/src/skills.rs
+new file mode 100644
+index 0000000..10ac9ad
+--- /dev/null
++++ b/crates/knowledge/src/skills.rs
+@@ -0,0 +1,496 @@
++//! Skill-package directory ingestion (2026-08-11 review, "activate skills").
++//!
++//! [`Registry::register_package`] existed with zero production callers — no
++//! daemon or CLI path ever loaded a skill directory into the governed registry,
++//! so retrieval had nothing to disclose beyond the built-ins. This module is
++//! that missing bridge: a **scan** over the two well-known skill roots
++//! (`<data_dir>/skills/*/` for the operator's own packages,
++//! `<repository>/.codypendent/skills/*/` for repo-local ones), and an
++//! **install** the CLI (`codypendent skill add <dir>`) copies a validated
++//! package through.
++//!
++//! ## Scope anchoring
++//!
++//! `register_package` demands the concrete [`Scope`] up front and validates it
++//! against the manifest's declared tier, so the scan peeks each package's
++//! `skill.toml` first and maps the tier onto the only anchors a local daemon
++//! actually has:
++//!
++//! - `"user"` → [`local_user_scope`] — the daemon is per-user, so one stable
++//!   local identity covers every package the operator installs globally;
++//! - `"repository"` → the caller's anchor repository (the checkout whose
++//!   `.codypendent/skills/` is being scanned, or the daemon's startup
++//!   repository for a data-dir package that declares repository scope).
++//!
++//! Any other tier (system is reserved for built-ins; workspace/organization
++//! have no local anchor yet) is skipped with a legible per-package failure —
++//! never a scan-wide error, matching the daemon's "context is an aid, not a
++//! gate" startup ethos. Registration itself is idempotent: `register_package`
++//! reuses the existing identity's id and flags a content-hash change at an
++//! unchanged version as `Modified`, so re-scanning on every boot is safe.
++
++use std::path::{Path, PathBuf};
++
++use codypendent_protocol::{RepositoryId, UserId};
++use sqlx::SqlitePool;
++
++use crate::codegraph::stable_repository_id;
++use crate::manifest::SkillManifest;
++use crate::registry::{Registry, RegistryError};
++use crate::types::{RegistryItem, RegistryStatus, Scope};
++
++/// The stable key of the local operator's user scope. The daemon serves exactly
++/// one OS user, so their globally-installed skills all live under this one
++/// identity — and the run-context assembler queries it (alongside System + the
++/// run's repository) so those skills are actually retrievable.
++pub const LOCAL_USER_KEY: &str = "local";
++
++/// The [`Scope`] a `<data_dir>/skills/` package declaring `scope = "user"` is
++/// registered under — and the scope the executor widens its context query with.
++/// One function, two callers, so registration and retrieval can never disagree
++/// on the key.
++#[must_use]
++pub fn local_user_scope() -> Scope {
++    Scope::User(UserId(LOCAL_USER_KEY.to_string()))
++}
++
++/// Derive the stable [`RepositoryId`] for `root`, exactly as the daemon's scan
++/// does (`codypendentd::scan::repository_id_for`): resolve the Git toplevel
++/// (canonicalized) when `root` is inside a checkout, else canonicalize the path
++/// itself, then hash it via [`stable_repository_id`]. The CLI installs skills
++/// against this identity, so a package registered by `codypendent skill add`
++/// resolves to the SAME repository a later daemon run attributes its context
++/// to — a mismatch here would make the installed skill silently invisible.
++#[must_use]
++pub fn anchor_repository_id(root: &Path) -> RepositoryId {
++    let canonical = git_toplevel(root)
++        .unwrap_or_else(|| root.canonicalize().unwrap_or_else(|_| root.to_path_buf()));
++    stable_repository_id(&canonical)
++}
++
++/// The canonicalized `git rev-parse --show-toplevel` for `root`, or `None`
++/// outside a checkout. Shelling out mirrors the daemon's discovery so the two
++/// derivations agree byte-for-byte.
++fn git_toplevel(root: &Path) -> Option<PathBuf> {
++    let output = std::process::Command::new("git")
++        .current_dir(root)
++        .args(["rev-parse", "--show-toplevel"])
++        .stdin(std::process::Stdio::null())
++        .stderr(std::process::Stdio::null())
++        .output()
++        .ok()?;
++    if !output.status.success() {
++        return None;
++    }
++    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
++    if path.as_os_str().is_empty() {
++        return None;
++    }
++    Some(path.canonicalize().unwrap_or(path))
++}
++
++/// A failure ingesting one skill package directory.
++#[derive(Debug, thiserror::Error)]
++pub enum SkillInstallError {
++    /// Reading the package directory or copying it into the skills root failed.
++    #[error("skill package I/O: {0}")]
++    Io(#[from] std::io::Error),
++    /// The package's `skill.toml` did not parse during the tier peek.
++    #[error("parsing skill.toml: {0}")]
++    Toml(#[from] toml::de::Error),
++    /// The declared scope tier has no local registration anchor.
++    #[error(
++        "scope `{0}` cannot be registered locally (supported: \"user\", \"repository\"; \
++         \"system\" is reserved for built-ins)"
++    )]
++    UnsupportedScope(String),
++    /// Loading/validating/registering the package failed.
++    #[error(transparent)]
++    Registry(#[from] RegistryError),
++}
++
++/// The outcome of scanning one skills root: every package that registered, and
++/// every directory that failed with why. A scan itself never fails — a broken
++/// package must not block the daemon (or its sibling packages) from starting.
++#[derive(Debug, Default)]
++pub struct SkillScanOutcome {
++    /// Successfully registered items, in directory order.
++    pub registered: Vec<RegistryItem>,
++    /// `(package directory, reason)` for each package that did not register.
++    pub failures: Vec<(PathBuf, String)>,
++}
++
++/// Scan `root` for skill packages — each immediate subdirectory holding a
++/// `skill.toml` — and register every valid one, anchoring repository-tier
++/// manifests to `anchor_repository` (see the module docs). A missing or empty
++/// `root` is a clean no-op, so the daemon can probe both well-known roots
++/// unconditionally on every boot.
++pub async fn scan_skill_root(
++    pool: &SqlitePool,
++    root: &Path,
++    anchor_repository: RepositoryId,
++) -> SkillScanOutcome {
++    let mut outcome = SkillScanOutcome::default();
++    let Ok(entries) = std::fs::read_dir(root) else {
++        return outcome; // absent root — nothing installed, nothing to do
++    };
++    // Sorted so registration order (and any Modified-flag races on duplicate
++    // identities) is deterministic across boots, like the code-graph walk.
++    let mut package_dirs: Vec<PathBuf> = entries
++        .filter_map(Result::ok)
++        .map(|entry| entry.path())
++        .filter(|path| path.is_dir() && path.join("skill.toml").is_file())
++        .collect();
++    package_dirs.sort();
++
++    for dir in package_dirs {
++        match register_dir(pool, &dir, anchor_repository).await {
++            Ok(item) => outcome.registered.push(item),
++            Err(error) => outcome.failures.push((dir, error.to_string())),
++        }
++    }
++    outcome
++}
++
++/// Register the package at `dir` under the scope its own manifest declares,
++/// resolved against the local anchors. The peek re-reads `skill.toml`, but
++/// `register_package` is the sole validator — this only extracts the tier.
++async fn register_dir(
++    pool: &SqlitePool,
++    dir: &Path,
++    anchor_repository: RepositoryId,
++) -> Result<RegistryItem, SkillInstallError> {
++    let scope = declared_scope(dir, anchor_repository)?;
++    Ok(Registry::new().register_package(pool, dir, scope).await?)
++}
++
++/// Peek the package's declared scope tier and map it onto a concrete local
++/// [`Scope`] (see the module docs for the anchoring rules).
++fn declared_scope(
++    dir: &Path,
++    anchor_repository: RepositoryId,
++) -> Result<Scope, SkillInstallError> {
++    let raw = std::fs::read_to_string(dir.join("skill.toml"))?;
++    let manifest: SkillManifest = toml::from_str(&raw)?;
++    match manifest.scope.as_str() {
++        "user" => Ok(local_user_scope()),
++        "repository" => Ok(Scope::Repository(anchor_repository)),
++        other => Err(SkillInstallError::UnsupportedScope(other.to_string())),
++    }
++}
++
++/// Install the package at `source` into `skills_root` (the data-dir skills
++/// directory) and register it — the engine under `codypendent skill add <dir>`.
++///
++/// Order is validate → copy → register, each step honest about partial state:
++///
++/// 1. **Validate in place** via [`crate::manifest::load_package`] under the
++///    scope the manifest declares, so a broken package is rejected before the
++///    skills root is touched at all.
++/// 2. **Copy** the whole package to a temporary sibling inside `skills_root`,
++///    then swap it into `<skills_root>/<id>/` — the previous install (if any)
++///    is removed only after the fresh copy fully landed, so a failed copy never
++///    destroys a working install.
++/// 3. **Register** the *installed* copy (not `source`), so the registry row's
++///    provenance names the path the daemon's startup scan will re-verify on
++///    every boot.
++///
++/// Returns the registered item and the installed path.
++pub async fn install_package(
++    pool: &SqlitePool,
++    source: &Path,
++    skills_root: &Path,
++    anchor_repository: RepositoryId,
++) -> Result<(RegistryItem, PathBuf), SkillInstallError> {
++    let scope = declared_scope(source, anchor_repository)?;
++    // Full validation (entrypoints, version, status, size ceiling, hash) before
++    // any filesystem mutation; the blocking walk runs off the async runtime
++    // exactly as `register_package` runs it.
++    let source_owned = source.to_path_buf();
++    let scope_for_load = scope.clone();
++    let validated = tokio::task::spawn_blocking(move || {
++        crate::manifest::load_package(&source_owned, scope_for_load)
++    })
++    .await
++    .map_err(|join| RegistryError::Corrupt(format!("package load task failed: {join}")))?
++    .map_err(RegistryError::from)?;
++
++    let destination = skills_root.join(&validated.name);
++    let source_canonical = source.canonicalize()?;
++    if source_canonical == destination {
++        // `skill add` pointed at the already-installed copy: just (re)register.
++        let item = Registry::new()
++            .register_package(pool, &destination, scope)
++            .await?;
++        return Ok((item, destination));
++    }
++
++    // Copy to a temporary sibling, then swap — never leave a half-copied
++    // package where the startup scan would find it.
++    std::fs::create_dir_all(skills_root)?;
++    let staging = skills_root.join(format!(".{}.installing", validated.name));
++    if staging.exists() {
++        std::fs::remove_dir_all(&staging)?;
++    }
++    copy_dir(&source_canonical, &staging)?;
++    if destination.exists() {
++        std::fs::remove_dir_all(&destination)?;
++    }
++    std::fs::rename(&staging, &destination)?;
++
++    let item = Registry::new()
++        .register_package(pool, &destination, scope)
++        .await?;
++    Ok((item, destination))
++}
++
++/// Whether `status` will actually be retrievable: the funnel hard-filters
++/// everything but [`RegistryStatus::Active`], so callers surface a warning for
++/// anything else at install time instead of leaving the operator to discover a
++/// silently never-disclosed skill (the exact failure the 2026-08-11 review
++/// found shipped).
++#[must_use]
++pub fn is_retrievable_status(status: RegistryStatus) -> bool {
++    status == RegistryStatus::Active
++}
++
++/// Recursively copy a directory tree (regular files + directories only;
++/// symlinks are skipped — a package must be self-contained, and following links
++/// out of it would copy files its content hash never covered).
++fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
++    std::fs::create_dir_all(to)?;
++    for entry in std::fs::read_dir(from)? {
++        let entry = entry?;
++        let file_type = entry.file_type()?;
++        let target = to.join(entry.file_name());
++        if file_type.is_dir() {
++            copy_dir(&entry.path(), &target)?;
++        } else if file_type.is_file() {
++            std::fs::copy(entry.path(), &target)?;
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Write a minimal valid skill package at `dir`.
++    fn write_package(dir: &Path, id: &str, scope: &str, status: &str) {
++        std::fs::create_dir_all(dir).unwrap();
++        let manifest = format!(
++            "schema_version = 1\n\
++             id = \"{id}\"\n\
++             name = \"Test Skill\"\n\
++             version = \"0.1.0\"\n\
++             scope = \"{scope}\"\n\
++             status = \"{status}\"\n\
++             description = \"A test skill.\"\n\
++             \n\
++             [entrypoints]\n\
++             instructions = \"SKILL.md\"\n\
++             \n\
++             [trust]\n\
++             publisher = \"local-user\"\n\
++             signature_required = false\n"
++        );
++        std::fs::write(dir.join("skill.toml"), manifest).unwrap();
++        std::fs::write(dir.join("SKILL.md"), "# Test\n").unwrap();
++    }
++
++    async fn temp_pool() -> (tempfile::TempDir, SqlitePool) {
++        let tmp = tempfile::tempdir().unwrap();
++        let pool = crate::db::open(&tmp.path().join("t.db")).await.unwrap();
++        (tmp, pool)
++    }
++
++    #[tokio::test]
++    async fn scan_registers_user_and_repository_tier_packages() {
++        let (_tmp, pool) = temp_pool().await;
++        let root = tempfile::tempdir().unwrap();
++        let repo = RepositoryId::new();
++
++        write_package(&root.path().join("one"), "test.user-skill", "user", "active");
++        write_package(
++            &root.path().join("two"),
++            "test.repo-skill",
++            "repository",
++            "active",
++        );
++
++        let outcome = scan_skill_root(&pool, root.path(), repo).await;
++        assert!(
++            outcome.failures.is_empty(),
++            "no failures expected: {:?}",
++            outcome.failures
++        );
++        assert_eq!(outcome.registered.len(), 2);
++        // The user-tier package landed under the stable local user scope; the
++        // repository-tier one anchored to the caller's repository.
++        let user = outcome
++            .registered
++            .iter()
++            .find(|item| item.name == "test.user-skill")
++            .unwrap();
++        assert_eq!(user.scope, local_user_scope());
++        let repo_item = outcome
++            .registered
++            .iter()
++            .find(|item| item.name == "test.repo-skill")
++            .unwrap();
++        assert_eq!(repo_item.scope, Scope::Repository(repo));
++    }
++
++    #[tokio::test]
++    async fn scan_is_idempotent_and_a_broken_package_never_blocks_its_siblings() {
++        let (_tmp, pool) = temp_pool().await;
++        let root = tempfile::tempdir().unwrap();
++        let repo = RepositoryId::new();
++
++        write_package(&root.path().join("good"), "test.good", "user", "active");
++        // A package whose declared entrypoint is missing on disk: rejected by
++        // `load_package`, collected as a per-package failure.
++        let broken = root.path().join("broken");
++        write_package(&broken, "test.broken", "user", "active");
++        std::fs::remove_file(broken.join("SKILL.md")).unwrap();
++        // A tier with no local anchor: skipped legibly, not a scan error.
++        write_package(&root.path().join("ws"), "test.ws", "workspace", "active");
++
++        let outcome = scan_skill_root(&pool, root.path(), repo).await;
++        assert_eq!(outcome.registered.len(), 1, "only the good package lands");
++        assert_eq!(outcome.registered[0].name, "test.good");
++        assert_eq!(outcome.failures.len(), 2, "{:?}", outcome.failures);
++        assert!(
++            outcome
++                .failures
++                .iter()
++                .any(|(dir, reason)| dir.ends_with("ws") && reason.contains("workspace")),
++            "the unsupported tier names itself: {:?}",
++            outcome.failures
++        );
++
++        // Re-scan: same identity re-registers in place (id stable, still one row
++        // per identity) — safe to run on every daemon boot.
++        let first_id = outcome.registered[0].id;
++        let again = scan_skill_root(&pool, root.path(), repo).await;
++        assert_eq!(again.registered.len(), 1);
++        assert_eq!(again.registered[0].id, first_id, "identity is stable");
++    }
++
++    #[tokio::test]
++    async fn scan_of_a_missing_root_is_a_clean_no_op() {
++        let (_tmp, pool) = temp_pool().await;
++        let outcome = scan_skill_root(
++            &pool,
++            Path::new("/definitely/not/a/real/skills/root"),
++            RepositoryId::new(),
++        )
++        .await;
++        assert!(outcome.registered.is_empty());
++        assert!(outcome.failures.is_empty());
++    }
++
++    #[tokio::test]
++    async fn install_copies_into_the_skills_root_and_registers_the_installed_copy() {
++        let (_tmp, pool) = temp_pool().await;
++        let source = tempfile::tempdir().unwrap();
++        let skills_root_dir = tempfile::tempdir().unwrap();
++        let skills_root = skills_root_dir.path().join("skills");
++        write_package(source.path(), "test.installed", "user", "active");
++
++        let (item, installed) =
++            install_package(&pool, source.path(), &skills_root, RepositoryId::new())
++                .await
++                .unwrap();
++
++        assert_eq!(item.name, "test.installed");
++        assert_eq!(installed, skills_root.join("test.installed"));
++        assert!(installed.join("skill.toml").is_file(), "package was copied");
++        // Provenance names the INSTALLED path — the one the startup scan re-walks
++        // — not the transient source directory.
++        match &item.provenance {
++            crate::types::Provenance::Package { path } => {
++                assert!(
++                    path.contains("test.installed"),
++                    "provenance should name the installed copy: {path}"
++                );
++            }
++            other => panic!("expected package provenance, got {other:?}"),
++        }
++        // The startup scan finds the installed copy and re-registers the same
++        // identity (the id survives).
++        let rescan = scan_skill_root(&pool, &skills_root, RepositoryId::new()).await;
++        assert_eq!(rescan.registered.len(), 1);
++        assert_eq!(rescan.registered[0].id, item.id);
++    }
++
++    #[tokio::test]
++    async fn install_replaces_a_previous_install_without_duplicating_rows() {
++        let (_tmp, pool) = temp_pool().await;
++        let skills_root_dir = tempfile::tempdir().unwrap();
++        let skills_root = skills_root_dir.path().join("skills");
++        let repo = RepositoryId::new();
++
++        let v1 = tempfile::tempdir().unwrap();
++        write_package(v1.path(), "test.replace", "user", "active");
++        let (first, _) = install_package(&pool, v1.path(), &skills_root, repo)
++            .await
++            .unwrap();
++
++        // A changed package at the SAME version: the copy replaces the install
++        // and the registry flags the unchanged-version hash change as Modified.
++        let v2 = tempfile::tempdir().unwrap();
++        write_package(v2.path(), "test.replace", "user", "active");
++        std::fs::write(v2.path().join("SKILL.md"), "# Edited\n").unwrap();
++        let (second, installed) = install_package(&pool, v2.path(), &skills_root, repo)
++            .await
++            .unwrap();
++
++        assert_eq!(second.id, first.id, "identity survives re-install");
++        assert_eq!(second.status, RegistryStatus::Modified);
++        assert_eq!(
++            std::fs::read_to_string(installed.join("SKILL.md")).unwrap(),
++            "# Edited\n",
++            "the installed copy is the new content"
++        );
++        let all = Registry::new().list(&pool).await.unwrap();
++        assert_eq!(all.len(), 1, "one row per identity");
++    }
++
++    #[tokio::test]
++    async fn install_rejects_an_invalid_package_before_touching_the_root() {
++        let (_tmp, pool) = temp_pool().await;
++        let source = tempfile::tempdir().unwrap();
++        let skills_root_dir = tempfile::tempdir().unwrap();
++        let skills_root = skills_root_dir.path().join("skills");
++        write_package(source.path(), "test.broken", "user", "active");
++        std::fs::remove_file(source.path().join("SKILL.md")).unwrap();
++
++        let error = install_package(&pool, source.path(), &skills_root, RepositoryId::new())
++            .await
++            .unwrap_err();
++        assert!(
++            error.to_string().contains("SKILL.md"),
++            "the entrypoint failure is legible: {error}"
++        );
++        assert!(
++            !skills_root.join("test.broken").exists(),
++            "an invalid package must never land in the skills root"
++        );
++    }
++
++    #[test]
++    fn anchor_repository_id_is_stable_and_distinct() {
++        let a = tempfile::tempdir().unwrap();
++        let b = tempfile::tempdir().unwrap();
++        assert_eq!(
++            anchor_repository_id(a.path()),
++            anchor_repository_id(a.path())
++        );
++        assert_ne!(
++            anchor_repository_id(a.path()),
++            anchor_repository_id(b.path())
++        );
++    }
++}
+diff --git a/crates/knowledge/tests/registry_it.rs b/crates/knowledge/tests/registry_it.rs
+index 8359dda..b2d30b5 100644
+--- a/crates/knowledge/tests/registry_it.rs
++++ b/crates/knowledge/tests/registry_it.rs
+@@ -71,7 +71,10 @@ fn package_parse_round_trip() {
+         item.intents,
+         vec!["ci failure", "rust tests", "github actions", "clippy"]
+     );
+-    assert_eq!(item.status, RegistryStatus::Draft);
++    // Active, not Draft: retrieval hard-filters non-Active items, so the shipped
++    // reference skill must carry the status that lets it actually be disclosed
++    // (2026-08-11 review — the draft status left the only real skill dead).
++    assert_eq!(item.status, RegistryStatus::Active);
+ 
+     // [permissions] flattens to 1 read + 1 write + 2 commands + 1 network = 5.
+     assert_eq!(item.permissions.len(), 5);
+diff --git a/crates/knowledge/tests/retrieval_eval.rs b/crates/knowledge/tests/retrieval_eval.rs
+index 713f4b2..f56920c 100644
+--- a/crates/knowledge/tests/retrieval_eval.rs
++++ b/crates/knowledge/tests/retrieval_eval.rs
+@@ -187,6 +187,43 @@ async fn retrieval_beats_full_injection_recall_and_forbidden_exclusion() {
+     );
+ }
+ 
++/// Skill activation gate (2026-08-11 review): a CI-failure query MUST disclose
++/// the shipped `rust.fix-ci` skill card.
++///
++/// Before the reference package's `status` flipped to `active`, the funnel's
++/// non-Active hard filter (`retrieval/mod.rs`) dropped it from every selection,
++/// and the 0.8 *mean*-recall gate above quietly absorbed the per-case misses —
++/// the suite passed while skill disclosure was dead product-wide. This test
++/// asserts the disclosure DIRECTLY, per skill, so a regression to a
++/// never-selectable shipped skill turns the suite red instead of shaving the
++/// mean.
++#[tokio::test]
++async fn a_ci_failure_query_discloses_the_shipped_fix_ci_skill_card() {
++    let (_tmp, items, repo) = seed().await;
++    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new()).unwrap();
++
++    // The same shape the executor's `emit_context` queries under: System + the
++    // run's repository, a Medium risk ceiling (the skill is Medium — writes +
++    // commands + network, no secret — so the ceiling admits it).
++    let query = RetrievalQuery::new(
++        "the github actions ci is failing on the rust tests, diagnose and fix it",
++        vec![Scope::System, Scope::Repository(repo)],
++        RiskClass::Medium,
++    );
++    let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default()).unwrap();
++
++    assert!(
++        result.skills.iter().any(|card| card.name == "rust.fix-ci"),
++        "the shipped rust.fix-ci skill must be disclosed for a CI-failure query; \
++         disclosed skills: {:?} (is the package still status = \"active\"?)",
++        result
++            .skills
++            .iter()
++            .map(|card| card.name.as_str())
++            .collect::<Vec<_>>()
++    );
++}
++
+ /// The risk ceiling — not mere absence — is what excludes the destructive
+ /// decoys. A query that names one directly ranks it top on exact overlap; it is
+ /// disclosed under a High ceiling, yet vanishes the instant the ceiling drops to

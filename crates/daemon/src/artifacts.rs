@@ -204,6 +204,34 @@ impl ArtifactStore {
         Ok(file)
     }
 
+    /// The classification RECORDED for `id` when it was stored.
+    ///
+    /// An [`ArtifactRef`] travels on the wire, so its `sensitivity` is whatever
+    /// the sender wrote — a client may cite a real artifact id under a lower
+    /// classification than the one the daemon stored. Any gate that decides
+    /// where those bytes may travel must ask this, never the ref. An
+    /// unrecognised (or future) column value reads back `Unknown`, which the
+    /// protocol ranks above `Secret`, so a corrupted row fails closed.
+    pub async fn classification(
+        &self,
+        pool: &SqlitePool,
+        id: ArtifactId,
+    ) -> anyhow::Result<DataClassification> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT classification FROM artifacts WHERE id = ?")
+                .bind(id.to_string())
+                .fetch_optional(pool)
+                .await?;
+        let (stored,) = row.ok_or_else(|| anyhow::anyhow!("artifact {id} is not in the store"))?;
+        Ok(match stored.as_str() {
+            "Public" => DataClassification::Public,
+            "Internal" => DataClassification::Internal,
+            "Confidential" => DataClassification::Confidential,
+            "Secret" => DataClassification::Secret,
+            _ => DataClassification::Unknown,
+        })
+    }
+
     /// Re-hash the blob backing `id` and report whether it matches the SHA-256
     /// recorded in the artifact row (integrity check).
     pub async fn verify(&self, pool: &SqlitePool, id: ArtifactId) -> anyhow::Result<bool> {
@@ -399,6 +427,70 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored_class, "Secret");
+    }
+
+    /// An `ArtifactRef` is wire data: a client can cite a real artifact id under
+    /// a classification it never had. Any gate deciding where those bytes may
+    /// travel (off-device transcription, above all) must read the stored row,
+    /// which is what `classification()` exists to provide.
+    #[tokio::test]
+    async fn stored_classification_ignores_what_a_ref_later_claims() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+
+        let secret = store
+            .put(
+                &pool,
+                "audio/wav",
+                DataClassification::Secret,
+                Provenance::system("voice capture"),
+                b"RIFF....dictated notes",
+            )
+            .await
+            .unwrap();
+
+        // The forged ref: same id, downgraded classification.
+        let mut forged = secret.clone();
+        forged.sensitivity = DataClassification::Public;
+        assert_eq!(forged.id, secret.id);
+
+        assert_eq!(
+            store.classification(&pool, forged.id).await.unwrap(),
+            DataClassification::Secret,
+            "the store must report what it recorded, not what the ref claims"
+        );
+    }
+
+    /// A row whose classification column is unreadable (a future variant, or
+    /// corruption) must fail closed: `Unknown` ranks above `Secret`.
+    #[tokio::test]
+    async fn an_unrecognised_stored_classification_reads_back_as_unknown() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+
+        let stored = store
+            .put(
+                &pool,
+                "audio/wav",
+                DataClassification::Internal,
+                Provenance::system("voice capture"),
+                b"RIFF....",
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE artifacts SET classification = ? WHERE id = ?")
+            .bind("SomethingNewerThanThisBuild")
+            .bind(stored.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.classification(&pool, stored.id).await.unwrap(),
+            DataClassification::Unknown
+        );
     }
 
     #[tokio::test]

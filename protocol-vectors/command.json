@@ -43,6 +43,18 @@
     "type": "CancelWorkflow",
     "workflow_run_id": "wfrun-abc123"
   },
+  "CommandBody_CheckDocuments": {
+    "repository": "/home/user/project",
+    "session_id": "20000000-0000-0000-0000-000000000001",
+    "type": "CheckDocuments"
+  },
+  "CommandBody_CreateDocument": {
+    "initial_markdown": "# Payments Runbook\n\nBody.\n",
+    "repository": "/home/user/project",
+    "scope": "repository",
+    "title": "Payments Runbook",
+    "type": "CreateDocument"
+  },
   "CommandBody_CreateSession": {
     "repository": "/home/user/project",
     "title": "fix the failing test",

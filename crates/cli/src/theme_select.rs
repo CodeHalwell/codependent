@@ -124,8 +124,54 @@ pub fn resolve_theme_for_depth(
 /// The live entry point: detect the terminal's real color depth
 /// ([`ColorDepth::detect`], honoring `NO_COLOR`/`COLORTERM`/`TERM`) and
 /// resolve the theme for it (see [`resolve_theme_for_depth`]).
-pub fn resolve_theme(paths: &RuntimePaths, override_name: Option<&str>) -> Result<Theme> {
-    resolve_theme_for_depth(paths, ColorDepth::detect(), override_name)
+///
+/// `remembered` is the id the TUI's `/theme` picker last kept (persisted
+/// beside the session store). It sits BELOW an explicit
+/// `--theme`/`CODYPENDENT_THEME` — an explicit override always wins — and
+/// above terminal detection. Unlike an override, a remembered id that no
+/// longer resolves (a deleted pack) is not an error: it falls through to
+/// detection, so a stale preference can never wedge the TUI shut.
+pub fn resolve_theme(
+    paths: &RuntimePaths,
+    override_name: Option<&str>,
+    remembered: Option<&str>,
+) -> Result<Theme> {
+    let depth = ColorDepth::detect();
+    if override_name.is_some() {
+        return resolve_theme_for_depth(paths, depth, override_name);
+    }
+    if let Some(name) = remembered.filter(|name| !name.trim().is_empty()) {
+        if let Ok(theme) = resolve_theme_for_depth(paths, depth, Some(name)) {
+            return Ok(theme);
+        }
+    }
+    resolve_theme_for_depth(paths, depth, None)
+}
+
+/// Every data-only theme pack installed under `<data-dir>/themes/*.toml`, as
+/// `(id, theme)` pairs sorted by id, skipping any file that fails to parse (a
+/// broken pack must not take the picker down with it).
+///
+/// The TUI crate performs no I/O, so the picker's rows have to arrive already
+/// parsed — this is the seam that reads them.
+#[must_use]
+pub fn discover_theme_packs(paths: &RuntimePaths) -> Vec<(String, Theme)> {
+    let Ok(entries) = std::fs::read_dir(paths.data_dir.join("themes")) else {
+        return Vec::new();
+    };
+    let mut packs: Vec<(String, Theme)> = entries
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "toml"))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let id = path.file_stem()?.to_str()?.to_owned();
+            let source = std::fs::read_to_string(&path).ok()?;
+            let theme = load_theme_pack(&source).ok()?;
+            Some((id, theme))
+        })
+        .collect();
+    packs.sort_by(|a, b| a.0.cmp(&b.0));
+    packs
 }
 
 #[cfg(test)]
@@ -286,5 +332,68 @@ network = ["evil.example.com:443"]
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("nonexistent"), "{msg}");
+    }
+
+    /// The `/theme` picker's kept choice is read at boot, below an explicit
+    /// `--theme`/`CODYPENDENT_THEME` and above terminal detection — and a
+    /// remembered id that no longer resolves falls through to detection
+    /// instead of failing the launch, so a deleted pack cannot wedge the TUI.
+    #[test]
+    fn a_remembered_theme_sits_between_an_explicit_override_and_detection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+
+        // Remembered alone wins over detection.
+        let remembered = resolve_theme(&paths, None, Some("monochrome")).unwrap();
+        assert_eq!(remembered, Theme::variant(ThemeVariant::Monochrome));
+
+        // An explicit override always wins over the remembered choice.
+        let overridden = resolve_theme(&paths, Some("light"), Some("monochrome")).unwrap();
+        assert_eq!(overridden, Theme::variant(ThemeVariant::Light));
+
+        // A stale remembered id degrades to detection rather than erroring.
+        let stale = resolve_theme(&paths, None, Some("deleted-pack")).unwrap();
+        assert_eq!(stale, resolve_theme(&paths, None, None).unwrap());
+
+        // A blank remembered value is treated as absent.
+        let blank = resolve_theme(&paths, None, Some("   ")).unwrap();
+        assert_eq!(blank, resolve_theme(&paths, None, None).unwrap());
+
+        // An explicit override that cannot resolve is still a hard error (the
+        // operator asked for it by name).
+        assert!(resolve_theme(&paths, Some("nonexistent"), None).is_err());
+    }
+
+    /// The picker's pack rows come from here (the TUI crate does no I/O): every
+    /// valid pack in the themes dir, sorted, with broken ones skipped rather
+    /// than taking the picker down.
+    #[test]
+    fn discover_theme_packs_lists_valid_packs_and_skips_broken_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        assert!(
+            discover_theme_packs(&paths).is_empty(),
+            "no themes dir, no packs"
+        );
+
+        let themes_dir = tmp.path().join("themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+        std::fs::write(
+            themes_dir.join("zebra.toml"),
+            "schema_version = 1\nid = \"zebra\"\nbase = \"dark\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            themes_dir.join("apple.toml"),
+            "schema_version = 1\nid = \"apple\"\nbase = \"light\"\n",
+        )
+        .unwrap();
+        std::fs::write(themes_dir.join("broken.toml"), "not = [valid").unwrap();
+        std::fs::write(themes_dir.join("notes.txt"), "ignored").unwrap();
+
+        let packs = discover_theme_packs(&paths);
+        let ids: Vec<&str> = packs.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["apple", "zebra"], "valid packs only, sorted by id");
+        assert_eq!(packs[1].1, Theme::variant(ThemeVariant::Dark));
     }
 }

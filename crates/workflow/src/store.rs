@@ -943,6 +943,74 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// The most recent runs of one repository, newest first — what the agent-facing
+    /// `workflow.query` tool lists when it is asked about a repository rather than a
+    /// single run (rubric 5). The synthetic board run
+    /// ([`ensure_board_run`](WorkflowStore::ensure_board_run)) is excluded: it is a
+    /// storage device for the task board, not a workflow anyone ran.
+    pub async fn list_runs_for_repository(
+        &self,
+        pool: &SqlitePool,
+        repository: &str,
+        limit: u32,
+    ) -> Result<Vec<WorkflowRunRecord>, WorkflowStoreError> {
+        let rows = sqlx::query(
+            "SELECT id, workflow_id, workflow_version, graph_signature, run_id, inputs_json, state \
+             FROM workflow_runs WHERE repository = ? AND workflow_id != 'repository-board' \
+             ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(repository)
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(WorkflowRunRecord {
+                    id: row.get("id"),
+                    workflow_id: row.get("workflow_id"),
+                    workflow_version: row.get::<i64, _>("workflow_version") as u32,
+                    graph_signature: row.get("graph_signature"),
+                    run_id: row.get("run_id"),
+                    inputs: serde_json::from_str(&row.get::<String, _>("inputs_json"))?,
+                    state: WorkflowRunState::parse(&row.get::<String, _>("state"))?,
+                })
+            })
+            .collect()
+    }
+
+    /// Ensure the **synthetic board run** backing a repository task board exists
+    /// (kanban, migration 0019). `board_id` is the stable
+    /// `codypendent_protocol::board_scope_id` string (`board:<canonical repo>`)
+    /// that doubles as the blackboard hub key; `repository` is recorded in the
+    /// run's `inputs_json` and `repository` column for attribution. Inserted
+    /// `OR IGNORE` in the terminal state `completed`, so startup recovery,
+    /// `list_incomplete_runs`, and every drive path ignore it — it exists only
+    /// to satisfy `blackboard_items.workflow_run_id`'s FK and to key the board's
+    /// reads/subscriptions. Idempotent: a second call is a no-op.
+    pub async fn ensure_board_run(
+        &self,
+        pool: &SqlitePool,
+        board_id: &str,
+        repository: &str,
+    ) -> Result<(), WorkflowStoreError> {
+        let now = Utc::now().to_rfc3339();
+        let inputs = serde_json::to_string(&serde_json::json!({ "repository": repository }))?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO workflow_runs \
+             (id, workflow_id, workflow_version, graph_signature, run_id, inputs_json, state, \
+              manifest_yaml, repository, created_at, updated_at) \
+             VALUES (?, 'repository-board', 1, 'board', NULL, ?, 'completed', NULL, ?, ?, ?)",
+        )
+        .bind(board_id)
+        .bind(&inputs)
+        .bind(repository)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
     /// Mark every still-`Pending` node of a run `Skipped` — the cancel drain (T9):
     /// a cancelled run's un-started nodes will never run, so they land in the one
     /// no-producer terminal node state a `CancelWorkflow` newly produces (alongside

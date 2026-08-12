@@ -28,6 +28,31 @@ pub trait Embedder {
     fn embed(&self, text: &str) -> Vec<f32>;
 }
 
+/// A failure calling a remote embedding model. Carries only a legible reason —
+/// callers degrade to the [`HashingEmbedder`] on any error, never fail a run.
+#[derive(Debug, thiserror::Error)]
+#[error("embedding failed: {0}")]
+pub struct EmbedError(pub String);
+
+/// A real (remote) embedding model behind an async seam — the `FactExtractor`
+/// pattern: this crate defines the trait and stays model-free (ADR-009); the
+/// runtime implements it over an OpenAI-compatible `/embeddings` endpoint
+/// configured by `models.toml`'s `[embedding]` entry, and the daemon injects it
+/// into context assembly and the index-outbox drain. Distinct from the sync
+/// [`Embedder`] (which the funnel calls inline for the offline hashing model):
+/// a network model must be batched and awaited, so its seam is async and
+/// fallible — any error degrades retrieval to the hashing embedder.
+#[async_trait::async_trait]
+pub trait SemanticEmbedder: Send + Sync {
+    /// The provider-side model name identifying this embedding space. Persisted
+    /// alongside every vector so a model change invalidates stored rows.
+    fn model(&self) -> &str;
+
+    /// Embed `texts` into dense vectors, one per input, in input order. All
+    /// vectors must share one dimensionality.
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError>;
+}
+
 /// A deterministic, offline embedder: hashed character trigrams, term-frequency
 /// weighted, projected into [`EMBEDDING_DIMENSION`] buckets and L2-normalized.
 ///

@@ -13,14 +13,26 @@
 //! [`RuntimeExecutor`] that drives the runtime agent loop and injects it into
 //! the server.
 
-mod blackboard;
-mod documents;
+// The agent document channel and the client mutation seam are `pub` so the
+// crate's own integration tests can drive the SAME production seams the daemon
+// wires (see `tests/docs_agent_it.rs`), rather than re-implementing them.
+/// The concrete blackboard + task-board seams. Public so an integration test can
+/// drive the SAME channel the `task.*` tools use, rather than reproducing the
+/// board's write rules in test SQL (which would then drift from them).
+pub mod blackboard;
+pub mod docs_channel;
+mod docs_job;
+pub mod documents;
 mod executor;
 mod promotion;
 mod publish;
+mod retrieval;
 mod routing;
 mod scan;
 mod session_history;
+// Voice v1 (rubric 8): the speech-to-text seam, implemented over the runtime's
+// OpenAI-compatible `/audio/transcriptions` client.
+mod transcription;
 mod workflow_exec;
 mod workflows;
 
@@ -95,12 +107,34 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         Err(error) => warn!(%error, "failed to register built-in tools"),
     }
 
+    // The indexer worker (rubric 9): reconcile persisted registry vectors at
+    // startup, then drain the `index_outbox` on a timer — the first production
+    // consumer that table has ever had, so it stops growing without bound and
+    // context assembly loads vectors instead of recomputing them per call.
+    // Fire-and-forget after `register_builtins` so the builtins' own outbox rows
+    // are already queued. With no `[embedding]` entry the drain still consumes
+    // rows (nothing to persist for the offline hashing model) and retrieval is
+    // byte-for-byte what it was before.
+    let embedder = retrieval::build_embedder(&paths);
+    retrieval::spawn_index_maintenance(pool.clone(), embedder.clone());
+
     // Derive the process's fallback repository identity without warming the code
     // graph synchronously. Session attach and run launch schedule valid Git
     // checkouts in the background; startup must never walk an arbitrary daemon
     // working directory before it can serve clients.
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let repository = scan::repository_id_for(&workdir);
+
+    // Register the operator's installed skill packages, so retrieval has
+    // something to disclose beyond the built-ins. `register_package` previously
+    // had no production caller at all: a package on disk reached the registry
+    // only from a test. Both well-known roots are probed on every boot —
+    // `<data_dir>/skills/` (what `codypendent skill add` installs into) and the
+    // startup checkout's `.codypendent/skills/` (packages committed alongside
+    // the code they serve) — and an absent root is a clean no-op. Idempotent
+    // like `register_builtins` above: identity is reused, so re-scanning every
+    // boot re-verifies each package's content hash rather than duplicating it.
+    scan_installed_skills(&pool, &paths.data_dir, &workdir, repository).await;
 
     // The executor owns the shared event fan-out + approval broker the server
     // binds to (`RunExecutor::collaborators`), and drives each accepted run
@@ -111,7 +145,11 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
     // so publication uses this same startup root, as the code-graph scan does).
     let mut executor =
         RuntimeExecutor::new(pool.clone(), paths.clone(), repository, workdir.clone())
-            .with_repository_root(workdir);
+            .with_repository_root(workdir)
+            // Rubric 9: the SAME embedder the maintenance job persists vectors
+            // with (one shared content-hash cache), plus the `[retrieval]`
+            // tuning each run's agent runtime gates its MCP advertisement by.
+            .with_retrieval(embedder, retrieval::retrieval_settings(&paths));
 
     // Personal-mode GitHub (Phase 3 STEP 3.2): discover a token from `gh auth
     // token` or `GITHUB_TOKEN` and enable the `github.*` tools. Absent (the
@@ -146,6 +184,17 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         ),
     ));
     info!("tavily web search adapter enabled (credentials resolve per call)");
+
+    // Voice input (voice v1, rubric 8): enabled only when `models.toml` declares
+    // a `[transcription]` endpoint — an affirmative operator act. Absent (the
+    // default), audio submissions are rejected `voice.transport-unavailable`
+    // and text input is entirely unaffected. Whether a transcription may leave
+    // the device is decided by the daemon against `routing.toml`'s existing
+    // off-device ceiling, NOT by the transcriber.
+    match crate::transcription::HostedTranscriber::arc_from_paths(&paths) {
+        Some(transcriber) => executor = executor.with_transcriber(transcriber),
+        None => info!("no [transcription] entry in models.toml; voice input disabled"),
+    }
 
     // MCP client (PR B): load the operator-declared server list from
     // `<config_dir>/mcp.toml` (sibling to `policy.toml`) and hand the registry
@@ -224,6 +273,45 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
     server::run_with_executor_on(listener, pool, paths, boot, Some(executor)).await
 }
 
+/// Register every skill package installed under the two well-known roots into
+/// the governed registry, so the retrieval funnel can disclose them.
+///
+/// Both roots are probed on every boot: `<data_dir>/skills/` (the operator's
+/// global installs, where `codypendent skill add` copies a validated package)
+/// and `<workdir>/.codypendent/skills/` (packages a checkout commits alongside
+/// the code they serve). `repository` anchors any package declaring
+/// repository tier, matching the identity the executor attributes a run's
+/// context to.
+///
+/// Best-effort throughout, like the code-graph warm-up: a broken package is
+/// logged with its reason and skipped, never fatal and never blocking its
+/// siblings. Registration is idempotent — a re-scan reuses the existing
+/// identity's id and only flags a content change — so this is safe every boot.
+async fn scan_installed_skills(
+    pool: &sqlx::SqlitePool,
+    data_dir: &std::path::Path,
+    workdir: &std::path::Path,
+    repository: codypendent_protocol::RepositoryId,
+) {
+    use codypendent_knowledge::{repository_skills_root, scan_skill_root, user_skills_root};
+
+    let roots = [
+        ("user", user_skills_root(data_dir)),
+        ("repository", repository_skills_root(workdir)),
+    ];
+    let mut registered = 0usize;
+    for (label, root) in roots {
+        let outcome = scan_skill_root(pool, &root, repository).await;
+        registered += outcome.registered.len();
+        for (dir, reason) in outcome.failures {
+            warn!(root = label, package = %dir.display(), %reason, "skill package not registered");
+        }
+    }
+    if registered > 0 {
+        info!(skills = registered, "installed skill packages registered");
+    }
+}
+
 /// Start the webhook listener if `<data_dir>/webhooks.toml` enables it. Any
 /// failure is logged and never blocks daemon startup — the webhook endpoint is
 /// an optional, opt-in surface.
@@ -269,5 +357,133 @@ async fn maybe_start_webhook_listener(paths: &RuntimePaths, pool: &sqlx::SqliteP
             addr = %webhooks.listen_addr,
             "could not bind the webhook listener"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use codypendent_knowledge::{
+        repository_skills_root, user_skills_root, Registry, RegistryItemKind, Scope,
+    };
+    use codypendent_protocol::RepositoryId;
+
+    /// Write a minimal valid skill package at `dir`.
+    fn write_package(dir: &std::path::Path, id: &str, scope: &str) {
+        std::fs::create_dir_all(dir).expect("package dir");
+        std::fs::write(
+            dir.join("skill.toml"),
+            format!(
+                "schema_version = 1\n\
+                 id = \"{id}\"\n\
+                 name = \"Test Skill\"\n\
+                 version = \"0.1.0\"\n\
+                 scope = \"{scope}\"\n\
+                 status = \"active\"\n\
+                 description = \"A test skill.\"\n\
+                 \n\
+                 [entrypoints]\n\
+                 instructions = \"SKILL.md\"\n\
+                 \n\
+                 [trust]\n\
+                 publisher = \"local-user\"\n\
+                 signature_required = false\n"
+            ),
+        )
+        .expect("write skill.toml");
+        std::fs::write(dir.join("SKILL.md"), "# Test\n").expect("write SKILL.md");
+    }
+
+    /// The startup scan is the production ingestion path the 2026-08-11 review
+    /// found missing entirely (`register_package` was reachable only from
+    /// tests): both well-known roots must register, a broken package must not
+    /// block its siblings, and a second boot must not duplicate a row.
+    #[tokio::test]
+    async fn startup_registers_both_skill_roots_idempotently() {
+        let data = tempfile::tempdir().expect("data dir");
+        let workdir = tempfile::tempdir().expect("workdir");
+        let pool = codypendent_daemon::db::open_database(&data.path().join("codypendent.db"))
+            .await
+            .expect("open db");
+        let repository = RepositoryId::new();
+
+        write_package(
+            &user_skills_root(data.path()).join("global"),
+            "test.global",
+            "user",
+        );
+        write_package(
+            &repository_skills_root(workdir.path()).join("local"),
+            "test.local",
+            "repository",
+        );
+        // A package whose declared entrypoint is missing: skipped with a
+        // reason, never fatal to its siblings or the boot.
+        let broken = user_skills_root(data.path()).join("broken");
+        write_package(&broken, "test.broken", "user");
+        std::fs::remove_file(broken.join("SKILL.md")).expect("break the package");
+
+        scan_installed_skills(&pool, data.path(), workdir.path(), repository).await;
+
+        let skills: Vec<_> = Registry::new()
+            .list(&pool)
+            .await
+            .expect("list registry")
+            .into_iter()
+            .filter(|item| item.kind == RegistryItemKind::Skill)
+            .collect();
+        assert_eq!(skills.len(), 2, "both good packages register: {skills:?}");
+        let global = skills
+            .iter()
+            .find(|item| item.name == "test.global")
+            .expect("the data-dir package registered");
+        assert_eq!(global.scope, codypendent_knowledge::local_user_scope());
+        let local = skills
+            .iter()
+            .find(|item| item.name == "test.local")
+            .expect("the repo-local package registered");
+        assert_eq!(
+            local.scope,
+            Scope::Repository(repository),
+            "a repository-tier package anchors to the daemon's repository"
+        );
+
+        // A second boot re-verifies rather than duplicating.
+        let ids: Vec<_> = skills.iter().map(|item| item.id).collect();
+        scan_installed_skills(&pool, data.path(), workdir.path(), repository).await;
+        let after: Vec<_> = Registry::new()
+            .list(&pool)
+            .await
+            .expect("list registry")
+            .into_iter()
+            .filter(|item| item.kind == RegistryItemKind::Skill)
+            .collect();
+        assert_eq!(after.len(), 2, "a re-scan must not duplicate rows");
+        for item in &after {
+            assert!(ids.contains(&item.id), "identity survives a re-scan");
+        }
+    }
+
+    /// Absent roots — the common case on a fresh install — are a clean no-op,
+    /// so the scan can run unconditionally on every boot.
+    #[tokio::test]
+    async fn startup_with_no_installed_skills_is_a_no_op() {
+        let data = tempfile::tempdir().expect("data dir");
+        let workdir = tempfile::tempdir().expect("workdir");
+        let pool = codypendent_daemon::db::open_database(&data.path().join("codypendent.db"))
+            .await
+            .expect("open db");
+
+        scan_installed_skills(&pool, data.path(), workdir.path(), RepositoryId::new()).await;
+
+        let skills = Registry::new()
+            .list(&pool)
+            .await
+            .expect("list registry")
+            .into_iter()
+            .filter(|item| item.kind == RegistryItemKind::Skill)
+            .count();
+        assert_eq!(skills, 0);
     }
 }

@@ -28,6 +28,7 @@
 
 pub mod accessible;
 pub mod action;
+pub mod dag;
 pub mod input;
 pub mod markdown;
 pub mod palette;
@@ -56,11 +57,13 @@ pub use remote_ui_host::{
 };
 pub use render::{render, render_splash};
 pub use state::{
-    AppState, BlackboardItemCard, CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft,
-    DocBlockView, DocCard, DocEdit, DocFocus, DocLeaseState, DocSuggestionView, GraphEdgeCard,
-    InputMode, KeyStatus, LayoutMode, MemoryCard, ModelCard, ModelLocationLabel, ModelReadiness,
-    Overlay, Pane, PatchSummary, PendingApproval, ProviderCard, RunView, SkillCard,
-    StatusProjection, ToolCard, ToolStatus, TranscriptEntry, WorkflowNodeCard, EDGE_PAGE_SIZE,
+    AddModelRow, AppState, BlackboardItemCard, CouncilBuilderState, CouncilBuilderStep,
+    CouncilCard, CouncilMemberDraft, CouncilRunSummary, DocBlockView, DocCard, DocEdit, DocFocus,
+    DocLeaseState, DocSuggestionView, GraphEdgeCard, InputMode, KanbanCard, KeyStatus, LayoutMode,
+    MemoryCard, ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness, Overlay, Pane,
+    PatchSummary, PendingApproval, ProviderCard, RunView, SkillCard, StatusProjection, ThemeChoice,
+    ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard, UnslothRepoCard, WorkflowNodeCard,
+    EDGE_PAGE_SIZE,
 };
 pub use terminal::TerminalGuard;
 pub use theme::{ColorDepth, Theme, ThemePreferences, ThemeVariant};

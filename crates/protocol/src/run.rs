@@ -204,6 +204,62 @@ pub enum ProposedAction {
     /// engine's explicit arm); never serialized into a `ToolProposed` (never gated by
     /// approval), so it needs no golden wire vector.
     RecordMemory,
+    /// Search the knowledge registry for the tools/skills that fit a task (the
+    /// `skills.search` core tool, rubric 9). A READ of the daemon's own registry
+    /// — no filesystem, command, network, or remote effect, and no
+    /// model-supplied path (a skill's package directory comes from its registry
+    /// row). Always policy-`Allow`ed, exactly like [`Self::RecordMemory`], and
+    /// likewise never serialized into a `ToolProposed`, so it needs no golden
+    /// wire vector.
+    SearchRegistry,
+    /// An agent `docs.*` tool call touching a collaborative document (rubric #4
+    /// doc-writer). Targets only the knowledge fabric's document store — not the
+    /// filesystem, a command, the network, or any remote — and every content
+    /// edit is still gated by the document's collaboration mode (organization
+    /// docs default to Suggest, so an agent edit lands as a reviewable
+    /// suggestion), while publishing to Git stays behind the separate
+    /// approval-gated `PublishDocument` pipeline. Always policy-`Allow`ed like
+    /// [`RecordMemory`](Self::RecordMemory) and recorded purely so the access
+    /// is traced; never serialized into a `ToolProposed`, so it needs no golden
+    /// wire vector.
+    DocumentEdit {
+        /// The document the tool call targets; empty for `docs.create` (the
+        /// document does not exist yet) and `docs.read` listings.
+        document_id: String,
+        /// A short human description of the access (e.g. `docs.edit block p`),
+        /// for the trace.
+        summary: String,
+    },
+    /// Query a durable workflow run's graph state (the `workflow.query` runtime
+    /// tool, rubric 5): nodes, states, dependency edges, and measured costs. A
+    /// pure read of Codypendent's own durable store — no filesystem, command,
+    /// network, or remote effect — so it is always policy-`Allow`ed (see the
+    /// daemon policy engine's explicit arm) and recorded only so the access is
+    /// traced like any other tool call.
+    WorkflowQuery {
+        /// The workflow run being read, or empty when listing the repository's
+        /// runs (server-derived from the run context / validated args).
+        workflow_run_id: String,
+    },
+    /// Write a card on the repository task board (the `task.create` /
+    /// `task.update` / `task.move` runtime tools, rubric 10). Internal
+    /// coordination state in Codypendent's own store — like a blackboard post it
+    /// touches no file, command, network, or remote — so policy allows it
+    /// without an approval gate; the action is recorded so every board write is
+    /// traced and attributable.
+    TaskWrite {
+        /// The canonical repository whose board is written (server-derived from
+        /// the run context, never model-supplied).
+        repository: String,
+        /// A short human rendering of the write (e.g. `create "wire the DAG"`).
+        summary: String,
+    },
+    /// Read the repository task board (the `task.list` runtime tool). A read of
+    /// internal state; always policy-`Allow`ed and recorded for the trace.
+    TaskRead {
+        /// The canonical repository whose board is read (server-derived).
+        repository: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -333,6 +389,10 @@ mod tests {
             agent: "claude-acp".to_string(),
             title: "write file".to_string(),
             details: "{\"path\":\"src/lib.rs\"}".to_string(),
+        });
+        round_trip(ProposedAction::DocumentEdit {
+            document_id: "70000000-0000-0000-0000-000000000001".to_string(),
+            summary: "docs.edit block p".to_string(),
         });
         round_trip(ProposedAction::PublishDocument {
             document_id: DocumentId::new(),

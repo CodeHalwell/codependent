@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-cli"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -703,13 +703,14 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "toml",
 ]
 
 [[package]]
 name = "codypendent-codypendentd"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -736,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-daemon"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -767,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-eval"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -785,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-integrations"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -815,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-knowledge"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -842,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-protocol"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "directories",
@@ -855,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-providers"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -867,7 +868,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-routing"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "codypendent-protocol",
  "serde",
@@ -877,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-runtime"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "agent-framework-anthropic",
  "agent-framework-core",
@@ -905,11 +906,12 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
 name = "codypendent-sandbox"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -926,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-test-support"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "codypendent-protocol",
  "serde_json",
@@ -934,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-tui"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "codypendent-protocol",
@@ -949,11 +951,12 @@ dependencies = [
  "toml",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+ "uuid",
 ]
 
 [[package]]
 name = "codypendent-ui-host"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "codypendent-protocol",
  "codypendent-sandbox",
@@ -967,14 +970,14 @@ dependencies = [
 
 [[package]]
 name = "codypendent-ui-worker-launcher"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "nix",
 ]
 
 [[package]]
 name = "codypendent-workflow"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",

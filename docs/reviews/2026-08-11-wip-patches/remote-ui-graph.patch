@@ -1,0 +1,1044 @@
+diff --git a/crates/tui/src/remote_ui/codec.rs b/crates/tui/src/remote_ui/codec.rs
+index 91f1bd0..fddf268 100644
+--- a/crates/tui/src/remote_ui/codec.rs
++++ b/crates/tui/src/remote_ui/codec.rs
+@@ -71,6 +71,13 @@ fn normalize_node(node: &mut UiNode) {
+             _ => None,
+         })
+     });
++    // Grid-only: the flat `columns` prop is a track count or a track list.
++    // (Table reuses the `columns` name for column descriptors, lifted below.)
++    if layout.columns.is_empty()
++        && node.node_type.as_ref().is_some_and(|value| value.as_str() == "Grid")
++    {
++        layout.columns = grid_columns(extension.get("columns"));
++    }
+     if *layout == UiLayout::default() {
+         node.props.layout = None;
+     }
+@@ -557,6 +564,30 @@ fn edges(value: Option<&Value>) -> Option<UiEdges> {
+     }
+ }
+ 
++/// Grid `columns`: an equal-track count (`3` → `1fr 1fr 1fr`) or an explicit
++/// track list (numbers are cells; strings accept `fr`, `%`, and plain cells).
++fn grid_columns(value: Option<&Value>) -> Vec<UiDimension> {
++    match value {
++        Some(Value::Number(count)) => {
++            let count = count
++                .as_u64()
++                .map_or(0, |count| count.clamp(0, 24) as usize);
++            vec![
++                UiDimension {
++                    value: 1.0,
++                    unit: "fr".to_owned(),
++                };
++                count
++            ]
++        }
++        Some(Value::Array(tracks)) => tracks
++            .iter()
++            .filter_map(|track| dimension(Some(track)))
++            .collect(),
++        _ => Vec::new(),
++    }
++}
++
+ fn dimension(value: Option<&Value>) -> Option<UiDimension> {
+     match value? {
+         Value::Number(value) => Some(UiDimension {
+diff --git a/crates/tui/src/remote_ui/paint.rs b/crates/tui/src/remote_ui/paint.rs
+index d011aea..8a57d1c 100644
+--- a/crates/tui/src/remote_ui/paint.rs
++++ b/crates/tui/src/remote_ui/paint.rs
+@@ -1,3 +1,6 @@
++use std::cell::RefCell;
++use std::collections::HashMap;
++
+ use codypendent_protocol::remote_ui::{
+     node_kinds, primitives, UiActionBinding, UiData, UiDocument, UiNode, UiNodeId, UiSemanticRole,
+     UiStyle, UiTextSpan,
+@@ -74,6 +77,7 @@ pub(super) fn render(
+         output,
+         visited: 0,
+         focus_sequence: 0,
++        measure_cache: RefCell::new(HashMap::new()),
+     };
+ 
+     let compatibility_ok = document.compatibility.as_ref().is_none_or(|compatibility| {
+@@ -143,6 +147,11 @@ struct Painter<'a> {
+     output: RemoteUiRenderOutput,
+     visited: u32,
+     focus_sequence: i32,
++    /// Per-frame memoization of [`Painter::measure`], keyed by node identity
++    /// and available width. Containers re-measure the same immutable subtree
++    /// several times per frame (collapse checks, grids, tabs); the document is
++    /// borrowed for the whole frame, so node addresses are stable cache keys.
++    measure_cache: RefCell<HashMap<(usize, u16), u16>>,
+ }
+ 
+ impl Painter<'_> {
+@@ -374,22 +383,28 @@ impl Painter<'_> {
+     }
+ 
+     fn split_container(&mut self, node: &UiNode, area: Rect, depth: u16) {
+-        if area.width < self.options.narrow_breakpoint {
++        let vertical = split_is_vertical(node);
++        if !vertical && area.width < self.options.narrow_breakpoint {
+             self.vertical_container(node, area, depth);
+             return;
+         }
+         let border = self.wants_border(node);
+         self.draw_border(node, area, border, None);
+         let inner = layout::content_box(area, node.props.layout.as_ref(), border);
+-        let gap = layout::gap(node.props.layout.as_ref(), Axis::Horizontal);
+-        let usable = inner
+-            .width
++        let axis = if vertical {
++            Axis::Vertical
++        } else {
++            Axis::Horizontal
++        };
++        let gap = layout::gap(node.props.layout.as_ref(), axis);
++        let usable = if vertical { inner.height } else { inner.width }
+             .saturating_sub(gap.saturating_mul(node.children.len().saturating_sub(1) as u16));
+-        let count = u16::try_from(node.children.len())
+-            .unwrap_or(u16::MAX)
+-            .max(1);
+-        let widths = vec![usable / count; node.children.len()];
+-        let rects = layout::horizontal(inner, &node.children, &widths, gap);
++        let sizes = split_sizes(usable, node.children.len(), split_ratio(node));
++        let rects = if vertical {
++            layout::vertical(inner, &node.children, &sizes, gap)
++        } else {
++            layout::horizontal(inner, &node.children, &sizes, gap)
++        };
+         for (child, child_area) in node.children.iter().zip(rects) {
+             self.node(child, child_area, depth + 1);
+         }
+@@ -1113,21 +1128,88 @@ impl Painter<'_> {
+     }
+ 
+     fn graph(&mut self, node: &UiNode, area: Rect) {
++        // Fidelity ladder: layered box-drawing diagram → adjacency text list.
++        // (The card-list rung lives in the producer-supplied node fallback.)
++        if area.width >= self.options.narrow_breakpoint {
++            if let Some(diagram) = layout_graph_diagram(node, area, self.capabilities.unicode) {
++                self.graph_diagram(node, &diagram, area);
++                return;
++            }
++        }
++        self.graph_adjacency_list(node, area);
++    }
++
++    fn graph_diagram(&mut self, node: &UiNode, diagram: &GraphDiagram, area: Rect) {
++        let selected = node
++            .props
++            .structured_data
++            .as_ref()
++            .map_or(&[][..], |data| data.selected_ids.as_slice());
++        // Connectors first; node labels then overwrite their own cells so a
++        // pass-through edge never bleeds into a label.
++        let connector_style = Style::default()
++            .fg(self.theme.surface.border)
++            .bg(self.theme.surface.background);
++        for (offset, mask) in diagram.arms.iter().enumerate() {
++            let Some(glyph) = arm_glyph(*mask, self.capabilities.unicode) else {
++                continue;
++            };
++            let x = area.x.saturating_add((offset % diagram.width) as u16);
++            let y = area.y.saturating_add((offset / diagram.width) as u16);
++            if x < area.right() && y < area.bottom() {
++                self.buffer.set_stringn(x, y, glyph, 1, connector_style);
++            }
++        }
++        for placement in &diagram.placements {
++            let x = area.x.saturating_add(placement.x);
++            let y = area.y.saturating_add(placement.y);
++            if y >= area.bottom() {
++                continue;
++            }
++            let style = if placement
++                .id
++                .as_deref()
++                .is_some_and(|id| selected.iter().any(|selected| selected == id))
++            {
++                self.theme.selection_style()
++            } else {
++                placement
++                    .status
++                    .as_deref()
++                    .map_or_else(|| self.base_style(), |status| tone_from_name(status, self.theme))
++            };
++            self.buffer.set_stringn(
++                x,
++                y,
++                &placement.label,
++                usize::from(area.right().saturating_sub(x)),
++                style,
++            );
++        }
++    }
++
++    fn graph_adjacency_list(&mut self, node: &UiNode, area: Rect) {
+         let arrow = if self.capabilities.unicode {
+             " → "
+         } else {
+             " -> "
+         };
++        let items = data_items(node);
++        let edges = graph_edges(node);
+         let mut lines = Vec::new();
+-        for (index, item) in data_items(node).iter().enumerate() {
+-            let object = item.as_object();
++        for (index, item) in items.iter().enumerate() {
+             let label = item_label(item, index);
+-            let edges = object
+-                .and_then(|object| object.get("edges").or_else(|| object.get("targets")))
+-                .and_then(Value::as_array)
+-                .map(|values| values.iter().map(value_text).collect::<Vec<_>>().join(", "))
+-                .unwrap_or_default();
+-            if edges.is_empty() {
++            let id = graph_item_key(item, index);
++            let targets = edges
++                .iter()
++                .filter(|(from, _)| *from == id)
++                .map(|(_, to)| {
++                    graph_item_index(items, to)
++                        .map_or_else(|| to.clone(), |target| item_label(&items[target], target))
++                })
++                .collect::<Vec<_>>()
++                .join(", ");
++            if targets.is_empty() {
+                 lines.push(format!(
+                     "{} {label}",
+                     if self.capabilities.unicode {
+@@ -1137,7 +1219,7 @@ impl Painter<'_> {
+                     }
+                 ));
+             } else {
+-                lines.push(format!("{label}{arrow}{edges}"));
++                lines.push(format!("{label}{arrow}{targets}"));
+             }
+         }
+         if lines.is_empty() {
+@@ -1805,6 +1887,18 @@ impl Painter<'_> {
+         if width == 0 || depth > self.options.limits.max_tree_depth {
+             return 0;
+         }
++        // The frame borrows one immutable document, so the node address plus
++        // the available width identify a measurement for the whole frame.
++        let key = (std::ptr::from_ref(original) as usize, width);
++        if let Some(cached) = self.measure_cache.borrow().get(&key) {
++            return *cached;
++        }
++        let measured = self.measure_uncached(original, width, depth);
++        self.measure_cache.borrow_mut().insert(key, measured);
++        measured
++    }
++
++    fn measure_uncached(&self, original: &UiNode, width: u16, depth: u16) -> u16 {
+         let node = match resolve_node(original, self.capabilities) {
+             ResolvedNode::Plain(text) => {
+                 return bounded_height(wrap_cells(&text, usize::from(width)).len())
+@@ -1884,7 +1978,6 @@ impl Painter<'_> {
+             | primitives::VIRTUAL_LIST
+             | primitives::TREE
+             | primitives::TIMELINE
+-            | primitives::GRAPH
+             | primitives::MENU
+             | primitives::COMMAND_LIST => {
+                 if node.children.is_empty() {
+@@ -1893,6 +1986,14 @@ impl Painter<'_> {
+                     vertical_measure(self, &node.children, inner_width, depth + 1, layout)
+                 }
+             }
++            primitives::GRAPH => {
++                if inner_width >= self.options.narrow_breakpoint {
++                    graph_diagram_height(node, inner_width)
++                        .unwrap_or_else(|| bounded_height(data_items(node).len().max(1)))
++                } else {
++                    bounded_height(data_items(node).len().max(1))
++                }
++            }
+             primitives::CHART => data_items(node).len().clamp(1, 8) as u16,
+             primitives::SPARKLINE => 1,
+             primitives::TABS => {
+@@ -1904,6 +2005,9 @@ impl Painter<'_> {
+                         .map_or(0, |child| self.measure(child, inner_width, depth + 1)),
+                 )
+             }
++            primitives::SPLIT if split_is_vertical(node) => {
++                vertical_measure(self, &node.children, inner_width, depth + 1, layout).max(1)
++            }
+             primitives::ROW | primitives::TOOLBAR | primitives::SPLIT
+                 if width >= self.options.narrow_breakpoint =>
+             {
+@@ -2561,6 +2665,470 @@ fn fit_column_widths(preferred: &[usize], available: usize) -> Vec<usize> {
+     widths
+ }
+ 
++const ARM_UP: u8 = 1;
++const ARM_DOWN: u8 = 2;
++const ARM_LEFT: u8 = 4;
++const ARM_RIGHT: u8 = 8;
++const GRAPH_NODE_GAP: u16 = 3;
++const GRAPH_WAYPOINT_LIMIT: usize = 512;
++
++/// A drawable box-glyph for a set of connector arms, or `None` for empty cells.
++fn arm_glyph(mask: u8, unicode: bool) -> Option<&'static str> {
++    if mask == 0 {
++        return None;
++    }
++    if !unicode {
++        return Some(match mask {
++            mask if mask & (ARM_LEFT | ARM_RIGHT) == 0 => "|",
++            mask if mask & (ARM_UP | ARM_DOWN) == 0 => "-",
++            _ => "+",
++        });
++    }
++    Some(match mask {
++        1..=3 => "│",
++        4 | 8 | 12 => "─",
++        5 => "┘",
++        9 => "└",
++        6 => "┐",
++        10 => "┌",
++        7 => "┤",
++        11 => "├",
++        13 => "┴",
++        14 => "┬",
++        _ => "┼",
++    })
++}
++
++/// One node label placed inside the graph area (coordinates relative to it).
++struct GraphPlacement {
++    x: u16,
++    y: u16,
++    label: String,
++    status: Option<String>,
++    id: Option<String>,
++}
++
++/// A laid-out graph: connector arms per cell plus real node placements.
++struct GraphDiagram {
++    width: usize,
++    arms: Vec<u8>,
++    placements: Vec<GraphPlacement>,
++}
++
++enum GraphEntry {
++    Item(usize),
++    Waypoint,
++}
++
++/// Top-level `edges: [{from,to}]` (the SDK Graph contract; also accepted as
++/// `source`/`target`), with the legacy per-node `edges`/`targets` id lists as a
++/// fallback. Endpoints are item ids, falling back to labels.
++fn graph_edges(node: &UiNode) -> Vec<(String, String)> {
++    let top_level = node
++        .props
++        .structured_data
++        .as_ref()
++        .and_then(|data| data.schema.as_ref())
++        .and_then(|schema| schema.get("edges"))
++        .or_else(|| attribute(node, "edges"))
++        .and_then(Value::as_array);
++    let mut edges = Vec::new();
++    if let Some(values) = top_level {
++        for value in values {
++            let Some(object) = value.as_object() else {
++                continue;
++            };
++            let from = object
++                .get("from")
++                .or_else(|| object.get("source"))
++                .and_then(Value::as_str);
++            let to = object
++                .get("to")
++                .or_else(|| object.get("target"))
++                .and_then(Value::as_str);
++            if let (Some(from), Some(to)) = (from, to) {
++                edges.push((from.to_owned(), to.to_owned()));
++            }
++        }
++    }
++    if !edges.is_empty() {
++        return edges;
++    }
++    for (index, item) in data_items(node).iter().enumerate() {
++        let Some(object) = item.as_object() else {
++            continue;
++        };
++        let Some(targets) = object
++            .get("edges")
++            .or_else(|| object.get("targets"))
++            .and_then(Value::as_array)
++        else {
++            continue;
++        };
++        let source = graph_item_key(item, index);
++        for target in targets {
++            let target = value_text(target);
++            if !target.is_empty() {
++                edges.push((source.clone(), target));
++            }
++        }
++    }
++    edges
++}
++
++fn graph_item_key(item: &Value, index: usize) -> String {
++    item_id(item)
++        .map(str::to_owned)
++        .unwrap_or_else(|| item_label(item, index))
++}
++
++fn graph_item_index(items: &[Value], key: &str) -> Option<usize> {
++    items
++        .iter()
++        .position(|item| item_id(item) == Some(key))
++        .or_else(|| {
++            items
++                .iter()
++                .enumerate()
++                .position(|(index, item)| item_label(item, index) == key)
++        })
++}
++
++fn graph_node_label(item: &Value, index: usize, unicode: bool) -> String {
++    let label = item_label(item, index);
++    match graph_item_status(item) {
++        Some(status) => format!("{} {label}", status_symbol(status, unicode)),
++        None => label,
++    }
++}
++
++fn graph_item_status(item: &Value) -> Option<&str> {
++    item.as_object()
++        .and_then(|object| object.get("status"))
++        .and_then(Value::as_str)
++}
++
++/// Assign every item a layer by longest-path depth. Bounded relaxation keeps
++/// the pass total under cycles; unreachable relaxations simply stop at the cap.
++fn graph_layers(item_count: usize, edges: &[(usize, usize)]) -> Vec<usize> {
++    let mut depth = vec![0_usize; item_count];
++    let cap = item_count.saturating_sub(1);
++    for _ in 0..item_count {
++        let mut changed = false;
++        for (from, to) in edges {
++            if from == to {
++                continue;
++            }
++            let candidate = depth[*from] + 1;
++            if candidate > depth[*to] && candidate <= cap {
++                depth[*to] = candidate;
++                changed = true;
++            }
++        }
++        if !changed {
++            break;
++        }
++    }
++    // Compact to consecutive ranks so capped/cyclic depths do not leave gaps.
++    let mut used = depth.clone();
++    used.sort_unstable();
++    used.dedup();
++    depth
++        .into_iter()
++        .map(|value| used.iter().position(|rank| *rank == value).unwrap_or(0))
++        .collect()
++}
++
++/// Lay the graph out as a layered DAG that fits `area`, or `None` when the
++/// data or space cannot support a diagram (the caller then degrades to text).
++fn layout_graph_diagram(node: &UiNode, area: Rect, unicode: bool) -> Option<GraphDiagram> {
++    let items = data_items(node);
++    if items.is_empty() || area.width == 0 || area.height == 0 {
++        return None;
++    }
++    let resolved = graph_edges(node)
++        .iter()
++        .filter_map(|(from, to)| {
++            Some((
++                graph_item_index(items, from)?,
++                graph_item_index(items, to)?,
++            ))
++        })
++        .collect::<Vec<_>>();
++    if resolved.is_empty() {
++        return None;
++    }
++    let depth = graph_layers(items.len(), &resolved);
++    let layer_count = depth.iter().copied().max().unwrap_or(0) + 1;
++    if layer_count < 2 {
++        return None;
++    }
++    let mut layers: Vec<Vec<GraphEntry>> = (0..layer_count).map(|_| Vec::new()).collect();
++    let mut slot: Vec<usize> = vec![0; items.len()];
++    for (index, item_depth) in depth.iter().enumerate() {
++        slot[index] = layers[*item_depth].len();
++        layers[*item_depth].push(GraphEntry::Item(index));
++    }
++    // Insert waypoint entries so every drawn segment spans adjacent layers.
++    let mut segments: Vec<(usize, usize, usize)> = Vec::new();
++    let mut waypoints = 0_usize;
++    for (from, to) in &resolved {
++        let (mut layer, target_layer) = (depth[*from], depth[*to]);
++        if target_layer <= layer {
++            continue; // cycle leftovers stay in the adjacency of the text rung
++        }
++        let mut source_slot = slot[*from];
++        while layer + 1 < target_layer {
++            waypoints += 1;
++            if waypoints > GRAPH_WAYPOINT_LIMIT {
++                return None;
++            }
++            let waypoint_slot = layers[layer + 1].len();
++            layers[layer + 1].push(GraphEntry::Waypoint);
++            segments.push((layer, source_slot, waypoint_slot));
++            source_slot = waypoint_slot;
++            layer += 1;
++        }
++        segments.push((layer, source_slot, slot[*to]));
++    }
++    let horizontal = node
++        .props
++        .layout
++        .as_ref()
++        .and_then(|layout| layout.direction.as_deref())
++        .map(str::to_owned)
++        .or_else(|| string_attribute(node, "direction"))
++        .is_some_and(|direction| direction == "horizontal");
++    let entry_label = |entry: &GraphEntry| -> Option<String> {
++        match entry {
++            GraphEntry::Item(index) => Some(graph_node_label(&items[*index], *index, unicode)),
++            GraphEntry::Waypoint => None,
++        }
++    };
++    let entry_width = |entry: &GraphEntry| -> u16 {
++        entry_label(entry).map_or(1, |label| cell_width(&label) as u16)
++    };
++
++    let width = usize::from(area.width);
++    let mut arms = Vec::new();
++    let mut placements = Vec::new();
++    let mark = |arms: &mut Vec<u8>, x: u16, y: u16, mask: u8| {
++        if usize::from(x) >= width {
++            return;
++        }
++        let index = usize::from(y) * width + usize::from(x);
++        if arms.len() <= index {
++            arms.resize((usize::from(y) + 1) * width, 0);
++        }
++        arms[index] |= mask;
++    };
++
++    if horizontal {
++        // Layers become columns flowing left → right.
++        let column_widths = layers
++            .iter()
++            .map(|layer| layer.iter().map(&entry_width).max().unwrap_or(1))
++            .collect::<Vec<_>>();
++        let mut column_x = Vec::with_capacity(layer_count);
++        let mut cursor = 0_u16;
++        for (index, column_width) in column_widths.iter().enumerate() {
++            column_x.push(cursor);
++            cursor = cursor.saturating_add(*column_width);
++            if index + 1 < layer_count {
++                cursor = cursor.saturating_add(GRAPH_NODE_GAP);
++            }
++        }
++        let height = layers.iter().map(Vec::len).max().unwrap_or(0) as u16;
++        if cursor > area.width || height > area.height || height == 0 {
++            return None;
++        }
++        for (layer_index, layer) in layers.iter().enumerate() {
++            for (slot_index, entry) in layer.iter().enumerate() {
++                let y = slot_index as u16;
++                match entry {
++                    GraphEntry::Item(index) => placements.push(GraphPlacement {
++                        x: column_x[layer_index],
++                        y,
++                        label: graph_node_label(&items[*index], *index, unicode),
++                        status: graph_item_status(&items[*index]).map(str::to_owned),
++                        id: item_id(&items[*index]).map(str::to_owned),
++                    }),
++                    GraphEntry::Waypoint => {
++                        for offset in 0..column_widths[layer_index] {
++                            mark(
++                                &mut arms,
++                                column_x[layer_index].saturating_add(offset),
++                                y,
++                                ARM_LEFT | ARM_RIGHT,
++                            );
++                        }
++                    }
++                }
++            }
++        }
++        for (layer, from_slot, to_slot) in segments {
++            let exit = column_x[layer].saturating_add(column_widths[layer]);
++            let mid = exit + 1;
++            let (r1, r2) = (from_slot as u16, to_slot as u16);
++            mark(&mut arms, exit, r1, ARM_LEFT | ARM_RIGHT);
++            mark(&mut arms, mid + 1, r2, ARM_LEFT | ARM_RIGHT);
++            if r1 == r2 {
++                mark(&mut arms, mid, r1, ARM_LEFT | ARM_RIGHT);
++            } else {
++                let (top, bottom) = (r1.min(r2), r1.max(r2));
++                mark(
++                    &mut arms,
++                    mid,
++                    r1,
++                    ARM_LEFT | if r2 > r1 { ARM_DOWN } else { ARM_UP },
++                );
++                for row in top + 1..bottom {
++                    mark(&mut arms, mid, row, ARM_UP | ARM_DOWN);
++                }
++                mark(
++                    &mut arms,
++                    mid,
++                    r2,
++                    ARM_RIGHT | if r2 > r1 { ARM_UP } else { ARM_DOWN },
++                );
++            }
++        }
++    } else {
++        // Layers become rows flowing top → bottom, one connector row between.
++        let needed_height = (layer_count * 2 - 1) as u16;
++        if needed_height > area.height {
++            return None;
++        }
++        let mut centers: Vec<Vec<u16>> = Vec::with_capacity(layer_count);
++        for layer in &layers {
++            let mut layer_centers = Vec::with_capacity(layer.len());
++            let mut cursor = 0_u16;
++            for (slot_index, entry) in layer.iter().enumerate() {
++                if slot_index > 0 {
++                    cursor = cursor.saturating_add(GRAPH_NODE_GAP);
++                }
++                let entry_cells = entry_width(entry);
++                layer_centers.push(cursor + entry_cells / 2);
++                cursor = cursor.saturating_add(entry_cells);
++            }
++            if cursor > area.width {
++                return None;
++            }
++            centers.push(layer_centers);
++        }
++        for (layer_index, layer) in layers.iter().enumerate() {
++            let y = (layer_index * 2) as u16;
++            let mut cursor = 0_u16;
++            for (slot_index, entry) in layer.iter().enumerate() {
++                if slot_index > 0 {
++                    cursor = cursor.saturating_add(GRAPH_NODE_GAP);
++                }
++                match entry {
++                    GraphEntry::Item(index) => {
++                        let label = graph_node_label(&items[*index], *index, unicode);
++                        let label_cells = cell_width(&label) as u16;
++                        placements.push(GraphPlacement {
++                            x: cursor,
++                            y,
++                            label,
++                            status: graph_item_status(&items[*index]).map(str::to_owned),
++                            id: item_id(&items[*index]).map(str::to_owned),
++                        });
++                        cursor = cursor.saturating_add(label_cells);
++                    }
++                    GraphEntry::Waypoint => {
++                        mark(&mut arms, centers[layer_index][slot_index], y, ARM_UP | ARM_DOWN);
++                        cursor = cursor.saturating_add(1);
++                    }
++                }
++            }
++        }
++        for (layer, from_slot, to_slot) in segments {
++            let y = (layer * 2 + 1) as u16;
++            let c1 = centers[layer][from_slot];
++            let c2 = centers[layer + 1][to_slot];
++            if c1 == c2 {
++                mark(&mut arms, c1, y, ARM_UP | ARM_DOWN);
++            } else {
++                let (left, right) = (c1.min(c2), c1.max(c2));
++                mark(
++                    &mut arms,
++                    c1,
++                    y,
++                    ARM_UP | if c2 > c1 { ARM_RIGHT } else { ARM_LEFT },
++                );
++                for column in left + 1..right {
++                    mark(&mut arms, column, y, ARM_LEFT | ARM_RIGHT);
++                }
++                mark(
++                    &mut arms,
++                    c2,
++                    y,
++                    ARM_DOWN | if c2 > c1 { ARM_LEFT } else { ARM_RIGHT },
++                );
++            }
++        }
++    }
++    Some(GraphDiagram {
++        width,
++        arms,
++        placements,
++    })
++}
++
++/// The measured height a graph diagram would need at `width`, or `None` when
++/// only the adjacency-list rung is drawable.
++fn graph_diagram_height(node: &UiNode, width: u16) -> Option<u16> {
++    let probe = Rect::new(0, 0, width, MAX_MEASURED_HEIGHT);
++    let diagram = layout_graph_diagram(node, probe, true)?;
++    let rows = diagram
++        .placements
++        .iter()
++        .map(|placement| placement.y + 1)
++        .chain(std::iter::once(
++            (diagram.arms.len().div_ceil(diagram.width.max(1))) as u16,
++        ))
++        .max()
++        .unwrap_or(1);
++    Some(rows.max(1))
++}
++
++fn split_is_vertical(node: &UiNode) -> bool {
++    node.props
++        .layout
++        .as_ref()
++        .and_then(|layout| layout.direction.as_deref())
++        .is_some_and(|direction| direction == "vertical")
++}
++
++/// The Split `ratio` prop, clamped exactly as the graphical renderer clamps it.
++fn split_ratio(node: &UiNode) -> f64 {
++    number_attribute(node, "ratio")
++        .filter(|ratio| ratio.is_finite())
++        .map_or(0.5, |ratio| ratio.clamp(0.1, 0.9))
++}
++
++/// Pane sizes matching the web renderer's flex weights: the first pane grows
++/// with `ratio`, every later pane with `1 - ratio`.
++fn split_sizes(usable: u16, count: usize, ratio: f64) -> Vec<u16> {
++    if count == 0 {
++        return Vec::new();
++    }
++    let weights = (0..count)
++        .map(|index| if index == 0 { ratio } else { 1.0 - ratio })
++        .collect::<Vec<_>>();
++    let total: f64 = weights.iter().sum();
++    let mut sizes = weights
++        .iter()
++        .map(|weight| (f64::from(usable) * weight / total).floor() as u16)
++        .collect::<Vec<_>>();
++    let assigned = sizes.iter().copied().fold(0_u16, u16::saturating_add);
++    if let Some(last) = sizes.last_mut() {
++        *last = last.saturating_add(usable.saturating_sub(assigned));
++    }
++    sizes
++}
++
+ fn numeric_series(node: &UiNode) -> Vec<f64> {
+     data_items(node)
+         .iter()
+@@ -3125,4 +3693,296 @@ mod tests {
+             "vendorPatch"
+         );
+     }
++
++    fn sdk_graph_document(direction: &str, edges: serde_json::Value) -> UiDocument {
++        serde_json::from_value(serde_json::json!({
++            "protocolVersion": {"major": 1, "minor": 0},
++            "documentId": "graph-golden",
++            "revision": 1,
++            "root": {
++                "kind": "element",
++                "id": "graph",
++                "type": "Graph",
++                "props": {
++                    "nodes": [
++                        {"id": "build", "label": "build", "status": "completed"},
++                        {"id": "test", "label": "test", "status": "running"},
++                        {"id": "deploy", "label": "deploy", "status": "failed"}
++                    ],
++                    "edges": edges,
++                    "direction": direction,
++                    "accessibleLabel": "Workflow graph"
++                },
++                "children": []
++            }
++        }))
++        .expect("SDK graph document deserializes")
++    }
++
++    #[test]
++    fn graph_paints_layered_dag_from_top_level_sdk_edges() {
++        let document = sdk_graph_document(
++            "vertical",
++            serde_json::json!([
++                {"id": "e1", "from": "build", "to": "test"},
++                {"id": "e2", "from": "build", "to": "deploy"}
++            ]),
++        );
++        let area = Rect::new(0, 0, 60, 6);
++        let mut buffer = Buffer::empty(area);
++        let _ = render_remote_ui(
++            &mut buffer,
++            area,
++            &document,
++            &Theme::dark(),
++            &TerminalUiCapabilities::native(),
++            &RemoteUiViewState::default(),
++            RemoteUiRenderOptions::default(),
++        );
++        assert_eq!(
++            buffer_snapshot(&buffer),
++            "✓ build\n   ├─────────┐\n● test   ✕ deploy"
++        );
++    }
++
++    #[test]
++    fn graph_honors_horizontal_direction() {
++        let document = sdk_graph_document(
++            "horizontal",
++            serde_json::json!([{"id": "e1", "from": "build", "to": "test"}]),
++        );
++        let area = Rect::new(0, 0, 60, 4);
++        let mut buffer = Buffer::empty(area);
++        let _ = render_remote_ui(
++            &mut buffer,
++            area,
++            &document,
++            &Theme::dark(),
++            &TerminalUiCapabilities::native(),
++            &RemoteUiViewState::default(),
++            RemoteUiRenderOptions::default(),
++        );
++        let snapshot = buffer_snapshot(&buffer);
++        // Column 0 (build/deploy), a 3-cell "───" bridge, then column 1 (test).
++        assert_eq!(snapshot, "✓ build ───● test\n✕ deploy");
++    }
++
++    #[test]
++    fn graph_degrades_to_adjacency_list_when_narrow() {
++        let document = sdk_graph_document(
++            "vertical",
++            serde_json::json!([{"id": "e1", "from": "build", "to": "test"}]),
++        );
++        // Narrower than the collapse breakpoint: fidelity ladder drops to text.
++        let area = Rect::new(0, 0, 30, 6);
++        let mut buffer = Buffer::empty(area);
++        let _ = render_remote_ui(
++            &mut buffer,
++            area,
++            &document,
++            &Theme::dark(),
++            &TerminalUiCapabilities::native(),
++            &RemoteUiViewState::default(),
++            RemoteUiRenderOptions::default(),
++        );
++        assert_eq!(
++            buffer_snapshot(&buffer),
++            "build → test\n○ test\n○ deploy"
++        );
++    }
++
++    #[test]
++    fn graph_still_accepts_legacy_per_node_edge_lists() {
++        let wire = serde_json::json!({
++            "protocolVersion": {"major": 1, "minor": 0},
++            "documentId": "graph-legacy",
++            "revision": 1,
++            "root": {
++                "kind": "element",
++                "id": "graph",
++                "type": "Graph",
++                "props": {
++                    "nodes": [
++                        {"id": "a", "label": "alpha", "targets": ["b"]},
++                        {"id": "b", "label": "beta"}
++                    ]
++                },
++                "children": []
++            }
++        });
++        let document: UiDocument = serde_json::from_value(wire).expect("legacy graph parses");
++        let area = Rect::new(0, 0, 60, 4);
++        let mut buffer = Buffer::empty(area);
++        let _ = render_remote_ui(
++            &mut buffer,
++            area,
++            &document,
++            &Theme::dark(),
++            &TerminalUiCapabilities::native(),
++            &RemoteUiViewState::default(),
++            RemoteUiRenderOptions::default(),
++        );
++        assert_eq!(buffer_snapshot(&buffer), "alpha\n  │\nbeta");
++    }
++
++    #[test]
++    fn graph_routes_layer_skipping_edges_through_waypoints() {
++        let document = sdk_graph_document(
++            "vertical",
++            serde_json::json!([
++                {"from": "build", "to": "test"},
++                {"from": "test", "to": "deploy"},
++                {"from": "build", "to": "deploy"}
++            ]),
++        );
++        let area = Rect::new(0, 0, 60, 8);
++        let mut buffer = Buffer::empty(area);
++        let _ = render_remote_ui(
++            &mut buffer,
++            area,
++            &document,
++            &Theme::dark(),
++            &TerminalUiCapabilities::native(),
++            &RemoteUiViewState::default(),
++            RemoteUiRenderOptions::default(),
++        );
++        let snapshot = buffer_snapshot(&buffer);
++        // build feeds test and a waypoint; both converge on deploy.
++        assert!(snapshot.contains("✓ build"), "{snapshot}");
++        assert!(snapshot.contains("● test"), "{snapshot}");
++        assert!(snapshot.contains("✕ deploy"), "{snapshot}");
++        assert!(snapshot.contains('│'), "{snapshot}");
++        assert!(snapshot.contains('┐') || snapshot.contains('┴'), "{snapshot}");
++    }
++
++    #[test]
++    fn split_honors_ratio_and_vertical_direction() {
++        let wire = serde_json::json!({
++            "protocolVersion": {"major": 1, "minor": 0},
++            "documentId": "split-golden",
++            "revision": 1,
++            "root": {
++                "kind": "element",
++                "id": "split",
++                "type": "Split",
++                "props": {"ratio": 0.75},
++                "children": [
++                    {"kind": "element", "id": "left", "type": "Text", "props": {"value": "L"}, "children": []},
++                    {"kind": "element", "id": "right", "type": "Text", "props": {"value": "R"}, "children": []}
++                ]
++            }
++        });
++        let document: UiDocument = serde_json::from_value(wire).expect("split parses");
++        let area = Rect::new(0, 0, 80, 2);
++        let mut buffer = Buffer::empty(area);
++        let _ = render_remote_ui(
++            &mut buffer,
++            area,
++            &document,
++            &Theme::dark(),
++            &TerminalUiCapabilities::native(),
++            &RemoteUiViewState::default(),
++            RemoteUiRenderOptions::default(),
++        );
++        let first = buffer_snapshot(&buffer).lines().next().unwrap_or_default().to_owned();
++        let left = first.find('L').expect("left pane painted");
++        let right = first.find('R').expect("right pane painted");
++        assert_eq!(left, 0);
++        // 0.75 of 80 columns → the second pane starts at column 60.
++        assert_eq!(right, 60);
++
++        let vertical = serde_json::json!({
++            "protocolVersion": {"major": 1, "minor": 0},
++            "documentId": "split-vertical",
++            "revision": 1,
++            "root": {
++                "kind": "element",
++                "id": "split",
++                "type": "Split",
++                "props": {"ratio": 0.5, "direction": "vertical"},
++                "children": [
++                    {"kind": "element", "id": "top", "type": "Text", "props": {"value": "T"}, "children": []},
++                    {"kind": "element", "id": "bottom", "type": "Text", "props": {"value": "B"}, "children": []}
++                ]
++            }
++        });
++        let document: UiDocument = serde_json::from_value(vertical).expect("vertical split parses");
++        let area = Rect::new(0, 0, 20, 4);
++        let mut buffer = Buffer::empty(area);
++        let _ = render_remote_ui(
++            &mut buffer,
++            area,
++            &document,
++            &Theme::dark(),
++            &TerminalUiCapabilities::native(),
++            &RemoteUiViewState::default(),
++            RemoteUiRenderOptions::default(),
++        );
++        assert_eq!(buffer_snapshot(&buffer), "T\n\nB");
++    }
++
++    #[test]
++    fn grid_columns_count_and_track_list_shape_the_grid() {
++        let wire = serde_json::json!({
++            "protocolVersion": {"major": 1, "minor": 0},
++            "documentId": "grid-columns",
++            "revision": 1,
++            "root": {
++                "kind": "element",
++                "id": "grid",
++                "type": "Grid",
++                "props": {"columns": 2},
++                "children": [
++                    {"kind": "element", "id": "a", "type": "Text", "props": {"value": "A"}, "children": []},
++                    {"kind": "element", "id": "b", "type": "Text", "props": {"value": "B"}, "children": []},
++                    {"kind": "element", "id": "c", "type": "Text", "props": {"value": "C"}, "children": []}
++                ]
++            }
++        });
++        let document: UiDocument = serde_json::from_value(wire).expect("grid parses");
++        let area = Rect::new(0, 0, 60, 4);
++        let mut buffer = Buffer::empty(area);
++        let _ = render_remote_ui(
++            &mut buffer,
++            area,
++            &document,
++            &Theme::dark(),
++            &TerminalUiCapabilities::native(),
++            &RemoteUiViewState::default(),
++            RemoteUiRenderOptions::default(),
++        );
++        // Two equal fr tracks over 60 cells: B starts on the second 30-cell
++        // track and the third child wraps to the next grid row.
++        let snapshot = buffer_snapshot(&buffer);
++        let mut lines = snapshot.lines();
++        let first = lines.next().unwrap_or_default();
++        assert_eq!(first.chars().next(), Some('A'), "{snapshot}");
++        assert_eq!(first.chars().position(|char| char == 'B'), Some(30), "{snapshot}");
++        assert_eq!(lines.next().map(str::trim_end), Some("C"), "{snapshot}");
++    }
++
++    #[test]
++    fn measure_is_memoized_within_a_frame() {
++        let mut root = UiNode::element("root", primitives::STACK);
++        root.children = (0..24)
++            .map(|index| text(&format!("text-{index}"), "Measured content line"))
++            .collect();
++        let document = document(root);
++        let area = Rect::new(0, 0, 40, 30);
++        let mut buffer = Buffer::empty(area);
++        let output = render_remote_ui(
++            &mut buffer,
++            area,
++            &document,
++            &Theme::dark(),
++            &TerminalUiCapabilities::native(),
++            &RemoteUiViewState::default(),
++            RemoteUiRenderOptions::default(),
++        );
++        assert!(output
++            .diagnostics
++            .iter()
++            .all(|diagnostic| diagnostic.severity != DiagnosticSeverity::Error));
++        assert!(buffer_snapshot(&buffer).contains("Measured content line"));
++    }
+ }

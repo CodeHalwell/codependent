@@ -5,9 +5,10 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use codypendent_integrations::acp::PermissionOption;
-use codypendent_integrations::acp_client::{AcpClient, AcpEventSink};
+use codypendent_integrations::acp_client::{AcpClient, AcpClientError, AcpEventSink};
 use codypendent_integrations::acp_registry::{
-    agent_coordinate, agent_id_from_coordinate, local_kimi_code_spec, AcpRegistry, AcpRegistryStore,
+    agent_coordinate, agent_coordinate_with_model, agent_id_from_coordinate,
+    agent_model_from_coordinate, local_kimi_code_spec, AcpRegistry, AcpRegistryStore,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{EventBody, ModelId, RunId};
@@ -147,24 +148,73 @@ pub async fn connect(
         repository.to_string_lossy().as_ref(),
     )
     .await
-    .with_context(|| format!("ACP handshake with `{agent}` failed"))?;
+    .map_err(|error| handshake_failure(agent, &error))?;
+    // The handshake told us which models this agent owns; one profile per model
+    // makes them selectable everywhere a model id is (`/model`, councils,
+    // `--model`), alongside the bare profile that leaves the agent on its own
+    // default. An agent advertising none degrades to exactly the bare profile.
+    let models = client.discovered_models();
+    let modes = client.discovered_modes();
     drop(client);
 
-    let profile = profile
+    let base = profile
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("acp/{}", spec.registry_id));
-    upsert_profile(
-        paths,
-        &profile,
-        &agent_coordinate(&spec.registry_id, &spec.version),
-    )?;
+    let coordinate = agent_coordinate(&spec.registry_id, &spec.version);
+    let mut profiles = vec![(base.clone(), coordinate.clone())];
+    for model in &models {
+        profiles.push((
+            model_profile_id(&base, &model.id),
+            agent_coordinate_with_model(&spec.registry_id, &spec.version, &model.id),
+        ));
+    }
+    upsert_profiles(paths, &profiles)?;
+
     println!(
-        "connected {} {} as model `{}`\nOpen /model in the TUI or run with this model pin.",
-        spec.name, spec.version, profile
+        "connected {} {} as model `{base}` (agent default)",
+        spec.name, spec.version
     );
+    if models.is_empty() {
+        println!("the agent advertised no model selector; it keeps its own default model");
+    } else {
+        println!("discovered {} agent model(s):", models.len());
+        for (model, (id, _)) in models.iter().zip(profiles.iter().skip(1)) {
+            let marker = if model.current { "*" } else { " " };
+            println!("  {marker} {id:<40} {} ({})", model.name, model.id);
+        }
+    }
+    if !modes.is_empty() {
+        let names = modes
+            .iter()
+            .map(|mode| mode.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("session modes: {names}");
+    }
+    println!("Open /model in the TUI or run with one of these model pins.");
     Ok(())
+}
+
+/// The profile id for one of an agent's own models: the connected profile plus
+/// the agent-model id, mirroring the `id@version#model` coordinate it stores.
+fn model_profile_id(base: &str, model_id: &str) -> String {
+    format!("{base}#{model_id}")
+}
+
+/// Turn a failed handshake into an actionable error. The client already names
+/// the agent's advertised authentication methods inside the error; this adds
+/// the one thing it cannot know — that authentication happens in the agent's
+/// own CLI, not in Codypendent, which holds no credentials for it.
+fn handshake_failure(agent: &str, error: &AcpClientError) -> anyhow::Error {
+    let message = error.to_string();
+    let hint = if message.contains("the agent advertises authentication:") {
+        "\nAuthenticate with the agent's own CLI (Codypendent stores no credentials for it), then re-run this command."
+    } else {
+        ""
+    };
+    anyhow!("ACP handshake with `{agent}` failed: {message}{hint}")
 }
 
 /// Exercise a real ACP `session/prompt` without persisting a model profile.
@@ -192,7 +242,8 @@ pub async fn probe(
         repository.to_string_lossy().as_ref(),
     )
     .await
-    .with_context(|| format!("ACP handshake with `{agent}` failed"))?;
+    .map_err(|error| handshake_failure(agent, &error))?;
+    let discovered = client.discovered_models();
     let mut sink = ProbeSink::default();
     let stop = tokio::time::timeout(
         std::time::Duration::from_secs(120),
@@ -214,6 +265,18 @@ pub async fn probe(
             safe_output.trim()
         }
     );
+    // A probe is also the cheapest way to see what a live agent advertises,
+    // without persisting anything.
+    if !discovered.is_empty() {
+        println!(
+            "advertised models: {}",
+            discovered
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -280,9 +343,15 @@ pub async fn status(paths: &RuntimePaths) -> anyhow::Result<()> {
     }
     store.load_or_refresh().await?;
     for (profile, agent) in profiles {
+        // A profile may pin one of the agent's own models (`…#model`); the
+        // launch is the same either way, so say which model the run will ask
+        // for rather than showing two indistinguishable "ready" lines.
+        let pin = agent_model_from_coordinate(&agent)
+            .map(|model| format!(" · model {model}"))
+            .unwrap_or_else(|| " · agent default model".to_string());
         match store.launch_spec(&agent) {
             Ok(spec) => println!(
-                "ready  {:<28} {} {} ({})",
+                "ready  {:<28} {} {} ({}){pin}",
                 profile,
                 spec.name,
                 spec.version,
@@ -313,9 +382,15 @@ fn connected_profiles(paths: &RuntimePaths) -> anyhow::Result<Vec<(String, Strin
         .collect())
 }
 
-fn upsert_profile(paths: &RuntimePaths, profile: &str, agent: &str) -> anyhow::Result<()> {
-    if profile.is_empty() || profile.len() > 256 || profile.contains(['\0', '\n', '\r']) {
-        bail!("invalid ACP profile id");
+/// Replace `profiles` (id → ACP coordinate) in `models.toml` in ONE
+/// load-modify-write, so connecting an agent that advertises many models does
+/// not rewrite the file once per model — and never leaves a half-written set
+/// behind if one id turns out to be invalid.
+fn upsert_profiles(paths: &RuntimePaths, profiles: &[(String, String)]) -> anyhow::Result<()> {
+    for (profile, _) in profiles {
+        if profile.is_empty() || profile.len() > 256 || profile.contains(['\0', '\n', '\r']) {
+            bail!("invalid ACP profile id");
+        }
     }
     std::fs::create_dir_all(&paths.data_dir)?;
     let path = paths.data_dir.join("models.toml");
@@ -324,15 +399,18 @@ fn upsert_profile(paths: &RuntimePaths, profile: &str, agent: &str) -> anyhow::R
     } else {
         Vec::new()
     };
-    configs.retain(|config| config.id.0 != profile);
-    configs.push(ModelConfig {
-        id: ModelId(profile.to_string()),
+    configs.retain(|config| !profiles.iter().any(|(profile, _)| config.id.0 == *profile));
+    configs.extend(profiles.iter().map(|(profile, agent)| ModelConfig {
+        id: ModelId(profile.clone()),
         provider: "acp".to_string(),
         base_url: String::new(),
-        model: agent.to_string(),
+        model: agent.clone(),
         api_key_env: String::new(),
         context_tokens: None,
-    });
+        // An ACP agent is launched, not addressed over HTTP, so it has no
+        // catalog provider whose auth header would need resolving.
+        provider_id: None,
+    }));
     write_models(&path, &configs)
 }
 
@@ -395,12 +473,18 @@ fn agent_status(
 mod tests {
     use super::*;
 
+    /// The single-profile shorthand the tests below drive `upsert_profiles`
+    /// with (`connect` always writes a whole set at once).
+    fn upsert_profile(paths: &RuntimePaths, profile: &str, agent: &str) -> anyhow::Result<()> {
+        upsert_profiles(paths, &[(profile.to_string(), agent.to_string())])
+    }
+
     #[test]
     fn profile_upsert_is_typed_and_preserves_other_models() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
         upsert_profile(&paths, "acp/codex", "codex-acp").expect("add profile");
-        upsert_profile(&paths, "acp/claude", "claude-acp").expect("add second");
+        upsert_profile(&paths, "acp/vibe", "mistral-vibe").expect("add second");
         upsert_profile(&paths, "acp/codex", "codex-acp").expect("replace profile");
         let configs = load_models(&paths.data_dir.join("models.toml")).expect("load");
         assert_eq!(configs.len(), 2);
@@ -408,10 +492,134 @@ mod tests {
         assert_eq!(
             configs
                 .iter()
-                .find(|config| config.id.0 == "acp/claude")
+                .find(|config| config.id.0 == "acp/vibe")
                 .map(|config| config.model.as_str()),
-            Some("claude-acp")
+            Some("mistral-vibe")
         );
+    }
+
+    #[test]
+    fn discovered_models_become_one_profile_each_beside_the_bare_agent_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        // What `connect` persists after a handshake advertising two models.
+        let base = "acp/demo".to_string();
+        let profiles = vec![
+            (base.clone(), agent_coordinate("demo-acp", "1.2.3")),
+            (
+                model_profile_id(&base, "agent-model-1"),
+                agent_coordinate_with_model("demo-acp", "1.2.3", "agent-model-1"),
+            ),
+            (
+                model_profile_id(&base, "agent-model-2"),
+                agent_coordinate_with_model("demo-acp", "1.2.3", "agent-model-2"),
+            ),
+        ];
+        upsert_profiles(&paths, &profiles).expect("persist profiles");
+
+        let configs = load_models(&paths.data_dir.join("models.toml")).expect("load");
+        assert_eq!(configs.len(), 3);
+        assert!(configs.iter().all(|config| config.provider == "acp"));
+        // The bare profile leaves the agent on its own default (no pin).
+        assert_eq!(
+            configs
+                .iter()
+                .find(|config| config.id.0 == "acp/demo")
+                .map(|config| config.model.as_str()),
+            Some("demo-acp@1.2.3")
+        );
+        // Every per-model profile resolves to the SAME launchable agent, and
+        // differs only in the model it pins.
+        for config in &configs {
+            assert_eq!(agent_id_from_coordinate(&config.model), "demo-acp");
+        }
+        assert_eq!(
+            configs
+                .iter()
+                .find(|config| config.id.0 == "acp/demo#agent-model-2")
+                .and_then(|config| agent_model_from_coordinate(&config.model)),
+            Some("agent-model-2")
+        );
+    }
+
+    #[test]
+    fn reconnecting_replaces_the_previous_profile_set_and_spares_other_models() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        upsert_profile(&paths, "acp/other", "other-acp@9.9.9").expect("unrelated profile");
+        upsert_profiles(
+            &paths,
+            &[
+                ("acp/demo".to_string(), "demo-acp@1.0.0".to_string()),
+                (
+                    "acp/demo#agent-model-1".to_string(),
+                    "demo-acp@1.0.0#agent-model-1".to_string(),
+                ),
+            ],
+        )
+        .expect("first connect");
+        // A second connect at a newer version rewrites the same ids in place.
+        upsert_profiles(
+            &paths,
+            &[
+                ("acp/demo".to_string(), "demo-acp@2.0.0".to_string()),
+                (
+                    "acp/demo#agent-model-1".to_string(),
+                    "demo-acp@2.0.0#agent-model-1".to_string(),
+                ),
+            ],
+        )
+        .expect("second connect");
+
+        let configs = load_models(&paths.data_dir.join("models.toml")).expect("load");
+        assert_eq!(configs.len(), 3, "no duplicate ids: {configs:?}");
+        assert_eq!(
+            configs
+                .iter()
+                .find(|config| config.id.0 == "acp/demo#agent-model-1")
+                .map(|config| config.model.as_str()),
+            Some("demo-acp@2.0.0#agent-model-1")
+        );
+        assert!(
+            configs.iter().any(|config| config.id.0 == "acp/other"),
+            "an unrelated ACP profile must survive"
+        );
+    }
+
+    #[test]
+    fn an_invalid_profile_id_writes_nothing_at_all() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        let error = upsert_profiles(
+            &paths,
+            &[
+                ("acp/demo".to_string(), "demo-acp@1.0.0".to_string()),
+                ("bad\nid".to_string(), "demo-acp@1.0.0#x".to_string()),
+            ],
+        )
+        .expect_err("rejects the invalid id");
+        assert!(error.to_string().contains("invalid ACP profile id"));
+        assert!(
+            !paths.data_dir.join("models.toml").exists(),
+            "a rejected set must leave no half-written file behind"
+        );
+    }
+
+    #[test]
+    fn an_auth_gated_handshake_failure_stays_actionable() {
+        let advertised = AcpClientError::Handshake(
+            "session/new failed: auth required (the agent advertises authentication: Agent login — Sign in first)"
+                .to_string(),
+        );
+        let message = handshake_failure("demo-acp", &advertised).to_string();
+        assert!(message.contains("Agent login"), "{message}");
+        assert!(message.contains("agent's own CLI"), "{message}");
+
+        // A non-auth failure gets no invented remedy.
+        let plain = AcpClientError::Handshake("initialize failed: broken pipe".to_string());
+        let message = handshake_failure("demo-acp", &plain).to_string();
+        assert!(message.contains("broken pipe"), "{message}");
+        assert!(!message.contains("own CLI"), "{message}");
     }
 
     #[tokio::test]

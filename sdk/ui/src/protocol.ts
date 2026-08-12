@@ -42,6 +42,24 @@ export interface UiHardLimits {
   maxContributions: number;
 }
 
+/**
+ * Sustained worker-to-host message rate, in messages per second.
+ *
+ * A worker's self-imposed budget must never exceed the host's, or a legitimate
+ * burst is a *kill* (the host drops the worker on `MessageRateExceeded`)
+ * instead of a recoverable local error the worker can coalesce around. These
+ * two constants mirror `UI_WORKER_MESSAGE_RATE_PER_SECOND` /
+ * `UI_WORKER_MESSAGE_BURST` in `crates/protocol/src/remote_ui.rs`, which is
+ * where the trusted host reads its own ceiling from.
+ */
+export const UI_WORKER_MESSAGE_RATE_PER_SECOND = 240;
+
+/**
+ * Burst allowance above {@link UI_WORKER_MESSAGE_RATE_PER_SECOND} for the
+ * snapshot-then-patch storm a surface emits when it first mounts.
+ */
+export const UI_WORKER_MESSAGE_BURST = 120;
+
 export const DEFAULT_UI_HARD_LIMITS: UiHardLimits = {
   maxTreeDepth: 64,
   maxNodes: 20_000,

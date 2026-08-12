@@ -73,11 +73,26 @@ codypendent
 - `ansi256` / `ansi16` (legacy terminal fallbacks)
 - `monochrome` (grayscale / no-color mode)
 
+#### Switching themes while running
+
+Open the command palette with `/` and choose **`/theme`  Theme picker**. It
+lists the seven built-in variants plus any data-only theme packs installed
+under `<data-dir>/themes/*.toml`. Moving the cursor previews the theme across
+the whole interface; `Enter` keeps it, `Esc` goes back to the one in force.
+
+A kept theme is remembered for the next launch. Resolution order at boot is:
+`--theme` / `CODYPENDENT_THEME` (an explicit override always wins) → the theme
+last kept in the picker → terminal capability detection. A remembered theme
+that no longer resolves (an uninstalled pack) quietly falls back to detection
+rather than failing the launch.
+
 ---
 
 ### 3.2 Keyboard & Mouse Parity Reference
 
-The TUI guarantees 100% feature parity between keyboard hotkeys and mouse actions.
+Every mouse gesture the TUI recognizes has a keyboard equivalent; the reverse
+is not claimed — some keys (steering, run switching, cursor motion) have no
+mouse gesture at all, and the table below says so with `-`.
 
 ```mermaid
 graph LR
@@ -89,36 +104,48 @@ graph LR
 
 #### Complete Hotkey Matrix
 
+The TUI has no permanent buttons, tabs, or toolbars: every surface is either
+the conversation, the composer, the one-line footer, or an overlay. The mouse
+column below therefore names only the things that actually exist on screen —
+rows, chips, and panes you can see. Where it says `-`, the mouse has no
+equivalent and the key is the only way in.
+
 | Category | Key | Action | Mouse Equivalent |
 | :--- | :--- | :--- | :--- |
-| **Navigation** | `F2` | Toggle layout (Chat ⇄ Workspace Panes) | Click Layout Button |
-| | `Tab` | Cycle focused pane | Click Pane Header |
-| | `↑` / `↓` or `k` / `j` | Move selection in list / browser / palette | Scroll Wheel |
-| | `PgUp` / `PgDn` | Scroll chat conversation history | Scroll Wheel on Chat |
+| **Navigation** | `F2` | Toggle layout (Chat ⇄ Workspace Panes) | Click the `F2 workspace` footer chip |
+| | `Tab` | Cycle focused pane (Workspace layout) | Click a pane |
+| | `↑` / `↓` or `k` / `j` | Move selection in list / browser / palette | Scroll wheel |
+| | `PgUp` / `PgDn` | Scroll chat conversation history a page | Scroll wheel (3 lines per notch) |
 | | `Ctrl-↑` / `Ctrl-↓` | Switch to previous / next active run | - |
+| | `Alt-↑` / `Alt-↓` | Browse transcript folds (tool cards, diffs, long notes) | Click a fold line |
+| | `Alt-Enter` | Expand / collapse the browsed fold, else insert a line break | Click a fold line |
+| **Composer** | `←` / `→` / `Home` / `End` | Move the draft cursor (within its own line) | - |
+| | `Ctrl-W` / `Ctrl-U` | Delete the word before the cursor / to the line start | - |
+| | `↑` / `↓` | Move between the draft's lines; recall history at its edges | - |
 | **Remote UI** | `F6` | Enter the mounted extension document without activating a control | Click extension chrome / the "Extension UI ready" footer |
 | | `Shift-F6` | Focus the next mounted extension document | - |
 | | `Tab` / `Shift-Tab` | Move through controls across all mounted documents | Click a control |
 | | `Enter` / `Space` | Activate the focused extension control | Click the control |
 | | `Esc` | Return to the conversation composer | - |
-| **Run Control** | `n` | Start a new run | Click "+ New Run" |
-| | `p` | Pause current run | Click "Pause" |
-| | `c` | Cancel active run | Click "Cancel" |
-| | `s` | Steer / add prompt to running agent | - |
-| | `q` or `Ctrl-C` | Detach TUI (run continues in daemon) | Click "Detach" |
-| **Approvals** | `a` | Approve requested action **once** | Click "Approve Once" |
-| | `A` | Approve requested action **for the whole run** | Click "Approve All" |
-| | `r` | Reject proposed action | Click "Reject" |
-| **Studios & Views** | `/` | Open searchable Command Palette | Click Palette Icon |
-| | `S` | Open Skills Studio | Click Skills Tab |
-| | `M` | Open Memory & Knowledge Fabric Browser | Click Memory Tab |
-| | `o` | Open current source file in external editor | Click File Link |
-| | `D` | Open Collaborative Docs Studio | Click Docs Tab |
-| | `G` | Open Code Graph Edge Inspector | Click Graph Node |
-| | `W` | Open Workflow Conductor View | Click Workflow Tab |
-| | `B` | Open Agent Blackboard / Claims View | Click Blackboard Tab |
-| | `?` | Toggle Help Overlay | Click Help Button |
-| | `Esc` | Clear draft, exit prompt, or close overlay | - |
+| **Run Control** | `n` | Start a new run | Palette row "New run" |
+| | `p` | Pause current run | Palette row "Pause / resume run" |
+| | `c` | Cancel active run | Palette row "Cancel run" |
+| | `s` | Steer / add prompt to running agent | Palette row "Steer run" |
+| | `q` or `Ctrl-C` | Detach TUI (run continues in daemon) | Palette row "Detach" |
+| **Approvals** | `a` | Approve requested action **once** | Click the `a once` footer chip |
+| | `A` | Approve requested action **for the whole run** | Click the `A run` footer chip |
+| | `r` | Reject proposed action | Click the `r reject` footer chip |
+| **Studios & Views** | `/` | Open searchable Command Palette | Click the `/ commands` footer chip |
+| | `S` | Open Skills Studio | Palette row "Skills" (or the `S skills` chip in Memory) |
+| | `M` | Open Memory & Knowledge Fabric Browser | Palette row "Memory" (or the `M memory` chip in Skills) |
+| | `o` | Reveal the focused memory's source | Click the `o source` chip in Memory |
+| | `D` | Open Collaborative Docs Studio | Palette row "Docs Studio" |
+| | `G` | Open Code Graph Edge Inspector | Palette row "Code graph" |
+| | `W` | Open Workflow Conductor View | Palette row "Workflows" |
+| | `B` | Open Agent Blackboard / Claims View | Palette row "Blackboard" |
+| | `/theme` | Switch the colour theme (previews live) | Palette row "/theme  Theme picker" |
+| | `?` | Toggle Help Overlay | Palette row "Help" |
+| | `Esc` | Clear draft, exit prompt, or close overlay | Click outside an overlay, or its `Esc close` chip |
 
 ---
 
@@ -264,6 +291,82 @@ codypendent promote approve <CANDIDATE_ID> # Requires human operator approval
 codypendent promote rollback <CANDIDATE_ID> # Roll back to predecessor version
 ```
 
+### 4.5.1 Local models via Unsloth
+
+Codypendent can browse the [Unsloth](https://huggingface.co/unsloth) org's
+GGUF catalog on Hugging Face, pull a quant through
+[Ollama](https://ollama.com), and register it as a selectable local model —
+and, separately, scaffold a QLoRA fine-tuning project for the same family of
+base models. **Honesty first:** Codypendent itself needs neither a GPU nor
+Ollama to run; both of the flows below shell out to binaries you install
+yourself (`ollama` for pulling, a CUDA-capable Python environment for
+fine-tuning), and every command degrades to an actionable error — never a
+silent failure or a fabricated result — when they're missing.
+
+```bash
+# Resolve unsloth/Qwen3-32B-GGUF, auto-pick a quant (Q4_K_M if present, or
+# the repo's only quant; otherwise it lists the choices instead of guessing),
+# drive `ollama pull` with streamed progress, and register the result
+codypendent models pull Qwen3-32B-GGUF
+
+# Pin an exact quant, or pull from outside the unsloth org
+codypendent models pull Qwen3-32B-GGUF:UD-Q4_K_XL
+codypendent models pull some-org/Some-Model-GGUF:Q8_0
+```
+
+`models pull` registers the pulled model in `models.toml` against the
+`ollama` provider using the **exact reference Ollama itself uses**
+(`hf.co/<org>/<repo>:<quant>` — what `ollama list` shows, and what the
+OpenAI-compatible `model` field must match at call time), carrying
+`context_tokens` from the repo's Hugging Face metadata when the Hub reports
+one. It prints a `codypendent models bench <id>` suggestion afterward so the
+router gets a measured profile, exactly like any other freshly-added local
+model. Requires `ollama` on `PATH`; a missing binary fails with an
+`install it from https://ollama.com` message rather than a bare error.
+
+The TUI offers the same catalog browse through the command palette. Press
+`/`, select **Local models: browse Unsloth catalog**, and step through:
+
+1. **Repos** — a fuzzy-filterable list of the org's GGUF repos (downloads,
+   likes, last updated), fetched live from the Hub.
+2. **Quants** — for the chosen repo, every quant variant parsed from its file
+   tree (including Unsloth's dynamic `UD-` quants and multi-part split
+   files), each with its combined download size.
+3. **Confirm** — a yes/no prompt naming the exact `ollama pull` reference and
+   its download size before anything downloads.
+4. **Progress** — live `ollama pull` output, then a registered-model notice
+   (or the failure, verbatim) once it finishes. Closing this view with `Esc`
+   does not cancel the pull — it keeps running detached, the same way a
+   dismissed model-discovery query does.
+
+```bash
+# Scaffold a standalone Unsloth QLoRA fine-tuning project (pinned
+# requirements, a train.py for the base model, a JSONL dataset stub, and a
+# README covering GPU requirements, training, GGUF export, and `ollama
+# create`). Refuses if the target directory already exists.
+codypendent finetune init
+codypendent finetune init --model unsloth/Qwen3-8B-unsloth-bnb-4bit --out my-finetune
+
+# Verify Python and CUDA are present on THIS machine before training there.
+# A missing GPU only warns (the scaffold is still useful without one); a
+# missing Python interpreter fails.
+codypendent finetune check
+
+# Seed dataset/train.jsonl from the repo's own session/eval history, where a
+# clean seam exists to do so. Today it prints exactly why that seam doesn't
+# exist yet (a daemon-side transcript-reconstruction API the CLI can't reach
+# read-only) instead of silently producing nothing.
+codypendent finetune dataset export
+```
+
+The scaffolded project is entirely separate from Codypendent's own build:
+`train.py` is a normal Unsloth QLoRA script you run yourself, on a machine
+with an NVIDIA GPU. Once you've exported a GGUF and run `ollama create` on
+it (both covered in the scaffold's own `README.md`), add the result to
+Codypendent the same way as any other local Ollama model — via the
+`/model`/`/provider` picker, or a hand-written `[[model]]` entry in
+`models.toml` — then `codypendent models bench <id>` to measure it.
+
 ### 4.6 IDE Integration, ACP Agents & Handoff (`codypendent open` / `acp`)
 
 ```bash
@@ -395,7 +498,129 @@ codypendent index rebuild
 
 ---
 
-## 5. Agent Modes & Policy Enforcements
+## 5. Voice (Speech-to-Text & Text-to-Speech)
+
+Voice is **optional and off by default**. Turning it on takes two things
+Codypendent deliberately does not ship: a **recorder binary** already on your
+machine, and an **API key for a speech provider**. Nothing below works without
+them, and nothing below is enabled implicitly.
+
+> [!WARNING]
+> Voice was developed and tested on a machine with **no audio hardware**. The
+> request shapes, configuration handling, classification gate, and every failure
+> path are covered by tests (mock HTTP servers and fake recorder/player
+> commands), but **no part of the capture or playback path has been exercised
+> against a real microphone or speaker**. Treat your first recording on real
+> hardware as unverified, and expect to tune `record_command` for your device.
+
+### 5.1 Configuration
+
+All of voice lives in three optional tables in `<data_dir>/models.toml`,
+alongside your `[[model]]` entries:
+
+```toml
+# Speech-to-text: what your voice notes are transcribed with.
+[transcription]
+base_url = "https://api.groq.com/openai/v1"
+model = "whisper-large-v3-turbo"
+api_key_env = "GROQ_API_KEY"
+# local = true    # set ONLY for an on-device engine (see 5.4)
+
+# Text-to-speech: what reads replies aloud. Optional.
+[speech]
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini-tts"
+voice = "alloy"
+format = "mp3"
+api_key_env = "OPENAI_API_KEY"
+
+# The client-side commands voice drives.
+[voice]
+# Omit to auto-detect rec/arecord/ffmpeg on $PATH.
+record_command = ["rec", "-q", "-r", "16000", "-c", "1", "-b", "16", "{path}"]
+# Required to hear replies; the clip is fed to this command on stdin.
+play_command = ["mpv", "--no-terminal", "-"]
+push_to_talk_key = "F4"
+```
+
+Keys resolve exactly as chat models' do: a key saved via `/keys` (in
+`auth.json`) wins, then the named environment variable. Only the variable
+**name** is ever written to disk.
+
+Because `/audio/transcriptions` and `/audio/speech` are the ordinary
+OpenAI-compatible endpoints, any provider serving them works — **Groq**
+(`whisper-large-v3`, `whisper-large-v3-turbo`), **OpenAI**
+(`gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `tts-1`, `gpt-4o-mini-tts`),
+**DeepInfra**, and **Together** among them.
+
+### 5.2 Push-to-talk
+
+Press **F4** (or your `push_to_talk_key`) to start recording; press it again to
+stop and send. While recording, the status line shows a prominent
+`◉ Recording` indicator that outranks every other status message.
+
+On stop, the captured WAV is uploaded to the daemon's content-addressed
+artifact store and submitted as an audio input envelope. The daemon transcribes
+it and **the transcript becomes the run's objective**; a note reading
+`transcribed 4.0 s of audio (model whisper-large-v3-turbo)` is appended to the
+transcript so you can always see that the turn came from speech and what
+produced it. The original audio is kept and linked to its transcript — a
+transcript is an addition, never a replacement.
+
+Codypendent bundles **no recorder**. It probes `$PATH` once at startup, in
+order, for:
+
+| Binary | Package | Notes |
+| :--- | :--- | :--- |
+| `rec` | `sox` | Preferred: portable, no platform-specific device spec. |
+| `arecord` | `alsa-utils` | Linux/ALSA. |
+| `ffmpeg` | `ffmpeg` | Last: its capture device is platform-specific and often needs `record_command` tuning. |
+
+If none is found, pressing the key tells you so and names what to install — it
+never silently does nothing. `record_command` overrides the probe entirely;
+`{path}` is replaced with a temporary `.wav` path your command must write.
+
+### 5.3 Speaking replies
+
+Open the command palette and choose **"Voice: speak replies"**. Each assistant
+turn is read aloud **once it is finished** — never mid-stream, because half a
+sentence read aloud is worse than silence.
+
+Synthesis and playback happen off the UI thread with a queue depth of one: if a
+new turn finishes while a clip is still being produced, the newer one
+**replaces** the queued one rather than queueing behind it, so speech tracks the
+conversation instead of drifting minutes behind it. Playback pipes the clip to
+your `play_command` on stdin and does not wait for it to finish.
+
+With no `[speech]` entry or no `play_command`, the toggle turns itself back off
+and says which one is missing.
+
+### 5.4 Privacy: when audio may leave your machine
+
+Captured audio is classified **Confidential** by default, so it cannot leave
+your device by accident. Whether a transcription may be sent to a hosted
+provider is decided by the daemon against the **same off-device ceiling that
+governs hosted chat models** — `policy.max_off_device` in
+`<data_dir>/routing.toml`. Voice deliberately reuses that ceiling instead of
+adding a second, divergent privacy knob, so tightening it protects voice too.
+
+* `[transcription].local = true` marks an **on-device** engine (e.g. a local
+  whisper.cpp server). On-device transcription is permitted under **any**
+  ceiling.
+* Anything else is treated as leaving the device. Set it only when it is true —
+  the flag defaults to `false`, so the safe classification is the one you get by
+  saying nothing.
+* With no `routing.toml`, the built-in `balanced` ceiling (`Confidential`) does
+  permit remote transcription. To keep voice on-device, either lower the ceiling
+  (e.g. `max_off_device = { type = "Internal" }`) or use a local engine.
+
+When the ceiling forbids it, the submission is refused with
+`voice.off-device-forbidden` **before any audio is read or transmitted** — the
+run does not start, and nothing is sent.
+
+---
+
+## 6. Agent Modes & Policy Enforcements
 
 Codypendent uses 5 distinct agent modes to enforce execution boundaries:
 

@@ -323,10 +323,18 @@ impl PolicyEngine {
             ProposedAction::GitPush { .. } => self.eval_git(GitOp::Push, ctx),
             ProposedAction::GitHubMutation { .. } => self.eval_github_mutation(ctx),
             ProposedAction::McpToolCall { server, .. } => self.eval_mcp_tool_call(server, ctx),
-            ProposedAction::BlackboardPost { .. } | ProposedAction::BlackboardQuery { .. } => {
-                self.eval_blackboard()
-            }
+            // The same reasoning as a blackboard access, for the same reason: a
+            // workflow-graph read and a task-board write touch only Codypendent's
+            // own durable coordination state, never the filesystem, a command, or
+            // a remote (rubrics 5 and 10).
+            ProposedAction::BlackboardPost { .. }
+            | ProposedAction::BlackboardQuery { .. }
+            | ProposedAction::WorkflowQuery { .. }
+            | ProposedAction::TaskWrite { .. }
+            | ProposedAction::TaskRead { .. } => self.eval_blackboard(),
             ProposedAction::RecordMemory => self.eval_record_memory(),
+            ProposedAction::SearchRegistry => self.eval_search_registry(),
+            ProposedAction::DocumentEdit { .. } => self.eval_document_edit(),
             _ => self.deny(PolicyReason::new(
                 "policy.unsupported-action",
                 "the proposed action is not recognized by this policy engine",
@@ -334,13 +342,14 @@ impl PolicyEngine {
         }
     }
 
-    /// A blackboard post/query (Phase 5 STEP 5.3) is always permitted: it targets
-    /// only the workflow run's OWN typed-artifact channel — not the filesystem, the
-    /// repository, or any remote — and the `blackboard.*` tools are offered solely
-    /// inside a workflow node's agent run. It grants no capability (the tool needs
-    /// no path/command/network scope) and is recorded purely so the board access is
-    /// traced like any other tool call. Writes that DO escape the run (files, git,
-    /// GitHub) keep their existing approval gates; this does not widen them.
+    /// A blackboard post/query (Phase 5 STEP 5.3) — and, on the same reasoning, a
+    /// `workflow.query` read or a `task.*` board write (rubrics 5/10) — is always
+    /// permitted: each targets only Codypendent's OWN durable coordination state,
+    /// not the filesystem, the repository, or any remote. It grants no capability
+    /// (none of these tools needs a path/command/network scope) and is recorded
+    /// purely so the access is traced like any other tool call. Writes that DO
+    /// escape the run (files, git, GitHub) keep their existing approval gates; this
+    /// does not widen them.
     fn eval_blackboard(&self) -> PolicyDecision {
         PolicyDecision {
             decision: Decision::Allow,
@@ -365,6 +374,51 @@ impl PolicyEngine {
             reasons: vec![PolicyReason::new(
                 "policy.record-memory-allowed",
                 "a memory proposal note targets only the run's own ledger",
+            )],
+            capability_grant: None,
+            policy_version: self.version.clone(),
+            approval_reusable: false,
+        }
+    }
+
+    /// A `skills.search` call (rubric 9) is always permitted, for the same reason
+    /// as [`Self::eval_record_memory`]: it READS the daemon's own registry —
+    /// never the filesystem, a command, the network, or a remote — so it grants
+    /// no capability and never reaches the approval gate. A skill's package
+    /// directory comes from its registry row, so no model-supplied path is ever
+    /// opened and the file-read scope has nothing to enforce here.
+    fn eval_search_registry(&self) -> PolicyDecision {
+        PolicyDecision {
+            decision: Decision::Allow,
+            reasons: vec![PolicyReason::new(
+                "policy.search-registry-allowed",
+                "a registry search reads only the daemon's own tool/skill catalog",
+            )],
+            capability_grant: None,
+            policy_version: self.version.clone(),
+            approval_reusable: false,
+        }
+    }
+
+    /// An agent `docs.*` access (rubric #4 doc writer) is always permitted: it
+    /// targets only the knowledge fabric's document store — not the filesystem,
+    /// a command, the network, or any remote. It grants no capability (the tools
+    /// need no path/command/network scope) and is recorded purely so the access
+    /// is traced, exactly like [`eval_record_memory`](Self::eval_record_memory).
+    ///
+    /// What an agent may actually DO to a document is not this engine's gate: it
+    /// is the document's own collaboration mode (organization scope defaults to
+    /// *Suggest*, so an agent edit lands as a reviewable suggestion), enforced in
+    /// the knowledge crate's `apply_mutation`. Publishing a document to Git keeps
+    /// its separate approval gate (`ProposedAction::PublishDocument`); this does
+    /// not widen it.
+    fn eval_document_edit(&self) -> PolicyDecision {
+        PolicyDecision {
+            decision: Decision::Allow,
+            reasons: vec![PolicyReason::new(
+                "policy.document-access-allowed",
+                "a docs.* call targets only the document store; its content effect is gated by \
+                 the document's collaboration mode",
             )],
             capability_grant: None,
             policy_version: self.version.clone(),

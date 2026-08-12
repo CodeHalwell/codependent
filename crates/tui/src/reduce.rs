@@ -7,6 +7,7 @@
 //! transcript/run/approval state is the core, and it is what the unit tests
 //! below exercise.
 
+use chrono::Utc;
 use codypendent_protocol::{
     Actor, ApprovalDecision, ApprovalScope, BudgetDimension, DocumentId, DocumentMutation,
     EventBody, ProposedAction, RunDisposition, RunState, SessionEvent, ToolOutcome,
@@ -15,16 +16,19 @@ use codypendent_protocol::{
 };
 use codypendent_ui_host::UiSessionUpdate;
 use serde_json::{Map, Value};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, WorkflowNodeUpdate};
 use crate::remote_ui::{RemoteKey, RemoteUiRenderOutput};
 use crate::remote_ui_host::{empty_message, terminal_viewport_message};
 use crate::state::{
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
-    filter_providers, key_row_target, AppState, CouncilBuilderState, CouncilBuilderStep,
-    CouncilMemberDraft, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView,
-    KeyStatus, ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView,
-    ToolCard, ToolStatus, TranscriptEntry, EDGE_PAGE_SIZE,
+    filter_providers, filter_themes, filter_unsloth_quants, filter_unsloth_repos, key_row_target,
+    AddModelRow, AppState, CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft,
+    DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView, KeyStatus, ModelListOrigin,
+    ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView, ToolCard,
+    ToolStatus, TranscriptEntry, UnslothQuantCard, UnslothRepoCard, EDGE_PAGE_SIZE,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -110,6 +114,9 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         // ~5 seconds at the 5 fps tick.
         Action::Notice(text) => state.notice = Some((text, state.tick + 25)),
+        // Voice v1 (rubric 8): the host reports capture start/stop; the flag
+        // only drives the status-line indicator.
+        Action::VoiceRecording(recording) => state.voice.recording = recording,
         Action::Issue(text) => {
             if !state.issues.iter().any(|issue| issue == &text) {
                 state.issues.push(text.clone());
@@ -154,11 +161,20 @@ pub fn reduce(state: &mut AppState, action: Action) {
             members,
             rounds,
         } => {
+            // Return to the browser (rubric 6): the wizard's only entry point
+            // is now `n` from inside it, so a successful save should surface
+            // the new council in the freshly reloaded list, not drop to the
+            // base view.
             if matches!(
                 &state.overlay,
                 Overlay::CouncilBuilder(builder) if builder.name == name
             ) {
-                state.overlay = Overlay::None;
+                state.selected_council = state
+                    .councils
+                    .iter()
+                    .position(|council| council.name == name)
+                    .unwrap_or(0);
+                state.overlay = Overlay::CouncilBrowser;
             }
             state.notice = Some((
                 format!("created council `{name}` · {members} members · {rounds} round(s)"),
@@ -171,6 +187,86 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 state.tick + 80,
             ));
         }
+        Action::CouncilDeleted { name } => {
+            clamp(&mut state.selected_council, state.councils.len());
+            if matches!(
+                &state.overlay,
+                Overlay::ConfirmCouncilDelete { name: pending } if pending == &name
+            ) {
+                state.overlay = Overlay::CouncilBrowser;
+            }
+            state.notice = Some((format!("removed council `{name}`"), state.tick + 40));
+        }
+        Action::CouncilDeleteFailed { name, error } => {
+            state.notice = Some((
+                format!("could not remove council `{name}`: {error}"),
+                state.tick + 80,
+            ));
+        }
+        Action::CouncilProgress { name, message } => {
+            let text = format!("council `{name}`: {message}");
+            if let Some(run) = state.selected_run_mut() {
+                AppState::push_entry(
+                    run,
+                    TranscriptEntry::Note {
+                        text,
+                        expanded: false,
+                    },
+                    Utc::now(),
+                );
+            } else {
+                state.notice = Some((text, state.tick + 40));
+            }
+        }
+        Action::CouncilRunFinished { name, result } => match result {
+            Ok(summary) => {
+                let mut text = format!(
+                    "Council `{name}` — chair synthesis\n\n{}",
+                    summary.synthesis.trim()
+                );
+                if !summary.participants.is_empty() {
+                    text.push_str("\n\nParticipants:\n");
+                    for line in &summary.participants {
+                        text.push_str("  - ");
+                        text.push_str(line);
+                        text.push('\n');
+                    }
+                }
+                text.push_str(&summary.cost_line);
+                text.push_str(&format!("\nreport: {}", summary.report_markdown));
+                if let Some(run) = state.selected_run_mut() {
+                    AppState::push_entry(
+                        run,
+                        TranscriptEntry::Note {
+                            text,
+                            expanded: false,
+                        },
+                        Utc::now(),
+                    );
+                }
+                state.notice = Some((format!("council `{name}` finished"), state.tick + 60));
+            }
+            Err(error) => {
+                if let Some(run) = state.selected_run_mut() {
+                    AppState::push_entry(
+                        run,
+                        TranscriptEntry::Note {
+                            text: format!("council `{name}` failed: {error}"),
+                            expanded: false,
+                        },
+                        Utc::now(),
+                    );
+                }
+                state.notice = Some((format!("council `{name}` failed: {error}"), state.tick + 90));
+            }
+        },
+        Action::OpenCouncils => {
+            state.overlay = match state.overlay {
+                Overlay::CouncilBrowser => Overlay::None,
+                _ => Overlay::CouncilBrowser,
+            };
+        }
+        Action::DeleteCouncil => begin_delete_council(state),
         Action::RemoteUiActivate {
             document_id,
             revision,
@@ -239,14 +335,26 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::SelectNext => nav(state, 1),
         Action::ScrollPageUp => scroll_page(state, true),
         Action::ScrollPageDown => scroll_page(state, false),
+        Action::ScrollLinesUp => scroll_transcript(state, true, WHEEL_LINES),
+        Action::ScrollLinesDown => scroll_transcript(state, false, WHEEL_LINES),
         Action::Expand => expand_selected(state),
+        Action::BrowseFoldPrev => browse_fold(state, -1),
+        Action::BrowseFoldNext => browse_fold(state, 1),
         Action::RemoveApiKey => begin_remove_key(state),
+        Action::VerifyApiKey => begin_verify_key(state),
+        Action::RefreshProviderModels => refresh_provider_models(state),
 
         Action::PrevRun => cycle_run(state, -1),
         Action::NextRun => cycle_run(state, 1),
         Action::NewRun => {
             if matches!(state.overlay, Overlay::Workflow) {
                 start_focused_workflow(state);
+            } else if matches!(state.overlay, Overlay::CouncilBrowser) {
+                state.overlay = Overlay::CouncilBuilder(CouncilBuilderState::default());
+            } else if matches!(state.overlay, Overlay::Docs) {
+                // In the Docs Studio, `n` creates a DOCUMENT — the same
+                // overlay-contextual routing the workflow browser uses above.
+                begin_doc_new(state);
             } else {
                 state.overlay = Overlay::NewRun(String::new());
             }
@@ -294,6 +402,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 begin_reject_ui_plugin(state);
             } else if matches!(state.overlay, Overlay::Docs) {
                 resolve_focused_suggestion(state, false);
+            } else if matches!(state.overlay, Overlay::CouncilBrowser) {
+                // Council browser: the same physical `r` key runs the focused
+                // council (prompts for an objective) — same pattern as
+                // Workflow's `r` meaning "retry" above.
+                begin_run_council(state);
             } else {
                 resolve_focused(state, ApprovalDecision::Reject, ApprovalScope::Once);
             }
@@ -301,23 +414,37 @@ pub fn reduce(state: &mut AppState, action: Action) {
 
         Action::InputChar(c) => input_char(state, c),
         Action::InputPaste(text) => {
-            edit_prompt(state, move |buf| buf.push_str(&text));
+            edit_prompt(state, &Edit::Insert(text));
             detach_history_on_edit(state);
         }
         Action::InputBackspace => {
-            edit_prompt(state, |buf| {
-                buf.pop();
-            });
+            edit_prompt(state, &Edit::Backspace);
             detach_history_on_edit(state);
         }
+        Action::CursorLeft => move_composer_cursor(state, CursorMove::Left),
+        Action::CursorRight => move_composer_cursor(state, CursorMove::Right),
+        Action::CursorLineStart => move_composer_cursor(state, CursorMove::LineStart),
+        Action::CursorLineEnd => move_composer_cursor(state, CursorMove::LineEnd),
+        Action::DeleteWordBack => delete_backwards(state, &Edit::WordBack),
+        Action::DeleteToLineStart => delete_backwards(state, &Edit::ToLineStart),
+        // `Alt-Enter` expands the browsed transcript fold when one is under the
+        // cursor (the keyboard path to tool cards and patch diffs), and is a
+        // plain line break otherwise. The input mapper is stateless, so the
+        // decision lives here, where the browse flag does.
         Action::InputNewline => {
-            edit_prompt(state, |buf| buf.push('\n'));
-            detach_history_on_edit(state);
+            if state.transcript_browse && matches!(state.overlay, Overlay::None) {
+                expand_selected(state);
+            } else {
+                edit_prompt(state, &Edit::Insert("\n".to_owned()));
+                detach_history_on_edit(state);
+            }
         }
         Action::InputSubmit => submit_prompt(state),
         Action::InputCancel => input_cancel(state),
-        Action::HistoryPrev => history_prev(state),
-        Action::HistoryNext => history_next(state),
+        // `↑`/`↓` walk the draft's own lines first and only recall history at
+        // its top/bottom edge — a single-line draft is unchanged.
+        Action::HistoryPrev => composer_up(state),
+        Action::HistoryNext => composer_down(state),
 
         Action::OpenSkills => {
             state.overlay = match state.overlay {
@@ -388,6 +515,9 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 watch_focused_blackboard_run(state);
             }
         }
+        Action::OpenKanban => open_kanban(state),
+        Action::MoveCardForward => move_focused_card(state, 1),
+        Action::MoveCardBack => move_focused_card(state, -1),
         Action::OpenUiPlugins => open_ui_plugins(state),
         Action::SmokeTestUiPlugin => smoke_test_ui_plugin(state),
         Action::EnableUiPluginSession => enable_ui_plugin(state, "session"),
@@ -441,12 +571,19 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 Overlay::ConfirmUiPluginApprove { .. }
                 | Overlay::ConfirmUiPluginReject { .. }
                 | Overlay::ConfirmUiPluginRevoke { .. } => Overlay::UiPlugins,
+                Overlay::ConfirmCouncilDelete { .. } => Overlay::CouncilBrowser,
+                // Backing out of the delete confirmation returns to the Docs
+                // Studio it floats over, not the base view.
+                Overlay::DocDeleteConfirm { .. } => Overlay::Docs,
                 _ => Overlay::None,
             };
         }
 
         // --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
         Action::EditDoc => begin_doc_edit(state),
+        Action::NewDoc => begin_doc_new(state),
+        Action::InsertDocBlock => begin_doc_insert(state),
+        Action::DeleteDocBlock => begin_doc_delete(state),
         Action::PublishDoc => begin_doc_publish(state),
         Action::DocumentSynced {
             document_id,
@@ -482,16 +619,38 @@ pub fn reduce(state: &mut AppState, action: Action) {
             items,
         } => replace_blackboard_run(state, &workflow_run_id, items),
         Action::BlackboardItemUpdated(item) => upsert_blackboard_item(state, item),
+        Action::BoardLoaded(cards) => {
+            state.kanban = cards;
+            let count = state.kanban_in_display_order().len();
+            clamp(&mut state.selected_card, count);
+        }
+        Action::BoardCardUpdated { card, superseded } => {
+            // A superseded revision is REMOVED, not merged: the replacement
+            // arrives as its own delivery, so the board never shows a card twice
+            // (once in its old column and once in its new one).
+            state.kanban.retain(|existing| existing.id != card.id);
+            if !superseded {
+                state.kanban.push(card);
+            }
+            let count = state.kanban_in_display_order().len();
+            clamp(&mut state.selected_card, count);
+        }
 
         // --- model discovery: the harness's fetched-list return path ---
         Action::ProviderModelsLoaded {
             provider_id,
             models,
-        } => on_provider_models_loaded(state, provider_id, models),
+            origin,
+        } => on_provider_models_loaded(state, provider_id, models, origin),
         Action::ProviderModelsFailed {
             provider_id,
             reason,
         } => on_provider_models_failed(state, provider_id, reason),
+        Action::ModelKeyVerified {
+            model_id,
+            ok,
+            reason,
+        } => on_model_key_verified(state, &model_id, ok, &reason),
 
         // --- `/keys` (D1): the harness's key-status projection ---
         Action::ApiKeyStatusesLoaded { models, tavily } => {
@@ -499,12 +658,37 @@ pub fn reduce(state: &mut AppState, action: Action) {
             state.tavily_key_status = tavily;
         }
 
+        // --- Local models: Unsloth catalog browse/pull ---
+        Action::UnslothReposLoaded(repos) => on_unsloth_repos_loaded(state, repos),
+        Action::UnslothReposFailed(reason) => on_unsloth_repos_failed(state, reason),
+        Action::UnslothQuantsLoaded { repo_id, quants } => {
+            on_unsloth_quants_loaded(state, repo_id, quants)
+        }
+        Action::UnslothQuantsFailed { repo_id, reason } => {
+            on_unsloth_quants_failed(state, repo_id, reason)
+        }
+        Action::UnslothPullProgress {
+            repo_id,
+            quant,
+            line,
+        } => on_unsloth_pull_progress(state, repo_id, quant, line),
+        Action::UnslothPullFinished {
+            repo_id,
+            quant,
+            result,
+        } => on_unsloth_pull_finished(state, repo_id, quant, result),
+
         Action::NoOp => {}
     }
 
     let remains_in_docs_flow = matches!(
         state.overlay,
-        Overlay::Docs | Overlay::DocEdit { .. } | Overlay::DocPublishPath { .. }
+        Overlay::Docs
+            | Overlay::DocEdit { .. }
+            | Overlay::DocNew { .. }
+            | Overlay::DocInsert { .. }
+            | Overlay::DocDeleteConfirm { .. }
+            | Overlay::DocPublishPath { .. }
     );
     if docs_surface_was_open
         && (!remains_in_docs_flow || state.should_detach || state.session_closed)
@@ -1009,9 +1193,16 @@ fn upsert_blackboard_item(state: &mut AppState, item: crate::state::BlackboardIt
     }
 }
 
-/// Fold one durable event into run / transcript / approval state.
+/// Fold one durable event into run / transcript / approval state. The event's
+/// `occurred_at` rides along to `push_entry`, which timestamps the transcript
+/// entry it produces — this is what the transcript's turn-header clocks read.
 fn apply_event(state: &mut AppState, event: SessionEvent) {
-    let SessionEvent { actor, body, .. } = event;
+    let SessionEvent {
+        actor,
+        body,
+        occurred_at: at,
+        ..
+    } = event;
 
     // Learn the serving model from any agent-authored event.
     if let Actor::Agent { run_id, model, .. } = &actor {
@@ -1073,7 +1264,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         expanded: false,
                     },
                 };
-                AppState::push_entry(run, backstage);
+                AppState::push_entry(run, backstage, at);
                 return;
             }
 
@@ -1083,6 +1274,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     text,
                     expanded: false,
                 },
+                at,
             );
         }
         EventBody::SessionClosed => state.session_closed = true,
@@ -1117,7 +1309,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 ) {
                     run.state = RunState::Preparing;
                 }
-                AppState::push_entry(run, TranscriptEntry::User { text: objective });
+                AppState::push_entry(run, TranscriptEntry::User { text: objective }, at);
             }
         }
         EventBody::RunStateChanged { run_id, state: rs } => {
@@ -1140,7 +1332,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
         }
         EventBody::ModelStreamDelta { run_id, text } => {
             if let Some(run) = state.run_mut(run_id) {
-                AppState::append_model_text(run, &text);
+                AppState::append_model_text(run, &text, at);
                 run.activity = RunActivity::Streaming;
             }
         }
@@ -1163,6 +1355,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         approval_id: Some(approval_id),
                         expanded: false,
                     })),
+                    at,
                 );
             }
             // Backfill the run link onto a matching pending approval.
@@ -1199,6 +1392,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         approval_id: None,
                         expanded: false,
                     })),
+                    at,
                 );
                 run.activity = RunActivity::Thinking;
             }
@@ -1239,6 +1433,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             approval_id: None,
                             expanded: false,
                         })),
+                        at,
                     ),
                 }
                 run.activity = RunActivity::RunningTool(tool_name);
@@ -1273,6 +1468,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             approval_id: None,
                             expanded: false,
                         })),
+                        at,
                     ),
                 }
                 // The tool finished; the agent is back to composing its next
@@ -1303,6 +1499,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         preview_truncated,
                         expanded: false,
                     }),
+                    at,
                 );
             }
         }
@@ -1327,7 +1524,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
         }
         EventBody::SteeringQueued { run_id } => {
             if let Some(run) = state.run_mut(run_id) {
-                AppState::push_entry(run, TranscriptEntry::Steering { applied: false });
+                AppState::push_entry(run, TranscriptEntry::Steering { applied: false }, at);
             }
         }
         EventBody::SteeringApplied { run_id } => {
@@ -1338,7 +1535,9 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 });
                 match marked {
                     Some(applied) => *applied = true,
-                    None => AppState::push_entry(run, TranscriptEntry::Steering { applied: true }),
+                    None => {
+                        AppState::push_entry(run, TranscriptEntry::Steering { applied: true }, at);
+                    }
                 }
             }
         }
@@ -1364,6 +1563,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         used,
                         limit,
                     },
+                    at,
                 );
             }
         }
@@ -1380,6 +1580,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         disposition: disposition.clone(),
                         expanded: false,
                     },
+                    at,
                 );
                 run.disposition = Some(disposition);
                 run.activity = RunActivity::Idle;
@@ -1417,6 +1618,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     TranscriptEntry::Unsupported {
                         label: "unsupported event".to_owned(),
                     },
+                    at,
                 );
             }
         }
@@ -1549,8 +1751,19 @@ fn nav(state: &mut AppState, delta: i32) {
             watch_focused_blackboard_run(state);
             return;
         }
+        Overlay::Kanban => {
+            // Selection walks the board's DISPLAY order (column by column), so
+            // ↑/↓ runs down a column and then continues into the next one.
+            let count = state.kanban_in_display_order().len();
+            step(&mut state.selected_card, count, delta);
+            return;
+        }
         Overlay::UiPlugins => {
             step(&mut state.selected_ui_plugin, state.ui_plugins.len(), delta);
+            return;
+        }
+        Overlay::CouncilBrowser => {
+            step(&mut state.selected_council, state.councils.len(), delta);
             return;
         }
         Overlay::Palette {
@@ -1591,6 +1804,16 @@ fn nav(state: &mut AppState, delta: i32) {
             ref mut selected,
         } => {
             let indices = filter_modes(query);
+            step(selected, indices.len(), delta);
+            return;
+        }
+        // The theme picker: the same shape again. Moving the cursor is all the
+        // preview needs — the renderer reads the focused row every frame.
+        Overlay::ThemePicker {
+            ref query,
+            ref mut selected,
+        } => {
+            let indices = filter_themes(&state.themes, query);
             step(selected, indices.len(), delta);
             return;
         }
@@ -1647,6 +1870,29 @@ fn nav(state: &mut AppState, delta: i32) {
             step(selected, indices.len(), delta);
             return;
         }
+        // The Unsloth repo/quant browsers: the same filterable-list shape as
+        // the add-model pick-list, over the overlay's own list field. Safe
+        // while `loading` (an empty list steps to 0 and stays there).
+        Overlay::UnslothRepos {
+            ref query,
+            ref mut selected,
+            ref repos,
+            ..
+        } => {
+            let indices = filter_unsloth_repos(repos, query);
+            step(selected, indices.len(), delta);
+            return;
+        }
+        Overlay::UnslothQuants {
+            ref query,
+            ref mut selected,
+            ref quants,
+            ..
+        } => {
+            let indices = filter_unsloth_quants(quants, query);
+            step(selected, indices.len(), delta);
+            return;
+        }
         _ => {}
     }
     // Base view: a pending approval owns the arrows (move between stacked
@@ -1677,7 +1923,18 @@ fn nav(state: &mut AppState, delta: i32) {
     }
 }
 
+/// `PgUp`/`PgDn`: a viewport-sized-ish jump.
+const PAGE: u16 = 10;
+
+/// One wheel notch. Conventional terminals scroll ~3 lines per notch; mapping
+/// the wheel to a 10-row page made the conversation lurch.
+const WHEEL_LINES: u16 = 3;
+
 fn scroll_page(state: &mut AppState, up: bool) {
+    scroll_transcript(state, up, PAGE);
+}
+
+fn scroll_transcript(state: &mut AppState, up: bool, rows: u16) {
     if matches!(state.overlay, Overlay::Edges) {
         let page = if up {
             state.edge_page.saturating_sub(1)
@@ -1689,7 +1946,8 @@ fn scroll_page(state: &mut AppState, up: bool) {
         request_edge_page(state, page);
         return;
     }
-    const PAGE: u16 = 10;
+    // Scrolling means the user is driving the viewport, not the fold cursor.
+    end_browse(state);
     // The renderer cached the true bottom last frame; use it so leaving follow
     // mode starts a page up from the bottom (not a jump to the top), and paging
     // back to the bottom re-enters follow.
@@ -1701,9 +1959,9 @@ fn scroll_page(state: &mut AppState, up: bool) {
                 run.follow = false;
                 run.scroll = max;
             }
-            run.scroll = run.scroll.saturating_sub(PAGE);
+            run.scroll = run.scroll.saturating_sub(rows);
         } else {
-            run.scroll = run.scroll.saturating_add(PAGE).min(max);
+            run.scroll = run.scroll.saturating_add(rows).min(max);
             if run.scroll >= max {
                 run.follow = true;
             }
@@ -1719,13 +1977,69 @@ fn request_edge_page(state: &mut AppState, page: usize) {
     });
 }
 
+/// `Alt-↑`/`Alt-↓`: walk the selected run's *foldable* entries — tool cards,
+/// patch diffs, the backstage fold, long notes, failed-run errors — and mark
+/// the transcript as being browsed, so the renderer highlights the landing
+/// entry, keeps it in the viewport, and `Alt-Enter` expands it. Stepping only
+/// over foldable entries means every stop has something to open (the mouse's
+/// click targets are exactly this set — see `TranscriptEntry::is_foldable`).
+/// A no-op when the selected run has no foldable entry at all.
+fn browse_fold(state: &mut AppState, delta: i32) {
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    let browsing = state.transcript_browse;
+    let Some(run) = state.selected_run_mut() else {
+        return;
+    };
+    let folds: Vec<usize> = run
+        .transcript
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.is_foldable())
+        .map(|(idx, _)| idx)
+        .collect();
+    let Some(&last) = folds.last() else {
+        return;
+    };
+    // The first Alt-↑/Alt-↓ enters browse mode at the newest fold (the one the
+    // tail of the conversation is showing); later presses walk from there.
+    if !browsing {
+        run.transcript_selected = last;
+        state.transcript_browse = true;
+        return;
+    }
+    let current = run.transcript_selected;
+    let position = folds
+        .iter()
+        .position(|&idx| idx == current)
+        .unwrap_or(folds.len() - 1);
+    let next = if delta < 0 {
+        position.saturating_sub(1)
+    } else {
+        (position + 1).min(folds.len() - 1)
+    };
+    run.transcript_selected = folds[next];
+}
+
+/// Leave transcript-browse mode: the selection stops being highlighted and
+/// `Alt-Enter` goes back to inserting a line break. Called by every gesture
+/// that means "I am driving the composer or the viewport again".
+fn end_browse(state: &mut AppState) {
+    state.transcript_browse = false;
+}
+
 fn expand_selected(state: &mut AppState) {
     // In the memory browser, `Enter` opens the focused memory's source.
     if matches!(state.overlay, Overlay::Memory { .. }) {
         open_source(state);
         return;
     }
-    if state.focus != Pane::Transcript {
+    // The transcript fold is reachable from the base conversation — by click
+    // (`ActivateRow`) or by `Alt-Enter` while browsing — and from the
+    // workspace transcript pane. An open browser overlay owns `Enter` for its
+    // own list, so it must not silently toggle a fold behind the modal.
+    if !matches!(state.overlay, Overlay::None) && state.focus != Pane::Transcript {
         return;
     }
     let idx = state.selected_run;
@@ -1901,6 +2215,50 @@ fn confirm_top(state: &mut AppState) {
                 state.overlay = Overlay::UiPlugins;
             }
         }
+        Overlay::ConfirmCouncilDelete { .. } => {
+            if let Overlay::ConfirmCouncilDelete { name } = std::mem::take(&mut state.overlay) {
+                state.outbox.push(Intent::DeleteCouncil { name });
+                state.overlay = Overlay::CouncilBrowser;
+            }
+        }
+        // Confirmed: drive the pull. The overlay moves to the live-progress
+        // step; a late `Action::UnslothPullProgress`/`PullFinished` for a
+        // repo/quant this operator backed out of before confirming can never
+        // arrive (nothing was ever sent), unlike a dismiss of the *next*
+        // step's overlay (see `Overlay::UnslothPulling`'s doc comment).
+        Overlay::UnslothConfirmPull { .. } => {
+            if let Overlay::UnslothConfirmPull { repo_id, quant, .. } =
+                std::mem::take(&mut state.overlay)
+            {
+                state.outbox.push(Intent::PullUnslothModel {
+                    repo_id: repo_id.clone(),
+                    quant: quant.clone(),
+                });
+                state.overlay = Overlay::UnslothPulling {
+                    repo_id,
+                    quant,
+                    lines: Vec::new(),
+                    done: false,
+                    error: None,
+                    registered_id: None,
+                };
+            }
+        }
+        // Confirmed block deletion. Structural, so it takes the whole-document
+        // lease (`block_id: None`) exactly as an insert does.
+        Overlay::DocDeleteConfirm { .. } => {
+            if let Overlay::DocDeleteConfirm { block_id, .. } = std::mem::take(&mut state.overlay) {
+                state.overlay = Overlay::Docs;
+                if let Some(document_id) = state.focused_doc().map(|doc| doc.document_id) {
+                    start_doc_edit(
+                        state,
+                        document_id,
+                        None,
+                        DocumentMutation::Delete { block_id },
+                    );
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1971,6 +2329,31 @@ fn begin_revoke_ui_plugin(state: &mut AppState) {
     }
 }
 
+/// `r` in the council browser (rubric 6 TUI wiring): open the objective prompt
+/// for the focused council. A no-op with an empty browser.
+fn begin_run_council(state: &mut AppState) {
+    if !matches!(state.overlay, Overlay::CouncilBrowser) {
+        return;
+    }
+    if let Some(name) = state.focused_council().map(|council| council.name.clone()) {
+        state.overlay = Overlay::CouncilRunObjective {
+            name,
+            buffer: String::new(),
+        };
+    }
+}
+
+/// `d` in the council browser (rubric 6 TUI wiring): open the removal confirm
+/// for the focused council. A no-op with an empty browser.
+fn begin_delete_council(state: &mut AppState) {
+    if !matches!(state.overlay, Overlay::CouncilBrowser) {
+        return;
+    }
+    if let Some(name) = state.focused_council().map(|council| council.name.clone()) {
+        state.overlay = Overlay::ConfirmCouncilDelete { name };
+    }
+}
+
 fn begin_steering(state: &mut AppState) {
     if state.selected_run().is_some() {
         state.overlay = Overlay::Steering(String::new());
@@ -1997,16 +2380,77 @@ fn resolve_focused(state: &mut AppState, decision: ApprovalDecision, scope: Appr
 
 // --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
 
-/// Begin editing the focused block: open the block-edit prompt. Only meaningful
-/// with the editor rail focused and a block under the cursor.
+/// Begin editing the focused block: open the block-edit prompt **prefilled with
+/// the block's current text**. Submit replaces that text wholesale (see
+/// [`Overlay::DocEdit`]), so `e` is a real block editor rather than the
+/// prepend-only insertion it used to be. Only meaningful with the editor rail
+/// focused and a text-bearing block under the cursor — a table, checklist,
+/// diagram, or embed block has no single editable text container, and says so
+/// rather than opening a prompt whose submit could not be applied.
 fn begin_doc_edit(state: &mut AppState) {
     if !matches!(state.overlay, Overlay::Docs) || state.doc_focus != DocFocus::Editor {
         return;
     }
-    if let Some(block_id) = state.focused_block().map(|block| block.id.clone()) {
-        state.overlay = Overlay::DocEdit {
-            block_id,
+    let Some(block) = state.focused_block() else {
+        return;
+    };
+    let block_id = block.id.clone();
+    let Some(original) = block.editable.clone() else {
+        state.notice = Some((
+            "this block kind has no editable text".to_owned(),
+            state.tick + 25,
+        ));
+        return;
+    };
+    state.overlay = Overlay::DocEdit {
+        block_id,
+        buffer: original.clone(),
+        original,
+    };
+}
+
+/// Open the new-document prompt (`n`). Available anywhere in the Docs Studio —
+/// creating the first document is exactly the case where no document is focused.
+fn begin_doc_new(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::Docs) {
+        state.overlay = Overlay::DocNew {
             buffer: String::new(),
+        };
+    }
+}
+
+/// Open the insert-block prompt (`i`): a new paragraph directly *below* the
+/// focused block, or at the top of a document with no blocks yet.
+fn begin_doc_insert(state: &mut AppState) {
+    if !matches!(state.overlay, Overlay::Docs) || state.doc_focus != DocFocus::Editor {
+        return;
+    }
+    let Some(doc) = state.focused_doc() else {
+        return;
+    };
+    // Below the cursor; an empty document inserts at 0. `selected_block` is
+    // clamped to the block list, so this can never exceed its length.
+    let index = if doc.blocks.is_empty() {
+        0
+    } else {
+        (state.selected_block + 1).min(doc.blocks.len())
+    };
+    state.overlay = Overlay::DocInsert {
+        index: index as u32,
+        buffer: String::new(),
+    };
+}
+
+/// Ask to delete the focused block (`X`). Deletion is destructive and has no TUI
+/// undo, so it routes through a confirmation rather than firing off the keypress.
+fn begin_doc_delete(state: &mut AppState) {
+    if !matches!(state.overlay, Overlay::Docs) || state.doc_focus != DocFocus::Editor {
+        return;
+    }
+    if let Some(block) = state.focused_block() {
+        state.overlay = Overlay::DocDeleteConfirm {
+            block_id: block.id.clone(),
+            label: format!("{} — {}", block.kind, block.text),
         };
     }
 }
@@ -2153,72 +2597,297 @@ fn apply_document_sync(
     clamp(&mut state.selected_suggestion, suggestions_len);
 }
 
-fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
+/// One text mutation, applied at the active buffer's insertion point. Only the
+/// composer has a movable cursor; every other prompt buffer is append-only, so
+/// [`append`] applies these at its end and reproduces the old push/pop
+/// behaviour exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Edit {
+    /// Insert text at the cursor (a typed char, a paste, or a line break).
+    Insert(String),
+    /// Delete the grapheme before the cursor.
+    Backspace,
+    /// Delete the word before the cursor (`Ctrl-W`).
+    WordBack,
+    /// Delete from the start of the cursor's line to the cursor (`Ctrl-U`).
+    ToLineStart,
+}
+
+/// `[start, end)` byte range of the line containing `cursor` (a line being the
+/// text between `\n`s — the composer's `Alt-Enter` breaks).
+fn line_bounds(text: &str, cursor: usize) -> (usize, usize) {
+    let start = text[..cursor].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[cursor..]
+        .find('\n')
+        .map_or(text.len(), |offset| cursor + offset);
+    (start, end)
+}
+
+/// Apply `edit` at `cursor`, keeping `cursor` on a `char` boundary and inside
+/// `buf`. Deletions step whole GRAPHEMES, so a combining sequence (`e` + U+0301)
+/// and a multi-byte or double-width character are removed as one unit rather
+/// than being cut in half into invalid text.
+fn splice(buf: &mut String, cursor: &mut usize, edit: &Edit) {
+    *cursor = (*cursor).min(buf.len());
+    while *cursor > 0 && !buf.is_char_boundary(*cursor) {
+        *cursor -= 1;
+    }
+    match edit {
+        Edit::Insert(text) => {
+            buf.insert_str(*cursor, text);
+            *cursor += text.len();
+        }
+        Edit::Backspace => {
+            if let Some(prev) = prev_grapheme(buf, *cursor) {
+                buf.replace_range(prev..*cursor, "");
+                *cursor = prev;
+            }
+        }
+        Edit::WordBack => {
+            let (line_start, _) = line_bounds(buf, *cursor);
+            // Skip the whitespace immediately before the cursor, then delete
+            // back to the start of the word it trails (readline's `Ctrl-W`).
+            let mut at = *cursor;
+            while at > line_start {
+                let Some(prev) = prev_grapheme(buf, at) else {
+                    break;
+                };
+                if buf[prev..at].chars().all(char::is_whitespace) {
+                    at = prev;
+                } else {
+                    break;
+                }
+            }
+            while at > line_start {
+                let Some(prev) = prev_grapheme(buf, at) else {
+                    break;
+                };
+                if buf[prev..at].chars().all(char::is_whitespace) {
+                    break;
+                }
+                at = prev;
+            }
+            buf.replace_range(at..*cursor, "");
+            *cursor = at;
+        }
+        Edit::ToLineStart => {
+            let (line_start, _) = line_bounds(buf, *cursor);
+            buf.replace_range(line_start..*cursor, "");
+            *cursor = line_start;
+        }
+    }
+}
+
+/// Apply `edit` at the end of an append-only buffer (every prompt except the
+/// composer). `Insert` is a push, `Backspace` a pop — exactly what these
+/// buffers did before the composer grew a cursor.
+fn append(buf: &mut String, edit: &Edit) {
+    let mut cursor = buf.len();
+    splice(buf, &mut cursor, edit);
+}
+
+/// The byte offset of the grapheme boundary before `cursor`, or `None` at the
+/// start of the buffer.
+fn prev_grapheme(text: &str, cursor: usize) -> Option<usize> {
+    UnicodeSegmentation::grapheme_indices(&text[..cursor], true)
+        .next_back()
+        .map(|(offset, _)| offset)
+}
+
+/// The byte offset of the grapheme boundary after `cursor`, or `None` at the
+/// end of the buffer.
+fn next_grapheme(text: &str, cursor: usize) -> Option<usize> {
+    UnicodeSegmentation::grapheme_indices(&text[cursor..], true)
+        .next()
+        .map(|(_, grapheme)| cursor + grapheme.len())
+}
+
+/// Where a cursor key moves the composer's insertion point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorMove {
+    Left,
+    Right,
+    LineStart,
+    LineEnd,
+}
+
+/// `←`/`→`/`Home`/`End` in the composer. Horizontal motion steps whole
+/// graphemes (never landing mid-character); `Home`/`End` are scoped to the
+/// cursor's own line, so they stay useful in a multi-line draft.
+fn move_composer_cursor(state: &mut AppState, motion: CursorMove) {
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    // Moving the caret is composing, not browsing.
+    end_browse(state);
+    let cursor = state.composer_cursor.min(state.composer.len());
+    let (line_start, line_end) = line_bounds(&state.composer, cursor);
+    state.composer_cursor = match motion {
+        CursorMove::Left => prev_grapheme(&state.composer, cursor).unwrap_or(0),
+        CursorMove::Right => next_grapheme(&state.composer, cursor).unwrap_or(cursor),
+        CursorMove::LineStart => line_start,
+        CursorMove::LineEnd => line_end,
+    };
+}
+
+/// Delete backwards in the composer (`Ctrl-W` / `Ctrl-U`); a no-op elsewhere,
+/// where these keys have never meant anything.
+fn delete_backwards(state: &mut AppState, edit: &Edit) {
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    splice(&mut state.composer, &mut state.composer_cursor, edit);
+    detach_history_on_edit(state);
+}
+
+/// The composer cursor's display column within its own line — the width the
+/// terminal actually paints, so `↑`/`↓` keep their column across CJK and emoji.
+fn cursor_column(text: &str, cursor: usize) -> usize {
+    let (start, _) = line_bounds(text, cursor);
+    UnicodeWidthStr::width(&text[start..cursor])
+}
+
+/// The byte offset within `[start, end)` closest to display `column` without
+/// overshooting it, snapped to a grapheme boundary.
+fn offset_for_column(text: &str, start: usize, end: usize, column: usize) -> usize {
+    let mut width = 0;
+    for (offset, grapheme) in UnicodeSegmentation::grapheme_indices(&text[start..end], true) {
+        if width >= column {
+            return start + offset;
+        }
+        width += UnicodeWidthStr::width(grapheme);
+    }
+    end
+}
+
+/// `↑` in the composer: move to the line above, keeping the display column;
+/// only at the draft's TOP line does it fall through to history recall. A
+/// single-line draft therefore behaves exactly as it did before.
+fn composer_up(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::None) {
+        let cursor = state.composer_cursor.min(state.composer.len());
+        let (line_start, _) = line_bounds(&state.composer, cursor);
+        if line_start > 0 {
+            let column = cursor_column(&state.composer, cursor);
+            let (prev_start, prev_end) = line_bounds(&state.composer, line_start - 1);
+            state.composer_cursor =
+                offset_for_column(&state.composer, prev_start, prev_end, column);
+            end_browse(state);
+            return;
+        }
+    }
+    history_prev(state);
+}
+
+/// `↓` in the composer: the mirror of [`composer_up`] — the line below, then
+/// history at the draft's bottom line.
+fn composer_down(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::None) {
+        let cursor = state.composer_cursor.min(state.composer.len());
+        let (_, line_end) = line_bounds(&state.composer, cursor);
+        if line_end < state.composer.len() {
+            let column = cursor_column(&state.composer, cursor);
+            let (next_start, next_end) = line_bounds(&state.composer, line_end + 1);
+            state.composer_cursor =
+                offset_for_column(&state.composer, next_start, next_end, column);
+            end_browse(state);
+            return;
+        }
+    }
+    history_next(state);
+}
+
+fn edit_prompt(state: &mut AppState, edit: &Edit) {
     match &mut state.overlay {
-        Overlay::NewRun(buf) | Overlay::Steering(buf) => edit(buf),
-        Overlay::WorkflowInputs { buffer, .. } => edit(buffer),
-        Overlay::EdgeSearch(buffer) => edit(buffer),
-        Overlay::DocEdit { buffer, .. } => edit(buffer),
-        Overlay::DocPublishPath { buffer, .. } => edit(buffer),
-        Overlay::AddModelId { buffer, .. } => edit(buffer),
+        Overlay::NewRun(buf) | Overlay::Steering(buf) => append(buf, edit),
+        Overlay::WorkflowInputs { buffer, .. } => append(buffer, edit),
+        Overlay::CouncilRunObjective { buffer, .. } => append(buffer, edit),
+        Overlay::EdgeSearch(buffer) => append(buffer, edit),
+        Overlay::DocNew { buffer } => append(buffer, edit),
+        Overlay::DocInsert { buffer, .. } => append(buffer, edit),
+        Overlay::DocEdit { buffer, .. } => append(buffer, edit),
+        Overlay::DocPublishPath { buffer, .. } => append(buffer, edit),
+        Overlay::AddModelId { buffer, .. } => append(buffer, edit),
         // The key buffer is a redacting newtype; edit its inner String.
-        Overlay::AddModelKey { buffer, .. } => edit(&mut buffer.0),
+        Overlay::AddModelKey { buffer, .. } => append(&mut buffer.0, edit),
         // The `/keys` set prompt masks the same redacting newtype (D1).
-        Overlay::ApiKeySet { buffer, .. } => edit(&mut buffer.0),
+        Overlay::ApiKeySet { buffer, .. } => append(&mut buffer.0, edit),
         // The key-first prompt masks a redacting newtype, like `AddModelKey`.
-        Overlay::AddModelProviderKey { buffer, .. } => edit(&mut buffer.0),
+        Overlay::AddModelProviderKey { buffer, .. } => append(&mut buffer.0, edit),
         // The pick-list filters like the model picker: editing the query resets
         // the selection to the top of the new filtered set.
         Overlay::AddModelPick {
             query, selected, ..
         } => {
-            edit(query);
+            append(query, edit);
+            *selected = 0;
+        }
+        // Same shape as the add-model pick-list: the Unsloth repo/quant
+        // browsers filter on their own query, resetting to the top of the
+        // new filtered set. Reachable only once loaded (`InputMode::Palette`
+        // — see `AppState::input_mode`); while loading, printable keys never
+        // reach here.
+        Overlay::UnslothRepos {
+            query, selected, ..
+        }
+        | Overlay::UnslothQuants {
+            query, selected, ..
+        } => {
+            append(query, edit);
             *selected = 0;
         }
         // Editing the palette query changes the filtered set, so the selection
         // returns to the top rather than pointing past the new results.
         Overlay::Palette { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the palette: editing the model picker's query changes
         // the filtered set, so the selection returns to the top.
         Overlay::ModelPicker { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the model picker (Task 8): editing the provider
         // picker's query changes the filtered set, so the selection returns
         // to the top.
         Overlay::ProviderPicker { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the provider picker (PR C2): editing the mode
         // picker's query changes the filtered set, so the selection returns
         // to the top.
         Overlay::ModePicker { query, selected } => {
-            edit(query);
+            append(query, edit);
+            *selected = 0;
+        }
+        // Same shape as the mode picker: editing the theme query changes the
+        // filtered set, so the selection (and therefore the live preview)
+        // returns to the top of the new results.
+        Overlay::ThemePicker { query, selected } => {
+            append(query, edit);
             *selected = 0;
         }
         // Same shape as the mode picker (D1): editing the `/keys` query
         // changes the filtered set, so the selection returns to the top.
         Overlay::ApiKeys { query, selected } => {
-            edit(query);
+            append(query, edit);
             *selected = 0;
         }
         Overlay::CouncilBuilder(builder) => match builder.step {
-            CouncilBuilderStep::Name => edit(&mut builder.name),
-            CouncilBuilderStep::Description => edit(&mut builder.description),
+            CouncilBuilderStep::Name => append(&mut builder.name, edit),
+            CouncilBuilderStep::Description => append(&mut builder.description, edit),
             CouncilBuilderStep::MemberModel | CouncilBuilderStep::Chair => {
-                edit(&mut builder.query);
+                append(&mut builder.query, edit);
                 builder.selected = 0;
             }
-            CouncilBuilderStep::MemberRole => edit(&mut builder.role),
+            CouncilBuilderStep::MemberRole => append(&mut builder.role, edit),
             CouncilBuilderStep::Rounds | CouncilBuilderStep::Review => {}
         },
-        // The base view: text lands in the persistent composer draft.
-        Overlay::None => edit(&mut state.composer),
+        // The base view: text lands in the persistent composer draft, at
+        // its cursor — the one buffer with a movable insertion point.
+        Overlay::None => splice(&mut state.composer, &mut state.composer_cursor, edit),
         _ => {}
     }
     // Keep `selected_model` resolved to the new top-of-filter card (mirrors
@@ -2250,7 +2919,7 @@ fn input_char(state: &mut AppState, c: char) {
         };
         return;
     }
-    edit_prompt(state, |buf| buf.push(c));
+    edit_prompt(state, &Edit::Insert(c.to_string()));
     detach_history_on_edit(state);
 }
 
@@ -2286,6 +2955,9 @@ fn begin_remove_key(state: &mut AppState) {
 fn detach_history_on_edit(state: &mut AppState) {
     if matches!(state.overlay, Overlay::None) {
         state.history_cursor = None;
+        // Typing means the composer, not the transcript, has the user's
+        // attention: leave fold-browse mode so `Alt-Enter` is a line break again.
+        end_browse(state);
     }
 }
 
@@ -2305,6 +2977,7 @@ fn history_prev(state: &mut AppState) {
         Some(idx) => idx.saturating_sub(1),
     };
     state.composer = state.composer_history[idx].clone();
+    state.composer_cursor = state.composer.len();
     state.history_cursor = Some(idx);
 }
 
@@ -2323,6 +2996,7 @@ fn history_next(state: &mut AppState) {
         state.composer = state.composer_history[idx].clone();
         state.history_cursor = Some(idx);
     }
+    state.composer_cursor = state.composer.len();
 }
 
 /// `Esc`: clear the composer draft in the base view, return the block-edit prompt
@@ -2361,15 +3035,29 @@ fn input_cancel(state: &mut AppState) {
         }
         return;
     }
+    // `Esc` while browsing folds steps out of browse mode first, so an
+    // in-progress draft is never destroyed by a keypress the user meant as
+    // "stop browsing".
+    if state.transcript_browse && matches!(state.overlay, Overlay::None) {
+        end_browse(state);
+        return;
+    }
     match state.overlay {
-        Overlay::None => state.composer.clear(),
+        Overlay::None => {
+            state.composer.clear();
+            state.composer_cursor = 0;
+        }
         // Abandoning the block-edit prompt returns to the browser, not the base
         // view (no lease was taken yet — the acquire only fires on submit).
-        Overlay::DocEdit { .. } => state.overlay = Overlay::Docs,
+        Overlay::DocEdit { .. }
+        | Overlay::DocNew { .. }
+        | Overlay::DocInsert { .. }
+        | Overlay::DocDeleteConfirm { .. } => state.overlay = Overlay::Docs,
         Overlay::DocPublishPath { .. } => state.overlay = Overlay::Docs,
         Overlay::EdgeSearch(_) => state.overlay = Overlay::Edges,
         Overlay::WorkflowInputs { .. } => state.overlay = Overlay::Workflow,
         Overlay::ConfirmWorkflowCancel { .. } => state.overlay = Overlay::Workflow,
+        Overlay::CouncilRunObjective { .. } => state.overlay = Overlay::CouncilBrowser,
         _ => state.overlay = Overlay::None,
     }
 }
@@ -2377,6 +3065,8 @@ fn input_cancel(state: &mut AppState) {
 /// Switch the conversation to another run (`Ctrl-↑/↓`), clamping at the ends.
 fn cycle_run(state: &mut AppState, delta: i32) {
     step(&mut state.selected_run, state.runs.len(), delta);
+    // The browsed fold belonged to the run we just left.
+    end_browse(state);
 }
 
 /// Set the open list overlay's `selected` to `n`, mirroring `nav`'s picker
@@ -2388,6 +3078,14 @@ fn set_overlay_selected(state: &mut AppState, n: usize) {
             ref mut selected, ..
         }
         | Overlay::AddModelPick {
+            ref mut selected, ..
+        }
+        // Same shape: no resolved `AppState` index to keep in sync, exactly
+        // like the mode picker / `/keys` below.
+        | Overlay::UnslothRepos {
+            ref mut selected, ..
+        }
+        | Overlay::UnslothQuants {
             ref mut selected, ..
         } => {
             *selected = n;
@@ -2415,8 +3113,11 @@ fn set_overlay_selected(state: &mut AppState, n: usize) {
         } => {
             *selected = n;
         }
-        // Same for the `/keys` overlay (D1).
-        Overlay::ApiKeys {
+        // Same for the theme picker and the `/keys` overlay (D1).
+        Overlay::ThemePicker {
+            ref mut selected, ..
+        }
+        | Overlay::ApiKeys {
             ref mut selected, ..
         } => {
             *selected = n;
@@ -2469,18 +3170,31 @@ fn activate_row(state: &mut AppState, n: usize) {
             state.selected_item = selected;
             watch_focused_blackboard_run(state);
         }
+        Overlay::Kanban => {
+            let mut selected = n;
+            clamp(&mut selected, state.kanban_in_display_order().len());
+            state.selected_card = selected;
+        }
         Overlay::UiPlugins => {
             let mut selected = n;
             clamp(&mut selected, state.ui_plugins.len());
             state.selected_ui_plugin = selected;
         }
+        Overlay::CouncilBrowser => {
+            let mut selected = n;
+            clamp(&mut selected, state.councils.len());
+            state.selected_council = selected;
+        }
         Overlay::Palette { .. }
         | Overlay::ModelPicker { .. }
         | Overlay::ProviderPicker { .. }
         | Overlay::ModePicker { .. }
+        | Overlay::ThemePicker { .. }
         | Overlay::ApiKeys { .. }
         | Overlay::AddModelPick { .. }
-        | Overlay::CouncilBuilder(_) => {
+        | Overlay::CouncilBuilder(_)
+        | Overlay::UnslothRepos { .. }
+        | Overlay::UnslothQuants { .. } => {
             set_overlay_selected(state, n);
             submit_prompt(state);
         }
@@ -2490,6 +3204,10 @@ fn activate_row(state: &mut AppState, n: usize) {
             if let Some(run) = state.runs.get_mut(idx) {
                 if n < run.transcript.len() {
                     run.transcript_selected = n;
+                    // A clicked fold becomes the browsed one, so the keyboard
+                    // can carry on from where the mouse left off (and the row
+                    // the click landed on is visibly selected).
+                    state.transcript_browse = true;
                 }
             }
             expand_selected(state);
@@ -2519,6 +3237,23 @@ fn submit_prompt(state: &mut AppState) {
             let run_id = state.selected_run().map(|r| r.run_id);
             if let (false, Some(run_id)) = (text.is_empty(), run_id) {
                 state.outbox.push(Intent::QueueSteering { run_id, text });
+            }
+        }
+        Overlay::CouncilRunObjective { name, buffer } => {
+            let objective = buffer.trim().to_owned();
+            if objective.is_empty() {
+                state.overlay = Overlay::CouncilRunObjective { name, buffer };
+                state.notice = Some((
+                    "council objective must not be empty".to_owned(),
+                    state.tick + 30,
+                ));
+            } else {
+                state.outbox.push(Intent::RunCouncil {
+                    name: name.clone(),
+                    objective,
+                });
+                state.overlay = Overlay::CouncilBrowser;
+                state.notice = Some((format!("council `{name}` running…"), state.tick + 60));
             }
         }
         Overlay::WorkflowInputs {
@@ -2568,24 +3303,62 @@ fn submit_prompt(state: &mut AppState) {
             request_edge_page(state, 0);
         }
         // Submit the block-edit prompt: acquire the block's lease and queue the
-        // insertion to fire once it is granted. `mem::take` left the overlay
+        // replacement to fire once it is granted. `mem::take` left the overlay
         // `None`; restore the Docs browser so the reflected sync lands in view.
-        Overlay::DocEdit { block_id, buffer } => {
+        Overlay::DocEdit {
+            block_id,
+            buffer,
+            original,
+        } => {
+            state.overlay = Overlay::Docs;
+            let text = buffer.trim().to_owned();
+            let document_id = state.focused_doc().map(|doc| doc.document_id);
+            // An unchanged buffer is not an edit — never spend a revision (and a
+            // suggestion in Suggest mode) on a no-op submit.
+            if text == original.trim() {
+                return;
+            }
+            if let Some(document_id) = document_id {
+                // A FULL REPLACE of the block's text: delete exactly the
+                // characters the prompt was prefilled with, then insert what the
+                // writer typed. `delete_len` counts CHARACTERS (the CRDT's text
+                // ops are character-indexed), not bytes. In Edit mode this
+                // applies directly; in Suggest mode the daemon turns the same
+                // range into a reviewable suggestion.
+                let mutation = DocumentMutation::EditText {
+                    block_id: block_id.clone(),
+                    position: 0,
+                    delete_len: original.chars().count() as u32,
+                    insert: text,
+                };
+                start_doc_edit(state, document_id, Some(block_id), mutation);
+            }
+        }
+        // Submit the new-document prompt: the harness sends `CreateDocument` and
+        // refreshes the Docs projection, so the document appears in the tree.
+        Overlay::DocNew { buffer } => {
+            state.overlay = Overlay::Docs;
+            let title = buffer.trim().to_owned();
+            if title.is_empty() {
+                state.notice = Some(("a document needs a title".to_owned(), state.tick + 25));
+                return;
+            }
+            state.outbox.push(Intent::CreateDocument { title });
+        }
+        // Submit the insert-block prompt: a new paragraph at `index`. A block
+        // insert reshapes the block list, so it takes the WHOLE-DOCUMENT lease
+        // (`block_id: None`) the daemon's structural gate requires.
+        Overlay::DocInsert { index, buffer } => {
             state.overlay = Overlay::Docs;
             let text = buffer.trim().to_owned();
             let document_id = state.focused_doc().map(|doc| doc.document_id);
             if let (false, Some(document_id)) = (text.is_empty(), document_id) {
-                // Insert the typed text at the start of the block. A pure insertion
-                // (delete_len 0) needs no knowledge of the block's current length —
-                // in Edit mode it applies directly, in Suggest mode the daemon turns
-                // it into a suggestion over the empty range [0,0).
-                let mutation = DocumentMutation::EditText {
-                    block_id: block_id.clone(),
-                    position: 0,
-                    delete_len: 0,
-                    insert: text,
+                let mutation = DocumentMutation::Insert {
+                    index,
+                    block_id: uuid::Uuid::now_v7().to_string(),
+                    content: serde_json::json!({ "type": "paragraph", "text": text }),
                 };
-                start_doc_edit(state, document_id, Some(block_id), mutation);
+                start_doc_edit(state, document_id, None, mutation);
             }
         }
         Overlay::DocPublishPath {
@@ -2829,6 +3602,8 @@ fn submit_prompt(state: &mut AppState) {
                     let requires_key = card.requires_key;
                     let can_list_models = card.can_list_models;
                     let available = card.available;
+                    let catalog_models = card.catalog_models;
+                    let has_key = card.has_key;
                     if available {
                         enter_add_model_flow(
                             state,
@@ -2836,6 +3611,8 @@ fn submit_prompt(state: &mut AppState) {
                             protocol,
                             requires_key,
                             can_list_models,
+                            catalog_models,
+                            has_key,
                         );
                     } else {
                         state.notice = Some((
@@ -2867,6 +3644,19 @@ fn submit_prompt(state: &mut AppState) {
                 ));
             }
         }
+        // Enter keeps the previewed theme: the renderer already draws in it
+        // (`AppState::effective_theme`), so this only makes the choice sticky
+        // and asks the harness to remember it for the next launch. Same
+        // zero-match guard as every other picker. `mem::take` already closed
+        // the picker.
+        Overlay::ThemePicker { query, selected } => {
+            if let Some(&idx) = filter_themes(&state.themes, &query).get(selected) {
+                state.theme_selected = Some(idx);
+                let id = state.themes[idx].id.clone();
+                state.notice = Some((format!("theme set to {id}"), state.tick + 25));
+                state.outbox.push(Intent::SetTheme { id });
+            }
+        }
         // Enter on a `/keys` row (D1) opens the masked set/replace prompt for
         // that row's target. Re-derives the filtered selection from the
         // overlay's own `query`/`selected` (the zero-match guard the other
@@ -2889,6 +3679,14 @@ fn submit_prompt(state: &mut AppState) {
             let key = buffer.0.trim().to_owned();
             if key.is_empty() {
                 state.notice = Some(("key not saved (blank)".to_owned(), state.tick + 25));
+                // Reopen the prompt rather than dropping the operator back to
+                // the base view: a stray `Enter` mid-paste should not discard
+                // the flow they were in. Mirrors `AddModelId`, which has always
+                // reopened on a blank submit.
+                state.overlay = Overlay::ApiKeySet {
+                    target,
+                    buffer: SecretKey(String::new()),
+                };
             } else {
                 state.outbox.push(Intent::SetApiKey {
                     target,
@@ -2943,6 +3741,7 @@ fn submit_prompt(state: &mut AppState) {
                 }
             }
             state.composer.clear();
+            state.composer_cursor = 0;
             // Snap the conversation back to the latest so the reply is in view.
             if let Some(run) = state.selected_run_mut() {
                 run.follow = true;
@@ -2967,7 +3766,14 @@ fn submit_prompt(state: &mut AppState) {
                     api_key,
                     buffer: String::new(),
                 };
-            } else if let Some(key) = api_key {
+            } else if let Some(key) = api_key.filter(|key| {
+                // A captured key only short-circuits the key step when it is
+                // actually a key. A BLANK captured key for a key-requiring
+                // provider must still route through the masked prompt —
+                // otherwise a failed query with an empty key silently writes a
+                // keyless model that can only 401 at run time.
+                !requires_key || !key.0.trim().is_empty()
+            }) {
                 // A key was already captured (a can-list provider's failed query
                 // fell back here). Emit directly — never re-prompt. A blank inner
                 // key normalizes to `None`.
@@ -2984,6 +3790,7 @@ fn submit_prompt(state: &mut AppState) {
                     provider_id,
                     model,
                     api_key,
+                    context_tokens: None,
                 });
             } else if requires_key {
                 state.overlay = Overlay::AddModelKey {
@@ -2999,6 +3806,7 @@ fn submit_prompt(state: &mut AppState) {
                     provider_id,
                     model,
                     api_key: None,
+                    context_tokens: None,
                 });
             }
         }
@@ -3022,6 +3830,7 @@ fn submit_prompt(state: &mut AppState) {
                 provider_id,
                 model,
                 api_key,
+                context_tokens: None,
             });
         }
         // Key-first prompt (can-list hosted): emit the query with the entered key
@@ -3040,6 +3849,7 @@ fn submit_prompt(state: &mut AppState) {
             state.outbox.push(Intent::QueryProviderModels {
                 provider_id: provider_id.clone(),
                 api_key: api_key.clone(),
+                refresh: false,
             });
             state.overlay = Overlay::AddModelQuerying {
                 provider_id,
@@ -3047,18 +3857,20 @@ fn submit_prompt(state: &mut AppState) {
             };
         }
         // The pick-list: resolve the filtered selection (same zero-match guard as
-        // the model picker) and emit `AddModel` for the chosen name, moving the
-        // stashed key into the intent.
+        // the model picker) and emit `AddModel` for the chosen row, moving the
+        // stashed key and the row's known context window into the intent.
         Overlay::AddModelPick {
             provider_id,
             api_key,
             models,
             query,
             selected,
+            ..
         } => {
             if let Some(&idx) = filter_model_names(&models, &query).get(selected) {
-                if let Some(model) = models.get(idx) {
-                    let model = model.clone();
+                if let Some(row) = models.get(idx) {
+                    let model = row.id.clone();
+                    let context_tokens = row.context_tokens;
                     let display_id = format!("{provider_id}/{model}");
                     state.notice = Some((format!("adding model {display_id}"), state.tick + 25));
                     state.outbox.push(Intent::AddModel {
@@ -3066,7 +3878,54 @@ fn submit_prompt(state: &mut AppState) {
                         provider_id,
                         model,
                         api_key,
+                        context_tokens,
                     });
+                }
+            }
+        }
+        // Step 1 → 2 of the Unsloth pull flow: resolve the filtered selection
+        // (same zero-match-closes convention as `AddModelPick`/`ModelPicker`
+        // above — an empty `repos` list during `loading` can never match, so
+        // a stray submit while still fetching simply closes) and begin
+        // fetching the chosen repo's quant variants.
+        Overlay::UnslothRepos {
+            repos,
+            query,
+            selected,
+            ..
+        } => {
+            if let Some(&idx) = filter_unsloth_repos(&repos, &query).get(selected) {
+                if let Some(card) = repos.get(idx) {
+                    let repo_id = card.id.clone();
+                    state.outbox.push(Intent::ListUnslothQuants {
+                        repo_id: repo_id.clone(),
+                    });
+                    state.overlay = Overlay::UnslothQuants {
+                        repo_id,
+                        quants: Vec::new(),
+                        query: String::new(),
+                        selected: 0,
+                        loading: true,
+                    };
+                }
+            }
+        }
+        // Step 2 → 3: resolve the filtered selection and open the pull
+        // confirm dialog.
+        Overlay::UnslothQuants {
+            repo_id,
+            quants,
+            query,
+            selected,
+            ..
+        } => {
+            if let Some(&idx) = filter_unsloth_quants(&quants, &query).get(selected) {
+                if let Some(card) = quants.get(idx) {
+                    state.overlay = Overlay::UnslothConfirmPull {
+                        repo_id,
+                        quant: card.quant.clone(),
+                        size_label: card.size_label.clone(),
+                    };
                 }
             }
         }
@@ -3104,34 +3963,73 @@ fn valid_publish_path(path: &str) -> bool {
 ///   model name exists), which on submit queries `<base_url>/models`.
 /// - can-list + local/no-auth → query immediately (no key).
 /// - cannot-list → today's free-text `AddModelId` flow, unchanged.
+///
+/// ACP agents branch first: an installed one joins the can-list query path (its
+/// models come from the session handshake, not an HTTP endpoint), an
+/// uninstalled one connects directly.
+/// - can-list + hosted with no stored key → key-first masked prompt (the key is
+///   needed before the model name exists), which on submit queries
+///   `<base_url>/models`.
+/// - can-list + local/no-auth, or a provider whose key `auth.json` already
+///   holds → query immediately (the harness resolves the stored key), so the
+///   same key is never asked for twice.
+/// - cannot-list, but the catalog ships models for it → query anyway: the
+///   harness answers from the catalog, so a provider with no listing endpoint
+///   (Perplexity) still gets a real pick-list instead of a free-text prompt.
+/// - cannot-list and nothing curated → the free-text `AddModelId` flow.
 fn enter_add_model_flow(
     state: &mut AppState,
     provider_id: String,
     protocol: String,
     requires_key: bool,
     can_list_models: bool,
+    catalog_models: usize,
+    has_key: bool,
 ) {
     if protocol == "acp" {
+        // An installed ACP agent advertises its own models over the session
+        // handshake, so it takes the SAME query -> pick path a hosted provider
+        // does; the harness spawns the agent instead of GETting `/models`, and
+        // short-circuits to a plain connect if it advertises no model selector.
+        // An agent that is not installed yet has nothing to handshake, so it
+        // keeps the connect-then-see path.
+        if can_list_models {
+            state.outbox.push(Intent::QueryProviderModels {
+                provider_id: provider_id.clone(),
+                api_key: None,
+                // A first query, not the operator's manual refresh — the cache
+                // may answer instantly and refresh behind the overlay.
+                refresh: false,
+            });
+            state.overlay = Overlay::AddModelQuerying {
+                provider_id,
+                api_key: None,
+            };
+            return;
+        }
         let display_id = format!("acp/{provider_id}");
         state.outbox.push(Intent::AddModel {
             display_id: display_id.clone(),
             model: provider_id.clone(),
             provider_id,
             api_key: None,
+            context_tokens: None,
         });
         state.notice = Some((format!("connecting {display_id}"), state.tick + 25));
         state.overlay = Overlay::None;
         return;
     }
-    state.overlay = if can_list_models && requires_key {
+    let can_offer = can_list_models || catalog_models > 0;
+    state.overlay = if can_offer && requires_key && !has_key {
         Overlay::AddModelProviderKey {
             provider_id,
             buffer: SecretKey(String::new()),
         }
-    } else if can_list_models {
+    } else if can_offer {
         state.outbox.push(Intent::QueryProviderModels {
             provider_id: provider_id.clone(),
             api_key: None,
+            refresh: false,
         });
         Overlay::AddModelQuerying {
             provider_id,
@@ -3147,11 +4045,82 @@ fn enter_add_model_flow(
     };
 }
 
+/// Re-fetch the open add-model pick-list from the provider (`Ctrl-R`),
+/// bypassing the on-disk cache. The stashed key rides the new query so a
+/// hosted provider is not asked for it again; the current rows stay on screen
+/// (with a "refreshing" marker) until the answer arrives. A no-op in every
+/// other overlay.
+fn refresh_provider_models(state: &mut AppState) {
+    let Overlay::AddModelPick {
+        provider_id,
+        api_key,
+        refreshing,
+        ..
+    } = &mut state.overlay
+    else {
+        return;
+    };
+    if *refreshing {
+        return;
+    }
+    *refreshing = true;
+    let intent = Intent::QueryProviderModels {
+        provider_id: provider_id.clone(),
+        api_key: api_key.clone(),
+        refresh: true,
+    };
+    state.outbox.push(intent);
+    state.notice = Some(("refreshing the model list…".to_owned(), state.tick + 25));
+}
+
+/// Verify the focused `/keys` row's key against its provider (`Ctrl-T`): emit
+/// the one-shot probe intent. A no-op outside the `/keys` overlay and on the
+/// Tavily row, which has no model endpoint to probe.
+fn begin_verify_key(state: &mut AppState) {
+    let Overlay::ApiKeys { query, selected } = &state.overlay else {
+        return;
+    };
+    let Some(&idx) = filter_key_rows(&state.models, query).get(*selected) else {
+        return;
+    };
+    let Some(card) = state.models.get(idx) else {
+        state.notice = Some((
+            "verification is available for model rows only".to_owned(),
+            state.tick + 25,
+        ));
+        return;
+    };
+    let model_id = card.id.0.clone();
+    state.notice = Some((format!("verifying {model_id}…"), state.tick + 40));
+    state.outbox.push(Intent::VerifyApiKey { model_id });
+}
+
+/// Fold a key-verification result back in: the notice reports it, and the
+/// model's card readiness is replaced with the honest answer so a hosted model
+/// stops claiming `Unverified` once it has actually been probed.
+fn on_model_key_verified(state: &mut AppState, model_id: &str, ok: bool, reason: &str) {
+    if let Some(card) = state.models.iter_mut().find(|card| card.id.0 == model_id) {
+        card.readiness = if ok {
+            ModelReadiness::Ready
+        } else {
+            ModelReadiness::Unavailable(reason.to_owned())
+        };
+    }
+    state.notice = Some((
+        if ok {
+            format!("{model_id}: key verified")
+        } else {
+            format!("{model_id}: {reason}")
+        },
+        state.tick + 40,
+    ));
+}
+
 /// Begin the add-model flow (`Tab` in the `/provider` picker) for the focused
 /// catalog provider. A no-op outside the provider picker, or when the filtered
 /// selection matches no provider (the same zero-match guard the Enter arm uses).
 fn begin_add_model(state: &mut AppState) {
-    let (provider_id, protocol, requires_key, can_list_models, available) = {
+    let (provider_id, protocol, requires_key, can_list_models, available, catalog_models, has_key) = {
         let Overlay::ProviderPicker { query, selected } = &state.overlay else {
             return;
         };
@@ -3165,6 +4134,8 @@ fn begin_add_model(state: &mut AppState) {
                 card.requires_key,
                 card.can_list_models,
                 card.available,
+                card.catalog_models,
+                card.has_key,
             ),
             None => return,
         }
@@ -3178,7 +4149,15 @@ fn begin_add_model(state: &mut AppState) {
         ));
         return;
     }
-    enter_add_model_flow(state, provider_id, protocol, requires_key, can_list_models);
+    enter_add_model_flow(
+        state,
+        provider_id,
+        protocol,
+        requires_key,
+        can_list_models,
+        catalog_models,
+        has_key,
+    );
 }
 
 /// Fold a fetched provider model list into the in-flight query overlay
@@ -3187,7 +4166,39 @@ fn begin_add_model(state: &mut AppState) {
 /// overlay is no longer the matching `AddModelQuerying` (the user dismissed or
 /// opened something else, or this is a stale result for another provider), the
 /// result is ignored — the race guard.
-fn on_provider_models_loaded(state: &mut AppState, provider_id: String, models: Vec<String>) {
+///
+/// A second delivery for a pick-list that is already open (the cached seed's
+/// live refresh, or a manual `Ctrl-R`) replaces the rows in place, keeping the
+/// operator's filter text and clamping the selection — losing their typing
+/// mid-browse would be worse than a stale row.
+fn on_provider_models_loaded(
+    state: &mut AppState,
+    provider_id: String,
+    models: Vec<AddModelRow>,
+    origin: ModelListOrigin,
+) {
+    // Already browsing this provider: fold the fresher list in underneath the
+    // filter rather than reopening the overlay from scratch.
+    if let Overlay::AddModelPick {
+        provider_id: pid,
+        models: rows,
+        query,
+        selected,
+        origin: current,
+        refreshing,
+        ..
+    } = &mut state.overlay
+    {
+        if *pid != provider_id {
+            return;
+        }
+        *rows = models;
+        *current = origin;
+        *refreshing = false;
+        let matches = filter_model_names(rows, query).len();
+        *selected = (*selected).min(matches.saturating_sub(1));
+        return;
+    }
     let matched = matches!(
         &state.overlay,
         Overlay::AddModelQuerying { provider_id: pid, .. } if *pid == provider_id
@@ -3206,6 +4217,8 @@ fn on_provider_models_loaded(state: &mut AppState, provider_id: String, models: 
             models,
             query: String::new(),
             selected: 0,
+            origin,
+            refreshing: false,
         };
     }
 }
@@ -3219,8 +4232,25 @@ fn on_provider_models_loaded(state: &mut AppState, provider_id: String, models: 
 /// whether this particular query happened to carry a key: a hosted provider
 /// queried with a blank key still requires one on the free-text fallback, so
 /// the flow re-prompts for it instead of silently adding a keyless model that
-/// can only fail later at run time.
+/// can only fail later at run time. When the card is missing entirely (the
+/// projection has not loaded), the fallback ASSUMES a key is needed rather
+/// than inferring it from the query — an extra prompt the operator can dismiss
+/// with `Enter` is strictly better than a keyless model that 401s at run time.
 fn on_provider_models_failed(state: &mut AppState, provider_id: String, reason: String) {
+    // A failed manual refresh leaves the pick-list standing: the rows on
+    // screen are still usable, so only the notice changes.
+    if let Overlay::AddModelPick {
+        provider_id: pid,
+        refreshing,
+        ..
+    } = &mut state.overlay
+    {
+        if *pid == provider_id {
+            *refreshing = false;
+            state.notice = Some((format!("refresh failed ({reason})"), state.tick + 25));
+        }
+        return;
+    }
     let matched = matches!(
         &state.overlay,
         Overlay::AddModelQuerying { provider_id: pid, .. } if *pid == provider_id
@@ -3237,7 +4267,7 @@ fn on_provider_models_failed(state: &mut AppState, provider_id: String, reason: 
             .providers
             .iter()
             .find(|c| c.id == provider_id)
-            .map_or(api_key.is_some(), |c| c.requires_key);
+            .is_none_or(|c| c.requires_key);
         state.notice = Some((
             format!("couldn't fetch models ({reason}); type the model name"),
             state.tick + 25,
@@ -3248,6 +4278,135 @@ fn on_provider_models_failed(state: &mut AppState, provider_id: String, reason: 
             api_key,
             buffer: String::new(),
         };
+    }
+}
+
+/// Open the "Local models: browse Unsloth catalog" overlay (palette entry)
+/// and kick off the repo listing. Always starts loading — a fresh browse
+/// never shows stale results from a prior session.
+fn open_unsloth_catalog(state: &mut AppState) {
+    state.overlay = Overlay::UnslothRepos {
+        repos: Vec::new(),
+        query: String::new(),
+        selected: 0,
+        loading: true,
+    };
+    state.outbox.push(Intent::ListUnslothRepos);
+}
+
+/// Fold the fetched Unsloth repo listing into the in-flight
+/// `Overlay::UnslothRepos { loading: true, .. }`. Ignored (race guard) if the
+/// operator closed the overlay before the fetch returned.
+fn on_unsloth_repos_loaded(state: &mut AppState, repos: Vec<UnslothRepoCard>) {
+    if !matches!(state.overlay, Overlay::UnslothRepos { loading: true, .. }) {
+        return;
+    }
+    state.overlay = Overlay::UnslothRepos {
+        repos,
+        query: String::new(),
+        selected: 0,
+        loading: false,
+    };
+}
+
+/// The repo listing failed: close the overlay (this flow has no free-text
+/// fallback to offer, unlike model-discovery) and surface a notice. Ignored
+/// if the overlay no longer matches.
+fn on_unsloth_repos_failed(state: &mut AppState, reason: String) {
+    if !matches!(state.overlay, Overlay::UnslothRepos { loading: true, .. }) {
+        return;
+    }
+    state.overlay = Overlay::None;
+    state.notice = Some((
+        format!("could not browse the Unsloth catalog: {reason}"),
+        state.tick + 40,
+    ));
+}
+
+/// Fold the fetched quant-variant listing into the in-flight
+/// `Overlay::UnslothQuants { loading: true, .. }`, guarded by `repo_id` so a
+/// stale reply for a repo the operator already navigated away from is
+/// dropped (mirrors [`on_provider_models_loaded`]'s `provider_id` guard).
+fn on_unsloth_quants_loaded(state: &mut AppState, repo_id: String, quants: Vec<UnslothQuantCard>) {
+    let matched = matches!(
+        &state.overlay,
+        Overlay::UnslothQuants { repo_id: current, loading: true, .. } if *current == repo_id
+    );
+    if !matched {
+        return;
+    }
+    state.overlay = Overlay::UnslothQuants {
+        repo_id,
+        quants,
+        query: String::new(),
+        selected: 0,
+        loading: false,
+    };
+}
+
+/// The quant listing failed: close the overlay and surface a notice, guarded
+/// by `repo_id` exactly like [`on_unsloth_quants_loaded`].
+fn on_unsloth_quants_failed(state: &mut AppState, repo_id: String, reason: String) {
+    let matched = matches!(
+        &state.overlay,
+        Overlay::UnslothQuants { repo_id: current, loading: true, .. } if *current == repo_id
+    );
+    if !matched {
+        return;
+    }
+    state.overlay = Overlay::None;
+    state.notice = Some((
+        format!("could not list quants for {repo_id}: {reason}"),
+        state.tick + 40,
+    ));
+}
+
+/// Append one parsed `ollama pull` progress line to the in-flight
+/// `Overlay::UnslothPulling`, guarded by `repo_id`+`quant` so a line from a
+/// pull the operator already dismissed (it keeps running detached — see the
+/// overlay's doc comment) is dropped rather than corrupting an unrelated
+/// view. A no-op once `done` (the terminal signal already arrived).
+fn on_unsloth_pull_progress(state: &mut AppState, repo_id: String, quant: String, line: String) {
+    if let Overlay::UnslothPulling {
+        repo_id: current_repo,
+        quant: current_quant,
+        lines,
+        done,
+        ..
+    } = &mut state.overlay
+    {
+        if !*done && *current_repo == repo_id && *current_quant == quant {
+            lines.push(line);
+        }
+    }
+}
+
+/// Fold the terminal pull outcome into the in-flight `Overlay::UnslothPulling`,
+/// guarded exactly like [`on_unsloth_pull_progress`]. Sets exactly one of
+/// `error`/`registered_id` and flips `done` — the render layer reads those to
+/// show either the registered-model notice or the failure.
+fn on_unsloth_pull_finished(
+    state: &mut AppState,
+    repo_id: String,
+    quant: String,
+    result: Result<String, String>,
+) {
+    if let Overlay::UnslothPulling {
+        repo_id: current_repo,
+        quant: current_quant,
+        done,
+        error,
+        registered_id,
+        ..
+    } = &mut state.overlay
+    {
+        if *current_repo == repo_id && *current_quant == quant {
+            *done = true;
+            match result {
+                Ok(id) => *registered_id = Some(id),
+                Err(reason) => *error = Some(reason),
+            }
+        }
     }
 }
 
@@ -3289,6 +4448,7 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
             state.overlay = Overlay::Blackboard;
             watch_focused_blackboard_run(state);
         }
+        PaletteCommand::Kanban => open_kanban(state),
         PaletteCommand::UiPlugins => open_ui_plugins(state),
         PaletteCommand::Model => {
             state.selected_model = 0;
@@ -3316,6 +4476,14 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
                     .unwrap_or(0),
             };
         }
+        // Open on the theme in force, so the first thing the cursor previews is
+        // what is already on screen.
+        PaletteCommand::Theme => {
+            state.overlay = Overlay::ThemePicker {
+                query: String::new(),
+                selected: state.theme_selected.unwrap_or(0),
+            };
+        }
         // D1: open the `/keys` overlay (rows come from `state.models` +
         // `state.key_status`, already seeded by the harness).
         PaletteCommand::ApiKeys => {
@@ -3324,8 +4492,25 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
                 selected: 0,
             };
         }
+        // Rubric 6 TUI wiring: `/council` opens the browser (list/run/delete),
+        // matching every other workspace command's list-first shape; `n`
+        // reaches the creation wizard from inside it.
         PaletteCommand::Council => {
-            state.overlay = Overlay::CouncilBuilder(CouncilBuilderState::default());
+            state.overlay = Overlay::CouncilBrowser;
+        }
+        PaletteCommand::UnslothCatalog => open_unsloth_catalog(state),
+        // Voice v1 (rubric 8). The toggle only flips the flag the CLI's voice
+        // host reads — the host owns the synthesis and playback subprocesses,
+        // and reports back (as a `Notice`) when speech is not configured, so
+        // the TUI never has to know what a provider or an audio device is.
+        PaletteCommand::VoiceSpeak => {
+            state.voice.speak_replies = !state.voice.speak_replies;
+            let text = if state.voice.speak_replies {
+                "speaking replies aloud"
+            } else {
+                "stopped speaking replies"
+            };
+            state.notice = Some((text.to_owned(), state.tick + 25));
         }
         PaletteCommand::ToggleLayout => {
             state.layout = state.layout.toggled();
@@ -3363,9 +4548,12 @@ fn refresh_open_projection(state: &mut AppState) {
     let kind = match state.overlay {
         Overlay::Skills => Some(ProjectionKind::Skills),
         Overlay::Memory { .. } => Some(ProjectionKind::Memory),
-        Overlay::Docs | Overlay::DocEdit { .. } | Overlay::DocPublishPath { .. } => {
-            Some(ProjectionKind::Docs)
-        }
+        Overlay::Docs
+        | Overlay::DocEdit { .. }
+        | Overlay::DocNew { .. }
+        | Overlay::DocInsert { .. }
+        | Overlay::DocDeleteConfirm { .. }
+        | Overlay::DocPublishPath { .. } => Some(ProjectionKind::Docs),
         Overlay::Workflow | Overlay::WorkflowInputs { .. } => Some(ProjectionKind::Workflow),
         _ => None,
     };
@@ -3381,6 +4569,57 @@ fn watch_focused_workflow(state: &mut AppState) {
     {
         state.outbox.push(Intent::WatchWorkflow { workflow_run_id });
     }
+}
+
+/// Open (or close) the repository task board, subscribing to the board's live
+/// channel and reading its baseline on the way in (rubric 10). Closing does not
+/// unsubscribe — the board is cheap and staying attached means reopening it is
+/// already current, exactly as the workflow panes behave.
+fn open_kanban(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::Kanban) {
+        state.overlay = Overlay::None;
+        return;
+    }
+    state.overlay = Overlay::Kanban;
+    state.outbox.push(Intent::WatchBoard);
+}
+
+/// Move the focused card `delta` columns and emit the daemon write.
+///
+/// The pane does NOT mutate its own card: the daemon applies the move as a
+/// supersession and publishes the replacement on the board channel, which merges
+/// back in by id. So the rendered board always shows what is actually stored — a
+/// refused move (a concurrent supersede) simply never appears, instead of leaving
+/// the pane lying about where the card is.
+fn move_focused_card(state: &mut AppState, delta: i32) {
+    // The horizontal arrows are global in `Normal` mode, so this MUST check the
+    // open overlay: without it, pressing → while reading the blackboard or the
+    // workflow graph would silently move a board card the operator cannot see.
+    if !matches!(state.overlay, Overlay::Kanban) {
+        return;
+    }
+    let Some(card) = state.focused_card() else {
+        return;
+    };
+    let current = crate::state::KANBAN_COLUMNS
+        .iter()
+        .position(|column| card.status.eq_ignore_ascii_case(column))
+        // A card in a team's own column moves from the first column, matching
+        // where `kanban_columns` renders it.
+        .unwrap_or(0);
+    let target = current.saturating_add_signed(delta as isize);
+    let Some(status) = crate::state::KANBAN_COLUMNS.get(target) else {
+        // Off either end of the board: nothing to do, and no command sent.
+        return;
+    };
+    if target == current {
+        return;
+    }
+    let item_id = card.id.clone();
+    state.outbox.push(Intent::MoveBoardCard {
+        item_id,
+        status: (*status).to_string(),
+    });
 }
 
 fn watch_focused_blackboard_run(state: &mut AppState) {
@@ -5035,6 +6274,7 @@ mod tests {
                 id: "b1".to_owned(),
                 kind: "heading".to_owned(),
                 text: title.to_owned(),
+                editable: Some(title.to_owned()),
             }],
             suggestions: vec![crate::state::DocSuggestionView {
                 id: "s1".to_owned(),
@@ -5103,6 +6343,7 @@ mod tests {
             id: "b2".to_owned(),
             kind: "paragraph".to_owned(),
             text: "second block".to_owned(),
+            editable: Some("second block".to_owned()),
         });
         first.suggestions.push(crate::state::DocSuggestionView {
             id: "s2".to_owned(),
@@ -5171,6 +6412,7 @@ mod tests {
             id: "b2".to_owned(),
             kind: "paragraph".to_owned(),
             text: "second".to_owned(),
+            editable: Some("second".to_owned()),
         });
         s.docs = vec![card, doc("b")];
         reduce(&mut s, Action::OpenDocs);
@@ -5182,16 +6424,23 @@ mod tests {
     }
 
     #[test]
-    fn edit_doc_opens_the_block_edit_prompt_for_the_focused_block() {
+    fn edit_doc_opens_the_block_edit_prompt_prefilled_with_the_block_text() {
         let mut s = AppState::new();
         s.docs = vec![doc("a")];
         reduce(&mut s, Action::OpenDocs);
         reduce(&mut s, Action::CyclePane); // Editor rail
         reduce(&mut s, Action::EditDoc);
         match &s.overlay {
-            Overlay::DocEdit { block_id, buffer } => {
+            Overlay::DocEdit {
+                block_id,
+                buffer,
+                original,
+            } => {
                 assert_eq!(block_id, "b1");
-                assert!(buffer.is_empty());
+                // Prefilled, not empty — `e` edits the block rather than
+                // prepending to it.
+                assert_eq!(buffer, "a");
+                assert_eq!(original, "a");
             }
             other => panic!("expected the block-edit prompt, got {other:?}"),
         }
@@ -5204,7 +6453,23 @@ mod tests {
     }
 
     #[test]
-    fn submitting_a_block_edit_acquires_the_lease_and_queues_the_mutation() {
+    fn edit_doc_refuses_a_block_with_no_editable_text() {
+        let mut s = AppState::new();
+        let mut card = doc("a");
+        card.blocks[0].kind = "table".to_owned();
+        card.blocks[0].editable = None;
+        s.docs = vec![card];
+        reduce(&mut s, Action::OpenDocs);
+        reduce(&mut s, Action::CyclePane); // Editor rail
+        reduce(&mut s, Action::EditDoc);
+        // No prompt opens — a structured block has no single text container to
+        // replace, so submitting one could never apply.
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert!(s.notice.is_some());
+    }
+
+    #[test]
+    fn submitting_a_block_edit_replaces_the_whole_block_text() {
         let mut s = AppState::new();
         s.docs = vec![doc("a")];
         let document_id = s.docs[0].document_id;
@@ -5212,6 +6477,8 @@ mod tests {
         let _ = s.drain_outbox();
         reduce(&mut s, Action::CyclePane); // Editor rail
         reduce(&mut s, Action::EditDoc);
+        // Clear the prefilled "a" and type a replacement.
+        reduce(&mut s, Action::InputBackspace);
         for c in "hi".chars() {
             reduce(&mut s, Action::InputChar(c));
         }
@@ -5226,7 +6493,8 @@ mod tests {
                 block_id: Some("b1".to_owned()),
             }]
         );
-        // The mutation is queued (not yet sent) and the lease is being acquired.
+        // A FULL REPLACE — delete the one character the block held, then insert
+        // the new text — not the prepend-only `delete_len: 0` of before.
         let edit = s.doc_edit.as_ref().expect("an edit is in flight");
         assert_eq!(edit.lease, DocLeaseState::Acquiring);
         assert_eq!(
@@ -5234,24 +6502,140 @@ mod tests {
             Some(DocumentMutation::EditText {
                 block_id: "b1".to_owned(),
                 position: 0,
-                delete_len: 0,
+                delete_len: 1,
                 insert: "hi".to_owned(),
             })
         );
     }
 
     #[test]
-    fn an_empty_block_edit_submits_nothing() {
+    fn an_unchanged_block_edit_submits_nothing() {
         let mut s = AppState::new();
         s.docs = vec![doc("a")];
         reduce(&mut s, Action::OpenDocs);
         let _ = s.drain_outbox();
         reduce(&mut s, Action::CyclePane);
         reduce(&mut s, Action::EditDoc);
-        reduce(&mut s, Action::InputSubmit); // empty buffer
+        // Submitting the prefilled text unchanged is a no-op: never spend a
+        // revision (or, in Suggest mode, a suggestion) on it.
+        reduce(&mut s, Action::InputSubmit);
         assert_eq!(s.overlay, Overlay::Docs);
         assert!(s.outbox.is_empty());
         assert!(s.doc_edit.is_none());
+    }
+
+    #[test]
+    fn n_creates_a_document_from_the_docs_studio() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        reduce(&mut s, Action::OpenDocs);
+        let _ = s.drain_outbox();
+        // `n` is contextual: in the Docs Studio it opens the new-DOCUMENT prompt
+        // rather than the new-run one.
+        reduce(&mut s, Action::NewRun);
+        assert!(matches!(s.overlay, Overlay::DocNew { .. }));
+        for c in "Runbook".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::CreateDocument {
+                title: "Runbook".to_owned(),
+            }]
+        );
+
+        // Outside the Docs Studio, `n` still opens the new-run prompt.
+        let mut t = AppState::new();
+        reduce(&mut t, Action::NewRun);
+        assert!(matches!(t.overlay, Overlay::NewRun(_)));
+    }
+
+    #[test]
+    fn insert_adds_a_paragraph_below_the_focused_block_under_a_structural_lease() {
+        let mut s = AppState::new();
+        let mut card = doc("a");
+        card.blocks.push(crate::state::DocBlockView {
+            id: "b2".to_owned(),
+            kind: "paragraph".to_owned(),
+            text: "second".to_owned(),
+            editable: Some("second".to_owned()),
+        });
+        s.docs = vec![card];
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::OpenDocs);
+        let _ = s.drain_outbox();
+        reduce(&mut s, Action::CyclePane); // Editor rail
+        reduce(&mut s, Action::InsertDocBlock);
+        match &s.overlay {
+            Overlay::DocInsert { index, .. } => assert_eq!(*index, 1, "below block 0"),
+            other => panic!("expected the insert prompt, got {other:?}"),
+        }
+        for c in "new".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+
+        // A structural mutation takes the WHOLE-DOCUMENT lease.
+        assert_eq!(
+            s.outbox,
+            vec![Intent::AcquireDocumentLease {
+                document_id,
+                block_id: None,
+            }]
+        );
+        let edit = s.doc_edit.as_ref().expect("an edit is in flight");
+        match edit.pending.as_ref().expect("a queued mutation") {
+            DocumentMutation::Insert {
+                index,
+                block_id,
+                content,
+            } => {
+                assert_eq!(*index, 1);
+                assert!(!block_id.is_empty(), "a fresh block id is minted");
+                assert_eq!(content["type"], "paragraph");
+                assert_eq!(content["text"], "new");
+            }
+            other => panic!("expected a block insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deleting_a_block_requires_a_confirmation_first() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::OpenDocs);
+        let _ = s.drain_outbox();
+        reduce(&mut s, Action::CyclePane); // Editor rail
+        reduce(&mut s, Action::DeleteDocBlock);
+        // Nothing was sent yet — the keypress only opens the confirmation.
+        assert!(matches!(s.overlay, Overlay::DocDeleteConfirm { .. }));
+        assert!(s.outbox.is_empty());
+
+        // Dismissing it deletes nothing.
+        reduce(&mut s, Action::Dismiss);
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert!(s.outbox.is_empty());
+
+        // Confirming does, under a structural (whole-document) lease.
+        reduce(&mut s, Action::DeleteDocBlock);
+        reduce(&mut s, Action::ConfirmCancel);
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::AcquireDocumentLease {
+                document_id,
+                block_id: None,
+            }]
+        );
+        assert_eq!(
+            s.doc_edit.as_ref().and_then(|e| e.pending.clone()),
+            Some(DocumentMutation::Delete {
+                block_id: "b1".to_owned(),
+            })
+        );
     }
 
     #[test]
@@ -5315,6 +6699,8 @@ mod tests {
         reduce(&mut s, Action::OpenDocs);
         reduce(&mut s, Action::CyclePane);
         reduce(&mut s, Action::EditDoc);
+        // The prompt opens prefilled with the block's text ("a"); typing appends
+        // to it, so the submitted edit replaces "a" with "ax".
         reduce(&mut s, Action::InputChar('x'));
         reduce(&mut s, Action::InputSubmit);
         let _ = s.drain_outbox(); // the AcquireDocumentLease intent
@@ -5338,8 +6724,8 @@ mod tests {
                 mutation: DocumentMutation::EditText {
                     block_id: "b1".to_owned(),
                     position: 0,
-                    delete_len: 0,
-                    insert: "x".to_owned(),
+                    delete_len: 1,
+                    insert: "ax".to_owned(),
                 },
             }]
         );
@@ -5434,6 +6820,7 @@ mod tests {
                     id: "b1".to_owned(),
                     kind: "paragraph".to_owned(),
                     text: "merged".to_owned(),
+                    editable: Some("merged".to_owned()),
                 }],
                 suggestions: vec![],
             },
@@ -5611,10 +6998,137 @@ mod tests {
             approval: "none".to_owned(),
             retry: "1 attempt".to_owned(),
             depends_on: "—".to_owned(),
+            depends_on_ids: Vec::new(),
             outputs: "test_result".to_owned(),
             cost: "—".to_owned(),
             error: "—".to_owned(),
         }
+    }
+
+    fn card(id: &str, title: &str, status: &str, ordinal: i64) -> crate::state::KanbanCard {
+        crate::state::KanbanCard {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            status: status.to_owned(),
+            assignee: "\u{2014}".to_owned(),
+            kind: "task".to_owned(),
+            author: "agent".to_owned(),
+            ordinal,
+        }
+    }
+
+    #[test]
+    fn the_board_lays_cards_out_in_column_order_and_never_hides_an_unknown_column() {
+        let mut s = AppState::new();
+        s.kanban = vec![
+            card("c1", "second in todo", "todo", 1),
+            card("c2", "in review", "review", 0),
+            card("c3", "first in todo", "todo", 0),
+            // A team's own column: shown in the FIRST column rather than dropped.
+            card("c4", "triage me", "icebox", 0),
+        ];
+        let columns = s.kanban_columns();
+        assert_eq!(columns.len(), 4);
+        assert_eq!(columns[0].0, "todo");
+        // Within a column, `ordinal` orders the cards, and a tie falls back to
+        // the title so the board is stable rather than arbitrary
+        // ("first in todo" < "triage me", both at ordinal 0).
+        let todo: Vec<&str> = columns[0].1.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(todo, vec!["c3", "c4", "c1"]);
+        assert!(columns[1].1.is_empty(), "doing is empty");
+        assert_eq!(columns[2].1.len(), 1, "review holds one card");
+        // Display order is column-major, and it is what `selected_card` indexes.
+        let order: Vec<&str> = s
+            .kanban_in_display_order()
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(order, vec!["c3", "c4", "c1", "c2"]);
+        s.selected_card = 3;
+        assert_eq!(s.focused_card().unwrap().id, "c2");
+    }
+
+    #[test]
+    fn moving_a_card_emits_the_write_but_does_not_edit_the_pane() {
+        // The pane is a projection of the store: it emits the intent and waits
+        // for the daemon's superseding republish. Editing its own copy would let
+        // the board show a move the daemon refused.
+        let mut s = AppState::new();
+        s.overlay = Overlay::Kanban;
+        s.kanban = vec![card("c1", "wire the DAG viewer", "todo", 0)];
+        reduce(&mut s, Action::MoveCardForward);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::MoveBoardCard {
+                item_id: "c1".to_owned(),
+                status: "doing".to_owned(),
+            }]
+        );
+        assert_eq!(
+            s.kanban[0].status, "todo",
+            "the pane must not move the card itself"
+        );
+
+        // The ends of the board are no-ops, not wrapped moves.
+        s.outbox.clear();
+        reduce(&mut s, Action::MoveCardBack);
+        assert!(s.outbox.is_empty(), "todo has nothing to its left");
+        s.kanban[0].status = "done".to_owned();
+        reduce(&mut s, Action::MoveCardForward);
+        assert!(s.outbox.is_empty(), "done has nothing to its right");
+    }
+
+    #[test]
+    fn a_column_move_outside_the_board_is_ignored() {
+        // The horizontal arrows are global in `Normal` mode, so a → pressed
+        // while reading the blackboard must not move a card off-screen.
+        let mut s = AppState::new();
+        s.kanban = vec![card("c1", "wire the DAG viewer", "todo", 0)];
+        for overlay in [Overlay::None, Overlay::Blackboard, Overlay::Workflow] {
+            s.overlay = overlay.clone();
+            s.outbox.clear();
+            reduce(&mut s, Action::MoveCardForward);
+            assert!(
+                s.outbox.is_empty(),
+                "{overlay:?} must not move a board card"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_board_delivery_merges_by_id_and_drops_a_superseded_revision() {
+        let mut s = AppState::new();
+        s.kanban = vec![card("c1", "old title", "todo", 0)];
+        // The replacement a move produced arrives as its own delivery.
+        reduce(
+            &mut s,
+            Action::BoardCardUpdated {
+                card: card("c2", "old title", "doing", 0),
+                superseded: false,
+            },
+        );
+        // …and the superseded revision is removed rather than merged, so the
+        // board never shows one card in two columns.
+        reduce(
+            &mut s,
+            Action::BoardCardUpdated {
+                card: card("c1", "old title", "todo", 0),
+                superseded: true,
+            },
+        );
+        assert_eq!(s.kanban.len(), 1);
+        assert_eq!(s.kanban[0].id, "c2");
+        assert_eq!(s.kanban[0].status, "doing");
+    }
+
+    #[test]
+    fn opening_the_board_watches_it_and_toggles_closed() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenKanban);
+        assert_eq!(s.overlay, Overlay::Kanban);
+        assert_eq!(s.outbox, vec![Intent::WatchBoard]);
+        reduce(&mut s, Action::OpenKanban);
+        assert_eq!(s.overlay, Overlay::None);
     }
 
     #[test]
@@ -6466,7 +7980,15 @@ mod tests {
         for c in "council".chars() {
             reduce(s, Action::InputChar(c));
         }
+        // `/council` now opens the BROWSER (list / run / delete); the builder is
+        // reached from it with `n`, the same overlay-contextual "new" the
+        // workflow and docs browsers use.
         reduce(s, Action::InputSubmit);
+        assert!(
+            matches!(s.overlay, Overlay::CouncilBrowser),
+            "the palette's council command should open the browser"
+        );
+        reduce(s, Action::NewRun);
     }
 
     #[test]
@@ -6544,7 +8066,9 @@ mod tests {
                 rounds: 2,
             },
         );
-        assert_eq!(s.overlay, Overlay::None);
+        // Rubric 6: a successful save returns to the browser (its only entry
+        // point is `n` from inside it), not the base view.
+        assert_eq!(s.overlay, Overlay::CouncilBrowser);
     }
 
     #[test]
@@ -6623,6 +8147,249 @@ mod tests {
         ));
         reduce(&mut s, Action::InputCancel);
         assert_eq!(s.overlay, Overlay::None);
+    }
+
+    fn council_card(name: &str, chair: &str, evidence: bool) -> crate::state::CouncilCard {
+        crate::state::CouncilCard {
+            name: name.to_owned(),
+            description: String::new(),
+            chair: chair.to_owned(),
+            rounds: 1,
+            evidence,
+            members: vec![
+                ("claude".to_owned(), "architect".to_owned()),
+                ("codex".to_owned(), "critic".to_owned()),
+            ],
+        }
+    }
+
+    /// Rubric 6 (TUI wiring): `/council` opens the browser, not the builder —
+    /// the builder is reached with `n` from inside it (a separate test below).
+    #[test]
+    fn palette_opens_the_council_browser() {
+        let mut s = AppState::new();
+        s.councils = vec![council_card("review-board", "chair", false)];
+        reduce(&mut s, Action::OpenPalette);
+        for c in "council".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::CouncilBrowser);
+        assert_eq!(s.input_mode(), crate::state::InputMode::Normal);
+    }
+
+    #[test]
+    fn council_browser_navigation_and_new_council_key() {
+        let mut s = AppState::new();
+        s.councils = vec![
+            council_card("alpha", "chair", false),
+            council_card("beta", "chair", true),
+        ];
+        s.overlay = Overlay::CouncilBrowser;
+        assert_eq!(s.focused_council().map(|c| c.name.as_str()), Some("alpha"));
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(s.selected_council, 1);
+        assert_eq!(s.focused_council().map(|c| c.name.as_str()), Some("beta"));
+        reduce(&mut s, Action::SelectNext); // saturates at the last row
+        assert_eq!(s.selected_council, 1);
+        reduce(&mut s, Action::SelectPrev);
+        assert_eq!(s.selected_council, 0);
+
+        // `n` (Action::NewRun) opens the existing creation wizard from inside
+        // the browser instead of starting a new conversation run.
+        reduce(&mut s, Action::NewRun);
+        assert!(matches!(s.overlay, Overlay::CouncilBuilder(_)));
+    }
+
+    #[test]
+    fn council_browser_run_prompts_for_objective_and_emits_intent() {
+        let mut s = AppState::new();
+        s.councils = vec![council_card("review-board", "chair", false)];
+        s.overlay = Overlay::CouncilBrowser;
+        // `r` reuses the physical Reject key, disambiguated by overlay (the
+        // same pattern Workflow already uses for `r` = retry).
+        reduce(&mut s, Action::Reject);
+        assert_eq!(
+            s.overlay,
+            Overlay::CouncilRunObjective {
+                name: "review-board".to_owned(),
+                buffer: String::new(),
+            }
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Editing);
+
+        // An empty objective is rejected with the prompt kept open.
+        reduce(&mut s, Action::InputSubmit);
+        assert!(matches!(s.overlay, Overlay::CouncilRunObjective { .. }));
+        assert!(s
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("must not be empty")));
+        assert!(s.drain_outbox().is_empty());
+
+        for c in "Choose the storage engine".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::CouncilBrowser);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::RunCouncil {
+                name: "review-board".to_owned(),
+                objective: "Choose the storage engine".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn council_browser_delete_confirms_then_emits_intent() {
+        let mut s = AppState::new();
+        s.councils = vec![council_card("review-board", "chair", false)];
+        s.overlay = Overlay::CouncilBrowser;
+        reduce(&mut s, Action::DeleteCouncil);
+        assert_eq!(
+            s.overlay,
+            Overlay::ConfirmCouncilDelete {
+                name: "review-board".to_owned(),
+            }
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Confirm);
+
+        // Esc/`n` returns to the browser without deleting anything.
+        reduce(&mut s, Action::Dismiss);
+        assert_eq!(s.overlay, Overlay::CouncilBrowser);
+        assert!(s.drain_outbox().is_empty());
+
+        reduce(&mut s, Action::DeleteCouncil);
+        // `y`/Enter (Action::ConfirmCancel — the shared confirm-mode key,
+        // exactly like every other confirm overlay) commits the removal.
+        reduce(&mut s, Action::ConfirmCancel);
+        assert_eq!(s.overlay, Overlay::CouncilBrowser);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::DeleteCouncil {
+                name: "review-board".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn council_deleted_action_closes_the_pending_confirm_and_clamps_selection() {
+        let mut s = AppState::new();
+        s.councils = vec![council_card("only-one", "chair", false)];
+        s.overlay = Overlay::ConfirmCouncilDelete {
+            name: "only-one".to_owned(),
+        };
+        // The harness reloads `councils` from disk before folding this
+        // action (mirrors `load_model_cards` after `AddModel`), so the
+        // deleted council is already gone by the time the reducer sees it.
+        s.councils.clear();
+        reduce(
+            &mut s,
+            Action::CouncilDeleted {
+                name: "only-one".to_owned(),
+            },
+        );
+        assert_eq!(s.overlay, Overlay::CouncilBrowser);
+        assert_eq!(s.selected_council, 0);
+        assert!(s
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("removed council")));
+    }
+
+    #[test]
+    fn council_progress_folds_into_the_active_runs_transcript() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "unrelated conversation".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::CouncilProgress {
+                name: "review-board".to_owned(),
+                message: "round 1/1 — launching 2 member(s)".to_owned(),
+            },
+        );
+        let note = s.runs[0]
+            .transcript
+            .iter()
+            .find_map(|entry| match entry {
+                TranscriptEntry::Note { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("a Note entry for the council progress line");
+        assert!(note.contains("review-board"));
+        assert!(note.contains("launching 2 member(s)"));
+    }
+
+    #[test]
+    fn council_run_finished_renders_the_chair_synthesis_into_the_transcript() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "unrelated conversation".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::CouncilRunFinished {
+                name: "review-board".to_owned(),
+                result: Ok(Box::new(crate::state::CouncilRunSummary {
+                    synthesis: "Adopt sqlite with a WAL-mode connection pool.".to_owned(),
+                    participants: vec!["claude · architect · session s1 · run r1".to_owned()],
+                    cost_line: "cost: 1200 tokens measured across 2/2 runs".to_owned(),
+                    report_markdown: "/data/councils/review-board/report.md".to_owned(),
+                })),
+            },
+        );
+        let note = s.runs[0]
+            .transcript
+            .iter()
+            .find_map(|entry| match entry {
+                TranscriptEntry::Note { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("a Note entry for the chair synthesis");
+        assert!(note.contains("Adopt sqlite"));
+        assert!(note.contains("claude · architect"));
+        assert!(note.contains("cost: 1200 tokens"));
+        assert!(note.contains("report.md"));
+        assert!(s
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("finished")));
+
+        // A failed run still surfaces the failure in the transcript rather
+        // than being silently lost.
+        reduce(
+            &mut s,
+            Action::CouncilRunFinished {
+                name: "review-board".to_owned(),
+                result: Err("council round 1 failed quorum (1 of 2 completed)".to_owned()),
+            },
+        );
+        let failures: Vec<_> = s.runs[0]
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Note { text, .. } if text.contains("failed quorum") => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failures.len(), 1);
     }
 
     #[test]
@@ -6805,6 +8572,12 @@ mod tests {
 
     // --- Task 8: the `/provider` picker (mirrors the model-picker tests above) ---
 
+    /// Bare live pick-list rows (ids only) — the shape a provider that answers
+    /// with ids alone produces, which is what most flow tests care about.
+    fn rows(ids: &[&str]) -> Vec<AddModelRow> {
+        ids.iter().map(|id| AddModelRow::live(*id)).collect()
+    }
+
     fn provider_card(
         id: &str,
         name: &str,
@@ -6824,6 +8597,10 @@ mod tests {
             can_list_models: protocol == "openai-chat"
                 && (auth.starts_with("api-key") || auth == "none"),
             available: protocol == "openai-chat" && (auth.starts_with("api-key") || auth == "none"),
+            // The default card ships no curated models and no stored key; the
+            // tests that exercise those paths set them explicitly.
+            catalog_models: 0,
+            has_key: false,
         }
     }
 
@@ -6959,6 +8736,7 @@ mod tests {
             vec![Intent::QueryProviderModels {
                 provider_id: "ollama".to_owned(),
                 api_key: None,
+                refresh: false,
             }]
         );
     }
@@ -7504,7 +9282,7 @@ mod tests {
     }
 
     #[test]
-    fn available_acp_provider_connects_without_asking_for_a_model_or_key() {
+    fn an_uninstalled_acp_provider_connects_without_asking_for_a_model_or_key() {
         let mut s = AppState::new();
         s.providers = vec![provider_card(
             "mistral-vibe",
@@ -7514,8 +9292,11 @@ mod tests {
             false,
         )];
         // The shared helper derives runtime availability for native chat
-        // providers; this fixture represents the CLI's verified ACP install.
+        // providers; this fixture represents the CLI's verified ACP install
+        // that is NOT yet launchable, so there is nothing to handshake for a
+        // model list.
         s.providers[0].available = true;
+        s.providers[0].can_list_models = false;
         open_provider_picker(&mut s);
         reduce(&mut s, Action::BeginAddModel);
         assert_eq!(
@@ -7525,9 +9306,79 @@ mod tests {
                 provider_id: "mistral-vibe".to_string(),
                 model: "mistral-vibe".to_string(),
                 api_key: None,
+                context_tokens: None,
             }]
         );
         assert!(matches!(s.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn an_installed_acp_provider_queries_its_models_before_connecting() {
+        // An installed agent can be handshaken, so it takes the same
+        // query -> pick path a hosted provider does. The harness spawns the
+        // agent instead of GETting `/models`; the overlay cannot tell.
+        let mut s = AppState::new();
+        s.providers = vec![provider_card(
+            "mistral-vibe",
+            "Mistral Vibe",
+            "acp",
+            "acp: binary",
+            false,
+        )];
+        s.providers[0].available = true;
+        s.providers[0].can_list_models = true;
+        open_provider_picker(&mut s);
+        reduce(&mut s, Action::BeginAddModel);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::QueryProviderModels {
+                provider_id: "mistral-vibe".to_string(),
+                // An ACP agent is never asked for an API key.
+                api_key: None,
+                refresh: false,
+            }]
+        );
+        assert!(matches!(
+            &s.overlay,
+            Overlay::AddModelQuerying { provider_id, api_key: None } if provider_id == "mistral-vibe"
+        ));
+    }
+
+    #[test]
+    fn picking_an_acp_agents_model_adds_it_as_that_agents_model() {
+        // The pick overlay carries the agent's OWN model ids; the harness turns
+        // the chosen one into a pinned ACP profile.
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "mistral-vibe".to_string(),
+            api_key: None,
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsLoaded {
+                provider_id: "mistral-vibe".to_string(),
+                // An agent advertises ids only — no catalog metadata exists for
+                // a model that lives inside someone else's agent.
+                models: vec![
+                    AddModelRow::live("agent-model-1"),
+                    AddModelRow::live("agent-model-2"),
+                ],
+                origin: ModelListOrigin::Live,
+            },
+        );
+        assert!(matches!(s.overlay, Overlay::AddModelPick { .. }));
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::AddModel {
+                display_id: "mistral-vibe/agent-model-1".to_string(),
+                provider_id: "mistral-vibe".to_string(),
+                model: "agent-model-1".to_string(),
+                api_key: None,
+                context_tokens: None,
+            }],
+            "the picked agent model must reach the harness verbatim"
+        );
     }
 
     #[test]
@@ -7608,6 +9459,7 @@ mod tests {
             vec![Intent::QueryProviderModels {
                 provider_id: "ollama".to_owned(),
                 api_key: None,
+                refresh: false,
             }]
         );
         assert_eq!(
@@ -7680,7 +9532,8 @@ mod tests {
             &mut s,
             Action::ProviderModelsLoaded {
                 provider_id: "groq".to_owned(),
-                models: vec!["llama-3.1-8b".to_owned(), "llama-3.3-70b".to_owned()],
+                models: rows(&["llama-3.1-8b", "llama-3.3-70b"]),
+                origin: ModelListOrigin::Live,
             },
         );
         assert_eq!(
@@ -7688,9 +9541,11 @@ mod tests {
             Overlay::AddModelPick {
                 provider_id: "groq".to_owned(),
                 api_key: Some(SecretKey("sk-secret".to_owned())),
-                models: vec!["llama-3.1-8b".to_owned(), "llama-3.3-70b".to_owned()],
+                models: rows(&["llama-3.1-8b", "llama-3.3-70b"]),
                 query: String::new(),
                 selected: 0,
+                origin: ModelListOrigin::Live,
+                refreshing: false,
             }
         );
     }
@@ -7706,7 +9561,8 @@ mod tests {
             &mut s,
             Action::ProviderModelsLoaded {
                 provider_id: "ollama".to_owned(),
-                models: vec!["qwen".to_owned()],
+                models: rows(&["qwen"]),
+                origin: ModelListOrigin::Live,
             },
         );
         assert_eq!(
@@ -7864,6 +9720,7 @@ mod tests {
             vec![Intent::QueryProviderModels {
                 provider_id: "groq".to_owned(),
                 api_key: Some(SecretKey("sk-secret".to_owned())),
+                refresh: false,
             }]
         );
         assert_eq!(
@@ -7888,6 +9745,7 @@ mod tests {
             vec![Intent::QueryProviderModels {
                 provider_id: "groq".to_owned(),
                 api_key: None,
+                refresh: false,
             }]
         );
         assert_eq!(
@@ -7905,9 +9763,11 @@ mod tests {
         s.overlay = Overlay::AddModelPick {
             provider_id: "groq".to_owned(),
             api_key: Some(SecretKey("sk-secret".to_owned())),
-            models: vec!["llama-3.1-8b".to_owned(), "llama-3.3-70b".to_owned()],
+            models: rows(&["llama-3.1-8b", "llama-3.3-70b"]),
             query: String::new(),
             selected: 1,
+            origin: ModelListOrigin::Live,
+            refreshing: false,
         };
         reduce(&mut s, Action::InputSubmit);
         assert_eq!(s.overlay, Overlay::None);
@@ -7918,6 +9778,7 @@ mod tests {
                 provider_id: "groq".to_owned(),
                 model: "llama-3.3-70b".to_owned(),
                 api_key: Some(SecretKey("sk-secret".to_owned())),
+                context_tokens: None,
             }]
         );
     }
@@ -7928,9 +9789,11 @@ mod tests {
         s.overlay = Overlay::AddModelPick {
             provider_id: "groq".to_owned(),
             api_key: None,
-            models: vec!["llama-3.1-8b".to_owned()],
+            models: rows(&["llama-3.1-8b"]),
             query: "zzz-nope".to_owned(),
             selected: 0,
+            origin: ModelListOrigin::Live,
+            refreshing: false,
         };
         reduce(&mut s, Action::InputSubmit);
         assert_eq!(s.overlay, Overlay::None, "the picker still closes");
@@ -7943,9 +9806,11 @@ mod tests {
         s.overlay = Overlay::AddModelPick {
             provider_id: "groq".to_owned(),
             api_key: None,
-            models: vec!["llama-3.1-8b".to_owned(), "gpt-oss-20b".to_owned()],
+            models: rows(&["llama-3.1-8b", "gpt-oss-20b"]),
             query: String::new(),
             selected: 1,
+            origin: ModelListOrigin::Live,
+            refreshing: false,
         };
         // Typing resets the selection to the top of the new filtered set.
         for c in "gpt".chars() {
@@ -7990,7 +9855,289 @@ mod tests {
                 provider_id: "groq".to_owned(),
                 model: "llama-3.1-8b".to_owned(),
                 api_key: Some(SecretKey("sk-secret".to_owned())),
+                context_tokens: None,
             }]
+        );
+    }
+
+    /// The picked row's context window rides the intent, so the model is
+    /// persisted with a real context instead of the `None` every discovered
+    /// model used to get.
+    #[test]
+    fn add_model_pick_carries_the_rows_context_window() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelPick {
+            provider_id: "nebius".to_owned(),
+            api_key: None,
+            models: vec![AddModelRow {
+                id: "deepseek-ai/DeepSeek-V3".to_owned(),
+                name: Some("DeepSeek V3".to_owned()),
+                context_tokens: Some(128_000),
+                cost_per_1m_input_usd: Some(0.5),
+                cost_per_1m_output_usd: Some(1.5),
+                live: true,
+            }],
+            query: String::new(),
+            selected: 0,
+            origin: ModelListOrigin::Live,
+            refreshing: false,
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::AddModel {
+                display_id: "nebius/deepseek-ai/DeepSeek-V3".to_owned(),
+                provider_id: "nebius".to_owned(),
+                model: "deepseek-ai/DeepSeek-V3".to_owned(),
+                api_key: None,
+                context_tokens: Some(128_000),
+            }]
+        );
+    }
+
+    /// The requires_key fallback bug: a hosted provider whose query failed with
+    /// a BLANK key must still be asked for one. Writing a keyless model here is
+    /// a guaranteed 401 at run time, discovered only when a run fails.
+    #[test]
+    fn add_model_id_with_a_blank_captured_key_still_prompts_a_key_requiring_provider() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelId {
+            provider_id: "groq".to_owned(),
+            requires_key: true,
+            api_key: Some(SecretKey("   ".to_owned())),
+            buffer: "llama-3.1-8b".to_owned(),
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert!(
+            matches!(
+                &s.overlay,
+                Overlay::AddModelKey { provider_id, model, .. }
+                    if provider_id == "groq" && model == "llama-3.1-8b"
+            ),
+            "a blank captured key must route through the masked prompt, got {:?}",
+            s.overlay
+        );
+        assert!(
+            s.outbox.is_empty(),
+            "nothing is added until a key decision is made"
+        );
+    }
+
+    /// The same bug from the other side: when the provider card is not loaded,
+    /// the failure fallback assumes a key IS needed rather than inferring it
+    /// from whether this particular query carried one.
+    #[test]
+    fn provider_models_failed_assumes_a_key_is_needed_for_an_unknown_provider() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "mystery".to_owned(),
+            api_key: None,
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsFailed {
+                provider_id: "mystery".to_owned(),
+                reason: "HTTP 401".to_owned(),
+            },
+        );
+        assert!(
+            matches!(
+                &s.overlay,
+                Overlay::AddModelId { requires_key, .. } if *requires_key
+            ),
+            "an unknown provider falls back to requiring a key, got {:?}",
+            s.overlay
+        );
+    }
+
+    /// A provider with no live listing but curated catalog rows still opens the
+    /// pick-list (via the harness's catalog answer) instead of the free-text
+    /// prompt — the Perplexity case.
+    #[test]
+    fn a_catalog_only_provider_queries_instead_of_falling_back_to_free_text() {
+        let mut s = AppState::new();
+        let mut card = provider_card(
+            "perplexity",
+            "Perplexity",
+            "openai-chat",
+            "api-key: PERPLEXITY_API_KEY",
+            false,
+        );
+        card.can_list_models = false;
+        card.available = true;
+        card.catalog_models = 7;
+        card.has_key = true; // a key is already stored: no re-prompt
+        s.providers = vec![card];
+        open_provider_picker(&mut s);
+        reduce(&mut s, Action::BeginAddModel);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::QueryProviderModels {
+                provider_id: "perplexity".to_owned(),
+                api_key: None,
+                refresh: false,
+            }],
+            "curated rows are requested rather than a model name typed blind"
+        );
+        assert!(matches!(s.overlay, Overlay::AddModelQuerying { .. }));
+    }
+
+    /// A stored provider key skips the key-first prompt entirely (adding a
+    /// second model from a provider must not ask for the same key again).
+    #[test]
+    fn a_provider_with_a_stored_key_skips_the_key_prompt() {
+        let mut s = AppState::new();
+        let mut card = provider_card(
+            "groq",
+            "Groq",
+            "openai-chat",
+            "api-key: GROQ_API_KEY",
+            false,
+        );
+        card.has_key = true;
+        s.providers = vec![card];
+        open_provider_picker(&mut s);
+        reduce(&mut s, Action::BeginAddModel);
+        assert!(
+            matches!(s.overlay, Overlay::AddModelQuerying { .. }),
+            "the flow goes straight to the query, got {:?}",
+            s.overlay
+        );
+    }
+
+    /// `Ctrl-R` on an open pick-list re-queries with the stashed key and marks
+    /// the overlay refreshing; the fresher answer replaces the rows under the
+    /// operator's filter without losing it.
+    #[test]
+    fn refresh_re_queries_and_folds_the_answer_under_the_live_filter() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelPick {
+            provider_id: "groq".to_owned(),
+            api_key: Some(SecretKey("sk-secret".to_owned())),
+            models: rows(&["llama-3.1-8b"]),
+            query: "llama".to_owned(),
+            selected: 0,
+            origin: ModelListOrigin::Cached("2h ago".to_owned()),
+            refreshing: false,
+        };
+        reduce(&mut s, Action::RefreshProviderModels);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::QueryProviderModels {
+                provider_id: "groq".to_owned(),
+                api_key: Some(SecretKey("sk-secret".to_owned())),
+                refresh: true,
+            }]
+        );
+        assert!(
+            matches!(&s.overlay, Overlay::AddModelPick { refreshing, .. } if *refreshing),
+            "the overlay marks the in-flight refresh"
+        );
+
+        reduce(
+            &mut s,
+            Action::ProviderModelsLoaded {
+                provider_id: "groq".to_owned(),
+                models: rows(&["llama-3.1-8b", "llama-3.3-70b", "gpt-oss-20b"]),
+                origin: ModelListOrigin::Live,
+            },
+        );
+        match &s.overlay {
+            Overlay::AddModelPick {
+                models,
+                query,
+                origin,
+                refreshing,
+                ..
+            } => {
+                assert_eq!(models.len(), 3, "the fresher list replaced the rows");
+                assert_eq!(query, "llama", "the operator's filter survives");
+                assert_eq!(*origin, ModelListOrigin::Live);
+                assert!(!refreshing);
+            }
+            other => panic!("expected the pick-list, got {other:?}"),
+        }
+    }
+
+    /// A failed manual refresh leaves the rows on screen: they are still
+    /// usable, so only the notice changes.
+    #[test]
+    fn a_failed_refresh_keeps_the_pick_list_open() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelPick {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+            models: rows(&["llama-3.1-8b"]),
+            query: String::new(),
+            selected: 0,
+            origin: ModelListOrigin::Live,
+            refreshing: true,
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsFailed {
+                provider_id: "groq".to_owned(),
+                reason: "request timed out".to_owned(),
+            },
+        );
+        match &s.overlay {
+            Overlay::AddModelPick {
+                models, refreshing, ..
+            } => {
+                assert_eq!(models.len(), 1, "the usable rows stay");
+                assert!(!refreshing);
+            }
+            other => panic!("expected the pick-list, got {other:?}"),
+        }
+    }
+
+    /// `Ctrl-T` in `/keys` probes the focused model, and the answer replaces
+    /// that card's readiness — a hosted model stops claiming "Unverified" once
+    /// it has actually been checked.
+    #[test]
+    fn verify_api_key_probes_the_focused_model_and_folds_the_result() {
+        let mut s = AppState::new();
+        s.models = vec![crate::state::ModelCard {
+            id: ModelId("groq/llama".to_owned()),
+            provider: "openai-compatible".to_owned(),
+            readiness: ModelReadiness::Unverified,
+            location: None,
+            cost_per_1k_usd: None,
+            context_tokens: None,
+        }];
+        s.overlay = Overlay::ApiKeys {
+            query: String::new(),
+            selected: 0,
+        };
+        reduce(&mut s, Action::VerifyApiKey);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::VerifyApiKey {
+                model_id: "groq/llama".to_owned(),
+            }]
+        );
+        reduce(
+            &mut s,
+            Action::ModelKeyVerified {
+                model_id: "groq/llama".to_owned(),
+                ok: true,
+                reason: String::new(),
+            },
+        );
+        assert_eq!(s.models[0].readiness, ModelReadiness::Ready);
+
+        reduce(
+            &mut s,
+            Action::ModelKeyVerified {
+                model_id: "groq/llama".to_owned(),
+                ok: false,
+                reason: "provider returned HTTP 401 from /models".to_owned(),
+            },
+        );
+        assert!(
+            matches!(&s.models[0].readiness, ModelReadiness::Unavailable(reason) if reason.contains("401")),
+            "a rejected key is reported honestly, got {:?}",
+            s.models[0].readiness
         );
     }
 
@@ -8224,6 +10371,1342 @@ mod tests {
             crate::markdown::parse_calls(),
             0,
             "already-cached entry re-parsed"
+        );
+    }
+
+    // --- Local models: browse the Unsloth GGUF catalog ---
+
+    fn unsloth_repo(id: &str) -> UnslothRepoCard {
+        UnslothRepoCard {
+            id: id.to_owned(),
+            downloads_label: "6.6M downloads".to_owned(),
+            likes_label: "891 likes".to_owned(),
+            updated_label: "updated 2026-01-30".to_owned(),
+        }
+    }
+
+    fn unsloth_quant(quant: &str) -> UnslothQuantCard {
+        UnslothQuantCard {
+            quant: quant.to_owned(),
+            size_label: "18.7 GB".to_owned(),
+            file_count: 1,
+            size_bytes: 18_700_000_000,
+        }
+    }
+
+    #[test]
+    fn palette_opens_the_unsloth_catalog_loading_and_requests_the_repo_listing() {
+        let mut s = AppState::new();
+        run_palette_command(&mut s, crate::palette::PaletteCommand::UnslothCatalog);
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothRepos {
+                repos: Vec::new(),
+                query: String::new(),
+                selected: 0,
+                loading: true,
+            }
+        );
+        assert_eq!(s.drain_outbox(), vec![Intent::ListUnslothRepos]);
+    }
+
+    #[test]
+    fn unsloth_repos_loaded_fills_the_loading_overlay() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothRepos {
+            repos: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+        };
+        let repos = vec![unsloth_repo("unsloth/Qwen3-32B-GGUF")];
+        reduce(&mut s, Action::UnslothReposLoaded(repos.clone()));
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothRepos {
+                repos,
+                query: String::new(),
+                selected: 0,
+                loading: false,
+            }
+        );
+    }
+    // --- Alt-↑/↓ + Alt-Enter: the keyboard path to tool cards and diffs ---
+
+    /// Builds a run whose transcript is: [0] User objective, [1] Tool card,
+    /// [2] Model prose, [3] Patch — two folds separated by a non-foldable
+    /// entry, so a walk that stepped one *entry* at a time would land on
+    /// something with nothing to open.
+    fn run_with_two_folds() -> AppState {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc".to_owned(),
+                label: Some("cargo test".to_owned()),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "on it".to_owned(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::PatchProposed {
+                run_id,
+                changeset_id: ChangeSetId::new(),
+                artifact: artifact(),
+                files: vec!["src/lib.rs".to_owned()],
+                additions: 2,
+                deletions: 1,
+                preview: "@@ -1 +1 @@\n-old\n+new".to_owned(),
+                preview_truncated: false,
+            }),
+        );
+        assert!(matches!(s.runs[0].transcript[1], TranscriptEntry::Tool(_)));
+        assert!(matches!(
+            s.runs[0].transcript[2],
+            TranscriptEntry::Model { .. }
+        ));
+        assert!(matches!(s.runs[0].transcript[3], TranscriptEntry::Patch(_)));
+        s
+    }
+
+    fn tool_expanded(s: &AppState) -> bool {
+        let TranscriptEntry::Tool(card) = &s.runs[0].transcript[1] else {
+            unreachable!()
+        };
+        card.expanded
+    }
+
+    fn patch_expanded(s: &AppState) -> bool {
+        let TranscriptEntry::Patch(patch) = &s.runs[0].transcript[3] else {
+            unreachable!()
+        };
+        patch.expanded
+    }
+
+    #[test]
+    fn alt_arrows_walk_only_foldable_entries_and_alt_enter_expands_them() {
+        let mut s = run_with_two_folds();
+        assert!(!s.transcript_browse, "the base view composes by default");
+
+        // The first Alt-↑ enters browse mode at the NEWEST fold — the one the
+        // tail of the conversation is already showing.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert!(s.transcript_browse);
+        assert_eq!(
+            s.runs[0].transcript_selected, 3,
+            "entered at the newest fold"
+        );
+
+        // Alt-Enter expands it: the diff renderer was unreachable before this.
+        reduce(&mut s, Action::InputNewline);
+        assert!(patch_expanded(&s), "Alt-Enter expands the browsed patch");
+        assert!(
+            s.composer.is_empty(),
+            "Alt-Enter while browsing must not type a newline into the draft"
+        );
+        reduce(&mut s, Action::InputNewline);
+        assert!(!patch_expanded(&s), "Alt-Enter toggles it back");
+
+        // Alt-↑ SKIPS the model prose at index 2 (nothing to open there).
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!(
+            s.runs[0].transcript_selected, 1,
+            "skipped the non-foldable model entry"
+        );
+        reduce(&mut s, Action::InputNewline);
+        assert!(tool_expanded(&s), "Alt-Enter expands the browsed tool card");
+
+        // Saturates at the oldest fold rather than wrapping into the objective…
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!(s.runs[0].transcript_selected, 1);
+        // …and walks forward again.
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert_eq!(s.runs[0].transcript_selected, 3);
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert_eq!(
+            s.runs[0].transcript_selected, 3,
+            "saturates at the newest fold"
+        );
+    }
+
+    #[test]
+    fn unsloth_repos_loaded_after_the_overlay_closed_is_ignored() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::None;
+        reduce(
+            &mut s,
+            Action::UnslothReposLoaded(vec![unsloth_repo("unsloth/Qwen3-32B-GGUF")]),
+        );
+        assert_eq!(s.overlay, Overlay::None, "a late reply must not reopen it");
+    }
+
+    #[test]
+    fn unsloth_repos_failed_closes_with_a_notice() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothRepos {
+            repos: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+        };
+        reduce(
+            &mut s,
+            Action::UnslothReposFailed("network error".to_owned()),
+        );
+        assert_eq!(s.overlay, Overlay::None);
+        assert!(s.notice.is_some());
+        assert!(s.notice.unwrap().0.contains("network error"));
+    }
+
+    #[test]
+    fn entering_a_repo_row_begins_fetching_its_quants() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothRepos {
+            repos: vec![unsloth_repo("unsloth/Qwen3-32B-GGUF")],
+            query: String::new(),
+            selected: 0,
+            loading: false,
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothQuants {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quants: Vec::new(),
+                query: String::new(),
+                selected: 0,
+                loading: true,
+            }
+        );
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::ListUnslothQuants {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn entering_a_repo_row_with_a_filtered_query_resolves_the_visible_selection() {
+        // Regression guard for the zero-match convention: `selected` indexes
+        // the FILTERED list, not the full one.
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothRepos {
+            repos: vec![
+                unsloth_repo("unsloth/Qwen3-32B-GGUF"),
+                unsloth_repo("unsloth/gpt-oss-20b-GGUF"),
+            ],
+            query: "gpt-oss".to_owned(),
+            selected: 0,
+            loading: false,
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::ListUnslothQuants {
+                repo_id: "unsloth/gpt-oss-20b-GGUF".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unsloth_quants_loaded_fills_the_matching_repo() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothQuants {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quants: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+        };
+        let quants = vec![unsloth_quant("Q4_K_M"), unsloth_quant("UD-Q4_K_XL")];
+        reduce(
+            &mut s,
+            Action::UnslothQuantsLoaded {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quants: quants.clone(),
+            },
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothQuants {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quants,
+                query: String::new(),
+                selected: 0,
+                loading: false,
+            }
+        );
+    }
+
+    #[test]
+    fn unsloth_quants_loaded_for_a_stale_repo_is_ignored() {
+        // The operator navigated back and picked a DIFFERENT repo before this
+        // reply for the first one landed.
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothQuants {
+            repo_id: "unsloth/gpt-oss-20b-GGUF".to_owned(),
+            quants: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+        };
+        reduce(
+            &mut s,
+            Action::UnslothQuantsLoaded {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quants: vec![unsloth_quant("Q4_K_M")],
+            },
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothQuants {
+                repo_id: "unsloth/gpt-oss-20b-GGUF".to_owned(),
+                quants: Vec::new(),
+                query: String::new(),
+                selected: 0,
+                loading: true,
+            },
+            "a stale reply for a different repo must not overwrite the current browse"
+        );
+    }
+
+    #[test]
+    fn unsloth_quants_failed_closes_with_a_notice_naming_the_repo() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothQuants {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quants: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+        };
+        reduce(
+            &mut s,
+            Action::UnslothQuantsFailed {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                reason: "404".to_owned(),
+            },
+        );
+        assert_eq!(s.overlay, Overlay::None);
+        let notice = s.notice.expect("a notice is set");
+        assert!(notice.0.contains("unsloth/Qwen3-32B-GGUF"));
+        assert!(notice.0.contains("404"));
+    }
+
+    #[test]
+    fn entering_a_quant_row_opens_the_pull_confirm() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothQuants {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quants: vec![unsloth_quant("UD-Q4_K_XL")],
+            query: String::new(),
+            selected: 0,
+            loading: false,
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothConfirmPull {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                size_label: "18.7 GB".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn confirming_the_pull_starts_it_and_emits_the_pull_intent() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothConfirmPull {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            size_label: "18.7 GB".to_owned(),
+        };
+        reduce(&mut s, Action::ConfirmCancel);
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothPulling {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                lines: Vec::new(),
+                done: false,
+                error: None,
+                registered_id: None,
+            }
+        );
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::PullUnslothModel {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn declining_the_pull_confirm_closes_without_emitting_anything() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothConfirmPull {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            size_label: "18.7 GB".to_owned(),
+        };
+        reduce(&mut s, Action::Dismiss);
+        assert_eq!(s.overlay, Overlay::None);
+        assert!(s.drain_outbox().is_empty());
+    }
+
+    #[test]
+    fn pull_progress_lines_append_only_for_the_matching_repo_and_quant() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothPulling {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            lines: Vec::new(),
+            done: false,
+            error: None,
+            registered_id: None,
+        };
+        reduce(
+            &mut s,
+            Action::UnslothPullProgress {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                line: "pulling manifest".to_owned(),
+            },
+        );
+        // A line for a DIFFERENT quant of a pull the operator already moved
+        // past must not land in this view.
+        reduce(
+            &mut s,
+            Action::UnslothPullProgress {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "Q4_K_M".to_owned(),
+                line: "should not appear".to_owned(),
+            },
+        );
+        match &s.overlay {
+            Overlay::UnslothPulling { lines, .. } => {
+                assert_eq!(lines, &vec!["pulling manifest".to_owned()]);
+            }
+            other => panic!("expected UnslothPulling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pull_finished_success_sets_done_and_the_registered_id() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothPulling {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            lines: vec!["pulling manifest".to_owned()],
+            done: false,
+            error: None,
+            registered_id: None,
+        };
+        reduce(
+            &mut s,
+            Action::UnslothPullFinished {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                result: Ok("hf.co/unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL".to_owned()),
+            },
+        );
+        assert_eq!(
+            s.overlay,
+            Overlay::UnslothPulling {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                lines: vec!["pulling manifest".to_owned()],
+                done: true,
+                error: None,
+                registered_id: Some("hf.co/unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn pull_finished_failure_sets_done_and_the_error() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UnslothPulling {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            lines: Vec::new(),
+            done: false,
+            error: None,
+            registered_id: None,
+        };
+        reduce(
+            &mut s,
+            Action::UnslothPullFinished {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                result: Err("ollama not found".to_owned()),
+            },
+        );
+        match &s.overlay {
+            Overlay::UnslothPulling {
+                done,
+                error,
+                registered_id,
+                ..
+            } => {
+                assert!(*done);
+                assert_eq!(error.as_deref(), Some("ollama not found"));
+                assert_eq!(*registered_id, None);
+            }
+            other => panic!("expected UnslothPulling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pull_finished_for_a_dismissed_overlay_is_dropped() {
+        // Mirrors `AddModelQuerying`'s documented "a late result is ignored"
+        // behavior: the operator closed the progress view, the detached pull
+        // keeps running, and its terminal result has nowhere to land.
+        let mut s = AppState::new();
+        s.overlay = Overlay::None;
+        reduce(
+            &mut s,
+            Action::UnslothPullFinished {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "UD-Q4_K_XL".to_owned(),
+                result: Ok("hf.co/unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL".to_owned()),
+            },
+        );
+        assert_eq!(s.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn esc_closes_every_step_of_the_unsloth_flow() {
+        let overlays = vec![
+            Overlay::UnslothRepos {
+                repos: vec![unsloth_repo("unsloth/Qwen3-32B-GGUF")],
+                query: String::new(),
+                selected: 0,
+                loading: false,
+            },
+            Overlay::UnslothQuants {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quants: vec![unsloth_quant("Q4_K_M")],
+                query: String::new(),
+                selected: 0,
+                loading: false,
+            },
+            Overlay::UnslothConfirmPull {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "Q4_K_M".to_owned(),
+                size_label: "18.7 GB".to_owned(),
+            },
+            Overlay::UnslothPulling {
+                repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                quant: "Q4_K_M".to_owned(),
+                lines: Vec::new(),
+                done: false,
+                error: None,
+                registered_id: None,
+            },
+        ];
+        for overlay in overlays {
+            let mut s = AppState::new();
+            s.overlay = overlay.clone();
+            reduce(&mut s, Action::Dismiss);
+            assert_eq!(s.overlay, Overlay::None, "Esc must close {overlay:?}");
+        }
+    }
+
+    #[test]
+    fn unsloth_repo_and_quant_filter_functions_match_case_insensitive_substrings() {
+        let repos = vec![
+            unsloth_repo("unsloth/Qwen3-32B-GGUF"),
+            unsloth_repo("unsloth/gpt-oss-20b-GGUF"),
+        ];
+        assert_eq!(filter_unsloth_repos(&repos, ""), vec![0, 1]);
+        assert_eq!(filter_unsloth_repos(&repos, "GPT-OSS"), vec![1]);
+        assert!(filter_unsloth_repos(&repos, "zzz").is_empty());
+
+        let quants = vec![unsloth_quant("Q4_K_M"), unsloth_quant("UD-Q4_K_XL")];
+        assert_eq!(filter_unsloth_quants(&quants, "ud-"), vec![1]);
+    }
+
+    #[test]
+    fn alt_enter_is_still_a_line_break_when_not_browsing() {
+        let mut s = run_with_two_folds();
+        reduce(&mut s, Action::InputChar('h'));
+        reduce(&mut s, Action::InputNewline);
+        reduce(&mut s, Action::InputChar('i'));
+        assert_eq!(s.composer, "h\ni");
+        assert!(!tool_expanded(&s) && !patch_expanded(&s));
+    }
+
+    #[test]
+    fn typing_scrolling_esc_and_run_switching_leave_browse_mode() {
+        // Browse mode is a transient "the transcript has my attention" state:
+        // every gesture meaning "I am driving the composer or the viewport
+        // again" ends it, so Alt-Enter is a line break once more.
+        let mut s = run_with_two_folds();
+
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(&mut s, Action::InputChar('x'));
+        assert!(!s.transcript_browse, "typing returns to composing");
+        assert_eq!(s.composer, "x");
+
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(&mut s, Action::ScrollPageUp);
+        assert!(
+            !s.transcript_browse,
+            "scrolling drives the viewport by hand"
+        );
+
+        // Esc steps out of browse mode WITHOUT destroying the draft; a second
+        // Esc then clears the draft as it always did.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(&mut s, Action::InputCancel);
+        assert!(!s.transcript_browse);
+        assert_eq!(s.composer, "x", "Esc out of browse mode keeps the draft");
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.composer, "", "a second Esc clears the draft");
+
+        // Switching runs abandons a selection that belonged to the other run.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        reduce(&mut s, Action::PrevRun);
+        assert!(!s.transcript_browse);
+    }
+
+    #[test]
+    fn browsing_is_a_no_op_without_folds_or_under_an_overlay() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // Only the User objective — nothing foldable.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert!(!s.transcript_browse, "no fold to browse, no browse mode");
+
+        // An open overlay owns the arrows; browsing must not run underneath it.
+        let mut s = run_with_two_folds();
+        s.overlay = Overlay::Help;
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert!(!s.transcript_browse);
+    }
+
+    #[test]
+    fn expand_no_longer_needs_the_unreachable_transcript_pane_focus() {
+        // The old guard required `focus == Pane::Transcript`, which `Tab` could
+        // not reach from the base view — that is what made tool cards and patch
+        // diffs dead UI. In the base view (no overlay) the fold expands from
+        // whatever the vestigial pane focus happens to be.
+        let mut s = run_with_two_folds();
+        s.focus = Pane::Sessions;
+        s.runs[0].transcript_selected = 1;
+        reduce(&mut s, Action::Expand);
+        assert!(tool_expanded(&s));
+
+        // A browser overlay still owns Enter for its own list: no silent
+        // toggling of a fold hidden behind the modal.
+        let mut s = run_with_two_folds();
+        s.focus = Pane::Sessions;
+        s.overlay = Overlay::Skills;
+        s.runs[0].transcript_selected = 1;
+        reduce(&mut s, Action::Expand);
+        assert!(!tool_expanded(&s));
+    }
+
+    #[test]
+    fn clicking_a_fold_row_hands_the_keyboard_the_same_selection() {
+        // RULE 3 both ways: a click selects + toggles and leaves the fold
+        // browsable, so Alt-↑ carries on from the clicked row.
+        let mut s = run_with_two_folds();
+        reduce(&mut s, Action::ActivateRow(3));
+        assert!(patch_expanded(&s));
+        assert!(s.transcript_browse, "the clicked fold is the browsed fold");
+        assert_eq!(s.runs[0].transcript_selected, 3);
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!(
+            s.runs[0].transcript_selected, 1,
+            "the keyboard continues from the click"
+        );
+    }
+
+    #[test]
+    fn every_foldable_entry_kind_is_reachable_by_both_click_and_keyboard() {
+        // `TranscriptEntry::is_foldable` is the single predicate the renderer's
+        // click targets and the Alt-↑/↓ walk share, so this list IS the parity
+        // guarantee.
+        let tool = TranscriptEntry::Tool(Box::new(crate::state::ToolCard {
+            tool: "shell.run".to_owned(),
+            status: crate::state::ToolStatus::Running,
+            action: None,
+            args_digest: None,
+            label: None,
+            outcome: None,
+            artifact: None,
+            approval_id: None,
+            expanded: false,
+        }));
+        assert!(tool.is_foldable(), "tool cards were the dead feature");
+        assert!(TranscriptEntry::Patch(PatchSummary {
+            changeset_id: ChangeSetId::new(),
+            artifact: artifact(),
+            files: vec!["a.rs".to_owned()],
+            additions: 1,
+            deletions: 0,
+            preview: "@@".to_owned(),
+            preview_truncated: false,
+            expanded: false,
+        })
+        .is_foldable());
+        assert!(TranscriptEntry::Backstage {
+            context_lines: Some(3),
+            memory_updates: 0,
+            raw: vec!["x".to_owned()],
+            expanded: false,
+        }
+        .is_foldable());
+        assert!(TranscriptEntry::Note {
+            text: "a\nb\nc".to_owned(),
+            expanded: false,
+        }
+        .is_foldable());
+        assert!(
+            !TranscriptEntry::Note {
+                text: "one liner".to_owned(),
+                expanded: false,
+            }
+            .is_foldable(),
+            "a short note renders inline — there is nothing to unfold"
+        );
+        assert!(TranscriptEntry::Completed {
+            disposition: RunDisposition::Failed {
+                reason: "boom".to_owned()
+            },
+            expanded: false,
+        }
+        .is_foldable());
+        assert!(!TranscriptEntry::User {
+            text: "hi".to_owned()
+        }
+        .is_foldable());
+    }
+
+    // --- composer cursor: a real text field, not an append-only buffer ---
+
+    /// Type `text` into an empty composer one action at a time, exactly as the
+    /// input layer would.
+    fn typed(text: &str) -> AppState {
+        let mut s = AppState::new();
+        for c in text.chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        assert_eq!(s.composer_cursor, s.composer.len());
+        s
+    }
+
+    #[test]
+    fn arrows_home_and_end_move_the_insertion_point_and_edits_splice() {
+        let mut s = typed("helo world");
+        // ← ← ← ← ← ← puts the caret between "hel" and "o world".
+        for _ in 0..7 {
+            reduce(&mut s, Action::CursorLeft);
+        }
+        assert_eq!(s.composer_cursor, 3);
+        reduce(&mut s, Action::InputChar('l'));
+        assert_eq!(s.composer, "hello world", "typing splices at the cursor");
+        assert_eq!(s.composer_cursor, 4, "the cursor follows the inserted text");
+
+        // Backspace deletes BEFORE the cursor, not at the end of the draft.
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.composer, "helo world");
+        assert_eq!(s.composer_cursor, 3);
+
+        reduce(&mut s, Action::CursorLineEnd);
+        assert_eq!(s.composer_cursor, s.composer.len());
+        reduce(&mut s, Action::CursorLineStart);
+        assert_eq!(s.composer_cursor, 0);
+        // Motion saturates at both ends instead of underflowing.
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(s.composer_cursor, 0);
+        reduce(&mut s, Action::CursorLineEnd);
+        reduce(&mut s, Action::CursorRight);
+        assert_eq!(s.composer_cursor, s.composer.len());
+    }
+
+    #[test]
+    fn ctrl_w_deletes_a_word_and_ctrl_u_deletes_to_the_line_start() {
+        let mut s = typed("cargo test --all-targets");
+        reduce(&mut s, Action::DeleteWordBack);
+        assert_eq!(s.composer, "cargo test ");
+        assert_eq!(s.composer_cursor, s.composer.len());
+        // Trailing whitespace is skipped before the word itself is eaten.
+        reduce(&mut s, Action::DeleteWordBack);
+        assert_eq!(s.composer, "cargo ");
+        reduce(&mut s, Action::DeleteToLineStart);
+        assert_eq!(s.composer, "");
+        assert_eq!(s.composer_cursor, 0);
+        // Both are inert on an empty draft rather than panicking.
+        reduce(&mut s, Action::DeleteWordBack);
+        reduce(&mut s, Action::DeleteToLineStart);
+        assert_eq!(s.composer, "");
+    }
+
+    #[test]
+    fn ctrl_w_and_ctrl_u_are_scoped_to_the_cursors_own_line() {
+        let mut s = typed("first line");
+        reduce(&mut s, Action::InputNewline);
+        for c in "second line".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::DeleteToLineStart);
+        assert_eq!(
+            s.composer, "first line\n",
+            "Ctrl-U clears the current line, never the whole draft"
+        );
+        reduce(&mut s, Action::DeleteWordBack);
+        assert_eq!(
+            s.composer, "first line\n",
+            "Ctrl-W stops at the line start rather than eating the line above"
+        );
+    }
+
+    #[test]
+    fn up_and_down_walk_the_drafts_own_lines_before_recalling_history() {
+        let mut s = AppState::new();
+        s.composer_history = vec!["recalled".to_owned()];
+        for c in "alpha".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputNewline);
+        for c in "bravo".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        // On the second line: ↑ moves within the draft, keeping the column.
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "alpha\nbravo", "the draft is untouched");
+        assert_eq!(s.composer_cursor, 5, "same column, line above");
+        // ↓ comes back down to the same column.
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer_cursor, 11);
+
+        // At the TOP line, ↑ falls through to history recall as before.
+        reduce(&mut s, Action::HistoryPrev);
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "recalled");
+        assert_eq!(
+            s.composer_cursor,
+            s.composer.len(),
+            "recall lands at the end"
+        );
+        // ...and ↓ past the newest entry restores the stashed draft.
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer, "alpha\nbravo");
+        assert_eq!(s.composer_cursor, s.composer.len());
+    }
+
+    #[test]
+    fn a_single_line_draft_recalls_history_exactly_as_before() {
+        // The vertical-motion change must not alter the shell-style contract
+        // for the ordinary one-line draft.
+        let mut s = AppState::new();
+        s.composer_history = vec!["older".to_owned(), "newer".to_owned()];
+        for c in "draft".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "newer");
+        reduce(&mut s, Action::HistoryPrev);
+        assert_eq!(s.composer, "older");
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer, "newer");
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(s.composer, "draft", "the stashed draft comes back");
+    }
+
+    #[test]
+    fn the_cursor_steps_whole_graphemes_over_multibyte_and_wide_text() {
+        // Multi-byte (é as e + U+0301), wide CJK, and an emoji: every motion
+        // and deletion must land on a grapheme boundary, never inside one —
+        // slicing a `String` off-boundary would panic.
+        let mut s = typed("e\u{301}日本🚀");
+        assert_eq!(s.composer_cursor, s.composer.len());
+
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(&s.composer[s.composer_cursor..], "🚀");
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(&s.composer[s.composer_cursor..], "本🚀");
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(&s.composer[s.composer_cursor..], "日本🚀");
+        reduce(&mut s, Action::CursorLeft);
+        assert_eq!(
+            s.composer_cursor, 0,
+            "the combining sequence is one grapheme, not two steps"
+        );
+        reduce(&mut s, Action::CursorRight);
+        assert_eq!(s.composer_cursor, "e\u{301}".len());
+
+        // Typing splices between graphemes and backspace removes a whole one.
+        reduce(&mut s, Action::InputChar('X'));
+        assert_eq!(s.composer, "e\u{301}X日本🚀");
+        reduce(&mut s, Action::CursorLineEnd);
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.composer, "e\u{301}X日本", "the emoji is deleted whole");
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.composer, "e\u{301}X日");
+        for _ in 0..3 {
+            reduce(&mut s, Action::InputBackspace);
+        }
+        assert_eq!(
+            s.composer, "",
+            "the combining sequence is deleted as one grapheme"
+        );
+        assert_eq!(s.composer_cursor, 0);
+    }
+
+    #[test]
+    fn vertical_motion_keeps_the_display_column_across_wide_glyphs() {
+        // "日本語" is 6 display columns wide but 9 bytes; ↑ from the ASCII line
+        // must land on the glyph boundary at (or before) the same COLUMN.
+        let mut s = typed("日本語");
+        reduce(&mut s, Action::InputNewline);
+        for c in "abcdef".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        // Cursor after "abcd" — column 4 on the second line.
+        reduce(&mut s, Action::CursorLeft);
+        reduce(&mut s, Action::CursorLeft);
+        reduce(&mut s, Action::HistoryPrev);
+        // Column 4 on "日本語" falls inside the third glyph, so the cursor
+        // snaps to the boundary before it (after 日本 = 4 columns).
+        assert_eq!(&s.composer[..s.composer_cursor], "日本");
+        // Coming back down restores the column, not the byte offset.
+        reduce(&mut s, Action::HistoryNext);
+        assert_eq!(
+            &s.composer[s.composer.find('\n').unwrap() + 1..s.composer_cursor],
+            "abcd"
+        );
+    }
+
+    #[test]
+    fn other_prompt_buffers_stay_append_only() {
+        // Only the composer grew a cursor: every other prompt keeps today's
+        // push/pop behaviour, and the cursor keys do nothing there.
+        let mut s = AppState::new();
+        s.overlay = Overlay::NewRun(String::new());
+        for c in "abc".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::CursorLeft);
+        reduce(&mut s, Action::CursorLineStart);
+        reduce(&mut s, Action::InputChar('d'));
+        reduce(&mut s, Action::InputBackspace);
+        assert_eq!(s.overlay, Overlay::NewRun("abc".to_owned()));
+        assert_eq!(s.composer_cursor, 0, "the composer cursor is untouched");
+    }
+
+    #[test]
+    fn submitting_and_clearing_reset_the_cursor() {
+        let mut s = typed("hello");
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.composer, "");
+        assert_eq!(s.composer_cursor, 0);
+
+        let mut s = typed("hello");
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.composer, "");
+        assert_eq!(s.composer_cursor, 0);
+    }
+
+    #[test]
+    fn a_paste_lands_at_the_cursor() {
+        let mut s = typed("ab");
+        reduce(&mut s, Action::CursorLeft);
+        reduce(&mut s, Action::InputPaste("XY".to_owned()));
+        assert_eq!(s.composer, "aXYb");
+        assert_eq!(s.composer_cursor, 3);
+    }
+
+    // --- wheel granularity, blank `/keys` submit, live mode chip ---
+
+    /// A wheel notch scrolls a few lines; `PgUp`/`PgDn` still move a page. Both
+    /// share the follow-mode contract (leaving at the true bottom, re-entering
+    /// when scrolled back down).
+    #[test]
+    fn the_wheel_scrolls_lines_while_page_keys_scroll_a_page() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // The renderer's cached bottom (a tall transcript).
+        s.transcript_max_scroll.set(100);
+        assert!(s.runs[0].follow);
+
+        reduce(&mut s, Action::ScrollLinesUp);
+        assert!(!s.runs[0].follow, "scrolling up leaves follow mode");
+        assert_eq!(
+            s.runs[0].scroll, 97,
+            "a wheel notch is a few lines from the true bottom, not a page"
+        );
+        reduce(&mut s, Action::ScrollLinesUp);
+        assert_eq!(s.runs[0].scroll, 94);
+
+        reduce(&mut s, Action::ScrollPageUp);
+        assert_eq!(s.runs[0].scroll, 84, "a page is still a page");
+
+        // Scrolling back to the bottom re-enters follow either way.
+        for _ in 0..6 {
+            reduce(&mut s, Action::ScrollLinesDown);
+        }
+        assert_eq!(s.runs[0].scroll, 100);
+        assert!(
+            s.runs[0].follow,
+            "reaching the bottom re-enters follow mode"
+        );
+    }
+
+    /// A blank `/keys` submit must reopen the masked prompt rather than
+    /// dropping the operator back to the base view — the same rule
+    /// `AddModelId` has always followed.
+    #[test]
+    fn a_blank_key_submit_reopens_the_prompt() {
+        let mut s = AppState::new();
+        let target = KeyTarget::Model("groq/llama".to_owned());
+        s.overlay = Overlay::ApiKeySet {
+            target: target.clone(),
+            buffer: SecretKey("   ".to_owned()),
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.overlay,
+            Overlay::ApiKeySet {
+                target,
+                buffer: SecretKey(String::new()),
+            },
+            "the prompt reopens, cleared, instead of closing"
+        );
+        assert!(s.outbox.is_empty(), "nothing is written for a blank key");
+        assert!(s.notice.is_some(), "and the operator is told why");
+    }
+
+    // --- turn timestamps: `SessionEvent.occurred_at` survives the fold ---
+
+    /// The event's wall-clock time used to be dropped at the fold. It now rides
+    /// along to the entry it produced, one timestamp per entry, in lockstep.
+    #[test]
+    fn folding_an_event_records_when_it_happened() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        let started = Utc::now() - chrono::Duration::minutes(5);
+        reduce(
+            &mut s,
+            Action::daemon_event(SessionEvent {
+                sequence: 1,
+                occurred_at: started,
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::RunStarted {
+                    run_id,
+                    objective: "o".to_owned(),
+                    mode: AgentMode::Build,
+                },
+            }),
+        );
+        let replied = Utc::now();
+        reduce(
+            &mut s,
+            Action::daemon_event(SessionEvent {
+                sequence: 2,
+                occurred_at: replied,
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::ModelStreamDelta {
+                    run_id,
+                    text: "hello".to_owned(),
+                },
+            }),
+        );
+        assert_eq!(
+            s.runs[0].entry_time(0),
+            Some(started),
+            "the user turn's time"
+        );
+        assert_eq!(s.runs[0].entry_time(1), Some(replied), "the reply's time");
+
+        // A coalesced stream keeps the time of its FIRST delta — when the turn
+        // began, which is what the turn header shows.
+        reduce(
+            &mut s,
+            Action::daemon_event(SessionEvent {
+                sequence: 3,
+                occurred_at: Utc::now() + chrono::Duration::seconds(30),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::ModelStreamDelta {
+                    run_id,
+                    text: " world".to_owned(),
+                },
+            }),
+        );
+        assert_eq!(s.runs[0].transcript.len(), 2, "the deltas coalesced");
+        assert_eq!(s.runs[0].entry_time(1), Some(replied));
+    }
+
+    /// The two vectors are written only by `push_entry`, including through the
+    /// transcript cap's oldest-entry drop — this asserts they never desync.
+    #[test]
+    fn transcript_and_entry_times_stay_in_lockstep() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // Well past MAX_TRANSCRIPT_ENTRIES, so the cap's drop path runs.
+        for i in 0..1_200 {
+            reduce(
+                &mut s,
+                system_ev(EventBody::NoteAppended {
+                    text: format!("note {i}"),
+                    run_id: Some(run_id),
+                }),
+            );
+            reduce(&mut s, system_ev(EventBody::SteeringQueued { run_id }));
+        }
+        let run = &s.runs[0];
+        assert_eq!(
+            run.transcript.len(),
+            run.entry_times.len(),
+            "one timestamp per entry, even after the cap dropped the oldest"
+        );
+        assert!(run.entry_time(run.transcript.len() - 1).is_some());
+        assert_eq!(
+            run.entry_time(run.transcript.len()),
+            None,
+            "no time past the end"
+        );
+    }
+
+    /// The interactive client redraws every tick while this holds, so the
+    /// answer must be true exactly when something on screen is turning.
+    #[test]
+    fn is_animating_tracks_every_spinner_surface() {
+        let mut s = AppState::new();
+        assert!(!s.is_animating(), "an idle shell needs no frames");
+
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Running,
+            }),
+        );
+        assert_eq!(s.runs[0].activity, RunActivity::Thinking);
+        assert!(s.is_animating(), "a thinking run shows the working spinner");
+
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+        assert!(!s.is_animating(), "a finished run stops the frames");
+
+        // The code-graph loading modal and the model-list fetch box each spin.
+        s.edge_loading = true;
+        assert!(s.is_animating());
+        s.edge_loading = false;
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+        };
+        assert!(s.is_animating());
+        s.overlay = Overlay::None;
+        assert!(!s.is_animating());
+    }
+
+    // --- /theme: pick a theme at runtime, preview it live, keep it ---
+
+    /// Open the theme picker through the palette front door, exactly as an
+    /// operator does: `/` → filter → Enter.
+    fn open_theme_picker(s: &mut AppState) {
+        reduce(s, Action::OpenPalette);
+        for c in "theme picker".chars() {
+            reduce(s, Action::InputChar(c));
+        }
+        reduce(s, Action::InputSubmit);
+    }
+
+    #[test]
+    fn the_theme_palette_entry_opens_the_picker_on_the_current_theme() {
+        let mut s = AppState::new();
+        assert_eq!(
+            s.themes.len(),
+            7,
+            "the seven built-in variants are always offered"
+        );
+        s.theme_selected = Some(2);
+        open_theme_picker(&mut s);
+        assert_eq!(
+            s.overlay,
+            Overlay::ThemePicker {
+                query: String::new(),
+                selected: 2,
+            },
+            "the picker opens on the theme already in force"
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
+    }
+
+    #[test]
+    fn moving_the_theme_cursor_previews_and_enter_keeps_it() {
+        let mut s = AppState::new();
+        let boot = crate::Theme::dark();
+        assert_eq!(
+            s.effective_theme(&boot),
+            boot,
+            "with no choice, the harness's boot theme stands"
+        );
+
+        open_theme_picker(&mut s);
+        reduce(&mut s, Action::SelectNext); // → light
+        assert_eq!(
+            s.effective_theme(&boot),
+            s.themes[1].theme,
+            "moving the cursor previews that theme across the whole shell"
+        );
+        assert_eq!(
+            s.theme_selected, None,
+            "previewing is not choosing — nothing is kept until Enter"
+        );
+
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::None);
+        assert_eq!(s.theme_selected, Some(1));
+        assert_eq!(
+            s.effective_theme(&boot),
+            s.themes[1].theme,
+            "the kept theme survives the picker closing"
+        );
+        assert_eq!(
+            s.outbox,
+            vec![Intent::SetTheme {
+                id: "light".to_owned()
+            }],
+            "the harness is asked to remember it for the next launch"
+        );
+
+        // Esc abandons a preview: the kept theme comes back.
+        open_theme_picker(&mut s);
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.theme_selected, Some(1));
+        assert_eq!(s.effective_theme(&boot), s.themes[1].theme);
+    }
+
+    #[test]
+    fn the_theme_picker_filters_and_guards_a_zero_match_submit() {
+        let mut s = AppState::new();
+        open_theme_picker(&mut s);
+        for c in "mono".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        let Overlay::ThemePicker { query, selected } = &s.overlay else {
+            unreachable!("the picker stays open while filtering")
+        };
+        assert_eq!(query, "mono");
+        assert_eq!(*selected, 0, "editing the query returns to the top");
+        let matches = crate::state::filter_themes(&s.themes, "mono");
+        assert_eq!(matches.len(), 1);
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.themes[s.theme_selected.expect("kept")].id, "monochrome");
+
+        // A query matching nothing keeps nothing (the zero-match guard every
+        // other picker uses).
+        let before = s.theme_selected;
+        s.outbox.clear();
+        open_theme_picker(&mut s);
+        for c in "zzzz".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.theme_selected, before);
+        assert!(s.outbox.is_empty());
+    }
+
+    #[test]
+    fn an_installed_pack_is_offered_and_previewed_like_a_builtin() {
+        // The harness parses packs and hands them over as rows; the reducer
+        // treats them exactly like the built-ins.
+        let mut s = AppState::new();
+        let mut pack_theme = crate::Theme::light();
+        pack_theme.focus.active = ratatui::style::Color::Rgb(1, 2, 3);
+        s.themes.push(crate::state::ThemeChoice {
+            id: "solarized".to_owned(),
+            summary: "installed theme pack".to_owned(),
+            theme: pack_theme,
+            pack: true,
+        });
+        open_theme_picker(&mut s);
+        for c in "solar".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        assert_eq!(
+            s.effective_theme(&crate::Theme::dark()),
+            pack_theme,
+            "live preview"
+        );
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::SetTheme {
+                id: "solarized".to_owned()
+            }]
         );
     }
 }

@@ -14,6 +14,7 @@ pub(super) fn normalize_document(document: &UiDocument) -> UiDocument {
 }
 
 fn normalize_node(node: &mut UiNode) {
+    let grid = is_grid(node);
     let extension = &node.props.extension;
 
     let layout = node.props.layout.get_or_insert_with(UiLayout::default);
@@ -71,6 +72,11 @@ fn normalize_node(node: &mut UiNode) {
             _ => None,
         })
     });
+    // Grid-only: the flat `columns` prop is a track count or a track list.
+    // (Table reuses the `columns` name for column descriptors, lifted below.)
+    if layout.columns.is_empty() && grid {
+        layout.columns = grid_columns(extension.get("columns"));
+    }
     if *layout == UiLayout::default() {
         node.props.layout = None;
     }
@@ -211,6 +217,7 @@ fn normalize_content(node: &mut UiNode) {
 }
 
 fn normalize_data(node: &mut UiNode) {
+    let grid = is_grid(node);
     let extension = &node.props.extension;
     let data = node
         .props
@@ -222,7 +229,9 @@ fn normalize_data(node: &mut UiNode) {
             .find_map(|key| extension.get(key).and_then(Value::as_array).cloned())
             .unwrap_or_default();
     }
-    if data.columns.is_empty() {
+    // A Grid's `columns` is a track template lifted into `UiLayout`, never a
+    // table column descriptor list.
+    if data.columns.is_empty() && !grid {
         data.columns = extension
             .get("columns")
             .and_then(Value::as_array)
@@ -554,6 +563,37 @@ fn edges(value: Option<&Value>) -> Option<UiEdges> {
             left: size(values.get("left")).unwrap_or(0.0),
         }),
         _ => None,
+    }
+}
+
+fn is_grid(node: &UiNode) -> bool {
+    node.node_type
+        .as_ref()
+        .is_some_and(|value| value.as_str() == "Grid")
+}
+
+/// Grid `columns`: an equal-track count (`3` → `1fr 1fr 1fr`) or an explicit
+/// track list (numbers are cells; strings accept `fr`, `%`, and plain cells).
+fn grid_columns(value: Option<&Value>) -> Vec<UiDimension> {
+    match value {
+        Some(Value::Number(count)) => {
+            let count = count
+                .as_f64()
+                .filter(|count| count.is_finite() && *count >= 1.0)
+                .map_or(0, |count| count.trunc().min(24.0) as usize);
+            vec![
+                UiDimension {
+                    value: 1.0,
+                    unit: "fr".to_owned(),
+                };
+                count
+            ]
+        }
+        Some(Value::Array(tracks)) => tracks
+            .iter()
+            .filter_map(|track| dimension(Some(track)))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

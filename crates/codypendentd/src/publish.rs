@@ -60,8 +60,8 @@ use codypendent_daemon::{ledger, projections};
 use codypendent_integrations::github::model::NewPullRequest;
 use codypendent_integrations::github::{GitHubApi, GitHubError, RepoId};
 use codypendent_knowledge::{
-    plan_publication, record_publication, DocStoreError, DocumentStore, PublishPlan,
-    PublishTarget as KnowledgeTarget,
+    plan_publication, record_publication, DocStoreError, DocumentStatus, DocumentStore,
+    PublishPlan, PublishTarget as KnowledgeTarget,
 };
 use codypendent_protocol::document::PublishTarget as WireTarget;
 use codypendent_protocol::{
@@ -380,6 +380,18 @@ async fn execute_approved_plan(
                 let _ = set_publish_job_state(&pool, approval_id, "failed").await;
                 let _ = projections::set_run_state(&pool, run_id, RunState::Failed).await;
                 return;
+            }
+            // The status lifecycle was decorative: nothing ever left `Draft`.
+            // A publish that reached a commit is exactly the transition
+            // `Published` describes, so record it — a metadata update that does
+            // NOT bump the content revision, so pending suggestions keep their
+            // anchors. Best-effort: the publication itself already committed,
+            // and a status that lags is a display concern, not a lost write.
+            if let Err(error) = DocumentStore::new()
+                .set_status(&pool, document_id, DocumentStatus::Published)
+                .await
+            {
+                warn!(%document_id, %error, "published, but the status stayed draft");
             }
             let _ = set_publish_job_state(&pool, approval_id, "completed").await;
             let _ = projections::set_run_state(&pool, run_id, RunState::Completed).await;
@@ -1511,6 +1523,103 @@ mod tests {
             1,
             "only the primary worktree should remain: {worktrees}"
         );
+    }
+
+    /// The status lifecycle used to be decorative: publishing recorded a
+    /// publication row but the document stayed `draft` forever. A publish that
+    /// reaches a commit now transitions `Draft` -> `Published`, WITHOUT bumping
+    /// the content revision (status is lifecycle state, not content, so pending
+    /// suggestions keep their anchors).
+    #[tokio::test]
+    async fn a_successful_publish_moves_the_document_from_draft_to_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = temp_pool(dir.path()).await;
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let document_id = seed_document(&pool, "Architecture").await;
+        let approvals = ApprovalBroker::new();
+        let publisher = build_publisher(pool.clone(), approvals.clone(), repo.clone(), dir.path());
+
+        let before = DocumentStore::new()
+            .snapshot_document(&pool, document_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.status, DocumentStatus::Draft);
+
+        let parked = publisher
+            .publish(publish_request(
+                document_id,
+                WireTarget::DocsBranchCommit {
+                    branch: "docs/publish".to_string(),
+                    path: "docs/architecture.md".to_string(),
+                },
+            ))
+            .await
+            .expect("publish parks an approval");
+        resolve(
+            &pool,
+            &approvals,
+            parked.approval_id,
+            ApprovalDecision::Approve,
+        )
+        .await;
+        wait_for_publication_count(&pool, document_id, 1).await;
+
+        let after = DocumentStore::new()
+            .snapshot_document(&pool, document_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, DocumentStatus::Published);
+        assert_eq!(
+            after.revision, before.revision,
+            "a status transition is metadata, never a content revision"
+        );
+    }
+
+    /// A publish that never executes (rejected at the approval) leaves the
+    /// document a draft — the transition follows the WRITE, not the request.
+    #[tokio::test]
+    async fn a_rejected_publish_leaves_the_document_a_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = temp_pool(dir.path()).await;
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let document_id = seed_document(&pool, "Architecture").await;
+        let approvals = ApprovalBroker::new();
+        let publisher = build_publisher(pool.clone(), approvals.clone(), repo.clone(), dir.path());
+
+        let parked = publisher
+            .publish(publish_request(
+                document_id,
+                WireTarget::DocsBranchCommit {
+                    branch: "docs/publish".to_string(),
+                    path: "docs/architecture.md".to_string(),
+                },
+            ))
+            .await
+            .expect("publish parks an approval");
+        resolve(
+            &pool,
+            &approvals,
+            parked.approval_id,
+            ApprovalDecision::Reject,
+        )
+        .await;
+        // Give the background task a beat to observe the rejection.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let after = DocumentStore::new()
+            .snapshot_document(&pool, document_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, DocumentStatus::Draft);
+        assert!(codypendent_knowledge::publications(&pool, document_id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

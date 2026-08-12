@@ -1,0 +1,1492 @@
+diff --git a/crates/codypendentd/tests/blackboard_it.rs b/crates/codypendentd/tests/blackboard_it.rs
+index 3e07610..96ad3f6 100644
+--- a/crates/codypendentd/tests/blackboard_it.rs
++++ b/crates/codypendentd/tests/blackboard_it.rs
+@@ -105,6 +105,7 @@ async fn seed_board(paths: &RuntimePaths, workflow_run_id: &str) {
+                 }),
+                 confidence: Some(0.9),
+                 evidence: vec![json!({ "path": "src/parse.rs", "line": 42 })],
++                board: Default::default(),
+             },
+         )
+         .await
+@@ -239,6 +240,7 @@ async fn an_observer_reads_the_board_over_the_socket_and_sees_node_authored_item
+             workflow_run_id: workflow_run_id.to_string(),
+             kind: Some("finding".to_string()),
+             include_superseded: false,
++            board_repository: None,
+         },
+         "read",
+     )
+diff --git a/crates/protocol/src/blackboard.rs b/crates/protocol/src/blackboard.rs
+index 624e679..77f64d3 100644
+--- a/crates/protocol/src/blackboard.rs
++++ b/crates/protocol/src/blackboard.rs
+@@ -17,6 +17,70 @@
+ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+ 
++/// The stable board id (and blackboard hub key) of a repository's task board.
++///
++/// A repository board is stored as a **synthetic workflow run** whose id is this
++/// string, so every existing board mechanism — the `blackboard_items` FK, the
++/// `ReadBlackboard` command, and the per-run `Subscription::Blackboard` fan-out —
++/// serves it unchanged (`board:<repo>` feeds via the existing hub pattern). Pure
++/// string formatting (the canonical repository path is already unique), so the
++/// daemon, the assembly, and clients derive identical ids with no shared state.
++/// Callers pass the **canonicalized** repository root; this does no I/O.
++#[must_use]
++pub fn board_scope_id(repository: &str) -> String {
++    format!("board:{repository}")
++}
++
++/// Which durable board a client-side blackboard write targets: a workflow run's
++/// board, or a repository's task board (the kanban surface). A wire enum with an
++/// [`Unknown`](BlackboardScope::Unknown) fallback so a scope from a newer client
++/// is rejected structurally rather than failing the frame.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(tag = "type")]
++#[non_exhaustive]
++pub enum BlackboardScope {
++    /// A durable workflow run's board.
++    WorkflowRun { workflow_run_id: String },
++    /// A repository's task board — resolved server-side to the synthetic board
++    /// run [`board_scope_id`] names, created on first use. `repository` is the
++    /// canonical filesystem root, exactly as `StartRun.repository` carries it.
++    RepositoryBoard { repository: String },
++    #[serde(other)]
++    Unknown,
++}
++
++/// A client-authored blackboard artifact before it is stored (Phase B kanban —
++/// the write half `PostBlackboardItem` carries). The author is **not** here: the
++/// daemon builds it server-side from the issuing connection, exactly as the
++/// workflow executor builds an agent's author — a client never supplies its own
++/// attribution.
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
++pub struct BlackboardItemDraft {
++    /// The typed artifact kind (`task` for board cards; any store kind is legal).
++    pub kind: String,
++    /// The artifact body (opaque JSON — for a `task`, conventionally
++    /// `{ "title": …, "description": … }`).
++    pub payload: Value,
++    /// The author's confidence in `[0, 1]`, if given.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub confidence: Option<f64>,
++    /// Evidence references grounding the artifact. Claim-like kinds require at
++    /// least one (the store enforces it); a `task` needs none.
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub evidence: Vec<Value>,
++    /// The board column (`todo` / `doing` / `review` / `done`, or a validated
++    /// free string). Defaults server-side to `todo` for a `task`.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub status: Option<String>,
++    /// Who the card is assigned to, if anyone.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub assignee: Option<String>,
++    /// The card's position within its column (lower sorts first). Appended to
++    /// the end of the column when absent.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub ordinal: Option<i64>,
++}
++
+ /// One stored blackboard artifact, projected for a client.
+ ///
+ /// A read-command reply carries a `Vec` of these (the run's board, kind-filtered);
+@@ -52,6 +116,22 @@ pub struct BlackboardItemView {
+     /// `None`.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub superseded_by: Option<String>,
++    /// The repository this item's board serves, when the item lives on a
++    /// repository task board rather than a real workflow run (its
++    /// `workflow_run_id` is then the synthetic [`board_scope_id`]). Additive: an
++    /// older daemon sends none and every field below parses back defaulted.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub board_scope: Option<String>,
++    /// The board column (`todo` / `doing` / `review` / `done`, or a validated
++    /// free string), when this item is a board card.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub status: Option<String>,
++    /// Who the card is assigned to, if anyone.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub assignee: Option<String>,
++    /// The card's position within its column (lower sorts first).
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub ordinal: Option<i64>,
+ }
+ 
+ #[cfg(test)]
+@@ -70,6 +150,10 @@ mod tests {
+             evidence: vec![json!({ "path": "src/parse.rs", "line": 42 })],
+             revision: 1,
+             superseded_by: None,
++            board_scope: None,
++            status: None,
++            assignee: None,
++            ordinal: None,
+         }
+     }
+ 
+@@ -97,7 +181,79 @@ mod tests {
+             !json.contains("superseded_by"),
+             "superseded_by skipped: {json}"
+         );
++        // The board fields are additive: absent for a plain workflow artifact
++        // (an older daemon's exact shape) and defaulted on reparse.
++        assert!(!json.contains("board_scope"), "board_scope skipped: {json}");
++        assert!(!json.contains("status"), "status skipped: {json}");
++        assert!(!json.contains("assignee"), "assignee skipped: {json}");
++        assert!(!json.contains("ordinal"), "ordinal skipped: {json}");
+         let parsed: BlackboardItemView = serde_json::from_str(&json).expect("deserialize");
+         assert_eq!(parsed, item);
+     }
++
++    #[test]
++    fn a_board_card_round_trips_its_board_fields() {
++        let mut card = view();
++        card.kind = "task".to_string();
++        card.workflow_run_id = board_scope_id("/home/user/project");
++        card.board_scope = Some("/home/user/project".to_string());
++        card.status = Some("doing".to_string());
++        card.assignee = Some("dana".to_string());
++        card.ordinal = Some(3);
++        let json = serde_json::to_string(&card).expect("serialize");
++        let parsed: BlackboardItemView = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(parsed, card);
++    }
++
++    #[test]
++    fn board_scope_id_is_stable_and_prefixed() {
++        // The synthetic run id doubles as the subscription hub key, so its shape
++        // is a wire contract: a fixed prefix plus the canonical repository path.
++        assert_eq!(
++            board_scope_id("/home/user/project"),
++            "board:/home/user/project"
++        );
++    }
++
++    #[test]
++    fn blackboard_scope_round_trips_and_tolerates_unknown() {
++        for scope in [
++            BlackboardScope::WorkflowRun {
++                workflow_run_id: "wfrun-abc".to_string(),
++            },
++            BlackboardScope::RepositoryBoard {
++                repository: "/home/user/project".to_string(),
++            },
++        ] {
++            let json = serde_json::to_string(&scope).expect("serialize");
++            assert_eq!(
++                serde_json::from_str::<BlackboardScope>(&json).expect("deserialize"),
++                scope
++            );
++        }
++        let future = json!({ "type": "OrganizationBoard", "org": "acme" });
++        assert!(matches!(
++            serde_json::from_value::<BlackboardScope>(future).expect("unknown scope parses"),
++            BlackboardScope::Unknown
++        ));
++    }
++
++    #[test]
++    fn item_draft_omits_absent_optionals_and_defaults_back() {
++        let draft = BlackboardItemDraft {
++            kind: "task".to_string(),
++            payload: json!({ "title": "wire the DAG viewer" }),
++            confidence: None,
++            evidence: Vec::new(),
++            status: None,
++            assignee: None,
++            ordinal: None,
++        };
++        let json = serde_json::to_string(&draft).expect("serialize");
++        assert!(!json.contains("confidence"), "confidence skipped: {json}");
++        assert!(!json.contains("status"), "status skipped: {json}");
++        assert!(!json.contains("ordinal"), "ordinal skipped: {json}");
++        let parsed: BlackboardItemDraft = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(parsed, draft);
++    }
+ }
+diff --git a/crates/protocol/src/command.rs b/crates/protocol/src/command.rs
+index b008599..77d50f6 100644
+--- a/crates/protocol/src/command.rs
++++ b/crates/protocol/src/command.rs
+@@ -7,6 +7,7 @@
+ 
+ use serde::{Deserialize, Serialize};
+ 
++use crate::blackboard::{BlackboardItemDraft, BlackboardScope};
+ use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
+ use crate::handshake::{ClientRole, Subscription};
+ use crate::ide::IdeContextUpdate;
+@@ -416,11 +417,97 @@ pub enum CommandBody {
+         /// live board (the "live-only" view the TUI shows).
+         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+         include_superseded: bool,
++        /// Read a **repository task board** instead of a workflow run's board
++        /// (Phase B kanban). When set, `workflow_run_id` is ignored: the daemon
++        /// resolves the board to the synthetic run
++        /// [`board_scope_id`](crate::blackboard::board_scope_id) names (an empty
++        /// board for a repository never written to — a read creates nothing).
++        /// Additive (`#[serde(default)]`): an older client omits it and reads a
++        /// run board exactly as before.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        board_repository: Option<String>,
++    },
++    /// Post a blackboard artifact from a **client** (Phase B kanban — the write
++    /// path the board and NL backlog need; the review's "deliberately no client
++    /// post command" stance is revised here for board use). Handled at the
++    /// connection level like `ReadBlackboard` (the board lives outside the
++    /// session ledger) through the assembly's `BlackboardWriter` seam, and gated
++    /// to the [`Controller`](crate::handshake::ClientRole::Controller) role — the
++    /// local human operator; an agent still writes only through its
++    /// `blackboard.*`/`task.*` tools, and an Observer stays read-only. The
++    /// daemon builds the item's author from the issuing connection (never from a
++    /// client-supplied identity) and replies
++    /// [`BlackboardItemApplied`](crate::envelope::Payload::BlackboardItemApplied)
++    /// with the stored item. A daemon without workflow transport rejects it
++    /// `workflow.transport-unavailable`.
++    PostBlackboardItem {
++        /// The board to post onto: a workflow run's, or a repository's task
++        /// board (created on first write).
++        scope: BlackboardScope,
++        /// The artifact to store (kind, payload, evidence, board fields).
++        item: BlackboardItemDraft,
++    },
++    /// Update (supersede) a blackboard item from a client (Phase B kanban): a
++    /// status/column move, a re-assignment, a re-order, or a payload edit. The
++    /// same supersession discipline as an agent's correction — the store posts
++    /// the replacement at the next revision and stamps the old row, never
++    /// editing in place — so board history is preserved. Fields left `None`
++    /// carry the old item's values forward. Role-gated and routed exactly like
++    /// [`PostBlackboardItem`](CommandBody::PostBlackboardItem); replies
++    /// [`BlackboardItemApplied`](crate::envelope::Payload::BlackboardItemApplied)
++    /// with the replacement item.
++    UpdateBlackboardItem {
++        /// The board holding the item.
++        scope: BlackboardScope,
++        /// The live item to supersede. An already-superseded item is refused
++        /// (`blackboard.already-superseded`), so concurrent moves never fork.
++        item_id: String,
++        /// The new column, when moving.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        status: Option<String>,
++        /// The new assignee, when re-assigning.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        assignee: Option<String>,
++        /// The new within-column position, when re-ordering. When only `status`
++        /// changes, the daemon appends to the end of the target column.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        ordinal: Option<i64>,
++        /// A replacement payload, when editing the card body.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        payload: Option<serde_json::Value>,
++    },
++    /// Read one page of a session's durable event history (fixing the >500-event
++    /// catch-up gap: a `Catchup::Snapshot` carries no transcript, and no paged
++    /// read existed). A **read** — any attached client, an Observer included,
++    /// may issue it. The daemon replies
++    /// [`SessionEventsPage`](crate::envelope::Payload::SessionEventsPage) with
++    /// events `after_sequence < sequence <= after_sequence + limit` in ascending
++    /// order; the client pages forward by passing the reply's `through` back as
++    /// the next `after_sequence`. An unknown session is rejected
++    /// `protocol.session-not-found`.
++    ReadSessionEvents {
++        session_id: SessionId,
++        /// Return events strictly **after** this sequence (0 = from the start).
++        #[serde(default, skip_serializing_if = "u64_is_zero")]
++        after_sequence: u64,
++        /// Maximum events in the page. 0 (or absent) asks for the server
++        /// default; the server clamps any request to its own page ceiling.
++        #[serde(default, skip_serializing_if = "u32_is_zero")]
++        limit: u32,
+     },
+     #[serde(other)]
+     Unknown,
+ }
+ 
++/// `skip_serializing_if` helpers for the paged-history defaults: a zero is the
++/// field's default, so it is omitted on the wire (an older peer's exact shape).
++fn u64_is_zero(value: &u64) -> bool {
++    *value == 0
++}
++fn u32_is_zero(value: &u32) -> bool {
++    *value == 0
++}
++
+ /// One legal state-machine transition to attempt via `AdvancePromotion`
+ /// (Phase 7 STEP 7.5). Mirrors `codypendent_eval::promote::Candidate`'s
+ /// methods exactly. Regression and canary verdicts are computed from durable
+@@ -746,9 +833,67 @@ mod tests {
+             workflow_run_id: "wfrun-abc123".to_string(),
+             kind: Some("finding".to_string()),
+             include_superseded: true,
++            board_repository: None,
++        });
++        // The repository-board read (Phase B kanban): board_repository set, the
++        // run id left empty for the daemon to resolve.
++        round_trip(CommandBody::ReadBlackboard {
++            workflow_run_id: String::new(),
++            kind: Some("task".to_string()),
++            include_superseded: false,
++            board_repository: Some("/home/user/project".to_string()),
++        });
++        round_trip(CommandBody::PostBlackboardItem {
++            scope: crate::blackboard::BlackboardScope::RepositoryBoard {
++                repository: "/home/user/project".to_string(),
++            },
++            item: crate::blackboard::BlackboardItemDraft {
++                kind: "task".to_string(),
++                payload: serde_json::json!({ "title": "wire the DAG viewer" }),
++                confidence: None,
++                evidence: Vec::new(),
++                status: Some("todo".to_string()),
++                assignee: Some("dana".to_string()),
++                ordinal: Some(1),
++            },
++        });
++        round_trip(CommandBody::UpdateBlackboardItem {
++            scope: crate::blackboard::BlackboardScope::RepositoryBoard {
++                repository: "/home/user/project".to_string(),
++            },
++            item_id: "0192-item".to_string(),
++            status: Some("doing".to_string()),
++            assignee: None,
++            ordinal: Some(2),
++            payload: None,
++        });
++        round_trip(CommandBody::ReadSessionEvents {
++            session_id: SessionId::new(),
++            after_sequence: 500,
++            limit: 200,
+         });
+     }
+ 
++    #[test]
++    fn read_session_events_omits_zero_defaults_and_reparses() {
++        // The from-the-start read sends neither optional key, and such a payload
++        // (also what a minimal encoder emits) reparses with both zeroed — the
++        // server then applies its own default page size.
++        let body = CommandBody::ReadSessionEvents {
++            session_id: SessionId::new(),
++            after_sequence: 0,
++            limit: 0,
++        };
++        let json = serde_json::to_string(&body).expect("serialize");
++        assert!(
++            !json.contains("after_sequence"),
++            "zero after_sequence skipped: {json}"
++        );
++        assert!(!json.contains("limit"), "zero limit skipped: {json}");
++        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(parsed, body);
++    }
++
+     #[test]
+     fn propose_promotion_without_the_review_flag_reparses_to_false() {
+         // A payload missing `requires_permission_review` entirely (what an
+@@ -791,6 +936,7 @@ mod tests {
+             workflow_run_id: "wfrun-abc123".to_string(),
+             kind: None,
+             include_superseded: false,
++            board_repository: None,
+         };
+         let json = serde_json::to_string(&body).expect("serialize");
+         assert!(!json.contains("kind"), "absent kind is skipped: {json}");
+@@ -798,6 +944,10 @@ mod tests {
+             !json.contains("include_superseded"),
+             "default (false) include_superseded is skipped: {json}"
+         );
++        assert!(
++            !json.contains("board_repository"),
++            "absent board_repository is skipped (an older client's shape): {json}"
++        );
+         let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+         assert_eq!(parsed, body);
+     }
+diff --git a/crates/protocol/src/envelope.rs b/crates/protocol/src/envelope.rs
+index 94e0206..cbd69b5 100644
+--- a/crates/protocol/src/envelope.rs
++++ b/crates/protocol/src/envelope.rs
+@@ -179,6 +179,27 @@ pub enum Payload {
+     /// frame is not session-scoped; a receiver merges it into the run's board by id
+     /// (a superseding revision arrives as its own delivery).
+     BlackboardPosted(BlackboardItemView),
++    /// A `PostBlackboardItem` / `UpdateBlackboardItem` command's reply (Phase B
++    /// kanban): the stored (or superseding) item. A distinct reply from
++    /// `CommandAccepted` because the writing client needs the minted item id and
++    /// revision back — e.g. to select the card it just created.
++    BlackboardItemApplied {
++        command_id: CommandId,
++        item: BlackboardItemView,
++    },
++    /// A `ReadSessionEvents` command's reply: one ascending page of the
++    /// session's durable event history. `through` is the highest sequence in
++    /// the page (equal to the request's `after_sequence` when the page is
++    /// empty) — the client passes it back as the next `after_sequence`;
++    /// `has_more` says whether events beyond `through` existed at read time, so
++    /// a pager knows when to stop without a probe read.
++    SessionEventsPage {
++        command_id: CommandId,
++        session_id: SessionId,
++        events: Vec<SessionEvent>,
++        through: u64,
++        has_more: bool,
++    },
+     /// A `ReadWorkflowRun` command's reply (Phase 5 STEP 5.2 / T9): the run's
+     /// observability snapshot — its current phase plus every node's full current
+     /// view. A distinct reply from `CommandAccepted` because the client needs the
+@@ -553,6 +574,10 @@ mod tests {
+             evidence: vec![json!({ "path": "src/lib.rs", "line": 7 })],
+             revision: 2,
+             superseded_by: None,
++            board_scope: None,
++            status: None,
++            assignee: None,
++            ordinal: None,
+         };
+ 
+         // The read-command reply carries a list of items.
+@@ -576,6 +601,61 @@ mod tests {
+             Payload::BlackboardPosted(delivered) => assert_eq!(delivered, item),
+             other => panic!("expected BlackboardPosted, got {other:?}"),
+         }
++
++        // The client-write reply carries the stored item back (Phase B kanban).
++        let command_id = CommandId::new();
++        match round_trip_payload(Payload::BlackboardItemApplied {
++            command_id,
++            item: item.clone(),
++        }) {
++            Payload::BlackboardItemApplied {
++                command_id: id,
++                item: applied,
++            } => {
++                assert_eq!(id, command_id);
++                assert_eq!(applied, item);
++            }
++            other => panic!("expected BlackboardItemApplied, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn session_events_page_payload_round_trips() {
++        use crate::events::{Actor, EventBody, SessionEvent};
++        use chrono::Utc;
++
++        let command_id = CommandId::new();
++        let session_id = SessionId::new();
++        let page = Payload::SessionEventsPage {
++            command_id,
++            session_id,
++            events: vec![SessionEvent {
++                sequence: 501,
++                occurred_at: Utc::now(),
++                causation_id: None,
++                correlation_id: None,
++                actor: Actor::System,
++                body: EventBody::SessionClosed,
++            }],
++            through: 501,
++            has_more: true,
++        };
++        match round_trip_payload(page) {
++            Payload::SessionEventsPage {
++                command_id: id,
++                session_id: sid,
++                events,
++                through,
++                has_more,
++            } => {
++                assert_eq!(id, command_id);
++                assert_eq!(sid, session_id);
++                assert_eq!(events.len(), 1);
++                assert_eq!(through, 501);
++                assert!(has_more);
++            }
++            other => panic!("expected SessionEventsPage, got {other:?}"),
++        }
+     }
+ 
+     #[test]
+@@ -594,6 +674,7 @@ mod tests {
+             cost: Some(json!({ "wall_time_secs": 3, "tool_calls": 1 })),
+             error: None,
+             warnings: Vec::new(),
++            depends_on: Vec::new(),
+         };
+ 
+         // The read-command reply carries a run snapshot.
+diff --git a/crates/protocol/src/lib.rs b/crates/protocol/src/lib.rs
+index 583ec47..f53721b 100644
+--- a/crates/protocol/src/lib.rs
++++ b/crates/protocol/src/lib.rs
+@@ -30,7 +30,7 @@ pub mod version;
+ pub mod workflow;
+ 
+ pub use artifact::{ArtifactRef, DataClassification};
+-pub use blackboard::BlackboardItemView;
++pub use blackboard::{board_scope_id, BlackboardItemDraft, BlackboardItemView, BlackboardScope};
+ pub use capabilities::ClientCapabilities;
+ pub use catchup::{Catchup, PendingApprovalProjection, SessionProjection};
+ pub use command::{CanaryMetrics, Command, CommandBody, PromotionAction, UiPluginLifecycleStatus};
+diff --git a/crates/protocol/src/run.rs b/crates/protocol/src/run.rs
+index 0c08901..48a14bb 100644
+--- a/crates/protocol/src/run.rs
++++ b/crates/protocol/src/run.rs
+@@ -204,6 +204,36 @@ pub enum ProposedAction {
+     /// engine's explicit arm); never serialized into a `ToolProposed` (never gated by
+     /// approval), so it needs no golden wire vector.
+     RecordMemory,
++    /// Query a durable workflow run's graph state (the `workflow.query` runtime
++    /// tool, rubric 5): nodes, states, dependency edges, and measured costs. A
++    /// pure read of Codypendent's own durable store — no filesystem, command,
++    /// network, or remote effect — so it is always policy-`Allow`ed (see the
++    /// daemon policy engine's explicit arm) and recorded only so the access is
++    /// traced like any other tool call.
++    WorkflowQuery {
++        /// The workflow run being read, or empty when listing the repository's
++        /// runs (server-derived from the run context / validated args).
++        workflow_run_id: String,
++    },
++    /// Write a card on the repository task board (the `task.create` /
++    /// `task.update` / `task.move` runtime tools, rubric 10). Internal
++    /// coordination state in Codypendent's own store — like a blackboard post it
++    /// touches no file, command, network, or remote — so policy allows it
++    /// without an approval gate; the action is recorded so every board write is
++    /// traced and attributable.
++    TaskWrite {
++        /// The canonical repository whose board is written (server-derived from
++        /// the run context, never model-supplied).
++        repository: String,
++        /// A short human rendering of the write (e.g. `create "wire the DAG"`).
++        summary: String,
++    },
++    /// Read the repository task board (the `task.list` runtime tool). A read of
++    /// internal state; always policy-`Allow`ed and recorded for the trace.
++    TaskRead {
++        /// The canonical repository whose board is read (server-derived).
++        repository: String,
++    },
+     #[serde(other)]
+     Unknown,
+ }
+diff --git a/crates/protocol/src/workflow.rs b/crates/protocol/src/workflow.rs
+index ea13c75..5efa77c 100644
+--- a/crates/protocol/src/workflow.rs
++++ b/crates/protocol/src/workflow.rs
+@@ -114,6 +114,16 @@ pub struct WorkflowNodeView {
+     /// of a limit but stayed within it), pre-rendered. Empty when none.
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     pub warnings: Vec<String>,
++    /// The node ids this node depends on — the graph's **edges**, so a client can
++    /// draw the DAG rather than a flat list (rubric 5). Carried on snapshot reads
++    /// (the daemon recompiles the run's stored manifest to recover them); a live
++    /// [`WorkflowEvent::NodeTransitioned`] omits them (the graph shape is static
++    /// per run), so a client merging live deliveries must preserve the edges it
++    /// learned from the snapshot rather than overwriting them with an empty list.
++    /// Additive (`#[serde(default)]`): an older daemon sends none and the field
++    /// parses back empty.
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub depends_on: Vec<String>,
+ }
+ 
+ /// A workflow run's full observable state — the catch-up baseline a mid-run
+@@ -169,6 +179,7 @@ mod tests {
+             cost: Some(json!({ "wall_time_secs": 12, "tool_calls": 3 })),
+             error: None,
+             warnings: vec!["tool_calls at 4/5 (80%)".to_string()],
++            depends_on: Vec::new(),
+         }
+     }
+ 
+@@ -192,11 +203,27 @@ mod tests {
+             cost: None,
+             error: None,
+             warnings: Vec::new(),
++            depends_on: Vec::new(),
+         };
+         let json = serde_json::to_string(&item).expect("serialize");
+         assert!(!json.contains("cost"), "cost skipped: {json}");
+         assert!(!json.contains("error"), "error skipped: {json}");
+         assert!(!json.contains("warnings"), "warnings skipped: {json}");
++        assert!(!json.contains("depends_on"), "depends_on skipped: {json}");
++        let parsed: WorkflowNodeView = serde_json::from_str(&json).expect("deserialize");
++        assert_eq!(parsed, item);
++    }
++
++    #[test]
++    fn depends_on_rides_the_wire_when_present() {
++        // The DAG edges (rubric 5): a node view carrying its dependency ids
++        // round-trips them, and an older peer's payload (no key) parses back to
++        // an empty list rather than failing the frame.
++        let mut item = node_view();
++        item.node_id = "verify".to_string();
++        item.depends_on = vec!["inspect".to_string(), "plan".to_string()];
++        let json = serde_json::to_string(&item).expect("serialize");
++        assert!(json.contains("depends_on"), "edges on the wire: {json}");
+         let parsed: WorkflowNodeView = serde_json::from_str(&json).expect("deserialize");
+         assert_eq!(parsed, item);
+     }
+diff --git a/crates/protocol/tests/golden_vectors.rs b/crates/protocol/tests/golden_vectors.rs
+index ad497ad..d48dea1 100644
+--- a/crates/protocol/tests/golden_vectors.rs
++++ b/crates/protocol/tests/golden_vectors.rs
+@@ -72,18 +72,19 @@ use codypendent_protocol::{
+     WorkspaceId,
+ };
+ use codypendent_protocol::{
+-    AgentMode, ApprovalDecision, ApprovalScope, ArtifactRef, AudioArtifact, BlackboardItemView,
+-    BudgetDimension, CanaryMetrics, Catchup, ClientCapabilities, ClientHello, ClientRole,
+-    CodypendentError, Command, CommandBody, DaemonStatus, DataClassification, Diagnostic,
+-    DiagnosticSeverity, DiffRequest, DirtyBufferDigest, DocumentEditLease, DocumentLeaseGrant,
+-    DocumentMutation, DocumentSync, EditorSelection, EventBody, GitHubRefKind, GitHubReference,
+-    IdeContextUpdate, IdeRequest, ImageArtifact, ImageRegion, InputBlock, InputEnvelope,
+-    InputSource, Location, ModelObservation, OffDevicePolicy, Payload, Position, PromotionAction,
+-    ProposedAction, ProtocolError, PublishTarget, Range, ResumeToken, Risk, RiskLevel,
+-    RunDisposition, RunState, ScopeLevel, ServerHello, SessionEvent, SessionProjection,
+-    SourceProvenance, Subscription, SuggestionInput, SymbolRef, TextEdit, ToolOutcome, Transcript,
+-    TranscriptionMode, UserAction, WorkflowEvent, WorkflowNodeState, WorkflowNodeView,
+-    WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceEdit, PROTOCOL_V1,
++    board_scope_id, AgentMode, ApprovalDecision, ApprovalScope, ArtifactRef, AudioArtifact,
++    BlackboardItemDraft, BlackboardItemView, BlackboardScope, BudgetDimension, CanaryMetrics,
++    Catchup, ClientCapabilities, ClientHello, ClientRole, CodypendentError, Command, CommandBody,
++    DaemonStatus, DataClassification, Diagnostic, DiagnosticSeverity, DiffRequest,
++    DirtyBufferDigest, DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync,
++    EditorSelection, EventBody, GitHubRefKind, GitHubReference, IdeContextUpdate, IdeRequest,
++    ImageArtifact, ImageRegion, InputBlock, InputEnvelope, InputSource, Location, ModelObservation,
++    OffDevicePolicy, Payload, Position, PromotionAction, ProposedAction, ProtocolError,
++    PublishTarget, Range, ResumeToken, Risk, RiskLevel, RunDisposition, RunState, ScopeLevel,
++    ServerHello, SessionEvent, SessionProjection, SourceProvenance, Subscription, SuggestionInput,
++    SymbolRef, TextEdit, ToolOutcome, Transcript, TranscriptionMode, UserAction, WorkflowEvent,
++    WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceEdit,
++    PROTOCOL_V1,
+ };
+ 
+ // ---------------------------------------------------------------------------
+@@ -457,6 +458,9 @@ fn command_vectors() -> Vec<Vector> {
+                 workflow_run_id: "wfrun-abc123".to_string(),
+                 kind: Some("finding".to_string()),
+                 include_superseded: true,
++                // Additive and default-skipped: this original vector's bytes
++                // are unchanged; the board-scoped read lives in board.json.
++                board_repository: None,
+             },
+         ),
+         vec_of(
+@@ -1518,6 +1522,12 @@ fn blackboard_item() -> BlackboardItemView {
+         evidence: vec![json!({ "path": "src/parse.rs", "line": 42 })],
+         revision: 1,
+         superseded_by: None,
++        // The board fields are additive and default-skipped, so this original
++        // vector's bytes are unchanged; the populated shapes live in board.json.
++        board_scope: None,
++        status: None,
++        assignee: None,
++        ordinal: None,
+     }
+ }
+ 
+@@ -1525,6 +1535,113 @@ fn blackboard_vectors() -> Vec<Vector> {
+     vec![vec_of("BlackboardItemView", blackboard_item())]
+ }
+ 
++// ---------------------------------------------------------------------------
++// board.json (NEW FILE — the kanban/board additions ride here so the original
++// blackboard.json/command.json/envelope.json vectors stay byte-identical):
++// BlackboardScope, BlackboardItemDraft, the client write commands, the
++// board-scoped read, the write reply, a board card view, and the task.* /
++// workflow.query proposed actions.
++// ---------------------------------------------------------------------------
++
++/// A stored board card: a `task` on the repository board's synthetic run, with
++/// every board field populated.
++fn board_card() -> BlackboardItemView {
++    BlackboardItemView {
++        id: "0192-card".to_string(),
++        workflow_run_id: board_scope_id("/home/user/project"),
++        kind: "task".to_string(),
++        payload: json!({ "title": "wire the DAG viewer", "description": "edges on the wire" }),
++        author: json!({ "role": "operator", "client_id": "60000000-0000-0000-0000-000000000001" }),
++        confidence: None,
++        evidence: Vec::new(),
++        revision: 1,
++        superseded_by: None,
++        board_scope: Some("/home/user/project".to_string()),
++        status: Some("todo".to_string()),
++        assignee: Some("dana".to_string()),
++        ordinal: Some(1),
++    }
++}
++
++fn board_vectors() -> Vec<Vector> {
++    let draft = BlackboardItemDraft {
++        kind: "task".to_string(),
++        payload: json!({ "title": "wire the DAG viewer" }),
++        confidence: None,
++        evidence: Vec::new(),
++        status: Some("todo".to_string()),
++        assignee: Some("dana".to_string()),
++        ordinal: Some(1),
++    };
++    vec![
++        vec_of(
++            "BlackboardScope_WorkflowRun",
++            BlackboardScope::WorkflowRun {
++                workflow_run_id: "wfrun-abc123".to_string(),
++            },
++        ),
++        vec_of(
++            "BlackboardScope_RepositoryBoard",
++            BlackboardScope::RepositoryBoard {
++                repository: "/home/user/project".to_string(),
++            },
++        ),
++        vec_of("BlackboardItemDraft", draft.clone()),
++        vec_of("BlackboardItemView_board_card", board_card()),
++        vec_of(
++            "CommandBody_PostBlackboardItem",
++            CommandBody::PostBlackboardItem {
++                scope: BlackboardScope::RepositoryBoard {
++                    repository: "/home/user/project".to_string(),
++                },
++                item: draft,
++            },
++        ),
++        vec_of(
++            "CommandBody_UpdateBlackboardItem",
++            CommandBody::UpdateBlackboardItem {
++                scope: BlackboardScope::RepositoryBoard {
++                    repository: "/home/user/project".to_string(),
++                },
++                item_id: "0192-card".to_string(),
++                status: Some("doing".to_string()),
++                assignee: None,
++                ordinal: Some(2),
++                payload: None,
++            },
++        ),
++        vec_of(
++            "CommandBody_ReadBlackboard_board",
++            CommandBody::ReadBlackboard {
++                workflow_run_id: String::new(),
++                kind: Some("task".to_string()),
++                include_superseded: false,
++                board_repository: Some("/home/user/project".to_string()),
++            },
++        ),
++        vec_of(
++            "Payload_BlackboardItemApplied",
++            Payload::BlackboardItemApplied {
++                command_id: command_id(),
++                item: board_card(),
++            },
++        ),
++        vec_of(
++            "ProposedAction_TaskWrite",
++            ProposedAction::TaskWrite {
++                repository: "/home/user/project".to_string(),
++                summary: "create \"wire the DAG viewer\"".to_string(),
++            },
++        ),
++        vec_of(
++            "ProposedAction_TaskRead",
++            ProposedAction::TaskRead {
++                repository: "/home/user/project".to_string(),
++            },
++        ),
++    ]
++}
++
+ // ---------------------------------------------------------------------------
+ // workflow.rs (Rust-only: not modeled in the extension yet)
+ // ---------------------------------------------------------------------------
+@@ -1538,9 +1655,88 @@ fn workflow_node_view() -> WorkflowNodeView {
+         cost: Some(json!({ "wall_time_secs": 12, "tool_calls": 3 })),
+         error: None,
+         warnings: vec!["tool_calls at 4/5 (80%)".to_string()],
++        // Additive and default-skipped, so this original vector's bytes are
++        // unchanged; the edge-carrying shapes live in workflow_graph.json.
++        depends_on: Vec::new(),
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// workflow_graph.json (NEW FILE — the DAG-edge additions ride here so the
++// original workflow.json vectors stay byte-identical): a node view carrying
++// `depends_on`, a snapshot whose nodes form a real two-edge graph, and the
++// workflow.query proposed action.
++// ---------------------------------------------------------------------------
++
++fn workflow_graph_vectors() -> Vec<Vector> {
++    let inspect = workflow_node_view();
++    let verify = WorkflowNodeView {
++        workflow_run_id: "wfrun-abc".to_string(),
++        node_id: "verify".to_string(),
++        state: WorkflowNodeState::Running,
++        attempt: 1,
++        cost: None,
++        error: None,
++        warnings: Vec::new(),
++        depends_on: vec!["inspect".to_string()],
++    };
++    let review = WorkflowNodeView {
++        workflow_run_id: "wfrun-abc".to_string(),
++        node_id: "review".to_string(),
++        state: WorkflowNodeState::Pending,
++        attempt: 0,
++        cost: None,
++        error: None,
++        warnings: Vec::new(),
++        depends_on: vec!["inspect".to_string(), "verify".to_string()],
++    };
++    vec![
++        vec_of("WorkflowNodeView_with_depends_on", verify.clone()),
++        vec_of(
++            "WorkflowRunSnapshot_with_edges",
++            WorkflowRunSnapshot {
++                workflow_run_id: "wfrun-abc".to_string(),
++                phase: WorkflowRunPhase::Running,
++                nodes: vec![inspect, verify, review],
++            },
++        ),
++        vec_of(
++            "ProposedAction_WorkflowQuery",
++            ProposedAction::WorkflowQuery {
++                workflow_run_id: "wfrun-abc123".to_string(),
++            },
++        ),
++    ]
++}
++
++// ---------------------------------------------------------------------------
++// history.json (NEW FILE — the paged history read): ReadSessionEvents and its
++// SessionEventsPage reply.
++// ---------------------------------------------------------------------------
++
++fn history_vectors() -> Vec<Vector> {
++    vec![
++        vec_of(
++            "CommandBody_ReadSessionEvents",
++            CommandBody::ReadSessionEvents {
++                session_id: session_id(),
++                after_sequence: 500,
++                limit: 200,
++            },
++        ),
++        vec_of(
++            "Payload_SessionEventsPage",
++            Payload::SessionEventsPage {
++                command_id: command_id(),
++                session_id: session_id(),
++                events: vec![event_with(EventBody::SessionClosed)],
++                through: 501,
++                has_more: true,
++            },
++        ),
++    ]
++}
++
+ fn workflow_vectors() -> Vec<Vector> {
+     vec![
+         vec_of("WorkflowNodeState_Pending", WorkflowNodeState::Pending),
+@@ -1796,6 +1992,13 @@ fn all_files() -> Vec<(&'static str, Vec<Vector>)> {
+         ("workflow.json", workflow_vectors()),
+         ("capabilities.json", capabilities_vectors()),
+         ("input.json", input_vectors()),
++        // New vector FILES for the additive kanban/DAG/history shapes — the
++        // original files above stay byte-identical because every new field is
++        // `#[serde(default)]` + skip-when-default and no existing generator
++        // sets one.
++        ("board.json", board_vectors()),
++        ("workflow_graph.json", workflow_graph_vectors()),
++        ("history.json", history_vectors()),
+     ]
+ }
+ 
+diff --git a/crates/workflow/src/blackboard.rs b/crates/workflow/src/blackboard.rs
+index 4baf234..642ea18 100644
+--- a/crates/workflow/src/blackboard.rs
++++ b/crates/workflow/src/blackboard.rs
+@@ -39,9 +39,41 @@ pub enum BlackboardError {
+     /// won the race, so this one is refused rather than forking the chain.
+     #[error("blackboard item {0} has already been superseded")]
+     AlreadySuperseded(String),
++    /// A board card carried a status the validator refused (empty, over-long, or
++    /// containing control characters).
++    #[error("invalid board status: {0}")]
++    InvalidStatus(String),
+ }
+ 
+-/// The typed artifacts the blackboard holds (Chapter 04).
++/// The default board columns, in display order. `status` is a free string —
++/// a team may add its own columns — but these are the validated defaults a
++/// fresh card lands in and every client renders first.
++pub const DEFAULT_BOARD_STATUSES: [&str; 4] = ["todo", "doing", "review", "done"];
++
++/// The status a new `task` card lands in when none is given.
++pub const DEFAULT_TASK_STATUS: &str = "todo";
++
++/// Longest accepted board status. Statuses render as column headers, so an
++/// unbounded free string would let one bad write distort every client.
++const MAX_STATUS_LEN: usize = 32;
++
++/// Validate (and normalize) a board status: trimmed, non-empty, bounded, no
++/// control characters. Free-form beyond that — the default columns
++/// ([`DEFAULT_BOARD_STATUSES`]) are conventions, not an enum — so a team can
++/// grow its own columns without a schema change.
++pub fn normalize_status(status: &str) -> Result<String, BlackboardError> {
++    let trimmed = status.trim();
++    if trimmed.is_empty()
++        || trimmed.chars().count() > MAX_STATUS_LEN
++        || trimmed.chars().any(char::is_control)
++    {
++        return Err(BlackboardError::InvalidStatus(status.to_owned()));
++    }
++    Ok(trimmed.to_lowercase())
++}
++
++/// The typed artifacts the blackboard holds (Chapter 04; `task` added for the
++/// kanban board, rubric 10).
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum BlackboardKind {
+     Finding,
+@@ -52,6 +84,10 @@ pub enum BlackboardKind {
+     TestResult,
+     DocumentDraft,
+     OpenQuestion,
++    /// A backlog/board card: a unit of work with a status column, an optional
++    /// assignee, and a within-column ordinal. Evidence-optional — a card is a
++    /// plan, not a claim about the codebase.
++    Task,
+ }
+ 
+ impl BlackboardKind {
+@@ -66,12 +102,14 @@ impl BlackboardKind {
+             BlackboardKind::TestResult => "test_result",
+             BlackboardKind::DocumentDraft => "document_draft",
+             BlackboardKind::OpenQuestion => "open_question",
++            BlackboardKind::Task => "task",
+         }
+     }
+ 
+     /// Whether an artifact of this kind must carry evidence. Claim-like artifacts
+     /// (a finding, a decision, a test result, a proposed patch, a located symbol)
+-    /// need grounding; a hypothesis, a draft, or an open question do not.
++    /// need grounding; a hypothesis, a draft, an open question, or a task card do
++    /// not.
+     #[must_use]
+     pub fn requires_evidence(self) -> bool {
+         matches!(
+@@ -98,6 +136,7 @@ impl BlackboardKind {
+             "test_result" => BlackboardKind::TestResult,
+             "document_draft" => BlackboardKind::DocumentDraft,
+             "open_question" => BlackboardKind::OpenQuestion,
++            "task" => BlackboardKind::Task,
+             _ => return None,
+         })
+     }
+@@ -107,6 +146,22 @@ impl BlackboardKind {
+     }
+ }
+ 
++/// The board-card fields of an artifact (migration 0019). All `None` for an
++/// ordinary workflow artifact; a `task` card carries at least a status.
++#[derive(Debug, Clone, PartialEq, Eq, Default)]
++pub struct BoardFields {
++    /// The repository this item's board serves, when the item lives on a
++    /// repository task board (its run id is then the synthetic board run).
++    pub board_scope: Option<String>,
++    /// The board column (`todo` / `doing` / `review` / `done`, or a validated
++    /// free string).
++    pub status: Option<String>,
++    /// Who the card is assigned to, if anyone.
++    pub assignee: Option<String>,
++    /// Position within the status column (lower sorts first).
++    pub ordinal: Option<i64>,
++}
++
+ /// An artifact to post (before it gets an id / revision).
+ #[derive(Debug, Clone)]
+ pub struct NewBlackboardItem {
+@@ -118,6 +173,10 @@ pub struct NewBlackboardItem {
+     pub confidence: Option<f64>,
+     /// Evidence references (opaque). Required for claim-like kinds.
+     pub evidence: Vec<Value>,
++    /// Board-card fields (0019). `BoardFields::default()` for ordinary
++    /// workflow artifacts; the store validates a present `status` and defaults
++    /// a `task`'s missing one to [`DEFAULT_TASK_STATUS`].
++    pub board: BoardFields,
+ }
+ 
+ /// A stored blackboard artifact.
+@@ -132,12 +191,14 @@ pub struct BlackboardItem {
+     pub revision: u32,
+     /// The id of the item that superseded this one, if any.
+     pub superseded_by: Option<String>,
++    /// Board-card fields (0019); all `None` for ordinary workflow artifacts.
++    pub board: BoardFields,
+ }
+ 
+ /// Every column [`row_to_item`] decodes, in a fixed order shared by the SELECT
+ /// statements.
+-const ITEM_COLUMNS: &str =
+-    "id, kind, payload_json, author_json, confidence, evidence_json, revision, superseded_by";
++const ITEM_COLUMNS: &str = "id, kind, payload_json, author_json, confidence, evidence_json, \
++     revision, superseded_by, board_scope, status, assignee, ordinal";
+ 
+ /// The `blackboard_items` store, scoped to a workflow run.
+ #[derive(Debug, Clone, Copy, Default)]
+@@ -150,16 +211,19 @@ impl BlackboardStore {
+     }
+ 
+     /// Post an artifact to a workflow run's blackboard. Refuses a claim-like kind
+-    /// with no evidence ([`BlackboardError::EvidenceRequired`]).
++    /// with no evidence ([`BlackboardError::EvidenceRequired`]) and an invalid
++    /// board status ([`BlackboardError::InvalidStatus`]); a `task` with no status
++    /// lands in [`DEFAULT_TASK_STATUS`].
+     pub async fn post(
+         &self,
+         pool: &SqlitePool,
+         workflow_run_id: &str,
+-        new: NewBlackboardItem,
++        mut new: NewBlackboardItem,
+     ) -> Result<BlackboardItem, BlackboardError> {
+         if new.kind.requires_evidence() && new.evidence.is_empty() {
+             return Err(BlackboardError::EvidenceRequired(new.kind.as_str()));
+         }
++        normalize_board(&mut new)?;
+         let id = Uuid::now_v7().to_string();
+         insert_item(pool, workflow_run_id, &id, &new, 1).await?;
+         Ok(BlackboardItem {
+@@ -171,6 +235,7 @@ impl BlackboardStore {
+             evidence: new.evidence,
+             revision: 1,
+             superseded_by: None,
++            board: new.board,
+         })
+     }
+ 
+@@ -182,11 +247,12 @@ impl BlackboardStore {
+         pool: &SqlitePool,
+         workflow_run_id: &str,
+         old_id: &str,
+-        new: NewBlackboardItem,
++        mut new: NewBlackboardItem,
+     ) -> Result<BlackboardItem, BlackboardError> {
+         if new.kind.requires_evidence() && new.evidence.is_empty() {
+             return Err(BlackboardError::EvidenceRequired(new.kind.as_str()));
+         }
++        normalize_board(&mut new)?;
+         // Read the old item's revision + supersession state, insert the
+         // replacement, and stamp the old row — all in ONE immediate (write-locked)
+         // transaction. A second concurrent supersede of the same item blocks at
+@@ -235,9 +301,31 @@ impl BlackboardStore {
+             evidence: new.evidence,
+             revision,
+             superseded_by: None,
++            board: new.board,
+         })
+     }
+ 
++    /// The next free ordinal at the END of one board column: one past the
++    /// column's current maximum among live items (0 for an empty column). The
++    /// append position a moved or newly created card takes when the caller does
++    /// not choose one.
++    pub async fn next_ordinal(
++        &self,
++        pool: &SqlitePool,
++        workflow_run_id: &str,
++        status: &str,
++    ) -> Result<i64, BlackboardError> {
++        let max: Option<i64> = sqlx::query_scalar(
++            "SELECT MAX(ordinal) FROM blackboard_items \
++             WHERE workflow_run_id = ? AND status = ? AND superseded_by IS NULL",
++        )
++        .bind(workflow_run_id)
++        .bind(status)
++        .fetch_one(pool)
++        .await?;
++        Ok(max.map_or(0, |m| m + 1))
++    }
++
+     /// Query a workflow run's blackboard. Optionally filter by `kind`; superseded
+     /// items are excluded unless `include_superseded` is set. Newest first.
+     pub async fn query(
+@@ -337,6 +425,18 @@ impl BlackboardStore {
+     }
+ }
+ 
++/// Validate and default an item's board fields before insert: a present status
++/// is normalized ([`normalize_status`]); a `task` with none lands in
++/// [`DEFAULT_TASK_STATUS`]. Non-card artifacts pass through untouched.
++fn normalize_board(new: &mut NewBlackboardItem) -> Result<(), BlackboardError> {
++    match (&new.board.status, new.kind) {
++        (Some(status), _) => new.board.status = Some(normalize_status(status)?),
++        (None, BlackboardKind::Task) => new.board.status = Some(DEFAULT_TASK_STATUS.to_owned()),
++        (None, _) => {}
++    }
++    Ok(())
++}
++
+ async fn insert_item(
+     pool: &SqlitePool,
+     workflow_run_id: &str,
+@@ -358,8 +458,8 @@ async fn insert_item_tx<'e, E: sqlx::SqliteExecutor<'e>>(
+     sqlx::query(
+         "INSERT INTO blackboard_items \
+          (id, workflow_run_id, kind, payload_json, author_json, confidence, evidence_json, \
+-          revision, superseded_by, created_at) \
+-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
++          revision, superseded_by, created_at, board_scope, status, assignee, ordinal) \
++         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
+     )
+     .bind(id)
+     .bind(workflow_run_id)
+@@ -370,6 +470,10 @@ async fn insert_item_tx<'e, E: sqlx::SqliteExecutor<'e>>(
+     .bind(serde_json::to_string(&new.evidence)?)
+     .bind(i64::from(revision))
+     .bind(Utc::now().to_rfc3339())
++    .bind(new.board.board_scope.as_deref())
++    .bind(new.board.status.as_deref())
++    .bind(new.board.assignee.as_deref())
++    .bind(new.board.ordinal)
+     .execute(exec)
+     .await?;
+     Ok(())
+@@ -385,5 +489,11 @@ fn row_to_item(row: sqlx::sqlite::SqliteRow) -> Result<BlackboardItem, Blackboar
+         evidence: serde_json::from_str(&row.get::<String, _>("evidence_json"))?,
+         revision: row.get::<i64, _>("revision") as u32,
+         superseded_by: row.get("superseded_by"),
++        board: BoardFields {
++            board_scope: row.get("board_scope"),
++            status: row.get("status"),
++            assignee: row.get("assignee"),
++            ordinal: row.get("ordinal"),
++        },
+     })
+ }
+diff --git a/crates/workflow/src/lib.rs b/crates/workflow/src/lib.rs
+index ad29963..51452c0 100644
+--- a/crates/workflow/src/lib.rs
++++ b/crates/workflow/src/lib.rs
+@@ -55,7 +55,8 @@ pub use agent::{
+ };
+ pub use binding::{bind_with, normalize_tool_name, scan_input_refs};
+ pub use blackboard::{
+-    BlackboardError, BlackboardItem, BlackboardKind, BlackboardStore, NewBlackboardItem,
++    normalize_status, BlackboardError, BlackboardItem, BlackboardKind, BlackboardStore,
++    BoardFields, NewBlackboardItem, DEFAULT_BOARD_STATUSES, DEFAULT_TASK_STATUS,
+ };
+ pub use budget::{
+     BudgetDimension, BudgetExceeded, BudgetLimits, BudgetScope, BudgetVerdict, BudgetWarning,
+diff --git a/crates/workflow/src/store.rs b/crates/workflow/src/store.rs
+index efacf95..521bf84 100644
+--- a/crates/workflow/src/store.rs
++++ b/crates/workflow/src/store.rs
+@@ -943,6 +943,39 @@ impl WorkflowStore {
+         Ok(())
+     }
+ 
++    /// Ensure the **synthetic board run** backing a repository task board exists
++    /// (kanban, migration 0019). `board_id` is the stable
++    /// `codypendent_protocol::board_scope_id` string (`board:<canonical repo>`)
++    /// that doubles as the blackboard hub key; `repository` is recorded in the
++    /// run's `inputs_json` and `repository` column for attribution. Inserted
++    /// `OR IGNORE` in the terminal state `completed`, so startup recovery,
++    /// `list_incomplete_runs`, and every drive path ignore it — it exists only
++    /// to satisfy `blackboard_items.workflow_run_id`'s FK and to key the board's
++    /// reads/subscriptions. Idempotent: a second call is a no-op.
++    pub async fn ensure_board_run(
++        &self,
++        pool: &SqlitePool,
++        board_id: &str,
++        repository: &str,
++    ) -> Result<(), WorkflowStoreError> {
++        let now = Utc::now().to_rfc3339();
++        let inputs = serde_json::to_string(&serde_json::json!({ "repository": repository }))?;
++        sqlx::query(
++            "INSERT OR IGNORE INTO workflow_runs \
++             (id, workflow_id, workflow_version, graph_signature, run_id, inputs_json, state, \
++              manifest_yaml, repository, created_at, updated_at) \
++             VALUES (?, 'repository-board', 1, 'board', NULL, ?, 'completed', NULL, ?, ?, ?)",
++        )
++        .bind(board_id)
++        .bind(&inputs)
++        .bind(repository)
++        .bind(&now)
++        .bind(&now)
++        .execute(pool)
++        .await?;
++        Ok(())
++    }
++
+     /// Mark every still-`Pending` node of a run `Skipped` — the cancel drain (T9):
+     /// a cancelled run's un-started nodes will never run, so they land in the one
+     /// no-producer terminal node state a `CancelWorkflow` newly produces (alongside
+diff --git a/crates/workflow/tests/blackboard_it.rs b/crates/workflow/tests/blackboard_it.rs
+index 8274971..17f995a 100644
+--- a/crates/workflow/tests/blackboard_it.rs
++++ b/crates/workflow/tests/blackboard_it.rs
+@@ -37,6 +37,7 @@ fn finding(text: &str, evidence: Vec<serde_json::Value>) -> NewBlackboardItem {
+         author: json!({ "agent": "investigator" }),
+         confidence: Some(0.8),
+         evidence,
++        board: Default::default(),
+     }
+ }
+ 
+@@ -82,6 +83,7 @@ async fn claim_kinds_require_evidence_but_questions_do_not() {
+                 author: json!({ "agent": "reviewer" }),
+                 confidence: None,
+                 evidence: vec![],
++                board: Default::default(),
+             },
+         )
+         .await
+diff --git a/migrations/0019_blackboard_board.sql b/migrations/0019_blackboard_board.sql
+new file mode 100644
+index 0000000..321d1b8
+--- /dev/null
++++ b/migrations/0019_blackboard_board.sql
+@@ -0,0 +1,27 @@
++-- Phase B (kanban on the blackboard, rubric 10): extend `blackboard_items` for
++-- board use — a column/status, an assignee, and a within-column ordinal — plus
++-- the board scope marker for repository task boards.
++--
++-- Scope design. `blackboard_items.workflow_run_id` is `NOT NULL REFERENCES
++-- workflow_runs(id)` (0010) and migrations are append-only, so making the FK
++-- nullable would need a full table rebuild. The cleaner shape kept here: a
++-- repository task board is a **synthetic workflow run** whose id is
++-- `board:<canonical repo path>` (see `codypendent_protocol::board_scope_id`),
++-- inserted on first board write with the terminal state `completed` so startup
++-- recovery and every drive path ignore it. Board cards then reference that run
++-- like any other item, and the existing read command, subscription hub, and
++-- supersession machinery serve the board unchanged. `board_scope` records the
++-- repository the board serves (NULL for ordinary workflow artifacts) so board
++-- items are distinguishable without parsing the run id.
++ALTER TABLE blackboard_items ADD COLUMN board_scope TEXT;
++-- The board column (todo | doing | review | done, or a validated free string).
++-- NULL for non-card artifacts.
++ALTER TABLE blackboard_items ADD COLUMN status TEXT;
++-- Who the card is assigned to, if anyone.
++ALTER TABLE blackboard_items ADD COLUMN assignee TEXT;
++-- Position within the status column (lower sorts first). NULL for non-cards.
++ALTER TABLE blackboard_items ADD COLUMN ordinal INTEGER;
++
++-- Column-grouped board reads: live cards of one run/board, per status, in order.
++CREATE INDEX ix_blackboard_items_board
++    ON blackboard_items (workflow_run_id, status, ordinal);
+diff --git a/protocol-vectors/board.json b/protocol-vectors/board.json
+new file mode 100644
+index 0000000..cf36887
+--- /dev/null
++++ b/protocol-vectors/board.json
+@@ -0,0 +1,100 @@
++{
++  "BlackboardItemDraft": {
++    "assignee": "dana",
++    "kind": "task",
++    "ordinal": 1,
++    "payload": {
++      "title": "wire the DAG viewer"
++    },
++    "status": "todo"
++  },
++  "BlackboardItemView_board_card": {
++    "assignee": "dana",
++    "author": {
++      "client_id": "60000000-0000-0000-0000-000000000001",
++      "role": "operator"
++    },
++    "board_scope": "/home/user/project",
++    "id": "0192-card",
++    "kind": "task",
++    "ordinal": 1,
++    "payload": {
++      "description": "edges on the wire",
++      "title": "wire the DAG viewer"
++    },
++    "revision": 1,
++    "status": "todo",
++    "workflow_run_id": "board:/home/user/project"
++  },
++  "BlackboardScope_RepositoryBoard": {
++    "repository": "/home/user/project",
++    "type": "RepositoryBoard"
++  },
++  "BlackboardScope_WorkflowRun": {
++    "type": "WorkflowRun",
++    "workflow_run_id": "wfrun-abc123"
++  },
++  "CommandBody_PostBlackboardItem": {
++    "item": {
++      "assignee": "dana",
++      "kind": "task",
++      "ordinal": 1,
++      "payload": {
++        "title": "wire the DAG viewer"
++      },
++      "status": "todo"
++    },
++    "scope": {
++      "repository": "/home/user/project",
++      "type": "RepositoryBoard"
++    },
++    "type": "PostBlackboardItem"
++  },
++  "CommandBody_ReadBlackboard_board": {
++    "board_repository": "/home/user/project",
++    "kind": "task",
++    "type": "ReadBlackboard",
++    "workflow_run_id": ""
++  },
++  "CommandBody_UpdateBlackboardItem": {
++    "item_id": "0192-card",
++    "ordinal": 2,
++    "scope": {
++      "repository": "/home/user/project",
++      "type": "RepositoryBoard"
++    },
++    "status": "doing",
++    "type": "UpdateBlackboardItem"
++  },
++  "Payload_BlackboardItemApplied": {
++    "command_id": "40000000-0000-0000-0000-000000000001",
++    "item": {
++      "assignee": "dana",
++      "author": {
++        "client_id": "60000000-0000-0000-0000-000000000001",
++        "role": "operator"
++      },
++      "board_scope": "/home/user/project",
++      "id": "0192-card",
++      "kind": "task",
++      "ordinal": 1,
++      "payload": {
++        "description": "edges on the wire",
++        "title": "wire the DAG viewer"
++      },
++      "revision": 1,
++      "status": "todo",
++      "workflow_run_id": "board:/home/user/project"
++    },
++    "type": "BlackboardItemApplied"
++  },
++  "ProposedAction_TaskRead": {
++    "repository": "/home/user/project",
++    "type": "TaskRead"
++  },
++  "ProposedAction_TaskWrite": {
++    "repository": "/home/user/project",
++    "summary": "create \"wire the DAG viewer\"",
++    "type": "TaskWrite"
++  }
++}
+diff --git a/protocol-vectors/history.json b/protocol-vectors/history.json
+new file mode 100644
+index 0000000..e458466
+--- /dev/null
++++ b/protocol-vectors/history.json
+@@ -0,0 +1,32 @@
++{
++  "CommandBody_ReadSessionEvents": {
++    "after_sequence": 500,
++    "limit": 200,
++    "session_id": "20000000-0000-0000-0000-000000000001",
++    "type": "ReadSessionEvents"
++  },
++  "Payload_SessionEventsPage": {
++    "command_id": "40000000-0000-0000-0000-000000000001",
++    "events": [
++      {
++        "actor": {
++          "agent_id": "c0000000-0000-0000-0000-000000000001",
++          "model": "claude-sonnet-5",
++          "run_id": "30000000-0000-0000-0000-000000000001",
++          "type": "Agent"
++        },
++        "body": {
++          "type": "SessionClosed"
++        },
++        "causation_id": "40000000-0000-0000-0000-000000000001",
++        "correlation_id": "b0000000-0000-0000-0000-000000000001",
++        "occurred_at": "2026-01-01T00:00:00Z",
++        "sequence": 9
++      }
++    ],
++    "has_more": true,
++    "session_id": "20000000-0000-0000-0000-000000000001",
++    "through": 501,
++    "type": "SessionEventsPage"
++  }
++}
+diff --git a/protocol-vectors/workflow_graph.json b/protocol-vectors/workflow_graph.json
+new file mode 100644
+index 0000000..a4eb8d4
+--- /dev/null
++++ b/protocol-vectors/workflow_graph.json
+@@ -0,0 +1,63 @@
++{
++  "ProposedAction_WorkflowQuery": {
++    "type": "WorkflowQuery",
++    "workflow_run_id": "wfrun-abc123"
++  },
++  "WorkflowNodeView_with_depends_on": {
++    "attempt": 1,
++    "depends_on": [
++      "inspect"
++    ],
++    "node_id": "verify",
++    "state": {
++      "type": "Running"
++    },
++    "workflow_run_id": "wfrun-abc"
++  },
++  "WorkflowRunSnapshot_with_edges": {
++    "nodes": [
++      {
++        "attempt": 1,
++        "cost": {
++          "tool_calls": 3,
++          "wall_time_secs": 12
++        },
++        "node_id": "inspect",
++        "state": {
++          "type": "Completed"
++        },
++        "warnings": [
++          "tool_calls at 4/5 (80%)"
++        ],
++        "workflow_run_id": "wfrun-abc"
++      },
++      {
++        "attempt": 1,
++        "depends_on": [
++          "inspect"
++        ],
++        "node_id": "verify",
++        "state": {
++          "type": "Running"
++        },
++        "workflow_run_id": "wfrun-abc"
++      },
++      {
++        "attempt": 0,
++        "depends_on": [
++          "inspect",
++          "verify"
++        ],
++        "node_id": "review",
++        "state": {
++          "type": "Pending"
++        },
++        "workflow_run_id": "wfrun-abc"
++      }
++    ],
++    "phase": {
++      "type": "Running"
++    },
++    "workflow_run_id": "wfrun-abc"
++  }
++}

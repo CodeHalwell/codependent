@@ -571,6 +571,7 @@ async fn create_attach_and_two_clients_observe_one_event() {
                     text: "focus on the parser".to_string(),
                     mode: AgentMode::Build,
                     model: None,
+                    envelope: None,
                 },
                 "input-1",
             )),
@@ -715,6 +716,7 @@ async fn a_follow_up_launches_a_new_run_after_a_prior_run() {
             text: "the follow up".to_string(),
             mode: AgentMode::Build,
             model: None,
+            envelope: None,
         },
         "input",
     )
@@ -823,6 +825,7 @@ async fn a_continuation_inherits_the_session_repository_and_pinned_model() {
             text: "the follow up".to_string(),
             mode: AgentMode::Build,
             model: None,
+            envelope: None,
         },
         "cont-input",
     )
@@ -955,6 +958,7 @@ async fn a_mid_conversation_repin_applies_instantly() {
             text: "switch to X".to_string(),
             mode: AgentMode::Build,
             model: Some(repin_x.clone()),
+            envelope: None,
         },
         "repin-input",
     )
@@ -1862,6 +1866,172 @@ async fn creating_a_session_with_a_repository_warms_the_code_graph_once() {
         repo.path(),
         "the server warms the session's repository root"
     );
+
+    shutdown(s1, task).await;
+}
+
+/// Paged history (`ReadSessionEvents`): the read that closes the >500-event
+/// catch-up gap. A client that falls far behind gets a `Catchup::Snapshot`
+/// carrying title + active runs and NO transcript; before this command there was
+/// no way to fetch the missing events at all, so the conversation could not be
+/// rebuilt. This walks a session's ledger a page at a time and asserts the
+/// contract a pager depends on: ascending order, a `through` cursor to pass back,
+/// `has_more` that tells it when to stop, and a clamped page size.
+#[tokio::test]
+async fn read_session_events_pages_the_ledger_forward() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+
+    let c1 = ClientId::new();
+    let mut s1 = connect(&paths).await;
+    handshake(&mut s1, c1).await;
+    bind_role(&mut s1, c1, ClientRole::Contributor, "att-role").await;
+    let reply = send_recv(
+        &mut s1,
+        &Envelope::request(
+            c1,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "a long conversation".to_string(),
+                    repository: None,
+                },
+                "create-history",
+            )),
+        ),
+    )
+    .await;
+    assert!(matches!(reply.payload, Payload::CommandAccepted { .. }));
+    let session_id = only_session_id(&pool).await;
+
+    // Append a ledger longer than one page so paging is actually exercised.
+    // `SessionCreated` is sequence 1, so this session ends at 13.
+    for index in 0..12u32 {
+        ledger::append_next_event(
+            &pool,
+            session_id,
+            &Actor::System,
+            &EventBody::NoteAppended {
+                text: format!("note {index}"),
+                run_id: None,
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("append");
+    }
+
+    async fn page(
+        stream: &mut UnixStream,
+        client_id: ClientId,
+        session_id: SessionId,
+        after: u64,
+        limit: u32,
+        key: &str,
+    ) -> (Vec<SessionEvent>, u64, bool) {
+        let body = CommandBody::ReadSessionEvents {
+            session_id,
+            after_sequence: after,
+            limit,
+        };
+        let request = Envelope::request(client_id, Payload::Command(command(body, key)));
+        match send_recv(stream, &request).await.payload {
+            Payload::SessionEventsPage {
+                events,
+                through,
+                has_more,
+                session_id: replied,
+                ..
+            } => {
+                assert_eq!(replied, session_id);
+                (events, through, has_more)
+            }
+            other => panic!("expected SessionEventsPage, got {other:?}"),
+        }
+    }
+
+    // First page: five events from the start, ascending, with more behind them.
+    let (events, through, has_more) = page(&mut s1, c1, session_id, 0, 5, "hist-1").await;
+    assert_eq!(events.len(), 5);
+    assert!(
+        events.windows(2).all(|w| w[0].sequence < w[1].sequence),
+        "a page must be ascending"
+    );
+    assert_eq!(events[0].sequence, 1);
+    assert_eq!(through, 5);
+    assert!(has_more);
+
+    // The cursor is exactly what the client passes back — no overlap, no gap.
+    let (events, through, has_more) = page(&mut s1, c1, session_id, through, 5, "hist-2").await;
+    assert_eq!(events[0].sequence, 6);
+    assert_eq!(through, 10);
+    assert!(has_more);
+
+    // Page to the end. The ledger's true length is whatever the daemon recorded
+    // (session creation plus the appends above), so the loop asserts the
+    // CONTRACT rather than a hardcoded count: `has_more` is the only stop signal
+    // a pager needs, and the pages tile the ledger exactly once.
+    let total = ledger::next_sequence(&pool, session_id)
+        .await
+        .expect("latest sequence")
+        - 1;
+    let mut walked: Vec<u64> = (1..=10).collect();
+    let mut cursor = through;
+    let mut more = has_more;
+    let mut round = 0;
+    while more {
+        round += 1;
+        assert!(round < 50, "paging must terminate");
+        let (events, next, has_more) = page(&mut s1, c1, session_id, cursor, 5, "hist-walk").await;
+        assert!(!events.is_empty(), "has_more promised another page");
+        walked.extend(events.iter().map(|event| event.sequence));
+        cursor = next;
+        more = has_more;
+    }
+    assert_eq!(cursor, total, "the last page's cursor is the ledger's end");
+    assert_eq!(
+        walked,
+        (1..=total).collect::<Vec<_>>(),
+        "the pages must tile the ledger exactly once, in order"
+    );
+
+    // A drained cursor is a fixed point: an empty page keeps `through` where it
+    // was rather than silently skipping the requested window.
+    let (events, drained_through, has_more) =
+        page(&mut s1, c1, session_id, cursor, 5, "hist-4").await;
+    assert!(events.is_empty());
+    assert_eq!(drained_through, cursor);
+    assert!(!has_more);
+
+    // Zero asks for the server default, and the server clamps rather than
+    // refusing — a client never has to know the page ceiling.
+    let (events, _, _) = page(&mut s1, c1, session_id, 0, 0, "hist-5").await;
+    assert_eq!(events.len() as u64, total);
+    let (events, _, _) = page(&mut s1, c1, session_id, 0, 100_000, "hist-6").await;
+    assert_eq!(events.len() as u64, total);
+
+    // An unknown session is REJECTED rather than answered with an empty page:
+    // a typo'd id must never read as "this session has no history".
+    let reply = send_recv(
+        &mut s1,
+        &Envelope::request(
+            c1,
+            Payload::Command(command(
+                CommandBody::ReadSessionEvents {
+                    session_id: SessionId::new(),
+                    after_sequence: 0,
+                    limit: 5,
+                },
+                "hist-missing",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.session-not-found"),
+        other => panic!("expected a rejection, got {other:?}"),
+    }
 
     shutdown(s1, task).await;
 }

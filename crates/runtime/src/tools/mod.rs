@@ -31,19 +31,24 @@
 //!
 //! [`ArtifactStore`]: codypendent_daemon::artifacts::ArtifactStore
 
+mod artifact;
 mod blackboard;
+mod docs;
 mod edit_file;
 mod git;
 mod github;
 mod label;
 mod memory;
 mod read_file;
+mod registry_search;
 mod repository;
 mod salient;
 mod search;
 mod secure_fs;
 mod shell;
+mod task;
 mod web_search;
+mod workflow_query;
 mod write_file;
 
 use std::path::PathBuf;
@@ -51,11 +56,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use codypendent_daemon::artifacts::Provenance;
-use codypendent_protocol::ArtifactRef;
+use codypendent_protocol::{ArtifactId, ArtifactRef};
 
+pub use artifact::{parse_artifact_read, ArtifactRead, ArtifactReadInput};
 pub use blackboard::{
     parse_blackboard_post, parse_blackboard_query, BlackboardPostInput, BlackboardPostTool,
     BlackboardQueryInput, BlackboardQueryTool,
+};
+pub use docs::{
+    docs_proposed_action, parse_docs_create, parse_docs_edit, parse_docs_read, parse_docs_suggest,
+    DocsCreateInput, DocsCreateTool, DocsEditInput, DocsEditTool, DocsReadInput, DocsReadTool,
+    DocsSuggestInput, DocsSuggestTool,
 };
 pub use edit_file::{parse_edit_file, EditFile, EditFileInput, EditFileOutcome, FileEdit};
 pub use git::{
@@ -71,11 +82,22 @@ pub use github::{
 pub use label::tool_label;
 pub use memory::{parse_memory_remember, MemoryRemember, MemoryRememberInput};
 pub use read_file::{FileExcerpt, ReadFile, ReadFileInput};
+pub use registry_search::{
+    parse_skills_search, render_registry_search, RegistryCard, RegistrySearch,
+    RegistrySearchOutcome, RegistrySearchRequest, SkillDocument, SkillsSearch, SkillsSearchInput,
+    SEARCH_CARD_LIMIT, SKILL_DOCUMENT_MAX_BYTES,
+};
 pub use repository::{RepositoryTest, RepositoryTestOutcome};
 pub use salient::{SalientStream, SalientView};
 pub use search::{Search, SearchInput, SearchMatch, SearchResults};
 pub use shell::{CommandRequest, EnvironmentBinding, Shell, ShellOutcome};
+pub use task::{
+    parse_task_create, parse_task_list, parse_task_move, parse_task_update, task_read_action,
+    task_write_action, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool,
+    TaskUpdateInput, TaskUpdateTool,
+};
 pub use web_search::{parse_web_search, render_search_outcome, WebSearch, WebSearchInput};
+pub use workflow_query::{parse_workflow_query, WorkflowQueryInput, WorkflowQueryTool};
 pub use write_file::{parse_write_file, WriteFile, WriteFileInput, WriteFileOutcome};
 
 /// A capability class a tool requires. The concrete
@@ -243,6 +265,47 @@ pub trait ArtifactSink: Send + Sync {
         provenance: Provenance,
         bytes: &[u8],
     ) -> anyhow::Result<ArtifactRef>;
+}
+
+/// The READ side of the artifact boundary, mirroring [`ArtifactSink`]: the
+/// `artifact.read` tool rehydrates a stored artifact's bytes by id through
+/// this seam, for the same reason the spill goes through a sink — the store's
+/// `get` needs a pool this crate cannot name (see the module docs). `Ok(None)`
+/// means "no such artifact", surfaced to the model as a legible tool failure;
+/// implementations must also answer `Ok(None)` for content the model may not
+/// see (e.g. secret-classified artifacts), never hand it back.
+#[async_trait]
+pub trait ArtifactReader: Send + Sync {
+    /// Load the stored bytes (and their media type) for `id`, or `None` when
+    /// no such artifact exists / it may not be disclosed.
+    async fn load(&self, id: ArtifactId) -> anyhow::Result<Option<LoadedArtifact>>;
+}
+
+/// An artifact's stored bytes plus the media type they were stored under —
+/// what [`ArtifactReader::load`] hands back for rendering.
+#[derive(Debug, Clone)]
+pub struct LoadedArtifact {
+    /// The media type recorded when the artifact was stored.
+    pub media_type: String,
+    /// The full stored bytes (bounded rendering is the TOOL's job, so the
+    /// reader stays a dumb byte fetch).
+    pub bytes: Vec<u8>,
+}
+
+/// An [`ArtifactReader`] built from a closure — the [`ClosureSink`] idiom for
+/// the read side, so a caller can capture an `ArtifactStore` + pool value and
+/// forward to the store's `get`.
+pub struct ClosureReader<F>(pub F);
+
+#[async_trait]
+impl<F, Fut> ArtifactReader for ClosureReader<F>
+where
+    F: Fn(ArtifactId) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = anyhow::Result<Option<LoadedArtifact>>> + Send,
+{
+    async fn load(&self, id: ArtifactId) -> anyhow::Result<Option<LoadedArtifact>> {
+        (self.0)(id).await
+    }
 }
 
 /// An [`ArtifactSink`] built from a closure, so a caller can capture an

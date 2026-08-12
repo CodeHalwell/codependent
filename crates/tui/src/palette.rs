@@ -35,6 +35,8 @@ pub enum PaletteCommand {
     Workflow,
     /// Open the blackboard view.
     Blackboard,
+    /// Open the repository task board.
+    Kanban,
     /// Open host-owned installed Remote UI plugin management.
     UiPlugins,
     /// Open the model picker (MP1).
@@ -47,6 +49,13 @@ pub enum PaletteCommand {
     ApiKeys,
     /// Surface the persisted multi-provider council workflow.
     Council,
+    /// Browse the Unsloth GGUF catalog on Hugging Face and pull one via
+    /// `ollama` into a selectable local model.
+    UnslothCatalog,
+    /// Toggle speaking finalized assistant turns aloud (voice v1, rubric 8).
+    VoiceSpeak,
+    /// Open the theme picker (7 built-in variants + installed packs).
+    Theme,
     /// Flip between the chat and workspace layouts.
     ToggleLayout,
     /// Toggle the help overlay.
@@ -164,7 +173,17 @@ pub const COMMANDS: &[PaletteEntry] = &[
     PaletteEntry {
         command: PaletteCommand::Council,
         title: "/council  Agent council",
-        description: "create a council from multiple model profiles, roles, and a synthesis chair",
+        description: "list, run, and manage persisted multi-model councils; `n` inside creates one",
+        key: "C",
+        group: "Models",
+    },
+    PaletteEntry {
+        command: PaletteCommand::UnslothCatalog,
+        title: "Local models: browse Unsloth catalog",
+        description:
+            "browse Unsloth GGUF repos on Hugging Face, pick a quant, and pull it via ollama",
+        // Palette-only: a rare, deliberate action gets no single-key slot,
+        // mirroring the other model-configuration entries in this group.
         key: "—",
         group: "Models",
     },
@@ -198,6 +217,13 @@ pub const COMMANDS: &[PaletteEntry] = &[
         group: "Workspace",
     },
     PaletteEntry {
+        command: PaletteCommand::Kanban,
+        title: "/board  Task board",
+        description: "backlog cards in columns; move them, or ask an agent to fill them",
+        key: "K",
+        group: "Workspace",
+    },
+    PaletteEntry {
         command: PaletteCommand::Skills,
         title: "/skills  Skill Studio · read only",
         description: "inspect registered skills and their permissions",
@@ -219,6 +245,24 @@ pub const COMMANDS: &[PaletteEntry] = &[
         group: "Workspace",
     },
     // --- Session: client-level and housekeeping commands. ---
+    PaletteEntry {
+        command: PaletteCommand::VoiceSpeak,
+        title: "Voice: speak replies",
+        description:
+            "read each finished assistant turn aloud (needs a [speech] entry and a play_command)",
+        // Palette-only: speaking aloud is a deliberate, occasional choice, not
+        // something to fire from a stray keystroke.
+        key: "—",
+        group: "Session",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Theme,
+        title: "/theme  Theme picker",
+        description: "switch the colour theme — previews live as you move",
+        // Palette-only, like the model/provider/mode pickers.
+        key: "—",
+        group: "Session",
+    },
     PaletteEntry {
         command: PaletteCommand::ToggleLayout,
         title: "Toggle layout",
@@ -358,6 +402,18 @@ mod tests {
     #[test]
     fn filters_to_the_agent_council_command() {
         assert_eq!(filtered("council")[0].command, PaletteCommand::Council);
+    }
+
+    #[test]
+    fn filters_to_the_unsloth_catalog_command() {
+        assert_eq!(
+            filtered("unsloth")[0].command,
+            PaletteCommand::UnslothCatalog
+        );
+        assert_eq!(
+            filtered("Local models")[0].command,
+            PaletteCommand::UnslothCatalog
+        );
     }
 
     #[test]

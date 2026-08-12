@@ -29,9 +29,19 @@
 //!   with `workflow.transport-unavailable`, exactly as `StartWorkflow` is without a
 //!   starter.
 //!
-//! There is deliberately **no** post seam here: only the workflow executor writes
-//! the board (an agent posts through the runtime tool layer), so no client-facing
-//! post command exists. An Observer may read; nobody posts over the wire.
+//! * [`BlackboardWriter`] — the mirror-image seam for *writing* a board from a
+//!   client (Phase B kanban). Originally there was deliberately no post seam here
+//!   (only the workflow executor wrote the board). The repository **task board**
+//!   needs one: a human moves a card in the TUI, and no agent run is involved. It
+//!   is gated at the server to the `Controller` role, so an Observer stays
+//!   read-only and an agent still writes only through its `blackboard.*`/`task.*`
+//!   tools.
+//!
+//! A **repository task board** rides the same three pieces unchanged: it is stored
+//! as a synthetic workflow run whose id is `codypendent_protocol::board_scope_id`
+//! (`board:<canonical repo>`), so the hub keys it like any run (`board:<repo>`
+//! feeds), the reader projects it like any run's board, and a client subscribes to
+//! it with an ordinary `Subscription::Blackboard { workflow_run_id: board_id }`.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -112,14 +122,98 @@ impl BlackboardHub {
 /// A client's request to read a workflow run's blackboard.
 #[derive(Debug, Clone)]
 pub struct ReadBlackboardRequest {
-    /// The durable workflow-run id whose board to read.
+    /// The durable workflow-run id whose board to read. Ignored when
+    /// [`board_repository`](Self::board_repository) is set — the assembly then
+    /// resolves the synthetic board run instead.
     pub workflow_run_id: String,
+    /// Read a **repository task board** (kanban) rather than a workflow run's
+    /// board. The canonical repository root; the assembly resolves it to the
+    /// synthetic board run `codypendent_protocol::board_scope_id` names. A board
+    /// never written to reads empty (a read creates nothing).
+    pub board_repository: Option<String>,
     /// A blackboard artifact kind to filter by, or all kinds when `None`.
     pub kind: Option<String>,
     /// Include superseded revisions too; `false` returns only the live board.
     pub include_superseded: bool,
     /// The identity of the reading client (for attribution / audit).
     pub client_id: ClientId,
+}
+
+/// Which durable board a client write targets — the daemon-side mirror of the
+/// wire [`BlackboardScope`](codypendent_protocol::BlackboardScope), with the
+/// `Unknown` (a newer client's scope) already rejected at the server edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoardTarget {
+    /// A durable workflow run's board.
+    WorkflowRun(String),
+    /// A repository's task board — the assembly creates the synthetic board run
+    /// on first write.
+    Repository(String),
+}
+
+/// A client's request to post a new artifact onto a board (`PostBlackboardItem`).
+///
+/// The `author` is **not** here: the assembly builds it from
+/// [`client_id`](Self::client_id) and the role the daemon recorded at attach,
+/// exactly as the workflow executor builds an agent's author — a client never
+/// supplies its own attribution.
+#[derive(Debug, Clone)]
+pub struct PostBlackboardRequest {
+    /// The board to write.
+    pub target: BoardTarget,
+    /// The artifact to store (kind, payload, evidence, board fields).
+    pub item: codypendent_protocol::BlackboardItemDraft,
+    /// The identity of the writing client (server-built attribution).
+    pub client_id: ClientId,
+}
+
+/// A client's request to supersede an existing board item
+/// (`UpdateBlackboardItem`): a column move, a re-assignment, a re-order, or a
+/// payload edit. Absent fields carry the stored item's values forward.
+#[derive(Debug, Clone)]
+pub struct UpdateBlackboardRequest {
+    /// The board holding the item.
+    pub target: BoardTarget,
+    /// The live item to supersede.
+    pub item_id: String,
+    /// The new column, when moving.
+    pub status: Option<String>,
+    /// The new assignee, when re-assigning.
+    pub assignee: Option<String>,
+    /// The new within-column position; absent appends to the target column.
+    pub ordinal: Option<i64>,
+    /// A replacement payload, when editing the card body.
+    pub payload: Option<serde_json::Value>,
+    /// The identity of the writing client (server-built attribution).
+    pub client_id: ClientId,
+}
+
+/// The future a [`BlackboardWriter`] returns: the stored (or superseding) item to
+/// reply with, or a structured [`CodypendentError`] the server rejects with.
+pub type BlackboardWriteFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<BlackboardItemView, CodypendentError>> + Send + 'a>>;
+
+/// The daemon's seam for *writing* a board from an accepted `PostBlackboardItem`
+/// / `UpdateBlackboardItem` (Phase B kanban).
+///
+/// The mirror of [`BlackboardReader`]: the daemon declares what it needs, the
+/// `codypendentd` assembly implements it over `codypendent-workflow`'s
+/// `BlackboardStore` on the daemon's pool (creating the synthetic board run on
+/// first repository-board write) and publishes the stored item to the
+/// [`BlackboardHub`] so live subscribers converge. The default-`None`
+/// [`RunExecutor::blackboard_writer`](crate::executor::RunExecutor::blackboard_writer)
+/// leaves it unwired — the lib-only / test server then rejects both commands with
+/// `workflow.transport-unavailable`.
+///
+/// The server gates both commands on the
+/// [`Controller`](codypendent_protocol::ClientRole::Controller) role *before*
+/// reaching this seam, so an implementation never sees an Observer's write.
+pub trait BlackboardWriter: Send + Sync {
+    /// Store a new artifact on `request`'s board, returning its projected view.
+    fn post(&self, request: PostBlackboardRequest) -> BlackboardWriteFuture<'_>;
+
+    /// Supersede `request`'s item with a revised one, returning the replacement.
+    fn update(&self, request: UpdateBlackboardRequest) -> BlackboardWriteFuture<'_>;
 }
 
 /// The future a [`BlackboardReader`] returns: the projected board items to reply
@@ -162,6 +256,10 @@ mod tests {
             evidence: Vec::new(),
             revision: 1,
             superseded_by: None,
+            board_scope: None,
+            status: None,
+            assignee: None,
+            ordinal: None,
         }
     }
 

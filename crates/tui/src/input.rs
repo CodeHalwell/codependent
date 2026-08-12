@@ -101,26 +101,28 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "↑↓ + Enter",
-        description: "activate a list row / transcript fold (same as clicking it)",
+        description: "activate the selected row in a browser or the palette",
         mouse: Some("click a row"),
     },
     KeyBinding {
         keys: "Tab",
-        description: "focus a pane (same as clicking it)",
+        description: "focus the next workspace pane (same as clicking it)",
         mouse: Some("click a pane"),
     },
-    // Appended (not inserted): FOOTER_HINTS above references entries by
-    // fixed index, so new bindings go at the end to keep those indices
-    // stable.
     KeyBinding {
         keys: "↑ / ↓ (composer)",
         description: "recall the previous / next composer message",
         mouse: None,
     },
     KeyBinding {
+        keys: "Alt-↑ / Alt-↓",
+        description: "browse transcript folds: tool cards, diffs, long notes",
+        mouse: Some("click a fold line"),
+    },
+    KeyBinding {
         keys: "Alt-Enter",
-        description: "insert a line break instead of sending",
-        mouse: None,
+        description: "expand / collapse the browsed fold, else insert a line break",
+        mouse: Some("click a fold line"),
     },
     KeyBinding {
         keys: "Delete",
@@ -147,62 +149,22 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         description: "enter Remote UI · next extension document · return to composer",
         mouse: Some("click extension chrome"),
     },
-];
-
-/// One footer chip: a compact display label paired with the real `KEY_BINDINGS`
-/// entry it derives from (so it can never drift) and the `Action` a click fires.
-#[derive(Debug, Clone)]
-pub struct FooterHint {
-    pub binding: &'static KeyBinding,
-    pub label: &'static str,
-    pub action: Action,
-}
-
-/// The curated, ordered footer strip. Each entry references a real binding by
-/// index (the drift-guard test asserts each is present in `KEY_BINDINGS`).
-static FOOTER_HINTS: &[FooterHint] = &[
-    FooterHint {
-        binding: &KEY_BINDINGS[1],
-        label: "⏎ send",
-        action: Action::InputSubmit,
+    KeyBinding {
+        keys: "C",
+        description: "agent council browser: list, run, and manage persisted councils",
+        mouse: None,
     },
-    FooterHint {
-        binding: &KEY_BINDINGS[2],
-        label: "/ commands",
-        action: Action::OpenPalette,
+    KeyBinding {
+        keys: "n / r / d (Council)",
+        description: "new council · run deliberation (prompts for objective) · delete",
+        mouse: None,
     },
-    FooterHint {
-        binding: &KEY_BINDINGS[3],
-        label: "PgUp",
-        action: Action::ScrollPageUp,
-    },
-    FooterHint {
-        binding: &KEY_BINDINGS[3],
-        label: "PgDn",
-        action: Action::ScrollPageDown,
-    },
-    FooterHint {
-        binding: &KEY_BINDINGS[5],
-        label: "F2 layout",
-        action: Action::ToggleLayout,
-    },
-    FooterHint {
-        binding: &KEY_BINDINGS[9],
-        label: "? help",
-        action: Action::Help,
-    },
-    FooterHint {
-        binding: &KEY_BINDINGS[12],
-        label: "Ctrl-C detach",
-        action: Action::Detach,
+    KeyBinding {
+        keys: "K · ← / → (Board)",
+        description: "open the task board · move the focused card between columns",
+        mouse: Some("click a card or a move chip"),
     },
 ];
-
-/// The persistent, derived shortcut strip (curated subset of `KEY_BINDINGS`).
-#[must_use]
-pub fn footer_hints() -> &'static [FooterHint] {
-    FOOTER_HINTS
-}
 
 /// Resolve a left click at `(col,row)` to the topmost registered rect's Action.
 /// Iterates in reverse so the last-registered (top-of-z-order) rect wins.
@@ -311,6 +273,11 @@ fn map_normal_key(key: &KeyEvent) -> Action {
         KeyCode::Enter => Action::Expand,
         KeyCode::Up => Action::SelectPrev,
         KeyCode::Down => Action::SelectNext,
+        // The task board's column moves (rubric 10). Horizontal arrows had no
+        // meaning in a navigable overlay before, and the reducer ignores them
+        // outside the board, so this costs no existing binding.
+        KeyCode::Left => Action::MoveCardBack,
+        KeyCode::Right => Action::MoveCardForward,
         KeyCode::PageUp => Action::ScrollPageUp,
         KeyCode::PageDown => Action::ScrollPageDown,
         KeyCode::Delete => Action::ClearIssues,
@@ -337,17 +304,26 @@ fn map_normal_char(c: char) -> Action {
         'M' => Action::OpenMemory,
         'o' => Action::OpenSource,
         'e' => Action::EditDoc,
+        'i' => Action::InsertDocBlock,
         'P' => Action::PublishDoc,
         'D' => Action::OpenDocs,
         'G' => Action::OpenEdges,
         'W' => Action::OpenWorkflow,
         'B' => Action::OpenBlackboard,
+        'C' => Action::OpenCouncils,
+        'K' => Action::OpenKanban,
         // Host-owned Remote UI plugin lifecycle controls. They are meaningful
         // only while the `/plugins` surface is open; the reducer ignores them
         // elsewhere.
         't' => Action::EnableUiPluginSession,
         'u' => Action::EnableUiPluginUser,
         'x' => Action::RevokeUiPlugin,
+        // Council browser controls (rubric 6). `n`/`r` reuse `NewRun`/`Reject`
+        // above (the reducer dispatches on the open overlay, like Workflow's
+        // n/p/r/c); `d` is meaningful only while `/council` is open — the
+        // reducer ignores it elsewhere.
+        'd' => Action::DeleteCouncil,
+        'X' => Action::DeleteDocBlock,
         '/' => Action::OpenPalette,
         _ => Action::NoOp,
     }
@@ -379,6 +355,11 @@ fn map_palette_key(key: &KeyEvent) -> Action {
         KeyCode::Down => Action::SelectNext,
         KeyCode::Delete => Action::RemoveApiKey,
         KeyCode::Char('c') if ctrl(key) => Action::InputCancel,
+        // Ctrl-chords stay out of the query buffer: `Ctrl-T` tests the focused
+        // `/keys` row's key, `Ctrl-R` re-fetches an open add-model pick-list.
+        // Both are no-ops in every other palette-mode overlay.
+        KeyCode::Char('t') if ctrl(key) => Action::VerifyApiKey,
+        KeyCode::Char('r') if ctrl(key) => Action::RefreshProviderModels,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
         KeyCode::Tab => Action::BeginAddModel,
         _ => Action::NoOp,
@@ -391,19 +372,39 @@ fn map_palette_key(key: &KeyEvent) -> Action {
 /// Ctrl-C detaches; Esc clears the draft.
 fn map_composer_key(key: &KeyEvent) -> Action {
     match key.code {
-        // Alt+Enter inserts a manual line break; plain Enter still submits.
+        // Alt+Enter expands the browsed transcript fold when `Alt-↑`/`Alt-↓`
+        // put one under the cursor, and otherwise inserts a manual line break
+        // — the reducer owns that choice because only it knows whether the
+        // transcript is being browsed (this mapper is pure). Plain Enter
+        // always submits.
         KeyCode::Enter if alt(key) => Action::InputNewline,
         KeyCode::Enter => Action::InputSubmit,
         KeyCode::Esc => Action::InputCancel,
         KeyCode::Backspace => Action::InputBackspace,
         KeyCode::PageUp => Action::ScrollPageUp,
         KeyCode::PageDown => Action::ScrollPageDown,
-        // Ctrl-↑/↓ switch runs; plain ↑/↓ (otherwise unbound in the composer)
-        // recall composer history, shell-style.
+        // Tab focuses the next workspace pane (the keyboard equivalent of
+        // clicking one — RULE 3); it was dead here before, which made the
+        // advertised "Tab — focus a pane" binding a lie in the base view.
+        KeyCode::Tab => Action::CyclePane,
+        // Ctrl-↑/↓ switch runs; Alt-↑/↓ walk the transcript's folds (tool
+        // cards, diffs, notes); plain ↑/↓ recall composer history, shell-style.
         KeyCode::Up if ctrl(key) => Action::PrevRun,
         KeyCode::Down if ctrl(key) => Action::NextRun,
+        KeyCode::Up if alt(key) => Action::BrowseFoldPrev,
+        KeyCode::Down if alt(key) => Action::BrowseFoldNext,
+        // ↑/↓ move between the draft's own lines first and only recall history
+        // at the draft's top/bottom edge (see `reduce::composer_up`).
         KeyCode::Up => Action::HistoryPrev,
         KeyCode::Down => Action::HistoryNext,
+        // Cursor editing: the draft is a real text field, not an append-only
+        // buffer.
+        KeyCode::Left => Action::CursorLeft,
+        KeyCode::Right => Action::CursorRight,
+        KeyCode::Home => Action::CursorLineStart,
+        KeyCode::End => Action::CursorLineEnd,
+        KeyCode::Char('w') if ctrl(key) => Action::DeleteWordBack,
+        KeyCode::Char('u') if ctrl(key) => Action::DeleteToLineStart,
         KeyCode::F(2) => Action::ToggleLayout,
         KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => {
             Action::RemoteUiNextDocument
@@ -470,8 +471,10 @@ fn map_mouse(
         // resolves through the hit-test map (a registered fold line, footer chip,
         // etc.), falling back to inert when nothing is registered there.
         InputMode::Composer => match mouse.kind {
-            MouseEventKind::ScrollUp => Action::ScrollPageUp,
-            MouseEventKind::ScrollDown => Action::ScrollPageDown,
+            // A notch is a few lines, the conventional wheel granularity —
+            // `PgUp`/`PgDn` remain the page-sized keyboard equivalent.
+            MouseEventKind::ScrollUp => Action::ScrollLinesUp,
+            MouseEventKind::ScrollDown => Action::ScrollLinesDown,
             MouseEventKind::Down(MouseButton::Left) => {
                 hit_test(hit_map, mouse.column, mouse.row).unwrap_or(Action::NoOp)
             }
@@ -491,12 +494,18 @@ fn map_mouse(
     }
 }
 
-/// Resolve which pane a column falls in, using the same 30 / 40 / 30 split the
-/// renderer lays out (see [`crate::render`]).
+/// Resolve which pane a column falls in, using the same 26 / 48 / 26 split
+/// `render_workspace` lays out (see [`crate::render`]). The doc comment and
+/// the arithmetic both used to say 30 / 40 / 30, which had drifted from the
+/// renderer — a click near a pane seam resolved to the neighbour.
+///
+/// The live mouse path resolves clicks through the renderer's own hit map, so
+/// this is the geometry answer for callers outside a frame (and the assertion
+/// that the two splits agree).
 #[must_use]
 pub fn pane_at(column: u16, width: u16) -> Pane {
-    let left = width * 3 / 10;
-    let right_start = width.saturating_sub(width * 3 / 10);
+    let left = width * 26 / 100;
+    let right_start = width.saturating_sub(width * 26 / 100);
     if column < left {
         Pane::Sessions
     } else if column >= right_start {
@@ -587,6 +596,14 @@ mod tests {
         assert_eq!(
             map_event(&ch('e'), InputMode::Normal, W, &[]),
             Action::EditDoc
+        );
+        assert_eq!(
+            map_event(&ch('i'), InputMode::Normal, W, &[]),
+            Action::InsertDocBlock
+        );
+        assert_eq!(
+            map_event(&ch('X'), InputMode::Normal, W, &[]),
+            Action::DeleteDocBlock
         );
         assert_eq!(
             map_event(&ch('D'), InputMode::Normal, W, &[]),
@@ -709,6 +726,20 @@ mod tests {
         assert_eq!(pane_at(1, W), Pane::Sessions);
         assert_eq!(pane_at(W / 2, W), Pane::Transcript);
         assert_eq!(pane_at(W - 2, W), Pane::Approvals);
+
+        // The seams are the renderer's 26 / 48 / 26 split, not the 30 / 40 / 30
+        // this function's arithmetic and doc comment had drifted to. At 200
+        // columns that is a 8-column difference at each seam — enough to
+        // resolve a click to the wrong pane.
+        let wide = 200_u16;
+        assert_eq!(
+            pane_at(51, wide),
+            Pane::Sessions,
+            "26% of 200 is 52 columns"
+        );
+        assert_eq!(pane_at(52, wide), Pane::Transcript);
+        assert_eq!(pane_at(147, wide), Pane::Transcript);
+        assert_eq!(pane_at(148, wide), Pane::Approvals);
     }
 
     fn ctrl(code: KeyCode) -> Event {
@@ -832,6 +863,111 @@ mod tests {
         );
     }
 
+    /// The keyboard path that un-deads tool cards and patch diffs: Alt-↑/↓
+    /// browse the transcript's folds, without disturbing the plain and Ctrl
+    /// arrow bindings that share those keys.
+    #[test]
+    fn alt_arrows_browse_transcript_folds_in_the_composer() {
+        let alt = |code| Event::Key(KeyEvent::new(code, KeyModifiers::ALT));
+        assert_eq!(
+            map_event(&alt(KeyCode::Up), InputMode::Composer, W, &[]),
+            Action::BrowseFoldPrev
+        );
+        assert_eq!(
+            map_event(&alt(KeyCode::Down), InputMode::Composer, W, &[]),
+            Action::BrowseFoldNext
+        );
+        // The other two arrow bindings are untouched.
+        assert_eq!(
+            map_event(&key(KeyCode::Up), InputMode::Composer, W, &[]),
+            Action::HistoryPrev
+        );
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Up), InputMode::Composer, W, &[]),
+            Action::PrevRun
+        );
+        // Alt-Enter still maps to one action; the reducer decides between
+        // expanding the browsed fold and inserting a line break.
+        assert_eq!(
+            map_event(&alt(KeyCode::Enter), InputMode::Composer, W, &[]),
+            Action::InputNewline
+        );
+    }
+
+    /// The composer is a real text field: motion and word/line kill keys map
+    /// from the base view, without stealing Ctrl-C (detach) or plain letters.
+    #[test]
+    fn composer_cursor_keys_map() {
+        for (code, action) in [
+            (KeyCode::Left, Action::CursorLeft),
+            (KeyCode::Right, Action::CursorRight),
+            (KeyCode::Home, Action::CursorLineStart),
+            (KeyCode::End, Action::CursorLineEnd),
+        ] {
+            assert_eq!(map_event(&key(code), InputMode::Composer, W, &[]), action);
+        }
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Char('w')), InputMode::Composer, W, &[]),
+            Action::DeleteWordBack
+        );
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Char('u')), InputMode::Composer, W, &[]),
+            Action::DeleteToLineStart
+        );
+        // Unmodified `w`/`u` are still ordinary text.
+        assert_eq!(
+            map_event(&ch('w'), InputMode::Composer, W, &[]),
+            Action::InputChar('w')
+        );
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Char('c')), InputMode::Composer, W, &[]),
+            Action::Detach
+        );
+    }
+
+    /// The advertised "Tab — focus a pane" binding was dead in the base view
+    /// (Composer mode), which made the help table lie. It now maps.
+    #[test]
+    fn tab_focuses_a_pane_from_the_base_view() {
+        assert_eq!(
+            map_event(&key(KeyCode::Tab), InputMode::Composer, W, &[]),
+            Action::CyclePane
+        );
+    }
+
+    /// Every binding advertising a mouse gesture must name keys that the
+    /// mapper actually produces somewhere — the help overlay renders this
+    /// table verbatim, so a stale row is a lie to the user (RULE 3).
+    #[test]
+    fn advertised_mouse_parity_bindings_are_live_in_some_mode() {
+        let modes = [
+            InputMode::Composer,
+            InputMode::Normal,
+            InputMode::Palette,
+            InputMode::Approval,
+            InputMode::Editing,
+        ];
+        let live = |event: &Event| {
+            modes
+                .iter()
+                .any(|mode| map_event(event, *mode, W, &[]) != Action::NoOp)
+        };
+        let alt = |code| Event::Key(KeyEvent::new(code, KeyModifiers::ALT));
+        for (keys, event) in [
+            ("Tab", key(KeyCode::Tab)),
+            ("↑↓ + Enter", key(KeyCode::Enter)),
+            ("Alt-↑ / Alt-↓", alt(KeyCode::Up)),
+            ("Alt-Enter", alt(KeyCode::Enter)),
+            ("PgUp / PgDn", key(KeyCode::PageUp)),
+        ] {
+            assert!(
+                KEY_BINDINGS.iter().any(|b| b.keys == keys),
+                "{keys} must be a documented binding"
+            );
+            assert!(live(&event), "{keys} is advertised but maps to nothing");
+        }
+    }
+
     #[test]
     fn approval_mode_only_decision_keys() {
         assert_eq!(
@@ -898,8 +1034,9 @@ mod tests {
             map_event(&key(KeyCode::Down), InputMode::Normal, W, &[])
         );
 
-        // In the conversation the wheel scrolls the transcript, reachable from
-        // PgUp / PgDn.
+        // In the conversation the wheel scrolls the transcript a few lines per
+        // notch; PgUp / PgDn are the page-sized keyboard equivalent (RULE 3 is
+        // "reachable by keyboard", not "identical granularity").
         assert_eq!(
             map_event(
                 &wheel(MouseEventKind::ScrollUp, 10),
@@ -907,11 +1044,24 @@ mod tests {
                 W,
                 &[]
             ),
-            Action::ScrollPageUp
+            Action::ScrollLinesUp
+        );
+        assert_eq!(
+            map_event(
+                &wheel(MouseEventKind::ScrollDown, 10),
+                InputMode::Composer,
+                W,
+                &[]
+            ),
+            Action::ScrollLinesDown
         );
         assert_eq!(
             map_event(&key(KeyCode::PageUp), InputMode::Composer, W, &[]),
             Action::ScrollPageUp
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::PageDown), InputMode::Composer, W, &[]),
+            Action::ScrollPageDown
         );
 
         // A left click with nothing registered under it (an empty hit-test map)
@@ -957,21 +1107,6 @@ mod tests {
             map_event(&key(KeyCode::Tab), InputMode::Normal, W, &[]),
             Action::CyclePane
         );
-    }
-
-    /// Drift guard: every footer chip must derive from a real `KEY_BINDINGS`
-    /// entry (Task 5) — the footer strip can never silently diverge from the
-    /// actual bindings table.
-    #[test]
-    fn footer_hints_are_all_backed_by_real_bindings() {
-        for hint in footer_hints() {
-            assert!(
-                KEY_BINDINGS.iter().any(|b| b.keys == hint.binding.keys),
-                "footer hint {:?} must derive from a real KEY_BINDINGS entry",
-                hint.label
-            );
-            assert!(!hint.label.is_empty());
-        }
     }
 
     #[test]

@@ -15,6 +15,7 @@
 //! name the retrieval/memory/graph internals to display a manifest.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use codypendent_protocol::RepositoryId;
 use serde::{Deserialize, Serialize};
@@ -24,9 +25,12 @@ use crate::codegraph::CodeGraphError;
 use crate::memory::{MemoryError, MemoryStore};
 use crate::registry::{Registry, RegistryError};
 use crate::retrieval::{
-    retrieve, HashingEmbedder, RetrievalConfig, RetrievalError, RetrievalIndexes, RetrievalQuery,
+    retrieve, semantic_indexes, HashingEmbedder, RetrievalConfig, RetrievalError, RetrievalIndexes,
+    RetrievalQuery, SemanticEmbedder,
 };
-use crate::types::{EvidenceRef, MemoryRecord, RiskClass, Scope, ToolCard, TrustTier};
+use crate::types::{
+    EvidenceRef, MemoryRecord, RegistryItem, RiskClass, Scope, ToolCard, TrustTier,
+};
 
 /// A failure assembling the context manifest. Each underlying fabric error is
 /// wrapped so the caller can log a cause without matching on the internals.
@@ -221,20 +225,67 @@ pub async fn assemble_context(
     objective: &str,
     scopes: &[Scope],
 ) -> Result<ContextManifest, ContextError> {
+    assemble_context_with(pool, repository, objective, scopes, None).await
+}
+
+/// [`assemble_context`] with an injected embedding model (the `FactExtractor`
+/// injection pattern): when `semantic` is `Some`, dense retrieval runs over the
+/// persisted `registry_embeddings` vectors that model produced (missing items —
+/// and the query — embedded in one batch call), instead of the offline hashing
+/// embedder. `None` — or any model failure — keeps the exact pre-embedding
+/// behavior, so an unconfigured `models.toml` changes nothing.
+///
+/// This entry sources the retrieval authority itself; [`ContextAssembler`]
+/// serves the same core from its stamped cache instead.
+pub async fn assemble_context_with(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    objective: &str,
+    scopes: &[Scope],
+    semantic: Option<&dyn SemanticEmbedder>,
+) -> Result<ContextManifest, ContextError> {
+    let items = Registry::new().list(pool).await?;
+    let (indexes, query_vector) = semantic_indexes(pool, &items, semantic, objective).await?;
+    assemble_with(
+        pool,
+        repository,
+        objective,
+        scopes,
+        &items,
+        &indexes,
+        query_vector,
+    )
+    .await
+}
+
+/// The assembly core beneath [`assemble_context_with`] and
+/// [`ContextAssembler::assemble`]: everything except sourcing the retrieval
+/// authority (`items`) and its derived `indexes`, which the stateless entry
+/// rebuilds per call and the assembler serves from its stamped cache.
+/// `query_vector` carries the semantically-embedded objective when a model is
+/// configured; `None` leaves the offline hashing path exactly as it was.
+async fn assemble_with(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    objective: &str,
+    scopes: &[Scope],
+    items: &[RegistryItem],
+    indexes: &RetrievalIndexes,
+    query_vector: Option<Vec<f32>>,
+) -> Result<ContextManifest, ContextError> {
     // 1. Repository map — fold the persisted graph into the compact tree.
     let repository_map = crate::repomap::repository_map(pool, repository)
         .await?
         .render();
 
     // 2. Retrieve the disclosed tool + skill cards over the whole registry.
-    let items = Registry::new().list(pool).await?;
-    let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new())?;
-    let query = RetrievalQuery::new(
+    let mut query = RetrievalQuery::new(
         objective,
         visible_scopes(repository, scopes),
         RiskClass::Medium,
     );
-    let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default())?;
+    query.query_vector = query_vector;
+    let result = retrieve(items, indexes, &query, &RetrievalConfig::default())?;
     let tool_cards = result.tools.iter().map(ContextCard::from_card).collect();
     let skill_cards = result.skills.iter().map(ContextCard::from_card).collect();
 
@@ -271,6 +322,116 @@ pub async fn assemble_context(
 /// disclosed tool/skill cards; retrieval-ranked memory selection is Phase 7+
 /// territory — until then recency is the only defensible ordering.
 const MAX_CONTEXT_MEMORIES: usize = 32;
+
+/// A cheap content stamp over `registry_items`: row count + newest
+/// `updated_at`. Every [`Registry`] write path moves it — `upsert` re-stamps
+/// `updated_at = now` on every insert/replace (so edits and additions advance
+/// `MAX(updated_at)`), and `remove` changes the count (a removal alone can
+/// leave the max untouched, which is why the count rides along). An equal stamp
+/// therefore means the derived retrieval indexes built from the same authority
+/// are still current.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryStamp {
+    rows: i64,
+    newest_updated_at: Option<String>,
+}
+
+/// Probe the current [`RegistryStamp`] — two aggregates over an indexed table,
+/// orders of magnitude cheaper than the full `list` + index build it guards.
+async fn registry_stamp(pool: &SqlitePool) -> Result<RegistryStamp, RegistryError> {
+    let (rows, newest_updated_at): (i64, Option<String>) =
+        sqlx::query_as("SELECT COUNT(*), MAX(updated_at) FROM registry_items")
+            .fetch_one(pool)
+            .await?;
+    Ok(RegistryStamp {
+        rows,
+        newest_updated_at,
+    })
+}
+
+/// The cached retrieval authority: the listed items and their derived indexes,
+/// pinned to the [`RegistryStamp`] they were built from. `Arc`s so a cache hit
+/// hands out shared views without cloning a Tantivy index.
+struct CachedRetrieval {
+    stamp: RegistryStamp,
+    items: Arc<Vec<RegistryItem>>,
+    indexes: Arc<RetrievalIndexes>,
+}
+
+/// A caching front for [`assemble_context`] (2026-08-11 review item:
+/// "assemble_context rebuilds dense+BM25 indexes from scratch every call").
+///
+/// The repository map and memory query are per-repository reads that must stay
+/// live, but the retrieval authority — `Registry::list` plus the
+/// [`RetrievalIndexes`] build (a full Tantivy index + an embedding per item) —
+/// is registry-global and only changes when the registry does. This assembler
+/// keys that pair on a [`RegistryStamp`] probe and rebuilds ONLY when the stamp
+/// moves, so repeat runs (and every continuation across a long session) reuse
+/// one build. A registry write from anywhere — a daemon skill scan, a CLI
+/// `skill add` against the same database, a builtin refresh — moves the stamp
+/// and invalidates the cache on the next call; no explicit invalidation hook is
+/// needed.
+///
+/// Held by the daemon's run executor (one per process, shared across its
+/// clones); the stateless [`assemble_context`] remains for one-shot callers.
+#[derive(Default)]
+pub struct ContextAssembler {
+    /// The stamped build, replaced wholesale on a stamp miss. A `tokio` mutex —
+    /// not `std` — because the rebuild inside the critical section awaits (the
+    /// registry list), and serializing concurrent rebuilds is exactly the
+    /// point: two racing first runs should build the indexes once, not twice.
+    cache: tokio::sync::Mutex<Option<CachedRetrieval>>,
+}
+
+impl ContextAssembler {
+    /// A fresh assembler with an empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// [`assemble_context`], but serving the retrieval authority from the
+    /// stamped cache (rebuilding it only when the registry changed).
+    pub async fn assemble(
+        &self,
+        pool: &SqlitePool,
+        repository: RepositoryId,
+        objective: &str,
+        scopes: &[Scope],
+    ) -> Result<ContextManifest, ContextError> {
+        let (items, indexes) = self.retrieval_authority(pool).await?;
+        // The cached path serves the offline hashing indexes it stamped, so it
+        // carries no semantic query vector; a configured embedding model routes
+        // through `assemble_context_with` instead (see the executor's
+        // `emit_context`), which sources and embeds per call.
+        assemble_with(pool, repository, objective, scopes, &items, &indexes, None).await
+    }
+
+    /// The current `(items, indexes)` pair: the cached build when the registry
+    /// stamp still matches, otherwise a fresh list + build stored under the new
+    /// stamp. The stamp is probed BEFORE taking the lock's cached value as
+    /// truth, so a write between two runs is always observed.
+    async fn retrieval_authority(
+        &self,
+        pool: &SqlitePool,
+    ) -> Result<(Arc<Vec<RegistryItem>>, Arc<RetrievalIndexes>), ContextError> {
+        let stamp = registry_stamp(pool).await?;
+        let mut cache = self.cache.lock().await;
+        if let Some(cached) = cache.as_ref() {
+            if cached.stamp == stamp {
+                return Ok((Arc::clone(&cached.items), Arc::clone(&cached.indexes)));
+            }
+        }
+        let items = Arc::new(Registry::new().list(pool).await?);
+        let indexes = Arc::new(RetrievalIndexes::build(&items, HashingEmbedder::new())?);
+        *cache = Some(CachedRetrieval {
+            stamp,
+            items: Arc::clone(&items),
+            indexes: Arc::clone(&indexes),
+        });
+        Ok((items, indexes))
+    }
+}
 
 /// The visibility chain the retrieval funnel filters against: the caller's
 /// `scopes`, always widened with [`System`](Scope::System) (built-ins live there)
@@ -393,5 +554,103 @@ mod tests {
         assert_eq!(tier_label(TrustTier::Untrusted), "untrusted");
         assert_eq!(tier_label(TrustTier::FirstParty), "first-party");
         assert_eq!(risk_label(RiskClass::High), "high");
+    }
+
+    /// A minimal Active tool item for exercising the assembler cache.
+    fn tool_item(name: &str) -> RegistryItem {
+        let now = chrono::Utc::now();
+        RegistryItem {
+            id: codypendent_protocol::RegistryItemId::new(),
+            kind: crate::types::RegistryItemKind::Tool,
+            name: name.to_string(),
+            version: crate::types::Version("1.0.0".to_string()),
+            scope: Scope::System,
+            description: format!("test tool {name}"),
+            intents: Vec::new(),
+            keywords: Vec::new(),
+            examples: Vec::new(),
+            input_schema: None,
+            output_schema: None,
+            dependencies: Vec::new(),
+            permissions: Vec::new(),
+            risk: RiskClass::Safe,
+            provenance: crate::types::Provenance::BuiltIn,
+            trust: crate::types::TrustMetadata {
+                publisher: "test".to_string(),
+                signature_required: false,
+                signature: None,
+                tier: TrustTier::FirstParty,
+            },
+            status: crate::types::RegistryStatus::Active,
+            content_hash: String::new(),
+            executable: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The assembler's cache contract: an unchanged registry serves the SAME
+    /// index build (pointer-identical, so repeat runs pay no rebuild), and any
+    /// registry write — observed through the count/updated_at stamp — replaces
+    /// it with a build that includes the new authority.
+    #[tokio::test]
+    async fn assembler_reuses_indexes_until_the_registry_stamp_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&tmp.path().join("t.db")).await.unwrap();
+        let registry = Registry::new();
+        registry
+            .upsert(&pool, &tool_item("test.alpha"))
+            .await
+            .unwrap();
+
+        let assembler = ContextAssembler::new();
+        let (items_a, indexes_a) = assembler.retrieval_authority(&pool).await.unwrap();
+        let (items_b, indexes_b) = assembler.retrieval_authority(&pool).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&indexes_a, &indexes_b) && Arc::ptr_eq(&items_a, &items_b),
+            "an unchanged registry must serve the cached build"
+        );
+
+        // A registry write moves the stamp; the next call rebuilds and sees it.
+        registry
+            .upsert(&pool, &tool_item("test.beta"))
+            .await
+            .unwrap();
+        let (items_c, indexes_c) = assembler.retrieval_authority(&pool).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&indexes_b, &indexes_c),
+            "a registry change must invalidate the cached indexes"
+        );
+        assert!(
+            items_c.iter().any(|item| item.name == "test.beta"),
+            "the rebuilt authority includes the new item"
+        );
+    }
+
+    /// A REMOVAL alone may leave `MAX(updated_at)` untouched (the newest row can
+    /// survive), which is exactly why the stamp carries the row count too — the
+    /// assembler must never serve an index that still ranks a deleted item.
+    #[tokio::test]
+    async fn assembler_invalidates_on_removal_via_the_row_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = crate::db::open(&tmp.path().join("t.db")).await.unwrap();
+        let registry = Registry::new();
+        let doomed = tool_item("test.doomed");
+        registry.upsert(&pool, &doomed).await.unwrap();
+        registry
+            .upsert(&pool, &tool_item("test.keeper"))
+            .await
+            .unwrap();
+
+        let assembler = ContextAssembler::new();
+        let (items_before, _) = assembler.retrieval_authority(&pool).await.unwrap();
+        assert!(items_before.iter().any(|item| item.name == "test.doomed"));
+
+        assert!(registry.remove(&pool, doomed.id).await.unwrap());
+        let (items_after, _) = assembler.retrieval_authority(&pool).await.unwrap();
+        assert!(
+            !items_after.iter().any(|item| item.name == "test.doomed"),
+            "a removed item must vanish from the cached authority"
+        );
     }
 }

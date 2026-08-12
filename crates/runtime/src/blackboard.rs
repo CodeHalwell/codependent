@@ -116,3 +116,109 @@ pub trait BlackboardChannel: Send + Sync {
         include_superseded: bool,
     ) -> Result<Vec<BlackboardItemView>, BlackboardChannelError>;
 }
+
+/// A backlog card an agent asks to place on a repository's task board (the
+/// `task.create` tool, rubric 10). Like [`BlackboardPost`], the `author` is built
+/// **server-side** by the runtime from the run context, never from model-supplied
+/// identity.
+#[derive(Debug, Clone)]
+pub struct TaskCardDraft {
+    /// The card body (opaque JSON — conventionally `{ "title", "description" }`).
+    pub payload: Value,
+    /// Attribution built from the run context.
+    pub author: Value,
+    /// The starting column; the assembly defaults a card with none to `todo`.
+    pub status: Option<String>,
+    /// Who the card is assigned to, if anyone.
+    pub assignee: Option<String>,
+    /// The within-column position; absent appends to the end of the column.
+    pub ordinal: Option<i64>,
+}
+
+/// The fields a `task.update` / `task.move` replaces. Everything absent is carried
+/// forward from the superseded card, so a move never has to restate the body.
+#[derive(Debug, Clone)]
+pub struct TaskCardChange {
+    /// The new column, when moving.
+    pub status: Option<String>,
+    /// The new assignee, when re-assigning.
+    pub assignee: Option<String>,
+    /// The new within-column position; absent appends when the column changed.
+    pub ordinal: Option<i64>,
+    /// A replacement card body, when editing.
+    pub payload: Option<Value>,
+    /// Attribution for the revision, built server-side from the run context.
+    pub author: Value,
+}
+
+/// The pool-erased seam the `task.*` tools reach a **repository task board**
+/// through — the kanban half of the blackboard (rubric 10).
+///
+/// Separate from [`BlackboardChannel`] because the two are scoped differently and
+/// offered differently: a blackboard post targets the agent's own *workflow run*
+/// and exists only inside one, while a task card targets the *repository*, so the
+/// tools work from a plain chat run too ("break this feature into backlog cards").
+/// The assembly implements both over one `BlackboardStore`, so a card an agent
+/// creates and a card a human creates in the TUI are the same durable row.
+#[async_trait]
+pub trait TaskBoardChannel: Send + Sync {
+    /// Create a card on `repository`'s board, returning the stored card. The
+    /// board is created on first write.
+    async fn create(
+        &self,
+        repository: &str,
+        draft: TaskCardDraft,
+    ) -> Result<BlackboardItemView, BlackboardChannelError>;
+
+    /// Supersede a live card with a revised one (a move, a re-assignment, a
+    /// re-order, or an edit), returning the replacement.
+    async fn update(
+        &self,
+        repository: &str,
+        item_id: &str,
+        change: TaskCardChange,
+    ) -> Result<BlackboardItemView, BlackboardChannelError>;
+
+    /// Every live card on `repository`'s board. An unwritten board reads empty.
+    async fn list(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<BlackboardItemView>, BlackboardChannelError>;
+}
+
+/// One line of the repository's recent-run list — what `workflow.query` answers
+/// with when it is not pointed at a single run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunSummary {
+    /// The durable workflow-run id (the subject of a follow-up query).
+    pub workflow_run_id: String,
+    /// The manifest's workflow id (e.g. `repair-github-check`).
+    pub workflow_id: String,
+    /// The run's current phase, lowercased (`running`, `completed`, …).
+    pub phase: String,
+}
+
+/// The pool-erased seam the `workflow.query` tool reads durable workflow state
+/// through (rubric 5) — the agent-facing counterpart of the daemon's
+/// `ReadWorkflowRun`.
+///
+/// Returns the protocol [`WorkflowRunSnapshot`] (which this crate *can* name), so
+/// the graph an agent sees is projected by exactly the code that projects the one
+/// a client sees: node states, dependency edges, and measured costs cannot drift
+/// between the two surfaces.
+#[async_trait]
+pub trait WorkflowQueryChannel: Send + Sync {
+    /// One run's full graph state, or `None` when no such run exists.
+    async fn snapshot(
+        &self,
+        workflow_run_id: &str,
+    ) -> Result<Option<codypendent_protocol::WorkflowRunSnapshot>, BlackboardChannelError>;
+
+    /// The repository's most recent runs, newest first — the entry point for an
+    /// agent that has no run id yet.
+    async fn recent_runs(
+        &self,
+        repository: &str,
+        limit: u32,
+    ) -> Result<Vec<WorkflowRunSummary>, BlackboardChannelError>;
+}

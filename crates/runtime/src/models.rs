@@ -24,16 +24,20 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use codypendent_protocol::{AgentMode, ModelId};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthStore;
+use codypendent_providers::Catalog;
 
 #[cfg(feature = "provider-openai")]
 use agent_framework_openai::OpenAIChatCompletionClient;
 
+#[cfg(feature = "provider-openai")]
+use std::collections::BTreeMap;
 #[cfg(feature = "provider-openai")]
 use std::sync::Arc;
 
@@ -78,6 +82,16 @@ pub struct ModelConfig {
     /// endpoint with no auth).
     #[serde(default)]
     pub api_key_env: String,
+    /// The provider-catalog id this model was added from (e.g. `"nebius"`,
+    /// `"azure-openai"`), when known. Additive and optional: it lets the
+    /// registry resolve the provider's auth header/prefix, extra headers, and
+    /// documented key env NAMES from the catalog at call time, so a
+    /// non-bearer provider (Azure OpenAI's `api-key` header, GitHub Models'
+    /// API-version header) authenticates correctly instead of being
+    /// flattened to `Authorization: Bearer`. `None` (every pre-existing
+    /// entry) keeps the legacy bearer behavior exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     /// The model's context window in tokens, if known. Sourced from
     /// `models.toml` (a user-set `context_tokens` key) — there is no
     /// auto-population from the provider catalog in v1. Used for two
@@ -111,6 +125,116 @@ pub fn load_models(path: &Path) -> Result<Vec<ModelConfig>> {
         source,
     })?;
     Ok(file.model)
+}
+
+// ---------------------------------------------------------------------------
+// models.toml extras: the `[embedding]` entry + `[retrieval]` tuning
+// ---------------------------------------------------------------------------
+
+/// The `[embedding]` entry in `models.toml` (rubric 9 — real embeddings):
+/// names the OpenAI-compatible `/embeddings` endpoint retrieval embeds with.
+/// Absent, retrieval keeps the offline hashing embedder (today's behavior).
+///
+/// ```toml
+/// [embedding]
+/// provider = "openai-compatible"          # the default; may be omitted
+/// base_url = "http://localhost:11434/v1"  # Ollama, OpenAI, Nebius, …
+/// model = "nomic-embed-text"
+/// api_key_env = ""                        # env var NAME; value never stored
+/// dims = 768                              # optional: verified against responses
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingConfig {
+    /// The runtime adapter; only `"openai-compatible"` is wired.
+    #[serde(default = "default_embedding_provider")]
+    pub provider: String,
+    /// The OpenAI-compatible base URL (`POST {base_url}/embeddings`).
+    pub base_url: String,
+    /// Provider-side embedding model name (e.g. `nomic-embed-text`,
+    /// `Qwen/Qwen3-Embedding-8B`).
+    pub model: String,
+    /// The NAME of the environment variable holding the API key, read at call
+    /// time — never persisted (the `ModelConfig::api_key_env` contract). Empty
+    /// means no key (a local endpoint).
+    #[serde(default)]
+    pub api_key_env: String,
+    /// Expected vector dimensionality. `None` accepts whatever the model
+    /// returns; `Some(n)` rejects a mismatched response (a wrong-model guard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dims: Option<usize>,
+}
+
+fn default_embedding_provider() -> String {
+    "openai-compatible".to_string()
+}
+
+/// Default `[retrieval] mcp_top_k`: when a run's MCP bridge offers more than
+/// this many tools, only the `mcp_top_k` most relevant to the run are
+/// advertised (at or below it, all are — today's behavior). `0` disables the
+/// gate entirely (full injection).
+pub const DEFAULT_MCP_TOP_K: usize = 8;
+
+/// The `[retrieval]` tuning table in `models.toml`.
+///
+/// ```toml
+/// [retrieval]
+/// mcp_top_k = 8   # 0 disables retrieval gating (advertise every MCP tool)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalSettings {
+    /// See [`DEFAULT_MCP_TOP_K`].
+    #[serde(default = "default_mcp_top_k")]
+    pub mcp_top_k: usize,
+}
+
+fn default_mcp_top_k() -> usize {
+    DEFAULT_MCP_TOP_K
+}
+
+impl Default for RetrievalSettings {
+    fn default() -> Self {
+        Self {
+            mcp_top_k: DEFAULT_MCP_TOP_K,
+        }
+    }
+}
+
+/// The non-`[[model]]` tables of `models.toml`, parsed independently of
+/// [`load_models`] so both readers ignore each other's keys and an existing
+/// file is back-compatible in both directions.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct ModelExtras {
+    /// The `[embedding]` entry, when configured.
+    #[serde(default)]
+    pub embedding: Option<EmbeddingConfig>,
+    /// The `[retrieval]` tuning; every field defaults when the table is absent.
+    #[serde(default)]
+    pub retrieval: RetrievalSettings,
+}
+
+/// Parse the `[embedding]` / `[retrieval]` extras from `models.toml`. An
+/// ABSENT file yields the defaults (no embedding model, default tuning) —
+/// unlike [`load_models`], because these tables are optional configuration and
+/// a daemon with no `models.toml` at all must still assemble context. A
+/// present-but-malformed file is an error, so a typo is legible rather than a
+/// silent fallback.
+pub fn load_model_extras(path: &Path) -> Result<ModelExtras> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ModelExtras::default())
+        }
+        Err(source) => {
+            return Err(ModelsError::ReadConfig {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    toml::from_str(&text).map_err(|source| ModelsError::ParseConfig {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -196,9 +320,117 @@ pub enum ModelsError {
     },
 }
 
+/// Whether a model-request failure is worth retrying (the transient/permanent
+/// error taxonomy the loop's retry-with-backoff wrapper dispatches on — see
+/// `FrameworkModelDriver::next_step` in `agent.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// Environmental and time-bounded — the identical request may genuinely
+    /// succeed a moment later (connect refused/reset, timeouts, HTTP 408/429/
+    /// 5xx, provider overload). Worth a bounded retry.
+    Transient,
+    /// The request itself (or its configuration) is refused — bad credentials,
+    /// an unknown model, a 4xx contract violation, unparseable config. A retry
+    /// can only repeat the same refusal, so it is surfaced immediately.
+    Permanent,
+}
+
+impl ModelsError {
+    /// Classify this error for retry purposes. Only the genuinely
+    /// environmental variants are [`FailureClass::Transient`]:
+    /// [`ConnectionFailed`](ModelsError::ConnectionFailed) (refused/reset/
+    /// timed-out connection attempts) always is, and
+    /// [`ModelUnavailable`](ModelsError::ModelUnavailable) is when its
+    /// provider-supplied `reason` names a transient condition (an HTTP 5xx or
+    /// 429 from `/models`). Everything else — config read/parse failures,
+    /// unknown models, unsupported providers, missing credentials, exhausted
+    /// candidate lists — is [`FailureClass::Permanent`]: retrying re-reads the
+    /// same file and re-misses the same env var.
+    #[must_use]
+    pub fn failure_class(&self) -> FailureClass {
+        match self {
+            ModelsError::ConnectionFailed { .. } => FailureClass::Transient,
+            ModelsError::ModelUnavailable { reason, .. } => classify_provider_message(reason),
+            _ => FailureClass::Permanent,
+        }
+    }
+}
+
+/// Classify an OPAQUE provider/stream failure message as transient or
+/// permanent. The live driver's stream errors cross the framework seam as
+/// formatted strings (and `ModelUnavailable.reason` embeds a response body),
+/// so this is a conservative textual taxonomy: only a message that plainly
+/// names a transient condition — a connect/reset/timeout failure, provider
+/// overload, or an HTTP 408/429/5xx status — is [`FailureClass::Transient`];
+/// anything unrecognized is [`FailureClass::Permanent`], so a novel failure
+/// surfaces immediately instead of being silently retried. HTTP status codes
+/// are matched as standalone digit runs (never substrings), so a `500` inside
+/// an id like `15005` cannot misclassify a message.
+#[must_use]
+pub fn classify_provider_message(message: &str) -> FailureClass {
+    /// Phrases that name a plainly transient condition, matched
+    /// case-insensitively.
+    const TRANSIENT_PHRASES: [&str; 14] = [
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "overloaded",
+        "rate limit",
+        "too many requests",
+        "internal server error",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+    ];
+    /// Retryable HTTP status codes: request timeout, rate limited, and the
+    /// server-side 5xx family a provider surfaces during a blip.
+    const TRANSIENT_STATUS: [&str; 6] = ["408", "429", "500", "502", "503", "504"];
+    let lower = message.to_ascii_lowercase();
+    if TRANSIENT_PHRASES
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+    {
+        return FailureClass::Transient;
+    }
+    let has_status = lower
+        .split(|c: char| !c.is_ascii_digit())
+        .any(|run| TRANSIENT_STATUS.contains(&run));
+    if has_status {
+        FailureClass::Transient
+    } else {
+        FailureClass::Permanent
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
+
+/// The `auth.json` entry id holding a PROVIDER-wide key (as opposed to a
+/// per-model entry keyed by the model's display id): `provider/<catalog-id>`.
+/// Stored by the add-model flow alongside the per-model entry so one pasted
+/// key serves every model later added from the same provider; read by
+/// [`ModelRegistry::client_for`]/[`check_model`](ModelRegistry::check_model)
+/// after the per-model entry and before the environment. The `provider/`
+/// prefix is reserved (like the Tavily `integrations/tavily` id) and cannot
+/// collide with add-model display ids, which are `<provider>/<model>` for
+/// catalog providers and `acp/<agent>` for ACP agents.
+#[must_use]
+pub fn provider_auth_id(provider_id: &str) -> String {
+    format!("provider/{provider_id}")
+}
+
+/// The process-wide built-in provider catalog, parsed once. The fallback for
+/// registries built without [`ModelRegistry::with_catalog`] (e.g. the daemon
+/// executor), so catalog-declared auth headers resolve there too.
+fn builtin_catalog() -> &'static Catalog {
+    static CATALOG: OnceLock<Catalog> = OnceLock::new();
+    CATALOG.get_or_init(Catalog::builtin)
+}
 
 /// The set of configured model profiles, keyed by [`ModelId`], plus the
 /// resolved [`AuthStore`] (`auth.json`) so [`ModelRegistry::client_for`] can
@@ -208,6 +440,12 @@ pub enum ModelsError {
 pub struct ModelRegistry {
     configs: HashMap<ModelId, ModelConfig>,
     auth: AuthStore,
+    /// The provider catalog auth headers are resolved against (see
+    /// [`ModelConfig::provider_id`]). `None` falls back to the built-ins, so
+    /// a caller that cannot layer the user's `providers.toml` still resolves
+    /// every built-in provider correctly.
+    #[cfg_attr(not(feature = "provider-openai"), allow(dead_code))]
+    catalog: Option<Catalog>,
 }
 
 impl ModelRegistry {
@@ -220,6 +458,7 @@ impl ModelRegistry {
         Self {
             configs,
             auth: AuthStore::default(),
+            catalog: None,
         }
     }
 
@@ -229,6 +468,16 @@ impl ModelRegistry {
     #[must_use]
     pub fn with_auth(mut self, auth: AuthStore) -> Self {
         self.auth = auth;
+        self
+    }
+
+    /// Attach a resolved provider [`Catalog`] (built-ins layered with the
+    /// user's `providers.toml`) for auth-header resolution. Additive: without
+    /// it the embedded built-in catalog is used, so only a user-defined
+    /// provider with a custom auth header needs this to be exact.
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: Catalog) -> Self {
+        self.catalog = Some(catalog);
         self
     }
 
@@ -253,21 +502,185 @@ impl ModelRegistry {
         self.get(id).is_some_and(|config| config.provider == "acp")
     }
 
-    /// The official registry id for an ACP profile.
+    /// The full ACP coordinate for an ACP profile — `id`, `id@version`, or
+    /// `id@version#model` once the profile pins one of the agent's own models.
+    /// Launch-oriented consumers strip the additive `#model` part with
+    /// [`acp_coordinate_agent`]; [`acp_agent_model`](Self::acp_agent_model)
+    /// reads the pin.
     #[must_use]
     pub fn acp_agent_id(&self, id: &ModelId) -> Option<&str> {
         self.get(id)
             .filter(|config| config.provider == "acp")
             .map(|config| config.model.as_str())
     }
+
+    /// The agent-model id an ACP profile pins on its external agent
+    /// (`id@version#model`), if any. `None` for a bare agent profile — the
+    /// agent then keeps whatever default model it booted with.
+    #[must_use]
+    pub fn acp_agent_model(&self, id: &ModelId) -> Option<&str> {
+        self.acp_agent_id(id).and_then(acp_coordinate_model)
+    }
+}
+
+/// Split an ACP model coordinate `id[@version][#model]` at the first `#` and
+/// return the launchable agent part. Additive: coordinates written before
+/// model pinning existed carry no `#` and return themselves unchanged.
+#[must_use]
+pub fn acp_coordinate_agent(coordinate: &str) -> &str {
+    coordinate
+        .split_once('#')
+        .map_or(coordinate, |(agent, _)| agent)
+}
+
+/// The agent-model id an ACP coordinate pins (`id[@version]#model`), if any.
+/// A dangling `#` pins nothing.
+#[must_use]
+pub fn acp_coordinate_model(coordinate: &str) -> Option<&str> {
+    coordinate
+        .split_once('#')
+        .map(|(_, model)| model)
+        .filter(|model| !model.is_empty())
+}
+
+#[cfg(test)]
+mod acp_coordinate_tests {
+    use super::*;
+
+    #[test]
+    fn coordinates_split_into_agent_and_optional_model_pin() {
+        assert_eq!(acp_coordinate_agent("demo-acp@1.2.3"), "demo-acp@1.2.3");
+        assert_eq!(acp_coordinate_model("demo-acp@1.2.3"), None);
+        assert_eq!(
+            acp_coordinate_agent("demo-acp@1.2.3#agent-model-1"),
+            "demo-acp@1.2.3"
+        );
+        assert_eq!(
+            acp_coordinate_model("demo-acp@1.2.3#agent-model-1"),
+            Some("agent-model-1")
+        );
+        // A dangling separator pins nothing (and still names the agent).
+        assert_eq!(acp_coordinate_model("demo-acp@1.2.3#"), None);
+        assert_eq!(acp_coordinate_agent("demo-acp@1.2.3#"), "demo-acp@1.2.3");
+    }
+
+    #[test]
+    fn registry_reads_the_model_pin_from_acp_profiles_only() {
+        let registry = ModelRegistry::new([
+            ModelConfig {
+                id: ModelId("acp/demo#agent-model-1".to_string()),
+                provider: "acp".to_string(),
+                base_url: String::new(),
+                model: "demo-acp@1.2.3#agent-model-1".to_string(),
+                api_key_env: String::new(),
+                context_tokens: None,
+                provider_id: None,
+            },
+            ModelConfig {
+                id: ModelId("acp/demo".to_string()),
+                provider: "acp".to_string(),
+                base_url: String::new(),
+                model: "demo-acp@1.2.3".to_string(),
+                api_key_env: String::new(),
+                context_tokens: None,
+                provider_id: None,
+            },
+            ModelConfig {
+                id: ModelId("hosted".to_string()),
+                provider: "openai-compatible".to_string(),
+                base_url: "https://example.test/v1".to_string(),
+                model: "some#model".to_string(),
+                api_key_env: String::new(),
+                context_tokens: None,
+                provider_id: None,
+            },
+        ]);
+        assert_eq!(
+            registry.acp_agent_model(&ModelId("acp/demo#agent-model-1".to_string())),
+            Some("agent-model-1")
+        );
+        assert_eq!(
+            registry.acp_agent_model(&ModelId("acp/demo".to_string())),
+            None
+        );
+        // Non-ACP profiles never expose a pin, whatever their model string.
+        assert_eq!(
+            registry.acp_agent_model(&ModelId("hosted".to_string())),
+            None
+        );
+    }
+}
+
+/// How a model's endpoint expects its key and extra headers on the wire,
+/// resolved from the provider catalog via [`ModelConfig::provider_id`]. A
+/// config with no (known) provider id resolves to the bearer default, so
+/// every pre-existing `models.toml` entry behaves exactly as before.
+#[cfg(feature = "provider-openai")]
+#[derive(Debug, Clone)]
+struct EndpointAuth {
+    /// The header the key is injected under (default `Authorization`).
+    header: String,
+    /// The value prefix in front of the key (default `"Bearer "`).
+    prefix: String,
+    /// Provider-wide headers sent on every request — an API-version pin, for
+    /// the providers whose catalog entry declares one.
+    extra_headers: BTreeMap<String, String>,
+    /// The provider's documented key env-var NAMES, consulted (first set
+    /// wins) only when the model has no `auth.json` key and no explicit
+    /// `api_key_env` of its own.
+    provider_env: Vec<String>,
+}
+
+#[cfg(feature = "provider-openai")]
+impl EndpointAuth {
+    /// Whether this is the exact shape the stock framework client sends
+    /// (`Authorization: Bearer …`, nothing else) — the fast path.
+    fn is_framework_default(&self) -> bool {
+        self.header == "Authorization" && self.prefix == "Bearer " && self.extra_headers.is_empty()
+    }
+}
+
+/// Resolve a model's [`EndpointAuth`] from the catalog. Defaults to bearer
+/// with no extras when the entry names no provider, or an unknown one.
+#[cfg(feature = "provider-openai")]
+fn endpoint_auth_for(cfg: &ModelConfig, catalog: &Catalog) -> EndpointAuth {
+    let provider = cfg.provider_id.as_deref().and_then(|id| catalog.get(id));
+    let (header, prefix, provider_env) = provider
+        .and_then(|p| {
+            p.auth.iter().find_map(|method| match method {
+                AuthMethod::ApiKey {
+                    env,
+                    header,
+                    prefix,
+                } => Some((header.clone(), prefix.clone(), env.clone())),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| {
+            (
+                "Authorization".to_string(),
+                "Bearer ".to_string(),
+                Vec::new(),
+            )
+        });
+    EndpointAuth {
+        header,
+        prefix,
+        extra_headers: provider
+            .map(|p| p.extra_headers.clone())
+            .unwrap_or_default(),
+        provider_env,
+    }
 }
 
 /// Map a persisted [`ModelConfig`] onto the provider abstraction. Chat profiles
 /// become `(OpenAiChat, ApiKey|None)`; ACP profiles are marked so the assembly
 /// executor can route them to the full-agent runtime instead of a chat client.
-/// This remains the backward-compatible bridge for existing `models.toml` files.
+/// This remains the backward-compatible bridge for existing `models.toml` files;
+/// the `ApiKey` arm carries the catalog-resolved header/prefix (bearer when the
+/// entry names no provider) so Azure-shaped providers stop being flattened.
 #[cfg(feature = "provider-openai")]
-fn config_to_protocol_auth(cfg: &ModelConfig) -> Result<(Protocol, AuthMethod)> {
+fn config_to_protocol_auth(cfg: &ModelConfig, catalog: &Catalog) -> Result<(Protocol, AuthMethod)> {
     if cfg.provider == "acp" {
         return Ok((
             Protocol::Acp,
@@ -287,10 +700,11 @@ fn config_to_protocol_auth(cfg: &ModelConfig) -> Result<(Protocol, AuthMethod)> 
     let auth = if cfg.api_key_env.trim().is_empty() {
         AuthMethod::None
     } else {
+        let endpoint = endpoint_auth_for(cfg, catalog);
         AuthMethod::ApiKey {
             env: vec![cfg.api_key_env.clone()],
-            header: "Authorization".to_string(),
-            prefix: "Bearer ".to_string(),
+            header: endpoint.header,
+            prefix: endpoint.prefix,
         }
     };
     Ok((Protocol::OpenAiChat, auth))
@@ -298,9 +712,20 @@ fn config_to_protocol_auth(cfg: &ModelConfig) -> Result<(Protocol, AuthMethod)> 
 
 #[cfg(feature = "provider-openai")]
 impl ModelRegistry {
+    /// The catalog auth headers are resolved against: the attached one, or
+    /// the process-wide built-ins.
+    fn catalog(&self) -> &Catalog {
+        self.catalog.as_ref().unwrap_or_else(|| builtin_catalog())
+    }
+
     /// Resolve the key exactly as the live client does. Keeping this in one
     /// helper ensures the readiness probe and the first completion cannot
-    /// disagree because they used different credential precedence.
+    /// disagree because they used different credential precedence:
+    /// (1) the model's own `auth.json` entry; (2) the provider-wide
+    /// `auth.json` entry ([`provider_auth_id`]); (3) the model's explicit
+    /// `api_key_env` (missing → a naming error, unchanged); (4) the catalog
+    /// provider's documented env NAMES, best-effort — an unset variable
+    /// falls through to keyless exactly as before, never a new error.
     async fn api_key_for(&self, cfg: &ModelConfig) -> Result<String> {
         if let Some(key) = self
             .auth
@@ -309,10 +734,33 @@ impl ModelRegistry {
         {
             return Ok(key.to_string());
         }
-        let (_, auth) = config_to_protocol_auth(cfg)?;
+        if let Some(key) = cfg
+            .provider_id
+            .as_deref()
+            .and_then(|pid| self.auth.get(&provider_auth_id(pid)))
+            .filter(|key| !key.is_empty())
+        {
+            return Ok(key.to_string());
+        }
+        let (_, auth) = config_to_protocol_auth(cfg, self.catalog())?;
         match credential_for(&auth).resolve().await {
             Ok(ResolvedCredential::ApiKey { value, .. }) => Ok(value),
-            Ok(ResolvedCredential::None) => Ok(String::new()),
+            Ok(ResolvedCredential::None) => {
+                let endpoint = endpoint_auth_for(cfg, self.catalog());
+                if !endpoint.provider_env.is_empty() {
+                    let provider_auth = AuthMethod::ApiKey {
+                        env: endpoint.provider_env,
+                        header: endpoint.header,
+                        prefix: endpoint.prefix,
+                    };
+                    if let Ok(ResolvedCredential::ApiKey { value, .. }) =
+                        credential_for(&provider_auth).resolve().await
+                    {
+                        return Ok(value);
+                    }
+                }
+                Ok(String::new())
+            }
             Err(CredentialError::MissingEnv { var }) => Err(ModelsError::MissingApiKeyEnv {
                 model: cfg.id.clone(),
                 var,
@@ -344,7 +792,7 @@ impl ModelRegistry {
             // RuntimePaths needed to resolve the installed agent.
             return Ok(());
         }
-        let (protocol, _) = config_to_protocol_auth(cfg)?;
+        let (protocol, _) = config_to_protocol_auth(cfg, self.catalog())?;
         if !matches!(protocol, Protocol::OpenAiChat) {
             return Err(ModelsError::ProtocolNotWired {
                 model: id.clone(),
@@ -367,9 +815,26 @@ impl ModelRegistry {
                 base_url: cfg.base_url.clone(),
                 reason: error.to_string(),
             })?;
+        // The exact header/prefix + extra headers the live client sends, so
+        // an Azure-shaped provider (`api-key`) verifies with the same auth it
+        // will run with — never a hardcoded bearer.
+        let auth = endpoint_auth_for(cfg, self.catalog());
         let mut request = client.get(endpoint);
+        for (name, value) in &auth.extra_headers {
+            request = request.header(name, value);
+        }
         if !key.is_empty() {
-            request = request.bearer_auth(key);
+            let mut value =
+                reqwest::header::HeaderValue::from_str(&format!("{}{key}", auth.prefix)).map_err(
+                    |_| ModelsError::ModelUnavailable {
+                        model: id.clone(),
+                        provider_model: cfg.model.clone(),
+                        reason: "the API key is not a valid header value".to_string(),
+                    },
+                )?;
+            // Sensitive: reqwest redacts it from any error/debug output.
+            value.set_sensitive(true);
+            request = request.header(auth.header.as_str(), value);
         }
         let response = request
             .send()
@@ -417,8 +882,10 @@ impl ModelRegistry {
     ///
     /// Resolves the API key right here, at call time, in precedence order:
     /// (1) `auth.json[model_id]`, when present and non-empty; (2) the
-    /// model's `api_key_env` environment variable; (3) no key at all (local
-    /// endpoints with an empty `api_key_env`). Whichever wins is moved
+    /// provider-wide `auth.json` entry ([`provider_auth_id`]); (3) the
+    /// model's `api_key_env` environment variable; (4) the catalog
+    /// provider's documented env NAMES (best-effort); (5) no key at all
+    /// (local endpoints with an empty `api_key_env`). Whichever wins is moved
     /// straight into the client and is never stored on the registry, logged,
     /// or otherwise retained by this function (Chapter 11, "Secrets"). A
     /// required-but-unset variable produces [`ModelsError::MissingApiKeyEnv`]
@@ -430,7 +897,11 @@ impl ModelRegistry {
     /// `OpenAIChatCompletionClient::new(api_key, model).with_base_url(base_url)`
     /// as before — the one code path that serves both the hosted OpenAI
     /// endpoint and any OpenAI-compatible local/self-hosted endpoint (e.g.
-    /// Ollama), per STEP 1.9 — now returned behind `Arc<dyn ChatClient>`. Any
+    /// Ollama), per STEP 1.9 — now returned behind `Arc<dyn ChatClient>`. A
+    /// [`ModelConfig::provider_id`] whose catalog auth is not the bearer
+    /// default (or that declares extra headers) builds the wire-identical
+    /// [`HeaderAuthChatClient`] instead, so Azure OpenAI / GitHub Models
+    /// authenticate with the headers the provider actually expects. Any
     /// other protocol (Anthropic/Gemini native are follow-ups) returns
     /// [`ModelsError::ProtocolNotWired`].
     pub async fn client_for(
@@ -440,18 +911,40 @@ impl ModelRegistry {
         let cfg = self
             .get(id)
             .ok_or_else(|| ModelsError::UnknownModel(id.clone()))?;
-        let (protocol, _) = config_to_protocol_auth(cfg)?;
+        let (protocol, _) = config_to_protocol_auth(cfg, self.catalog())?;
         match protocol {
             Protocol::OpenAiChat => {
                 // Key resolution precedence (additive): (a) an `auth.json` key for
-                // this model id wins → (b) the model's `api_key_env` (today's
-                // path) → (c) none. A model with no `auth.json` entry behaves
-                // exactly as before. The stored key is moved straight into the
-                // client and is never logged or retained by this function.
+                // this model id wins → (b) the provider-wide `auth.json` entry →
+                // (c) the model's `api_key_env` (today's path) → (d) none. A model
+                // with no `auth.json` entry behaves exactly as before. The stored
+                // key is moved straight into the client and is never logged or
+                // retained by this function.
                 let api_key = self.api_key_for(cfg).await?;
-                let client = OpenAIChatCompletionClient::new(api_key, cfg.model.clone())
-                    .with_base_url(cfg.base_url.clone());
-                Ok(Arc::new(client))
+                let auth = endpoint_auth_for(cfg, self.catalog());
+                if auth.is_framework_default() {
+                    let client = OpenAIChatCompletionClient::new(api_key, cfg.model.clone())
+                        .with_base_url(cfg.base_url.clone());
+                    Ok(Arc::new(client))
+                } else {
+                    // A catalog-declared non-bearer header (Azure OpenAI's
+                    // `api-key`) or provider extra headers (GitHub Models):
+                    // the stock framework client hardcodes `bearer_auth`, so
+                    // these run through the wire-identical header-aware client.
+                    let client =
+                        HeaderAuthChatClient::new(cfg, &auth, &api_key).ok_or_else(|| {
+                            ModelsError::ModelUnavailable {
+                                model: id.clone(),
+                                provider_model: cfg.model.clone(),
+                                reason: format!(
+                                    "provider auth header `{}` or its value is not a valid \
+                                     HTTP header",
+                                    auth.header
+                                ),
+                            }
+                        })?;
+                    Ok(Arc::new(client))
+                }
             }
             Protocol::Acp => Err(ModelsError::ProtocolNotWired {
                 model: id.clone(),
@@ -462,6 +955,146 @@ impl ModelRegistry {
                 protocol: format!("{other:?}"),
             }),
         }
+    }
+}
+
+/// An OpenAI-compatible chat client for providers whose auth is NOT the
+/// framework default `Authorization: Bearer …` (Azure OpenAI's `api-key`
+/// header) or that require provider-wide extra headers (GitHub Models'
+/// `X-GitHub-Api-Version`). `OpenAIChatCompletionClient` hardcodes
+/// `bearer_auth` with no header hook, so this client mirrors it
+/// request-for-request by reusing the framework's own public conversion and
+/// SSE-parsing helpers — only header injection differs. The auth header value
+/// is marked sensitive so reqwest never echoes it into an error.
+#[cfg(feature = "provider-openai")]
+struct HeaderAuthChatClient {
+    http: reqwest::Client,
+    base_url: String,
+    model: String,
+    headers: reqwest::header::HeaderMap,
+}
+
+#[cfg(feature = "provider-openai")]
+impl HeaderAuthChatClient {
+    /// Build the client, assembling the fixed header set: the provider's
+    /// extra headers plus (when a key is present) `header: prefix+key`,
+    /// sensitive. `None` when a header name/value cannot be represented —
+    /// the caller maps that to a legible config error naming no key.
+    fn new(cfg: &ModelConfig, auth: &EndpointAuth, api_key: &str) -> Option<Self> {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut headers = HeaderMap::new();
+        for (name, value) in &auth.extra_headers {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).ok()?,
+                HeaderValue::from_str(value).ok()?,
+            );
+        }
+        if !api_key.is_empty() {
+            let mut value = HeaderValue::from_str(&format!("{}{api_key}", auth.prefix)).ok()?;
+            value.set_sensitive(true);
+            headers.insert(HeaderName::from_bytes(auth.header.as_bytes()).ok()?, value);
+        }
+        Some(Self {
+            http: reqwest::Client::new(),
+            base_url: cfg.base_url.clone(),
+            model: cfg.model.clone(),
+            headers,
+        })
+    }
+
+    /// The exact chat-completions body the stock client builds, via the
+    /// framework's own public conversion helpers.
+    fn build_body(
+        &self,
+        messages: &[agent_framework_core::types::Message],
+        options: &agent_framework_core::types::ChatOptions,
+        stream: bool,
+    ) -> serde_json::Value {
+        use agent_framework_openai::convert;
+        let mut body = serde_json::Map::new();
+        let model = options.model.clone().unwrap_or_else(|| self.model.clone());
+        body.insert("model".into(), serde_json::json!(model));
+        body.insert(
+            "messages".into(),
+            serde_json::json!(convert::messages_to_openai(messages)),
+        );
+        convert::apply_options(&mut body, options);
+        let (tools, tool_choice) = convert::tools_to_openai(options);
+        if let Some(tools) = tools {
+            body.insert("tools".into(), tools);
+        }
+        if let Some(choice) = tool_choice {
+            body.insert("tool_choice".into(), choice);
+        }
+        if stream {
+            body.insert("stream".into(), serde_json::json!(true));
+            body.insert(
+                "stream_options".into(),
+                serde_json::json!({ "include_usage": true }),
+            );
+        }
+        serde_json::Value::Object(body)
+    }
+
+    async fn post(
+        &self,
+        body: &serde_json::Value,
+    ) -> agent_framework_core::error::Result<reqwest::Response> {
+        use agent_framework_core::error::Error;
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.headers.clone())
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(agent_framework_openai::classify_service_error(
+                status.as_u16(),
+                &text,
+                format!("OpenAI-compatible API error {status}: {text}"),
+                None,
+            ));
+        }
+        Ok(resp)
+    }
+}
+
+#[cfg(feature = "provider-openai")]
+#[async_trait::async_trait]
+impl agent_framework_core::client::ChatClient for HeaderAuthChatClient {
+    async fn get_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        options: agent_framework_core::types::ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::types::ChatResponse> {
+        use agent_framework_core::error::Error;
+        let body = self.build_body(&messages, &options, false);
+        let resp = self.post(&body).await?;
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
+        Ok(agent_framework_openai::convert::parse_response(&value))
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        options: agent_framework_core::types::ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+        use futures::StreamExt;
+        let body = self.build_body(&messages, &options, true);
+        let resp = self.post(&body).await?;
+        Ok(agent_framework_openai::parse_sse_stream(resp).boxed())
+    }
+
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
     }
 }
 
@@ -684,6 +1317,555 @@ pub async fn resolve_model_with_probe(
     Err(ModelsError::AllCandidatesFailed { mode, attempts })
 }
 
+// ===========================================================================
+// Audio: speech-to-text and text-to-speech (voice v1, rubric 8)
+// ===========================================================================
+//
+// Both ride the SAME OpenAI-compatible plumbing the chat profiles use — the
+// `/audio/transcriptions` and `/audio/speech` endpoints are served by Groq
+// (`whisper-large-v3`, `whisper-large-v3-turbo`), OpenAI (`gpt-4o-transcribe`,
+// `gpt-4o-mini-transcribe`, `tts-1`, `gpt-4o-mini-tts`), DeepInfra and Together,
+// so voice needs no new provider protocol. Configuration is two OPTIONAL tables
+// in the existing `models.toml`, parsed independently of `[[model]]` so a file
+// without them is unchanged:
+//
+// ```toml
+// [transcription]
+// base_url = "https://api.groq.com/openai/v1"
+// model = "whisper-large-v3-turbo"
+// api_key_env = "GROQ_API_KEY"
+// # local = true   # set for an on-device engine, so classified audio is
+// #                # allowed to be transcribed under any policy ceiling
+//
+// [speech]
+// base_url = "https://api.openai.com/v1"
+// model = "gpt-4o-mini-tts"
+// voice = "alloy"
+// api_key_env = "OPENAI_API_KEY"
+// ```
+//
+// NOTE ON VERIFICATION: the machine this was written on has NO audio hardware
+// and no provider credentials. Every test below drives a wiremock server and
+// fixture bytes. Nothing here is evidence that a real provider's response shape
+// or a real audio device behaves as expected.
+
+/// One `[transcription]` / `[speech]` table in `models.toml`.
+///
+/// Deliberately its own type rather than a reuse of [`ModelConfig`]: an audio
+/// profile has no [`ModelId`] (there is exactly one of each, selected by the
+/// table name, not by a policy candidate list) and TTS carries a `voice` that
+/// means nothing to a chat profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioModelConfig {
+    /// The OpenAI-compatible base URL, e.g. `https://api.groq.com/openai/v1`.
+    /// The endpoint path (`/audio/transcriptions`, `/audio/speech`) is appended.
+    pub base_url: String,
+    /// The provider-side model name, e.g. `whisper-large-v3-turbo`.
+    pub model: String,
+    /// The NAME of the environment variable holding the API key, read at call
+    /// time and never stored. Empty means no key (a local endpoint).
+    #[serde(default)]
+    pub api_key_env: String,
+    /// TTS only: the provider's voice name, e.g. `alloy`. Ignored for STT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// TTS only: the requested container, e.g. `mp3`/`wav`/`opus`. Sent verbatim
+    /// as `response_format`; omitted lets the provider choose its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Whether this endpoint runs ON THIS DEVICE (a local whisper.cpp server,
+    /// an Ollama-hosted ASR). This is the single knob that decides whether the
+    /// daemon's classification gate treats a transcription as
+    /// [`TranscriptionMode::Local`](codypendent_protocol::input::TranscriptionMode)
+    /// — under which even `Confidential` audio may be transcribed — or as
+    /// `Remote`, which the operator's off-device ceiling governs. It defaults to
+    /// `false`: an unmarked endpoint is assumed to leave the device, so the
+    /// safe classification is the one you get by saying nothing.
+    #[serde(default)]
+    pub local: bool,
+    /// Request timeout in seconds. Audio requests are slower than chat ones (a
+    /// minute of speech is a megabyte-scale upload), hence the generous default.
+    #[serde(default = "default_audio_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_audio_timeout_secs() -> u64 {
+    120
+}
+
+/// The optional audio tables in `models.toml`. Parsed with its OWN struct
+/// (rather than by extending the `[[model]]` file shape) so an existing
+/// `models.toml` — and every existing reader of it — is entirely unaffected.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AudioModels {
+    /// The `[transcription]` table: the speech-to-text endpoint.
+    #[serde(default)]
+    pub transcription: Option<AudioModelConfig>,
+    /// The `[speech]` table: the text-to-speech endpoint.
+    #[serde(default)]
+    pub speech: Option<AudioModelConfig>,
+}
+
+/// Parse the `[transcription]` / `[speech]` tables from `models.toml`.
+///
+/// A missing FILE yields an empty [`AudioModels`] (voice is simply not
+/// configured — the overwhelmingly common case), but a file that exists and
+/// does not parse is an error, so a typo in a voice table surfaces instead of
+/// silently disabling voice.
+pub fn load_audio_models(path: &Path) -> Result<AudioModels> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AudioModels::default())
+        }
+        Err(source) => {
+            return Err(ModelsError::ReadConfig {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    toml::from_str(&text).map_err(|source| ModelsError::ParseConfig {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Errors from the audio clients and the playback command.
+///
+/// Its own enum rather than new [`ModelsError`] variants: the audio path has
+/// failure modes (no player configured, a spawn failure) that have nothing to
+/// do with chat model resolution, and keeping them separate means a caller can
+/// exhaustively match one without the other.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AudioError {
+    /// `models.toml` has no `[transcription]` / `[speech]` table.
+    #[error("no [{table}] entry in models.toml; voice {feature} is not configured")]
+    NotConfigured {
+        /// The missing table name.
+        table: &'static str,
+        /// What it would have enabled, for the message.
+        feature: &'static str,
+    },
+    /// The configured `api_key_env` names an unset environment variable.
+    #[error("environment variable {var} is not set (needed by the [{table}] entry)")]
+    MissingApiKeyEnv {
+        /// The table whose `api_key_env` could not be resolved.
+        table: &'static str,
+        /// The environment variable NAME (never a value).
+        var: String,
+    },
+    /// The request could not be sent (DNS, TLS, connect, timeout).
+    #[error("audio request to {url} failed: {source}")]
+    Transport {
+        /// The endpoint that was called.
+        url: String,
+        /// The underlying transport error.
+        source: reqwest::Error,
+    },
+    /// The provider answered with a non-success status.
+    #[error("audio endpoint {url} returned {status}: {body}")]
+    Status {
+        /// The endpoint that was called.
+        url: String,
+        /// The HTTP status.
+        status: u16,
+        /// The (truncated) response body, for diagnosis.
+        body: String,
+    },
+    /// The provider's response did not have the documented shape.
+    #[error("audio endpoint {url} returned an unreadable response: {detail}")]
+    MalformedResponse {
+        /// The endpoint that was called.
+        url: String,
+        /// What was wrong.
+        detail: String,
+    },
+    /// Playback was requested with no `play_command` configured.
+    #[error("no voice play_command is configured; set voice.play_command in config.toml (e.g. [\"mpv\", \"--no-terminal\", \"-\"])")]
+    NoPlayer,
+    /// The playback command could not be started or fed.
+    #[error("could not run the playback command {command:?}: {source}")]
+    Playback {
+        /// The configured command, for the message.
+        command: Vec<String>,
+        /// The spawn/write failure.
+        source: std::io::Error,
+    },
+}
+
+/// Join a base URL and an endpoint path without doubling or dropping the slash.
+fn audio_url(base_url: &str, path: &str) -> String {
+    format!("{}/{}", base_url.trim_end_matches('/'), path)
+}
+
+/// Resolve an audio profile's API key with the SAME precedence a chat profile
+/// uses: an `auth.json` entry first (keyed by the table name, so a TUI-saved key
+/// applies), then the configured environment variable via the shared
+/// [`credential_for`](codypendent_providers::credential_for) seam. An empty
+/// `api_key_env` means "no key needed" and resolves to an empty string.
+async fn audio_api_key(
+    config: &AudioModelConfig,
+    auth: &AuthStore,
+    table: &'static str,
+) -> std::result::Result<String, AudioError> {
+    if let Some(key) = auth.get(table).filter(|key| !key.is_empty()) {
+        return Ok(key.to_string());
+    }
+    if config.api_key_env.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let method = codypendent_providers::AuthMethod::ApiKey {
+        env: vec![config.api_key_env.clone()],
+        header: "Authorization".to_string(),
+        prefix: "Bearer ".to_string(),
+    };
+    match codypendent_providers::credential_for(&method)
+        .resolve()
+        .await
+    {
+        Ok(codypendent_providers::ResolvedCredential::ApiKey { value, .. }) => Ok(value),
+        Ok(codypendent_providers::ResolvedCredential::None) => Ok(String::new()),
+        Err(codypendent_providers::CredentialError::MissingEnv { var }) => {
+            Err(AudioError::MissingApiKeyEnv { table, var })
+        }
+        Err(other) => Err(AudioError::MissingApiKeyEnv {
+            table,
+            var: other.to_string(),
+        }),
+    }
+}
+
+/// Read a response body as text, truncated so a provider's HTML error page
+/// cannot flood a log line or an error message.
+async fn error_body(response: reqwest::Response) -> String {
+    let mut body = response.text().await.unwrap_or_default();
+    body.truncate(512);
+    body
+}
+
+/// A speech-to-text client over an OpenAI-compatible
+/// `{base_url}/audio/transcriptions` endpoint.
+///
+/// The request is `multipart/form-data` with a `file` part (the audio bytes)
+/// and a `model` part, exactly as Groq/OpenAI/DeepInfra/Together document. The
+/// multipart body is assembled by hand rather than through `reqwest`'s
+/// `multipart` feature, so voice adds no new feature flag to the workspace's
+/// shared HTTP dependency; the boundary is derived from the payload's own
+/// SHA-256, which cannot collide with content it is a digest of.
+#[derive(Debug, Clone)]
+pub struct AudioTranscriber {
+    config: AudioModelConfig,
+    auth: AuthStore,
+    http: reqwest::Client,
+}
+
+impl AudioTranscriber {
+    /// Build a transcriber from the `[transcription]` table, or
+    /// [`AudioError::NotConfigured`] when there is none.
+    pub fn new(models: &AudioModels, auth: AuthStore) -> std::result::Result<Self, AudioError> {
+        let config = models
+            .transcription
+            .clone()
+            .ok_or(AudioError::NotConfigured {
+                table: "transcription",
+                feature: "input (speech-to-text)",
+            })?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_default();
+        Ok(Self { config, auth, http })
+    }
+
+    /// The configured profile (endpoint, model name, locality).
+    #[must_use]
+    pub fn config(&self) -> &AudioModelConfig {
+        &self.config
+    }
+
+    /// Whether this endpoint runs on-device — what the daemon's classification
+    /// gate reads to pick `Local` vs `Remote`.
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        self.config.local
+    }
+
+    /// Transcribe `bytes` (an audio container named `filename`, whose extension
+    /// is how most providers detect the format) and return the recognized text.
+    pub async fn transcribe(
+        &self,
+        bytes: &[u8],
+        filename: &str,
+        media_type: &str,
+    ) -> std::result::Result<String, AudioError> {
+        let url = audio_url(&self.config.base_url, "audio/transcriptions");
+        let key = audio_api_key(&self.config, &self.auth, "transcription").await?;
+        let boundary = multipart_boundary(bytes);
+        let body = multipart_body(&boundary, bytes, filename, media_type, &self.config.model);
+
+        let mut request = self
+            .http
+            .post(&url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body);
+        if !key.is_empty() {
+            request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|source| AudioError::Transport {
+                url: url.clone(),
+                source,
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AudioError::Status {
+                url,
+                status: status.as_u16(),
+                body: error_body(response).await,
+            });
+        }
+        let payload: serde_json::Value =
+            response
+                .json()
+                .await
+                .map_err(|source| AudioError::MalformedResponse {
+                    url: url.clone(),
+                    detail: source.to_string(),
+                })?;
+        payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or(AudioError::MalformedResponse {
+                url,
+                detail: "no string `text` field in the response".to_string(),
+            })
+    }
+}
+
+/// A boundary derived from the payload's SHA-256. A multipart boundary must not
+/// occur inside any part; a digest of the very bytes it delimits cannot, short
+/// of a preimage the payload would have to contain of itself.
+fn multipart_boundary(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("codypendentaudio{}", hex::encode(&hasher.finalize()[..12]))
+}
+
+/// Assemble the `multipart/form-data` body: a `file` part then a `model` part.
+fn multipart_body(
+    boundary: &str,
+    bytes: &[u8],
+    filename: &str,
+    media_type: &str,
+    model: &str,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(bytes.len() + 512);
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {media_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n");
+    body.extend_from_slice(model.as_bytes());
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// Audio a [`AudioSynthesizer`] produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynthesizedSpeech {
+    /// The encoded audio bytes, in whatever container the provider returned.
+    pub bytes: Vec<u8>,
+    /// The `Content-Type` the provider reported, e.g. `audio/mpeg`.
+    pub media_type: String,
+}
+
+/// A text-to-speech client over an OpenAI-compatible `{base_url}/audio/speech`
+/// endpoint (Groq, OpenAI, DeepInfra, Together). The reply is raw audio bytes,
+/// not JSON.
+#[derive(Debug, Clone)]
+pub struct AudioSynthesizer {
+    config: AudioModelConfig,
+    auth: AuthStore,
+    http: reqwest::Client,
+}
+
+impl AudioSynthesizer {
+    /// Build a synthesizer from the `[speech]` table, or
+    /// [`AudioError::NotConfigured`] when there is none.
+    pub fn new(models: &AudioModels, auth: AuthStore) -> std::result::Result<Self, AudioError> {
+        let config = models.speech.clone().ok_or(AudioError::NotConfigured {
+            table: "speech",
+            feature: "output (text-to-speech)",
+        })?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_default();
+        Ok(Self { config, auth, http })
+    }
+
+    /// The configured profile.
+    #[must_use]
+    pub fn config(&self) -> &AudioModelConfig {
+        &self.config
+    }
+
+    /// Synthesize `text` into audio bytes.
+    pub async fn synthesize(
+        &self,
+        text: &str,
+    ) -> std::result::Result<SynthesizedSpeech, AudioError> {
+        let url = audio_url(&self.config.base_url, "audio/speech");
+        let key = audio_api_key(&self.config, &self.auth, "speech").await?;
+        let mut payload = serde_json::json!({
+            "model": self.config.model,
+            "input": text,
+        });
+        if let Some(voice) = &self.config.voice {
+            payload["voice"] = serde_json::Value::String(voice.clone());
+        }
+        if let Some(format) = &self.config.format {
+            payload["response_format"] = serde_json::Value::String(format.clone());
+        }
+
+        let mut request = self.http.post(&url).json(&payload);
+        if !key.is_empty() {
+            request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|source| AudioError::Transport {
+                url: url.clone(),
+                source,
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AudioError::Status {
+                url,
+                status: status.as_u16(),
+                body: error_body(response).await,
+            });
+        }
+        let media_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("audio/mpeg")
+            .to_string();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|source| AudioError::Transport {
+                url: url.clone(),
+                source,
+            })?
+            .to_vec();
+        if bytes.is_empty() {
+            return Err(AudioError::MalformedResponse {
+                url,
+                detail: "the speech endpoint returned no audio bytes".to_string(),
+            });
+        }
+        Ok(SynthesizedSpeech { bytes, media_type })
+    }
+}
+
+/// Plays synthesized audio by piping it to a USER-CONFIGURED command's stdin.
+///
+/// There is no bundled audio backend on purpose: shipping one would mean a
+/// platform-specific native dependency for a strictly optional feature, and
+/// every desktop already has a player that reads stdin (`mpv --no-terminal -`,
+/// `ffplay -nodisp -autoexit -`, `paplay`, `afplay` via a temp file). The
+/// operator names theirs in `config.toml`.
+///
+/// The child is spawned **detached**: its handle is dropped immediately, so a
+/// long clip never blocks the caller's task, and its stdout/stderr are silenced
+/// so a chatty player cannot corrupt a TUI's terminal. Nothing here has been
+/// exercised against a real audio device — this container has none; the tests
+/// substitute a `cat > file` "player" and assert the bytes arrive on its stdin.
+#[derive(Debug, Clone, Default)]
+pub struct AudioPlayer {
+    command: Vec<String>,
+}
+
+impl AudioPlayer {
+    /// A player driven by `command` (program plus arguments). An empty command
+    /// means "unconfigured": [`play`](Self::play) then fails
+    /// [`AudioError::NoPlayer`] instead of guessing a binary.
+    #[must_use]
+    pub fn new(command: Vec<String>) -> Self {
+        Self { command }
+    }
+
+    /// Whether a playback command is configured.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        !self.command.is_empty()
+    }
+
+    /// Pipe `bytes` to the configured command's stdin and return without
+    /// waiting for it to finish.
+    ///
+    /// The write itself is awaited (so a spawn/pipe failure is reported rather
+    /// than silently swallowed) but the process is NOT waited on. A player that
+    /// outlives the caller is intentional: playback continues while the UI
+    /// carries on. Note this leaves the child unreaped by this process; callers
+    /// that spawn many should run this from a task whose runtime reaps children
+    /// (tokio's `Command` does so via its signal handling).
+    pub async fn play(&self, bytes: &[u8]) -> std::result::Result<(), AudioError> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let Some((program, args)) = self.command.split_first() else {
+            return Err(AudioError::NoPlayer);
+        };
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(false)
+            .spawn()
+            .map_err(|source| AudioError::Playback {
+                command: self.command.clone(),
+                source,
+            })?;
+        let mut stdin = child.stdin.take().ok_or_else(|| AudioError::Playback {
+            command: self.command.clone(),
+            source: std::io::Error::other("the playback command has no stdin"),
+        })?;
+        stdin
+            .write_all(bytes)
+            .await
+            .map_err(|source| AudioError::Playback {
+                command: self.command.clone(),
+                source,
+            })?;
+        // Closing stdin is what tells the player the clip is complete.
+        stdin.shutdown().await.ok();
+        drop(stdin);
+        // Detach: the clip plays on while this task returns immediately.
+        drop(child);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,6 +1953,7 @@ model = "codex-acp"
             model: "codex-acp".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         };
         let registry = ModelRegistry::new(vec![config]);
         assert!(registry.is_acp(&model_id("acp/codex-acp")));
@@ -852,6 +2035,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "gpt-5.1-codex".to_string(),
             api_key_env: var_name.to_string(),
             context_tokens: None,
+            provider_id: None,
         }]);
 
         // `Arc<dyn ChatClient>` (the `Ok` type) has no `Debug` impl, so
@@ -886,6 +2070,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "qwen2.5-coder:14b".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         }]);
 
         // Builds an OpenAI-compatible client with no key (Ok is enough — the
@@ -913,6 +2098,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "llama-3.1-8b".to_string(),
             api_key_env: var.to_string(),
             context_tokens: None,
+            provider_id: None,
         };
 
         // Without an auth.json entry the env var is required and missing → error.
@@ -947,6 +2133,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "qwen2.5-coder:14b".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         }])
         .with_auth(AuthStore::default());
         assert!(
@@ -984,6 +2171,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "llama-3.1-8b".to_string(),
             api_key_env: var.to_string(),
             context_tokens: None,
+            provider_id: None,
         };
 
         let mut auth = AuthStore::default();
@@ -1021,6 +2209,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "claude-sonnet-5".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         }]);
 
         let err = registry
@@ -1092,6 +2281,7 @@ api_key_env = "OPENAI_API_KEY"
                 model: "unused".to_string(),
                 api_key_env: String::new(),
                 context_tokens: None,
+                provider_id: None,
             },
             ModelConfig {
                 id: reachable.clone(),
@@ -1100,6 +2290,7 @@ api_key_env = "OPENAI_API_KEY"
                 model: "unused".to_string(),
                 api_key_env: String::new(),
                 context_tokens: None,
+                provider_id: None,
             },
         ]);
         let policy = ModelPolicy::new()
@@ -1128,6 +2319,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "unused".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         }]);
         let policy = ModelPolicy::new().with_candidates(AgentMode::Build, vec![closed.clone()]);
 
@@ -1169,6 +2361,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "unused".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         }]);
         let ghost = model_id("not-in-registry");
         let policy =
@@ -1225,6 +2418,7 @@ api_key_env = "OPENAI_API_KEY"
                 model: "missing-model".to_string(),
                 api_key_env: String::new(),
                 context_tokens: None,
+                provider_id: None,
             },
             ModelConfig {
                 id: healthy.clone(),
@@ -1233,6 +2427,7 @@ api_key_env = "OPENAI_API_KEY"
                 model: "installed-model".to_string(),
                 api_key_env: String::new(),
                 context_tokens: None,
+                provider_id: None,
             },
         ]);
         let policy =
@@ -1244,6 +2439,360 @@ api_key_env = "OPENAI_API_KEY"
         assert_eq!(resolved.id, healthy);
         stale_server.await.unwrap();
         healthy_server.await.unwrap();
+    }
+
+    // -- models.toml extras: [embedding] + [retrieval] ---------------------
+
+    #[test]
+    fn extras_parse_embedding_and_retrieval_alongside_model_entries() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        write!(
+            file,
+            r#"
+[[model]]
+id = "local-default"
+provider = "openai-compatible"
+base_url = "http://localhost:11434/v1"
+model = "qwen2.5-coder:14b"
+api_key_env = ""
+
+[embedding]
+base_url = "http://localhost:11434/v1"
+model = "nomic-embed-text"
+dims = 768
+
+[retrieval]
+mcp_top_k = 5
+"#
+        )
+        .expect("write temp file");
+
+        // Both readers coexist on one file: `load_models` ignores the new
+        // tables; `load_model_extras` ignores the [[model]] entries.
+        let models = load_models(file.path()).expect("model entries still parse");
+        assert_eq!(models.len(), 1);
+        let extras = load_model_extras(file.path()).expect("extras parse");
+        let embedding = extras.embedding.expect("embedding entry present");
+        assert_eq!(embedding.provider, "openai-compatible", "provider defaults");
+        assert_eq!(embedding.base_url, "http://localhost:11434/v1");
+        assert_eq!(embedding.model, "nomic-embed-text");
+        assert_eq!(embedding.api_key_env, "", "api_key_env defaults empty");
+        assert_eq!(embedding.dims, Some(768));
+        assert_eq!(extras.retrieval.mcp_top_k, 5);
+    }
+
+    #[test]
+    fn extras_default_when_tables_or_file_are_absent() {
+        // A models.toml with only [[model]] entries (the existing shape) yields
+        // the defaults: no embedding model, default MCP top-k.
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        write!(
+            file,
+            r#"
+[[model]]
+id = "hosted-default"
+provider = "openai-compatible"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5.1-codex"
+api_key_env = "OPENAI_API_KEY"
+"#
+        )
+        .expect("write temp file");
+        let extras = load_model_extras(file.path()).expect("extras parse");
+        assert_eq!(extras.embedding, None);
+        assert_eq!(extras.retrieval.mcp_top_k, DEFAULT_MCP_TOP_K);
+
+        // No file at all: defaults too (context assembly must not need one).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extras =
+            load_model_extras(&dir.path().join("models.toml")).expect("absent file defaults");
+        assert_eq!(extras, ModelExtras::default());
+    }
+
+    #[test]
+    fn malformed_extras_are_a_legible_error_not_a_silent_default() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        write!(file, "[embedding]\nmodel = 42\n").expect("write temp file");
+        assert!(
+            matches!(
+                load_model_extras(file.path()),
+                Err(ModelsError::ParseConfig { .. })
+            ),
+            "a typo'd [embedding] table must error, never silently disable embeddings"
+        );
+    }
+
+    // -- failure taxonomy (transient vs permanent) -------------------------
+
+    #[test]
+    fn classify_provider_message_marks_connect_timeout_and_5xx_transient() {
+        for message in [
+            "connection refused (os error 111)",
+            "Connection reset by peer",
+            "operation timed out",
+            "request timeout",
+            "provider returned HTTP 429 Too Many Requests from /models",
+            "HTTP status server error (503 Service Unavailable)",
+            "upstream 502",
+            "the model is overloaded, please retry",
+        ] {
+            assert_eq!(
+                classify_provider_message(message),
+                FailureClass::Transient,
+                "expected transient: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_provider_message_marks_contract_failures_permanent() {
+        for message in [
+            "provider returned HTTP 401 Unauthorized from /models",
+            "invalid request: unknown model `nope`",
+            "provider returned HTTP 404 from /models",
+            "content policy violation",
+            // A transient-looking digit run embedded in a longer number must
+            // NOT match — status codes are standalone digit runs only.
+            "request id 15005 was rejected: bad schema",
+        ] {
+            assert_eq!(
+                classify_provider_message(message),
+                FailureClass::Permanent,
+                "expected permanent: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn models_error_failure_class_follows_the_variant_taxonomy() {
+        let transient = ModelsError::ConnectionFailed {
+            base_url: "http://localhost:11434/v1".to_string(),
+            reason: "connection refused".to_string(),
+        };
+        assert_eq!(transient.failure_class(), FailureClass::Transient);
+
+        // ModelUnavailable defers to its provider-supplied reason: a 5xx from
+        // /models is a blip worth retrying, a missing model tag is not.
+        let blip = ModelsError::ModelUnavailable {
+            model: model_id("m"),
+            provider_model: "m".to_string(),
+            reason: "provider returned HTTP 503 from /models".to_string(),
+        };
+        assert_eq!(blip.failure_class(), FailureClass::Transient);
+        let missing = ModelsError::ModelUnavailable {
+            model: model_id("m"),
+            provider_model: "m".to_string(),
+            reason: "provider did not list this model".to_string(),
+        };
+        assert_eq!(missing.failure_class(), FailureClass::Permanent);
+
+        // Config/credential failures can never be fixed by waiting.
+        let permanent = ModelsError::MissingApiKeyEnv {
+            model: model_id("m"),
+            var: "SOME_KEY".to_string(),
+        };
+        assert_eq!(permanent.failure_class(), FailureClass::Permanent);
+        assert_eq!(
+            ModelsError::UnknownModel(model_id("nope")).failure_class(),
+            FailureClass::Permanent
+        );
+    }
+
+    // -- catalog-resolved auth headers (provider_id) ------------------------
+
+    /// A one-request HTTP server that answers `body` and hands back the raw
+    /// request head it received, so a test can assert on the exact auth
+    /// headers a probe/client sent.
+    #[cfg(feature = "provider-openai")]
+    async fn capture_server(body: &str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 8192];
+            let n = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request[..n]).into_owned()
+        });
+        (format!("http://{address}/v1"), task)
+    }
+
+    /// The HIGH-severity auth-flatten regression: an azure-shaped provider
+    /// (catalog auth `header = "api-key"`, `prefix = ""` — the built-in
+    /// `azure-openai` entry) must round-trip its key under `api-key`, not
+    /// under a hardcoded `Authorization: Bearer`. `check_model` is asserted
+    /// on the wire; `client_for` must agree because both resolve the same
+    /// [`EndpointAuth`].
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn check_model_sends_the_catalog_declared_api_key_header_for_azure() {
+        use crate::auth::AuthStore;
+        let id = model_id("azure-openai/gpt-5.1");
+        let (url, server) = capture_server(r#"{"data":[{"id":"gpt-5.1"}]}"#).await;
+        let mut auth = AuthStore::default();
+        auth.set(id.0.as_str(), "azure-secret-key");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: url,
+            model: "gpt-5.1".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: Some("azure-openai".to_string()),
+        }])
+        .with_auth(auth);
+
+        registry
+            .check_model(&id)
+            .await
+            .expect("the endpoint lists the model");
+        let request = server.await.unwrap();
+        let head = request.to_lowercase();
+        assert!(
+            head.contains("api-key: azure-secret-key"),
+            "the key must ride the catalog-declared `api-key` header:\n{request}"
+        );
+        assert!(
+            !head.contains("authorization:"),
+            "no bearer header may be sent for an api-key provider:\n{request}"
+        );
+    }
+
+    /// The legacy shape (no `provider_id`) keeps the exact bearer wire
+    /// behavior — the back-compat half of the azure round-trip test.
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn check_model_defaults_to_bearer_when_no_provider_id_is_set() {
+        use crate::auth::AuthStore;
+        let id = model_id("groq/llama");
+        let (url, server) = capture_server(r#"{"data":[{"id":"llama-3.1-8b"}]}"#).await;
+        let mut auth = AuthStore::default();
+        auth.set(id.0.as_str(), "sk-legacy");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: url,
+            model: "llama-3.1-8b".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: None,
+        }])
+        .with_auth(auth);
+
+        registry.check_model(&id).await.expect("listed");
+        let request = server.await.unwrap();
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer sk-legacy"),
+            "a legacy entry keeps `Authorization: Bearer`:\n{request}"
+        );
+    }
+
+    /// `client_for` completes a chat call through the header-aware client for
+    /// an azure-shaped provider: the mock asserts `api-key` (no bearer) and
+    /// the provider's extra headers on the actual `/chat/completions` POST.
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn client_for_sends_catalog_headers_on_chat_completions() {
+        use crate::auth::AuthStore;
+        use agent_framework_core::client::ChatClient;
+        use agent_framework_core::types::{ChatOptions, Message};
+
+        // A user-shadowed azure-shaped provider carrying an extra header, so
+        // both the auth header and extra_headers are exercised in one call.
+        let provider_toml = r#"
+[[provider]]
+id = "azure-shaped"
+name = "Azure-shaped"
+protocol = "openai-chat"
+base_url = "https://unused.example/v1"
+extra_headers = { "x-extra-version" = "2026-01-01" }
+[[provider.auth]]
+kind = "api_key"
+env = ["AZURE_SHAPED_KEY_UNSET_TEST"]
+header = "api-key"
+prefix = ""
+"#;
+        let file: codypendent_providers::ProvidersFile =
+            toml::from_str(provider_toml).expect("provider toml");
+        let catalog = Catalog::from_providers(file.providers);
+
+        let body = r#"{"id":"resp-1","model":"gpt-5.1","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
+        let (url, server) = capture_server(body).await;
+
+        let id = model_id("azure-shaped/gpt-5.1");
+        let mut auth = AuthStore::default();
+        auth.set(id.0.as_str(), "azure-secret-key");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: url,
+            model: "gpt-5.1".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: Some("azure-shaped".to_string()),
+        }])
+        .with_auth(auth)
+        .with_catalog(catalog);
+
+        let client = registry.client_for(&id).await.expect("client builds");
+        let response = client
+            .get_response(vec![Message::user("ping")], ChatOptions::default())
+            .await
+            .expect("the mock answers");
+        assert_eq!(response.text(), "hi");
+
+        let request = server.await.unwrap();
+        let head = request.to_lowercase();
+        assert!(
+            head.starts_with("post /v1/chat/completions"),
+            "the chat route is the base_url sibling:\n{request}"
+        );
+        assert!(
+            head.contains("api-key: azure-secret-key"),
+            "the key rides the catalog-declared header:\n{request}"
+        );
+        assert!(
+            head.contains("x-extra-version: 2026-01-01"),
+            "provider extra headers are sent:\n{request}"
+        );
+        assert!(
+            !head.contains("authorization:"),
+            "no bearer header for an api-key provider:\n{request}"
+        );
+    }
+
+    /// A stored provider-wide key (`provider/<id>`) satisfies a model that has
+    /// no per-model `auth.json` entry and no env var — the dedupe-key-entry
+    /// seam: one pasted key serves every model added from that provider.
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn provider_wide_auth_json_key_resolves_for_models_of_that_provider() {
+        use crate::auth::AuthStore;
+        let id = model_id("nebius/deepseek");
+        let mut auth = AuthStore::default();
+        auth.set(provider_auth_id("nebius"), "nb-provider-key");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.tokenfactory.nebius.com/v1".to_string(),
+            model: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: Some("nebius".to_string()),
+        }])
+        .with_auth(auth);
+        assert!(
+            registry.client_for(&id).await.is_ok(),
+            "a provider-wide stored key must satisfy the model"
+        );
     }
 
     // -- authority_from_base_url -------------------------------------------
