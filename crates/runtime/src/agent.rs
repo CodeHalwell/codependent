@@ -1817,19 +1817,24 @@ impl FrameworkAgentRuntime {
                 // `NoteAppended` per folding pass keeps the trace honest about
                 // what was compacted and how to get it back.
                 let budget_tokens = (limit.saturating_mul(COMPACTION_THRESHOLD_PCT) / 100) as usize;
-                let before = estimate_request_tokens(&transcript, &tool_definitions);
-                if before > budget_tokens {
+                // One estimate per step, re-taken only when a fold actually
+                // changed the transcript — it walks every turn plus every
+                // schema, so it is not worth running three times to learn the
+                // same number.
+                let mut used = estimate_request_tokens(&transcript, &tool_definitions);
+                if used > budget_tokens {
+                    let before = used;
                     let folded =
                         fold_oldest_tool_results(&mut transcript, &tool_definitions, budget_tokens);
                     if folded > 0 {
-                        let after = estimate_request_tokens(&transcript, &tool_definitions);
+                        used = estimate_request_tokens(&transcript, &tool_definitions);
                         self.emit(
                             run.session_id,
                             run_actor.clone(),
                             EventBody::NoteAppended {
                                 text: format!(
                                     "compaction: folded {folded} oldest tool result(s) into \
-                                     artifact-ref stubs (≈{before} → ≈{after} of {limit} \
+                                     artifact-ref stubs (≈{before} → ≈{used} of {limit} \
                                      tokens); folded output can be reopened with artifact.read"
                                 ),
                                 run_id: Some(run.run_id),
@@ -1838,7 +1843,7 @@ impl FrameworkAgentRuntime {
                         .await?;
                     }
                 }
-                let used = estimate_request_tokens(&transcript, &tool_definitions) as u64;
+                let used = used as u64;
                 if let Some((body, pct)) =
                     token_budget_event(run.run_id, used, limit, last_token_pct)
                 {
