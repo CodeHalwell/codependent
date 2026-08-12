@@ -1343,12 +1343,16 @@ async fn event_loop<P: Presentation>(
                 ),
             }
         }
-        // The steady shell has no frame-based animation. Wakeups still drive
-        // repair and reducer time, but only notice expiry and the periodic
-        // projection refresh need a new frame; input and daemon events redraw
-        // immediately through the non-tick path.
+        // A steady shell has no frame-based animation, so most ticks need no
+        // frame: input and daemon events redraw immediately through the
+        // non-tick path. But while a spinner is on screen — a run thinking or
+        // running a tool, a graph page loading, a model list being fetched —
+        // every tick must draw, or the "spinner" advances one frame per 25
+        // ticks (~5s) and reads as a frozen UI. The 25-tick beat stays as the
+        // keep-alive for notice expiry and the periodic projection refresh.
         let redraw = !tick_action
             || state.notice != notice_before
+            || state.is_animating()
             || state.tick.is_multiple_of(25)
             || presentation.wants_periodic_draw();
 

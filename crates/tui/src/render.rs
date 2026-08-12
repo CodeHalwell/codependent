@@ -1086,18 +1086,33 @@ fn style_for(role: SpanRole, theme: &Theme) -> Style {
     }
 }
 
+/// The frame-constant inputs the transcript walk needs beyond the runs
+/// themselves: the live theme, which run owns this frame's click targets,
+/// which fold (if any) is being browsed, the reading width rows are measured
+/// against, and the animation tick its spinners turn on. Passed as one value
+/// so the measure pass and the build pass provably walk with identical
+/// parameters.
+#[derive(Clone, Copy)]
+struct TranscriptView<'t> {
+    theme: &'t Theme,
+    selected_run: usize,
+    browsed: Option<usize>,
+    inner_width: u16,
+    tick: u64,
+}
+
 /// Walk the whole session transcript in scroll order, emitting one `Row` per
 /// logical line. Mirrors the old `conversation_lines` walk exactly; the `Model`
 /// entry is emitted as borrowed `Row::Model` rows (measured cheaply, built only
 /// when visible), every other entry reuses the existing `entry_lines` builders.
-fn for_each_row<'a>(
-    runs: &'a [RunView],
-    theme: &Theme,
-    selected_run: usize,
-    browsed: Option<usize>,
-    inner_width: u16,
-    mut visit: impl FnMut(Row<'a>),
-) {
+fn for_each_row<'a>(runs: &'a [RunView], view: TranscriptView<'_>, mut visit: impl FnMut(Row<'a>)) {
+    let TranscriptView {
+        theme,
+        selected_run,
+        browsed,
+        inner_width,
+        tick,
+    } = view;
     let mut awaiting_header = false;
     let mut seen_user_turn = false;
     let last_run_idx = runs.len().checked_sub(1);
@@ -1240,10 +1255,22 @@ fn for_each_row<'a>(
                 Style::default().fg(theme.text.muted),
             )));
         }
-        if let Some(status) = activity_status_line(&run.activity, theme) {
+        if let Some(status) = activity_status_line(&run.activity, tick, theme) {
             visit(Row::built(status));
         }
     }
+}
+
+/// The braille-dot spinner frames CLI spinners conventionally use. One table
+/// for every animated surface, so they all turn at the same rate and in the
+/// same direction.
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// This tick's spinner glyph. Pure: the caller supplies `AppState::tick`, and
+/// the CLI keeps redrawing while [`AppState::is_animating`] holds, so every
+/// spinner actually turns.
+fn spinner_frame(tick: u64) -> char {
+    SPINNER_FRAMES[(tick % SPINNER_FRAMES.len() as u64) as usize]
 }
 
 /// Right-align a turn header's wall-clock time in dim text, if the row is wide
@@ -1291,7 +1318,17 @@ fn fold_hit_entry(entry: &TranscriptEntry, idx: usize) -> Option<usize> {
 /// tests that only care about the height.
 #[cfg(test)]
 fn transcript_rows(runs: &[RunView], theme: &Theme, inner_width: u16) -> u16 {
-    measure_transcript(runs, theme, inner_width, usize::MAX, None).0
+    measure_transcript(
+        runs,
+        TranscriptView {
+            theme,
+            selected_run: usize::MAX,
+            browsed: None,
+            inner_width,
+            tick: 0,
+        },
+    )
+    .0
 }
 
 /// The measure pass: the transcript's total wrapped height and, when the
@@ -1299,18 +1336,12 @@ fn transcript_rows(runs: &[RunView], theme: &Theme, inner_width: u16) -> u16 {
 /// entry's rows in that same coordinate space. `render_conversation` uses the
 /// range to keep the browsed fold inside the viewport — a pure projection of
 /// the selection, not a mutation of `run.scroll`.
-fn measure_transcript(
-    runs: &[RunView],
-    theme: &Theme,
-    inner_width: u16,
-    selected_run: usize,
-    browsed: Option<usize>,
-) -> (u16, Option<(u16, u16)>) {
+fn measure_transcript(runs: &[RunView], view: TranscriptView<'_>) -> (u16, Option<(u16, u16)>) {
     let mut total: u16 = 0;
     let mut span: Option<(u16, u16)> = None;
-    for_each_row(runs, theme, selected_run, browsed, inner_width, |row| {
+    for_each_row(runs, view, |row| {
         let start = total;
-        total = total.saturating_add(row.rows(inner_width));
+        total = total.saturating_add(row.rows(view.inner_width));
         if row.selected {
             span = Some(match span {
                 Some((first, _)) => (first, total),
@@ -1324,20 +1355,20 @@ fn measure_transcript(
 /// Build only the rows whose wrapped range intersects `[first_row, first_row+height)`.
 fn build_transcript_window<'a>(
     runs: &'a [RunView],
-    theme: &Theme,
-    inner_width: u16,
+    view: TranscriptView<'_>,
     first_row: u16,
     height: u16,
-    selected_run: usize,
-    browsed: Option<usize>,
 ) -> (Vec<Line<'a>>, u16, Vec<(usize, usize)>) {
+    let TranscriptView {
+        theme, inner_width, ..
+    } = view;
     let last_row = first_row.saturating_add(height);
     let mut out: Vec<Line> = Vec::with_capacity(height as usize + 2);
     let mut hits: Vec<(usize, usize)> = Vec::new();
     let mut cursor: u16 = 0;
     let mut scroll: u16 = 0;
     let mut first_seen = false;
-    for_each_row(runs, theme, selected_run, browsed, inner_width, |row| {
+    for_each_row(runs, view, |row| {
         let h = row.rows(inner_width);
         let row_start = cursor;
         let row_end = cursor.saturating_add(h);
@@ -1459,8 +1490,14 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         .transcript_browse
         .then(|| state.selected_run().map(|run| run.transcript_selected))
         .flatten();
-    let (content_rows, browsed_span) =
-        measure_transcript(&state.runs, theme, inner_width, state.selected_run, browsed);
+    let view = TranscriptView {
+        theme,
+        selected_run: state.selected_run,
+        browsed,
+        inner_width,
+        tick: state.tick,
+    };
+    let (content_rows, browsed_span) = measure_transcript(&state.runs, view);
     let max_scroll = content_rows.saturating_sub(inner.height);
     state.transcript_max_scroll.set(max_scroll);
     let (follow, scroll) = state
@@ -1487,15 +1524,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     // reintroduce the overflow the old implicit coupling merely avoided.
     offset = offset.min(u16::MAX.saturating_sub(inner.height));
 
-    let (mut lines, r0, hits) = build_transcript_window(
-        &state.runs,
-        theme,
-        inner_width,
-        offset,
-        inner.height,
-        state.selected_run,
-        browsed,
-    );
+    let (mut lines, r0, hits) = build_transcript_window(&state.runs, view, offset, inner.height);
 
     // A new conversation starts near the top of its reading canvas. Keeping
     // hundreds of empty rows above the first exchange made the timeline feel
@@ -1672,13 +1701,21 @@ fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
 /// between visible transcript updates never looks silently paused.
 /// `Streaming` needs no row of its own (the growing model text is itself the
 /// live signal) and `Idle` renders nothing.
-fn activity_status_line(activity: &RunActivity, theme: &Theme) -> Option<Line<'static>> {
+fn activity_status_line(activity: &RunActivity, tick: u64, theme: &Theme) -> Option<Line<'static>> {
     let text = match activity {
         RunActivity::Thinking => "working…".to_owned(),
         RunActivity::RunningTool(tool) => format!("running {tool}…"),
         RunActivity::Streaming | RunActivity::Idle => return None,
     };
-    Some(Line::styled(text, Style::default().fg(theme.text.muted)))
+    // A turning spinner distinguishes "the agent is thinking" from "the UI is
+    // stuck" — this row is on screen precisely when nothing else is moving.
+    Some(Line::from(vec![
+        Span::styled(
+            format!("{} ", spinner_frame(tick)),
+            Style::default().fg(theme.agent.tool),
+        ),
+        Span::styled(text, Style::default().fg(theme.text.muted)),
+    ]))
 }
 
 fn entry_lines<'a>(
@@ -4469,10 +4506,9 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
 }
 
 fn render_loading_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let rect = centered_modal(area, 64, 11);
     let inner = modal_surface(frame, rect, "Code graph", state, theme);
-    let spinner = SPINNER[(state.tick as usize) % SPINNER.len()];
+    let spinner = spinner_frame(state.tick);
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(spinner.to_string(), Style::default().fg(theme.agent.tool)),
@@ -5429,10 +5465,19 @@ fn render_querying(
     // Compact two-line progress state; the absolute minimum keeps the content
     // visible on short terminals.
     let lines = vec![
-        Line::styled(
-            format!("Fetching models from {provider_id}…"),
-            Style::default().fg(theme.text.heading),
-        ),
+        // A turning spinner is the only signal that the fetch is still alive:
+        // this box has no other moving part, and a slow provider left it
+        // looking frozen.
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", spinner_frame(state.tick)),
+                Style::default().fg(theme.agent.tool),
+            ),
+            Span::styled(
+                format!("Fetching models from {provider_id}…"),
+                Style::default().fg(theme.text.heading),
+            ),
+        ]),
         Line::styled("Esc to cancel", Style::default().fg(theme.text.muted)),
     ];
     let rect = centered_rect_min(70, 20, 44, 5, area);
@@ -6777,6 +6822,18 @@ mod tests {
             actor: Actor::System,
             body,
         })
+    }
+
+    /// The default transcript walk parameters for the geometry tests: no run
+    /// owns click targets, nothing is browsed, tick 0.
+    fn test_view<'t>(theme: &'t Theme, inner_width: u16) -> TranscriptView<'t> {
+        TranscriptView {
+            theme,
+            selected_run: 0,
+            browsed: None,
+            inner_width,
+            tick: 0,
+        }
     }
 
     fn render_to_string(state: &AppState, w: u16, h: u16) -> String {
@@ -9912,12 +9969,9 @@ mod tests {
         assert!(total >= 5000, "measure sees the whole history: {total}");
         let (lines, _r0, _hits) = build_transcript_window(
             &s.runs,
-            &theme,
-            inner_width,
+            test_view(&theme, inner_width),
             total.saturating_sub(height),
             height,
-            0,
-            None,
         );
         assert!(
             lines.len() <= height as usize + 4,
@@ -9961,7 +10015,7 @@ mod tests {
     fn finalized_model_renders_styled_heading() {
         let s = finalized_model_state("# Heading");
         let theme = Theme::dark();
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 0, 40, 0, None);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, test_view(&theme, 78), 0, 40);
         // A heading span is bold and coloured text.heading.
         let styled = lines.iter().flat_map(|l| l.spans.iter()).any(|sp| {
             sp.style.fg == Some(theme.text.heading)
@@ -9974,7 +10028,7 @@ mod tests {
     fn keyword_span_maps_to_syntax_keyword() {
         let s = finalized_model_state("```rust\nfn a() {}\n```");
         let theme = Theme::dark();
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 0, 40, 0, None);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, test_view(&theme, 78), 0, 40);
         let has_kw = lines
             .iter()
             .flat_map(|l| l.spans.iter())
@@ -10008,12 +10062,9 @@ mod tests {
         );
         let (lines, _r, _h) = build_transcript_window(
             &s.runs,
-            &theme,
-            inner_width,
+            test_view(&theme, inner_width),
             total.saturating_sub(height),
             height,
-            0,
-            None,
         );
         assert!(
             lines.len() <= height as usize + 4,
@@ -10044,7 +10095,8 @@ mod tests {
         let s = user_turn_state();
         let theme = Theme::dark();
         let inner_width = 40u16;
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, inner_width, 0, 40, 0, None);
+        let (lines, _r, _h) =
+            build_transcript_window(&s.runs, test_view(&theme, inner_width), 0, 40);
         let user_line = lines
             .iter()
             .find(|l| l.spans.iter().any(|sp| sp.content.contains("my question")))
@@ -10065,7 +10117,7 @@ mod tests {
     fn ansi16_user_row_uses_an_accent_bar_not_a_bg() {
         let s = user_turn_state();
         let theme = Theme::ansi16(); // surface.user == surface.panel here
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 40, 0, 40, 0, None);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, test_view(&theme, 40), 0, 40);
         let user_line = lines
             .iter()
             .find(|l| l.spans.iter().any(|sp| sp.content.contains("my question")))
@@ -10093,7 +10145,7 @@ mod tests {
             system_ev(EventBody::ModelStreamDelta { run_id, text: big }),
         );
         let theme = Theme::dark();
-        let (lines, _r, _h) = build_transcript_window(&s.runs, &theme, 78, 100, 20, 0, None);
+        let (lines, _r, _h) = build_transcript_window(&s.runs, test_view(&theme, 78), 100, 20);
         assert!(
             lines.len() <= 24,
             "build still O(viewport): {}",
@@ -10105,8 +10157,9 @@ mod tests {
     fn theme_change_re_renders_without_re_parsing() {
         let s = finalized_model_state("# H");
         crate::markdown::reset_parse_calls();
-        let (dark, _r, _h) = build_transcript_window(&s.runs, &Theme::dark(), 78, 0, 40, 0, None);
-        let (light, _r, _h) = build_transcript_window(&s.runs, &Theme::light(), 78, 0, 40, 0, None);
+        let (dark, _r, _h) = build_transcript_window(&s.runs, test_view(&Theme::dark(), 78), 0, 40);
+        let (light, _r, _h) =
+            build_transcript_window(&s.runs, test_view(&Theme::light(), 78), 0, 40);
         assert_eq!(
             crate::markdown::parse_calls(),
             0,
@@ -10348,7 +10401,7 @@ mod tests {
         // The viewport at the very TOP: the `You` header and the model-named
         // assistant header are among the first virtualized rows.
         let (top_lines, _r0, _hits) =
-            build_transcript_window(&s.runs, &theme, inner_width, 0, height, 0, None);
+            build_transcript_window(&s.runs, test_view(&theme, inner_width), 0, height);
         assert!(
             top_lines.len() <= height as usize + 4,
             "top-of-history build stays O(viewport), not O(history): {}",
@@ -10373,12 +10426,9 @@ mod tests {
         // O(viewport), not O(history) — Task 2 must not undo Task 1's fix.
         let (tail_lines, _r0, _hits) = build_transcript_window(
             &s.runs,
-            &theme,
-            inner_width,
+            test_view(&theme, inner_width),
             total.saturating_sub(height),
             height,
-            0,
-            None,
         );
         assert!(
             tail_lines.len() <= height as usize + 4,
@@ -10619,12 +10669,9 @@ mod tests {
         );
         let (lines, _r, _h) = build_transcript_window(
             &s.runs,
-            &theme,
-            inner_width,
+            test_view(&theme, inner_width),
             total.saturating_sub(height),
             height,
-            0,
-            None,
         );
         assert!(
             lines.len() <= height as usize + 4,
@@ -11022,6 +11069,50 @@ mod tests {
         assert!(
             !narrow.contains(&expected),
             "the clock is the first field to go on a narrow screen:\n{narrow}"
+        );
+    }
+
+    /// Every waiting surface turns: the run-activity row and the model-fetch
+    /// box each advance a spinner frame with the tick, so a slow provider or a
+    /// thinking agent never reads as a frozen UI.
+    #[test]
+    fn waiting_surfaces_animate_with_the_tick() {
+        let mut state = running_build_state();
+        state.runs[0].activity = RunActivity::Thinking;
+        let working = render_to_string(&state, 100, 24);
+        assert!(working.contains("working…"), "{working}");
+        let first = spinner_frame(state.tick);
+        assert!(
+            working.contains(first),
+            "the working row carries a spinner frame:\n{working}"
+        );
+        state.tick += 1;
+        let later = render_to_string(&state, 100, 24);
+        assert!(
+            later.contains(spinner_frame(state.tick)) && spinner_frame(state.tick) != first,
+            "the working spinner advanced with the tick:\n{later}"
+        );
+
+        // The "Fetching models…" box had no moving part at all.
+        let mut state = AppState::new();
+        state.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+        };
+        let fetching = render_to_string(&state, 80, 24);
+        assert!(
+            fetching.contains("Fetching models from groq…"),
+            "{fetching}"
+        );
+        assert!(
+            fetching.contains(spinner_frame(0)),
+            "the fetch box spins while it waits:\n{fetching}"
+        );
+        state.tick = 3;
+        let spun = render_to_string(&state, 80, 24);
+        assert!(
+            spun.contains(spinner_frame(3)) && spinner_frame(3) != spinner_frame(0),
+            "the fetch spinner advanced with the tick:\n{spun}"
         );
     }
 }

@@ -9252,4 +9252,52 @@ mod tests {
             "no time past the end"
         );
     }
+
+    /// The interactive client redraws every tick while this holds, so the
+    /// answer must be true exactly when something on screen is turning.
+    #[test]
+    fn is_animating_tracks_every_spinner_surface() {
+        let mut s = AppState::new();
+        assert!(!s.is_animating(), "an idle shell needs no frames");
+
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Running,
+            }),
+        );
+        assert_eq!(s.runs[0].activity, RunActivity::Thinking);
+        assert!(s.is_animating(), "a thinking run shows the working spinner");
+
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+        assert!(!s.is_animating(), "a finished run stops the frames");
+
+        // The code-graph loading modal and the model-list fetch box each spin.
+        s.edge_loading = true;
+        assert!(s.is_animating());
+        s.edge_loading = false;
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+        };
+        assert!(s.is_animating());
+        s.overlay = Overlay::None;
+        assert!(!s.is_animating());
+    }
 }

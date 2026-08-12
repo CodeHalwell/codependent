@@ -1645,6 +1645,25 @@ impl AppState {
         }
     }
 
+    /// Whether any surface on screen right now has a moving part — a run that
+    /// is thinking or executing a tool, a code-graph page in flight, or a
+    /// provider's model list being fetched.
+    ///
+    /// The interactive client redraws on every tick while this holds, and
+    /// falls back to its sparse keep-alive redraw otherwise. Without it, the
+    /// spinners were repainted once every 25 ticks (~5s) — a "spinner" that
+    /// changes frame once every five seconds reads as a frozen UI, which is
+    /// the exact opposite of what it is there to say.
+    #[must_use]
+    pub fn is_animating(&self) -> bool {
+        self.edge_loading
+            || matches!(self.overlay, Overlay::AddModelQuerying { .. })
+            || self
+                .runs
+                .iter()
+                .any(|run| !matches!(run.activity, RunActivity::Idle))
+    }
+
     /// Drain the outbox of intents accumulated since the last call. The CLI's
     /// connection task calls this after each reduce to dispatch commands.
     pub fn drain_outbox(&mut self) -> Vec<Intent> {
