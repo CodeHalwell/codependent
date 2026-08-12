@@ -32,6 +32,7 @@
 //! [`ArtifactStore`]: codypendent_daemon::artifacts::ArtifactStore
 
 mod blackboard;
+mod docs;
 mod edit_file;
 mod git;
 mod github;
@@ -56,6 +57,11 @@ use codypendent_protocol::ArtifactRef;
 pub use blackboard::{
     parse_blackboard_post, parse_blackboard_query, BlackboardPostInput, BlackboardPostTool,
     BlackboardQueryInput, BlackboardQueryTool,
+};
+pub use docs::{
+    docs_proposed_action, parse_docs_create, parse_docs_edit, parse_docs_read, parse_docs_suggest,
+    DocsCreateInput, DocsCreateTool, DocsEditInput, DocsEditTool, DocsReadInput, DocsReadTool,
+    DocsSuggestInput, DocsSuggestTool,
 };
 pub use edit_file::{parse_edit_file, EditFile, EditFileInput, EditFileOutcome, FileEdit};
 pub use git::{

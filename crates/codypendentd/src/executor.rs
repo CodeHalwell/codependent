@@ -434,6 +434,26 @@ impl RuntimeExecutor {
                     .lock()
                     .expect("scanned set lock")
                     .insert(repository);
+                // The graph just changed, which is exactly when documentation
+                // can have gone stale — so run the `/update-docs` sweep against
+                // it (STEP 4.6, previously tested but never wired). It only
+                // FILES SUGGESTIONS, so nothing it finds edits a document; a
+                // failure is logged and the run continues, since documentation
+                // maintenance must never gate agent work.
+                match crate::docs_job::run_docs_check(&self.pool, root).await {
+                    Ok(report) if report.stale_findings > 0 => info!(
+                        %repository,
+                        documents = report.documents_checked,
+                        links = report.links_resolved,
+                        stale = report.stale_findings,
+                        suggestions = report.suggestions_filed,
+                        "documentation staleness sweep filed suggestions"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(%repository, %error, "documentation staleness sweep failed")
+                    }
+                }
             }
             Err(error) => {
                 warn!(%repository, %error, "code-graph scan failed; a later run will retry");
@@ -684,6 +704,14 @@ impl RuntimeExecutor {
         if let Some(search) = &self.search {
             runtime = runtime.with_search(search.clone());
         }
+        // The `docs.*` tools (rubric #4): always wired — this daemon always has
+        // the knowledge fabric. What an agent may actually do to a document is
+        // bounded by the document's collaboration mode inside the channel, not
+        // by withholding the tools.
+        runtime = runtime.with_docs(Arc::new(crate::docs_channel::AssemblyDocsChannel::new(
+            self.pool.clone(),
+            self.startup_repository_root.clone(),
+        )));
 
         // Bind the run's worktree (STEP 1.8, the Phase-1 follow-up): a writing
         // mode (`Build`) gets a DEDICATED, isolated worktree carved from the

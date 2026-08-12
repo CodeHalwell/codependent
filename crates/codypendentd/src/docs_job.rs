@@ -129,7 +129,7 @@ impl DocumentCreator for KnowledgeDocumentCreator {
 /// Parse the wire scope string. `None` means the default: the repository the
 /// checkout at `root` identifies, so a created document lives with the code it
 /// documents. An unrecognized value is rejected rather than guessed at.
-fn parse_scope(scope: Option<&str>, root: &Path) -> Result<Scope, CodypendentError> {
+pub(crate) fn parse_scope(scope: Option<&str>, root: &Path) -> Result<Scope, CodypendentError> {
     match scope.map(str::trim) {
         None | Some("") | Some("repository") => Ok(Scope::Repository(repository_id_for(root))),
         Some("system") => Ok(Scope::System),

@@ -327,6 +327,7 @@ impl PolicyEngine {
                 self.eval_blackboard()
             }
             ProposedAction::RecordMemory => self.eval_record_memory(),
+            ProposedAction::DocumentEdit { .. } => self.eval_document_edit(),
             _ => self.deny(PolicyReason::new(
                 "policy.unsupported-action",
                 "the proposed action is not recognized by this policy engine",
@@ -365,6 +366,32 @@ impl PolicyEngine {
             reasons: vec![PolicyReason::new(
                 "policy.record-memory-allowed",
                 "a memory proposal note targets only the run's own ledger",
+            )],
+            capability_grant: None,
+            policy_version: self.version.clone(),
+            approval_reusable: false,
+        }
+    }
+
+    /// An agent `docs.*` access (rubric #4 doc writer) is always permitted: it
+    /// targets only the knowledge fabric's document store — not the filesystem,
+    /// a command, the network, or any remote. It grants no capability (the tools
+    /// need no path/command/network scope) and is recorded purely so the access
+    /// is traced, exactly like [`eval_record_memory`](Self::eval_record_memory).
+    ///
+    /// What an agent may actually DO to a document is not this engine's gate: it
+    /// is the document's own collaboration mode (organization scope defaults to
+    /// *Suggest*, so an agent edit lands as a reviewable suggestion), enforced in
+    /// the knowledge crate's `apply_mutation`. Publishing a document to Git keeps
+    /// its separate approval gate (`ProposedAction::PublishDocument`); this does
+    /// not widen it.
+    fn eval_document_edit(&self) -> PolicyDecision {
+        PolicyDecision {
+            decision: Decision::Allow,
+            reasons: vec![PolicyReason::new(
+                "policy.document-access-allowed",
+                "a docs.* call targets only the document store; its content effect is gated by \
+                 the document's collaboration mode",
             )],
             capability_grant: None,
             policy_version: self.version.clone(),
