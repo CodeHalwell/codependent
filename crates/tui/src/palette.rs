@@ -35,6 +35,8 @@ pub enum PaletteCommand {
     Workflow,
     /// Open the blackboard view.
     Blackboard,
+    /// Open the repository task board.
+    Kanban,
     /// Open host-owned installed Remote UI plugin management.
     UiPlugins,
     /// Open the model picker (MP1).
@@ -210,6 +212,13 @@ pub const COMMANDS: &[PaletteEntry] = &[
         title: "/blackboard  Blackboard",
         description: "follow live workflow findings, decisions, and evidence",
         key: "B",
+        group: "Workspace",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Kanban,
+        title: "/board  Task board",
+        description: "backlog cards in columns; move them, or ask an agent to fill them",
+        key: "K",
         group: "Workspace",
     },
     PaletteEntry {

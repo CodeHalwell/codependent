@@ -28,6 +28,7 @@
 
 pub mod accessible;
 pub mod action;
+pub mod dag;
 pub mod input;
 pub mod markdown;
 pub mod palette;
@@ -59,10 +60,10 @@ pub use state::{
     AddModelRow, AppState, BlackboardItemCard, CouncilBuilderState, CouncilBuilderStep,
     CouncilCard, CouncilMemberDraft, CouncilRunSummary, DocBlockView, DocCard, DocEdit,
     DocFocus, DocLeaseState, DocSuggestionView, EDGE_PAGE_SIZE, GraphEdgeCard, InputMode,
-    KeyStatus, LayoutMode, MemoryCard, ModelCard, ModelListOrigin, ModelLocationLabel,
-    ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, ProviderCard, RunView,
-    SkillCard, StatusProjection, ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard,
-    UnslothRepoCard, WorkflowNodeCard,
+    KanbanCard, KeyStatus, LayoutMode, MemoryCard, ModelCard, ModelListOrigin,
+    ModelLocationLabel, ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval,
+    ProviderCard, RunView, SkillCard, StatusProjection, ToolCard, ToolStatus, TranscriptEntry,
+    UnslothQuantCard, UnslothRepoCard, WorkflowNodeCard,
 };
 pub use terminal::TerminalGuard;
 pub use theme::{ColorDepth, Theme, ThemePreferences, ThemeVariant};

@@ -4044,6 +4044,12 @@ mod tests {
                 evidence: vec![json!({ "path": "src/lib.rs" })],
                 revision: 2,
                 superseded_by: None,
+                // Board columns are absent on a workflow-run item — they only
+                // carry values on a repository task board's cards.
+                board_scope: None,
+                status: None,
+                assignee: None,
+                ordinal: None,
             }],
         })
         .unwrap();

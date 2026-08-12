@@ -51,6 +51,9 @@ use codypendent_protocol::{
     CodypendentError, WorkflowEvent, WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase,
     WorkflowRunSnapshot as ProtocolWorkflowRunSnapshot,
 };
+use codypendent_runtime::blackboard::{
+    BlackboardChannelError, WorkflowQueryChannel, WorkflowRunSummary,
+};
 use codypendent_workflow::{
     compile_yaml, BudgetWarning, ConductorError, NodeExecutor, NodeObserver, NodeState,
     NodeTransition, WorkflowConductor, WorkflowNodeRecord, WorkflowRunState,
@@ -628,9 +631,13 @@ impl<E: NodeExecutor + 'static> WorkflowLifecycle for WorkflowConductorHost<E> {
                         {
                             host.workflows.publish(
                                 &request.workflow_run_id,
+                                // A live transition carries no edges — the graph
+                                // shape is static per run, so a client keeps the
+                                // ones its snapshot read taught it.
                                 WorkflowEvent::NodeTransitioned(node_record_to_wire(
                                     &request.workflow_run_id,
                                     record,
+                                    &HashMap::new(),
                                 )),
                             );
                         }
@@ -689,6 +696,11 @@ impl NodeObserver for PublishingNodeObserver {
                 .iter()
                 .map(render_budget_warning)
                 .collect(),
+            // A live transition carries no edges: the graph shape is static per
+            // run and the callback is sync (it cannot re-read the manifest). A
+            // client learns the edges once from `ReadWorkflowRun` and preserves
+            // them across live merges.
+            depends_on: Vec::new(),
         };
         self.hub
             .publish(&self.run_id, WorkflowEvent::NodeTransitioned(view));
@@ -742,7 +754,14 @@ fn render_budget_warning(warning: &BudgetWarning) -> String {
 
 /// Project one durable node record into the wire [`WorkflowNodeView`] (T9), used for
 /// both the cancel-drain `Skipped` publishes and the `ReadWorkflowRun` snapshot.
-fn node_record_to_wire(workflow_run_id: &str, record: &WorkflowNodeRecord) -> WorkflowNodeView {
+/// `edges` maps node id → its `depends_on` list, recovered from the run's stored
+/// manifest by [`node_edges`]; empty when the manifest is unavailable, which
+/// degrades the client to the flat node list it rendered before edges existed.
+fn node_record_to_wire(
+    workflow_run_id: &str,
+    record: &WorkflowNodeRecord,
+    edges: &HashMap<String, Vec<String>>,
+) -> WorkflowNodeView {
     WorkflowNodeView {
         workflow_run_id: workflow_run_id.to_owned(),
         node_id: record.node_id.clone(),
@@ -753,6 +772,38 @@ fn node_record_to_wire(workflow_run_id: &str, record: &WorkflowNodeRecord) -> Wo
         // Warnings are transient history the observer relays live, not a durable node
         // fact — a snapshot/skip view carries none.
         warnings: Vec::new(),
+        depends_on: edges.get(&record.node_id).cloned().unwrap_or_default(),
+    }
+}
+
+/// Recover a run's DAG **edges** (rubric 5) by recompiling the manifest YAML stored
+/// with it: node id → the ids it depends on.
+///
+/// The durable `workflow_nodes` rows carry state, attempt, cost, and topological
+/// order but no adjacency — the graph shape lives only in the manifest — so the
+/// snapshot read recompiles it here rather than duplicating edges into a table.
+/// Every failure mode (no manifest recorded, a manifest that no longer compiles)
+/// degrades to **no edges** rather than failing the read: a client that cannot draw
+/// arrows still gets the truthful node list it got before.
+async fn node_edges(pool: &SqlitePool, workflow_run_id: &str) -> HashMap<String, Vec<String>> {
+    let manifest = match WorkflowStore::new().manifest(pool, workflow_run_id).await {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return HashMap::new(),
+        Err(error) => {
+            warn!(run = %workflow_run_id, %error, "could not read the workflow manifest for edges");
+            return HashMap::new();
+        }
+    };
+    match compile_yaml(&manifest) {
+        Ok(compiled) => compiled
+            .nodes
+            .into_iter()
+            .map(|node| (node.id, node.depends_on))
+            .collect(),
+        Err(error) => {
+            warn!(run = %workflow_run_id, %error, "stored workflow manifest no longer compiles; the snapshot carries no edges");
+            HashMap::new()
+        }
     }
 }
 
@@ -780,15 +831,23 @@ impl WorkflowReader for WorkflowRunReader {
                 .snapshot(&pool, &request.workflow_run_id)
                 .await
             {
-                Ok(Some(snapshot)) => Ok(ProtocolWorkflowRunSnapshot {
-                    workflow_run_id: request.workflow_run_id.clone(),
-                    phase: run_state_to_wire(snapshot.run.state),
-                    nodes: snapshot
-                        .nodes
-                        .iter()
-                        .map(|record| node_record_to_wire(&request.workflow_run_id, record))
-                        .collect(),
-                }),
+                Ok(Some(snapshot)) => {
+                    // The snapshot is the ONLY place edges ride the wire (a live
+                    // transition omits them), so recover them here from the run's
+                    // stored manifest — this is what lets a client draw the DAG.
+                    let edges = node_edges(&pool, &request.workflow_run_id).await;
+                    Ok(ProtocolWorkflowRunSnapshot {
+                        workflow_run_id: request.workflow_run_id.clone(),
+                        phase: run_state_to_wire(snapshot.run.state),
+                        nodes: snapshot
+                            .nodes
+                            .iter()
+                            .map(|record| {
+                                node_record_to_wire(&request.workflow_run_id, record, &edges)
+                            })
+                            .collect(),
+                    })
+                }
                 // A run either exists or it does not — unlike a board, whose own board
                 // is simply empty. A missing run is a legible rejection.
                 Ok(None) => Err(CodypendentError::new(
@@ -803,6 +862,72 @@ impl WorkflowReader for WorkflowRunReader {
                 )),
             }
         })
+    }
+}
+
+/// Implements the runtime's [`WorkflowQueryChannel`] — the agent-facing
+/// `workflow.query` tool (rubric 5) — over the same store the `ReadWorkflowRun`
+/// command reads.
+///
+/// It deliberately reuses [`WorkflowRunReader`] rather than re-projecting: the
+/// graph an agent sees (states, edges, costs) is then *by construction* the same
+/// graph a human sees in the TUI, so the two surfaces cannot drift. Cheap to
+/// clone.
+#[derive(Clone)]
+pub struct AssemblyWorkflowQuery {
+    pool: SqlitePool,
+}
+
+impl AssemblyWorkflowQuery {
+    /// Build the channel over the daemon's pool.
+    #[must_use]
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkflowQueryChannel for AssemblyWorkflowQuery {
+    async fn snapshot(
+        &self,
+        workflow_run_id: &str,
+    ) -> Result<Option<ProtocolWorkflowRunSnapshot>, BlackboardChannelError> {
+        let reader = WorkflowRunReader::new(self.pool.clone());
+        match reader
+            .read(ReadWorkflowRunRequest {
+                workflow_run_id: workflow_run_id.to_string(),
+                // The agent's own client identity is not meaningful here — this is
+                // a read on behalf of a run, not a connection.
+                client_id: codypendent_protocol::ClientId::new(),
+            })
+            .await
+        {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            // "No such run" is not a failure of the tool: the agent named an id
+            // that does not exist, and the tool layer says so plainly.
+            Err(error) if error.code == "workflow.run-not-found" => Ok(None),
+            Err(error) => Err(BlackboardChannelError::Backend(error.message)),
+        }
+    }
+
+    async fn recent_runs(
+        &self,
+        repository: &str,
+        limit: u32,
+    ) -> Result<Vec<WorkflowRunSummary>, BlackboardChannelError> {
+        WorkflowStore::new()
+            .list_runs_for_repository(&self.pool, repository, limit)
+            .await
+            .map(|runs| {
+                runs.into_iter()
+                    .map(|run| WorkflowRunSummary {
+                        workflow_run_id: run.id,
+                        workflow_id: run.workflow_id,
+                        phase: format!("{:?}", run_state_to_wire(run.state)).to_lowercase(),
+                    })
+                    .collect()
+            })
+            .map_err(|error| BlackboardChannelError::Backend(error.to_string()))
     }
 }
 

@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::artifact::DataClassification;
+use crate::blackboard::{BlackboardItemDraft, BlackboardScope};
 use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
@@ -490,6 +491,83 @@ pub enum CommandBody {
         /// live board (the "live-only" view the TUI shows).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         include_superseded: bool,
+        /// Read a **repository task board** instead of a workflow run's board
+        /// (Phase B kanban). When set, `workflow_run_id` is ignored: the daemon
+        /// resolves the board to the synthetic run
+        /// [`board_scope_id`](crate::blackboard::board_scope_id) names (an empty
+        /// board for a repository never written to — a read creates nothing).
+        /// Additive (`#[serde(default)]`): an older client omits it and reads a
+        /// run board exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        board_repository: Option<String>,
+    },
+    /// Post a blackboard artifact from a **client** (Phase B kanban — the write
+    /// path the board and NL backlog need; the review's "deliberately no client
+    /// post command" stance is revised here for board use). Handled at the
+    /// connection level like `ReadBlackboard` (the board lives outside the
+    /// session ledger) through the assembly's `BlackboardWriter` seam, and gated
+    /// to the [`Controller`](crate::handshake::ClientRole::Controller) role — the
+    /// local human operator; an agent still writes only through its
+    /// `blackboard.*`/`task.*` tools, and an Observer stays read-only. The
+    /// daemon builds the item's author from the issuing connection (never from a
+    /// client-supplied identity) and replies
+    /// [`BlackboardItemApplied`](crate::envelope::Payload::BlackboardItemApplied)
+    /// with the stored item. A daemon without workflow transport rejects it
+    /// `workflow.transport-unavailable`.
+    PostBlackboardItem {
+        /// The board to post onto: a workflow run's, or a repository's task
+        /// board (created on first write).
+        scope: BlackboardScope,
+        /// The artifact to store (kind, payload, evidence, board fields).
+        item: BlackboardItemDraft,
+    },
+    /// Update (supersede) a blackboard item from a client (Phase B kanban): a
+    /// status/column move, a re-assignment, a re-order, or a payload edit. The
+    /// same supersession discipline as an agent's correction — the store posts
+    /// the replacement at the next revision and stamps the old row, never
+    /// editing in place — so board history is preserved. Fields left `None`
+    /// carry the old item's values forward. Role-gated and routed exactly like
+    /// [`PostBlackboardItem`](CommandBody::PostBlackboardItem); replies
+    /// [`BlackboardItemApplied`](crate::envelope::Payload::BlackboardItemApplied)
+    /// with the replacement item.
+    UpdateBlackboardItem {
+        /// The board holding the item.
+        scope: BlackboardScope,
+        /// The live item to supersede. An already-superseded item is refused
+        /// (`blackboard.already-superseded`), so concurrent moves never fork.
+        item_id: String,
+        /// The new column, when moving.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        /// The new assignee, when re-assigning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assignee: Option<String>,
+        /// The new within-column position, when re-ordering. When only `status`
+        /// changes, the daemon appends to the end of the target column.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ordinal: Option<i64>,
+        /// A replacement payload, when editing the card body.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+    },
+    /// Read one page of a session's durable event history (fixing the >500-event
+    /// catch-up gap: a `Catchup::Snapshot` carries no transcript, and no paged
+    /// read existed). A **read** — any attached client, an Observer included,
+    /// may issue it. The daemon replies
+    /// [`SessionEventsPage`](crate::envelope::Payload::SessionEventsPage) with
+    /// events `after_sequence < sequence <= after_sequence + limit` in ascending
+    /// order; the client pages forward by passing the reply's `through` back as
+    /// the next `after_sequence`. An unknown session is rejected
+    /// `protocol.session-not-found`.
+    ReadSessionEvents {
+        session_id: SessionId,
+        /// Return events strictly **after** this sequence (0 = from the start).
+        #[serde(default, skip_serializing_if = "u64_is_zero")]
+        after_sequence: u64,
+        /// Maximum events in the page. 0 (or absent) asks for the server
+        /// default; the server clamps any request to its own page ceiling.
+        #[serde(default, skip_serializing_if = "u32_is_zero")]
+        limit: u32,
     },
     /// Upload client-captured bytes into the daemon's content-addressed
     /// artifact store (voice v1, rubric 8): the client→daemon half of the
@@ -515,6 +593,15 @@ pub enum CommandBody {
     },
     #[serde(other)]
     Unknown,
+}
+
+/// `skip_serializing_if` helpers for the paged-history defaults: a zero is the
+/// field's default, so it is omitted on the wire (an older peer's exact shape).
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
+}
+fn u32_is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// One legal state-machine transition to attempt via `AdvancePromotion`
@@ -946,7 +1033,65 @@ mod tests {
             workflow_run_id: "wfrun-abc123".to_string(),
             kind: Some("finding".to_string()),
             include_superseded: true,
+            board_repository: None,
         });
+        // The repository-board read (Phase B kanban): board_repository set, the
+        // run id left empty for the daemon to resolve.
+        round_trip(CommandBody::ReadBlackboard {
+            workflow_run_id: String::new(),
+            kind: Some("task".to_string()),
+            include_superseded: false,
+            board_repository: Some("/home/user/project".to_string()),
+        });
+        round_trip(CommandBody::PostBlackboardItem {
+            scope: crate::blackboard::BlackboardScope::RepositoryBoard {
+                repository: "/home/user/project".to_string(),
+            },
+            item: crate::blackboard::BlackboardItemDraft {
+                kind: "task".to_string(),
+                payload: serde_json::json!({ "title": "wire the DAG viewer" }),
+                confidence: None,
+                evidence: Vec::new(),
+                status: Some("todo".to_string()),
+                assignee: Some("dana".to_string()),
+                ordinal: Some(1),
+            },
+        });
+        round_trip(CommandBody::UpdateBlackboardItem {
+            scope: crate::blackboard::BlackboardScope::RepositoryBoard {
+                repository: "/home/user/project".to_string(),
+            },
+            item_id: "0192-item".to_string(),
+            status: Some("doing".to_string()),
+            assignee: None,
+            ordinal: Some(2),
+            payload: None,
+        });
+        round_trip(CommandBody::ReadSessionEvents {
+            session_id: SessionId::new(),
+            after_sequence: 500,
+            limit: 200,
+        });
+    }
+
+    #[test]
+    fn read_session_events_omits_zero_defaults_and_reparses() {
+        // The from-the-start read sends neither optional key, and such a payload
+        // (also what a minimal encoder emits) reparses with both zeroed — the
+        // server then applies its own default page size.
+        let body = CommandBody::ReadSessionEvents {
+            session_id: SessionId::new(),
+            after_sequence: 0,
+            limit: 0,
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(
+            !json.contains("after_sequence"),
+            "zero after_sequence skipped: {json}"
+        );
+        assert!(!json.contains("limit"), "zero limit skipped: {json}");
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body);
     }
 
     #[test]
@@ -991,12 +1136,17 @@ mod tests {
             workflow_run_id: "wfrun-abc123".to_string(),
             kind: None,
             include_superseded: false,
+            board_repository: None,
         };
         let json = serde_json::to_string(&body).expect("serialize");
         assert!(!json.contains("kind"), "absent kind is skipped: {json}");
         assert!(
             !json.contains("include_superseded"),
             "default (false) include_superseded is skipped: {json}"
+        );
+        assert!(
+            !json.contains("board_repository"),
+            "absent board_repository is skipped (an older client's shape): {json}"
         );
         let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, body);

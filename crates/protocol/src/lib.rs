@@ -30,7 +30,7 @@ pub mod version;
 pub mod workflow;
 
 pub use artifact::{ArtifactRef, DataClassification};
-pub use blackboard::BlackboardItemView;
+pub use blackboard::{board_scope_id, BlackboardItemDraft, BlackboardItemView, BlackboardScope};
 pub use capabilities::ClientCapabilities;
 pub use catchup::{Catchup, PendingApprovalProjection, SessionProjection};
 pub use command::{CanaryMetrics, Command, CommandBody, PromotionAction, UiPluginLifecycleStatus};

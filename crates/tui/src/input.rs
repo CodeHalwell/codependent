@@ -157,6 +157,11 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         description: "new council · run deliberation (prompts for objective) · delete",
         mouse: None,
     },
+    KeyBinding {
+        keys: "K · ← / → (Board)",
+        description: "open the task board · move the focused card between columns",
+        mouse: Some("click a card or a move chip"),
+    },
 ];
 
 /// One footer chip: a compact display label paired with the real `KEY_BINDINGS`
@@ -321,6 +326,11 @@ fn map_normal_key(key: &KeyEvent) -> Action {
         KeyCode::Enter => Action::Expand,
         KeyCode::Up => Action::SelectPrev,
         KeyCode::Down => Action::SelectNext,
+        // The task board's column moves (rubric 10). Horizontal arrows had no
+        // meaning in a navigable overlay before, and the reducer ignores them
+        // outside the board, so this costs no existing binding.
+        KeyCode::Left => Action::MoveCardBack,
+        KeyCode::Right => Action::MoveCardForward,
         KeyCode::PageUp => Action::ScrollPageUp,
         KeyCode::PageDown => Action::ScrollPageDown,
         KeyCode::Delete => Action::ClearIssues,
@@ -354,6 +364,7 @@ fn map_normal_char(c: char) -> Action {
         'W' => Action::OpenWorkflow,
         'B' => Action::OpenBlackboard,
         'C' => Action::OpenCouncils,
+        'K' => Action::OpenKanban,
         // Host-owned Remote UI plugin lifecycle controls. They are meaningful
         // only while the `/plugins` surface is open; the reducer ignores them
         // elsewhere.

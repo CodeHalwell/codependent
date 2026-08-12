@@ -13,13 +13,16 @@
 //! [`RuntimeExecutor`] that drives the runtime agent loop and injects it into
 //! the server.
 
-mod blackboard;
 // The agent document channel and the client mutation seam are `pub` so the
 // crate's own integration tests can drive the SAME production seams the daemon
 // wires (see `tests/docs_agent_it.rs`), rather than re-implementing them.
 pub mod docs_channel;
 mod docs_job;
 pub mod documents;
+/// The concrete blackboard + task-board seams. Public so an integration test can
+/// drive the SAME channel the `task.*` tools use, rather than reproducing the
+/// board's write rules in test SQL (which would then drift from them).
+pub mod blackboard;
 mod executor;
 mod promotion;
 mod publish;

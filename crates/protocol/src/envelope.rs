@@ -213,6 +213,27 @@ pub enum Payload {
     /// frame is not session-scoped; a receiver merges it into the run's board by id
     /// (a superseding revision arrives as its own delivery).
     BlackboardPosted(BlackboardItemView),
+    /// A `PostBlackboardItem` / `UpdateBlackboardItem` command's reply (Phase B
+    /// kanban): the stored (or superseding) item. A distinct reply from
+    /// `CommandAccepted` because the writing client needs the minted item id and
+    /// revision back — e.g. to select the card it just created.
+    BlackboardItemApplied {
+        command_id: CommandId,
+        item: BlackboardItemView,
+    },
+    /// A `ReadSessionEvents` command's reply: one ascending page of the
+    /// session's durable event history. `through` is the highest sequence in
+    /// the page (equal to the request's `after_sequence` when the page is
+    /// empty) — the client passes it back as the next `after_sequence`;
+    /// `has_more` says whether events beyond `through` existed at read time, so
+    /// a pager knows when to stop without a probe read.
+    SessionEventsPage {
+        command_id: CommandId,
+        session_id: SessionId,
+        events: Vec<SessionEvent>,
+        through: u64,
+        has_more: bool,
+    },
     /// A `ReadWorkflowRun` command's reply (Phase 5 STEP 5.2 / T9): the run's
     /// observability snapshot — its current phase plus every node's full current
     /// view. A distinct reply from `CommandAccepted` because the client needs the
@@ -662,6 +683,10 @@ mod tests {
             evidence: vec![json!({ "path": "src/lib.rs", "line": 7 })],
             revision: 2,
             superseded_by: None,
+            board_scope: None,
+            status: None,
+            assignee: None,
+            ordinal: None,
         };
 
         // The read-command reply carries a list of items.
@@ -685,6 +710,61 @@ mod tests {
             Payload::BlackboardPosted(delivered) => assert_eq!(delivered, item),
             other => panic!("expected BlackboardPosted, got {other:?}"),
         }
+
+        // The client-write reply carries the stored item back (Phase B kanban).
+        let command_id = CommandId::new();
+        match round_trip_payload(Payload::BlackboardItemApplied {
+            command_id,
+            item: item.clone(),
+        }) {
+            Payload::BlackboardItemApplied {
+                command_id: id,
+                item: applied,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(applied, item);
+            }
+            other => panic!("expected BlackboardItemApplied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_events_page_payload_round_trips() {
+        use crate::events::{Actor, EventBody, SessionEvent};
+        use chrono::Utc;
+
+        let command_id = CommandId::new();
+        let session_id = SessionId::new();
+        let page = Payload::SessionEventsPage {
+            command_id,
+            session_id,
+            events: vec![SessionEvent {
+                sequence: 501,
+                occurred_at: Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::SessionClosed,
+            }],
+            through: 501,
+            has_more: true,
+        };
+        match round_trip_payload(page) {
+            Payload::SessionEventsPage {
+                command_id: id,
+                session_id: sid,
+                events,
+                through,
+                has_more,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(sid, session_id);
+                assert_eq!(events.len(), 1);
+                assert_eq!(through, 501);
+                assert!(has_more);
+            }
+            other => panic!("expected SessionEventsPage, got {other:?}"),
+        }
     }
 
     #[test]
@@ -703,6 +783,7 @@ mod tests {
             cost: Some(json!({ "wall_time_secs": 3, "tool_calls": 1 })),
             error: None,
             warnings: Vec::new(),
+            depends_on: Vec::new(),
         };
 
         // The read-command reply carries a run snapshot.

@@ -323,9 +323,15 @@ impl PolicyEngine {
             ProposedAction::GitPush { .. } => self.eval_git(GitOp::Push, ctx),
             ProposedAction::GitHubMutation { .. } => self.eval_github_mutation(ctx),
             ProposedAction::McpToolCall { server, .. } => self.eval_mcp_tool_call(server, ctx),
-            ProposedAction::BlackboardPost { .. } | ProposedAction::BlackboardQuery { .. } => {
-                self.eval_blackboard()
-            }
+            // The same reasoning as a blackboard access, for the same reason: a
+            // workflow-graph read and a task-board write touch only Codypendent's
+            // own durable coordination state, never the filesystem, a command, or
+            // a remote (rubrics 5 and 10).
+            ProposedAction::BlackboardPost { .. }
+            | ProposedAction::BlackboardQuery { .. }
+            | ProposedAction::WorkflowQuery { .. }
+            | ProposedAction::TaskWrite { .. }
+            | ProposedAction::TaskRead { .. } => self.eval_blackboard(),
             ProposedAction::RecordMemory => self.eval_record_memory(),
             ProposedAction::SearchRegistry => self.eval_search_registry(),
             ProposedAction::DocumentEdit { .. } => self.eval_document_edit(),
@@ -336,13 +342,14 @@ impl PolicyEngine {
         }
     }
 
-    /// A blackboard post/query (Phase 5 STEP 5.3) is always permitted: it targets
-    /// only the workflow run's OWN typed-artifact channel — not the filesystem, the
-    /// repository, or any remote — and the `blackboard.*` tools are offered solely
-    /// inside a workflow node's agent run. It grants no capability (the tool needs
-    /// no path/command/network scope) and is recorded purely so the board access is
-    /// traced like any other tool call. Writes that DO escape the run (files, git,
-    /// GitHub) keep their existing approval gates; this does not widen them.
+    /// A blackboard post/query (Phase 5 STEP 5.3) — and, on the same reasoning, a
+    /// `workflow.query` read or a `task.*` board write (rubrics 5/10) — is always
+    /// permitted: each targets only Codypendent's OWN durable coordination state,
+    /// not the filesystem, the repository, or any remote. It grants no capability
+    /// (none of these tools needs a path/command/network scope) and is recorded
+    /// purely so the access is traced like any other tool call. Writes that DO
+    /// escape the run (files, git, GitHub) keep their existing approval gates; this
+    /// does not widen them.
     fn eval_blackboard(&self) -> PolicyDecision {
         PolicyDecision {
             decision: Decision::Allow,

@@ -55,7 +55,8 @@ pub use agent::{
 };
 pub use binding::{bind_with, normalize_tool_name, scan_input_refs};
 pub use blackboard::{
-    BlackboardError, BlackboardItem, BlackboardKind, BlackboardStore, NewBlackboardItem,
+    normalize_status, BlackboardError, BlackboardItem, BlackboardKind, BlackboardStore,
+    BoardFields, NewBlackboardItem, DEFAULT_BOARD_STATUSES, DEFAULT_TASK_STATUS,
 };
 pub use budget::{
     BudgetDimension, BudgetExceeded, BudgetLimits, BudgetScope, BudgetVerdict, BudgetWarning,

@@ -114,6 +114,16 @@ pub struct WorkflowNodeView {
     /// of a limit but stayed within it), pre-rendered. Empty when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// The node ids this node depends on — the graph's **edges**, so a client can
+    /// draw the DAG rather than a flat list (rubric 5). Carried on snapshot reads
+    /// (the daemon recompiles the run's stored manifest to recover them); a live
+    /// [`WorkflowEvent::NodeTransitioned`] omits them (the graph shape is static
+    /// per run), so a client merging live deliveries must preserve the edges it
+    /// learned from the snapshot rather than overwriting them with an empty list.
+    /// Additive (`#[serde(default)]`): an older daemon sends none and the field
+    /// parses back empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 /// A workflow run's full observable state — the catch-up baseline a mid-run
@@ -169,6 +179,7 @@ mod tests {
             cost: Some(json!({ "wall_time_secs": 12, "tool_calls": 3 })),
             error: None,
             warnings: vec!["tool_calls at 4/5 (80%)".to_string()],
+            depends_on: Vec::new(),
         }
     }
 
@@ -192,11 +203,27 @@ mod tests {
             cost: None,
             error: None,
             warnings: Vec::new(),
+            depends_on: Vec::new(),
         };
         let json = serde_json::to_string(&item).expect("serialize");
         assert!(!json.contains("cost"), "cost skipped: {json}");
         assert!(!json.contains("error"), "error skipped: {json}");
         assert!(!json.contains("warnings"), "warnings skipped: {json}");
+        assert!(!json.contains("depends_on"), "depends_on skipped: {json}");
+        let parsed: WorkflowNodeView = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, item);
+    }
+
+    #[test]
+    fn depends_on_rides_the_wire_when_present() {
+        // The DAG edges (rubric 5): a node view carrying its dependency ids
+        // round-trips them, and an older peer's payload (no key) parses back to
+        // an empty list rather than failing the frame.
+        let mut item = node_view();
+        item.node_id = "verify".to_string();
+        item.depends_on = vec!["inspect".to_string(), "plan".to_string()];
+        let json = serde_json::to_string(&item).expect("serialize");
+        assert!(json.contains("depends_on"), "edges on the wire: {json}");
         let parsed: WorkflowNodeView = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, item);
     }

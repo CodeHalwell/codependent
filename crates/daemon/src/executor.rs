@@ -253,6 +253,17 @@ pub trait RunExecutor: Send + Sync {
         None
     }
 
+    /// The assembly-provided [`BlackboardWriter`](crate::blackboard::BlackboardWriter)
+    /// that stores a `PostBlackboardItem` / `UpdateBlackboardItem` from a
+    /// `Controller` client (Phase B kanban — the human half of the task board).
+    /// Bundled with the executor for the same reason as the reader: only the
+    /// assembly can name `BlackboardStore` and the pool. The default `None`
+    /// leaves board writes unwired — the executor-less server rejects both
+    /// commands with `workflow.transport-unavailable`.
+    fn blackboard_writer(&self) -> Option<std::sync::Arc<dyn crate::blackboard::BlackboardWriter>> {
+        None
+    }
+
     /// The per-run blackboard fan-out ([`BlackboardHub`](crate::blackboard::BlackboardHub))
     /// the workflow executor publishes posted artifacts through and the server
     /// subscribes a client's `Subscription::Blackboard` forwarder to (Phase 5

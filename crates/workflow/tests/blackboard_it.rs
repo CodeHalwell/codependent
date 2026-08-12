@@ -37,6 +37,7 @@ fn finding(text: &str, evidence: Vec<serde_json::Value>) -> NewBlackboardItem {
         author: json!({ "agent": "investigator" }),
         confidence: Some(0.8),
         evidence,
+        board: Default::default(),
     }
 }
 
@@ -82,6 +83,7 @@ async fn claim_kinds_require_evidence_but_questions_do_not() {
                 author: json!({ "agent": "reviewer" }),
                 confidence: None,
                 evidence: vec![],
+                board: Default::default(),
             },
         )
         .await

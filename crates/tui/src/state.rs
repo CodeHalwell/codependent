@@ -205,6 +205,12 @@ pub enum Overlay {
     /// item — its kind, author, confidence, evidence, revision, and payload
     /// summary. The focused workflow run is subscribed while this view is open.
     Blackboard,
+    /// The repository task board (rubric 10): the [`AppState::kanban`] cards laid
+    /// out in status columns, with keyboard moves that supersede a card into its
+    /// new column through the daemon. The repository's board channel is
+    /// subscribed while this view is open, so a card an agent creates with
+    /// `task.create` appears live.
+    Kanban,
     /// Host-owned management surface for verified Remote UI plugins. Plugin
     /// code can never draw or intercept its own trust or revocation controls.
     UiPlugins,
@@ -933,6 +939,12 @@ pub struct WorkflowNodeCard {
     pub retry: String,
     /// The nodes this one depends on, pre-rendered (comma-joined, or `"—"`).
     pub depends_on: String,
+    /// The same dependencies as raw node ids — the graph's **edges** (rubric 5),
+    /// which the pre-rendered [`depends_on`](Self::depends_on) string above cannot
+    /// be parsed back out of. The workflow pane lays these out into ASCII lanes;
+    /// empty means a root node (or a projection that predates edges, which simply
+    /// renders the flat list it always did).
+    pub depends_on_ids: Vec<String>,
     /// The blackboard artifact kinds the node declares to produce, pre-rendered
     /// (comma-joined, or `"—"`).
     pub outputs: String,
@@ -978,6 +990,44 @@ pub struct BlackboardItemCard {
     /// Whether this item has been superseded by a later revision (the review
     /// rail shows the live item; a superseded one is dimmed).
     pub superseded: bool,
+}
+
+/// The board columns the kanban pane renders, in display order (rubric 10).
+///
+/// A card's `status` is a free string in the store — a team may grow its own
+/// columns — but these four are the defaults every write lands in and every
+/// client renders first. A card whose status is none of them is shown in the
+/// first column rather than dropped, so an unknown column never hides work.
+pub const KANBAN_COLUMNS: [&str; 4] = ["todo", "doing", "review", "done"];
+
+/// One backlog card projected for the kanban board (rubric 10).
+///
+/// Self-contained, like [`BlackboardItemCard`]: the TUI never depends on
+/// `codypendent-workflow`, so the CLI renders the stored item's opaque JSON
+/// payload into these strings. A card IS a blackboard item of kind `task` living
+/// on the repository's board, so it carries the same id and supersession-aware
+/// identity — a move republishes the card at a new revision and the pane merges
+/// it by id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KanbanCard {
+    /// Stable card id — what a move/update command names, and the merge key for
+    /// a live delivery.
+    pub id: String,
+    /// The card's one-line title, rendered from the stored payload.
+    pub title: String,
+    /// The column the card sits in (one of [`KANBAN_COLUMNS`], or a team's own).
+    pub status: String,
+    /// Who the card is assigned to, pre-rendered (`"—"` when nobody).
+    pub assignee: String,
+    /// The artifact kind, pre-rendered — `task` for a backlog card, but a board
+    /// can also hold a promoted `decision` or `open_question`, so the kind is
+    /// shown rather than assumed.
+    pub kind: String,
+    /// Who created (or last revised) it, pre-rendered (e.g. `"agent"` /
+    /// `"operator"`), so a human can see which cards the model wrote.
+    pub author: String,
+    /// The card's position within its column (lower sorts first).
+    pub ordinal: i64,
 }
 
 /// Where a model-picker card's model runs (MP1). A tui-local mirror of just
@@ -1513,6 +1563,15 @@ pub struct AppState {
     pub councils: Vec<CouncilCard>,
     /// Index into `councils` of the focused council.
     pub selected_council: usize,
+    /// The repository task board (rubric 10): every live `task` card on the
+    /// repository's board, mapped to self-contained [`KanbanCard`]s by the CLI.
+    /// The [`Overlay::Kanban`] view reads it; a live `BlackboardPosted` on the
+    /// board's channel merges into it by id, so an agent's `task.create` appears
+    /// in the pane without a refresh.
+    pub kanban: Vec<KanbanCard>,
+    /// Index into the board's DISPLAY order (column-major, the order the pane
+    /// walks columns and cards) of the focused card.
+    pub selected_card: usize,
     /// The model-picker projection (MP1): every model configured in
     /// `models.toml`, enriched with its measured profile from
     /// `model_profiles` when one exists, mapped to a self-contained
@@ -1673,6 +1732,8 @@ impl AppState {
             selected_item: 0,
             councils: Vec::new(),
             selected_council: 0,
+            kanban: Vec::new(),
+            selected_card: 0,
             models: Vec::new(),
             selected_model: 0,
             pending_model: None,
@@ -1777,6 +1838,7 @@ impl AppState {
             | Overlay::Edges
             | Overlay::Workflow
             | Overlay::Blackboard
+            | Overlay::Kanban
             | Overlay::UiPlugins
             | Overlay::CouncilBrowser
             | Overlay::AddModelQuerying { .. }
@@ -1882,6 +1944,58 @@ impl AppState {
     #[must_use]
     pub fn focused_item(&self) -> Option<&BlackboardItemCard> {
         self.blackboard.get(self.selected_item)
+    }
+
+    /// The board's cards in DISPLAY order: column by column in
+    /// [`KANBAN_COLUMNS`] order, each column sorted by `ordinal` then title.
+    ///
+    /// One ordering serves the renderer, the keyboard selection, and the hit
+    /// regions, so "the third card" means the same thing to all three. A card
+    /// whose status matches no known column is shown in the FIRST column rather
+    /// than dropped — an unrecognized column must never hide work.
+    #[must_use]
+    pub fn kanban_columns(&self) -> Vec<(&'static str, Vec<&KanbanCard>)> {
+        KANBAN_COLUMNS
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                let mut cards: Vec<&KanbanCard> = self
+                    .kanban
+                    .iter()
+                    .filter(|card| {
+                        card.status.eq_ignore_ascii_case(column)
+                            || (index == 0
+                                && !KANBAN_COLUMNS
+                                    .iter()
+                                    .any(|known| card.status.eq_ignore_ascii_case(known)))
+                    })
+                    .collect();
+                cards.sort_by(|a, b| {
+                    a.ordinal
+                        .cmp(&b.ordinal)
+                        .then_with(|| a.title.cmp(&b.title))
+                });
+                (*column, cards)
+            })
+            .collect()
+    }
+
+    /// The board's cards flattened in display order — the sequence
+    /// [`selected_card`](Self::selected_card) indexes.
+    #[must_use]
+    pub fn kanban_in_display_order(&self) -> Vec<&KanbanCard> {
+        self.kanban_columns()
+            .into_iter()
+            .flat_map(|(_, cards)| cards)
+            .collect()
+    }
+
+    /// The focused board card, if any.
+    #[must_use]
+    pub fn focused_card(&self) -> Option<&KanbanCard> {
+        self.kanban_in_display_order()
+            .get(self.selected_card)
+            .copied()
     }
 
     /// The focused host-managed Remote UI plugin, if one is installed.

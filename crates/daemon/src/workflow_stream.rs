@@ -160,6 +160,9 @@ mod tests {
             cost: None,
             error: None,
             warnings: Vec::new(),
+            // A live transition carries no edges — the graph shape is static per
+            // run, learned once from the `ReadWorkflowRun` snapshot.
+            depends_on: Vec::new(),
         })
     }
 

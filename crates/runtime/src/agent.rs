@@ -83,9 +83,12 @@ use codypendent_sandbox::sanitize_untrusted;
 /// `agent-framework-core` directly — can name the trait's parameter type).
 pub use agent_framework_core::tools::ToolDefinition;
 
-use crate::blackboard::{BlackboardChannel, BlackboardChannelError, BlackboardPost};
 use crate::docs::{
     DocsAuthor, DocsChannel, DocsChannelError, DocsCreate, DocsEdit, DocsSuggest, DocsWriteEffect,
+};
+use crate::blackboard::{
+    BlackboardChannel, BlackboardChannelError, BlackboardPost, TaskBoardChannel, TaskCardChange,
+    TaskCardDraft, WorkflowQueryChannel,
 };
 use crate::models::ModelRegistry;
 #[cfg(feature = "provider-openai")]
@@ -102,11 +105,15 @@ use crate::tools::{
     parse_create_check_run, parse_create_draft_pull_request, parse_docs_create, parse_docs_edit,
     parse_docs_read, parse_docs_suggest, parse_edit_file as parse_edit_file_args,
     parse_get_pull_request, parse_list_check_runs, parse_memory_remember, parse_skills_search,
-    parse_update_pull_request, parse_web_search, parse_write_file as parse_write_file_args,
-    ReadFile, ReadFileInput, RegistrySearch, RegistrySearchRequest, render_check_runs,
-    render_pull_request, render_registry_search, render_search_outcome, RepositoryTest, Search,
-    SearchInput, Shell, SkillsSearch, SkillsSearchInput, tool_label, UpdatePullRequestInput,
-    UpdatePullRequestTool, WebSearch, WebSearchInput, WriteFile, WriteFileInput,
+    parse_task_create, parse_task_list, parse_task_move, parse_task_update,
+    parse_update_pull_request, parse_web_search, parse_workflow_query,
+    parse_write_file as parse_write_file_args, ReadFile, ReadFileInput, RegistrySearch,
+    RegistrySearchRequest, render_check_runs, render_pull_request, render_registry_search,
+    render_search_outcome, RepositoryTest, Search, SearchInput, Shell, SkillsSearch,
+    SkillsSearchInput, task_read_action, task_write_action, TaskCreateInput, TaskCreateTool,
+    TaskListInput, TaskListTool, TaskMoveTool, TaskUpdateInput, TaskUpdateTool, tool_label,
+    UpdatePullRequestInput, UpdatePullRequestTool, WebSearch, WebSearchInput,
+    WorkflowQueryInput, WorkflowQueryTool, WriteFile, WriteFileInput,
 };
 
 /// Safety valve: the maximum number of `next_step` calls a single run makes
@@ -1078,6 +1085,16 @@ pub struct RunContext {
     /// and server-built author come from here); `None` for a plain single-agent
     /// run, which is never offered them.
     pub workflow: Option<WorkflowContext>,
+    /// The run's repository **identity** — the canonical checkout the task board
+    /// and workflow history are keyed by (rubric 5 / 10), as a string so this
+    /// crate does not have to decide what a repository id is.
+    ///
+    /// Deliberately NOT [`repository`](Self::repository): that is the policy
+    /// read/search root, which for an isolated run is a throwaway worktree outside
+    /// the checkout. Cards must not scatter across per-run worktrees, so the
+    /// executor sets this from the run's launch repository. `None` (a run with no
+    /// repository) leaves the `task.*` tools unoffered.
+    pub board_repository: Option<String>,
     /// Optional channel of queued steering text, drained at safe points.
     pub steering: Option<mpsc::UnboundedReceiver<String>>,
     /// The prior conversation transcript this run is seeded with
@@ -1120,6 +1137,7 @@ impl RunContext {
             github_repo: None,
             ide_dirty_buffers: Vec::new(),
             workflow: None,
+            board_repository: None,
             steering: None,
             prior: Vec::new(),
             mcp_advertised: None,
@@ -1138,6 +1156,15 @@ impl RunContext {
     /// leaves it unset and is never offered those tools.
     pub fn with_workflow(mut self, workflow: WorkflowContext) -> Self {
         self.workflow = Some(workflow);
+        self
+    }
+
+    /// Name the run's repository **identity** — the board the `task.*` tools write
+    /// and the history `workflow.query` lists. Distinct from
+    /// [`repository`](Self::repository), which is the policy read root (a worktree
+    /// for an isolated run).
+    pub fn with_board_repository(mut self, repository: impl Into<String>) -> Self {
+        self.board_repository = Some(repository.into());
         self
     }
 
@@ -1369,6 +1396,13 @@ pub struct FrameworkAgentRuntime {
     /// citations stay display-only exactly as before; with one, the model can
     /// reopen the bulk output behind any truncated observation.
     artifacts: Option<Arc<dyn ArtifactReader>>,
+    /// The workflow-graph read channel the `workflow.query` tool reads through
+    /// (rubric 5), if wired. Repository-scoped rather than run-scoped, so it also
+    /// serves a plain chat run.
+    workflow_query: Option<Arc<dyn WorkflowQueryChannel>>,
+    /// The repository task board the `task.*` backlog tools write and read
+    /// (rubric 10), if wired.
+    task_board: Option<Arc<dyn TaskBoardChannel>>,
 }
 
 /// How a run terminated, before it is folded into a [`RunDisposition`].
@@ -1407,6 +1441,8 @@ impl FrameworkAgentRuntime {
             registry: None,
             docs: None,
             artifacts: None,
+            workflow_query: None,
+            task_board: None,
         }
     }
 
@@ -1509,6 +1545,35 @@ impl FrameworkAgentRuntime {
         self.blackboard.is_some() && run.workflow.is_some()
     }
 
+    /// Inject the workflow-graph read channel the `workflow.query` tool uses
+    /// (rubric 5). Without it the tool is never offered.
+    pub fn with_workflow_query(mut self, workflows: Arc<dyn WorkflowQueryChannel>) -> Self {
+        self.workflow_query = Some(workflows);
+        self
+    }
+
+    /// Inject the task-board channel the `task.*` tools use (rubric 10). Without
+    /// it those tools are never offered.
+    pub fn with_task_board(mut self, board: Arc<dyn TaskBoardChannel>) -> Self {
+        self.task_board = Some(board);
+        self
+    }
+
+    /// Whether `workflow.query` is offered to `run`. A **read** of Codypendent's
+    /// own durable state, so — unlike `blackboard.*` — it is not workflow-gated: a
+    /// chat agent may ask about the repository's runs. It needs a wired channel and
+    /// either an ambient workflow run or a known repository identity to scope to.
+    fn offers_workflow_query(&self, run: &RunContext) -> bool {
+        self.workflow_query.is_some() && (run.workflow.is_some() || run.board_repository.is_some())
+    }
+
+    /// Whether the `task.*` tools are offered to `run`: a wired board channel plus
+    /// the run's repository identity (the board is keyed by repository, so without
+    /// one there is no board to write).
+    fn offers_task_board(&self, run: &RunContext) -> bool {
+        self.task_board.is_some() && run.board_repository.is_some()
+    }
+
     /// The tool names offered to `run` — the workspace/git baseline, the `github.*`
     /// tools when a client is configured, the `mcp.<server>.<tool>` tools a wired
     /// MCP bridge currently offers (a cold or failed server contributes none —
@@ -1608,6 +1673,26 @@ impl FrameworkAgentRuntime {
                     DocsReadTool::NAME,
                     DocsEditTool::NAME,
                     DocsSuggestTool::NAME,
+                ]
+                .iter()
+                .map(|name| (*name).to_string()),
+            );
+        }
+        // Rubric 5 / 10: unlike `blackboard.*` these are repository-scoped, not
+        // run-scoped, so a plain chat run is offered them too — that is the point
+        // of a backlog ("break this feature into cards") and of asking how the
+        // last workflow run went. Both are gated only on a wired channel plus the
+        // run knowing its repository identity.
+        if self.offers_workflow_query(run) {
+            names.push(WorkflowQueryTool::NAME.to_string());
+        }
+        if self.offers_task_board(run) {
+            names.extend(
+                [
+                    TaskCreateTool::NAME,
+                    TaskUpdateTool::NAME,
+                    TaskMoveTool::NAME,
+                    TaskListTool::NAME,
                 ]
                 .iter()
                 .map(|name| (*name).to_string()),
@@ -3048,6 +3133,58 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::DocsSuggest(input),
                 })
             }
+            // Rubric 5: the run to read is server-derived — the ambient workflow
+            // run when there is one, else whatever the model named (validated by
+            // the channel, which only ever reads). A bare call from chat carries
+            // an empty run id and lists the repository's recent runs instead.
+            WorkflowQueryTool::NAME if self.offers_workflow_query(run) => {
+                let input = parse_workflow_query(args);
+                let subject = input
+                    .workflow_run_id
+                    .clone()
+                    .or_else(|| run.workflow.as_ref().map(|wf| wf.workflow_run_id.clone()))
+                    .unwrap_or_default();
+                Ok(Prepared {
+                    action: WorkflowQueryTool::proposed_action(&subject),
+                    tool: PreparedTool::WorkflowQuery(WorkflowQueryInput {
+                        workflow_run_id: (!subject.is_empty()).then_some(subject),
+                    }),
+                })
+            }
+            // Rubric 10 (NL backlog): the BOARD is server-derived from the run's
+            // repository identity — a model can never redirect a card onto another
+            // repository's board by passing a path.
+            TaskCreateTool::NAME if self.offers_task_board(run) => {
+                let repository = self.board_target(run)?;
+                let input = parse_task_create(args)?;
+                Ok(Prepared {
+                    action: task_write_action(&repository, format!("create \"{}\"", input.title)),
+                    tool: PreparedTool::TaskCreate(input),
+                })
+            }
+            TaskUpdateTool::NAME if self.offers_task_board(run) => {
+                let repository = self.board_target(run)?;
+                let input = parse_task_update(args)?;
+                Ok(Prepared {
+                    action: task_write_action(&repository, input.summary("update")),
+                    tool: PreparedTool::TaskUpdate(input),
+                })
+            }
+            TaskMoveTool::NAME if self.offers_task_board(run) => {
+                let repository = self.board_target(run)?;
+                let input = parse_task_move(args)?;
+                Ok(Prepared {
+                    action: task_write_action(&repository, input.summary("move")),
+                    tool: PreparedTool::TaskUpdate(input),
+                })
+            }
+            TaskListTool::NAME if self.offers_task_board(run) => {
+                let repository = self.board_target(run)?;
+                Ok(Prepared {
+                    action: task_read_action(&repository),
+                    tool: PreparedTool::TaskList(parse_task_list(args)),
+                })
+            }
             // CORE (smarter-memory M2): unconditional — no run gate, unlike the
             // blackboard arms above.
             MemoryRemember::NAME => {
@@ -3457,6 +3594,10 @@ impl FrameworkAgentRuntime {
             },
             PreparedTool::BlackboardPost(input) => self.execute_blackboard_post(input, run).await,
             PreparedTool::BlackboardQuery(input) => self.execute_blackboard_query(input, run).await,
+            PreparedTool::WorkflowQuery(input) => self.execute_workflow_query(input, run).await,
+            PreparedTool::TaskCreate(input) => self.execute_task_create(input, run).await,
+            PreparedTool::TaskUpdate(input) => self.execute_task_update(input, run).await,
+            PreparedTool::TaskList(input) => self.execute_task_list(input, run).await,
             PreparedTool::MemoryRemember(input) => {
                 self.execute_memory_remember(input, run, run_actor).await
             }
@@ -3864,6 +4005,193 @@ impl FrameworkAgentRuntime {
         }
     }
 
+    /// The run's board/history subject: its repository **identity**, which
+    /// `offers_task_board` already proved is present. A separate accessor (rather
+    /// than an `expect` at each call site) so the invariant is stated once.
+    fn board_target(&self, run: &RunContext) -> Result<String, String> {
+        run.board_repository
+            .clone()
+            .ok_or_else(|| "this run has no repository, so it has no task board".to_string())
+    }
+
+    /// Read durable workflow state through the [`WorkflowQueryChannel`] (rubric 5)
+    /// — a named run's full graph (nodes, states, **edges**, measured cost), or the
+    /// repository's recent runs when no run is named. Framed as evidence like a
+    /// blackboard query: node errors are agent-authored text, reasoned about and
+    /// never obeyed.
+    async fn execute_workflow_query(
+        &self,
+        input: WorkflowQueryInput,
+        run: &RunContext,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let Some(channel) = self.workflow_query.as_ref() else {
+            return blackboard_unavailable(WorkflowQueryTool::NAME);
+        };
+        let failure = |e: &BlackboardChannelError| {
+            (
+                format!("{} error: {e}", WorkflowQueryTool::NAME),
+                None,
+                ToolOutcome::Failed {
+                    message: e.code().to_string(),
+                },
+            )
+        };
+        match input.workflow_run_id {
+            Some(workflow_run_id) => match channel.snapshot(&workflow_run_id).await {
+                Ok(Some(snapshot)) => (
+                    blackboard_evidence(render_workflow_snapshot(&snapshot)),
+                    None,
+                    ToolOutcome::Succeeded,
+                ),
+                // A missing run is the agent's mistake to correct (it named an id
+                // that does not exist), not a broken tool — say so plainly rather
+                // than returning an empty graph it would read as "nothing ran".
+                Ok(None) => (
+                    format!("no workflow run `{workflow_run_id}`"),
+                    None,
+                    ToolOutcome::Failed {
+                        message: "workflow.run-not-found".to_string(),
+                    },
+                ),
+                Err(e) => failure(&e),
+            },
+            None => {
+                let Some(repository) = run.board_repository.as_deref() else {
+                    return blackboard_unavailable(WorkflowQueryTool::NAME);
+                };
+                match channel.recent_runs(repository, RECENT_WORKFLOW_RUNS).await {
+                    Ok(runs) => (
+                        blackboard_evidence(render_workflow_runs(&runs)),
+                        None,
+                        ToolOutcome::Succeeded,
+                    ),
+                    Err(e) => failure(&e),
+                }
+            }
+        }
+    }
+
+    /// Create a backlog card on the repository's board (rubric 10). Attribution is
+    /// built server-side from the run context, exactly as a blackboard post's is.
+    async fn execute_task_create(
+        &self,
+        input: TaskCreateInput,
+        run: &RunContext,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let (Some(channel), Some(repository)) =
+            (self.task_board.as_ref(), run.board_repository.as_deref())
+        else {
+            return blackboard_unavailable(TaskCreateTool::NAME);
+        };
+        let draft = TaskCardDraft {
+            payload: input.payload(),
+            author: task_author(run),
+            status: input.status,
+            assignee: input.assignee,
+            ordinal: None,
+        };
+        match channel.create(repository, draft).await {
+            Ok(card) => (
+                format!(
+                    "created card {} in `{}`: {}",
+                    card.id,
+                    card.status.as_deref().unwrap_or("todo"),
+                    input.title
+                ),
+                None,
+                ToolOutcome::Succeeded,
+            ),
+            Err(e) => (
+                format!("{} error: {e}", TaskCreateTool::NAME),
+                None,
+                ToolOutcome::Failed {
+                    message: e.code().to_string(),
+                },
+            ),
+        }
+    }
+
+    /// Revise a card — a column move, a re-assignment, a re-order, or an edit. The
+    /// board applies it as a *supersession*, so the card's history survives.
+    async fn execute_task_update(
+        &self,
+        input: TaskUpdateInput,
+        run: &RunContext,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let (Some(channel), Some(repository)) =
+            (self.task_board.as_ref(), run.board_repository.as_deref())
+        else {
+            return blackboard_unavailable(TaskUpdateTool::NAME);
+        };
+        let change = TaskCardChange {
+            status: input.status.clone(),
+            assignee: input.assignee.clone(),
+            ordinal: input.ordinal,
+            payload: input.payload(),
+            author: task_author(run),
+        };
+        match channel.update(repository, &input.item_id, change).await {
+            Ok(card) => (
+                format!(
+                    "card {} is now {} (revision {})",
+                    card.id,
+                    card.status.as_deref().unwrap_or("todo"),
+                    card.revision
+                ),
+                None,
+                ToolOutcome::Succeeded,
+            ),
+            Err(e) => (
+                format!("{} error: {e}", TaskUpdateTool::NAME),
+                None,
+                ToolOutcome::Failed {
+                    message: e.code().to_string(),
+                },
+            ),
+        }
+    }
+
+    /// Read the repository's live board, optionally one column. Framed as evidence
+    /// — card text is human- or agent-authored prose, never instructions.
+    async fn execute_task_list(
+        &self,
+        input: TaskListInput,
+        run: &RunContext,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let (Some(channel), Some(repository)) =
+            (self.task_board.as_ref(), run.board_repository.as_deref())
+        else {
+            return blackboard_unavailable(TaskListTool::NAME);
+        };
+        match channel.list(repository).await {
+            Ok(cards) => {
+                let filtered: Vec<_> = match input.status.as_deref() {
+                    Some(status) => cards
+                        .into_iter()
+                        .filter(|card| {
+                            card.status
+                                .as_deref()
+                                .is_some_and(|s| s.eq_ignore_ascii_case(status))
+                        })
+                        .collect(),
+                    None => cards,
+                };
+                (
+                    blackboard_evidence(render_task_cards(&filtered)),
+                    None,
+                    ToolOutcome::Succeeded,
+                )
+            }
+            Err(e) => (
+                format!("{} error: {e}", TaskListTool::NAME),
+                None,
+                ToolOutcome::Failed {
+                    message: e.code().to_string(),
+                },
+            ),
+        }
+    }
+
     /// The review node: if the worktree has a diff, spill it as a change-set
     /// artifact and emit `PatchProposed`. Loop-issued (not model-proposed), so
     /// it runs without approval — it is a trusted daemon diff of the run's own
@@ -4007,6 +4335,16 @@ enum PreparedTool {
     WebSearch(WebSearchInput),
     BlackboardPost(BlackboardPostInput),
     BlackboardQuery(BlackboardQueryInput),
+    /// A `workflow.query` call (rubric 5): the run to read, or `None` to list the
+    /// repository's recent runs.
+    WorkflowQuery(WorkflowQueryInput),
+    /// A `task.create` call (rubric 10).
+    TaskCreate(TaskCreateInput),
+    /// A `task.update` or `task.move` call — one shape, since a move is an update
+    /// that must name a destination column.
+    TaskUpdate(TaskUpdateInput),
+    /// A `task.list` call.
+    TaskList(TaskListInput),
     MemoryRemember(MemoryRememberInput),
     /// A `skills.search` call (rubric 9): the parsed query plus the optional
     /// skill name whose procedure to open.
@@ -4331,7 +4669,7 @@ fn blackboard_author(run: &RunContext, wf: &WorkflowContext) -> Value {
 /// offered — a defensive fallback, since `prepare` gates it).
 fn blackboard_unavailable(tool: &str) -> (String, Option<ArtifactRef>, ToolOutcome) {
     (
-        format!("{tool} is only available inside a workflow run"),
+        format!("{tool} is not available for this run"),
         None,
         ToolOutcome::Failed {
             message: BlackboardChannelError::Unavailable.code().to_string(),
@@ -4365,6 +4703,101 @@ fn render_blackboard_items(items: &[codypendent_protocol::BlackboardItemView]) -
             "- [{}] {} (rev {}, by {}): {}\n",
             item.kind, item.id, item.revision, author, item.payload
         ));
+    }
+    out
+}
+
+/// How many recent runs `workflow.query` lists when it is not pointed at one.
+/// Bounded because the list enters the model's context: enough to answer "how did
+/// the last few go", not a full history dump.
+const RECENT_WORKFLOW_RUNS: u32 = 10;
+
+/// Build a task card's author **server-side** from the run context (rubric 10):
+/// the agent's run, and its node/role when the card came from inside a workflow.
+/// Never model-supplied, so a card's provenance cannot be forged.
+fn task_author(run: &RunContext) -> Value {
+    match run.workflow.as_ref() {
+        Some(wf) => json!({
+            "role": wf.agent_role,
+            "node_id": wf.node_id,
+            "run_id": run.run_id.to_string(),
+            "workflow_run_id": wf.workflow_run_id,
+        }),
+        None => json!({ "role": "agent", "run_id": run.run_id.to_string() }),
+    }
+}
+
+/// Render a workflow run's graph for the model (rubric 5): one line per node with
+/// its state, attempt, measured cost, failure reason, and — the point of the whole
+/// exercise — the **edges** it depends on, so an agent can reason about what
+/// already ran and what is waiting on what.
+fn render_workflow_snapshot(snapshot: &codypendent_protocol::WorkflowRunSnapshot) -> String {
+    let mut out = format!(
+        "workflow run {} is {:?}\n",
+        snapshot.workflow_run_id, snapshot.phase
+    );
+    if snapshot.nodes.is_empty() {
+        out.push_str("- (no nodes)\n");
+        return out;
+    }
+    for node in &snapshot.nodes {
+        out.push_str(&format!("- {} [{:?}]", node.node_id, node.state));
+        if node.attempt > 1 {
+            out.push_str(&format!(" attempt {}", node.attempt));
+        }
+        if !node.depends_on.is_empty() {
+            out.push_str(&format!(" after {}", node.depends_on.join(", ")));
+        }
+        if let Some(cost) = &node.cost {
+            out.push_str(&format!(" cost {cost}"));
+        }
+        if let Some(error) = &node.error {
+            out.push_str(&format!(" — {error}"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Render the repository's recent workflow runs — the entry point for an agent
+/// that has no run id yet.
+fn render_workflow_runs(runs: &[crate::blackboard::WorkflowRunSummary]) -> String {
+    if runs.is_empty() {
+        return "this repository has no workflow runs\n".to_string();
+    }
+    let mut out = String::new();
+    for run in runs {
+        out.push_str(&format!(
+            "- {} [{}] {}\n",
+            run.workflow_run_id, run.phase, run.workflow_id
+        ));
+    }
+    out
+}
+
+/// Render the repository's board for the model: one line per live card, grouped
+/// implicitly by the column it names, with the id an update/move needs.
+fn render_task_cards(cards: &[codypendent_protocol::BlackboardItemView]) -> String {
+    if cards.is_empty() {
+        return "the board has no matching cards\n".to_string();
+    }
+    let mut out = String::new();
+    for card in cards {
+        let title = card
+            .payload
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("(untitled)");
+        out.push_str(&format!(
+            "- [{}] {} {}",
+            card.status.as_deref().unwrap_or("todo"),
+            card.id,
+            title
+        ));
+        if let Some(assignee) = &card.assignee {
+            out.push_str(&format!(" (@{assignee})"));
+        }
+        out.push('\n');
     }
     out
 }
@@ -5047,6 +5480,80 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "kind": {"type": "string"},
                     "include_superseded": {"type": "boolean"}
+                }
+            }),
+        ),
+        // Rubric 5: repository-scoped, so unlike the blackboard entries above this
+        // is also advertised in a plain chat run (the offered-set gate decides).
+        decl(
+            WorkflowQueryTool::NAME,
+            "Inspect durable workflow runs: with `workflow_run_id`, the run's graph — \
+                 every node's state, the nodes it depends on, and its measured cost; \
+                 without one, this repository's most recent runs.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "workflow_run_id": {"type": "string"}
+                }
+            }),
+        ),
+        // Rubric 10 (NL backlog): the repository's task board. The board is
+        // server-derived from the run's repository — no argument names it.
+        decl(
+            TaskCreateTool::NAME,
+            "Add a card to this repository's task board — how a feature request becomes \
+                 backlog items. `status` is the column (todo | doing | review | done), \
+                 defaulting to todo.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "status": {"type": "string"},
+                    "assignee": {"type": "string"}
+                },
+                "required": ["title"]
+            }),
+        ),
+        decl(
+            TaskUpdateTool::NAME,
+            "Revise a board card: edit its title/description, re-assign it, or re-order \
+                 it. Fields you omit keep their current values.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "status": {"type": "string"},
+                    "assignee": {"type": "string"},
+                    "ordinal": {"type": "integer"}
+                },
+                "required": ["item_id"]
+            }),
+        ),
+        decl(
+            TaskMoveTool::NAME,
+            "Move a board card to another column (todo | doing | review | done). The card \
+                 lands at the end of the target column unless you pass `ordinal`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string"},
+                    "status": {"type": "string"},
+                    "ordinal": {"type": "integer"}
+                },
+                "required": ["item_id", "status"]
+            }),
+        ),
+        decl(
+            TaskListTool::NAME,
+            "Read this repository's task board — every live card with its column, \
+                 assignee, and id. Optionally filter to one `status` column.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"}
                 }
             }),
         ),
@@ -6100,6 +6607,230 @@ mod tests {
         ) -> Result<Vec<codypendent_protocol::BlackboardItemView>, BlackboardChannelError> {
             Ok(Vec::new())
         }
+    }
+
+    /// A recording task board: the assembly's `AssemblyTaskBoardChannel` stands
+    /// here in production. It stores what the tools actually wrote, so a test can
+    /// assert the CARD — not just that a call happened.
+    #[derive(Default)]
+    struct RecordingTaskBoard {
+        cards: Mutex<Vec<(String, codypendent_protocol::BlackboardItemView)>>,
+    }
+
+    impl RecordingTaskBoard {
+        fn view(
+            id: &str,
+            payload: Value,
+            author: Value,
+            status: &str,
+            assignee: Option<String>,
+        ) -> codypendent_protocol::BlackboardItemView {
+            codypendent_protocol::BlackboardItemView {
+                id: id.to_string(),
+                workflow_run_id: codypendent_protocol::board_scope_id("/repo"),
+                kind: "task".to_string(),
+                payload,
+                author,
+                confidence: None,
+                evidence: Vec::new(),
+                revision: 1,
+                superseded_by: None,
+                board_scope: Some("/repo".to_string()),
+                status: Some(status.to_string()),
+                assignee,
+                ordinal: Some(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TaskBoardChannel for RecordingTaskBoard {
+        async fn create(
+            &self,
+            repository: &str,
+            draft: TaskCardDraft,
+        ) -> Result<codypendent_protocol::BlackboardItemView, BlackboardChannelError> {
+            let mut cards = self.cards.lock().expect("board mutex");
+            let card = Self::view(
+                &format!("card-{}", cards.len() + 1),
+                draft.payload,
+                draft.author,
+                draft.status.as_deref().unwrap_or("todo"),
+                draft.assignee,
+            );
+            cards.push((repository.to_string(), card.clone()));
+            Ok(card)
+        }
+
+        async fn update(
+            &self,
+            repository: &str,
+            item_id: &str,
+            change: TaskCardChange,
+        ) -> Result<codypendent_protocol::BlackboardItemView, BlackboardChannelError> {
+            let mut cards = self.cards.lock().expect("board mutex");
+            let existing = cards
+                .iter()
+                .find(|(_, card)| card.id == item_id)
+                .map(|(_, card)| card.clone())
+                .ok_or_else(|| BlackboardChannelError::NotFound(item_id.to_string()))?;
+            let mut moved = Self::view(
+                item_id,
+                change.payload.unwrap_or(existing.payload),
+                change.author,
+                change
+                    .status
+                    .as_deref()
+                    .or(existing.status.as_deref())
+                    .unwrap_or("todo"),
+                change.assignee.or(existing.assignee),
+            );
+            moved.revision = existing.revision + 1;
+            cards.retain(|(_, card)| card.id != item_id);
+            cards.push((repository.to_string(), moved.clone()));
+            Ok(moved)
+        }
+
+        async fn list(
+            &self,
+            _repository: &str,
+        ) -> Result<Vec<codypendent_protocol::BlackboardItemView>, BlackboardChannelError> {
+            Ok(self
+                .cards
+                .lock()
+                .expect("board mutex")
+                .iter()
+                .map(|(_, card)| card.clone())
+                .collect())
+        }
+    }
+
+    /// Rubric 10, end to end through the loop: a scripted agent in a PLAIN chat
+    /// run (no workflow context) turns a feature request into backlog cards and
+    /// then moves one — the "break this feature into backlog cards" path.
+    ///
+    /// The three things this pins, none of which the parsing unit tests can:
+    /// the tools are dispatchable outside a workflow run; the board they write is
+    /// the run's SERVER-DERIVED repository, never an argument; and the card's
+    /// author is built from the run context, so a model cannot forge provenance.
+    #[tokio::test]
+    async fn a_scripted_agent_fills_the_backlog_and_moves_a_card() {
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::CallTool {
+                tool: TaskCreateTool::NAME.to_string(),
+                args: json!({
+                    "title": "wire the DAG viewer",
+                    "description": "edges on the wire",
+                }),
+            },
+            ModelStep::CallTool {
+                tool: TaskCreateTool::NAME.to_string(),
+                args: json!({ "title": "column-grouped board pane", "status": "doing" }),
+            },
+            ModelStep::CallTool {
+                tool: TaskMoveTool::NAME.to_string(),
+                args: json!({ "item_id": "card-1", "status": "review" }),
+            },
+            ModelStep::CallTool {
+                tool: TaskListTool::NAME.to_string(),
+                args: json!({}),
+            },
+            ModelStep::Finish {
+                summary: "backlog filled".to_string(),
+            },
+        ]);
+        let board = Arc::new(RecordingTaskBoard::default());
+        let (runtime, mut events, session_id) = test_runtime();
+        let runtime = runtime.with_task_board(board.clone());
+        let repo = tempfile::tempdir().expect("tempdir");
+        // A PLAIN chat run: no `WorkflowContext` at all.
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "break this feature into backlog cards",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        )
+        .with_board_repository("/repo");
+
+        // The tools are advertised to this run — a chat agent can reach them.
+        let advertised: Vec<String> = runtime
+            .advertised_tool_definitions(&ctx)
+            .iter()
+            .map(|definition| definition.name.clone())
+            .collect();
+        for tool in [
+            TaskCreateTool::NAME,
+            TaskUpdateTool::NAME,
+            TaskMoveTool::NAME,
+            TaskListTool::NAME,
+        ] {
+            assert!(
+                advertised.iter().any(|name| name == tool),
+                "{tool} must be advertised to a plain chat run: {advertised:?}"
+            );
+        }
+
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("the run completes");
+
+        // Every board write succeeded — no approval gate, no policy denial.
+        let mut outcomes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::ToolCompleted { tool, outcome, .. } = event.body {
+                if tool.starts_with("task.") {
+                    outcomes.push((tool, outcome));
+                }
+            }
+        }
+        assert_eq!(outcomes.len(), 4, "four task.* calls ran: {outcomes:?}");
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, outcome)| matches!(outcome, ToolOutcome::Succeeded)),
+            "a board write is internal state, never approval-gated: {outcomes:?}"
+        );
+
+        let cards = board.cards.lock().expect("board mutex").clone();
+        assert_eq!(cards.len(), 2);
+        // The board is the run's repository identity — the model never named it.
+        assert!(cards.iter().all(|(repository, _)| repository == "/repo"));
+        // The author is built server-side from the run context.
+        assert!(
+            cards
+                .iter()
+                .all(|(_, card)| card.author["role"] == "agent"
+                    && card.author.get("run_id").is_some())
+        );
+        // The second card honored its explicit column; the moved card is at its
+        // new one, at the next revision, with its body carried forward.
+        let moved = cards
+            .iter()
+            .find(|(_, card)| card.id == "card-1")
+            .expect("the moved card");
+        assert_eq!(moved.1.status.as_deref(), Some("review"));
+        assert_eq!(moved.1.revision, 2);
+        assert_eq!(moved.1.payload["title"], "wire the DAG viewer");
+        assert!(cards
+            .iter()
+            .any(|(_, card)| card.status.as_deref() == Some("doing")));
+    }
+
+    /// The gate: with no repository identity there is no board, so the `task.*`
+    /// tools are not offered at all rather than failing at call time.
+    #[test]
+    fn the_task_tools_need_a_repository_identity() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime.with_task_board(Arc::new(RecordingTaskBoard::default()));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let names = runtime.offered_tool_names(&solo_run(session_id, repo.path()));
+        assert!(
+            !names.iter().any(|name| name.starts_with("task.")),
+            "no repository identity → no board tools: {names:?}"
+        );
     }
 
     /// FIX 1 (advertise/execute mismatch): a plain single-agent run's model must
