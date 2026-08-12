@@ -392,20 +392,60 @@ impl DocumentStore {
             }
         }
         let rows = q.fetch_all(pool).await?;
-        rows.iter()
-            .map(|row| {
-                Ok(DocumentSummary {
-                    id: row
-                        .get::<String, _>("id")
-                        .parse()
-                        .map_err(|e: uuid::Error| DocStoreError::Corrupt(e.to_string()))?,
-                    title: row.get("title"),
-                    status: parse_status(row.get::<String, _>("status").as_str())?,
-                    revision: row.get::<i64, _>("revision") as u64,
-                })
-            })
-            .collect()
+        rows.iter().map(decode_summary).collect()
     }
+
+    /// List EVERY document, newest first, across all scopes. This is the
+    /// daemon-side maintenance sweep's view (`/update-docs` staleness checking
+    /// walks every document it stores); client-facing listings go through
+    /// [`list`](Self::list), which enforces scope isolation.
+    pub async fn list_all(&self, pool: &SqlitePool) -> Result<Vec<DocumentSummary>, DocStoreError> {
+        let rows = sqlx::query(
+            "SELECT id, title, status, revision FROM documents \
+             ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(pool)
+        .await?;
+        rows.iter().map(decode_summary).collect()
+    }
+
+    /// Set a document's lifecycle status (e.g. `Draft` → `Published` once a
+    /// publish plan executed, STEP 4.4). A metadata transition: it does **not**
+    /// bump the content revision or record authorship — the status column is
+    /// lifecycle state, not content — so pending suggestions and optimistic
+    /// saves keep their anchors. Errors with
+    /// [`DocStoreError::NoSuchDocument`] when the document is gone.
+    pub async fn set_status(
+        &self,
+        pool: &SqlitePool,
+        id: DocumentId,
+        status: DocumentStatus,
+    ) -> Result<(), DocStoreError> {
+        let affected = sqlx::query("UPDATE documents SET status = ?, updated_at = ? WHERE id = ?")
+            .bind(status.as_str())
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(DocStoreError::NoSuchDocument(id));
+        }
+        Ok(())
+    }
+}
+
+/// Decode one summary row (`id, title, status, revision`).
+fn decode_summary(row: &sqlx::sqlite::SqliteRow) -> Result<DocumentSummary, DocStoreError> {
+    Ok(DocumentSummary {
+        id: row
+            .get::<String, _>("id")
+            .parse()
+            .map_err(|e: uuid::Error| DocStoreError::Corrupt(e.to_string()))?,
+        title: row.get("title"),
+        status: parse_status(row.get::<String, _>("status").as_str())?,
+        revision: row.get::<i64, _>("revision") as u64,
+    })
 }
 
 /// A compact document listing entry.

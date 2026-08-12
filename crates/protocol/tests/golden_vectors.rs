@@ -343,6 +343,22 @@ fn command_vectors() -> Vec<Vector> {
             },
         ),
         vec_of(
+            "CommandBody_CreateDocument",
+            CommandBody::CreateDocument {
+                title: "Payments Runbook".to_string(),
+                scope: Some("repository".to_string()),
+                repository: Some("/home/user/project".to_string()),
+                initial_markdown: Some("# Payments Runbook\n\nBody.\n".to_string()),
+            },
+        ),
+        vec_of(
+            "CommandBody_CheckDocuments",
+            CommandBody::CheckDocuments {
+                repository: Some("/home/user/project".to_string()),
+                session_id: Some(session_id()),
+            },
+        ),
+        vec_of(
             "CommandBody_MutateDocument",
             CommandBody::MutateDocument {
                 document_id: document_id(),
@@ -610,6 +626,23 @@ fn envelope_vectors() -> Vec<Vector> {
                     block_id: Some("b3".to_string()),
                     expires_at: sentinel_time(),
                 },
+            },
+        ),
+        vec_of(
+            "Payload_DocumentCreated",
+            Payload::DocumentCreated {
+                command_id: command_id(),
+                document_id: document_id(),
+            },
+        ),
+        vec_of(
+            "Payload_DocsCheckCompleted",
+            Payload::DocsCheckCompleted {
+                command_id: command_id(),
+                documents_checked: 4,
+                links_resolved: 9,
+                stale_findings: 2,
+                suggestions_filed: 2,
             },
         ),
         vec_of(

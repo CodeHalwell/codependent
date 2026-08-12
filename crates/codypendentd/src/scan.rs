@@ -104,6 +104,10 @@ pub fn discover_repository_root(root: &Path) -> Option<PathBuf> {
 /// revision the daemon has not folded warms the graph again, so a long-lived
 /// daemon does not keep serving a repository map from whatever the tree looked
 /// like at its first run.
+///
+/// Crate-visible because the `/update-docs` sweep labels its staleness findings
+/// with the same revision the scan resolved links at (`crate::docs_job`).
+#[must_use]
 pub fn head_revision(root: &Path) -> GitRevision {
     let head = std::process::Command::new("git")
         .arg("-C")

@@ -2885,6 +2885,15 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             document_id,
             target,
         },
+        // Creation names no document (there is none yet), so the scope defaults
+        // to this checkout's repository — the created document lives with the
+        // code it documents.
+        Intent::CreateDocument { title } => CommandBody::CreateDocument {
+            title,
+            scope: None,
+            repository: Some(repository.to_owned()),
+            initial_markdown: None,
+        },
         Intent::WatchDocument { .. } => unreachable!(
             "WatchDocument is applied locally by the harness, never sent to the daemon"
         ),
@@ -4741,11 +4750,15 @@ fn block_view(block: &DocumentBlock) -> DocBlockView {
         }
         BlockContent::EmbeddedSkill { skill } => ("embed-skill".to_owned(), skill.clone()),
     };
-    // Collapse to one line — the editor rail renders a block per row.
+    // Collapse to one line — the editor rail renders a block per row. The raw
+    // primary text rides alongside it so `e` can prefill the edit prompt with
+    // exactly what the block holds (and replace exactly that many characters);
+    // a structured/embed block has none, and the rail says so instead.
     DocBlockView {
         id: block.id.clone(),
         kind,
         text: text.replace('\n', " "),
+        editable: block.primary_text().map(str::to_owned),
     }
 }
 

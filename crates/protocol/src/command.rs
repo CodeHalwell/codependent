@@ -202,6 +202,63 @@ pub enum CommandBody {
         session_id: SessionId,
         update: IdeContextUpdate,
     },
+    /// Create a new collaborative document (Docs Studio, rubric #4 — before
+    /// this command existed the Docs Studio browsed a set nothing could ever
+    /// populate). Handled at the connection level like `MutateDocument`
+    /// (documents live outside the session ledger): the daemon creates the
+    /// document at revision 1 through its `DocumentCreator` seam — importing
+    /// `initial_markdown` into typed blocks when present, else an empty block
+    /// list — and replies
+    /// [`DocumentCreated`](crate::envelope::Payload::DocumentCreated) carrying
+    /// the new document id. An Observer is role-denied; a daemon assembled
+    /// without a creator rejects it `document.transport-unavailable`.
+    CreateDocument {
+        /// The document title (non-empty; the daemon rejects a blank one).
+        title: String,
+        /// The scope to create the document in: `"repository"` (the default
+        /// when absent — the document lives with the checkout),
+        /// `"system"`, or `"organization:<id>"` (organization docs default to
+        /// suggest-only agent collaboration). An unrecognized value is
+        /// rejected `document.invalid-scope`, never guessed at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        /// The canonical filesystem root of the repository a
+        /// repository-scoped document belongs to. Mirrors
+        /// [`StartRun.repository`](CommandBody::StartRun::repository):
+        /// `#[serde(default)]` keeps an older client working — the daemon then
+        /// falls back to its own startup root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository: Option<String>,
+        /// Markdown to seed the document's blocks from (`docs new --from
+        /// file.md`, the agent's `docs.create`). Imported lossily-but-
+        /// reasonably at block granularity; absent creates an empty document.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_markdown: Option<String>,
+    },
+    /// Run the documentation staleness check (`/update-docs` glue, Phase 4
+    /// STEP 4.6 finally wired): resolve every document's `{{ symbol:… }}`
+    /// links against the code graph, persist them, diff for signature
+    /// changes/disappearances, and file each finding as a Maintain-mode
+    /// suggestion (never a direct edit). Handled at the connection level like
+    /// `MutateDocument`; the daemon replies
+    /// [`DocsCheckCompleted`](crate::envelope::Payload::DocsCheckCompleted)
+    /// with the sweep's counts. An Observer is role-denied (the sweep files
+    /// suggestions); a daemon assembled without a checker rejects it
+    /// `document.transport-unavailable`.
+    CheckDocuments {
+        /// The canonical filesystem root of the repository whose code graph
+        /// the links resolve against. Mirrors
+        /// [`StartRun.repository`](CommandBody::StartRun::repository); absent
+        /// falls back to the daemon's startup root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository: Option<String>,
+        /// A session to surface the result into: when set and the sweep found
+        /// anything stale, the daemon appends a `NoteAppended` to this
+        /// session's ledger so the finding count reaches the active
+        /// conversation. Absent, the counts ride only on the reply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+    },
     /// Apply a semantic mutation to a collaborative document (Phase 4 STEP 4.3).
     ///
     /// Handled at the connection level (documents live outside the session
@@ -765,6 +822,27 @@ mod tests {
                 ..Default::default()
             },
         });
+        round_trip(CommandBody::CreateDocument {
+            title: "Payments Runbook".to_string(),
+            scope: Some("repository".to_string()),
+            repository: Some("/home/user/project".to_string()),
+            initial_markdown: Some("# Payments Runbook\n\nBody.\n".to_string()),
+        });
+        // The minimal create (an older client's shape): only the title.
+        round_trip(CommandBody::CreateDocument {
+            title: "Notes".to_string(),
+            scope: None,
+            repository: None,
+            initial_markdown: None,
+        });
+        round_trip(CommandBody::CheckDocuments {
+            repository: Some("/home/user/project".to_string()),
+            session_id: Some(SessionId::new()),
+        });
+        round_trip(CommandBody::CheckDocuments {
+            repository: None,
+            session_id: None,
+        });
         round_trip(CommandBody::MutateDocument {
             document_id: DocumentId::new(),
             mutation: DocumentMutation::EditText {
@@ -964,6 +1042,31 @@ mod tests {
         assert!(
             json.contains("/home/user/project"),
             "repository on the wire: {json}"
+        );
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body);
+    }
+
+    #[test]
+    fn create_document_omits_absent_optionals() {
+        // A title-only create sends none of the optional keys, and such a
+        // payload (also what an older client emits) reparses with all three
+        // defaulted to None.
+        let body = CommandBody::CreateDocument {
+            title: "Notes".to_string(),
+            scope: None,
+            repository: None,
+            initial_markdown: None,
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(!json.contains("scope"), "absent scope is skipped: {json}");
+        assert!(
+            !json.contains("repository"),
+            "absent repository is skipped: {json}"
+        );
+        assert!(
+            !json.contains("initial_markdown"),
+            "absent markdown is skipped: {json}"
         );
         let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, body);

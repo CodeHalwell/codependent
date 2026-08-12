@@ -375,7 +375,9 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         | Overlay::UnslothQuants { .. }
         | Overlay::UnslothConfirmPull { .. }
         | Overlay::UnslothPulling { .. } => "local models: unsloth catalog",
-        Overlay::DocEdit { .. } => "document editor",
+        Overlay::DocEdit { .. } | Overlay::DocInsert { .. } => "document editor",
+        Overlay::DocNew { .. } => "new document",
+        Overlay::DocDeleteConfirm { .. } => "delete block confirmation",
         Overlay::DocPublishPath { .. } => "document publish path",
         Overlay::ConfirmUiPluginApprove { .. }
         | Overlay::ConfirmUiPluginReject { .. }

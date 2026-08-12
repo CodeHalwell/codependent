@@ -133,6 +133,19 @@
     "type": "DaemonStatusResponse",
     "uptime_seconds": 3600
   },
+  "Payload_DocsCheckCompleted": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "documents_checked": 4,
+    "links_resolved": 9,
+    "stale_findings": 2,
+    "suggestions_filed": 2,
+    "type": "DocsCheckCompleted"
+  },
+  "Payload_DocumentCreated": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "document_id": "70000000-0000-0000-0000-000000000001",
+    "type": "DocumentCreated"
+  },
   "Payload_DocumentLeaseGranted": {
     "command_id": "40000000-0000-0000-0000-000000000001",
     "grant": {

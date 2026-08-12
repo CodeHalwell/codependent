@@ -531,6 +531,29 @@ enum WorkflowCommand {
 
 #[derive(Subcommand)]
 enum DocsCommand {
+    /// Create a collaborative document (rubric #4 doc-writer). Sends
+    /// `CreateDocument`; with `--from` the Markdown file is imported into typed
+    /// blocks (headings / paragraphs / code / lists / tables / callouts /
+    /// embeds), otherwise the document starts empty. Prints the new id.
+    New {
+        /// The document title.
+        title: String,
+        /// A Markdown file to seed the document's blocks from.
+        #[arg(long = "from", value_name = "FILE")]
+        from: Option<PathBuf>,
+        /// The scope to create it in: `repository` (default), `system`, or
+        /// `organization:<uuid>`.
+        #[arg(long)]
+        scope: Option<String>,
+    },
+    /// List the documents this checkout can see (repository + system scope),
+    /// newest first, with their status and revision.
+    List,
+    /// Run the documentation staleness check (`/update-docs`): resolve every
+    /// document's `{{ symbol:… }}` links against the code graph, diff them for
+    /// signature changes and disappearances, and file each finding as a
+    /// reviewable Maintain-mode suggestion. Prints the finding counts.
+    Check,
     /// Publish a document's current revision to a Git target (Phase 4 STEP
     /// 4.4). Prints the computed plan (target / changed files / resulting Git
     /// action) and prompts for confirmation, then sends `PublishDocument`;
@@ -1000,6 +1023,11 @@ async fn main() -> anyhow::Result<()> {
             commands::fix_ci(&paths, pr, repo).await
         }
         TopCommand::Docs { command } => match command {
+            DocsCommand::New { title, from, scope } => {
+                commands::docs_new(&paths, &title, from.as_deref(), scope).await
+            }
+            DocsCommand::List => commands::docs_list(&paths).await,
+            DocsCommand::Check => commands::docs_check(&paths).await,
             DocsCommand::Publish {
                 document,
                 target,

@@ -84,21 +84,27 @@ use codypendent_sandbox::sanitize_untrusted;
 pub use agent_framework_core::tools::ToolDefinition;
 
 use crate::blackboard::{BlackboardChannel, BlackboardChannelError, BlackboardPost};
+use crate::docs::{
+    DocsAuthor, DocsChannel, DocsChannelError, DocsCreate, DocsEdit, DocsSuggest, DocsWriteEffect,
+};
 use crate::models::ModelRegistry;
 use crate::tools::{
-    new_pull_request, parse_blackboard_post, parse_blackboard_query, parse_create_check_run,
-    parse_create_draft_pull_request, parse_edit_file as parse_edit_file_args,
-    parse_get_pull_request, parse_list_check_runs, parse_memory_remember, parse_skills_search,
-    parse_update_pull_request, parse_web_search, parse_write_file as parse_write_file_args,
-    render_check_runs, render_pull_request, render_registry_search, render_search_outcome,
-    tool_label, ApplyPatch, ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
+    ApplyPatch, ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
     BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CreateCheckRunInput,
-    CreateCheckRunSummary, CreateDraftPullRequest, CreateDraftPullRequestInput, EditFile,
-    EditFileInput, EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput,
-    ListCheckRuns, ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile,
-    ReadFileInput, RegistrySearch, RegistrySearchRequest, RepositoryTest, Search, SearchInput,
-    Shell, SkillsSearch, SkillsSearchInput, UpdatePullRequestInput, UpdatePullRequestTool,
-    WebSearch, WebSearchInput, WriteFile, WriteFileInput,
+    CreateCheckRunSummary, CreateDraftPullRequest, CreateDraftPullRequestInput,
+    docs_proposed_action, DocsCreateInput, DocsCreateTool, DocsEditInput, DocsEditTool,
+    DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool, EditFile, EditFileInput,
+    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput,
+    ListCheckRuns, ListCheckRunsInput, MemoryRemember, MemoryRememberInput, new_pull_request,
+    parse_blackboard_post, parse_blackboard_query, parse_create_check_run,
+    parse_create_draft_pull_request, parse_docs_create, parse_docs_edit, parse_docs_read,
+    parse_docs_suggest, parse_edit_file as parse_edit_file_args, parse_get_pull_request,
+    parse_list_check_runs, parse_memory_remember, parse_skills_search,
+    parse_update_pull_request, parse_web_search, parse_write_file as parse_write_file_args,
+    ReadFile, ReadFileInput, RegistrySearch, RegistrySearchRequest, render_check_runs,
+    render_pull_request, render_registry_search, render_search_outcome, RepositoryTest, Search,
+    SearchInput, Shell, SkillsSearch, SkillsSearchInput, tool_label, UpdatePullRequestInput,
+    UpdatePullRequestTool, WebSearch, WebSearchInput, WriteFile, WriteFileInput,
 };
 
 /// Safety valve: the maximum number of `next_step` calls a single run makes
@@ -1109,6 +1115,12 @@ pub struct FrameworkAgentRuntime {
     /// the runtime rather than the run context. `None` leaves the tool unoffered
     /// and the run behaves exactly as before.
     registry: Option<Arc<dyn RegistrySearch>>,
+    /// The document channel the `docs.*` tools author through (rubric #4), if
+    /// wired. Like `blackboard`, it is process-wide (one knowledge fabric), so it
+    /// lives on the runtime rather than the run context; unlike it, there is no
+    /// per-run gate — drafting documentation is useful in any run, and the
+    /// document's own collaboration mode is what bounds what an agent may do.
+    docs: Option<Arc<dyn DocsChannel>>,
 }
 
 /// How a run terminated, before it is folded into a [`RunDisposition`].
@@ -1145,6 +1157,7 @@ impl FrameworkAgentRuntime {
             blackboard: None,
             mcp_top_k: crate::models::DEFAULT_MCP_TOP_K,
             registry: None,
+            docs: None,
         }
     }
 
@@ -1202,6 +1215,33 @@ impl FrameworkAgentRuntime {
     pub fn with_registry_search(mut self, registry: Arc<dyn RegistrySearch>) -> Self {
         self.registry = Some(registry);
         self
+    }
+
+    /// Bind the document channel the `docs.*` tools author through (rubric #4).
+    /// The assembly binds it over the knowledge fabric's `apply_mutation` seam —
+    /// the same collaboration-mode gate a human client's `MutateDocument` passes
+    /// through — so an agent edit to an organization-scope document lands as a
+    /// reviewable suggestion rather than a silent content change.
+    #[must_use]
+    pub fn with_docs(mut self, docs: Arc<dyn DocsChannel>) -> Self {
+        self.docs = Some(docs);
+        self
+    }
+
+    /// The document author for `run`, built SERVER-SIDE from the run context and
+    /// the active policy — never from model-supplied identity. `run_actor` is the
+    /// same `Actor::Agent` every event of this run is attributed to, so the
+    /// document's attribution log and the run's ledger name the same model.
+    fn docs_author(&self, run: &RunContext, run_actor: &Actor) -> DocsAuthor {
+        let model = match run_actor {
+            Actor::Agent { model, .. } => model.0.clone(),
+            _ => String::new(),
+        };
+        DocsAuthor {
+            run_id: run.run_id,
+            model,
+            policy_version: self.policy.policy_version().to_string(),
+        }
     }
 
     /// Whether the `blackboard.*` tools are offered to `run`: only when a channel
@@ -1289,6 +1329,22 @@ impl FrameworkAgentRuntime {
                 [BlackboardPostTool::NAME, BlackboardQueryTool::NAME]
                     .iter()
                     .map(|name| (*name).to_string()),
+            );
+        }
+        // The `docs.*` tools (rubric #4): offered whenever a document channel is
+        // wired — like `web.search`, the configured gate alone decides, since
+        // there is no per-run target to resolve. Safety comes from the
+        // document's collaboration mode, not from withholding the tools.
+        if self.docs.is_some() {
+            names.extend(
+                [
+                    DocsCreateTool::NAME,
+                    DocsReadTool::NAME,
+                    DocsEditTool::NAME,
+                    DocsSuggestTool::NAME,
+                ]
+                .iter()
+                .map(|name| (*name).to_string()),
             );
         }
         if let Some(bridge) = &self.mcp {
@@ -2478,6 +2534,56 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::BlackboardQuery(input),
                 })
             }
+            // The `docs.*` tools (rubric #4). Match-guarded on a wired channel
+            // (the blackboard idiom): with none, a call falls through to the
+            // unknown-tool arm — the same refusal the offering gate promised.
+            DocsCreateTool::NAME if self.docs.is_some() => {
+                let input = parse_docs_create(args)?;
+                Ok(Prepared {
+                    // No document exists yet, so the traced action names none.
+                    action: docs_proposed_action("", format!("docs.create \"{}\"", input.title)),
+                    tool: PreparedTool::DocsCreate(input),
+                })
+            }
+            DocsReadTool::NAME if self.docs.is_some() => {
+                let input = parse_docs_read(args);
+                let summary = match &input.document_id {
+                    Some(id) => format!("docs.read {id}"),
+                    None => "docs.read (list)".to_string(),
+                };
+                Ok(Prepared {
+                    action: docs_proposed_action(
+                        input.document_id.as_deref().unwrap_or_default(),
+                        summary,
+                    ),
+                    tool: PreparedTool::DocsRead(input),
+                })
+            }
+            DocsEditTool::NAME if self.docs.is_some() => {
+                let input = parse_docs_edit(args)?;
+                let action = docs_proposed_action(
+                    &input.document_id,
+                    format!("docs.edit block {}", input.block_id),
+                );
+                Ok(Prepared {
+                    action,
+                    tool: PreparedTool::DocsEdit(input),
+                })
+            }
+            DocsSuggestTool::NAME if self.docs.is_some() => {
+                let input = parse_docs_suggest(args)?;
+                let action = docs_proposed_action(
+                    &input.document_id,
+                    format!(
+                        "docs.suggest block {} [{}..{})",
+                        input.block_id, input.range_start, input.range_end
+                    ),
+                );
+                Ok(Prepared {
+                    action,
+                    tool: PreparedTool::DocsSuggest(input),
+                })
+            }
             // CORE (smarter-memory M2): unconditional — no run gate, unlike the
             // blackboard arms above.
             MemoryRemember::NAME => {
@@ -2879,6 +2985,14 @@ impl FrameworkAgentRuntime {
             PreparedTool::MemoryRemember(input) => {
                 self.execute_memory_remember(input, run, run_actor).await
             }
+            PreparedTool::DocsCreate(input) => {
+                self.execute_docs_create(input, run, run_actor).await
+            }
+            PreparedTool::DocsRead(input) => self.execute_docs_read(input, run).await,
+            PreparedTool::DocsEdit(input) => self.execute_docs_edit(input, run, run_actor).await,
+            PreparedTool::DocsSuggest(input) => {
+                self.execute_docs_suggest(input, run, run_actor).await
+            }
             PreparedTool::WebSearch(input) => match self.search.as_ref() {
                 None => web_search_unconfigured(),
                 Some(client) => match client.search(&input.query, input.max_results).await {
@@ -3009,6 +3123,128 @@ impl FrameworkAgentRuntime {
     /// ledger (smarter-memory M2). Harvest's `explicit_proposal_candidates`
     /// later turns it into a `Semantic` candidate — no new harvest wiring is
     /// needed here. The entire side effect of this tool is the note.
+    /// `docs.create`: draft a document, attributed to this run's agent identity.
+    async fn execute_docs_create(
+        &self,
+        input: DocsCreateInput,
+        run: &RunContext,
+        run_actor: &Actor,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let Some(docs) = self.docs.as_ref() else {
+            return docs_unavailable();
+        };
+        let author = self.docs_author(run, run_actor);
+        let repository = run.repository.to_string_lossy().into_owned();
+        let title = input.title.clone();
+        match docs
+            .create(
+                &author,
+                DocsCreate {
+                    title: input.title,
+                    scope: input.scope,
+                    markdown: input.markdown,
+                },
+                &repository,
+            )
+            .await
+        {
+            Ok(document_id) => (
+                format!(
+                    "created document \"{title}\" ({document_id}). Use docs.read to see its \
+                     blocks, docs.edit to change one, or docs.suggest to propose a change."
+                ),
+                None,
+                ToolOutcome::Succeeded,
+            ),
+            Err(error) => docs_failure(&error),
+        }
+    }
+
+    /// `docs.read`: render a document (or list the visible ones).
+    async fn execute_docs_read(
+        &self,
+        input: DocsReadInput,
+        run: &RunContext,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let Some(docs) = self.docs.as_ref() else {
+            return docs_unavailable();
+        };
+        let repository = run.repository.to_string_lossy().into_owned();
+        match docs.read(input.document_id.as_deref(), &repository).await {
+            Ok(rendered) => (rendered, None, ToolOutcome::Succeeded),
+            Err(error) => docs_failure(&error),
+        }
+    }
+
+    /// `docs.edit`: replace a block's text, routed through the document's
+    /// collaboration mode. The observation tells the agent WHICH happened —
+    /// "applied" and "proposed for review" are materially different outcomes.
+    async fn execute_docs_edit(
+        &self,
+        input: DocsEditInput,
+        run: &RunContext,
+        run_actor: &Actor,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let Some(docs) = self.docs.as_ref() else {
+            return docs_unavailable();
+        };
+        let author = self.docs_author(run, run_actor);
+        let block_id = input.block_id.clone();
+        match docs
+            .edit(
+                &author,
+                DocsEdit {
+                    document_id: input.document_id,
+                    block_id: input.block_id,
+                    text: input.text,
+                },
+            )
+            .await
+        {
+            Ok(effect) => (
+                describe_docs_effect(&effect, &format!("block {block_id}")),
+                None,
+                ToolOutcome::Succeeded,
+            ),
+            Err(error) => docs_failure(&error),
+        }
+    }
+
+    /// `docs.suggest`: propose a range replacement for human review.
+    async fn execute_docs_suggest(
+        &self,
+        input: DocsSuggestInput,
+        run: &RunContext,
+        run_actor: &Actor,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let Some(docs) = self.docs.as_ref() else {
+            return docs_unavailable();
+        };
+        let author = self.docs_author(run, run_actor);
+        let block_id = input.block_id.clone();
+        match docs
+            .suggest(
+                &author,
+                DocsSuggest {
+                    document_id: input.document_id,
+                    block_id: input.block_id,
+                    range_start: input.range_start,
+                    range_end: input.range_end,
+                    replacement: input.replacement,
+                    rationale: input.rationale,
+                },
+            )
+            .await
+        {
+            Ok(effect) => (
+                describe_docs_effect(&effect, &format!("block {block_id}")),
+                None,
+                ToolOutcome::Succeeded,
+            ),
+            Err(error) => docs_failure(&error),
+        }
+    }
+
     async fn execute_memory_remember(
         &self,
         input: MemoryRememberInput,
@@ -3249,6 +3485,10 @@ enum PreparedTool {
     /// A `skills.search` call (rubric 9): the parsed query plus the optional
     /// skill name whose procedure to open.
     SkillsSearch(SkillsSearchInput),
+    DocsCreate(DocsCreateInput),
+    DocsRead(DocsReadInput),
+    DocsEdit(DocsEditInput),
+    DocsSuggest(DocsSuggestInput),
     /// An MCP tool call (PR B): the dispatch pair `prepare`'s guard verified
     /// against the bridge's offered cache, plus the RAW model-supplied args
     /// (the canonical form lives on the `McpToolCall` action, for the digest).
@@ -3317,6 +3557,49 @@ fn web_search_unconfigured() -> (String, Option<ArtifactRef>, ToolOutcome) {
             message: "web.search.unconfigured".to_string(),
         },
     )
+}
+
+/// The tool-result tuple for a `docs.*` call with no wired channel (defensive:
+/// `prepare`'s match guards already refuse such a call as an unknown tool).
+fn docs_unavailable() -> (String, Option<ArtifactRef>, ToolOutcome) {
+    (
+        "the document fabric is not available for this run".to_string(),
+        None,
+        ToolOutcome::Failed {
+            message: "docs.unavailable".to_string(),
+        },
+    )
+}
+
+/// Feed a document failure back to the agent as a CORRECTABLE observation: the
+/// legible reason plus its stable dotted code (a drifted range, for instance, is
+/// fixed by re-reading and proposing again).
+fn docs_failure(error: &DocsChannelError) -> (String, Option<ArtifactRef>, ToolOutcome) {
+    (
+        format!("document error: {error}"),
+        None,
+        ToolOutcome::Failed {
+            message: error.code().to_string(),
+        },
+    )
+}
+
+/// Describe what a document write actually did. The agent MUST be able to tell
+/// "applied" from "proposed for review" — an organization-scope document's
+/// default `Suggest` mode turns every agent edit into the latter, and an agent
+/// that believed it had applied a change would report finished work that no
+/// human has accepted.
+fn describe_docs_effect(effect: &DocsWriteEffect, target: &str) -> String {
+    match effect {
+        DocsWriteEffect::Applied { revision } => {
+            format!("applied to {target}; the document is now at revision {revision}")
+        }
+        DocsWriteEffect::Suggested { suggestion_id } => format!(
+            "proposed as suggestion {suggestion_id} on {target}. This document's collaboration \
+             mode routes agent changes through review, so NOTHING changed yet — a human must \
+             accept it in the Docs Studio review rail."
+        ),
+    }
 }
 
 /// The tool-result tuple for an `mcp.*` call with no wired bridge (defensive:

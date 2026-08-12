@@ -569,3 +569,182 @@ async fn propose_refuses_a_stale_source_revision() {
     // Nothing was recorded — no stale suggestion lingers on the review rail.
     assert!(suggestions.pending(&pool, doc.id).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn accepting_one_suggestion_re_anchors_the_others_so_all_three_apply() {
+    // The N>1 review-session fix: three suggestions proposed against the same
+    // revision, each targeting its own block. Accepting the first bumps the
+    // document revision; the other two must be re-anchored (their block text
+    // is untouched, so their anchors still hold) rather than stranded behind
+    // `SuggestionRangeDrifted` — a reviewer can accept all three.
+    let (_tmp, pool) = temp_pool().await;
+    let docs = DocumentStore::new();
+    let suggestions = SuggestionStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("reviewer".into()),
+    };
+    let mut doc = docs
+        .create(
+            &pool,
+            NewDocument {
+                title: "Doc".into(),
+                scope: Scope::Organization(OrganizationId::new()),
+                metadata: DocumentMetadata::default(),
+                blocks: vec![
+                    DocumentBlock::with_id(
+                        "a",
+                        BlockContent::Paragraph {
+                            text: "alpha text".into(),
+                        },
+                    ),
+                    DocumentBlock::with_id(
+                        "b",
+                        BlockContent::Paragraph {
+                            text: "beta text".into(),
+                        },
+                    ),
+                    DocumentBlock::with_id(
+                        "c",
+                        BlockContent::Paragraph {
+                            text: "gamma text".into(),
+                        },
+                    ),
+                ],
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+
+    let propose = |block: &str, original: &str, replacement: &str, revision: u64| NewSuggestion {
+        block_id: block.into(),
+        range_start: 0,
+        range_end: original.chars().count(),
+        source_revision: revision,
+        original: original.into(),
+        replacement: replacement.into(),
+        author: human.clone(),
+        rationale: None,
+    };
+    let s1 = suggestions
+        .propose(&pool, doc.id, propose("a", "alpha", "ALPHA", doc.revision))
+        .await
+        .unwrap();
+    let s2 = suggestions
+        .propose(&pool, doc.id, propose("b", "beta", "BETA", doc.revision))
+        .await
+        .unwrap();
+    let s3 = suggestions
+        .propose(&pool, doc.id, propose("c", "gamma", "GAMMA", doc.revision))
+        .await
+        .unwrap();
+
+    // Accept all three, in order — each accept re-anchors the survivors.
+    suggestions
+        .accept(&pool, &mut doc, &s1.id, &human)
+        .await
+        .expect("first accept");
+    suggestions
+        .accept(&pool, &mut doc, &s2.id, &human)
+        .await
+        .expect("second accept must not be stranded by the first");
+    suggestions
+        .accept(&pool, &mut doc, &s3.id, &human)
+        .await
+        .expect("third accept must not be stranded either");
+
+    let blocks = doc.blocks().unwrap();
+    assert_eq!(blocks[0].content_text(), "ALPHA text");
+    assert_eq!(blocks[1].content_text(), "BETA text");
+    assert_eq!(blocks[2].content_text(), "GAMMA text");
+    assert!(suggestions.pending(&pool, doc.id).await.unwrap().is_empty());
+
+    // The persisted document agrees (the re-anchor commits atomically with
+    // each accept).
+    let reloaded = docs.load(&pool, doc.id).await.unwrap().unwrap();
+    assert_eq!(reloaded.revision, 4);
+}
+
+#[tokio::test]
+async fn re_anchoring_still_refuses_a_genuinely_drifted_survivor() {
+    // Two suggestions on the SAME block: accepting the first changes text ahead
+    // of the second's range, so the second's anchor no longer matches. It must
+    // stay refused (`SuggestionRangeDrifted`) — re-anchoring never resurrects a
+    // suggestion whose offsets would now hit the wrong characters.
+    let (_tmp, pool) = temp_pool().await;
+    let docs = DocumentStore::new();
+    let suggestions = SuggestionStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("reviewer".into()),
+    };
+    let mut doc = docs
+        .create(
+            &pool,
+            NewDocument {
+                title: "Doc".into(),
+                scope: Scope::Organization(OrganizationId::new()),
+                metadata: DocumentMetadata::default(),
+                blocks: vec![DocumentBlock::with_id(
+                    "p",
+                    BlockContent::Paragraph {
+                        text: "hello world".into(),
+                    },
+                )],
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+
+    // First replaces "hello" (0..5) with a LONGER word, shifting everything
+    // after it; second targets "world" at 6..11 — stale after the first lands.
+    let s1 = suggestions
+        .propose(
+            &pool,
+            doc.id,
+            NewSuggestion {
+                block_id: "p".into(),
+                range_start: 0,
+                range_end: 5,
+                source_revision: doc.revision,
+                original: "hello".into(),
+                replacement: "greetings".into(),
+                author: human.clone(),
+                rationale: None,
+            },
+        )
+        .await
+        .unwrap();
+    let s2 = suggestions
+        .propose(
+            &pool,
+            doc.id,
+            NewSuggestion {
+                block_id: "p".into(),
+                range_start: 6,
+                range_end: 11,
+                source_revision: doc.revision,
+                original: "world".into(),
+                replacement: "WORLD".into(),
+                author: human.clone(),
+                rationale: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    suggestions
+        .accept(&pool, &mut doc, &s1.id, &human)
+        .await
+        .expect("first accept");
+    assert_eq!(doc.blocks().unwrap()[0].content_text(), "greetings world");
+
+    // 6..11 now covers "gs wo", not "world" — refused, still pending.
+    let err = suggestions
+        .accept(&pool, &mut doc, &s2.id, &human)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DocStoreError::SuggestionRangeDrifted(_)));
+    assert_eq!(suggestions.pending(&pool, doc.id).await.unwrap().len(), 1);
+    assert_eq!(doc.blocks().unwrap()[0].content_text(), "greetings world");
+}

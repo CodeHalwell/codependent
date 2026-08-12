@@ -14,7 +14,12 @@
 //! the server.
 
 mod blackboard;
-mod documents;
+// The agent document channel and the client mutation seam are `pub` so the
+// crate's own integration tests can drive the SAME production seams the daemon
+// wires (see `tests/docs_agent_it.rs`), rather than re-implementing them.
+pub mod docs_channel;
+mod docs_job;
+pub mod documents;
 mod executor;
 mod promotion;
 mod publish;

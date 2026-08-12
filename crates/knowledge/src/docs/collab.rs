@@ -342,6 +342,25 @@ impl SuggestionStore {
             now,
         )
         .await?;
+        // Re-anchor the OTHER pending suggestions to the new revision — in the
+        // SAME transaction, so the review rail never lands half-updated. Without
+        // this, accepting one suggestion bumped the revision and stranded every
+        // other pending suggestion behind the `source_revision == doc.revision`
+        // guard above: a three-suggestion review session could accept exactly
+        // one. A suggestion is re-anchored only when its anchor still PROVES its
+        // offsets cover the text the proposer saw in the post-accept document:
+        //
+        // * a different block — untouched by this accept — whose anchor text
+        //   still matches (it must, but the check keeps this fail-closed);
+        // * the SAME block when its non-empty `original` still matches at the
+        //   stored offsets (the accepted range did not shift it).
+        //
+        // A zero-length (insertion) suggestion in the same block is never
+        // re-anchored: its empty `original` matches anywhere, so it cannot
+        // detect that the accepted edit shifted its offset — exactly the drift
+        // the revision guard exists to refuse. Genuinely drifted suggestions
+        // keep refusing with `SuggestionRangeDrifted`, unchanged.
+        re_anchor_pending_tx(&mut tx, doc, &suggestion, revision).await?;
         tx.commit().await?;
         doc.revision = revision;
         Ok(revision)
@@ -405,6 +424,57 @@ impl SuggestionStore {
         .ok_or_else(|| DocStoreError::Corrupt(format!("no such suggestion: {suggestion_id}")))?;
         decode_suggestion(&row, document_id)
     }
+}
+
+/// Re-anchor the still-pending suggestions of `doc` (other than the one just
+/// `accepted`) onto `new_revision`, inside the accept's own transaction. Only a
+/// suggestion whose anchor text still matches the post-accept CRDT at its
+/// stored offsets is bumped (see the call site's comment for the exact rules);
+/// everything else is left at its old `source_revision` and keeps refusing as
+/// drifted. An out-of-range anchor read simply skips the suggestion — drift,
+/// not an error.
+async fn re_anchor_pending_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    doc: &Document,
+    accepted: &Suggestion,
+    new_revision: u64,
+) -> Result<(), DocStoreError> {
+    let rows = sqlx::query(
+        "SELECT id, block_id, range_start, range_end, source_revision, original, replacement, \
+         author_json, rationale, status FROM document_suggestions \
+         WHERE document_id = ? AND status = 'pending' ORDER BY created_at ASC, id ASC",
+    )
+    .bind(doc.id.to_string())
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in &rows {
+        let other = decode_suggestion(row, doc.id)?;
+        if other.id == accepted.id {
+            continue;
+        }
+        let same_block = other.block_id == accepted.block_id;
+        if same_block && other.original.is_empty() {
+            // An insertion's empty anchor cannot prove its offset survived an
+            // edit to its own block — leave it drifted.
+            continue;
+        }
+        let anchored = matches!(
+            doc.crdt
+                .text_range(&other.block_id, other.range_start, other.range_end),
+            Ok(current) if current == other.original
+        );
+        if anchored {
+            sqlx::query(
+                "UPDATE document_suggestions SET source_revision = ? \
+                 WHERE id = ? AND status = 'pending'",
+            )
+            .bind(new_revision as i64)
+            .bind(&other.id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Stamp a suggestion's resolution **only if it is still pending**, within the

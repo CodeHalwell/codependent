@@ -2254,8 +2254,34 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 area,
                 state,
                 theme,
-                "Insert text into the focused block",
+                "Edit the focused block (replaces its text)",
                 buffer,
+            );
+        }
+        Overlay::DocNew { buffer } => {
+            render_docs(frame, area, state, theme);
+            render_prompt(frame, area, state, theme, "New document title", buffer);
+        }
+        Overlay::DocInsert { buffer, .. } => {
+            render_docs(frame, area, state, theme);
+            render_prompt(
+                frame,
+                area,
+                state,
+                theme,
+                "New paragraph below the focused block",
+                buffer,
+            );
+        }
+        Overlay::DocDeleteConfirm { label, .. } => {
+            render_docs(frame, area, state, theme);
+            render_confirm_box(
+                frame,
+                area,
+                state,
+                theme,
+                &format!("Delete this block? ({label})"),
+                "The block and its text are removed from the document.",
             );
         }
         Overlay::DocPublishPath { buffer, .. } => {
@@ -4090,12 +4116,15 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     );
     frame.render_widget(
         Paragraph::new(vec![
+            // Both lines are sized to the narrowest rail this footer is pinned
+            // in (43 columns at an 80-wide terminal), so no control is silently
+            // truncated away.
             Line::styled(
-                " Tab rail · ↑/↓ select · Esc close",
+                " Tab rail · ↑/↓ · a accept · r reject · Esc",
                 Style::default().fg(theme.text.muted),
             ),
             Line::styled(
-                " e edit · a accept · r reject · P publish",
+                " n new · e edit · i ins · X del · P publish",
                 Style::default().fg(theme.focus.active),
             ),
         ]),
@@ -9367,11 +9396,13 @@ mod tests {
                     id: "b1".to_owned(),
                     kind: "heading".to_owned(),
                     text: "Charging a customer".to_owned(),
+                    editable: Some("Charging a customer".to_owned()),
                 },
                 DocBlockView {
                     id: "b2".to_owned(),
                     kind: "paragraph".to_owned(),
                     text: "Call charge_customer with an idempotency key.".to_owned(),
+                    editable: Some("Call charge_customer with an idempotency key.".to_owned()),
                 },
             ],
             suggestions: vec![DocSuggestionView {
@@ -9410,6 +9441,7 @@ mod tests {
                 id: format!("b{index}"),
                 kind: "paragraph".to_owned(),
                 text: format!("block-{index}"),
+                editable: Some(format!("block-{index}")),
             });
         }
         state.doc_focus = DocFocus::Editor;

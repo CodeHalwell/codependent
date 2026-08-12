@@ -15,6 +15,7 @@
 pub mod apply;
 pub mod collab;
 pub mod crdt;
+pub mod import;
 pub mod leases;
 pub mod model;
 pub mod render;
@@ -24,6 +25,7 @@ pub mod store;
 
 pub use apply::{apply_mutation, ApplyError, MutationEffect, MutationOutcome};
 pub use crdt::{DocCrdtError, DocumentCrdt};
+pub use import::{import_markdown, markdown_to_blocks};
 pub use leases::{DocumentLease, DocumentLeaseStore, LeaseError};
 pub use model::{
     AuthorshipRecord, BlockContent, ChecklistItem, Citation, DocumentAuthor, DocumentBlock,

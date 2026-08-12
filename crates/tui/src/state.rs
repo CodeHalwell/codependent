@@ -244,7 +244,25 @@ pub enum Overlay {
     /// `MutateDocument`; the daemon's collaboration mode decides whether it applies
     /// directly (Edit) or lands as a suggestion (Suggest). `block_id` is the block
     /// the edit targets, captured when the prompt opened.
-    DocEdit { block_id: String, buffer: String },
+    DocEdit {
+        block_id: String,
+        buffer: String,
+        /// The block's text as it was when the prompt opened, prefilled into
+        /// `buffer`. Submit sends a FULL REPLACE — delete exactly this many
+        /// characters, then insert the buffer — so `e` is a real editor rather
+        /// than the prepend-only insertion it used to be.
+        original: String,
+    },
+    /// The Docs Studio new-document prompt: a single-line title buffer. Submit
+    /// sends `CreateDocument` (rubric #4 — before this the Docs Studio browsed a
+    /// set nothing could populate).
+    DocNew { buffer: String },
+    /// The Docs Studio new-block prompt: text for a paragraph inserted directly
+    /// below the focused block (or at the top of an empty document).
+    DocInsert { index: u32, buffer: String },
+    /// Confirm deleting the focused block. Destructive and un-undoable from the
+    /// TUI, so it never fires straight off a keypress.
+    DocDeleteConfirm { block_id: String, label: String },
     /// Repository-relative Markdown path for publishing the focused document.
     DocPublishPath {
         document_id: DocumentId,
@@ -744,6 +762,11 @@ pub struct DocBlockView {
     pub kind: String,
     /// A one-line human rendering of the block's content.
     pub text: String,
+    /// The block's primary text VERBATIM (newlines included), or `None` for a
+    /// structured/embed block that has no single editable text container. This
+    /// is what the `e` prompt prefills and what its full-replace deletes — the
+    /// one-line `text` above is display-only and lossy.
+    pub editable: Option<String>,
 }
 
 /// One pending suggestion on a document (the review rail): a proposed
@@ -1632,6 +1655,8 @@ impl AppState {
             | Overlay::WorkflowInputs { .. }
             | Overlay::EdgeSearch(_)
             | Overlay::DocEdit { .. }
+            | Overlay::DocNew { .. }
+            | Overlay::DocInsert { .. }
             | Overlay::DocPublishPath { .. }
             | Overlay::AddModelId { .. }
             | Overlay::AddModelKey { .. }
@@ -1646,6 +1671,7 @@ impl AppState {
             | Overlay::ConfirmUiPluginRevoke { .. }
             | Overlay::ConfirmCouncilDelete { .. }
             | Overlay::UnslothConfirmPull { .. } => InputMode::Confirm,
+            | Overlay::DocDeleteConfirm { .. } => InputMode::Confirm,
             // The palette, the model picker, the provider picker, the mode
             // picker, the `/keys` overlay, and the add-model pick-list all
             // filter on printable keys while staying arrow-navigable, so they
