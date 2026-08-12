@@ -4819,6 +4819,8 @@ fn measured_usage(
 
 #[cfg(test)]
 mod tests {
+    // Only the retry tests count requests, and they need a live driver.
+    #[cfg(feature = "provider-openai")]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
