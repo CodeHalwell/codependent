@@ -38,6 +38,7 @@ mod github;
 mod label;
 mod memory;
 mod read_file;
+mod registry_search;
 mod repository;
 mod salient;
 mod search;
@@ -71,6 +72,11 @@ pub use github::{
 pub use label::tool_label;
 pub use memory::{parse_memory_remember, MemoryRemember, MemoryRememberInput};
 pub use read_file::{FileExcerpt, ReadFile, ReadFileInput};
+pub use registry_search::{
+    parse_skills_search, render_registry_search, RegistryCard, RegistrySearch,
+    RegistrySearchOutcome, RegistrySearchRequest, SkillDocument, SkillsSearch, SkillsSearchInput,
+    SEARCH_CARD_LIMIT, SKILL_DOCUMENT_MAX_BYTES,
+};
 pub use repository::{RepositoryTest, RepositoryTestOutcome};
 pub use salient::{SalientStream, SalientView};
 pub use search::{Search, SearchInput, SearchMatch, SearchResults};

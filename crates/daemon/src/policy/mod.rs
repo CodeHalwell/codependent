@@ -327,6 +327,7 @@ impl PolicyEngine {
                 self.eval_blackboard()
             }
             ProposedAction::RecordMemory => self.eval_record_memory(),
+            ProposedAction::SearchRegistry => self.eval_search_registry(),
             _ => self.deny(PolicyReason::new(
                 "policy.unsupported-action",
                 "the proposed action is not recognized by this policy engine",
@@ -365,6 +366,25 @@ impl PolicyEngine {
             reasons: vec![PolicyReason::new(
                 "policy.record-memory-allowed",
                 "a memory proposal note targets only the run's own ledger",
+            )],
+            capability_grant: None,
+            policy_version: self.version.clone(),
+            approval_reusable: false,
+        }
+    }
+
+    /// A `skills.search` call (rubric 9) is always permitted, for the same reason
+    /// as [`Self::eval_record_memory`]: it READS the daemon's own registry —
+    /// never the filesystem, a command, the network, or a remote — so it grants
+    /// no capability and never reaches the approval gate. A skill's package
+    /// directory comes from its registry row, so no model-supplied path is ever
+    /// opened and the file-read scope has nothing to enforce here.
+    fn eval_search_registry(&self) -> PolicyDecision {
+        PolicyDecision {
+            decision: Decision::Allow,
+            reasons: vec![PolicyReason::new(
+                "policy.search-registry-allowed",
+                "a registry search reads only the daemon's own tool/skill catalog",
             )],
             capability_grant: None,
             policy_version: self.version.clone(),

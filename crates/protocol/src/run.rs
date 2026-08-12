@@ -204,6 +204,14 @@ pub enum ProposedAction {
     /// engine's explicit arm); never serialized into a `ToolProposed` (never gated by
     /// approval), so it needs no golden wire vector.
     RecordMemory,
+    /// Search the knowledge registry for the tools/skills that fit a task (the
+    /// `skills.search` core tool, rubric 9). A READ of the daemon's own registry
+    /// — no filesystem, command, network, or remote effect, and no
+    /// model-supplied path (a skill's package directory comes from its registry
+    /// row). Always policy-`Allow`ed, exactly like [`Self::RecordMemory`], and
+    /// likewise never serialized into a `ToolProposed`, so it needs no golden
+    /// wire vector.
+    SearchRegistry,
     #[serde(other)]
     Unknown,
 }

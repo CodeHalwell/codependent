@@ -18,6 +18,7 @@ mod documents;
 mod executor;
 mod promotion;
 mod publish;
+mod retrieval;
 mod routing;
 mod scan;
 mod session_history;
@@ -95,6 +96,17 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         Err(error) => warn!(%error, "failed to register built-in tools"),
     }
 
+    // The indexer worker (rubric 9): reconcile persisted registry vectors at
+    // startup, then drain the `index_outbox` on a timer — the first production
+    // consumer that table has ever had, so it stops growing without bound and
+    // context assembly loads vectors instead of recomputing them per call.
+    // Fire-and-forget after `register_builtins` so the builtins' own outbox rows
+    // are already queued. With no `[embedding]` entry the drain still consumes
+    // rows (nothing to persist for the offline hashing model) and retrieval is
+    // byte-for-byte what it was before.
+    let embedder = retrieval::build_embedder(&paths);
+    retrieval::spawn_index_maintenance(pool.clone(), embedder.clone());
+
     // Derive the process's fallback repository identity without warming the code
     // graph synchronously. Session attach and run launch schedule valid Git
     // checkouts in the background; startup must never walk an arbitrary daemon
@@ -111,7 +123,11 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
     // so publication uses this same startup root, as the code-graph scan does).
     let mut executor =
         RuntimeExecutor::new(pool.clone(), paths.clone(), repository, workdir.clone())
-            .with_repository_root(workdir);
+            .with_repository_root(workdir)
+            // Rubric 9: the SAME embedder the maintenance job persists vectors
+            // with (one shared content-hash cache), plus the `[retrieval]`
+            // tuning each run's agent runtime gates its MCP advertisement by.
+            .with_retrieval(embedder, retrieval::retrieval_settings(&paths));
 
     // Personal-mode GitHub (Phase 3 STEP 3.2): discover a token from `gh auth
     // token` or `GITHUB_TOKEN` and enable the `github.*` tools. Absent (the

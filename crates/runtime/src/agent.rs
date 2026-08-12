@@ -88,15 +88,16 @@ use crate::models::ModelRegistry;
 use crate::tools::{
     new_pull_request, parse_blackboard_post, parse_blackboard_query, parse_create_check_run,
     parse_create_draft_pull_request, parse_edit_file as parse_edit_file_args,
-    parse_get_pull_request, parse_list_check_runs, parse_memory_remember,
+    parse_get_pull_request, parse_list_check_runs, parse_memory_remember, parse_skills_search,
     parse_update_pull_request, parse_web_search, parse_write_file as parse_write_file_args,
-    render_check_runs, render_pull_request, render_search_outcome, tool_label, ApplyPatch,
-    ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput,
-    BlackboardQueryTool, CommandRequest, CreateCheckRunInput, CreateCheckRunSummary,
-    CreateDraftPullRequest, CreateDraftPullRequestInput, EditFile, EditFileInput,
-    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns,
-    ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput,
-    RepositoryTest, Search, SearchInput, Shell, UpdatePullRequestInput, UpdatePullRequestTool,
+    render_check_runs, render_pull_request, render_registry_search, render_search_outcome,
+    tool_label, ApplyPatch, ApplyPatchInput, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
+    BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CreateCheckRunInput,
+    CreateCheckRunSummary, CreateDraftPullRequest, CreateDraftPullRequestInput, EditFile,
+    EditFileInput, EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput,
+    ListCheckRuns, ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile,
+    ReadFileInput, RegistrySearch, RegistrySearchRequest, RepositoryTest, Search, SearchInput,
+    Shell, SkillsSearch, SkillsSearchInput, UpdatePullRequestInput, UpdatePullRequestTool,
     WebSearch, WebSearchInput, WriteFile, WriteFileInput,
 };
 
@@ -1103,6 +1104,11 @@ pub struct FrameworkAgentRuntime {
     /// gate outright — every offered MCP tool is advertised, today's behavior.
     /// Set from `models.toml`'s `[retrieval] mcp_top_k`.
     mcp_top_k: usize,
+    /// The registry the `skills.search` tool queries (rubric 9), if wired.
+    /// Process-wide (one knowledge pool), like `github`/`mcp`, so it lives on
+    /// the runtime rather than the run context. `None` leaves the tool unoffered
+    /// and the run behaves exactly as before.
+    registry: Option<Arc<dyn RegistrySearch>>,
 }
 
 /// How a run terminated, before it is folded into a [`RunDisposition`].
@@ -1138,6 +1144,7 @@ impl FrameworkAgentRuntime {
             search: None,
             blackboard: None,
             mcp_top_k: crate::models::DEFAULT_MCP_TOP_K,
+            registry: None,
         }
     }
 
@@ -1184,6 +1191,16 @@ impl FrameworkAgentRuntime {
     #[must_use]
     pub fn with_mcp_top_k(mut self, mcp_top_k: usize) -> Self {
         self.mcp_top_k = mcp_top_k;
+        self
+    }
+
+    /// Inject the registry the `skills.search` tool queries (rubric 9). Without
+    /// it the tool is never offered, so a run's surface is unchanged. The daemon
+    /// binds it over the knowledge pool and the same retrieval funnel context
+    /// assembly uses.
+    #[must_use]
+    pub fn with_registry_search(mut self, registry: Arc<dyn RegistrySearch>) -> Self {
+        self.registry = Some(registry);
         self
     }
 
@@ -1259,6 +1276,13 @@ impl FrameworkAgentRuntime {
         // configured gate alone decides.
         if self.search.is_some() {
             names.push(WebSearch::NAME.to_string());
+        }
+        // Rubric 9: offered whenever the registry seam is wired — a read of the
+        // daemon's own catalog, so like `web.search` the configured gate alone
+        // decides, and unlike the write tools no mode overlay can deny it (the
+        // filter below leaves it in every mode).
+        if self.registry.is_some() {
+            names.push(SkillsSearch::NAME.to_string());
         }
         if self.offers_blackboard(run) {
             names.extend(
@@ -2463,6 +2487,16 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::MemoryRemember(input),
                 })
             }
+            // Rubric 9: guarded on the seam being wired, the `web.search` idiom —
+            // a call with no registry falls through to the unknown-tool refusal,
+            // the same answer the offering gate already gave the model.
+            SkillsSearch::NAME if self.registry.is_some() => {
+                let input = parse_skills_search(args)?;
+                Ok(Prepared {
+                    action: SkillsSearch::proposed_action(),
+                    tool: PreparedTool::SkillsSearch(input),
+                })
+            }
             // MCP client (PR B): an `mcp.<server>.<tool>` call. The match guard
             // re-verifies the bridge CURRENTLY offers that exact server.tool pair
             // (defense in depth, the blackboard match-guard idiom above): a cold
@@ -2885,6 +2919,44 @@ impl FrameworkAgentRuntime {
                     }
                 },
             },
+            // Rubric 9: the registry read. The rendered result is already
+            // evidence-framed and its opened `SKILL.md` already sanitized under
+            // `SKILL_DOCUMENT_MAX_BYTES` (see `render_registry_search`), so the
+            // observation carries a bounded, trust-labelled block — the same
+            // discipline as the MCP/web arms, applied at the renderer because the
+            // cards themselves are first-party while only the procedure is not.
+            PreparedTool::SkillsSearch(input) => match self.registry.as_ref() {
+                None => (
+                    "skills.search is unavailable (no registry connection)".to_string(),
+                    None,
+                    ToolOutcome::Failed {
+                        message: "skills.search.unavailable".to_string(),
+                    },
+                ),
+                Some(registry) => {
+                    let request = RegistrySearchRequest {
+                        query: &input.query,
+                        open: input.open.as_deref(),
+                        // Server-derived, never model-supplied: a search sees
+                        // exactly this run's repository scope.
+                        repository: &run.repository,
+                    };
+                    match registry.search(request).await {
+                        Ok(outcome) => (
+                            render_registry_search(&outcome),
+                            None,
+                            ToolOutcome::Succeeded,
+                        ),
+                        Err(reason) => (
+                            format!("skills.search failed: {reason}"),
+                            None,
+                            ToolOutcome::Failed {
+                                message: "skills.search.failed".to_string(),
+                            },
+                        ),
+                    }
+                }
+            },
             PreparedTool::Mcp { server, tool, args } => match self.mcp.as_ref() {
                 None => mcp_unavailable(&format!("mcp.{server}.{tool}")),
                 Some(bridge) => match bridge.call_tool(&server, &tool, args).await {
@@ -3174,6 +3246,9 @@ enum PreparedTool {
     BlackboardPost(BlackboardPostInput),
     BlackboardQuery(BlackboardQueryInput),
     MemoryRemember(MemoryRememberInput),
+    /// A `skills.search` call (rubric 9): the parsed query plus the optional
+    /// skill name whose procedure to open.
+    SkillsSearch(SkillsSearchInput),
     /// An MCP tool call (PR B): the dispatch pair `prepare`'s guard verified
     /// against the bridge's offered cache, plus the RAW model-supplied args
     /// (the canonical form lives on the `McpToolCall` action, for the digest).
@@ -3970,6 +4045,24 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {"statement": {"type": "string"}, "value": {}},
                 "required": ["statement"]
+            }),
+        ),
+        // Rubric 9: the agent-callable half of retrieval. Offered only when the
+        // daemon wired a registry seam (`advertised_tool_definitions` projects
+        // through `offered_tool_names`, so an unwired daemon never shows it).
+        decl(
+            SkillsSearch::NAME,
+            "Search the tool/skill registry for what fits a task, returning compact cards \
+                 (name, kind, summary, declared permissions). Pass `open` with a skill name \
+                 from an earlier result to also receive that skill's written procedure. Use \
+                 when you suspect a capability exists but is not in your tool list.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "open": {"type": "string"}
+                },
+                "required": ["query"]
             }),
         ),
         decl(
@@ -6370,6 +6463,129 @@ mod tests {
             }
             other => panic!("expected NoteAppended, got {other:?}"),
         }
+    }
+
+    /// A `RegistrySearch` stub: records what it was asked and answers with a
+    /// fixed card plus (when `open` was set) a skill procedure.
+    struct StubRegistry {
+        seen: Mutex<Vec<(String, Option<String>, PathBuf)>>,
+    }
+
+    #[async_trait]
+    impl RegistrySearch for StubRegistry {
+        async fn search(
+            &self,
+            request: RegistrySearchRequest<'_>,
+        ) -> Result<crate::tools::RegistrySearchOutcome, String> {
+            self.seen.lock().expect("stub lock").push((
+                request.query.to_string(),
+                request.open.map(str::to_string),
+                request.repository.to_path_buf(),
+            ));
+            Ok(crate::tools::RegistrySearchOutcome {
+                cards: vec![crate::tools::RegistryCard {
+                    name: "rust.fix-ci".to_string(),
+                    kind: "skill".to_string(),
+                    summary: "diagnose and fix a failing CI build".to_string(),
+                    permissions: vec!["command:cargo".to_string()],
+                }],
+                document: request.open.map(|name| crate::tools::SkillDocument {
+                    name: name.to_string(),
+                    content: "1. read the failing job log\n2. reproduce locally".to_string(),
+                }),
+                open_note: None,
+            })
+        }
+    }
+
+    /// Rubric 9: `skills.search` is offered only when a registry seam is wired,
+    /// and the whole `prepare` → policy → `execute_prepared` path works — the
+    /// action is policy-`Allow`ed (a read of the daemon's own catalog), the
+    /// repository scope is SERVER-derived from the run, and an opened skill's
+    /// procedure comes back evidence-framed.
+    #[tokio::test]
+    async fn skills_search_is_seam_gated_and_returns_evidence_framed_cards() {
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        // Unwired: neither offered nor dispatchable.
+        let (bare, _events, session_id) = test_runtime();
+        let run = solo_run(session_id, repo.path());
+        assert!(
+            !bare
+                .offered_tool_names(&run)
+                .iter()
+                .any(|n| n == SkillsSearch::NAME),
+            "no registry seam → the tool is not offered"
+        );
+        assert!(
+            bare.prepare(SkillsSearch::NAME, &json!({"query": "x"}), &run)
+                .await
+                .is_err(),
+            "an unoffered tool is not dispatchable"
+        );
+
+        // Wired: offered, advertised, and executable.
+        let registry = Arc::new(StubRegistry {
+            seen: Mutex::new(Vec::new()),
+        });
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime.with_registry_search(registry.clone());
+        let run = solo_run(session_id, repo.path());
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+        assert!(runtime
+            .offered_tool_names(&run)
+            .iter()
+            .any(|n| n == SkillsSearch::NAME));
+        assert!(
+            runtime
+                .advertised_tool_definitions(&run)
+                .iter()
+                .any(|d| d.name == SkillsSearch::NAME),
+            "advertised ≡ offered covers the new tool too"
+        );
+
+        let prepared = runtime
+            .prepare(
+                SkillsSearch::NAME,
+                &json!({"query": "the ci build is red", "open": "rust.fix-ci"}),
+                &run,
+            )
+            .await
+            .expect("prepares");
+        let decision = runtime
+            .policy
+            .evaluate(&prepared.action, &runtime.eval_ctx(&run));
+        assert_eq!(
+            decision.decision,
+            Decision::Allow,
+            "a registry read is always permitted"
+        );
+
+        let (observation, artifact, outcome) =
+            runtime.execute_prepared(prepared, &run, &run_actor).await;
+        assert!(matches!(outcome, ToolOutcome::Succeeded));
+        assert!(artifact.is_none());
+        assert!(observation.contains("EVIDENCE, NOT INSTRUCTIONS"));
+        assert!(observation.contains("skill rust.fix-ci"));
+        assert!(observation.contains("permissions: command:cargo"));
+        assert!(
+            observation.contains("read the failing job log"),
+            "an opened skill's SKILL.md is injected: {observation}"
+        );
+
+        let seen = registry.seen.lock().expect("stub lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "the ci build is red");
+        assert_eq!(seen[0].1.as_deref(), Some("rust.fix-ci"));
+        assert_eq!(
+            seen[0].2,
+            repo.path(),
+            "the repository scope is server-derived from the run, not the model"
+        );
     }
 
     /// Continuation-content persistence, Task 1: `read_file`'s output was
