@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use codypendent_daemon::approvals::ApprovalBroker;
 use codypendent_daemon::artifacts::{ArtifactStore, Provenance};
-use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader};
+use codypendent_daemon::blackboard::{BlackboardHub, BlackboardReader, BlackboardWriter};
 use codypendent_daemon::executor::{PriorTurn, RunExecutor, RunLaunch};
 use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT, TAVILY_API_ENDPOINT};
 use codypendent_daemon::subscriptions::SubscriptionHub;
@@ -63,13 +63,13 @@ use codypendent_runtime::tools::{ArtifactSink, ClosureSink};
 use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
-use crate::blackboard::WorkflowBlackboardReader;
+use crate::blackboard::{AssemblyBoardWriter, AssemblyTaskBoardChannel, WorkflowBlackboardReader};
 use crate::promotion::PromotionStoreGateway;
 use crate::routing::{estimate_input_tokens, RoutingConfig, RoutingCoordinator};
 use crate::scan;
 use crate::session_history::continuation_prior;
 use crate::workflow_exec::{build_workflow_host, AgentLoopNodeExecutor, WorkflowRunCancellations};
-use crate::workflows::{WorkflowConductorHost, WorkflowRunReader};
+use crate::workflows::{AssemblyWorkflowQuery, WorkflowConductorHost, WorkflowRunReader};
 
 /// How many of a session's most recent runs a continuation replays VERBATIM
 /// (turn-by-turn); every earlier run is compacted to a single summary turn
@@ -684,6 +684,18 @@ impl RuntimeExecutor {
         if let Some(search) = &self.search {
             runtime = runtime.with_search(search.clone());
         }
+        // Rubrics 5 / 10: a PLAIN chat run gets the repository-scoped workflow
+        // read and backlog tools — the whole point is that "break this feature
+        // into backlog cards" and "how did the last /fix-ci go?" work in ordinary
+        // conversation, not only inside a workflow node. Both are wired here
+        // unconditionally; the offering gate is the run's repository identity,
+        // set below.
+        runtime = runtime
+            .with_workflow_query(Arc::new(AssemblyWorkflowQuery::new(self.pool.clone())))
+            .with_task_board(Arc::new(AssemblyTaskBoardChannel::new(
+                self.pool.clone(),
+                self.blackboards.clone(),
+            )));
 
         // Bind the run's worktree (STEP 1.8, the Phase-1 follow-up): a writing
         // mode (`Build`) gets a DEDICATED, isolated worktree carved from the
@@ -732,6 +744,11 @@ impl RuntimeExecutor {
         let mut prior = convert_launch_prior(&launch.prior);
         prior.extend(reconstructed_prior);
         ctx = ctx.with_prior(prior);
+        // The board/history subject is the run's repository IDENTITY (`R`) — never
+        // the operating tree above, which for an isolated run is a throwaway
+        // worktree. Cards must accumulate on one board per checkout, not scatter
+        // across per-run worktrees (rubrics 5 / 10).
+        ctx = ctx.with_board_repository(launch.repository.to_string_lossy().into_owned());
         // Resolve the run's GitHub `owner/repo` from the checkout's origin remote,
         // so the `github.*` tools know their target. Uses the repository IDENTITY
         // (`R`), not the worktree read root. Only meaningful when a client is
@@ -2126,6 +2143,17 @@ impl RunExecutor for RuntimeExecutor {
         // Read a durable run's board for a `ReadBlackboard` command over the
         // workflow `BlackboardStore` on the shared pool (Phase 5 STEP 5.3).
         Some(Arc::new(WorkflowBlackboardReader::new(self.pool.clone())))
+    }
+
+    fn blackboard_writer(&self) -> Option<Arc<dyn BlackboardWriter>> {
+        // Apply a Controller's `PostBlackboardItem` / `UpdateBlackboardItem` over
+        // the SAME store and the SAME fan-out hub an agent's board write uses
+        // (Phase B kanban), so a human's move and an agent's `task.move` produce
+        // identical rows and identical live deliveries.
+        Some(Arc::new(AssemblyBoardWriter::new(
+            self.pool.clone(),
+            self.blackboards.clone(),
+        )))
     }
 
     fn blackboard_hub(&self) -> Option<BlackboardHub> {

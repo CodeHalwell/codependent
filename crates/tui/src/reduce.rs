@@ -5611,6 +5611,7 @@ mod tests {
             approval: "none".to_owned(),
             retry: "1 attempt".to_owned(),
             depends_on: "—".to_owned(),
+            depends_on_ids: Vec::new(),
             outputs: "test_result".to_owned(),
             cost: "—".to_owned(),
             error: "—".to_owned(),

@@ -793,6 +793,12 @@ pub struct WorkflowNodeCard {
     pub retry: String,
     /// The nodes this one depends on, pre-rendered (comma-joined, or `"—"`).
     pub depends_on: String,
+    /// The same dependencies as raw node ids — the graph's **edges** (rubric 5),
+    /// which the pre-rendered [`depends_on`](Self::depends_on) string above cannot
+    /// be parsed back out of. The workflow pane lays these out into ASCII lanes;
+    /// empty means a root node (or a projection that predates edges, which simply
+    /// renders the flat list it always did).
+    pub depends_on_ids: Vec<String>,
     /// The blackboard artifact kinds the node declares to produce, pre-rendered
     /// (comma-joined, or `"—"`).
     pub outputs: String,

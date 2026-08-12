@@ -26,12 +26,17 @@
 
 use async_trait::async_trait;
 use codypendent_daemon::blackboard::{
-    BlackboardHub, BlackboardReadFuture, BlackboardReader, ReadBlackboardRequest,
+    BlackboardHub, BlackboardReadFuture, BlackboardReader, BlackboardWriteFuture, BlackboardWriter,
+    BoardTarget, PostBlackboardRequest, ReadBlackboardRequest, UpdateBlackboardRequest,
 };
-use codypendent_protocol::{BlackboardItemView, CodypendentError};
-use codypendent_runtime::blackboard::{BlackboardChannel, BlackboardChannelError, BlackboardPost};
+use codypendent_protocol::{board_scope_id, BlackboardItemView, CodypendentError};
+use codypendent_runtime::blackboard::{
+    BlackboardChannel, BlackboardChannelError, BlackboardPost, TaskBoardChannel, TaskCardChange,
+    TaskCardDraft,
+};
 use codypendent_workflow::{
-    BlackboardError, BlackboardItem, BlackboardKind, BlackboardStore, NewBlackboardItem,
+    BlackboardError, BlackboardItem, BlackboardKind, BlackboardStore, BoardFields,
+    NewBlackboardItem, WorkflowStore, DEFAULT_TASK_STATUS,
 };
 use sqlx::SqlitePool;
 
@@ -48,6 +53,10 @@ fn item_to_view(workflow_run_id: &str, item: BlackboardItem) -> BlackboardItemVi
         evidence: item.evidence,
         revision: item.revision,
         superseded_by: item.superseded_by,
+        board_scope: item.board.board_scope,
+        status: item.board.status,
+        assignee: item.board.assignee,
+        ordinal: item.board.ordinal,
     }
 }
 
@@ -110,6 +119,10 @@ impl BlackboardChannel for AssemblyBlackboardChannel {
             author: post.author,
             confidence: post.confidence,
             evidence: post.evidence,
+            // A workflow artifact is not a board card: no scope, column, assignee,
+            // or ordinal. (A `task` posted through this path still defaults to the
+            // `todo` column in the store.)
+            board: BoardFields::default(),
         };
         // A post carrying `supersedes` is a correction (posted at the next revision,
         // stamping the old row in one transaction); otherwise a fresh artifact.
@@ -176,10 +189,20 @@ impl BlackboardReader for WorkflowBlackboardReader {
         Box::pin(async move {
             let ReadBlackboardRequest {
                 workflow_run_id,
+                board_repository,
                 kind,
                 include_superseded,
                 client_id: _,
             } = request;
+
+            // A repository-board read re-points the SAME query at the synthetic
+            // board run. Nothing is created: a repository never written to simply
+            // has no rows, and an empty board is the truthful answer (the store's
+            // FK only matters for writes).
+            let workflow_run_id = match board_repository.as_deref() {
+                Some(repository) => board_scope_id(repository),
+                None => workflow_run_id,
+            };
 
             // An explicit kind filter that names no known artifact kind is a client
             // error (a typo like `test-result`), rejected legibly rather than
@@ -210,6 +233,372 @@ impl BlackboardReader for WorkflowBlackboardReader {
                 .map(|item| item_to_view(&workflow_run_id, item))
                 .collect())
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The task board (Phase B kanban, rubric 10)
+// ---------------------------------------------------------------------------
+
+/// Everything a board write needs, shared by the client seam
+/// ([`AssemblyBoardWriter`]) and the agent seam (the `task.*` tools): resolve the
+/// board, store the card under supersession discipline, publish it.
+///
+/// One implementation serves both so a human's move in the TUI and an agent's
+/// `task.move` are the *same* write — same validation, same ordinal defaulting,
+/// same fan-out — differing only in the attribution each caller supplies.
+#[derive(Clone)]
+struct BoardOps {
+    pool: SqlitePool,
+    store: BlackboardStore,
+    hub: BlackboardHub,
+}
+
+impl BoardOps {
+    fn new(pool: SqlitePool, hub: BlackboardHub) -> Self {
+        Self {
+            pool,
+            store: BlackboardStore::new(),
+            hub,
+        }
+    }
+
+    /// Resolve a board target to the durable run id its items hang off, creating
+    /// the synthetic board run on the first *write* to a repository board (a read
+    /// never creates one). Returns the run id and the `board_scope` to stamp on
+    /// the stored card (`None` for a real workflow run's board).
+    async fn resolve_for_write(
+        &self,
+        target: &BoardTarget,
+    ) -> Result<(String, Option<String>), BlackboardError> {
+        match target {
+            BoardTarget::WorkflowRun(run) => Ok((run.clone(), None)),
+            BoardTarget::Repository(repository) => {
+                let board_id = board_scope_id(repository);
+                WorkflowStore::new()
+                    .ensure_board_run(&self.pool, &board_id, repository)
+                    .await
+                    .map_err(|error| BlackboardError::BoardUnavailable(error.to_string()))?;
+                Ok((board_id, Some(repository.clone())))
+            }
+        }
+    }
+
+    /// Store a new card and fan it out. `ordinal` absent appends to the end of the
+    /// target column, so a caller that only knows "put this in `todo`" never has
+    /// to compute a position.
+    async fn post_card(
+        &self,
+        target: &BoardTarget,
+        kind: BlackboardKind,
+        payload: serde_json::Value,
+        author: serde_json::Value,
+        confidence: Option<f64>,
+        evidence: Vec<serde_json::Value>,
+        status: Option<String>,
+        assignee: Option<String>,
+        ordinal: Option<i64>,
+    ) -> Result<BlackboardItemView, BlackboardError> {
+        let (run_id, board_scope) = self.resolve_for_write(target).await?;
+        let status = match status {
+            Some(status) => Some(codypendent_workflow::normalize_status(&status)?),
+            None if kind == BlackboardKind::Task => Some(DEFAULT_TASK_STATUS.to_string()),
+            None => None,
+        };
+        let ordinal = match (ordinal, status.as_deref()) {
+            (Some(ordinal), _) => Some(ordinal),
+            (None, Some(status)) => {
+                Some(self.store.next_ordinal(&self.pool, &run_id, status).await?)
+            }
+            (None, None) => None,
+        };
+        let item = self
+            .store
+            .post(
+                &self.pool,
+                &run_id,
+                NewBlackboardItem {
+                    kind,
+                    payload,
+                    author,
+                    confidence,
+                    evidence,
+                    board: BoardFields {
+                        board_scope,
+                        status,
+                        assignee,
+                        ordinal,
+                    },
+                },
+            )
+            .await?;
+        Ok(self.publish(&run_id, item))
+    }
+
+    /// Supersede a live card with a revised one — a column move, a re-assignment,
+    /// a re-order, or a payload edit. Absent fields carry the stored card's values
+    /// forward, and the store's fork-proof supersession is what actually applies
+    /// the change, so board history is preserved and two concurrent moves cannot
+    /// both win.
+    async fn update_card(
+        &self,
+        target: &BoardTarget,
+        item_id: &str,
+        change: CardChange,
+    ) -> Result<BlackboardItemView, BlackboardError> {
+        let (run_id, _) = self.resolve_for_write(target).await?;
+        let old = self
+            .store
+            .get(&self.pool, &run_id, item_id)
+            .await?
+            .ok_or_else(|| BlackboardError::NotFound(item_id.to_string()))?;
+
+        let moved_column = change
+            .status
+            .as_ref()
+            .is_some_and(|status| Some(status.as_str()) != old.board.status.as_deref());
+        let status = match change.status {
+            Some(status) => Some(codypendent_workflow::normalize_status(&status)?),
+            None => old.board.status.clone(),
+        };
+        // A card that changed column with no explicit position lands at the END of
+        // its new column rather than keeping a stale index from the old one.
+        let ordinal = match (change.ordinal, moved_column, status.as_deref()) {
+            (Some(ordinal), _, _) => Some(ordinal),
+            (None, true, Some(status)) => {
+                Some(self.store.next_ordinal(&self.pool, &run_id, status).await?)
+            }
+            (None, _, _) => old.board.ordinal,
+        };
+        let item = self
+            .store
+            .supersede(
+                &self.pool,
+                &run_id,
+                item_id,
+                NewBlackboardItem {
+                    kind: old.kind,
+                    payload: change.payload.unwrap_or(old.payload),
+                    author: change.author.unwrap_or(old.author),
+                    confidence: old.confidence,
+                    evidence: old.evidence,
+                    board: BoardFields {
+                        board_scope: old.board.board_scope,
+                        status,
+                        assignee: change.assignee.or(old.board.assignee),
+                        ordinal,
+                    },
+                },
+            )
+            .await?;
+        Ok(self.publish(&run_id, item))
+    }
+
+    /// Read a board's live cards. Never creates the synthetic run — an unwritten
+    /// board is simply empty.
+    async fn list_cards(
+        &self,
+        target: &BoardTarget,
+        kind: Option<BlackboardKind>,
+    ) -> Result<Vec<BlackboardItemView>, BlackboardError> {
+        let run_id = match target {
+            BoardTarget::WorkflowRun(run) => run.clone(),
+            BoardTarget::Repository(repository) => board_scope_id(repository),
+        };
+        let items = self.store.query(&self.pool, &run_id, kind, false).await?;
+        Ok(items
+            .into_iter()
+            .map(|item| item_to_view(&run_id, item))
+            .collect())
+    }
+
+    /// Persist-before-publish: the store commit has already happened; fan the
+    /// stored card out to the board's live subscribers (the board run id doubles
+    /// as the hub key, so a TUI board pane converges with no new machinery).
+    fn publish(&self, run_id: &str, item: BlackboardItem) -> BlackboardItemView {
+        let view = item_to_view(run_id, item);
+        self.hub.publish(run_id, view.clone());
+        view
+    }
+}
+
+/// The fields an update may replace; everything else is carried forward from the
+/// superseded card.
+#[derive(Debug, Clone, Default)]
+struct CardChange {
+    status: Option<String>,
+    assignee: Option<String>,
+    ordinal: Option<i64>,
+    payload: Option<serde_json::Value>,
+    /// Replacement attribution — the *editor's*, so a card's latest revision names
+    /// whoever last touched it. `None` keeps the original author.
+    author: Option<serde_json::Value>,
+}
+
+/// Map a store error to the wire error a rejected client board write carries.
+fn map_write_error(error: BlackboardError) -> CodypendentError {
+    let (code, retryable) = match &error {
+        BlackboardError::EvidenceRequired(_) => ("blackboard.evidence-required", false),
+        BlackboardError::NotFound(_) => ("blackboard.item-not-found", false),
+        BlackboardError::AlreadySuperseded(_) => ("blackboard.already-superseded", false),
+        BlackboardError::InvalidStatus(_) => ("blackboard.invalid-status", false),
+        _ => ("blackboard.write-failed", true),
+    };
+    CodypendentError::new(code, error.to_string(), retryable)
+}
+
+/// Implements the daemon's [`BlackboardWriter`] — a `Controller` client's
+/// `PostBlackboardItem` / `UpdateBlackboardItem` (Phase B kanban). Cheap to clone.
+#[derive(Clone)]
+pub struct AssemblyBoardWriter {
+    ops: BoardOps,
+}
+
+impl AssemblyBoardWriter {
+    /// Build the writer over the daemon's pool and the board fan-out hub.
+    #[must_use]
+    pub fn new(pool: SqlitePool, hub: BlackboardHub) -> Self {
+        Self {
+            ops: BoardOps::new(pool, hub),
+        }
+    }
+}
+
+/// Attribution for a card written by a human operator over the socket. Built
+/// **server-side** from the connection's client id — a client never supplies its
+/// own identity, exactly as an agent's author is built from its run context.
+fn operator_author(client_id: codypendent_protocol::ClientId) -> serde_json::Value {
+    serde_json::json!({ "role": "operator", "client_id": client_id.to_string() })
+}
+
+impl BlackboardWriter for AssemblyBoardWriter {
+    fn post(&self, request: PostBlackboardRequest) -> BlackboardWriteFuture<'_> {
+        let ops = self.ops.clone();
+        Box::pin(async move {
+            let kind = BlackboardKind::parse_kind(&request.item.kind).ok_or_else(|| {
+                CodypendentError::new(
+                    "workflow.unknown-blackboard-kind",
+                    format!(
+                        "`{}` is not a known blackboard artifact kind",
+                        request.item.kind
+                    ),
+                    false,
+                )
+            })?;
+            ops.post_card(
+                &request.target,
+                kind,
+                request.item.payload,
+                operator_author(request.client_id),
+                request.item.confidence,
+                request.item.evidence,
+                request.item.status,
+                request.item.assignee,
+                request.item.ordinal,
+            )
+            .await
+            .map_err(map_write_error)
+        })
+    }
+
+    fn update(&self, request: UpdateBlackboardRequest) -> BlackboardWriteFuture<'_> {
+        let ops = self.ops.clone();
+        Box::pin(async move {
+            ops.update_card(
+                &request.target,
+                &request.item_id,
+                CardChange {
+                    status: request.status,
+                    assignee: request.assignee,
+                    ordinal: request.ordinal,
+                    payload: request.payload,
+                    author: Some(operator_author(request.client_id)),
+                },
+            )
+            .await
+            .map_err(map_write_error)
+        })
+    }
+}
+
+/// Implements the runtime's [`TaskBoardChannel`] — the `task.create` /
+/// `task.update` / `task.move` / `task.list` tools an agent turns a feature
+/// request into backlog cards with (rubric 10). It shares [`BoardOps`] with the
+/// client writer above, so an agent-created card is indistinguishable in the store
+/// from a human-created one apart from its attribution. Cheap to clone.
+#[derive(Clone)]
+pub struct AssemblyTaskBoardChannel {
+    ops: BoardOps,
+}
+
+impl AssemblyTaskBoardChannel {
+    /// Build the channel over the daemon's pool and the board fan-out hub.
+    #[must_use]
+    pub fn new(pool: SqlitePool, hub: BlackboardHub) -> Self {
+        Self {
+            ops: BoardOps::new(pool, hub),
+        }
+    }
+}
+
+#[async_trait]
+impl TaskBoardChannel for AssemblyTaskBoardChannel {
+    async fn create(
+        &self,
+        repository: &str,
+        draft: TaskCardDraft,
+    ) -> Result<BlackboardItemView, BlackboardChannelError> {
+        self.ops
+            .post_card(
+                &BoardTarget::Repository(repository.to_string()),
+                BlackboardKind::Task,
+                draft.payload,
+                draft.author,
+                None,
+                // A card is a plan, not a claim about the codebase, so it needs no
+                // evidence — the store's `Task` kind is evidence-optional.
+                Vec::new(),
+                draft.status,
+                draft.assignee,
+                draft.ordinal,
+            )
+            .await
+            .map_err(map_channel_error)
+    }
+
+    async fn update(
+        &self,
+        repository: &str,
+        item_id: &str,
+        change: TaskCardChange,
+    ) -> Result<BlackboardItemView, BlackboardChannelError> {
+        self.ops
+            .update_card(
+                &BoardTarget::Repository(repository.to_string()),
+                item_id,
+                CardChange {
+                    status: change.status,
+                    assignee: change.assignee,
+                    ordinal: change.ordinal,
+                    payload: change.payload,
+                    author: Some(change.author),
+                },
+            )
+            .await
+            .map_err(map_channel_error)
+    }
+
+    async fn list(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<BlackboardItemView>, BlackboardChannelError> {
+        self.ops
+            .list_cards(
+                &BoardTarget::Repository(repository.to_string()),
+                Some(BlackboardKind::Task),
+            )
+            .await
+            .map_err(map_channel_error)
     }
 }
 

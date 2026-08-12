@@ -43,6 +43,12 @@ pub enum BlackboardError {
     /// containing control characters).
     #[error("invalid board status: {0}")]
     InvalidStatus(String),
+    /// The synthetic run backing a repository task board could not be prepared, so
+    /// the card has nowhere to hang (`blackboard_items.workflow_run_id` is a NOT
+    /// NULL FK). Distinct from a plain database error so the caller can say what
+    /// actually failed.
+    #[error("could not prepare the repository board: {0}")]
+    BoardUnavailable(String),
 }
 
 /// The default board columns, in display order. `status` is a free string —

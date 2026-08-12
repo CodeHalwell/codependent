@@ -43,7 +43,9 @@ mod salient;
 mod search;
 mod secure_fs;
 mod shell;
+mod task;
 mod web_search;
+mod workflow_query;
 mod write_file;
 
 use std::path::PathBuf;
@@ -75,7 +77,13 @@ pub use repository::{RepositoryTest, RepositoryTestOutcome};
 pub use salient::{SalientStream, SalientView};
 pub use search::{Search, SearchInput, SearchMatch, SearchResults};
 pub use shell::{CommandRequest, EnvironmentBinding, Shell, ShellOutcome};
+pub use task::{
+    parse_task_create, parse_task_list, parse_task_move, parse_task_update, task_read_action,
+    task_write_action, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool,
+    TaskUpdateInput, TaskUpdateTool,
+};
 pub use web_search::{parse_web_search, render_search_outcome, WebSearch, WebSearchInput};
+pub use workflow_query::{parse_workflow_query, WorkflowQueryInput, WorkflowQueryTool};
 pub use write_file::{parse_write_file, WriteFile, WriteFileInput, WriteFileOutcome};
 
 /// A capability class a tool requires. The concrete

@@ -4388,6 +4388,10 @@ fn workflow_node_card(
         approval,
         retry,
         depends_on: join(&node.depends_on),
+        // The raw edge ids the pane lays out into ASCII lanes (rubric 5) — the
+        // comma-joined string above is for the detail rail and cannot be parsed
+        // back into a graph.
+        depends_on_ids: node.depends_on.clone(),
         outputs: join(&node.outputs),
         cost,
         error,

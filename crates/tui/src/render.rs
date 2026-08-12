@@ -22,6 +22,7 @@ use codypendent_protocol::{
 };
 
 use crate::action::{Action, KeyTarget};
+use crate::dag::DagLayout;
 use crate::reduce::capability_label;
 use crate::remote_ui_host::{TERMINAL_CENTRAL_SLOTS, TERMINAL_OVERLAY_SLOTS};
 use crate::state::{
@@ -4379,6 +4380,13 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let list_area = cols[0];
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(state.selected_node, state.workflow.len(), visible_rows);
+    // Rubric 5: lay the topological list out as layered lanes with box-drawing
+    // connectors, so the DAG's EDGES are visible instead of only its order. The
+    // lanes are an addition to the same rows — selection, scrolling, and hit
+    // regions are untouched — and `None` here degrades to exactly the list this
+    // pane rendered before: a graph with no edges, too many lanes to fit, or a
+    // pane too narrow to spare the columns.
+    let graph = workflow_lanes(&state.workflow, list_area.width);
     let mut items: Vec<ListItem> = Vec::new();
     if state.workflow.is_empty() {
         items.push(ListItem::new(vec![
@@ -4401,13 +4409,36 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     {
         let selected = idx == state.selected_node;
         let marker = if selected { "› " } else { "  " };
-        let mut lines = vec![Line::styled(
-            truncate(&node.workflow, 36),
-            theme
-                .selection_aware_text_style(selected, theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        )];
+        let row = graph.as_ref().and_then(|layout| layout.rows.get(idx));
+        // The lane art takes the node's own STATE color, so an edge reads as
+        // "this is what `verify` is waiting on" at a glance — the same color key
+        // the list and the detail rail already use (RULE 7: theme tokens only).
+        let lane_style =
+            theme.selection_aware_text_style(selected, node_state_color(&node.state, theme));
+        // Line 1 is the workflow label, prefixed by the connector when this node
+        // joins dependencies living in other lanes.
+        let mut lines = vec![match row.filter(|row| !row.connector.is_empty()) {
+            Some(row) => Line::from(vec![
+                Span::styled(format!("{} ", row.connector), lane_style),
+                Span::styled(
+                    truncate(&node.workflow, 30),
+                    theme
+                        .selection_aware_text_style(selected, theme.text.heading)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            None => Line::styled(
+                truncate(&node.workflow, 36),
+                theme
+                    .selection_aware_text_style(selected, theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        }];
         lines.push(Line::from(vec![
+            Span::styled(
+                row.map_or_else(String::new, |row| format!("{} ", row.node)),
+                lane_style,
+            ),
             Span::styled(
                 marker,
                 theme.selection_aware_text_style(selected, theme.focus.active),
@@ -4425,10 +4456,16 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 theme.selection_aware_text_style(selected, node_state_color(&node.state, theme)),
             ),
         ]));
-        lines.push(Line::styled(
-            format!("    {}", truncate(&node.action, 34)),
-            theme.selection_aware_text_style(selected, theme.text.muted),
-        ));
+        lines.push(Line::from(vec![
+            Span::styled(
+                row.map_or_else(String::new, |row| format!("{} ", row.trail)),
+                lane_style,
+            ),
+            Span::styled(
+                format!("    {}", truncate(&node.action, 34)),
+                theme.selection_aware_text_style(selected, theme.text.muted),
+            ),
+        ]));
         let item = ListItem::new(lines);
         items.push(if selected {
             item.style(theme.selection_style())
@@ -4556,6 +4593,41 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             Action::Cancel,
         );
     }
+}
+
+/// The narrowest node list that still has room for lane art. Below this the
+/// columns the lanes would consume come straight out of the node id, so the pane
+/// keeps the plain topological list instead (rubric 5's explicit degradation).
+const MIN_DAG_LIST_WIDTH: u16 = 30;
+
+/// Lay the workflow node list out into ASCII DAG lanes, or `None` to keep the
+/// flat list.
+///
+/// Returns `None` when there is nothing to gain or no room to draw: a graph with
+/// no edges at all, more lanes than [`crate::dag::MAX_LANES`], or a list column
+/// too narrow to spare the lane characters. Nodes carrying no `depends_on_ids`
+/// (a projection from before edges existed) fall into the no-edges case, so an
+/// older client degrades to exactly what it rendered before.
+fn workflow_lanes(nodes: &[crate::state::WorkflowNodeCard], width: u16) -> Option<DagLayout> {
+    if nodes.is_empty() || width < MIN_DAG_LIST_WIDTH {
+        return None;
+    }
+    let layout = crate::dag::lay_out(
+        &nodes
+            .iter()
+            .map(|node| crate::dag::DagNode {
+                id: node.id.clone(),
+                depends_on: node.depends_on_ids.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    // The lane prefix costs `lanes + 1` columns on every line; refuse when that
+    // would eat into the node id rather than truncating the graph into a lie.
+    let affordable = u16::try_from(layout.lanes + 1).unwrap_or(u16::MAX);
+    (layout.has_edges
+        && layout.lanes <= crate::dag::MAX_LANES
+        && width.saturating_sub(affordable) >= MIN_DAG_LIST_WIDTH - affordable)
+        .then_some(layout)
 }
 
 /// Color for a workflow node's lifecycle state. Terminal-success reads calm;
@@ -9449,6 +9521,7 @@ mod tests {
                 approval: "before write".to_owned(),
                 retry: "1 attempt".to_owned(),
                 depends_on: "\u{2014}".to_owned(),
+                depends_on_ids: Vec::new(),
                 outputs: "proposed_patch".to_owned(),
                 cost: "\u{2014}".to_owned(),
                 error: "\u{2014}".to_owned(),
@@ -9469,6 +9542,7 @@ mod tests {
                 approval: "none".to_owned(),
                 retry: "2 attempts \u{b7} 5s backoff".to_owned(),
                 depends_on: "patch".to_owned(),
+                depends_on_ids: vec!["patch".to_owned()],
                 outputs: "test_result".to_owned(),
                 cost: "\u{2014}".to_owned(),
                 error: "\u{2014}".to_owned(),
@@ -9521,6 +9595,81 @@ mod tests {
                 .filter(|(_, action)| action == &Action::Cancel)
                 .all(|(rect, _)| rect.width > 0),
             "cancel must never register a zero-width hit target"
+        );
+    }
+
+    #[test]
+    fn workflow_view_draws_dag_lanes_and_degrades_to_the_plain_list() {
+        // Rubric 5: the pane must show the graph's EDGES, not just its order —
+        // `verify` depends on `patch`, so both sit in one lane joined by a
+        // node glyph and a trailing edge.
+        use crate::state::WorkflowNodeCard;
+        let mut state = running_build_state();
+        let card = |id: &str, deps: Vec<&str>| WorkflowNodeCard {
+            workflow_id: "repair-github-check".to_owned(),
+            workflow: "repair-github-check v1".to_owned(),
+            workflow_run_id: Some("workflow-run-1".to_owned()),
+            run_phase: "running".to_owned(),
+            inputs: "pull_request:github_pull_request*".to_owned(),
+            id: id.to_owned(),
+            action: "tool repository.test".to_owned(),
+            kind: "tool".to_owned(),
+            state: "pending".to_owned(),
+            agent: "\u{2014}".to_owned(),
+            model_policy: "\u{2014}".to_owned(),
+            workspace: "shared worktree".to_owned(),
+            approval: "none".to_owned(),
+            retry: "1 attempt".to_owned(),
+            depends_on: if deps.is_empty() {
+                "\u{2014}".to_owned()
+            } else {
+                deps.join(", ")
+            },
+            depends_on_ids: deps.iter().map(|d| (*d).to_owned()).collect(),
+            outputs: "test_result".to_owned(),
+            cost: "\u{2014}".to_owned(),
+            error: "\u{2014}".to_owned(),
+        };
+        state.workflow = vec![
+            card("patch", vec![]),
+            card("left", vec!["patch"]),
+            card("right", vec!["patch"]),
+            card("verify", vec!["left", "right"]),
+        ];
+        reduce(&mut state, Action::OpenWorkflow);
+        // The node's own row is the one carrying its selection marker; the lane
+        // art is the prefix in front of it.
+        let node_row = |text: &str, id: &str| -> String {
+            text.lines()
+                .find(|line| line.contains(&format!(" {id}  ")))
+                .unwrap_or_else(|| panic!("no row for `{id}`:\n{text}"))
+                .to_owned()
+        };
+        let wide = render_to_string(&state, 160, 40);
+        assert!(
+            node_row(&wide, "patch").contains('\u{25cf}'),
+            "the node glyph must prefix the node's row:\n{wide}"
+        );
+        assert!(
+            node_row(&wide, "right").contains('\u{2502}'),
+            "an edge in flight must be drawn as a vertical lane:\n{wide}"
+        );
+        assert!(
+            wide.contains('\u{2534}'),
+            "a fan-in must draw a join connector:\n{wide}"
+        );
+
+        // Degradation: with no edges at all there is nothing to draw, so the pane
+        // renders exactly the list it always did.
+        state.workflow = vec![card("patch", vec![]), card("verify", vec![])];
+        let flat = render_to_string(&state, 160, 40);
+        assert!(
+            !node_row(&flat, "patch").contains('\u{25cf}'),
+            "an edgeless graph must not paint lane art:\n{flat}"
+        );
+        assert!(
+            flat.contains("patch"),
+            "the plain list must survive:\n{flat}"
         );
     }
 

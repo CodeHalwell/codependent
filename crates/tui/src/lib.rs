@@ -28,6 +28,7 @@
 
 pub mod accessible;
 pub mod action;
+pub mod dag;
 pub mod input;
 pub mod markdown;
 pub mod palette;
