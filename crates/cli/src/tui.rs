@@ -45,13 +45,14 @@ use codypendent_protocol::{
     DocumentEditLease, DocumentId, DocumentSync, Envelope, ModelId, Payload, RepositoryId,
     SessionEvent, SessionId, Subscription, WorkspaceId,
 };
+use codypendent_runtime::models::provider_auth_id;
 use codypendent_tui::{
     accessible_snapshot, accessible_terminal_capabilities_message, map_accessible_input, map_event,
     reduce, render, render_splash, sanitize_accessible_text, terminal_capabilities_message, Action,
-    AppState, BlackboardItemCard, ColorDepth, DocBlockView, DocCard, DocSuggestionView,
-    GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard, ModelLocationLabel,
-    ModelReadiness, ProjectionKind, ProviderCard, SkillCard, TerminalGuard, Theme,
-    WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
+    AddModelRow, AppState, BlackboardItemCard, ColorDepth, DocBlockView, DocCard,
+    DocSuggestionView, GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard,
+    ModelListOrigin, ModelLocationLabel, ModelReadiness, ProjectionKind, ProviderCard, SkillCard,
+    TerminalGuard, Theme, WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -1200,8 +1201,12 @@ async fn event_loop<P: Presentation>(
                     "publish plan ready: {target} · {changed_files} file(s) · {git_action}"
                 )),
                 Some(ReaderSignal::ProviderModels { provider_id, result }) => match result {
-                    Ok(models) => Action::ProviderModelsLoaded { provider_id, models },
+                    Ok((models, origin)) => Action::ProviderModelsLoaded { provider_id, models, origin },
                     Err(reason) => Action::ProviderModelsFailed { provider_id, reason },
+                },
+                Some(ReaderSignal::ModelKeyVerified { model_id, result }) => match result {
+                    Ok(()) => Action::ModelKeyVerified { model_id, ok: true, reason: String::new() },
+                    Err(reason) => Action::ModelKeyVerified { model_id, ok: false, reason },
                 },
                 Some(ReaderSignal::AcpConnected { display_id, provider_id, result }) => {
                     connected_acp = Some((display_id, provider_id, result));
@@ -1321,7 +1326,8 @@ async fn event_loop<P: Presentation>(
         if let Some((display_id, provider_id, result)) = connected_acp.take() {
             match result {
                 Ok(coordinate) => {
-                    match write_add_model(paths, &display_id, &provider_id, &coordinate, None) {
+                    match write_add_model(paths, &display_id, &provider_id, &coordinate, None, None)
+                    {
                         Ok(()) => {
                             let mut warnings = Vec::new();
                             state.models = load_model_cards(paths, &mut warnings).await;
@@ -1390,6 +1396,7 @@ async fn event_loop<P: Presentation>(
                 provider_id,
                 model,
                 api_key,
+                context_tokens,
             } = &intent
             {
                 let acp =
@@ -1424,27 +1431,31 @@ async fn event_loop<P: Presentation>(
                     provider_id,
                     model,
                     api_key.as_ref().map(|k| k.0.as_str()),
+                    *context_tokens,
                 )
                 .await;
                 continue;
             }
             // `QueryProviderModels` is the other client-only intent (model
-            // discovery): resolve the catalog provider's base_url + first
-            // api-key header/prefix, then spawn the `<base_url>/models` GET off
-            // the UI thread and feed the result back as
-            // `ReaderSignal::ProviderModels`. Never a daemon command. The spawned
-            // task owns the key for the request and drops it — it is never sent
-            // back.
+            // discovery). Three steps, none of them on the UI thread beyond a
+            // cache read: seed the pick-list from `<data_dir>/model_lists/`
+            // when a previous fetch left one there (instant), then spawn the
+            // `<base_url>/models` GET and feed its merged result back as
+            // `ReaderSignal::ProviderModels`. Never a daemon command. The
+            // spawned task owns the key for the request and drops it — it is
+            // never sent back.
             if let Intent::QueryProviderModels {
                 provider_id,
                 api_key,
+                refresh,
             } = &intent
             {
                 use codypendent_providers::{AuthMethod, Catalog};
                 let catalog =
                     Catalog::load_with_user_overrides(&paths.data_dir.join("providers.toml"))
                         .unwrap_or_else(|_| Catalog::builtin());
-                let (base_url, header, prefix) = match catalog.get(provider_id) {
+                let curated = catalog_rows_for(&catalog, provider_id);
+                let (base_url, header, prefix, listable) = match catalog.get(provider_id) {
                     Some(provider) => {
                         let base = provider.base_url.clone().unwrap_or_default();
                         let (header, prefix) = match provider.auth.first() {
@@ -1453,25 +1464,98 @@ async fn event_loop<P: Presentation>(
                             }
                             _ => ("Authorization".to_string(), "Bearer ".to_string()),
                         };
-                        (base, header, prefix)
+                        (base, header, prefix, provider_can_list_models(provider))
                     }
                     None => (
                         String::new(),
                         "Authorization".to_string(),
                         "Bearer ".to_string(),
+                        false,
                     ),
                 };
+                // Instant seed: the cached listing, catalog metadata merged in.
+                if !*refresh {
+                    if let Some((cached, age)) = read_model_list_cache(&paths.data_dir, provider_id)
+                    {
+                        reduce(
+                            state,
+                            Action::ProviderModelsLoaded {
+                                provider_id: provider_id.clone(),
+                                models: merge_catalog_rows(cached, &curated),
+                                origin: ModelListOrigin::Cached(age),
+                            },
+                        );
+                    }
+                }
+                // A provider with no listing endpoint (Perplexity) never
+                // reaches the network at all: its curated rows ARE the answer.
+                if !listable {
+                    reduce(
+                        state,
+                        if curated.is_empty() {
+                            Action::ProviderModelsFailed {
+                                provider_id: provider_id.clone(),
+                                reason: "this provider has no model-list endpoint".to_owned(),
+                            }
+                        } else {
+                            Action::ProviderModelsLoaded {
+                                provider_id: provider_id.clone(),
+                                models: curated,
+                                origin: ModelListOrigin::Catalog("no listing endpoint".to_owned()),
+                            }
+                        },
+                    );
+                    continue;
+                }
                 let provider_id = provider_id.clone();
-                let key = api_key.as_ref().map(|k| k.0.clone());
+                // No key in hand: fall back to the provider-wide key a previous
+                // add already stored, so the same key is never asked for twice.
+                let key = api_key.as_ref().map(|k| k.0.clone()).or_else(|| {
+                    stored_provider_key(&paths.data_dir, &provider_id).filter(|k| !k.is_empty())
+                });
                 let tx = live.query_tx.clone();
+                let data_dir = paths.data_dir.clone();
                 tokio::spawn(async move {
                     let result =
-                        query_provider_models(&base_url, &header, &prefix, key.as_deref()).await;
+                        match query_provider_models(&base_url, &header, &prefix, key.as_deref())
+                            .await
+                        {
+                            Ok(live_rows) => {
+                                write_model_list_cache(&data_dir, &provider_id, &live_rows);
+                                Ok((
+                                    merge_catalog_rows(live_rows, &curated),
+                                    ModelListOrigin::Live,
+                                ))
+                            }
+                            // A failed fetch still has the curated rows to
+                            // offer — the picker never becomes a dead end.
+                            Err(reason) if !curated.is_empty() => {
+                                Ok((curated, ModelListOrigin::Catalog(reason)))
+                            }
+                            Err(reason) => Err(reason),
+                        };
                     let _ = tx
                         .send(ReaderSignal::ProviderModels {
                             provider_id,
                             result,
                         })
+                        .await;
+                });
+                continue;
+            }
+            // `VerifyApiKey` (`/keys`, `Ctrl-T`) is client-only for the same
+            // reason `SetApiKey` is: the key stays on this machine. One
+            // `/models` call through the real registry — the same credential
+            // precedence and headers a run would use — answered back as
+            // `Action::ModelKeyVerified`.
+            if let Intent::VerifyApiKey { model_id } = &intent {
+                let model_id = model_id.clone();
+                let data_dir = paths.data_dir.clone();
+                let tx = live.query_tx.clone();
+                tokio::spawn(async move {
+                    let result = verify_model_key(&data_dir, &model_id).await;
+                    let _ = tx
+                        .send(ReaderSignal::ModelKeyVerified { model_id, result })
                         .await;
                 });
                 continue;
@@ -1893,12 +1977,21 @@ enum ReaderSignal {
         git_action: String,
     },
     /// A provider's fetched model list (model-discovery): the result of the
-    /// spawned `<base_url>/models` GET, keyed by `provider_id`. Mapped by the
+    /// spawned `<base_url>/models` GET merged with the curated catalog rows,
+    /// keyed by `provider_id`, plus where the rows came from. Mapped by the
     /// loop's `select!` to `Action::ProviderModelsLoaded` (Ok) /
-    /// `ProviderModelsFailed` (Err). Carries NO key.
+    /// `ProviderModelsFailed` (Err — the fetch failed AND the catalog had
+    /// nothing for this provider). Carries NO key.
     ProviderModels {
         provider_id: String,
-        result: Result<Vec<String>, String>,
+        result: Result<(Vec<AddModelRow>, ModelListOrigin), String>,
+    },
+    /// The result of a one-shot `/keys` key verification (`Ctrl-T`): `Ok` when
+    /// the provider listed the configured model with the stored key, `Err`
+    /// with a key-free reason otherwise.
+    ModelKeyVerified {
+        model_id: String,
+        result: Result<(), String>,
     },
     /// Completion of an off-UI-thread ACP install + handshake + typed profile
     /// write. The loop refreshes model/key projections after success.
@@ -2438,6 +2531,9 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::SetApiKey { .. } | Intent::RemoveApiKey { .. } => unreachable!(
             "SetApiKey/RemoveApiKey are applied locally by the harness (write_api_key), never sent to the daemon"
         ),
+        Intent::VerifyApiKey { .. } => unreachable!(
+            "VerifyApiKey is probed locally by the harness (verify_model_key), never sent to the daemon"
+        ),
         Intent::CreateCouncil { .. } => unreachable!(
             "CreateCouncil is validated and persisted locally by the harness, never sent to the daemon"
         ),
@@ -2477,12 +2573,22 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
 /// the whole add before anything is written, rather than leaving a keyless
 /// `models.toml` entry behind while the key silently fails to save. A keyless
 /// add never loads `auth.json` at all, exactly as before.
+///
+/// The entry also records `provider_id`, so the runtime resolves this
+/// provider's auth header/prefix and extra headers from the catalog instead of
+/// flattening every provider to `Authorization: Bearer` (Azure OpenAI's
+/// `api-key` header would otherwise 401 on the first run), and
+/// `context_tokens` when the picked row knew it — never a guess. The key is
+/// stored twice: under the model's display id (today's behavior) and under the
+/// provider-wide `provider/<id>` entry, so the next model added from the same
+/// provider does not re-prompt for the same key.
 fn write_add_model(
     paths: &RuntimePaths,
     display_id: &str,
     provider_id: &str,
     model: &str,
     api_key: Option<&str>,
+    context_tokens: Option<u64>,
 ) -> anyhow::Result<()> {
     use codypendent_providers::Catalog;
     use codypendent_runtime::auth::AuthStore;
@@ -2524,7 +2630,9 @@ fn write_add_model(
         .and_then(|registry| registry.get(provider_id).cloned());
     let catalog = Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
         .unwrap_or_else(|_| Catalog::builtin());
-    let (runtime_provider, base_url, provider_model) = if let Some(agent) = acp_agent {
+    let (runtime_provider, base_url, provider_model, catalog_provider) = if let Some(agent) =
+        acp_agent
+    {
         let coordinate = if codypendent_integrations::acp_registry::agent_id_from_coordinate(model)
             == agent.id
         {
@@ -2535,7 +2643,7 @@ fn write_add_model(
         acp_store
             .launch_spec(&coordinate)
             .with_context(|| format!("ACP agent `{}` is not launchable", agent.id))?;
-        ("acp".to_string(), String::new(), coordinate)
+        ("acp".to_string(), String::new(), coordinate, false)
     } else {
         let provider = catalog
             .get(provider_id)
@@ -2548,13 +2656,26 @@ fn write_add_model(
         }
         (
             "openai-compatible".to_string(),
-            provider
-                .base_url
-                .clone()
-                .expect("runtime-supported providers have a non-blank base URL"),
+            // Normalized on persist: a catalog `base_url` written with a
+            // trailing slash (`…/v1/`) would otherwise reach the chat client
+            // as `…/v1//chat/completions`.
+            normalize_base_url(
+                provider
+                    .base_url
+                    .as_deref()
+                    .expect("runtime-supported providers have a non-blank base URL"),
+            ),
             model.to_string(),
+            true,
         )
     };
+    // A catalog row for this exact model fills in the context window when the
+    // caller did not already know it (the picker passes what it displayed).
+    let context_tokens = context_tokens.or_else(|| {
+        catalog
+            .model(provider_id, model)
+            .and_then(|row| row.context_tokens)
+    });
 
     // Read the existing models.toml (absent ⇒ start empty) through the real
     // loader, drop any entry sharing the new display id (update-in-place), then
@@ -2572,8 +2693,10 @@ fn write_add_model(
         base_url,
         model: provider_model,
         api_key_env: String::new(),
-        context_tokens: None,
-        provider_id: None,
+        // Only a catalog provider's auth is resolvable from the catalog; an
+        // ACP agent's provider id names a registry agent, not a provider.
+        provider_id: catalog_provider.then(|| provider_id.to_string()),
+        context_tokens,
     });
 
     // Serialize back to `[[model]]` tables and write atomically.
@@ -2598,10 +2721,58 @@ fn write_add_model(
             .as_mut()
             .expect("loaded above because `key` is Some (M3 ordering)");
         auth.set(display_id, key);
+        // Also store it provider-wide, so adding a second model from the same
+        // provider needs no second paste of the same key. The runtime reads
+        // this entry after the per-model one (`provider_auth_id`).
+        if catalog_provider {
+            auth.set(provider_auth_id(provider_id), key);
+        }
         auth.save(data_dir)
             .with_context(|| format!("writing {}", data_dir.join("auth.json").display()))?;
     }
     Ok(())
+}
+
+/// A provider `base_url` as it should be persisted: trailing slashes trimmed.
+/// The catalog stores a few with one (`…/v1/`), and the chat client joins
+/// `{base}/chat/completions` — the raw value would produce a double slash on
+/// every request. A blank/whitespace-only URL is returned as an empty string
+/// (the caller's own validation reports it).
+fn normalize_base_url(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_string()
+}
+
+/// The provider-wide key a previous add stored in `auth.json`
+/// (`provider/<catalog-id>`), if any. Read so the add flow never asks for a key
+/// it already holds; a missing or corrupt store is simply "no key".
+fn stored_provider_key(data_dir: &Path, provider_id: &str) -> Option<String> {
+    codypendent_runtime::auth::AuthStore::load(data_dir)
+        .ok()?
+        .get(&provider_auth_id(provider_id))
+        .map(str::to_owned)
+}
+
+/// One-shot verification of a configured model's credentials (`/keys`,
+/// `Ctrl-T`): run the real [`ModelRegistry::check_model`], which resolves the
+/// key through the same precedence a run uses and sends the same
+/// catalog-declared headers, so an "ok" here means the run would authenticate.
+/// The returned reason is the registry's own error text, which never contains
+/// key material.
+async fn verify_model_key(data_dir: &Path, model_id: &str) -> Result<(), String> {
+    use codypendent_runtime::models::{load_models, ModelRegistry};
+
+    let models_path = data_dir.join("models.toml");
+    let configs = load_models(&models_path).map_err(|error| error.to_string())?;
+    let auth = codypendent_runtime::auth::AuthStore::load(data_dir).unwrap_or_default();
+    let catalog =
+        codypendent_providers::Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
+            .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+    ModelRegistry::new(configs)
+        .with_auth(auth)
+        .with_catalog(catalog)
+        .check_model(&ModelId(model_id.to_owned()))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Install (when necessary) and handshake one official ACP agent away from the
@@ -2643,8 +2814,16 @@ async fn apply_add_model(
     provider_id: &str,
     model: &str,
     api_key: Option<&str>,
+    context_tokens: Option<u64>,
 ) {
-    match write_add_model(paths, display_id, provider_id, model, api_key) {
+    match write_add_model(
+        paths,
+        display_id,
+        provider_id,
+        model,
+        api_key,
+        context_tokens,
+    ) {
         Ok(()) => {
             // Re-seed the model picker so the new model shows immediately.
             let mut warnings = Vec::new();
@@ -2867,37 +3046,279 @@ fn models_url(base_url: &str) -> String {
     format!("{}/models", base_url.trim_end_matches('/'))
 }
 
+/// One entry of a provider's `/models` response, keeping the OPTIONAL metadata
+/// several OpenAI-compatible providers ship alongside the id. Every field but
+/// `id` is best-effort: a provider that answers with bare ids parses exactly as
+/// before, and a provider that answers with a shape this build does not know
+/// simply contributes nothing extra.
+///
+/// The known spellings, all observed in the wild on the same endpoint the add
+/// flow already calls: `context_length` (OpenRouter, Nebius `?verbose=true`),
+/// `max_model_len` (vLLM-derived: DeepInfra, Novita, SambaNova),
+/// `max_context_length`/`context_window` (Venice and friends), and a nested
+/// `pricing.{prompt,completion}` object priced per TOKEN (OpenRouter's
+/// convention) which is scaled to per-1M for display.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct DiscoveredModel {
+    #[serde(default)]
+    id: String,
+    #[serde(default, alias = "display_name", alias = "name")]
+    name: Option<String>,
+    #[serde(
+        default,
+        alias = "context_length",
+        alias = "max_model_len",
+        alias = "max_context_length",
+        alias = "context_window"
+    )]
+    context_tokens: Option<u64>,
+    #[serde(default)]
+    pricing: Option<DiscoveredPricing>,
+}
+
+/// A `/models` entry's optional pricing object. The values arrive as strings on
+/// OpenRouter (`"0.0000004"`) and as numbers elsewhere, so both are accepted
+/// and anything unparseable is simply dropped.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct DiscoveredPricing {
+    #[serde(default, alias = "input")]
+    prompt: Option<serde_json::Value>,
+    #[serde(default, alias = "output")]
+    completion: Option<serde_json::Value>,
+}
+
+/// A per-token price as USD per 1M tokens, accepting the string and number
+/// spellings providers use. `None` for anything that is not a finite,
+/// non-negative number — a fabricated price is worse than a blank column.
+fn price_per_1m(value: Option<&serde_json::Value>) -> Option<f64> {
+    let raw = match value? {
+        serde_json::Value::String(text) => text.trim().parse::<f64>().ok()?,
+        other => other.as_f64()?,
+    };
+    (raw.is_finite() && raw >= 0.0).then_some(raw * 1_000_000.0)
+}
+
 /// Parse an OpenAI/Ollama `/models` response body (`{ "object": "list", "data":
-/// [ { "id": "…" }, … ] }`) into the model ids: trim each, skip blank/missing,
-/// dedup preserving order. An empty result is an `Err` so the reducer's failure
-/// arm routes to the free-text fallback uniformly. A pure function over the body
-/// string — the network GET is in `query_provider_models` — so it is directly
-/// unit-testable. The error strings are generic and never carry a key.
-fn parse_models_response(body: &str) -> Result<Vec<String>, String> {
+/// [ { "id": "…" }, … ] }`) into rows: trim each id, skip blank/missing, dedup
+/// preserving order, and keep any optional metadata the provider volunteered.
+/// An empty result is an `Err` so the caller can fall back to the catalog
+/// uniformly. A pure function over the body string — the network GET is in
+/// `query_provider_models` — so it is directly unit-testable. The error strings
+/// are generic and never carry a key.
+fn parse_models_response(body: &str) -> Result<Vec<AddModelRow>, String> {
     #[derive(serde::Deserialize)]
     struct ModelsResponse {
         #[serde(default)]
-        data: Vec<ModelEntry>,
-    }
-    #[derive(serde::Deserialize)]
-    struct ModelEntry {
-        #[serde(default)]
-        id: String,
+        data: Vec<DiscoveredModel>,
     }
     let parsed: ModelsResponse = serde_json::from_str(body)
         .map_err(|_| "the provider returned an unexpected response".to_string())?;
-    let mut ids: Vec<String> = Vec::new();
+    let mut rows: Vec<AddModelRow> = Vec::new();
     for entry in parsed.data {
         let id = entry.id.trim().to_string();
-        if id.is_empty() || ids.contains(&id) {
+        if id.is_empty() || rows.iter().any(|row| row.id == id) {
             continue;
         }
-        ids.push(id);
+        let pricing = entry.pricing.unwrap_or_default();
+        rows.push(AddModelRow {
+            id,
+            name: entry
+                .name
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty()),
+            context_tokens: entry.context_tokens.filter(|tokens| *tokens > 0),
+            cost_per_1m_input_usd: price_per_1m(pricing.prompt.as_ref()),
+            cost_per_1m_output_usd: price_per_1m(pricing.completion.as_ref()),
+            live: true,
+        });
     }
-    if ids.is_empty() {
+    if rows.is_empty() {
         return Err("provider returned no models".to_string());
     }
-    Ok(ids)
+    Ok(rows)
+}
+
+/// Merge a provider's live listing with the curated catalog rows for the same
+/// provider: catalog metadata fills any gap a live row left (never overwriting
+/// what the provider itself said), and catalog models the listing did not name
+/// are appended as unconfirmed (`live: false`) rows — the offline/no-listing
+/// path. Live rows keep their listing order; catalog-only rows follow in
+/// catalog order, so the provider's own ranking survives.
+fn merge_catalog_rows(live: Vec<AddModelRow>, catalog: &[AddModelRow]) -> Vec<AddModelRow> {
+    let mut rows = live;
+    for row in &mut rows {
+        let Some(known) = catalog.iter().find(|entry| entry.id == row.id) else {
+            continue;
+        };
+        if row.name.is_none() {
+            row.name.clone_from(&known.name);
+        }
+        if row.context_tokens.is_none() {
+            row.context_tokens = known.context_tokens;
+        }
+        if row.cost_per_1m_input_usd.is_none() {
+            row.cost_per_1m_input_usd = known.cost_per_1m_input_usd;
+        }
+        if row.cost_per_1m_output_usd.is_none() {
+            row.cost_per_1m_output_usd = known.cost_per_1m_output_usd;
+        }
+    }
+    for known in catalog {
+        if !rows.iter().any(|row| row.id == known.id) {
+            rows.push(known.clone());
+        }
+    }
+    rows
+}
+
+/// The catalog's curated `[[model]]` rows for one provider, as pick-list rows.
+/// `live: false` — these are offerable, but nothing has confirmed this account
+/// can reach them.
+fn catalog_rows_for(
+    catalog: &codypendent_providers::Catalog,
+    provider_id: &str,
+) -> Vec<AddModelRow> {
+    catalog
+        .models()
+        .filter(|model| model.provider_id == provider_id)
+        .map(|model| AddModelRow {
+            id: model.id.clone(),
+            name: model.name.clone(),
+            context_tokens: model.context_tokens,
+            cost_per_1m_input_usd: model.cost_per_1m_input_usd,
+            cost_per_1m_output_usd: model.cost_per_1m_output_usd,
+            live: false,
+        })
+        .collect()
+}
+
+/// The on-disk shape of one cached provider listing
+/// (`<data_dir>/model_lists/<provider>.json`). Plain data, no key material: it
+/// holds exactly what the pick-list shows. `fetched_at_unix` is seconds since
+/// the epoch — the same dependency-free stamp `humantime_now` uses, rather
+/// than pulling a time-formatting crate into this crate's build.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedModelList {
+    provider_id: String,
+    fetched_at_unix: u64,
+    models: Vec<CachedModelRow>,
+}
+
+/// One cached row. Mirrors [`AddModelRow`] minus `live` — everything in the
+/// cache came from a live listing at `fetched_at`, and is re-marked as such
+/// when it is read back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedModelRow {
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_per_1m_input_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_per_1m_output_usd: Option<f64>,
+}
+
+/// Where one provider's cached listing lives.
+fn model_list_cache_path(data_dir: &Path, provider_id: &str) -> PathBuf {
+    // Provider ids are catalog identifiers (`azure-openai`, `nebius`), but the
+    // value reaches here from a user-editable `providers.toml`, so any path
+    // separator is neutralized before it becomes a file name.
+    let safe: String = provider_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    data_dir.join("model_lists").join(format!("{safe}.json"))
+}
+
+/// Read a provider's cached listing, if one is on disk and parseable. Returns
+/// the rows (re-marked `live`, since they were a live listing when written)
+/// and a human age label for the header. A missing/corrupt cache is simply
+/// `None` — the cache is an accelerator, never a source of truth.
+fn read_model_list_cache(data_dir: &Path, provider_id: &str) -> Option<(Vec<AddModelRow>, String)> {
+    let text = std::fs::read_to_string(model_list_cache_path(data_dir, provider_id)).ok()?;
+    let cached: CachedModelList = serde_json::from_str(&text).ok()?;
+    if cached.models.is_empty() {
+        return None;
+    }
+    let rows = cached
+        .models
+        .into_iter()
+        .map(|row| AddModelRow {
+            id: row.id,
+            name: row.name,
+            context_tokens: row.context_tokens,
+            cost_per_1m_input_usd: row.cost_per_1m_input_usd,
+            cost_per_1m_output_usd: row.cost_per_1m_output_usd,
+            live: true,
+        })
+        .collect();
+    Some((rows, cache_age_label(cached.fetched_at_unix, unix_now())))
+}
+
+/// Seconds since the Unix epoch, or `0` when the clock is before it (the same
+/// dependency-free stamp the crash log uses).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// A human age for a cached listing ("4m ago"). A stamp from the future (a
+/// clock that moved backwards) reads as "just now" rather than as a negative
+/// age — the label is a hint, and `Ctrl-R` is always available.
+fn cache_age_label(fetched_at_unix: u64, now_unix: u64) -> String {
+    let minutes = now_unix.saturating_sub(fetched_at_unix) / 60;
+    match minutes {
+        m if m < 1 => "just now".to_owned(),
+        m if m < 60 => format!("{m}m ago"),
+        m if m < 60 * 24 => format!("{}h ago", m / 60),
+        m => format!("{}d ago", m / (60 * 24)),
+    }
+}
+
+/// Persist a provider's live listing for the next add (instant seed). Failures
+/// are ignored: a cache that cannot be written must never break the add flow.
+fn write_model_list_cache(data_dir: &Path, provider_id: &str, rows: &[AddModelRow]) {
+    let path = model_list_cache_path(data_dir, provider_id);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let cached = CachedModelList {
+        provider_id: provider_id.to_owned(),
+        fetched_at_unix: unix_now(),
+        models: rows
+            .iter()
+            .filter(|row| row.live)
+            .map(|row| CachedModelRow {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                context_tokens: row.context_tokens,
+                cost_per_1m_input_usd: row.cost_per_1m_input_usd,
+                cost_per_1m_output_usd: row.cost_per_1m_output_usd,
+            })
+            .collect(),
+    };
+    if cached.models.is_empty() {
+        return;
+    }
+    let Ok(rendered) = serde_json::to_string_pretty(&cached) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, rendered.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// GET `<base_url>/models` for the add-model flow (model-discovery), applying the
@@ -2913,7 +3334,7 @@ async fn query_provider_models(
     header: &str,
     prefix: &str,
     api_key: Option<&str>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<AddModelRow>, String> {
     let url = models_url(base_url);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -3580,6 +4001,15 @@ async fn load_provider_cards(
             Catalog::builtin()
         }
     };
+    // How many curated models the catalog ships per provider, counted once
+    // rather than re-scanning for every card.
+    let mut catalog_model_counts: HashMap<&str, usize> = HashMap::new();
+    for model in catalog.models() {
+        *catalog_model_counts
+            .entry(model.provider_id.as_str())
+            .or_default() += 1;
+    }
+    let auth = codypendent_runtime::auth::AuthStore::load(&paths.data_dir).unwrap_or_default();
     let mut cards: Vec<_> = catalog
         .providers()
         // ACP entries come from the official live registry below. Keeping the
@@ -3615,6 +4045,17 @@ async fn load_provider_cards(
             // tested against the real enums.
             can_list_models: provider_can_list_models(p),
             available: provider_runtime_supported(p),
+            // The curated `[[model]]` rows this provider ships: what the add
+            // flow can offer with no network at all.
+            catalog_models: catalog_model_counts
+                .get(p.id.as_str())
+                .copied()
+                .unwrap_or_default(),
+            // A provider-wide key already in `auth.json` means the add flow
+            // can skip straight to the pick-list.
+            has_key: auth
+                .get(&provider_auth_id(&p.id))
+                .is_some_and(|key| !key.is_empty()),
         })
         .collect();
     let acp_store = AcpRegistryStore::new(&paths.data_dir);
@@ -3651,6 +4092,10 @@ async fn load_provider_cards(
                 // background when selected. Package entries are selectable
                 // only when their runner is actually present.
                 available: acp_store.launch_spec(&agent.id).is_ok() || binary_installable,
+                // An ACP agent owns its own model; there is nothing for the
+                // catalog to curate and no provider key to hold.
+                catalog_models: 0,
+                has_key: false,
             }
         }));
     }
@@ -3665,6 +4110,8 @@ async fn load_provider_cards(
                 requires_key: false,
                 can_list_models: false,
                 available: true,
+                catalog_models: 0,
+                has_key: false,
             });
         }
     }

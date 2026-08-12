@@ -21,10 +21,10 @@ use crate::remote_ui::{RemoteKey, RemoteUiRenderOutput};
 use crate::remote_ui_host::{empty_message, terminal_viewport_message};
 use crate::state::{
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
-    filter_providers, key_row_target, AppState, CouncilBuilderState, CouncilBuilderStep,
-    CouncilMemberDraft, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView,
-    KeyStatus, ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView,
-    ToolCard, ToolStatus, TranscriptEntry, EDGE_PAGE_SIZE,
+    filter_providers, key_row_target, AddModelRow, AppState, CouncilBuilderState,
+    CouncilBuilderStep, CouncilMemberDraft, DocBlockView, DocEdit, DocFocus, DocLeaseState,
+    DocSuggestionView, KeyStatus, ModelListOrigin, ModelReadiness, Overlay, Pane, PatchSummary,
+    PendingApproval, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry, EDGE_PAGE_SIZE,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -241,6 +241,8 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::ScrollPageDown => scroll_page(state, false),
         Action::Expand => expand_selected(state),
         Action::RemoveApiKey => begin_remove_key(state),
+        Action::VerifyApiKey => begin_verify_key(state),
+        Action::RefreshProviderModels => refresh_provider_models(state),
 
         Action::PrevRun => cycle_run(state, -1),
         Action::NextRun => cycle_run(state, 1),
@@ -487,11 +489,17 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::ProviderModelsLoaded {
             provider_id,
             models,
-        } => on_provider_models_loaded(state, provider_id, models),
+            origin,
+        } => on_provider_models_loaded(state, provider_id, models, origin),
         Action::ProviderModelsFailed {
             provider_id,
             reason,
         } => on_provider_models_failed(state, provider_id, reason),
+        Action::ModelKeyVerified {
+            model_id,
+            ok,
+            reason,
+        } => on_model_key_verified(state, &model_id, ok, &reason),
 
         // --- `/keys` (D1): the harness's key-status projection ---
         Action::ApiKeyStatusesLoaded { models, tavily } => {
@@ -2829,6 +2837,8 @@ fn submit_prompt(state: &mut AppState) {
                     let requires_key = card.requires_key;
                     let can_list_models = card.can_list_models;
                     let available = card.available;
+                    let catalog_models = card.catalog_models;
+                    let has_key = card.has_key;
                     if available {
                         enter_add_model_flow(
                             state,
@@ -2836,6 +2846,8 @@ fn submit_prompt(state: &mut AppState) {
                             protocol,
                             requires_key,
                             can_list_models,
+                            catalog_models,
+                            has_key,
                         );
                     } else {
                         state.notice = Some((
@@ -2967,7 +2979,14 @@ fn submit_prompt(state: &mut AppState) {
                     api_key,
                     buffer: String::new(),
                 };
-            } else if let Some(key) = api_key {
+            } else if let Some(key) = api_key.filter(|key| {
+                // A captured key only short-circuits the key step when it is
+                // actually a key. A BLANK captured key for a key-requiring
+                // provider must still route through the masked prompt —
+                // otherwise a failed query with an empty key silently writes a
+                // keyless model that can only 401 at run time.
+                !requires_key || !key.0.trim().is_empty()
+            }) {
                 // A key was already captured (a can-list provider's failed query
                 // fell back here). Emit directly — never re-prompt. A blank inner
                 // key normalizes to `None`.
@@ -2984,6 +3003,7 @@ fn submit_prompt(state: &mut AppState) {
                     provider_id,
                     model,
                     api_key,
+                    context_tokens: None,
                 });
             } else if requires_key {
                 state.overlay = Overlay::AddModelKey {
@@ -2999,6 +3019,7 @@ fn submit_prompt(state: &mut AppState) {
                     provider_id,
                     model,
                     api_key: None,
+                    context_tokens: None,
                 });
             }
         }
@@ -3022,6 +3043,7 @@ fn submit_prompt(state: &mut AppState) {
                 provider_id,
                 model,
                 api_key,
+                context_tokens: None,
             });
         }
         // Key-first prompt (can-list hosted): emit the query with the entered key
@@ -3040,6 +3062,7 @@ fn submit_prompt(state: &mut AppState) {
             state.outbox.push(Intent::QueryProviderModels {
                 provider_id: provider_id.clone(),
                 api_key: api_key.clone(),
+                refresh: false,
             });
             state.overlay = Overlay::AddModelQuerying {
                 provider_id,
@@ -3047,18 +3070,20 @@ fn submit_prompt(state: &mut AppState) {
             };
         }
         // The pick-list: resolve the filtered selection (same zero-match guard as
-        // the model picker) and emit `AddModel` for the chosen name, moving the
-        // stashed key into the intent.
+        // the model picker) and emit `AddModel` for the chosen row, moving the
+        // stashed key and the row's known context window into the intent.
         Overlay::AddModelPick {
             provider_id,
             api_key,
             models,
             query,
             selected,
+            ..
         } => {
             if let Some(&idx) = filter_model_names(&models, &query).get(selected) {
-                if let Some(model) = models.get(idx) {
-                    let model = model.clone();
+                if let Some(row) = models.get(idx) {
+                    let model = row.id.clone();
+                    let context_tokens = row.context_tokens;
                     let display_id = format!("{provider_id}/{model}");
                     state.notice = Some((format!("adding model {display_id}"), state.tick + 25));
                     state.outbox.push(Intent::AddModel {
@@ -3066,6 +3091,7 @@ fn submit_prompt(state: &mut AppState) {
                         provider_id,
                         model,
                         api_key,
+                        context_tokens,
                     });
                 }
             }
@@ -3100,16 +3126,24 @@ fn valid_publish_path(path: &str) -> bool {
 /// The shared add-model entry, called by both `Tab` (`begin_add_model`) and
 /// `Enter` (the `ProviderPicker` submit arm). Branches on the focused provider's
 /// gates (model-discovery):
-/// - can-list + hosted → key-first masked prompt (the key is needed before the
-///   model name exists), which on submit queries `<base_url>/models`.
-/// - can-list + local/no-auth → query immediately (no key).
-/// - cannot-list → today's free-text `AddModelId` flow, unchanged.
+/// - can-list + hosted with no stored key → key-first masked prompt (the key is
+///   needed before the model name exists), which on submit queries
+///   `<base_url>/models`.
+/// - can-list + local/no-auth, or a provider whose key `auth.json` already
+///   holds → query immediately (the harness resolves the stored key), so the
+///   same key is never asked for twice.
+/// - cannot-list, but the catalog ships models for it → query anyway: the
+///   harness answers from the catalog, so a provider with no listing endpoint
+///   (Perplexity) still gets a real pick-list instead of a free-text prompt.
+/// - cannot-list and nothing curated → the free-text `AddModelId` flow.
 fn enter_add_model_flow(
     state: &mut AppState,
     provider_id: String,
     protocol: String,
     requires_key: bool,
     can_list_models: bool,
+    catalog_models: usize,
+    has_key: bool,
 ) {
     if protocol == "acp" {
         let display_id = format!("acp/{provider_id}");
@@ -3118,20 +3152,23 @@ fn enter_add_model_flow(
             model: provider_id.clone(),
             provider_id,
             api_key: None,
+            context_tokens: None,
         });
         state.notice = Some((format!("connecting {display_id}"), state.tick + 25));
         state.overlay = Overlay::None;
         return;
     }
-    state.overlay = if can_list_models && requires_key {
+    let can_offer = can_list_models || catalog_models > 0;
+    state.overlay = if can_offer && requires_key && !has_key {
         Overlay::AddModelProviderKey {
             provider_id,
             buffer: SecretKey(String::new()),
         }
-    } else if can_list_models {
+    } else if can_offer {
         state.outbox.push(Intent::QueryProviderModels {
             provider_id: provider_id.clone(),
             api_key: None,
+            refresh: false,
         });
         Overlay::AddModelQuerying {
             provider_id,
@@ -3147,11 +3184,82 @@ fn enter_add_model_flow(
     };
 }
 
+/// Re-fetch the open add-model pick-list from the provider (`Ctrl-R`),
+/// bypassing the on-disk cache. The stashed key rides the new query so a
+/// hosted provider is not asked for it again; the current rows stay on screen
+/// (with a "refreshing" marker) until the answer arrives. A no-op in every
+/// other overlay.
+fn refresh_provider_models(state: &mut AppState) {
+    let Overlay::AddModelPick {
+        provider_id,
+        api_key,
+        refreshing,
+        ..
+    } = &mut state.overlay
+    else {
+        return;
+    };
+    if *refreshing {
+        return;
+    }
+    *refreshing = true;
+    let intent = Intent::QueryProviderModels {
+        provider_id: provider_id.clone(),
+        api_key: api_key.clone(),
+        refresh: true,
+    };
+    state.outbox.push(intent);
+    state.notice = Some(("refreshing the model list…".to_owned(), state.tick + 25));
+}
+
+/// Verify the focused `/keys` row's key against its provider (`Ctrl-T`): emit
+/// the one-shot probe intent. A no-op outside the `/keys` overlay and on the
+/// Tavily row, which has no model endpoint to probe.
+fn begin_verify_key(state: &mut AppState) {
+    let Overlay::ApiKeys { query, selected } = &state.overlay else {
+        return;
+    };
+    let Some(&idx) = filter_key_rows(&state.models, query).get(*selected) else {
+        return;
+    };
+    let Some(card) = state.models.get(idx) else {
+        state.notice = Some((
+            "verification is available for model rows only".to_owned(),
+            state.tick + 25,
+        ));
+        return;
+    };
+    let model_id = card.id.0.clone();
+    state.notice = Some((format!("verifying {model_id}…"), state.tick + 40));
+    state.outbox.push(Intent::VerifyApiKey { model_id });
+}
+
+/// Fold a key-verification result back in: the notice reports it, and the
+/// model's card readiness is replaced with the honest answer so a hosted model
+/// stops claiming `Unverified` once it has actually been probed.
+fn on_model_key_verified(state: &mut AppState, model_id: &str, ok: bool, reason: &str) {
+    if let Some(card) = state.models.iter_mut().find(|card| card.id.0 == model_id) {
+        card.readiness = if ok {
+            ModelReadiness::Ready
+        } else {
+            ModelReadiness::Unavailable(reason.to_owned())
+        };
+    }
+    state.notice = Some((
+        if ok {
+            format!("{model_id}: key verified")
+        } else {
+            format!("{model_id}: {reason}")
+        },
+        state.tick + 40,
+    ));
+}
+
 /// Begin the add-model flow (`Tab` in the `/provider` picker) for the focused
 /// catalog provider. A no-op outside the provider picker, or when the filtered
 /// selection matches no provider (the same zero-match guard the Enter arm uses).
 fn begin_add_model(state: &mut AppState) {
-    let (provider_id, protocol, requires_key, can_list_models, available) = {
+    let (provider_id, protocol, requires_key, can_list_models, available, catalog_models, has_key) = {
         let Overlay::ProviderPicker { query, selected } = &state.overlay else {
             return;
         };
@@ -3165,6 +3273,8 @@ fn begin_add_model(state: &mut AppState) {
                 card.requires_key,
                 card.can_list_models,
                 card.available,
+                card.catalog_models,
+                card.has_key,
             ),
             None => return,
         }
@@ -3178,7 +3288,15 @@ fn begin_add_model(state: &mut AppState) {
         ));
         return;
     }
-    enter_add_model_flow(state, provider_id, protocol, requires_key, can_list_models);
+    enter_add_model_flow(
+        state,
+        provider_id,
+        protocol,
+        requires_key,
+        can_list_models,
+        catalog_models,
+        has_key,
+    );
 }
 
 /// Fold a fetched provider model list into the in-flight query overlay
@@ -3187,7 +3305,39 @@ fn begin_add_model(state: &mut AppState) {
 /// overlay is no longer the matching `AddModelQuerying` (the user dismissed or
 /// opened something else, or this is a stale result for another provider), the
 /// result is ignored — the race guard.
-fn on_provider_models_loaded(state: &mut AppState, provider_id: String, models: Vec<String>) {
+///
+/// A second delivery for a pick-list that is already open (the cached seed's
+/// live refresh, or a manual `Ctrl-R`) replaces the rows in place, keeping the
+/// operator's filter text and clamping the selection — losing their typing
+/// mid-browse would be worse than a stale row.
+fn on_provider_models_loaded(
+    state: &mut AppState,
+    provider_id: String,
+    models: Vec<AddModelRow>,
+    origin: ModelListOrigin,
+) {
+    // Already browsing this provider: fold the fresher list in underneath the
+    // filter rather than reopening the overlay from scratch.
+    if let Overlay::AddModelPick {
+        provider_id: pid,
+        models: rows,
+        query,
+        selected,
+        origin: current,
+        refreshing,
+        ..
+    } = &mut state.overlay
+    {
+        if *pid != provider_id {
+            return;
+        }
+        *rows = models;
+        *current = origin;
+        *refreshing = false;
+        let matches = filter_model_names(rows, query).len();
+        *selected = (*selected).min(matches.saturating_sub(1));
+        return;
+    }
     let matched = matches!(
         &state.overlay,
         Overlay::AddModelQuerying { provider_id: pid, .. } if *pid == provider_id
@@ -3206,6 +3356,8 @@ fn on_provider_models_loaded(state: &mut AppState, provider_id: String, models: 
             models,
             query: String::new(),
             selected: 0,
+            origin,
+            refreshing: false,
         };
     }
 }
@@ -3219,8 +3371,25 @@ fn on_provider_models_loaded(state: &mut AppState, provider_id: String, models: 
 /// whether this particular query happened to carry a key: a hosted provider
 /// queried with a blank key still requires one on the free-text fallback, so
 /// the flow re-prompts for it instead of silently adding a keyless model that
-/// can only fail later at run time.
+/// can only fail later at run time. When the card is missing entirely (the
+/// projection has not loaded), the fallback ASSUMES a key is needed rather
+/// than inferring it from the query — an extra prompt the operator can dismiss
+/// with `Enter` is strictly better than a keyless model that 401s at run time.
 fn on_provider_models_failed(state: &mut AppState, provider_id: String, reason: String) {
+    // A failed manual refresh leaves the pick-list standing: the rows on
+    // screen are still usable, so only the notice changes.
+    if let Overlay::AddModelPick {
+        provider_id: pid,
+        refreshing,
+        ..
+    } = &mut state.overlay
+    {
+        if *pid == provider_id {
+            *refreshing = false;
+            state.notice = Some((format!("refresh failed ({reason})"), state.tick + 25));
+        }
+        return;
+    }
     let matched = matches!(
         &state.overlay,
         Overlay::AddModelQuerying { provider_id: pid, .. } if *pid == provider_id
@@ -3237,7 +3406,7 @@ fn on_provider_models_failed(state: &mut AppState, provider_id: String, reason: 
             .providers
             .iter()
             .find(|c| c.id == provider_id)
-            .map_or(api_key.is_some(), |c| c.requires_key);
+            .is_none_or(|c| c.requires_key);
         state.notice = Some((
             format!("couldn't fetch models ({reason}); type the model name"),
             state.tick + 25,

@@ -26,9 +26,10 @@ use crate::reduce::capability_label;
 use crate::remote_ui_host::{TERMINAL_CENTRAL_SLOTS, TERMINAL_OVERLAY_SLOTS};
 use crate::state::{
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
-    filter_providers, AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus, DocLeaseState,
-    KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, ModelReadiness, Overlay, Pane,
-    PatchSummary, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    filter_providers, AddModelRow, AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus,
+    DocLeaseState, KeyStatus, LayoutMode, ModelCard, ModelListOrigin, ModelLocationLabel,
+    ModelReadiness, Overlay, Pane, PatchSummary, ProviderCard, RunActivity, RunView, ToolCard,
+    ToolStatus, TranscriptEntry,
 };
 use crate::theme::Theme;
 use crate::{render_remote_ui, RemoteUiRenderOptions};
@@ -2268,6 +2269,8 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             models,
             query,
             selected,
+            origin,
+            refreshing,
             ..
         } => {
             render_add_model_pick(
@@ -2279,6 +2282,8 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 models,
                 query,
                 *selected,
+                origin,
+                *refreshing,
             );
         }
         Overlay::None => {
@@ -3035,6 +3040,16 @@ fn context_label(context_tokens: Option<u64>) -> String {
     }
 }
 
+/// A catalog price column: USD per 1M tokens, or an em dash when the catalog
+/// (and the provider's own listing) said nothing. Display-only — these numbers
+/// are never summed into a spend figure.
+fn price_per_1m_label(cost_per_1m_usd: Option<f64>) -> String {
+    match cost_per_1m_usd {
+        Some(cost) => format!("${cost}"),
+        None => "—".to_owned(),
+    }
+}
+
 /// The provider-catalog picker (Task 8): the same filter-line + list/detail
 /// shape as [`render_model_picker`], over [`AppState::providers`] instead of
 /// `models`. `Enter` (or `Tab`) begins the add-model flow for the focused
@@ -3124,9 +3139,10 @@ fn render_provider_picker(
         );
         let metadata_line = Line::styled(
             format!(
-                "      {} · {}",
+                "      {} · {} · {}",
                 provider_location_label(card.local),
-                card.auth
+                card.auth,
+                provider_listing_label(card),
             ),
             theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
@@ -3429,8 +3445,22 @@ fn render_api_keys(
                 theme.selection_aware_text_style(is_selected, theme.text.primary),
             ),
         ]);
+        // A model row that has actually been probed reports the result here,
+        // so a verified key reads as verified rather than staying "Unverified"
+        // forever. `Ctrl-T` is what fills this in.
+        let verified = state
+            .models
+            .get(idx)
+            .map(|card| match &card.readiness {
+                ModelReadiness::Ready => " · verified ✓".to_owned(),
+                ModelReadiness::Unavailable(reason) => {
+                    format!(" · {}", truncate_display_width(reason, 40))
+                }
+                ModelReadiness::Unverified => String::new(),
+            })
+            .unwrap_or_default();
         let detail_line = Line::styled(
-            format!("      {provider} · {detail}"),
+            format!("      {provider} · {detail}{verified}"),
             theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, detail_line]);
@@ -3455,7 +3485,7 @@ fn render_api_keys(
     }
 
     let hint = Line::styled(
-        "↑/↓ select · Enter set/replace · Delete remove · Esc close",
+        "↑/↓ select · Enter set/replace · Ctrl-T verify · Delete remove · Esc close",
         Style::default().fg(theme.text.muted),
     )
     .alignment(Alignment::Center);
@@ -3529,6 +3559,19 @@ fn provider_location_label(local: bool) -> &'static str {
         "local ✓"
     } else {
         "hosted"
+    }
+}
+
+/// What the add-model flow can offer for this provider: a live `/models`
+/// listing, the curated catalog rows, both, or neither (free-text). Stated on
+/// the card so the operator knows before pressing Enter whether they are about
+/// to browse or to type.
+fn provider_listing_label(card: &ProviderCard) -> String {
+    match (card.can_list_models, card.catalog_models) {
+        (true, 0) => "live list ✓".to_owned(),
+        (true, n) => format!("live list ✓ · catalog {n}"),
+        (false, 0) => "type the model name".to_owned(),
+        (false, n) => format!("catalog {n} models"),
     }
 }
 
@@ -5227,9 +5270,13 @@ fn render_querying(
 }
 
 /// The add-model pick-list (model-discovery): a filter line over the provider's
-/// fetched model ids, the same shape as [`render_model_picker`] but over plain
-/// `String` names (there is no `ModelCard` detail to show). Colors are Theme
-/// tokens only (RULE 7). The key is NOT in scope here.
+/// offerable models, each row a card — id, display name, context window, and
+/// USD per 1M input/output tokens — merged by the harness from the live
+/// `/models` listing and the built-in catalog. A `~` marks a catalog-only row
+/// (offerable, but not confirmed by the provider just now), and the header
+/// states where the list came from, so a cached or catalog-only list is never
+/// mistaken for a live one. Prices are display-only (never summed). Colors are
+/// Theme tokens only (RULE 7). The key is NOT in scope here.
 #[allow(clippy::too_many_arguments)] // mirrors the model/provider picker signatures + `state` (Task 8)
 fn render_add_model_pick(
     frame: &mut Frame,
@@ -5237,20 +5284,30 @@ fn render_add_model_pick(
     state: &AppState,
     theme: &Theme,
     provider_id: &str,
-    models: &[String],
+    models: &[AddModelRow],
     query: &str,
     selected: usize,
+    origin: &ModelListOrigin,
+    refreshing: bool,
 ) {
     let matches = filter_model_names(models, query);
-    let rect = centered_modal(area, 84, 24);
+    let rect = centered_modal(area, 96, 26);
+    let source = match origin {
+        ModelListOrigin::Live => "live list".to_owned(),
+        ModelListOrigin::Cached(age) => format!("cached {age}"),
+        ModelListOrigin::Catalog(reason) if reason.is_empty() => "catalog".to_owned(),
+        ModelListOrigin::Catalog(reason) => format!("catalog · {reason}"),
+    };
     let inner = modal_surface(
         frame,
         rect,
         format!(
-            "Add model · {}  ·  {} of {} results",
+            "Add model · {}  ·  {} of {} results  ·  {}{}",
             truncate_display_width(provider_id, 24),
             matches.len(),
-            models.len()
+            models.len(),
+            source,
+            if refreshing { " · refreshing…" } else { "" }
         ),
         state,
         theme,
@@ -5267,13 +5324,15 @@ fn render_add_model_pick(
     render_modal_search(frame, rows[0], query, theme);
 
     let list_block = modal_panel(
-        format!("Models  ·  {} of {}", matches.len(), models.len()),
+        format!(
+            "Models  ·  {} of {}  ·  ctx · $/1M in · out",
+            matches.len(),
+            models.len()
+        ),
         theme,
     );
     let list_area = list_block.inner(rows[1]);
     frame.render_widget(list_block, rows[1]);
-    let visible_rows = usize::from(list_area.height).max(1);
-    let first = first_visible_row(selected, matches.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if models.is_empty() {
         items.push(ListItem::new(Line::styled(
@@ -5286,22 +5345,47 @@ fn render_add_model_pick(
             Style::default().fg(theme.text.muted),
         )));
     }
+    // Two lines per row: the id (with a live/catalog marker), then the
+    // metadata columns. A row whose metadata is entirely unknown still shows
+    // its dashes rather than collapsing, so the columns stay aligned.
+    const ROW_LINES: usize = 2;
+    let visible_rows = (usize::from(list_area.height) / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
     for (row, &idx) in matches.iter().enumerate().skip(first) {
         let is_selected = row == selected;
+        let card = &models[idx];
         let head = Line::from(vec![
             Span::styled(
                 if is_selected { "▎ " } else { "  " },
                 theme.selection_aware_text_style(is_selected, theme.focus.active),
             ),
             Span::styled(
-                truncate_display_width(
-                    &models[idx],
-                    usize::from(list_area.width.saturating_sub(2)),
+                if card.live { "✓ " } else { "~ " },
+                theme.selection_aware_text_style(
+                    is_selected,
+                    if card.live {
+                        theme.status.success
+                    } else {
+                        theme.text.muted
+                    },
                 ),
+            ),
+            Span::styled(
+                truncate_display_width(&card.id, usize::from(list_area.width.saturating_sub(4))),
                 theme.selection_aware_text_style(is_selected, theme.text.primary),
             ),
         ]);
-        let item = ListItem::new(vec![head]);
+        let detail = Line::styled(
+            format!(
+                "      {} · ctx {} · in {} · out {}",
+                card.name.as_deref().unwrap_or("—"),
+                context_label(card.context_tokens),
+                price_per_1m_label(card.cost_per_1m_input_usd),
+                price_per_1m_label(card.cost_per_1m_output_usd),
+            ),
+            theme.selection_aware_text_style(is_selected, theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, detail]);
         items.push(if is_selected {
             item.style(theme.selection_style())
         } else {
@@ -5312,16 +5396,16 @@ fn render_add_model_pick(
         List::new(items).style(Style::default().bg(theme.surface.panel)),
         list_area,
     );
-    // Each row is a single line — register a 1-row rect per filtered row.
+    // Each row is two lines tall — register a matching rect per filtered row.
     for (row, _) in matches.iter().enumerate().skip(first) {
-        let Some(hit) = visible_row_hit(list_area, row - first, 1) else {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
             break;
         };
         state.register_hit(hit, Action::ActivateRow(row));
     }
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "↑/↓ select  ·  Enter add  ·  Esc close",
+            "↑/↓ select  ·  Enter add  ·  Ctrl-R refresh  ·  Esc close",
             Style::default().fg(theme.text.muted),
         ))
         .alignment(Alignment::Center),

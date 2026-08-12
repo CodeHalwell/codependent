@@ -379,6 +379,11 @@ fn map_palette_key(key: &KeyEvent) -> Action {
         KeyCode::Down => Action::SelectNext,
         KeyCode::Delete => Action::RemoveApiKey,
         KeyCode::Char('c') if ctrl(key) => Action::InputCancel,
+        // Ctrl-chords stay out of the query buffer: `Ctrl-T` tests the focused
+        // `/keys` row's key, `Ctrl-R` re-fetches an open add-model pick-list.
+        // Both are no-ops in every other palette-mode overlay.
+        KeyCode::Char('t') if ctrl(key) => Action::VerifyApiKey,
+        KeyCode::Char('r') if ctrl(key) => Action::RefreshProviderModels,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
         KeyCode::Tab => Action::BeginAddModel,
         _ => Action::NoOp,

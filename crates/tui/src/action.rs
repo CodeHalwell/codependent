@@ -13,7 +13,10 @@ use codypendent_protocol::{
 };
 
 use crate::remote_ui::RemoteKey;
-use crate::state::{BlackboardItemCard, DocBlockView, DocSuggestionView, KeyStatus, Pane};
+use crate::state::{
+    AddModelRow, BlackboardItemCard, DocBlockView, DocSuggestionView, KeyStatus, ModelListOrigin,
+    Pane,
+};
 
 /// One live workflow-node projection carried from the socket-owning harness to
 /// the pure reducer.
@@ -282,19 +285,35 @@ pub enum Action {
     /// Merge one live `BlackboardPosted` delivery by stable artifact id.
     BlackboardItemUpdated(BlackboardItemCard),
 
-    /// A provider's model list, fetched by the harness (client-only add-model
-    /// flow). Folds into the in-flight `Overlay::AddModelQuerying` (matched by
-    /// `provider_id`) → `Overlay::AddModelPick`. Carries NO key — the key stays
-    /// in the reducer's `AddModelQuerying` overlay across the round trip.
+    /// A provider's model list, fetched (or cache-seeded) by the harness
+    /// (client-only add-model flow). Folds into the in-flight
+    /// `Overlay::AddModelQuerying` (matched by `provider_id`) →
+    /// `Overlay::AddModelPick`, and folds again into an already-open
+    /// `AddModelPick` for the same provider so a cached seed can be replaced
+    /// by the live refresh under the operator's fingers without losing their
+    /// filter. Carries NO key — the key stays in the reducer's overlay across
+    /// the round trip.
     ProviderModelsLoaded {
         provider_id: String,
-        models: Vec<String>,
+        models: Vec<AddModelRow>,
+        origin: ModelListOrigin,
     },
     /// The model-list query failed (unreachable / non-200 / unparseable / auth
-    /// rejected / empty). `reason` is a human, key-free message. Folds the
-    /// in-flight query into the free-text `Overlay::AddModelId` fallback (carrying
-    /// any already-entered key).
+    /// rejected / empty) AND the catalog had no rows to fall back on. `reason`
+    /// is a human, key-free message. Folds the in-flight query into the
+    /// free-text `Overlay::AddModelId` fallback (carrying any already-entered
+    /// key). A failure with catalog rows available arrives as
+    /// `ProviderModelsLoaded` with a `Catalog` origin instead.
     ProviderModelsFailed { provider_id: String, reason: String },
+    /// The result of a one-shot `/keys` key verification (`Ctrl-T`): a single
+    /// `/models` call against the model's endpoint with the stored key.
+    /// `reason` is key-free. Upgrades that model's card readiness from
+    /// `Unverified` to the honest answer.
+    ModelKeyVerified {
+        model_id: String,
+        ok: bool,
+        reason: String,
+    },
 
     /// The `/keys` status projection (D1), loaded by the harness after the
     /// other projections (it reads `auth.json` + `models.toml` — the tui crate
@@ -317,6 +336,13 @@ pub enum Action {
     /// outside that overlay, or when the row is backed only by an environment
     /// variable / has no key.
     RemoveApiKey,
+    /// Verify the focused `/keys` row's key against its provider (`Ctrl-T`):
+    /// one `/models` call, then `ModelKeyVerified`. A no-op outside that
+    /// overlay, and on the Tavily row (it has no model endpoint to probe).
+    VerifyApiKey,
+    /// Re-fetch the open add-model pick-list from the provider, bypassing the
+    /// on-disk cache (`Ctrl-R`). A no-op outside `Overlay::AddModelPick`.
+    RefreshProviderModels,
     /// Flip between the chat single-column and the workspace panes (`F2`).
     ToggleLayout,
 
@@ -550,24 +576,38 @@ pub enum Intent {
     /// defaults it to `<provider>/<model>`); `provider_id` selects the catalog
     /// entry the harness reads `base_url` from; `model` is the provider-side model
     /// name. `api_key` is the entered key for a hosted provider (redacted in
-    /// `Debug`), or `None` for a local/no-auth provider.
+    /// `Debug`), or `None` for a local/no-auth provider. `context_tokens` is
+    /// the picked row's known context window (catalog or `/models` metadata),
+    /// persisted so the context gauge and the `num_ctx` hint work from the
+    /// first run; `None` when nothing is known — never a guess.
     AddModel {
         display_id: String,
         provider_id: String,
         model: String,
         api_key: Option<SecretKey>,
+        context_tokens: Option<u64>,
     },
 
     /// Query a provider's OpenAI-compatible model list (client-only — NOT a
-    /// daemon command). The harness GETs `<base_url>/models` with the provider's
-    /// auth header and feeds the result back as `Action::ProviderModelsLoaded` /
-    /// `ProviderModelsFailed`. `api_key` is the key the user entered for a hosted
-    /// provider (redacted in `Debug`), or `None` for a local/no-auth provider.
-    /// Intercepted in the harness drain loop, mirroring `AddModel`; never mapped
-    /// to a `CommandBody`.
+    /// daemon command). The harness seeds from `<data_dir>/model_lists/` and
+    /// GETs `<base_url>/models` with the provider's auth header, feeding both
+    /// back as `Action::ProviderModelsLoaded` / `ProviderModelsFailed`.
+    /// `api_key` is the key the user entered for a hosted provider (redacted
+    /// in `Debug`), or `None` — in which case the harness falls back to the
+    /// provider-wide key already in `auth.json`. `refresh` skips the cache
+    /// seed (the overlay's manual `Ctrl-R`). Intercepted in the harness drain
+    /// loop, mirroring `AddModel`; never mapped to a `CommandBody`.
     QueryProviderModels {
         provider_id: String,
         api_key: Option<SecretKey>,
+        refresh: bool,
+    },
+
+    /// Verify one model's stored key with a single `/models` call (client-only
+    /// — the key never leaves the machine, exactly like [`Intent::SetApiKey`]).
+    /// The harness answers with `Action::ModelKeyVerified`.
+    VerifyApiKey {
+        model_id: String,
     },
 
     /// Set (or replace) an API key from the `/keys` overlay (D1; client-only —
