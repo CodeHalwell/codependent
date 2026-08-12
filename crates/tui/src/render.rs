@@ -6808,6 +6808,100 @@ mod tests {
         );
     }
 
+    fn council_card(name: &str, chair: &str, evidence: bool) -> crate::state::CouncilCard {
+        crate::state::CouncilCard {
+            name: name.to_owned(),
+            description: "Independent architecture review".to_owned(),
+            chair: chair.to_owned(),
+            rounds: 2,
+            evidence,
+            members: vec![
+                ("claude-reviewer".to_owned(), "security reviewer".to_owned()),
+                ("kimi-architect".to_owned(), "systems architect".to_owned()),
+            ],
+        }
+    }
+
+    /// Rubric 6 (TUI wiring): the browser's list + detail pane, and the run
+    /// objective / delete confirm overlays that hang off it.
+    #[test]
+    fn council_browser_renders_list_detail_and_its_sub_overlays() {
+        let mut state = AppState::new();
+        state.councils = vec![
+            council_card("design-council", "amp-chair", false),
+            council_card("grounded-council", "amp-chair", true),
+        ];
+        state.overlay = Overlay::CouncilBrowser;
+        let browser = render_to_string(&state, 100, 30);
+        assert!(browser.contains("Agent councils"), "title:\n{browser}");
+        assert!(browser.contains("design-council"), "list row:\n{browser}");
+        assert!(
+            browser.contains("grounded-council"),
+            "second list row:\n{browser}"
+        );
+        // The focused (first) council's detail pane.
+        assert!(browser.contains("amp-chair"), "chair detail:\n{browser}");
+        assert!(
+            browser.contains("security reviewer"),
+            "member detail:\n{browser}"
+        );
+        assert!(
+            browser.contains("evidence mode: off"),
+            "evidence off for the focused (first) council:\n{browser}"
+        );
+        assert!(
+            browser.contains("run") && browser.contains("delete"),
+            "footer hints:\n{browser}"
+        );
+        assert!(state
+            .hit_map
+            .borrow()
+            .iter()
+            .any(|(_, action)| matches!(action, Action::ActivateRow(1))));
+
+        state.overlay = Overlay::CouncilRunObjective {
+            name: "design-council".to_owned(),
+            buffer: "Choose a storage engine".to_owned(),
+        };
+        let prompt = render_to_string(&state, 100, 30);
+        assert!(
+            prompt.contains("design-council"),
+            "run prompt names the council:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Choose a storage engine"),
+            "run prompt shows the typed objective:\n{prompt}"
+        );
+
+        state.overlay = Overlay::ConfirmCouncilDelete {
+            name: "design-council".to_owned(),
+        };
+        let confirm = render_to_string(&state, 100, 30);
+        assert!(
+            confirm.contains("design-council"),
+            "delete confirm names the council:\n{confirm}"
+        );
+        assert!(
+            confirm.contains("remain on disk"),
+            "delete confirm reassures reports survive:\n{confirm}"
+        );
+    }
+
+    #[test]
+    fn council_browser_with_no_councils_prompts_to_create_one() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::CouncilBrowser;
+        let empty = render_to_string(&state, 100, 30);
+        assert!(
+            empty.contains("No councils configured"),
+            "empty state:\n{empty}"
+        );
+        assert!(
+            empty.contains("No council selected"),
+            "empty detail pane:\n{empty}"
+        );
+    }
+
     #[test]
     fn selected_picker_children_use_the_selection_foreground_in_every_theme() {
         let mut state = AppState::new();

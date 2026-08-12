@@ -6700,7 +6700,9 @@ mod tests {
                 rounds: 2,
             },
         );
-        assert_eq!(s.overlay, Overlay::None);
+        // Rubric 6: a successful save returns to the browser (its only entry
+        // point is `n` from inside it), not the base view.
+        assert_eq!(s.overlay, Overlay::CouncilBrowser);
     }
 
     #[test]
@@ -6779,6 +6781,249 @@ mod tests {
         ));
         reduce(&mut s, Action::InputCancel);
         assert_eq!(s.overlay, Overlay::None);
+    }
+
+    fn council_card(name: &str, chair: &str, evidence: bool) -> crate::state::CouncilCard {
+        crate::state::CouncilCard {
+            name: name.to_owned(),
+            description: String::new(),
+            chair: chair.to_owned(),
+            rounds: 1,
+            evidence,
+            members: vec![
+                ("claude".to_owned(), "architect".to_owned()),
+                ("codex".to_owned(), "critic".to_owned()),
+            ],
+        }
+    }
+
+    /// Rubric 6 (TUI wiring): `/council` opens the browser, not the builder —
+    /// the builder is reached with `n` from inside it (a separate test below).
+    #[test]
+    fn palette_opens_the_council_browser() {
+        let mut s = AppState::new();
+        s.councils = vec![council_card("review-board", "chair", false)];
+        reduce(&mut s, Action::OpenPalette);
+        for c in "council".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::CouncilBrowser);
+        assert_eq!(s.input_mode(), crate::state::InputMode::Normal);
+    }
+
+    #[test]
+    fn council_browser_navigation_and_new_council_key() {
+        let mut s = AppState::new();
+        s.councils = vec![
+            council_card("alpha", "chair", false),
+            council_card("beta", "chair", true),
+        ];
+        s.overlay = Overlay::CouncilBrowser;
+        assert_eq!(s.focused_council().map(|c| c.name.as_str()), Some("alpha"));
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(s.selected_council, 1);
+        assert_eq!(s.focused_council().map(|c| c.name.as_str()), Some("beta"));
+        reduce(&mut s, Action::SelectNext); // saturates at the last row
+        assert_eq!(s.selected_council, 1);
+        reduce(&mut s, Action::SelectPrev);
+        assert_eq!(s.selected_council, 0);
+
+        // `n` (Action::NewRun) opens the existing creation wizard from inside
+        // the browser instead of starting a new conversation run.
+        reduce(&mut s, Action::NewRun);
+        assert!(matches!(s.overlay, Overlay::CouncilBuilder(_)));
+    }
+
+    #[test]
+    fn council_browser_run_prompts_for_objective_and_emits_intent() {
+        let mut s = AppState::new();
+        s.councils = vec![council_card("review-board", "chair", false)];
+        s.overlay = Overlay::CouncilBrowser;
+        // `r` reuses the physical Reject key, disambiguated by overlay (the
+        // same pattern Workflow already uses for `r` = retry).
+        reduce(&mut s, Action::Reject);
+        assert_eq!(
+            s.overlay,
+            Overlay::CouncilRunObjective {
+                name: "review-board".to_owned(),
+                buffer: String::new(),
+            }
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Editing);
+
+        // An empty objective is rejected with the prompt kept open.
+        reduce(&mut s, Action::InputSubmit);
+        assert!(matches!(s.overlay, Overlay::CouncilRunObjective { .. }));
+        assert!(s
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("must not be empty")));
+        assert!(s.drain_outbox().is_empty());
+
+        for c in "Choose the storage engine".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::CouncilBrowser);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::RunCouncil {
+                name: "review-board".to_owned(),
+                objective: "Choose the storage engine".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn council_browser_delete_confirms_then_emits_intent() {
+        let mut s = AppState::new();
+        s.councils = vec![council_card("review-board", "chair", false)];
+        s.overlay = Overlay::CouncilBrowser;
+        reduce(&mut s, Action::DeleteCouncil);
+        assert_eq!(
+            s.overlay,
+            Overlay::ConfirmCouncilDelete {
+                name: "review-board".to_owned(),
+            }
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Confirm);
+
+        // Esc/`n` returns to the browser without deleting anything.
+        reduce(&mut s, Action::Dismiss);
+        assert_eq!(s.overlay, Overlay::CouncilBrowser);
+        assert!(s.drain_outbox().is_empty());
+
+        reduce(&mut s, Action::DeleteCouncil);
+        // `y`/Enter (Action::ConfirmCancel — the shared confirm-mode key,
+        // exactly like every other confirm overlay) commits the removal.
+        reduce(&mut s, Action::ConfirmCancel);
+        assert_eq!(s.overlay, Overlay::CouncilBrowser);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::DeleteCouncil {
+                name: "review-board".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn council_deleted_action_closes_the_pending_confirm_and_clamps_selection() {
+        let mut s = AppState::new();
+        s.councils = vec![council_card("only-one", "chair", false)];
+        s.overlay = Overlay::ConfirmCouncilDelete {
+            name: "only-one".to_owned(),
+        };
+        // The harness reloads `councils` from disk before folding this
+        // action (mirrors `load_model_cards` after `AddModel`), so the
+        // deleted council is already gone by the time the reducer sees it.
+        s.councils.clear();
+        reduce(
+            &mut s,
+            Action::CouncilDeleted {
+                name: "only-one".to_owned(),
+            },
+        );
+        assert_eq!(s.overlay, Overlay::CouncilBrowser);
+        assert_eq!(s.selected_council, 0);
+        assert!(s
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("removed council")));
+    }
+
+    #[test]
+    fn council_progress_folds_into_the_active_runs_transcript() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "unrelated conversation".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::CouncilProgress {
+                name: "review-board".to_owned(),
+                message: "round 1/1 — launching 2 member(s)".to_owned(),
+            },
+        );
+        let note = s.runs[0]
+            .transcript
+            .iter()
+            .find_map(|entry| match entry {
+                TranscriptEntry::Note { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("a Note entry for the council progress line");
+        assert!(note.contains("review-board"));
+        assert!(note.contains("launching 2 member(s)"));
+    }
+
+    #[test]
+    fn council_run_finished_renders_the_chair_synthesis_into_the_transcript() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "unrelated conversation".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            Action::CouncilRunFinished {
+                name: "review-board".to_owned(),
+                result: Ok(Box::new(crate::state::CouncilRunSummary {
+                    synthesis: "Adopt sqlite with a WAL-mode connection pool.".to_owned(),
+                    participants: vec!["claude · architect · session s1 · run r1".to_owned()],
+                    cost_line: "cost: 1200 tokens measured across 2/2 runs".to_owned(),
+                    report_markdown: "/data/councils/review-board/report.md".to_owned(),
+                })),
+            },
+        );
+        let note = s.runs[0]
+            .transcript
+            .iter()
+            .find_map(|entry| match entry {
+                TranscriptEntry::Note { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("a Note entry for the chair synthesis");
+        assert!(note.contains("Adopt sqlite"));
+        assert!(note.contains("claude · architect"));
+        assert!(note.contains("cost: 1200 tokens"));
+        assert!(note.contains("report.md"));
+        assert!(s
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("finished")));
+
+        // A failed run still surfaces the failure in the transcript rather
+        // than being silently lost.
+        reduce(
+            &mut s,
+            Action::CouncilRunFinished {
+                name: "review-board".to_owned(),
+                result: Err("council round 1 failed quorum (1 of 2 completed)".to_owned()),
+            },
+        );
+        let failures: Vec<_> = s.runs[0]
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Note { text, .. } if text.contains("failed quorum") => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failures.len(), 1);
     }
 
     #[test]
