@@ -37,8 +37,10 @@ use codypendent_daemon::workflow_stream::{WorkflowHub, WorkflowReader};
 use codypendent_daemon::worktrees::{WorktreeError, WorktreeManager};
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::acp::PermissionOption;
-use codypendent_integrations::acp_client::{AcpClient, AcpEventSink, AcpStopReason};
-use codypendent_integrations::acp_registry::AcpRegistryStore;
+use codypendent_integrations::acp_client::{
+    forwardable_mcp_servers, AcpClient, AcpEventSink, AcpSessionOptions, AcpStopReason,
+};
+use codypendent_integrations::acp_registry::{agent_model_from_coordinate, AcpRegistryStore};
 use codypendent_integrations::github::{GitHubApi, RepoId};
 use codypendent_integrations::mcp::{McpBridge, McpRegistry};
 use codypendent_integrations::search::SearchApi;
@@ -897,14 +899,30 @@ impl RuntimeExecutor {
             .await?;
 
         let command = launch_spec.command.to_string_lossy().into_owned();
-        let mut client = AcpClient::spawn(
+        // The external agent inherits the same operator-declared MCP servers a
+        // native run is offered, so delegating a run does not silently shrink
+        // the tool surface. Launch specs only — never the operator's `env`
+        // pairs (see `forwardable_mcp_servers`).
+        let mut client = AcpClient::spawn_with(
             &command,
             &launch_spec.args,
             &launch_spec.env,
             operating_tree.to_string_lossy().as_ref(),
+            AcpSessionOptions {
+                mcp_servers: forwardable_mcp_servers(&self.paths.global_mcp_path()),
+            },
         )
         .await
         .map_err(|error| format!("could not start ACP agent `{registry_agent_id}`: {error}"))?;
+        // A profile pinned to one of the agent's own models (`…#model`) selects
+        // it for this session BEFORE the turn starts. A failure here is fatal:
+        // silently running the agent's default model would attribute the run to
+        // a model that never executed it.
+        if let Some(model) = agent_model_from_coordinate(registry_agent_id) {
+            client.set_model(model).await.map_err(|error| {
+                format!("ACP agent `{registry_agent_id}` could not select model `{model}`: {error}")
+            })?;
+        }
         self.transition_acp(launch.session_id, launch.run_id, RunState::Running)
             .await?;
 
@@ -929,11 +947,44 @@ impl RuntimeExecutor {
             failure: None,
         };
 
-        let stop = tokio::select! {
-            result = client.prompt(&objective, launch.run_id, &mut sink) => {
-                result.map_err(|error| format!("ACP prompt failed: {error}"))?
+        // How long a cancelled agent gets to wind its turn down gracefully
+        // before the process group is torn down. Long enough for an agent to
+        // finish an in-flight write and answer `cancelled`; short enough that a
+        // wedged agent cannot hold a cancelled run open.
+        const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let stop = {
+            // Taken BEFORE the prompt borrows the client mutably.
+            let cancel = client.cancel_handle();
+            let prompt = client.prompt(&objective, launch.run_id, &mut sink);
+            tokio::pin!(prompt);
+            tokio::select! {
+                result = &mut prompt => {
+                    result.map_err(|error| format!("ACP prompt failed: {error}"))?
+                }
+                _ = token.cancelled() => {
+                    // Graceful first: `session/cancel` lets the agent stop its
+                    // own tool loop and report the wire-correct `cancelled`
+                    // stop reason. Only when it will not wind down inside the
+                    // grace period does teardown fall back to killing the
+                    // process group (the `drop` below).
+                    cancel.cancel().await;
+                    match tokio::time::timeout(CANCEL_GRACE, &mut prompt).await {
+                        Ok(Ok(stop)) => stop,
+                        Ok(Err(error)) => {
+                            warn!(run_id = %launch.run_id, %error, "cancelled ACP turn ended with an error");
+                            AcpStopReason::Cancelled
+                        }
+                        Err(_) => {
+                            warn!(
+                                run_id = %launch.run_id,
+                                "ACP agent did not acknowledge session/cancel; tearing down its process group"
+                            );
+                            AcpStopReason::Cancelled
+                        }
+                    }
+                }
             }
-            _ = token.cancelled() => AcpStopReason::Cancelled,
         };
         drop(client); // aborts the driver/process group if a cancellation won.
         if let Some(failure) = sink.failure.take() {

@@ -253,12 +253,109 @@ impl ModelRegistry {
         self.get(id).is_some_and(|config| config.provider == "acp")
     }
 
-    /// The official registry id for an ACP profile.
+    /// The full ACP coordinate for an ACP profile — `id`, `id@version`, or
+    /// `id@version#model` once the profile pins one of the agent's own models.
+    /// Launch-oriented consumers strip the additive `#model` part with
+    /// [`acp_coordinate_agent`]; [`acp_agent_model`](Self::acp_agent_model)
+    /// reads the pin.
     #[must_use]
     pub fn acp_agent_id(&self, id: &ModelId) -> Option<&str> {
         self.get(id)
             .filter(|config| config.provider == "acp")
             .map(|config| config.model.as_str())
+    }
+
+    /// The agent-model id an ACP profile pins on its external agent
+    /// (`id@version#model`), if any. `None` for a bare agent profile — the
+    /// agent then keeps whatever default model it booted with.
+    #[must_use]
+    pub fn acp_agent_model(&self, id: &ModelId) -> Option<&str> {
+        self.acp_agent_id(id).and_then(acp_coordinate_model)
+    }
+}
+
+/// Split an ACP model coordinate `id[@version][#model]` at the first `#` and
+/// return the launchable agent part. Additive: coordinates written before
+/// model pinning existed carry no `#` and return themselves unchanged.
+#[must_use]
+pub fn acp_coordinate_agent(coordinate: &str) -> &str {
+    coordinate
+        .split_once('#')
+        .map_or(coordinate, |(agent, _)| agent)
+}
+
+/// The agent-model id an ACP coordinate pins (`id[@version]#model`), if any.
+/// A dangling `#` pins nothing.
+#[must_use]
+pub fn acp_coordinate_model(coordinate: &str) -> Option<&str> {
+    coordinate
+        .split_once('#')
+        .map(|(_, model)| model)
+        .filter(|model| !model.is_empty())
+}
+
+#[cfg(test)]
+mod acp_coordinate_tests {
+    use super::*;
+
+    #[test]
+    fn coordinates_split_into_agent_and_optional_model_pin() {
+        assert_eq!(acp_coordinate_agent("demo-acp@1.2.3"), "demo-acp@1.2.3");
+        assert_eq!(acp_coordinate_model("demo-acp@1.2.3"), None);
+        assert_eq!(
+            acp_coordinate_agent("demo-acp@1.2.3#agent-model-1"),
+            "demo-acp@1.2.3"
+        );
+        assert_eq!(
+            acp_coordinate_model("demo-acp@1.2.3#agent-model-1"),
+            Some("agent-model-1")
+        );
+        // A dangling separator pins nothing (and still names the agent).
+        assert_eq!(acp_coordinate_model("demo-acp@1.2.3#"), None);
+        assert_eq!(acp_coordinate_agent("demo-acp@1.2.3#"), "demo-acp@1.2.3");
+    }
+
+    #[test]
+    fn registry_reads_the_model_pin_from_acp_profiles_only() {
+        let registry = ModelRegistry::new([
+            ModelConfig {
+                id: ModelId("acp/demo#agent-model-1".to_string()),
+                provider: "acp".to_string(),
+                base_url: String::new(),
+                model: "demo-acp@1.2.3#agent-model-1".to_string(),
+                api_key_env: String::new(),
+                context_tokens: None,
+            },
+            ModelConfig {
+                id: ModelId("acp/demo".to_string()),
+                provider: "acp".to_string(),
+                base_url: String::new(),
+                model: "demo-acp@1.2.3".to_string(),
+                api_key_env: String::new(),
+                context_tokens: None,
+            },
+            ModelConfig {
+                id: ModelId("hosted".to_string()),
+                provider: "openai-compatible".to_string(),
+                base_url: "https://example.test/v1".to_string(),
+                model: "some#model".to_string(),
+                api_key_env: String::new(),
+                context_tokens: None,
+            },
+        ]);
+        assert_eq!(
+            registry.acp_agent_model(&ModelId("acp/demo#agent-model-1".to_string())),
+            Some("agent-model-1")
+        );
+        assert_eq!(
+            registry.acp_agent_model(&ModelId("acp/demo".to_string())),
+            None
+        );
+        // Non-ACP profiles never expose a pin, whatever their model string.
+        assert_eq!(
+            registry.acp_agent_model(&ModelId("hosted".to_string())),
+            None
+        );
     }
 }
 
