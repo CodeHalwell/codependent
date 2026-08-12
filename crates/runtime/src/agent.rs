@@ -6329,56 +6329,60 @@ mod tests {
         // Salient views cite `artifact <id> sha256:…` and, until this tool,
         // the model had no way to open one. A hit returns the bytes; a miss is
         // a legible tool failure it can correct, never a run-ending error.
-        let id = ArtifactId::new();
-        let (runtime, mut events, session_id) =
-            runtime_with_artifacts(vec![(id, "the full log\n")]);
-        let repo = tempfile::tempdir().expect("tempdir");
-        let missing = ArtifactId::new();
-        let driver = ScriptedDriver::new(vec![
-            ModelStep::CallTool {
-                tool: ArtifactRead::NAME.to_string(),
-                args: json!({"id": id.to_string()}),
-            },
-            ModelStep::CallTool {
-                tool: ArtifactRead::NAME.to_string(),
-                args: json!({"id": missing.to_string()}),
-            },
-            ModelStep::Finish {
-                summary: "done".to_string(),
-            },
-        ]);
-        let ctx = RunContext::new(
-            session_id,
-            RunId::new(),
-            "reopen the artifact",
-            AgentMode::Build,
-            repo.path(),
-            repo.path(),
-        );
-        runtime
-            .execute_run(&driver, ctx, CancellationToken::never())
-            .await
-            .expect("run completes");
+        // Run in Ask too — the most restrictive overlay — because the tool is
+        // ADVERTISED in every mode, and advertised must mean dispatchable.
+        for mode in [AgentMode::Build, AgentMode::Ask] {
+            let id = ArtifactId::new();
+            let (runtime, mut events, session_id) =
+                runtime_with_artifacts(vec![(id, "the full log\n")]);
+            let repo = tempfile::tempdir().expect("tempdir");
+            let missing = ArtifactId::new();
+            let driver = ScriptedDriver::new(vec![
+                ModelStep::CallTool {
+                    tool: ArtifactRead::NAME.to_string(),
+                    args: json!({"id": id.to_string()}),
+                },
+                ModelStep::CallTool {
+                    tool: ArtifactRead::NAME.to_string(),
+                    args: json!({"id": missing.to_string()}),
+                },
+                ModelStep::Finish {
+                    summary: "done".to_string(),
+                },
+            ]);
+            let ctx = RunContext::new(
+                session_id,
+                RunId::new(),
+                "reopen the artifact",
+                mode,
+                repo.path(),
+                repo.path(),
+            );
+            runtime
+                .execute_run(&driver, ctx, CancellationToken::never())
+                .await
+                .expect("run completes");
 
-        let mut outcomes = Vec::new();
-        while let Ok(event) = events.try_recv() {
-            if let EventBody::ToolCompleted { tool, outcome, .. } = event.body {
-                if tool == ArtifactRead::NAME {
-                    outcomes.push(outcome);
+            let mut outcomes = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let EventBody::ToolCompleted { tool, outcome, .. } = event.body {
+                    if tool == ArtifactRead::NAME {
+                        outcomes.push(outcome);
+                    }
                 }
             }
+            assert_eq!(outcomes.len(), 2, "both calls executed in {mode:?}");
+            assert!(
+                matches!(outcomes[0], ToolOutcome::Succeeded),
+                "a stored artifact must be readable in {mode:?}, got {:?}",
+                outcomes[0]
+            );
+            assert!(
+                matches!(&outcomes[1], ToolOutcome::Failed { message } if message == "artifact.not-found"),
+                "a missing id is a legible failure in {mode:?}, got {:?}",
+                outcomes[1]
+            );
         }
-        assert_eq!(outcomes.len(), 2, "both calls executed");
-        assert!(
-            matches!(outcomes[0], ToolOutcome::Succeeded),
-            "a stored artifact must be readable, got {:?}",
-            outcomes[0]
-        );
-        assert!(
-            matches!(&outcomes[1], ToolOutcome::Failed { message } if message == "artifact.not-found"),
-            "a missing id is a legible failure, got {:?}",
-            outcomes[1]
-        );
     }
 
     // -----------------------------------------------------------------------
