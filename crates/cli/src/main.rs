@@ -121,6 +121,12 @@ enum TopCommand {
         #[command(subcommand)]
         command: IndexCommand,
     },
+    /// Install skill packages into the governed registry, so retrieval can
+    /// disclose them to a run.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Work with declarative workflow manifests (Phase 5).
     Workflow {
         #[command(subcommand)]
@@ -254,6 +260,17 @@ enum IndexCommand {
     /// from the authoritative rows. Does NOT rebuild the code graph — that is
     /// built per-repository on session open / first run.
     Rebuild,
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Validate a skill package directory, copy it under `<data_dir>/skills/`,
+    /// and register it. Idempotent: re-adding the same package keeps its
+    /// registry identity, and the daemon re-verifies it on its next boot.
+    Add {
+        /// The package directory — the one holding `skill.toml`.
+        directory: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -887,6 +904,9 @@ async fn main() -> anyhow::Result<()> {
         TopCommand::Index {
             command: IndexCommand::Rebuild,
         } => commands::index_rebuild(&paths).await,
+        TopCommand::Skill {
+            command: SkillCommand::Add { directory },
+        } => commands::skill_add(&paths, &directory).await,
         TopCommand::Workflow { command } => match command {
             WorkflowCommand::Validate { file, agents } => {
                 commands::workflow_validate(&file, agents.as_deref())

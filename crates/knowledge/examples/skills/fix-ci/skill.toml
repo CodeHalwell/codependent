@@ -2,8 +2,13 @@ schema_version = 1
 id = "rust.fix-ci"
 name = "Fix Rust CI"
 version = "0.1.0"
+# `active`, not `draft`: retrieval hard-filters non-Active items
+# (`retrieval/mod.rs`), so a draft skill can never be disclosed to a run. The
+# 2026-08-11 review found this package — the only shipped skill — silently dead
+# for that reason; the reference package must model the status a working skill
+# actually needs.
 scope = "repository"
-status = "draft"
+status = "active"
 
 description = "Diagnose and repair Rust GitHub Actions failures."
 intents = ["ci failure", "rust tests", "github actions", "clippy"]
