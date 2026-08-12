@@ -6582,13 +6582,15 @@ fn format_cost(cost_minor: Option<u64>) -> String {
     }
 }
 
+/// Fit `text` into `max` **display columns** (not chars), ellipsing the tail.
+///
+/// Every caller here is fitting text into a column budget, so counting `char`s
+/// was wrong for any CJK or emoji content: a 26-char CJK name is 52 columns
+/// wide and overflowed its cell, shoving the rest of the row out of alignment.
+/// This is deliberately the very same function the pickers use — one
+/// implementation, so the two can never drift apart again.
 fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_owned()
-    } else {
-        let kept: String = text.chars().take(max.saturating_sub(1)).collect();
-        format!("{kept}…")
-    }
+    truncate_display_width(text, max)
 }
 
 fn short_id(id: &impl std::fmt::Display) -> String {
@@ -10814,6 +10816,52 @@ mod tests {
             second[0].1,
             first[0].1 + 1,
             "the cursor sits on its own draft line: {first:?} vs {second:?}"
+        );
+    }
+
+    /// `truncate` fits a COLUMN budget, not a char count — the browsers, the
+    /// runs pane, tool labels, and the header all size their cells in terminal
+    /// cells, so a CJK/emoji string counted by chars overflowed its column.
+    #[test]
+    fn truncate_fits_display_columns_for_wide_and_combining_text() {
+        for (text, budget) in [
+            ("日本語のタイトルはとても長い", 10_usize),
+            ("🚀🚀🚀🚀🚀🚀🚀🚀", 7),
+            ("plain ascii title that is long", 12),
+            ("e\u{301}e\u{301}e\u{301} combining", 6),
+        ] {
+            let fitted = truncate(text, budget);
+            assert!(
+                UnicodeWidthStr::width(fitted.as_str()) <= budget,
+                "{fitted:?} is {} columns, over the {budget}-column budget",
+                UnicodeWidthStr::width(fitted.as_str())
+            );
+            // Nothing is cut mid-grapheme: the result re-splits identically.
+            let rejoined: String = UnicodeSegmentation::graphemes(fitted.as_str(), true).collect();
+            assert_eq!(rejoined, fitted);
+        }
+        // Text already inside the budget is returned verbatim.
+        assert_eq!(truncate("日本", 4), "日本");
+    }
+
+    /// A wide session title must not push the header's other fields off the
+    /// row. Counted by `char`s, a 30-"char" CJK title is 60 columns wide and
+    /// ate the space the model/mode/context chips are laid out in.
+    #[test]
+    fn a_wide_session_title_does_not_crowd_out_the_header_fields() {
+        let mut state = running_build_state();
+        state.session_title = Some("日本語のとても長いセッション名前です".repeat(3));
+        // (`buffer_text` pads the cell after a double-width glyph, so the dumped
+        // string is not a column measure — assert on the fields instead.)
+        let text = render_to_string(&state, 100, 20);
+        let header = text.lines().next().expect("a header row");
+        assert!(
+            header.contains('…'),
+            "the title must be fitted, not left to overflow: {header:?}"
+        );
+        assert!(
+            header.contains("gpt-5.1-codex") && header.contains("Build"),
+            "a wide title must not crowd the model/mode chips off the header: {header:?}"
         );
     }
 }
