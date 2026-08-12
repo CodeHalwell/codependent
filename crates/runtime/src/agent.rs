@@ -4806,7 +4806,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::tools::ClosureSink;
+    use crate::tools::{ClosureReader, ClosureSink, LoadedArtifact};
 
     #[test]
     fn diff_summary_reports_files_stats_and_bounded_preview() {
@@ -6116,6 +6116,541 @@ mod tests {
             vec![TurnItem::Objective("add a /mode picker".to_string())],
             "no instruction, no reformatting: exactly the objective"
         );
+    }
+
+    /// Review and Ask get the same seed treatment Plan already had: their
+    /// overlays deny writes (Ask denies commands too), and a model that does
+    /// not know what the mode is FOR spends steps bouncing off those denials.
+    #[tokio::test]
+    async fn review_and_ask_runs_seed_their_mode_instruction() {
+        for (mode, instruction) in [
+            (AgentMode::Review, REVIEW_MODE_INSTRUCTION),
+            (AgentMode::Ask, ASK_MODE_INSTRUCTION),
+        ] {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let driver = CapturingDriver { seen: seen.clone() };
+            let (runtime, _events, session_id) = test_runtime();
+            let repo = tempfile::tempdir().expect("tempdir");
+            let ctx = RunContext::new(
+                session_id,
+                RunId::new(),
+                "what does the reducer do?",
+                mode,
+                repo.path(),
+                repo.path(),
+            );
+
+            runtime
+                .execute_run(&driver, ctx, CancellationToken::never())
+                .await
+                .expect("run completes");
+
+            let seen = seen
+                .lock()
+                .expect("mutex")
+                .clone()
+                .expect("the driver observed a transcript");
+            assert_eq!(
+                seen,
+                vec![TurnItem::Objective(format!(
+                    "{instruction}\n\nwhat does the reducer do?"
+                ))],
+                "{mode:?} must seed its instruction ahead of the objective"
+            );
+        }
+    }
+
+    #[test]
+    fn only_plan_review_and_ask_carry_a_seed_instruction() {
+        // The seed rides the TRANSCRIPT, never the ledger, so every mode that
+        // does NOT have one must stay byte-identical to the raw objective —
+        // the property `a_build_run_seeds_the_objective_byte_identically`
+        // pins end to end, here across the whole enum at once.
+        assert!(mode_seed_instruction(AgentMode::Plan).is_some());
+        assert!(mode_seed_instruction(AgentMode::Review).is_some());
+        assert!(mode_seed_instruction(AgentMode::Ask).is_some());
+        assert!(mode_seed_instruction(AgentMode::Build).is_none());
+        assert!(mode_seed_instruction(AgentMode::Explore).is_none());
+        assert!(mode_seed_instruction(AgentMode::Unknown).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Advertised schemas must expose every parameter the parser accepts.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn advertised_schemas_expose_the_parameters_the_parsers_accept() {
+        // Schema/parser drift: `parse_command_request` has always accepted
+        // `cwd`/`environment`/`timeout_secs` and `parse_read_file` has always
+        // accepted `range`, but the advertised schemas hid them — so a model
+        // could not discover paging or a longer timeout and instead re-issued
+        // the same default 200-line read of a big file.
+        let defs = static_tool_definitions();
+        let def = |name: &str| {
+            defs.iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("{name} must be advertised"))
+        };
+
+        let shell = def(Shell::NAME);
+        let shell_props = &shell.parameters["properties"];
+        for param in ["program", "args", "cwd", "environment", "timeout_secs"] {
+            assert!(
+                !shell_props[param].is_null(),
+                "shell.run must advertise `{param}`"
+            );
+        }
+        assert!(
+            shell.description.contains("timeout_secs"),
+            "the description must name the timeout knob: {}",
+            shell.description
+        );
+
+        let read = def(ReadFile::NAME);
+        assert!(
+            !read.parameters["properties"]["range"].is_null(),
+            "workspace.read_file must advertise `range`"
+        );
+        // The 200-line default is the whole reason `range` matters; a model
+        // that cannot see the cap does not know there is more file to ask for.
+        assert!(
+            read.description.contains("200"),
+            "the description must state the 200-line default: {}",
+            read.description
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `artifact.read`: registration, mode filtering, execution.
+    // -----------------------------------------------------------------------
+
+    /// A runtime with an artifact reader wired over `contents`, keyed by id.
+    fn runtime_with_artifacts(
+        contents: Vec<(ArtifactId, &'static str)>,
+    ) -> (
+        FrameworkAgentRuntime,
+        tokio::sync::broadcast::Receiver<SessionEvent>,
+        SessionId,
+    ) {
+        let (runtime, events, session_id) = test_runtime();
+        let map: std::collections::HashMap<ArtifactId, &'static str> =
+            contents.into_iter().collect();
+        let reader = ClosureReader(move |id: ArtifactId| {
+            let found = map.get(&id).map(|body| LoadedArtifact {
+                media_type: "text/plain".to_string(),
+                bytes: body.as_bytes().to_vec(),
+            });
+            async move { Ok(found) }
+        });
+        (
+            runtime.with_artifact_reader(Arc::new(reader)),
+            events,
+            session_id,
+        )
+    }
+
+    #[test]
+    fn artifact_read_is_offered_only_with_a_reader_and_in_every_mode() {
+        // The configured gate (`web.search`'s idiom): no reader, no tool — so
+        // a deployment without an artifact store behaves exactly as before.
+        // With one, it is offered in EVERY mode, because it reads the daemon's
+        // own store and no overlay has a reason to remove a read.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let modes = [
+            AgentMode::Ask,
+            AgentMode::Explore,
+            AgentMode::Plan,
+            AgentMode::Review,
+            AgentMode::Build,
+        ];
+
+        let (bare, _events, session_id) = test_runtime();
+        let (wired, _events2, _s) = runtime_with_artifacts(Vec::new());
+        for mode in modes {
+            let run = || {
+                RunContext::new(
+                    session_id,
+                    RunId::new(),
+                    "solo",
+                    mode,
+                    repo.path(),
+                    repo.path(),
+                )
+            };
+            assert!(
+                !bare
+                    .offered_tool_names(&run())
+                    .contains(&ArtifactRead::NAME.to_string()),
+                "{mode:?} must not offer artifact.read without a reader"
+            );
+            let offered = wired.offered_tool_names(&run());
+            assert!(
+                offered.contains(&ArtifactRead::NAME.to_string()),
+                "{mode:?} must offer artifact.read when a reader is wired"
+            );
+            // advertised ≡ offered (FIX 1) must still hold with the new tool.
+            let advertised: Vec<String> = wired
+                .advertised_tool_definitions(&run())
+                .iter()
+                .map(|d| d.name.clone())
+                .collect();
+            assert!(
+                advertised.contains(&ArtifactRead::NAME.to_string()),
+                "{mode:?} advertises what it offers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_read_rehydrates_a_cited_artifact_and_reports_a_missing_one() {
+        // Salient views cite `artifact <id> sha256:…` and, until this tool,
+        // the model had no way to open one. A hit returns the bytes; a miss is
+        // a legible tool failure it can correct, never a run-ending error.
+        let id = ArtifactId::new();
+        let (runtime, mut events, session_id) =
+            runtime_with_artifacts(vec![(id, "the full log\n")]);
+        let repo = tempfile::tempdir().expect("tempdir");
+        let missing = ArtifactId::new();
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::CallTool {
+                tool: ArtifactRead::NAME.to_string(),
+                args: json!({"id": id.to_string()}),
+            },
+            ModelStep::CallTool {
+                tool: ArtifactRead::NAME.to_string(),
+                args: json!({"id": missing.to_string()}),
+            },
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ]);
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "reopen the artifact",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("run completes");
+
+        let mut outcomes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::ToolCompleted { tool, outcome, .. } = event.body {
+                if tool == ArtifactRead::NAME {
+                    outcomes.push(outcome);
+                }
+            }
+        }
+        assert_eq!(outcomes.len(), 2, "both calls executed");
+        assert!(
+            matches!(outcomes[0], ToolOutcome::Succeeded),
+            "a stored artifact must be readable, got {:?}",
+            outcomes[0]
+        );
+        assert!(
+            matches!(&outcomes[1], ToolOutcome::Failed { message } if message == "artifact.not-found"),
+            "a missing id is a legible failure, got {:?}",
+            outcomes[1]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mid-run compaction.
+    // -----------------------------------------------------------------------
+
+    /// A `ToolResult` turn with `len` characters of output and no artifact.
+    fn bulky_result(tool: &str, len: usize) -> TurnItem {
+        TurnItem::ToolResult {
+            tool: tool.to_string(),
+            output: format!("{tool} said:\n{}", "x".repeat(len)),
+            artifact: None,
+        }
+    }
+
+    #[test]
+    fn compaction_folds_oldest_results_first_and_spares_the_newest() {
+        // Compaction runs at the safe point BEFORE the next request, so the
+        // newest result has not been seen by the model yet and the one before
+        // it is what the model is still acting on. Only OLDER results are
+        // honest fold candidates.
+        let mut transcript = vec![TurnItem::Objective("go".to_string())];
+        for i in 0..5 {
+            transcript.push(bulky_result(&format!("tool{i}"), 4_000));
+        }
+        let before = estimate_request_tokens(&transcript, &[]);
+
+        let folded = fold_oldest_tool_results(&mut transcript, &[], before / 4);
+
+        assert!(folded > 0, "an over-budget transcript must fold something");
+        assert!(
+            estimate_request_tokens(&transcript, &[]) < before,
+            "folding must actually shrink the request"
+        );
+        // The two newest results are untouched...
+        for turn in transcript.iter().rev().take(2) {
+            match turn {
+                TurnItem::ToolResult { output, .. } => assert!(
+                    !output.starts_with(FOLDED_RESULT_PREFIX),
+                    "the newest results must be spared"
+                ),
+                other => panic!("expected a ToolResult, got {other:?}"),
+            }
+        }
+        // ...and the oldest is the one that went.
+        match &transcript[1] {
+            TurnItem::ToolResult { output, .. } => {
+                assert!(output.starts_with(FOLDED_RESULT_PREFIX))
+            }
+            other => panic!("expected a ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compaction_cites_the_artifact_and_never_folds_twice() {
+        // A folded stub keeps the artifact id + digest a salient view cites and
+        // points at `artifact.read`, so folding LOSES nothing the model cannot
+        // get back. And a second pass must be a no-op on an already-folded
+        // stub, or the loop could spin re-folding the same turn.
+        let artifact = ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "text/plain".to_string(),
+            byte_length: 9_000,
+            sha256: "abcdef0123456789".to_string(),
+            sensitivity: codypendent_protocol::DataClassification::Internal,
+        };
+        let mut transcript = vec![
+            TurnItem::Objective("go".to_string()),
+            TurnItem::ToolResult {
+                tool: "shell.run".to_string(),
+                output: "y".repeat(9_000),
+                artifact: Some(artifact.clone()),
+            },
+            bulky_result("a", 100),
+            bulky_result("b", 100),
+        ];
+
+        assert_eq!(fold_oldest_tool_results(&mut transcript, &[], 1), 1);
+        let TurnItem::ToolResult { output, .. } = &transcript[1] else {
+            panic!("expected a ToolResult");
+        };
+        assert!(output.contains(&artifact.id.to_string()), "cites the id");
+        assert!(output.contains("abcdef012345"), "cites the digest prefix");
+        assert!(output.contains("artifact.read"), "says how to reopen it");
+
+        // Idempotent: nothing left to fold, so a second pass folds nothing.
+        assert_eq!(fold_oldest_tool_results(&mut transcript, &[], 1), 0);
+    }
+
+    #[test]
+    fn compaction_never_grows_a_result_it_cannot_shrink() {
+        // A short result's stub would be LONGER than the result itself;
+        // installing it would grow the very transcript compaction exists to
+        // shrink, so such a turn is left alone.
+        let mut transcript = vec![
+            TurnItem::Objective("go".to_string()),
+            TurnItem::ToolResult {
+                tool: "t".to_string(),
+                output: "ok".to_string(),
+                artifact: None,
+            },
+            bulky_result("a", 100),
+            bulky_result("b", 100),
+        ];
+        let before = transcript.clone();
+
+        assert_eq!(fold_oldest_tool_results(&mut transcript, &[], 1), 0);
+        assert_eq!(transcript, before, "nothing may change");
+    }
+
+    #[test]
+    fn the_request_estimate_charges_for_tool_definitions() {
+        // The estimator ignored the system prompt and the advertised schemas,
+        // understating usage exactly when MCP servers ship huge `inputSchema`s
+        // that are re-sent verbatim on every request.
+        let transcript = [TurnItem::Objective("go".to_string())];
+        let bare = estimate_request_tokens(&transcript, &[]);
+        let with_tools = estimate_request_tokens(&transcript, &static_tool_definitions());
+
+        assert!(
+            bare > estimate_context_tokens(&transcript),
+            "the system prompt is sent on every request and must be charged"
+        );
+        assert!(
+            with_tools > bare,
+            "advertised definitions must be charged: {with_tools} vs {bare}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_past_the_window_threshold_folds_and_says_so() {
+        // End to end: a tiny window forces the threshold immediately, and the
+        // loop must fold the oldest results AND emit exactly one honest
+        // `NoteAppended` per pass describing what it compacted — the trace
+        // stays truthful about output the model can no longer see verbatim.
+        let repo = tempfile::tempdir().expect("tempdir");
+        let body: String = (0..400)
+            .map(|i| format!("line {i} of the file\n"))
+            .collect();
+        std::fs::write(repo.path().join("big.txt"), &body).expect("write fixture");
+        let read = |end: usize| ModelStep::CallTool {
+            tool: ReadFile::NAME.to_string(),
+            args: json!({"path": "big.txt", "range": [1, end]}),
+        };
+        let driver = ScriptedDriver::new(vec![
+            read(200),
+            read(199),
+            read(198),
+            read(197),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ])
+        .with_context_window(2_000);
+        let (runtime, mut events, session_id) = test_runtime();
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "read a big file repeatedly",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("run completes");
+
+        let mut notes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::NoteAppended { text, .. } = event.body {
+                notes.push(text);
+            }
+        }
+        let compactions: Vec<&String> = notes
+            .iter()
+            .filter(|n| n.starts_with("compaction:"))
+            .collect();
+        assert!(
+            !compactions.is_empty(),
+            "crossing the threshold must fold and report it, notes: {notes:?}"
+        );
+        assert!(
+            compactions[0].contains("artifact.read"),
+            "the note must say how to get the folded output back: {}",
+            compactions[0]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Repeated-identical-call steering: the refusal path must not promise a
+    // "result" that is a denial.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn refusal_observations_are_distinguished_from_executed_results() {
+        assert!(observation_is_refusal(
+            "policy denied: writes are denied in Ask"
+        ));
+        assert!(observation_is_refusal("approval rejected"));
+        assert!(!observation_is_refusal("1: fn main() {}"));
+        assert!(!observation_is_refusal("tool error: no such file"));
+    }
+
+    #[tokio::test]
+    async fn repeating_a_denied_call_is_steered_as_a_refusal_not_a_result() {
+        // The old steer told the model "its result is in the transcript
+        // above" on EVERY path — including the one where the duplicates were
+        // denied, sending it hunting for output that does not exist instead of
+        // changing approach. `python` is deliberately never allow-listed, so
+        // three identical `shell.run` calls are denied by policy and trip the
+        // guard on exactly that path.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let denied = || ModelStep::CallTool {
+            tool: Shell::NAME.to_string(),
+            args: json!({"program": "python", "args": ["--version"]}),
+        };
+        let driver = ScriptedDriver::new(vec![
+            denied(),
+            denied(),
+            denied(),
+            ModelStep::Finish {
+                summary: "gave up".to_string(),
+            },
+        ]);
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "run an unlisted interpreter",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        // Capture the transcript the FINAL request carried, which is where the
+        // steer lands.
+        let recording = RecordingDriver {
+            inner: driver,
+            seen: seen.clone(),
+        };
+        runtime
+            .execute_run(&recording, ctx, CancellationToken::never())
+            .await
+            .expect("run completes");
+
+        let transcripts = seen.lock().expect("mutex").clone();
+        let last = transcripts.last().expect("at least one request");
+        let steer = last
+            .iter()
+            .rev()
+            .find_map(|turn| match turn {
+                TurnItem::Steering(text) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("the guard must have steered");
+        assert!(
+            steer.contains("refused"),
+            "a denied duplicate must be steered as a refusal: {steer}"
+        );
+        assert!(
+            !steer.contains("its result is in the transcript"),
+            "it must not promise a result that is a denial: {steer}"
+        );
+    }
+
+    /// Wraps a driver and records every transcript it is handed, so a test can
+    /// inspect what the loop had accumulated by the final request.
+    struct RecordingDriver {
+        inner: ScriptedDriver,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<TurnItem>>>>,
+    }
+
+    #[async_trait]
+    impl ModelDriver for RecordingDriver {
+        fn model_id(&self) -> ModelId {
+            self.inner.model_id()
+        }
+
+        fn context_window(&self) -> Option<u64> {
+            self.inner.context_window()
+        }
+
+        async fn next_step(
+            &self,
+            transcript: &[TurnItem],
+            tools: &[ToolDefinition],
+            sink: &mut dyn DeltaSink,
+        ) -> anyhow::Result<StepOutcome> {
+            self.seen
+                .lock()
+                .expect("recording driver mutex")
+                .push(transcript.to_vec());
+            self.inner.next_step(transcript, tools, sink).await
+        }
     }
 
     /// PR C2: the offered baseline mirrors the mode overlay exactly — Ask /
