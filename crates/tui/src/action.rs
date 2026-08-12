@@ -49,6 +49,11 @@ pub enum Action {
     /// A transient status-line notice from the harness (e.g. a rejected
     /// command's code + message). Cleared automatically a few seconds later.
     Notice(String),
+    /// Push-to-talk capture started (`true`) or stopped (`false`), reported by
+    /// the CLI's voice host (voice v1, rubric 8). Purely presentational: it
+    /// drives the status-line recording indicator so a hot microphone is always
+    /// visible. The capture itself is the host's subprocess, never the TUI's.
+    VoiceRecording(bool),
     /// A persistent setup/runtime diagnostic from the harness. De-duplicated by
     /// the reducer and available in the Issues overlay until explicitly cleared.
     Issue(String),

@@ -110,6 +110,9 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         // ~5 seconds at the 5 fps tick.
         Action::Notice(text) => state.notice = Some((text, state.tick + 25)),
+        // Voice v1 (rubric 8): the host reports capture start/stop; the flag
+        // only drives the status-line indicator.
+        Action::VoiceRecording(recording) => state.voice.recording = recording,
         Action::Issue(text) => {
             if !state.issues.iter().any(|issue| issue == &text) {
                 state.issues.push(text.clone());
@@ -3326,6 +3329,19 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         }
         PaletteCommand::Council => {
             state.overlay = Overlay::CouncilBuilder(CouncilBuilderState::default());
+        }
+        // Voice v1 (rubric 8). The toggle only flips the flag the CLI's voice
+        // host reads — the host owns the synthesis and playback subprocesses,
+        // and reports back (as a `Notice`) when speech is not configured, so
+        // the TUI never has to know what a provider or an audio device is.
+        PaletteCommand::VoiceSpeak => {
+            state.voice.speak_replies = !state.voice.speak_replies;
+            let text = if state.voice.speak_replies {
+                "speaking replies aloud"
+            } else {
+                "stopped speaking replies"
+            };
+            state.notice = Some((text.to_owned(), state.tick + 25));
         }
         PaletteCommand::ToggleLayout => {
             state.layout = state.layout.toggled();

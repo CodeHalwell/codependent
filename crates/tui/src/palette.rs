@@ -47,6 +47,8 @@ pub enum PaletteCommand {
     ApiKeys,
     /// Surface the persisted multi-provider council workflow.
     Council,
+    /// Toggle speaking finalized assistant turns aloud (voice v1, rubric 8).
+    VoiceSpeak,
     /// Flip between the chat and workspace layouts.
     ToggleLayout,
     /// Toggle the help overlay.
@@ -219,6 +221,16 @@ pub const COMMANDS: &[PaletteEntry] = &[
         group: "Workspace",
     },
     // --- Session: client-level and housekeeping commands. ---
+    PaletteEntry {
+        command: PaletteCommand::VoiceSpeak,
+        title: "Voice: speak replies",
+        description:
+            "read each finished assistant turn aloud (needs a [speech] entry and a play_command)",
+        // Palette-only: speaking aloud is a deliberate, occasional choice, not
+        // something to fire from a stray keystroke.
+        key: "—",
+        group: "Session",
+    },
     PaletteEntry {
         command: PaletteCommand::ToggleLayout,
         title: "Toggle layout",
