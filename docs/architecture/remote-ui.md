@@ -80,11 +80,19 @@ The core messages are:
 State and commands cross the worker boundary only through typed mediation:
 
 - `UiProjectionSubscription` asks for an authorized `session`, `run`,
-  `artifact`, `command`, `theme`, `viewport`, or capability projection;
+  `context`, `workflow`, `blackboard`, `artifact`, `command`, `theme`,
+  `viewport`, or capability projection. Each kind maps to exactly one declared
+  capability, and each resource is re-authorized against the broker session:
+  `blackboard` is a workflow run's board, so it takes a workflow run id and
+  rides `workflow-read` — the same resource, ownership join, and read-only
+  authority as `workflow`;
 - `UiProjectionUpdate` supplies a bounded latest-wins value and optional
   revision, never a database handle, path, socket, token, or callable object;
 - `UiActionInvocation` is a revision-bound intent whose action identifier must
-  be declared by the package and authorized again by the daemon;
+  be declared by the package and authorized again by the daemon against a
+  declarative allowlist table (`run.pause|resume|cancel`,
+  `workflow.pause|resume|retry_node|cancel`) — an action absent from that table
+  can never reach a command, whatever a package declares;
 - `UiActionResult` returns a typed success, failure, or cancellation result;
 - host-originated cancellation settles one owned in-flight invocation; workers
   cannot cancel guessed host operations.

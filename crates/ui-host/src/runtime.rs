@@ -2476,7 +2476,9 @@ fn projection_capability(kind: &str) -> Option<&'static str> {
         "artifact" => Some("artifact-read"),
         "context" | "session" => Some("context-read"),
         "run" => Some("run-read"),
-        "workflow" => Some("workflow-read"),
+        // A run's blackboard is part of that workflow run's observable state:
+        // same resource id, same ownership join, same read-only authority.
+        "workflow" | "blackboard" => Some("workflow-read"),
         "command" => Some("command-invoke"),
         _ => None,
     }
@@ -3239,6 +3241,10 @@ targets = ["shared"]
     fn command_descriptors_use_the_command_invoke_capability() {
         assert_eq!(projection_capability("command"), Some("command-invoke"));
         assert_eq!(projection_capability("artifact"), Some("artifact-read"));
+        // A workflow run's blackboard rides the workflow-read capability: same
+        // resource id, same ownership join, read-only either way.
+        assert_eq!(projection_capability("workflow"), Some("workflow-read"));
+        assert_eq!(projection_capability("blackboard"), Some("workflow-read"));
         assert_eq!(projection_capability("raw-daemon-handle"), None);
     }
 

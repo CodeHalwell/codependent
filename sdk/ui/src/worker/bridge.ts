@@ -14,6 +14,8 @@ import {
 import type {
   ArtifactProjectionOptions,
   ArtifactView,
+  BlackboardProjectionOptions,
+  BlackboardView,
   CommandDescriptor,
   ExternalProjection,
   IdeContextView,
@@ -245,6 +247,40 @@ export class MediatedUiBridge implements UiProjectionStore, UiCommandActions {
       });
       return { workflowRunId, phase, nodes };
     });
+  }
+
+  blackboard(id: string, options: BlackboardProjectionOptions = {}): ExternalProjection<BlackboardView | undefined> {
+    return this.#projection("blackboard", id, undefined, (value, removed) => {
+      if (removed) return undefined;
+      const entry = object(value);
+      const workflowRunId = entry === undefined ? undefined : stringField(entry, "workflowRunId");
+      if (entry === undefined || workflowRunId === undefined) return undefined;
+      const items = (Array.isArray(entry.items) ? entry.items : []).flatMap((value) => {
+        const item = object(value);
+        if (item === undefined) return [];
+        const itemId = stringField(item, "id");
+        const kind = stringField(item, "kind");
+        if (itemId === undefined || kind === undefined || !Number.isSafeInteger(item.revision)) return [];
+        const supersededBy = stringField(item, "supersededBy");
+        // Anything the daemon added beyond the fields this SDK release knows
+        // stays reachable instead of being silently dropped.
+        const known = new Set(["id", "workflowRunId", "kind", "payload", "author", "confidence", "evidence", "revision", "supersededBy"]);
+        const extra = Object.fromEntries(Object.entries(item).filter(([key]) => !known.has(key)).map(([key, value]) => [key, clone(value)]));
+        return [{
+          id: itemId,
+          workflowRunId: stringField(item, "workflowRunId") ?? workflowRunId,
+          kind,
+          payload: item.payload === undefined ? null : clone(item.payload),
+          author: item.author === undefined ? null : clone(item.author),
+          ...(typeof item.confidence === "number" ? { confidence: item.confidence } : {}),
+          evidence: Array.isArray(item.evidence) ? clone(item.evidence) : [],
+          revision: item.revision as number,
+          ...(supersededBy === undefined ? {} : { supersededBy }),
+          extra,
+        }];
+      });
+      return { workflowRunId, items };
+    }, Object.fromEntries(Object.entries(options).filter((entry): entry is [string, UiJsonValue] => entry[1] !== undefined)));
   }
 
   artifact<T extends UiJsonValue = UiJsonValue>(id: string, options: ArtifactProjectionOptions = {}): ExternalProjection<ArtifactView<T> | undefined> {
