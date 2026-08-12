@@ -6195,6 +6195,7 @@ steps:
             "groq",
             "llama-3.1-8b",
             Some("sk-secret"),
+            None,
         )
         .expect("write_add_model");
 
@@ -6215,10 +6216,248 @@ steps:
             "the key lives in auth.json, not api_key_env"
         );
 
-        // The key landed in auth.json.
+        // The key landed in auth.json, per model AND provider-wide (so the
+        // next model from this provider needs no second paste).
         let auth =
             codypendent_runtime::auth::AuthStore::load(&paths.data_dir).expect("auth.json loads");
         assert_eq!(auth.get("groq/llama"), Some("sk-secret"));
+        assert_eq!(auth.get(&provider_auth_id("groq")), Some("sk-secret"));
+    }
+
+    /// The HIGH-severity auth-flatten regression, from the add side: the entry
+    /// must record which catalog provider it came from, so the runtime sends
+    /// that provider's real auth header (`api-key` for Azure OpenAI) instead
+    /// of a hardcoded bearer. Without this the add "succeeds" and every run
+    /// 401s.
+    #[test]
+    fn write_add_model_records_the_provider_so_azure_auth_survives() {
+        use codypendent_providers::{AuthMethod, Catalog};
+        use codypendent_runtime::models::load_models;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).expect("create data dir");
+
+        // The built-in `azure-openai` entry declares the non-bearer header but
+        // deliberately carries no base_url (it is per-resource), so a real user
+        // sets theirs in `providers.toml` — exactly what this fixture does. The
+        // built-in's header is asserted so this fails loudly if it ever changes.
+        let builtin = Catalog::builtin();
+        assert!(
+            builtin
+                .get("azure-openai")
+                .expect("azure-openai is a built-in provider")
+                .auth
+                .iter()
+                .any(|method| matches!(
+                    method,
+                    AuthMethod::ApiKey { header, .. } if header == "api-key"
+                )),
+            "the azure-openai catalog entry must declare the `api-key` header"
+        );
+        std::fs::write(
+            paths.data_dir.join("providers.toml"),
+            br#"
+[[provider]]
+id = "azure-openai"
+name = "Azure OpenAI (my resource)"
+protocol = "openai-chat"
+base_url = "https://my-resource.openai.azure.com/openai/v1/"
+[[provider.auth]]
+kind = "api_key"
+env = ["AZURE_OPENAI_API_KEY"]
+header = "api-key"
+prefix = ""
+"#,
+        )
+        .expect("seed providers.toml");
+
+        write_add_model(
+            &paths,
+            "azure-openai/gpt-5.1",
+            "azure-openai",
+            "gpt-5.1",
+            Some("azure-secret"),
+            None,
+        )
+        .expect("write_add_model");
+
+        let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
+        let entry = configs
+            .iter()
+            .find(|c| c.id.0 == "azure-openai/gpt-5.1")
+            .expect("the entry is present");
+        assert_eq!(
+            entry.provider_id.as_deref(),
+            Some("azure-openai"),
+            "the provider id is what the runtime resolves the `api-key` header from"
+        );
+        assert_eq!(
+            entry.base_url, "https://my-resource.openai.azure.com/openai/v1",
+            "the catalog's trailing slash is normalized on persist"
+        );
+    }
+
+    /// A catalog base URL written with a trailing slash would otherwise reach
+    /// the chat client as `…/v1//chat/completions`.
+    #[test]
+    fn normalize_base_url_trims_trailing_slashes() {
+        assert_eq!(
+            normalize_base_url("https://api.tokenfactory.nebius.com/v1/"),
+            "https://api.tokenfactory.nebius.com/v1"
+        );
+        assert_eq!(
+            normalize_base_url("  http://localhost:11434/v1  "),
+            "http://localhost:11434/v1"
+        );
+    }
+
+    /// The context window the picker showed is what gets persisted, so the
+    /// context gauge and the `num_ctx` hint work from the first run.
+    #[test]
+    fn write_add_model_persists_the_context_window_it_was_given() {
+        use codypendent_runtime::models::load_models;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            None,
+            Some(131_072),
+        )
+        .expect("write");
+        let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
+        assert_eq!(configs[0].context_tokens, Some(131_072));
+    }
+
+    /// The merge is what makes a catalog-only provider usable and a bare live
+    /// listing informative: live rows keep their order and gain the catalog's
+    /// metadata, catalog-only models follow as unconfirmed rows, and anything
+    /// the provider itself stated wins over the catalog.
+    #[test]
+    fn merge_catalog_rows_enriches_live_rows_and_appends_catalog_only_ones() {
+        let live = vec![
+            AddModelRow::live("llama-3.1-8b"),
+            AddModelRow {
+                id: "llama-3.3-70b".to_owned(),
+                name: None,
+                context_tokens: Some(999),
+                cost_per_1m_input_usd: None,
+                cost_per_1m_output_usd: None,
+                live: true,
+            },
+        ];
+        let catalog = vec![
+            AddModelRow {
+                id: "llama-3.1-8b".to_owned(),
+                name: Some("Llama 3.1 8B".to_owned()),
+                context_tokens: Some(128_000),
+                cost_per_1m_input_usd: Some(0.05),
+                cost_per_1m_output_usd: Some(0.08),
+                live: false,
+            },
+            AddModelRow {
+                id: "llama-3.3-70b".to_owned(),
+                name: Some("Llama 3.3 70B".to_owned()),
+                context_tokens: Some(128_000),
+                cost_per_1m_input_usd: None,
+                cost_per_1m_output_usd: None,
+                live: false,
+            },
+            AddModelRow {
+                id: "not-listed-today".to_owned(),
+                name: Some("Retired?".to_owned()),
+                context_tokens: Some(8_192),
+                cost_per_1m_input_usd: None,
+                cost_per_1m_output_usd: None,
+                live: false,
+            },
+        ];
+        let merged = merge_catalog_rows(live, &catalog);
+        assert_eq!(
+            merged.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["llama-3.1-8b", "llama-3.3-70b", "not-listed-today"],
+            "live order first, catalog-only rows appended"
+        );
+        assert_eq!(merged[0].name.as_deref(), Some("Llama 3.1 8B"));
+        assert_eq!(merged[0].context_tokens, Some(128_000));
+        assert!(merged[0].live);
+        assert_eq!(
+            merged[1].context_tokens,
+            Some(999),
+            "what the provider itself said is never overwritten by the catalog"
+        );
+        assert!(
+            !merged[2].live,
+            "a model the provider did not list stays marked unconfirmed"
+        );
+    }
+
+    /// The discovery cache: a live listing is written, read back as live rows,
+    /// and labelled with its age — the instant seed the next add gets.
+    #[test]
+    fn model_list_cache_round_trips_with_an_age_label() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+        let rows = vec![
+            AddModelRow {
+                id: "llama-3.1-8b".to_owned(),
+                name: Some("Llama 3.1 8B".to_owned()),
+                context_tokens: Some(128_000),
+                cost_per_1m_input_usd: Some(0.05),
+                cost_per_1m_output_usd: None,
+                live: true,
+            },
+            // Catalog-only rows are not cached: the cache records what the
+            // provider actually served.
+            AddModelRow {
+                id: "catalog-only".to_owned(),
+                name: None,
+                context_tokens: None,
+                cost_per_1m_input_usd: None,
+                cost_per_1m_output_usd: None,
+                live: false,
+            },
+        ];
+        write_model_list_cache(&data_dir, "groq", &rows);
+        assert!(model_list_cache_path(&data_dir, "groq").exists());
+
+        let (cached, age) = read_model_list_cache(&data_dir, "groq").expect("a cache was written");
+        assert_eq!(cached.len(), 1, "only the live rows are cached");
+        assert_eq!(cached[0].id, "llama-3.1-8b");
+        assert_eq!(cached[0].context_tokens, Some(128_000));
+        assert!(cached[0].live, "cached rows were live when written");
+        assert_eq!(age, "just now");
+
+        // A provider with no cache is simply `None` — never an error.
+        assert!(read_model_list_cache(&data_dir, "nebius").is_none());
+    }
+
+    /// A provider id from a user-editable `providers.toml` must never escape
+    /// the cache directory.
+    #[test]
+    fn model_list_cache_path_neutralizes_path_separators() {
+        let path = model_list_cache_path(Path::new("/data"), "../../etc/passwd");
+        assert_eq!(
+            path,
+            Path::new("/data/model_lists/______etc_passwd.json"),
+            "no path traversal survives into the cache file name"
+        );
+    }
+
+    #[test]
+    fn cache_age_label_reads_in_human_units() {
+        let now = 10_000_000;
+        assert_eq!(cache_age_label(now, now), "just now");
+        assert_eq!(cache_age_label(now - 240, now), "4m ago");
+        assert_eq!(cache_age_label(now - 7_200, now), "2h ago");
+        assert_eq!(cache_age_label(now - 172_800, now), "2d ago");
+        assert_eq!(
+            cache_age_label(now + 600, now),
+            "just now",
+            "a clock that moved backwards never reads as a negative age"
+        );
     }
 
     #[cfg(unix)]
@@ -6233,6 +6472,7 @@ steps:
             "groq",
             "llama-3.1-8b",
             Some("sk-secret"),
+            None,
         )
         .expect("write");
         let meta = std::fs::metadata(paths.data_dir.join("auth.json")).expect("metadata");
@@ -6246,7 +6486,15 @@ steps:
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
 
         // "ollama" is a built-in LOCAL provider (auth none) — no key entered.
-        write_add_model(&paths, "ollama/qwen", "ollama", "qwen2.5-coder:14b", None).expect("write");
+        write_add_model(
+            &paths,
+            "ollama/qwen",
+            "ollama",
+            "qwen2.5-coder:14b",
+            None,
+            None,
+        )
+        .expect("write");
 
         let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
         assert!(configs.iter().any(|c| c.id.0 == "ollama/qwen"));
@@ -6265,7 +6513,15 @@ steps:
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
 
-        write_add_model(&paths, "groq/llama", "groq", "llama-3.1-8b", Some("   ")).expect("write");
+        write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            Some("   "),
+            None,
+        )
+        .expect("write");
 
         assert!(
             !paths.data_dir.join("auth.json").exists(),
@@ -6279,9 +6535,24 @@ steps:
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
 
-        write_add_model(&paths, "groq/llama", "groq", "llama-3.1-8b", Some("k1")).expect("write 1");
-        write_add_model(&paths, "groq/llama", "groq", "llama-3.3-70b", Some("k2"))
-            .expect("write 2");
+        write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            Some("k1"),
+            None,
+        )
+        .expect("write 1");
+        write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.3-70b",
+            Some("k2"),
+            None,
+        )
+        .expect("write 2");
 
         let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
         let matching: Vec<_> = configs.iter().filter(|c| c.id.0 == "groq/llama").collect();
@@ -6312,10 +6583,24 @@ steps:
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
 
-        write_add_model(&paths, "groq/llama", "groq", "llama-3.1-8b", Some("k1"))
-            .expect("write first model");
-        write_add_model(&paths, "ollama/qwen", "ollama", "qwen2.5-coder:14b", None)
-            .expect("write second model");
+        write_add_model(
+            &paths,
+            "groq/llama",
+            "groq",
+            "llama-3.1-8b",
+            Some("k1"),
+            None,
+        )
+        .expect("write first model");
+        write_add_model(
+            &paths,
+            "ollama/qwen",
+            "ollama",
+            "qwen2.5-coder:14b",
+            None,
+            None,
+        )
+        .expect("write second model");
 
         let configs = load_models(&paths.data_dir.join("models.toml")).expect("parse");
         assert_eq!(configs.len(), 2, "both entries survive: {configs:?}");
@@ -6338,8 +6623,15 @@ steps:
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
 
-        let error = write_add_model(&paths, "   ", "groq", "llama-3.1-8b", Some("sk-secret"))
-            .expect_err("a blank display id must be rejected");
+        let error = write_add_model(
+            &paths,
+            "   ",
+            "groq",
+            "llama-3.1-8b",
+            Some("sk-secret"),
+            None,
+        )
+        .expect_err("a blank display id must be rejected");
         assert!(
             !error.to_string().is_empty(),
             "the error must carry a user-visible message"
@@ -6374,6 +6666,7 @@ steps:
             "groq",
             "llama-3.1-8b",
             Some("sk-secret"),
+            None,
         )
         .expect_err("a corrupt pre-existing auth.json must abort the whole add");
         assert!(
@@ -6670,6 +6963,7 @@ model = "qwen2.5-coder:14b"
             "groq",
             "llama-3.1-8b",
             Some("sk-secret"),
+            None,
         )
         .await;
 
@@ -6952,22 +7246,72 @@ model = "qwen2.5-coder:14b"
         );
     }
 
+    /// Ids of the parsed rows, in order — most parse tests only care about
+    /// which models came back, not the optional metadata.
+    fn parsed_ids(body: &str) -> Vec<String> {
+        parse_models_response(body)
+            .expect("parse")
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    }
+
     #[test]
     fn parse_models_response_extracts_ids_from_the_openai_shape() {
         let body = r#"{"object":"list","data":[{"id":"llama-3.1-8b"},{"id":"llama-3.3-70b"}]}"#;
-        assert_eq!(
-            parse_models_response(body).expect("parse"),
-            vec!["llama-3.1-8b".to_string(), "llama-3.3-70b".to_string()]
-        );
+        assert_eq!(parsed_ids(body), vec!["llama-3.1-8b", "llama-3.3-70b"]);
     }
 
     #[test]
     fn parse_models_response_skips_blank_and_dedups_preserving_order() {
         let body = r#"{"data":[{"id":"a"},{"id":"  "},{"id":""},{"id":"a"},{"id":"b"}]}"#;
-        assert_eq!(
-            parse_models_response(body).expect("parse"),
-            vec!["a".to_string(), "b".to_string()]
-        );
+        assert_eq!(parsed_ids(body), vec!["a", "b"]);
+    }
+
+    /// A bare-id response (Ollama, Groq, most providers) parses to rows with
+    /// every optional column empty — the metadata is never required.
+    #[test]
+    fn parse_models_response_leaves_metadata_empty_when_the_provider_sends_none() {
+        let body = r#"{"data":[{"id":"qwen2.5-coder:14b"}]}"#;
+        let rows = parse_models_response(body).expect("parse");
+        assert_eq!(rows[0].id, "qwen2.5-coder:14b");
+        assert!(rows[0].name.is_none());
+        assert!(rows[0].context_tokens.is_none());
+        assert!(rows[0].cost_per_1m_input_usd.is_none());
+        assert!(rows[0].live, "a listed model is a live row");
+    }
+
+    /// The richer shapes several OpenAI-compatible providers already return on
+    /// the same endpoint: OpenRouter's `context_length` + per-TOKEN string
+    /// prices (scaled to per-1M here), and the vLLM-derived `max_model_len`
+    /// numeric spelling.
+    #[test]
+    fn parse_models_response_keeps_context_and_pricing_when_present() {
+        let body = r#"{"data":[
+            {"id":"meta-llama/llama-3.3-70b","name":"Llama 3.3 70B",
+             "context_length":131072,
+             "pricing":{"prompt":"0.00000013","completion":"0.0000004"}},
+            {"id":"deepseek-v3","max_model_len":163840,
+             "pricing":{"input":0.0000005,"output":0.0000015}}
+        ]}"#;
+        let rows = parse_models_response(body).expect("parse");
+        assert_eq!(rows[0].name.as_deref(), Some("Llama 3.3 70B"));
+        assert_eq!(rows[0].context_tokens, Some(131_072));
+        // Per-token prices are scaled to the per-1M column the picker shows.
+        assert!((rows[0].cost_per_1m_input_usd.expect("input price") - 0.13).abs() < 1e-9);
+        assert!((rows[0].cost_per_1m_output_usd.expect("output price") - 0.4).abs() < 1e-9);
+        assert_eq!(rows[1].context_tokens, Some(163_840));
+        assert!((rows[1].cost_per_1m_input_usd.expect("input price") - 0.5).abs() < 1e-9);
+    }
+
+    /// A price this build cannot make sense of is dropped, not guessed: a
+    /// fabricated number in a cost column is worse than a blank one.
+    #[test]
+    fn parse_models_response_drops_unparseable_prices() {
+        let body = r#"{"data":[{"id":"m","pricing":{"prompt":"free","completion":null}}]}"#;
+        let rows = parse_models_response(body).expect("parse");
+        assert!(rows[0].cost_per_1m_input_usd.is_none());
+        assert!(rows[0].cost_per_1m_output_usd.is_none());
     }
 
     #[test]
