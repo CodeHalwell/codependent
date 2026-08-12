@@ -664,6 +664,7 @@ mod tests {
             provider_id: "groq".to_string(),
             model: "llama-3.1-8b".to_string(),
             api_key: Some(SecretKey("sk-secret".to_string())),
+            context_tokens: None,
         };
         assert!(
             !format!("{intent:?}").contains("sk-secret"),
@@ -676,6 +677,7 @@ mod tests {
         let intent = Intent::QueryProviderModels {
             provider_id: "groq".to_string(),
             api_key: Some(SecretKey("sk-secret".to_string())),
+            refresh: false,
         };
         assert!(
             !format!("{intent:?}").contains("sk-secret"),

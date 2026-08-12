@@ -1780,11 +1780,14 @@ mod tests {
     use super::*;
 
     /// [`filter_model_names`] mirrors [`filter_models`]/[`filter_providers`]'s
-    /// substring-match shape, adapted to bare `String` model ids (the
-    /// add-model pick-list's fetched names have no [`ModelCard`] wrapper).
+    /// substring-match shape, adapted to the add-model pick-list's
+    /// [`AddModelRow`] cards.
     #[test]
     fn filter_model_names_matches_case_insensitive_substrings() {
-        let models = vec!["llama-3.1-8b".to_owned(), "gpt-oss-20b".to_owned()];
+        let models = vec![
+            AddModelRow::live("llama-3.1-8b"),
+            AddModelRow::live("gpt-oss-20b"),
+        ];
         assert_eq!(
             filter_model_names(&models, ""),
             vec![0, 1],
@@ -1804,6 +1807,23 @@ mod tests {
             filter_model_names(&models, "zzz-no-such-model").is_empty(),
             "no match returns an empty list"
         );
+    }
+
+    /// A catalog row's display NAME is searchable too: an operator who knows a
+    /// model as "Llama 3.3 70B" should not have to guess the provider's id
+    /// spelling to find it.
+    #[test]
+    fn filter_model_names_also_matches_the_display_name() {
+        let models = vec![AddModelRow {
+            id: "meta-llama/Llama-3.3-70B-Instruct".to_owned(),
+            name: Some("Llama 3.3 70B Instruct".to_owned()),
+            context_tokens: Some(128_000),
+            cost_per_1m_input_usd: Some(0.13),
+            cost_per_1m_output_usd: Some(0.4),
+            live: false,
+        }];
+        assert_eq!(filter_model_names(&models, "3.3 70b"), vec![0]);
+        assert_eq!(filter_model_names(&models, "META-LLAMA"), vec![0]);
     }
 
     /// Secret hygiene (model discovery): every new overlay that carries a
@@ -1835,9 +1855,11 @@ mod tests {
                 Overlay::AddModelPick {
                     provider_id: "groq".to_owned(),
                     api_key: Some(SecretKey("sk-secret".to_owned())),
-                    models: vec!["llama-3.1-8b".to_owned()],
+                    models: vec![AddModelRow::live("llama-3.1-8b")],
                     query: String::new(),
                     selected: 0,
+                    origin: ModelListOrigin::Live,
+                    refreshing: false,
                 }
             ),
             format!(

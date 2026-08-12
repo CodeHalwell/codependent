@@ -3195,6 +3195,13 @@ fn render_provider_picker(
             provider_location_label(card.local).to_owned(),
             theme.status.info,
         ));
+        // What the add flow can actually offer here — a live listing, curated
+        // catalog rows, or (only when there is neither) a typed model name.
+        lines.push(field(
+            "models",
+            provider_listing_label(card),
+            theme.status.info,
+        ));
         lines.push(field(
             "status",
             if card.available {
@@ -8991,6 +8998,8 @@ mod tests {
                 requires_key: true,
                 can_list_models: true,
                 available: true,
+                catalog_models: 12,
+                has_key: false,
             },
             ProviderCard {
                 id: "ollama".to_owned(),
@@ -9001,6 +9010,8 @@ mod tests {
                 requires_key: false,
                 can_list_models: true,
                 available: true,
+                catalog_models: 0,
+                has_key: false,
             },
         ];
         reduce(&mut state, Action::OpenPalette);
@@ -9050,6 +9061,8 @@ mod tests {
             requires_key: true,
             can_list_models: true,
             available: true,
+            catalog_models: 0,
+            has_key: false,
         }];
         reduce(&mut state, Action::OpenPalette);
         for c in "provider".chars() {
@@ -9373,9 +9386,21 @@ mod tests {
         state.overlay = Overlay::AddModelPick {
             provider_id: "groq".to_owned(),
             api_key: None,
-            models: vec!["llama-3.1-8b".to_owned(), "gpt-oss-20b".to_owned()],
+            models: vec![
+                AddModelRow {
+                    id: "llama-3.1-8b".to_owned(),
+                    name: Some("Llama 3.1 8B".to_owned()),
+                    context_tokens: Some(128_000),
+                    cost_per_1m_input_usd: Some(0.05),
+                    cost_per_1m_output_usd: Some(0.08),
+                    live: true,
+                },
+                AddModelRow::live("gpt-oss-20b"),
+            ],
             query: "llama".to_owned(),
             selected: 0,
+            origin: ModelListOrigin::Live,
+            refreshing: false,
         };
         let text = render_to_string(&state, 100, 30);
         assert!(
@@ -9389,6 +9414,50 @@ mod tests {
         assert!(
             !text.contains("gpt-oss-20b"),
             "a non-matching model is filtered out:\n{text}"
+        );
+        // The catalog metadata columns are what make the pick-list a decision
+        // surface rather than a list of opaque ids.
+        assert!(
+            text.contains("Llama 3.1 8B"),
+            "the display name shows:\n{text}"
+        );
+        assert!(text.contains("ctx 128k"), "the context column:\n{text}");
+        assert!(
+            text.contains("in $0.05") && text.contains("out $0.08"),
+            "the per-1M price columns:\n{text}"
+        );
+        assert!(
+            text.contains("live list"),
+            "the header states where the rows came from:\n{text}"
+        );
+    }
+
+    /// A provider with no listing endpoint but curated catalog rows must say so
+    /// on its card — the operator needs to know the flow will still work.
+    #[test]
+    fn provider_card_badges_a_catalog_only_provider() {
+        let mut state = running_build_state();
+        state.providers = vec![ProviderCard {
+            id: "perplexity".to_owned(),
+            name: "Perplexity".to_owned(),
+            protocol: "openai-chat".to_owned(),
+            auth: "api-key: PERPLEXITY_API_KEY".to_owned(),
+            local: false,
+            requires_key: true,
+            can_list_models: false,
+            available: true,
+            catalog_models: 7,
+            has_key: false,
+        }];
+        reduce(&mut state, Action::OpenPalette);
+        for c in "provider".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputSubmit);
+        let text = render_to_string(&state, 120, 30);
+        assert!(
+            text.contains("catalog 7 models"),
+            "a provider with no live listing advertises its curated rows:\n{text}"
         );
     }
 

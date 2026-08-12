@@ -6974,6 +6974,12 @@ mod tests {
 
     // --- Task 8: the `/provider` picker (mirrors the model-picker tests above) ---
 
+    /// Bare live pick-list rows (ids only) — the shape a provider that answers
+    /// with ids alone produces, which is what most flow tests care about.
+    fn rows(ids: &[&str]) -> Vec<AddModelRow> {
+        ids.iter().map(|id| AddModelRow::live(*id)).collect()
+    }
+
     fn provider_card(
         id: &str,
         name: &str,
@@ -6993,6 +6999,10 @@ mod tests {
             can_list_models: protocol == "openai-chat"
                 && (auth.starts_with("api-key") || auth == "none"),
             available: protocol == "openai-chat" && (auth.starts_with("api-key") || auth == "none"),
+            // The default card ships no curated models and no stored key; the
+            // tests that exercise those paths set them explicitly.
+            catalog_models: 0,
+            has_key: false,
         }
     }
 
@@ -7128,6 +7138,7 @@ mod tests {
             vec![Intent::QueryProviderModels {
                 provider_id: "ollama".to_owned(),
                 api_key: None,
+                refresh: false,
             }]
         );
     }
@@ -7694,6 +7705,7 @@ mod tests {
                 provider_id: "mistral-vibe".to_string(),
                 model: "mistral-vibe".to_string(),
                 api_key: None,
+                context_tokens: None,
             }]
         );
         assert!(matches!(s.overlay, Overlay::None));
@@ -7777,6 +7789,7 @@ mod tests {
             vec![Intent::QueryProviderModels {
                 provider_id: "ollama".to_owned(),
                 api_key: None,
+                refresh: false,
             }]
         );
         assert_eq!(
@@ -7849,7 +7862,8 @@ mod tests {
             &mut s,
             Action::ProviderModelsLoaded {
                 provider_id: "groq".to_owned(),
-                models: vec!["llama-3.1-8b".to_owned(), "llama-3.3-70b".to_owned()],
+                models: rows(&["llama-3.1-8b", "llama-3.3-70b"]),
+                origin: ModelListOrigin::Live,
             },
         );
         assert_eq!(
@@ -7857,9 +7871,11 @@ mod tests {
             Overlay::AddModelPick {
                 provider_id: "groq".to_owned(),
                 api_key: Some(SecretKey("sk-secret".to_owned())),
-                models: vec!["llama-3.1-8b".to_owned(), "llama-3.3-70b".to_owned()],
+                models: rows(&["llama-3.1-8b", "llama-3.3-70b"]),
                 query: String::new(),
                 selected: 0,
+                origin: ModelListOrigin::Live,
+                refreshing: false,
             }
         );
     }
@@ -7875,7 +7891,8 @@ mod tests {
             &mut s,
             Action::ProviderModelsLoaded {
                 provider_id: "ollama".to_owned(),
-                models: vec!["qwen".to_owned()],
+                models: rows(&["qwen"]),
+                origin: ModelListOrigin::Live,
             },
         );
         assert_eq!(
@@ -8033,6 +8050,7 @@ mod tests {
             vec![Intent::QueryProviderModels {
                 provider_id: "groq".to_owned(),
                 api_key: Some(SecretKey("sk-secret".to_owned())),
+                refresh: false,
             }]
         );
         assert_eq!(
@@ -8057,6 +8075,7 @@ mod tests {
             vec![Intent::QueryProviderModels {
                 provider_id: "groq".to_owned(),
                 api_key: None,
+                refresh: false,
             }]
         );
         assert_eq!(
@@ -8074,9 +8093,11 @@ mod tests {
         s.overlay = Overlay::AddModelPick {
             provider_id: "groq".to_owned(),
             api_key: Some(SecretKey("sk-secret".to_owned())),
-            models: vec!["llama-3.1-8b".to_owned(), "llama-3.3-70b".to_owned()],
+            models: rows(&["llama-3.1-8b", "llama-3.3-70b"]),
             query: String::new(),
             selected: 1,
+            origin: ModelListOrigin::Live,
+            refreshing: false,
         };
         reduce(&mut s, Action::InputSubmit);
         assert_eq!(s.overlay, Overlay::None);
@@ -8087,6 +8108,7 @@ mod tests {
                 provider_id: "groq".to_owned(),
                 model: "llama-3.3-70b".to_owned(),
                 api_key: Some(SecretKey("sk-secret".to_owned())),
+                context_tokens: None,
             }]
         );
     }
@@ -8097,9 +8119,11 @@ mod tests {
         s.overlay = Overlay::AddModelPick {
             provider_id: "groq".to_owned(),
             api_key: None,
-            models: vec!["llama-3.1-8b".to_owned()],
+            models: rows(&["llama-3.1-8b"]),
             query: "zzz-nope".to_owned(),
             selected: 0,
+            origin: ModelListOrigin::Live,
+            refreshing: false,
         };
         reduce(&mut s, Action::InputSubmit);
         assert_eq!(s.overlay, Overlay::None, "the picker still closes");
@@ -8112,9 +8136,11 @@ mod tests {
         s.overlay = Overlay::AddModelPick {
             provider_id: "groq".to_owned(),
             api_key: None,
-            models: vec!["llama-3.1-8b".to_owned(), "gpt-oss-20b".to_owned()],
+            models: rows(&["llama-3.1-8b", "gpt-oss-20b"]),
             query: String::new(),
             selected: 1,
+            origin: ModelListOrigin::Live,
+            refreshing: false,
         };
         // Typing resets the selection to the top of the new filtered set.
         for c in "gpt".chars() {
@@ -8159,7 +8185,289 @@ mod tests {
                 provider_id: "groq".to_owned(),
                 model: "llama-3.1-8b".to_owned(),
                 api_key: Some(SecretKey("sk-secret".to_owned())),
+                context_tokens: None,
             }]
+        );
+    }
+
+    /// The picked row's context window rides the intent, so the model is
+    /// persisted with a real context instead of the `None` every discovered
+    /// model used to get.
+    #[test]
+    fn add_model_pick_carries_the_rows_context_window() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelPick {
+            provider_id: "nebius".to_owned(),
+            api_key: None,
+            models: vec![AddModelRow {
+                id: "deepseek-ai/DeepSeek-V3".to_owned(),
+                name: Some("DeepSeek V3".to_owned()),
+                context_tokens: Some(128_000),
+                cost_per_1m_input_usd: Some(0.5),
+                cost_per_1m_output_usd: Some(1.5),
+                live: true,
+            }],
+            query: String::new(),
+            selected: 0,
+            origin: ModelListOrigin::Live,
+            refreshing: false,
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::AddModel {
+                display_id: "nebius/deepseek-ai/DeepSeek-V3".to_owned(),
+                provider_id: "nebius".to_owned(),
+                model: "deepseek-ai/DeepSeek-V3".to_owned(),
+                api_key: None,
+                context_tokens: Some(128_000),
+            }]
+        );
+    }
+
+    /// The requires_key fallback bug: a hosted provider whose query failed with
+    /// a BLANK key must still be asked for one. Writing a keyless model here is
+    /// a guaranteed 401 at run time, discovered only when a run fails.
+    #[test]
+    fn add_model_id_with_a_blank_captured_key_still_prompts_a_key_requiring_provider() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelId {
+            provider_id: "groq".to_owned(),
+            requires_key: true,
+            api_key: Some(SecretKey("   ".to_owned())),
+            buffer: "llama-3.1-8b".to_owned(),
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert!(
+            matches!(
+                &s.overlay,
+                Overlay::AddModelKey { provider_id, model, .. }
+                    if provider_id == "groq" && model == "llama-3.1-8b"
+            ),
+            "a blank captured key must route through the masked prompt, got {:?}",
+            s.overlay
+        );
+        assert!(
+            s.outbox.is_empty(),
+            "nothing is added until a key decision is made"
+        );
+    }
+
+    /// The same bug from the other side: when the provider card is not loaded,
+    /// the failure fallback assumes a key IS needed rather than inferring it
+    /// from whether this particular query carried one.
+    #[test]
+    fn provider_models_failed_assumes_a_key_is_needed_for_an_unknown_provider() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "mystery".to_owned(),
+            api_key: None,
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsFailed {
+                provider_id: "mystery".to_owned(),
+                reason: "HTTP 401".to_owned(),
+            },
+        );
+        assert!(
+            matches!(
+                &s.overlay,
+                Overlay::AddModelId { requires_key, .. } if *requires_key
+            ),
+            "an unknown provider falls back to requiring a key, got {:?}",
+            s.overlay
+        );
+    }
+
+    /// A provider with no live listing but curated catalog rows still opens the
+    /// pick-list (via the harness's catalog answer) instead of the free-text
+    /// prompt — the Perplexity case.
+    #[test]
+    fn a_catalog_only_provider_queries_instead_of_falling_back_to_free_text() {
+        let mut s = AppState::new();
+        let mut card = provider_card(
+            "perplexity",
+            "Perplexity",
+            "openai-chat",
+            "api-key: PERPLEXITY_API_KEY",
+            false,
+        );
+        card.can_list_models = false;
+        card.available = true;
+        card.catalog_models = 7;
+        card.has_key = true; // a key is already stored: no re-prompt
+        s.providers = vec![card];
+        open_provider_picker(&mut s);
+        reduce(&mut s, Action::BeginAddModel);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::QueryProviderModels {
+                provider_id: "perplexity".to_owned(),
+                api_key: None,
+                refresh: false,
+            }],
+            "curated rows are requested rather than a model name typed blind"
+        );
+        assert!(matches!(s.overlay, Overlay::AddModelQuerying { .. }));
+    }
+
+    /// A stored provider key skips the key-first prompt entirely (adding a
+    /// second model from a provider must not ask for the same key again).
+    #[test]
+    fn a_provider_with_a_stored_key_skips_the_key_prompt() {
+        let mut s = AppState::new();
+        let mut card = provider_card(
+            "groq",
+            "Groq",
+            "openai-chat",
+            "api-key: GROQ_API_KEY",
+            false,
+        );
+        card.has_key = true;
+        s.providers = vec![card];
+        open_provider_picker(&mut s);
+        reduce(&mut s, Action::BeginAddModel);
+        assert!(
+            matches!(s.overlay, Overlay::AddModelQuerying { .. }),
+            "the flow goes straight to the query, got {:?}",
+            s.overlay
+        );
+    }
+
+    /// `Ctrl-R` on an open pick-list re-queries with the stashed key and marks
+    /// the overlay refreshing; the fresher answer replaces the rows under the
+    /// operator's filter without losing it.
+    #[test]
+    fn refresh_re_queries_and_folds_the_answer_under_the_live_filter() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelPick {
+            provider_id: "groq".to_owned(),
+            api_key: Some(SecretKey("sk-secret".to_owned())),
+            models: rows(&["llama-3.1-8b"]),
+            query: "llama".to_owned(),
+            selected: 0,
+            origin: ModelListOrigin::Cached("2h ago".to_owned()),
+            refreshing: false,
+        };
+        reduce(&mut s, Action::RefreshProviderModels);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::QueryProviderModels {
+                provider_id: "groq".to_owned(),
+                api_key: Some(SecretKey("sk-secret".to_owned())),
+                refresh: true,
+            }]
+        );
+        assert!(
+            matches!(&s.overlay, Overlay::AddModelPick { refreshing, .. } if *refreshing),
+            "the overlay marks the in-flight refresh"
+        );
+
+        reduce(
+            &mut s,
+            Action::ProviderModelsLoaded {
+                provider_id: "groq".to_owned(),
+                models: rows(&["llama-3.1-8b", "llama-3.3-70b", "gpt-oss-20b"]),
+                origin: ModelListOrigin::Live,
+            },
+        );
+        match &s.overlay {
+            Overlay::AddModelPick {
+                models,
+                query,
+                origin,
+                refreshing,
+                ..
+            } => {
+                assert_eq!(models.len(), 3, "the fresher list replaced the rows");
+                assert_eq!(query, "llama", "the operator's filter survives");
+                assert_eq!(*origin, ModelListOrigin::Live);
+                assert!(!refreshing);
+            }
+            other => panic!("expected the pick-list, got {other:?}"),
+        }
+    }
+
+    /// A failed manual refresh leaves the rows on screen: they are still
+    /// usable, so only the notice changes.
+    #[test]
+    fn a_failed_refresh_keeps_the_pick_list_open() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelPick {
+            provider_id: "groq".to_owned(),
+            api_key: None,
+            models: rows(&["llama-3.1-8b"]),
+            query: String::new(),
+            selected: 0,
+            origin: ModelListOrigin::Live,
+            refreshing: true,
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsFailed {
+                provider_id: "groq".to_owned(),
+                reason: "request timed out".to_owned(),
+            },
+        );
+        match &s.overlay {
+            Overlay::AddModelPick {
+                models, refreshing, ..
+            } => {
+                assert_eq!(models.len(), 1, "the usable rows stay");
+                assert!(!refreshing);
+            }
+            other => panic!("expected the pick-list, got {other:?}"),
+        }
+    }
+
+    /// `Ctrl-T` in `/keys` probes the focused model, and the answer replaces
+    /// that card's readiness — a hosted model stops claiming "Unverified" once
+    /// it has actually been checked.
+    #[test]
+    fn verify_api_key_probes_the_focused_model_and_folds_the_result() {
+        let mut s = AppState::new();
+        s.models = vec![crate::state::ModelCard {
+            id: ModelId("groq/llama".to_owned()),
+            provider: "openai-compatible".to_owned(),
+            readiness: ModelReadiness::Unverified,
+            location: None,
+            cost_per_1k_usd: None,
+            context_tokens: None,
+        }];
+        s.overlay = Overlay::ApiKeys {
+            query: String::new(),
+            selected: 0,
+        };
+        reduce(&mut s, Action::VerifyApiKey);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::VerifyApiKey {
+                model_id: "groq/llama".to_owned(),
+            }]
+        );
+        reduce(
+            &mut s,
+            Action::ModelKeyVerified {
+                model_id: "groq/llama".to_owned(),
+                ok: true,
+                reason: String::new(),
+            },
+        );
+        assert_eq!(s.models[0].readiness, ModelReadiness::Ready);
+
+        reduce(
+            &mut s,
+            Action::ModelKeyVerified {
+                model_id: "groq/llama".to_owned(),
+                ok: false,
+                reason: "provider returned HTTP 401 from /models".to_owned(),
+            },
+        );
+        assert!(
+            matches!(&s.models[0].readiness, ModelReadiness::Unavailable(reason) if reason.contains("401")),
+            "a rejected key is reported honestly, got {:?}",
+            s.models[0].readiness
         );
     }
 
