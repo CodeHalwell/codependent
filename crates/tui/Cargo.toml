@@ -27,6 +27,10 @@ pulldown-cmark = { workspace = true }
 synoptic = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
+# Stable ids for blocks the Docs Studio inserts. The `Insert` mutation carries
+# the block's id from the client (the CRDT anchors links/citations to it), so
+# the reducer must mint one — the same time-ordered v7 form the fabric uses.
+uuid = { workspace = true }
 
 [lints]
 workspace = true

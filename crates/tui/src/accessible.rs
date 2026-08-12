@@ -337,7 +337,9 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         | Overlay::AddModelProviderKey { .. }
         | Overlay::AddModelQuerying { .. }
         | Overlay::AddModelPick { .. } => "add model",
-        Overlay::DocEdit { .. } => "document editor",
+        Overlay::DocEdit { .. } | Overlay::DocInsert { .. } => "document editor",
+        Overlay::DocNew { .. } => "new document",
+        Overlay::DocDeleteConfirm { .. } => "delete block confirmation",
         Overlay::DocPublishPath { .. } => "document publish path",
         Overlay::ConfirmUiPluginApprove { .. }
         | Overlay::ConfirmUiPluginReject { .. }

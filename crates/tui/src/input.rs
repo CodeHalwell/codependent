@@ -337,6 +337,7 @@ fn map_normal_char(c: char) -> Action {
         'M' => Action::OpenMemory,
         'o' => Action::OpenSource,
         'e' => Action::EditDoc,
+        'i' => Action::InsertDocBlock,
         'P' => Action::PublishDoc,
         'D' => Action::OpenDocs,
         'G' => Action::OpenEdges,
@@ -348,6 +349,7 @@ fn map_normal_char(c: char) -> Action {
         't' => Action::EnableUiPluginSession,
         'u' => Action::EnableUiPluginUser,
         'x' => Action::RevokeUiPlugin,
+        'X' => Action::DeleteDocBlock,
         '/' => Action::OpenPalette,
         _ => Action::NoOp,
     }
@@ -587,6 +589,14 @@ mod tests {
         assert_eq!(
             map_event(&ch('e'), InputMode::Normal, W, &[]),
             Action::EditDoc
+        );
+        assert_eq!(
+            map_event(&ch('i'), InputMode::Normal, W, &[]),
+            Action::InsertDocBlock
+        );
+        assert_eq!(
+            map_event(&ch('X'), InputMode::Normal, W, &[]),
+            Action::DeleteDocBlock
         );
         assert_eq!(
             map_event(&ch('D'), InputMode::Normal, W, &[]),

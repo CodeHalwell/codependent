@@ -629,6 +629,148 @@ pub async fn open(
     Ok(())
 }
 
+/// `codypendent docs new <TITLE> [--from FILE] [--scope S]` — the CLI half of
+/// document creation (rubric #4). Ensures a daemon, sends `CreateDocument` with
+/// the current checkout as the repository (so a repository-scoped document
+/// lands with the code it documents), and prints the id the daemon minted.
+///
+/// `--from` reads the Markdown here rather than passing a path, so the daemon
+/// never opens a client-named file: the seed content crosses the socket as
+/// data, which also works when the daemon runs elsewhere.
+pub async fn docs_new(
+    paths: &RuntimePaths,
+    title: &str,
+    from: Option<&std::path::Path>,
+    scope: Option<String>,
+) -> anyhow::Result<()> {
+    let initial_markdown = match from {
+        Some(path) => Some(
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let repository = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned());
+
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(&mut conn).await?;
+
+    let reply = conn
+        .send_command(CommandBody::CreateDocument {
+            title: title.to_string(),
+            scope,
+            repository,
+            initial_markdown,
+        })
+        .await?;
+    match reply.payload {
+        Payload::DocumentCreated { document_id, .. } => {
+            println!("Created \"{title}\" ({document_id}).");
+            println!("Open it in the TUI's Docs Studio (D) to edit, review, or publish.");
+            Ok(())
+        }
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "daemon rejected the document: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to CreateDocument: {other:?}"),
+    }
+}
+
+/// `codypendent docs list` — the documents this checkout can see (repository +
+/// system scope), newest first. Reads the daemon's database directly, the same
+/// read-only projection seam `docs publish` and the TUI's Docs Studio use, so
+/// listing never needs a running daemon.
+pub async fn docs_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = knowledge_db::open(&database_path)
+        .await
+        .with_context(|| format!("opening {}", database_path.display()))?;
+
+    let repository =
+        codypendent_knowledge::stable_repository_id(&std::env::current_dir()?.canonicalize()?);
+    let scopes = [Scope::Repository(repository), Scope::System];
+    let summaries = DocumentStore::new().list(&pool, &scopes).await?;
+    if summaries.is_empty() {
+        println!("No documents yet. Create one with `codypendent docs new \"<title>\"`.");
+        return Ok(());
+    }
+    println!("{:<38} {:<10} {:>4}  TITLE", "ID", "STATUS", "REV");
+    for summary in &summaries {
+        println!(
+            "{:<38} {:<10} {:>4}  {}",
+            summary.id.to_string(),
+            summary.status.as_str(),
+            summary.revision,
+            summary.title
+        );
+    }
+    Ok(())
+}
+
+/// `codypendent docs check` — the on-demand `/update-docs` sweep. Ensures a
+/// daemon (the sweep runs there, against the code graph it maintains) and
+/// prints the finding counts it reports back.
+pub async fn docs_check(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let repository = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned());
+
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(&mut conn).await?;
+
+    let reply = conn
+        .send_command(CommandBody::CheckDocuments {
+            repository,
+            session_id: None,
+        })
+        .await?;
+    match reply.payload {
+        Payload::DocsCheckCompleted {
+            documents_checked,
+            links_resolved,
+            stale_findings,
+            suggestions_filed,
+            ..
+        } => {
+            println!("Checked {documents_checked} document(s); {links_resolved} symbol link(s) resolved.");
+            if stale_findings == 0 {
+                println!("No stale documentation found.");
+            } else {
+                println!(
+                    "{stale_findings} stale finding(s); {suggestions_filed} suggestion(s) filed \
+                     for review."
+                );
+                println!("Review them in the TUI's Docs Studio (D).");
+            }
+            Ok(())
+        }
+        Payload::CommandRejected(error) => {
+            anyhow::bail!(
+                "daemon rejected the check: {} ({})",
+                error.message,
+                error.code
+            )
+        }
+        other => anyhow::bail!("unexpected reply to CheckDocuments: {other:?}"),
+    }
+}
+
 /// `codypendent docs publish --target <T>` (Phase 4 STEP 4.4). Which Git
 /// target to publish to, decoupled from `clap`'s `ValueEnum` derive (mirrors
 /// `codypendent_knowledge::PublishTarget`'s three variants with CLI-friendly

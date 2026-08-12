@@ -216,6 +216,17 @@ pub enum Action {
     /// Publish the focused document to a repository Markdown file (`P`). The
     /// daemon computes the plan and parks its ordinary human approval first.
     PublishDoc,
+    /// Open the new-document prompt in the Docs Studio. Reached from `n` while
+    /// the Docs Studio is open (see [`Action::NewRun`], which the reducer routes
+    /// by overlay exactly as it routes `n` to "start the focused workflow" in
+    /// the workflow browser), never bound to its own global key.
+    NewDoc,
+    /// Open the insert-block prompt for a new paragraph below the focused block
+    /// (`i`, editor rail).
+    InsertDocBlock,
+    /// Ask to delete the focused block (`x`, editor rail); routes through a
+    /// confirmation before any mutation is sent.
+    DeleteDocBlock,
     /// A merged replica update, projected by the CLI harness after it folded an
     /// incoming `DocumentSync` into the document's client replica and re-read its
     /// pending suggestions. Replaces the matching card's blocks/suggestions/revision
@@ -500,6 +511,12 @@ pub enum Intent {
     PublishDocument {
         document_id: DocumentId,
         target: codypendent_protocol::PublishTarget,
+    },
+    /// Create a collaborative document with `title` (rubric #4 doc-writer). The
+    /// harness sends `CreateDocument` and refreshes the Docs projection so the
+    /// new document appears in the tree.
+    CreateDocument {
+        title: String,
     },
     /// Subscribe to a document's live sync stream without mutating it. This is
     /// client-only: opening/focusing a document should keep the Docs Studio

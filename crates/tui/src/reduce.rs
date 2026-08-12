@@ -247,6 +247,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::NewRun => {
             if matches!(state.overlay, Overlay::Workflow) {
                 start_focused_workflow(state);
+            } else if matches!(state.overlay, Overlay::Docs) {
+                // In the Docs Studio, `n` creates a DOCUMENT — the same
+                // overlay-contextual routing the workflow browser uses above.
+                begin_doc_new(state);
             } else {
                 state.overlay = Overlay::NewRun(String::new());
             }
@@ -441,12 +445,18 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 Overlay::ConfirmUiPluginApprove { .. }
                 | Overlay::ConfirmUiPluginReject { .. }
                 | Overlay::ConfirmUiPluginRevoke { .. } => Overlay::UiPlugins,
+                // Backing out of the delete confirmation returns to the Docs
+                // Studio it floats over, not the base view.
+                Overlay::DocDeleteConfirm { .. } => Overlay::Docs,
                 _ => Overlay::None,
             };
         }
 
         // --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
         Action::EditDoc => begin_doc_edit(state),
+        Action::NewDoc => begin_doc_new(state),
+        Action::InsertDocBlock => begin_doc_insert(state),
+        Action::DeleteDocBlock => begin_doc_delete(state),
         Action::PublishDoc => begin_doc_publish(state),
         Action::DocumentSynced {
             document_id,
@@ -504,7 +514,12 @@ pub fn reduce(state: &mut AppState, action: Action) {
 
     let remains_in_docs_flow = matches!(
         state.overlay,
-        Overlay::Docs | Overlay::DocEdit { .. } | Overlay::DocPublishPath { .. }
+        Overlay::Docs
+            | Overlay::DocEdit { .. }
+            | Overlay::DocNew { .. }
+            | Overlay::DocInsert { .. }
+            | Overlay::DocDeleteConfirm { .. }
+            | Overlay::DocPublishPath { .. }
     );
     if docs_surface_was_open
         && (!remains_in_docs_flow || state.should_detach || state.session_closed)
@@ -1901,6 +1916,21 @@ fn confirm_top(state: &mut AppState) {
                 state.overlay = Overlay::UiPlugins;
             }
         }
+        // Confirmed block deletion. Structural, so it takes the whole-document
+        // lease (`block_id: None`) exactly as an insert does.
+        Overlay::DocDeleteConfirm { .. } => {
+            if let Overlay::DocDeleteConfirm { block_id, .. } = std::mem::take(&mut state.overlay) {
+                state.overlay = Overlay::Docs;
+                if let Some(document_id) = state.focused_doc().map(|doc| doc.document_id) {
+                    start_doc_edit(
+                        state,
+                        document_id,
+                        None,
+                        DocumentMutation::Delete { block_id },
+                    );
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1997,16 +2027,77 @@ fn resolve_focused(state: &mut AppState, decision: ApprovalDecision, scope: Appr
 
 // --- Docs Studio live editing (Phase 4 STEP 4.3 client wiring) ---
 
-/// Begin editing the focused block: open the block-edit prompt. Only meaningful
-/// with the editor rail focused and a block under the cursor.
+/// Begin editing the focused block: open the block-edit prompt **prefilled with
+/// the block's current text**. Submit replaces that text wholesale (see
+/// [`Overlay::DocEdit`]), so `e` is a real block editor rather than the
+/// prepend-only insertion it used to be. Only meaningful with the editor rail
+/// focused and a text-bearing block under the cursor — a table, checklist,
+/// diagram, or embed block has no single editable text container, and says so
+/// rather than opening a prompt whose submit could not be applied.
 fn begin_doc_edit(state: &mut AppState) {
     if !matches!(state.overlay, Overlay::Docs) || state.doc_focus != DocFocus::Editor {
         return;
     }
-    if let Some(block_id) = state.focused_block().map(|block| block.id.clone()) {
-        state.overlay = Overlay::DocEdit {
-            block_id,
+    let Some(block) = state.focused_block() else {
+        return;
+    };
+    let block_id = block.id.clone();
+    let Some(original) = block.editable.clone() else {
+        state.notice = Some((
+            "this block kind has no editable text".to_owned(),
+            state.tick + 25,
+        ));
+        return;
+    };
+    state.overlay = Overlay::DocEdit {
+        block_id,
+        buffer: original.clone(),
+        original,
+    };
+}
+
+/// Open the new-document prompt (`n`). Available anywhere in the Docs Studio —
+/// creating the first document is exactly the case where no document is focused.
+fn begin_doc_new(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::Docs) {
+        state.overlay = Overlay::DocNew {
             buffer: String::new(),
+        };
+    }
+}
+
+/// Open the insert-block prompt (`i`): a new paragraph directly *below* the
+/// focused block, or at the top of a document with no blocks yet.
+fn begin_doc_insert(state: &mut AppState) {
+    if !matches!(state.overlay, Overlay::Docs) || state.doc_focus != DocFocus::Editor {
+        return;
+    }
+    let Some(doc) = state.focused_doc() else {
+        return;
+    };
+    // Below the cursor; an empty document inserts at 0. `selected_block` is
+    // clamped to the block list, so this can never exceed its length.
+    let index = if doc.blocks.is_empty() {
+        0
+    } else {
+        (state.selected_block + 1).min(doc.blocks.len())
+    };
+    state.overlay = Overlay::DocInsert {
+        index: index as u32,
+        buffer: String::new(),
+    };
+}
+
+/// Ask to delete the focused block (`X`). Deletion is destructive and has no TUI
+/// undo, so it routes through a confirmation rather than firing off the keypress.
+fn begin_doc_delete(state: &mut AppState) {
+    if !matches!(state.overlay, Overlay::Docs) || state.doc_focus != DocFocus::Editor {
+        return;
+    }
+    if let Some(block) = state.focused_block() {
+        state.overlay = Overlay::DocDeleteConfirm {
+            block_id: block.id.clone(),
+            label: format!("{} — {}", block.kind, block.text),
         };
     }
 }
@@ -2159,6 +2250,8 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
         Overlay::WorkflowInputs { buffer, .. } => edit(buffer),
         Overlay::EdgeSearch(buffer) => edit(buffer),
         Overlay::DocEdit { buffer, .. } => edit(buffer),
+        Overlay::DocNew { buffer } => edit(buffer),
+        Overlay::DocInsert { buffer, .. } => edit(buffer),
         Overlay::DocPublishPath { buffer, .. } => edit(buffer),
         Overlay::AddModelId { buffer, .. } => edit(buffer),
         // The key buffer is a redacting newtype; edit its inner String.
@@ -2365,7 +2458,10 @@ fn input_cancel(state: &mut AppState) {
         Overlay::None => state.composer.clear(),
         // Abandoning the block-edit prompt returns to the browser, not the base
         // view (no lease was taken yet — the acquire only fires on submit).
-        Overlay::DocEdit { .. } => state.overlay = Overlay::Docs,
+        Overlay::DocEdit { .. }
+        | Overlay::DocNew { .. }
+        | Overlay::DocInsert { .. }
+        | Overlay::DocDeleteConfirm { .. } => state.overlay = Overlay::Docs,
         Overlay::DocPublishPath { .. } => state.overlay = Overlay::Docs,
         Overlay::EdgeSearch(_) => state.overlay = Overlay::Edges,
         Overlay::WorkflowInputs { .. } => state.overlay = Overlay::Workflow,
@@ -2568,24 +2664,62 @@ fn submit_prompt(state: &mut AppState) {
             request_edge_page(state, 0);
         }
         // Submit the block-edit prompt: acquire the block's lease and queue the
-        // insertion to fire once it is granted. `mem::take` left the overlay
+        // replacement to fire once it is granted. `mem::take` left the overlay
         // `None`; restore the Docs browser so the reflected sync lands in view.
-        Overlay::DocEdit { block_id, buffer } => {
+        Overlay::DocEdit {
+            block_id,
+            buffer,
+            original,
+        } => {
+            state.overlay = Overlay::Docs;
+            let text = buffer.trim().to_owned();
+            let document_id = state.focused_doc().map(|doc| doc.document_id);
+            // An unchanged buffer is not an edit — never spend a revision (and a
+            // suggestion in Suggest mode) on a no-op submit.
+            if text == original.trim() {
+                return;
+            }
+            if let Some(document_id) = document_id {
+                // A FULL REPLACE of the block's text: delete exactly the
+                // characters the prompt was prefilled with, then insert what the
+                // writer typed. `delete_len` counts CHARACTERS (the CRDT's text
+                // ops are character-indexed), not bytes. In Edit mode this
+                // applies directly; in Suggest mode the daemon turns the same
+                // range into a reviewable suggestion.
+                let mutation = DocumentMutation::EditText {
+                    block_id: block_id.clone(),
+                    position: 0,
+                    delete_len: original.chars().count() as u32,
+                    insert: text,
+                };
+                start_doc_edit(state, document_id, Some(block_id), mutation);
+            }
+        }
+        // Submit the new-document prompt: the harness sends `CreateDocument` and
+        // refreshes the Docs projection, so the document appears in the tree.
+        Overlay::DocNew { buffer } => {
+            state.overlay = Overlay::Docs;
+            let title = buffer.trim().to_owned();
+            if title.is_empty() {
+                state.notice = Some(("a document needs a title".to_owned(), state.tick + 25));
+                return;
+            }
+            state.outbox.push(Intent::CreateDocument { title });
+        }
+        // Submit the insert-block prompt: a new paragraph at `index`. A block
+        // insert reshapes the block list, so it takes the WHOLE-DOCUMENT lease
+        // (`block_id: None`) the daemon's structural gate requires.
+        Overlay::DocInsert { index, buffer } => {
             state.overlay = Overlay::Docs;
             let text = buffer.trim().to_owned();
             let document_id = state.focused_doc().map(|doc| doc.document_id);
             if let (false, Some(document_id)) = (text.is_empty(), document_id) {
-                // Insert the typed text at the start of the block. A pure insertion
-                // (delete_len 0) needs no knowledge of the block's current length —
-                // in Edit mode it applies directly, in Suggest mode the daemon turns
-                // it into a suggestion over the empty range [0,0).
-                let mutation = DocumentMutation::EditText {
-                    block_id: block_id.clone(),
-                    position: 0,
-                    delete_len: 0,
-                    insert: text,
+                let mutation = DocumentMutation::Insert {
+                    index,
+                    block_id: uuid::Uuid::now_v7().to_string(),
+                    content: serde_json::json!({ "type": "paragraph", "text": text }),
                 };
-                start_doc_edit(state, document_id, Some(block_id), mutation);
+                start_doc_edit(state, document_id, None, mutation);
             }
         }
         Overlay::DocPublishPath {
@@ -3363,9 +3497,12 @@ fn refresh_open_projection(state: &mut AppState) {
     let kind = match state.overlay {
         Overlay::Skills => Some(ProjectionKind::Skills),
         Overlay::Memory { .. } => Some(ProjectionKind::Memory),
-        Overlay::Docs | Overlay::DocEdit { .. } | Overlay::DocPublishPath { .. } => {
-            Some(ProjectionKind::Docs)
-        }
+        Overlay::Docs
+        | Overlay::DocEdit { .. }
+        | Overlay::DocNew { .. }
+        | Overlay::DocInsert { .. }
+        | Overlay::DocDeleteConfirm { .. }
+        | Overlay::DocPublishPath { .. } => Some(ProjectionKind::Docs),
         Overlay::Workflow | Overlay::WorkflowInputs { .. } => Some(ProjectionKind::Workflow),
         _ => None,
     };
@@ -5035,6 +5172,7 @@ mod tests {
                 id: "b1".to_owned(),
                 kind: "heading".to_owned(),
                 text: title.to_owned(),
+                editable: Some(title.to_owned()),
             }],
             suggestions: vec![crate::state::DocSuggestionView {
                 id: "s1".to_owned(),
@@ -5103,6 +5241,7 @@ mod tests {
             id: "b2".to_owned(),
             kind: "paragraph".to_owned(),
             text: "second block".to_owned(),
+            editable: Some("second block".to_owned()),
         });
         first.suggestions.push(crate::state::DocSuggestionView {
             id: "s2".to_owned(),
@@ -5171,6 +5310,7 @@ mod tests {
             id: "b2".to_owned(),
             kind: "paragraph".to_owned(),
             text: "second".to_owned(),
+            editable: Some("second".to_owned()),
         });
         s.docs = vec![card, doc("b")];
         reduce(&mut s, Action::OpenDocs);
@@ -5182,16 +5322,23 @@ mod tests {
     }
 
     #[test]
-    fn edit_doc_opens_the_block_edit_prompt_for_the_focused_block() {
+    fn edit_doc_opens_the_block_edit_prompt_prefilled_with_the_block_text() {
         let mut s = AppState::new();
         s.docs = vec![doc("a")];
         reduce(&mut s, Action::OpenDocs);
         reduce(&mut s, Action::CyclePane); // Editor rail
         reduce(&mut s, Action::EditDoc);
         match &s.overlay {
-            Overlay::DocEdit { block_id, buffer } => {
+            Overlay::DocEdit {
+                block_id,
+                buffer,
+                original,
+            } => {
                 assert_eq!(block_id, "b1");
-                assert!(buffer.is_empty());
+                // Prefilled, not empty — `e` edits the block rather than
+                // prepending to it.
+                assert_eq!(buffer, "a");
+                assert_eq!(original, "a");
             }
             other => panic!("expected the block-edit prompt, got {other:?}"),
         }
@@ -5204,7 +5351,23 @@ mod tests {
     }
 
     #[test]
-    fn submitting_a_block_edit_acquires_the_lease_and_queues_the_mutation() {
+    fn edit_doc_refuses_a_block_with_no_editable_text() {
+        let mut s = AppState::new();
+        let mut card = doc("a");
+        card.blocks[0].kind = "table".to_owned();
+        card.blocks[0].editable = None;
+        s.docs = vec![card];
+        reduce(&mut s, Action::OpenDocs);
+        reduce(&mut s, Action::CyclePane); // Editor rail
+        reduce(&mut s, Action::EditDoc);
+        // No prompt opens — a structured block has no single text container to
+        // replace, so submitting one could never apply.
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert!(s.notice.is_some());
+    }
+
+    #[test]
+    fn submitting_a_block_edit_replaces_the_whole_block_text() {
         let mut s = AppState::new();
         s.docs = vec![doc("a")];
         let document_id = s.docs[0].document_id;
@@ -5212,6 +5375,8 @@ mod tests {
         let _ = s.drain_outbox();
         reduce(&mut s, Action::CyclePane); // Editor rail
         reduce(&mut s, Action::EditDoc);
+        // Clear the prefilled "a" and type a replacement.
+        reduce(&mut s, Action::InputBackspace);
         for c in "hi".chars() {
             reduce(&mut s, Action::InputChar(c));
         }
@@ -5226,7 +5391,8 @@ mod tests {
                 block_id: Some("b1".to_owned()),
             }]
         );
-        // The mutation is queued (not yet sent) and the lease is being acquired.
+        // A FULL REPLACE — delete the one character the block held, then insert
+        // the new text — not the prepend-only `delete_len: 0` of before.
         let edit = s.doc_edit.as_ref().expect("an edit is in flight");
         assert_eq!(edit.lease, DocLeaseState::Acquiring);
         assert_eq!(
@@ -5234,24 +5400,140 @@ mod tests {
             Some(DocumentMutation::EditText {
                 block_id: "b1".to_owned(),
                 position: 0,
-                delete_len: 0,
+                delete_len: 1,
                 insert: "hi".to_owned(),
             })
         );
     }
 
     #[test]
-    fn an_empty_block_edit_submits_nothing() {
+    fn an_unchanged_block_edit_submits_nothing() {
         let mut s = AppState::new();
         s.docs = vec![doc("a")];
         reduce(&mut s, Action::OpenDocs);
         let _ = s.drain_outbox();
         reduce(&mut s, Action::CyclePane);
         reduce(&mut s, Action::EditDoc);
-        reduce(&mut s, Action::InputSubmit); // empty buffer
+        // Submitting the prefilled text unchanged is a no-op: never spend a
+        // revision (or, in Suggest mode, a suggestion) on it.
+        reduce(&mut s, Action::InputSubmit);
         assert_eq!(s.overlay, Overlay::Docs);
         assert!(s.outbox.is_empty());
         assert!(s.doc_edit.is_none());
+    }
+
+    #[test]
+    fn n_creates_a_document_from_the_docs_studio() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        reduce(&mut s, Action::OpenDocs);
+        let _ = s.drain_outbox();
+        // `n` is contextual: in the Docs Studio it opens the new-DOCUMENT prompt
+        // rather than the new-run one.
+        reduce(&mut s, Action::NewRun);
+        assert!(matches!(s.overlay, Overlay::DocNew { .. }));
+        for c in "Runbook".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::CreateDocument {
+                title: "Runbook".to_owned(),
+            }]
+        );
+
+        // Outside the Docs Studio, `n` still opens the new-run prompt.
+        let mut t = AppState::new();
+        reduce(&mut t, Action::NewRun);
+        assert!(matches!(t.overlay, Overlay::NewRun(_)));
+    }
+
+    #[test]
+    fn insert_adds_a_paragraph_below_the_focused_block_under_a_structural_lease() {
+        let mut s = AppState::new();
+        let mut card = doc("a");
+        card.blocks.push(crate::state::DocBlockView {
+            id: "b2".to_owned(),
+            kind: "paragraph".to_owned(),
+            text: "second".to_owned(),
+            editable: Some("second".to_owned()),
+        });
+        s.docs = vec![card];
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::OpenDocs);
+        let _ = s.drain_outbox();
+        reduce(&mut s, Action::CyclePane); // Editor rail
+        reduce(&mut s, Action::InsertDocBlock);
+        match &s.overlay {
+            Overlay::DocInsert { index, .. } => assert_eq!(*index, 1, "below block 0"),
+            other => panic!("expected the insert prompt, got {other:?}"),
+        }
+        for c in "new".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+
+        // A structural mutation takes the WHOLE-DOCUMENT lease.
+        assert_eq!(
+            s.outbox,
+            vec![Intent::AcquireDocumentLease {
+                document_id,
+                block_id: None,
+            }]
+        );
+        let edit = s.doc_edit.as_ref().expect("an edit is in flight");
+        match edit.pending.as_ref().expect("a queued mutation") {
+            DocumentMutation::Insert {
+                index,
+                block_id,
+                content,
+            } => {
+                assert_eq!(*index, 1);
+                assert!(!block_id.is_empty(), "a fresh block id is minted");
+                assert_eq!(content["type"], "paragraph");
+                assert_eq!(content["text"], "new");
+            }
+            other => panic!("expected a block insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deleting_a_block_requires_a_confirmation_first() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("a")];
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::OpenDocs);
+        let _ = s.drain_outbox();
+        reduce(&mut s, Action::CyclePane); // Editor rail
+        reduce(&mut s, Action::DeleteDocBlock);
+        // Nothing was sent yet — the keypress only opens the confirmation.
+        assert!(matches!(s.overlay, Overlay::DocDeleteConfirm { .. }));
+        assert!(s.outbox.is_empty());
+
+        // Dismissing it deletes nothing.
+        reduce(&mut s, Action::Dismiss);
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert!(s.outbox.is_empty());
+
+        // Confirming does, under a structural (whole-document) lease.
+        reduce(&mut s, Action::DeleteDocBlock);
+        reduce(&mut s, Action::ConfirmCancel);
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::AcquireDocumentLease {
+                document_id,
+                block_id: None,
+            }]
+        );
+        assert_eq!(
+            s.doc_edit.as_ref().and_then(|e| e.pending.clone()),
+            Some(DocumentMutation::Delete {
+                block_id: "b1".to_owned(),
+            })
+        );
     }
 
     #[test]
@@ -5315,6 +5597,8 @@ mod tests {
         reduce(&mut s, Action::OpenDocs);
         reduce(&mut s, Action::CyclePane);
         reduce(&mut s, Action::EditDoc);
+        // The prompt opens prefilled with the block's text ("a"); typing appends
+        // to it, so the submitted edit replaces "a" with "ax".
         reduce(&mut s, Action::InputChar('x'));
         reduce(&mut s, Action::InputSubmit);
         let _ = s.drain_outbox(); // the AcquireDocumentLease intent
@@ -5338,8 +5622,8 @@ mod tests {
                 mutation: DocumentMutation::EditText {
                     block_id: "b1".to_owned(),
                     position: 0,
-                    delete_len: 0,
-                    insert: "x".to_owned(),
+                    delete_len: 1,
+                    insert: "ax".to_owned(),
                 },
             }]
         );
@@ -5434,6 +5718,7 @@ mod tests {
                     id: "b1".to_owned(),
                     kind: "paragraph".to_owned(),
                     text: "merged".to_owned(),
+                    editable: Some("merged".to_owned()),
                 }],
                 suggestions: vec![],
             },
