@@ -2562,6 +2562,190 @@ steps:
 }
 
 // ---------------------------------------------------------------------------
+// `codypendent models list | add | check` — headless parity with the TUI
+// ---------------------------------------------------------------------------
+
+/// `codypendent models list`: the configured models, one per line, with the
+/// same facts the TUI's `/model` picker shows — provider, endpoint, context
+/// window, and whether a key is stored. Never prints key material: only
+/// whether one exists, and for an env-backed entry, the variable NAME.
+///
+/// An absent `models.toml` is not an error: it prints the "none configured"
+/// line and the `models add` hint, since that is the true state of a fresh
+/// install rather than a failure.
+pub fn models_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+    use codypendent_runtime::auth::AuthStore;
+    use codypendent_runtime::models::load_models;
+
+    let models_path = paths.data_dir.join("models.toml");
+    if !models_path.exists() {
+        println!("no models configured ({})", models_path.display());
+        println!("add one with: codypendent models add <provider> <model-id>");
+        return Ok(());
+    }
+    let configs =
+        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?;
+    if configs.is_empty() {
+        println!("no models configured ({})", models_path.display());
+        return Ok(());
+    }
+    let auth = AuthStore::load(&paths.data_dir).unwrap_or_default();
+    for config in &configs {
+        let key = if auth.get(&config.id.0).is_some_and(|k| !k.is_empty()) {
+            "key: stored".to_string()
+        } else if !config.api_key_env.trim().is_empty() {
+            format!("key: env {}", config.api_key_env)
+        } else if config
+            .provider_id
+            .as_deref()
+            .and_then(|p| auth.get(&codypendent_runtime::models::provider_auth_id(p)))
+            .is_some_and(|k| !k.is_empty())
+        {
+            "key: stored (provider-wide)".to_string()
+        } else {
+            "key: none".to_string()
+        };
+        let context = config
+            .context_tokens
+            .map_or_else(|| "context: —".to_string(), |t| format!("context: {t}"));
+        let endpoint = if config.base_url.is_empty() {
+            config.model.clone()
+        } else {
+            config.base_url.clone()
+        };
+        println!(
+            "{}\n    {} · {} · {} · {}",
+            config.id.0,
+            config.provider_id.as_deref().unwrap_or(&config.provider),
+            endpoint,
+            context,
+            key
+        );
+    }
+    Ok(())
+}
+
+/// `codypendent models add <provider> <model-id> [--key-env NAME] [--id ID]`:
+/// the headless twin of the TUI's add-model flow. Resolves the provider from
+/// the same catalog (built-ins layered with the user's `providers.toml`),
+/// records `provider_id` so the runtime sends that provider's real auth header,
+/// carries the catalog row's context window when it has one, and writes
+/// `models.toml` atomically.
+///
+/// No key is ever read from an argument (a key on a command line lands in the
+/// shell history and the process table): `--key-env` names the environment
+/// variable to read at call time, and without it the provider's own documented
+/// variable — or a key already stored by the TUI — is used.
+pub fn models_add(
+    paths: &RuntimePaths,
+    provider_id: &str,
+    model: &str,
+    key_env: Option<&str>,
+    id: Option<&str>,
+) -> anyhow::Result<()> {
+    use codypendent_providers::Catalog;
+    use codypendent_runtime::models::{load_models, ModelConfig};
+
+    let data_dir = &paths.data_dir;
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating the data dir {}", data_dir.display()))?;
+    let catalog = Catalog::load_with_user_overrides(&data_dir.join("providers.toml"))
+        .unwrap_or_else(|_| Catalog::builtin());
+    let provider = catalog
+        .get(provider_id)
+        .ok_or_else(|| anyhow::anyhow!("provider `{provider_id}` is not in the catalog"))?;
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("provider `{provider_id}` has no base URL and cannot be added")
+        })?;
+    let display_id = id
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{provider_id}/{model}"));
+    if display_id.trim().is_empty() {
+        anyhow::bail!("model id must not be blank");
+    }
+
+    let models_path = data_dir.join("models.toml");
+    let mut configs = if models_path.exists() {
+        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?
+    } else {
+        Vec::new()
+    };
+    let replaced = configs.iter().any(|c| c.id.0 == display_id);
+    configs.retain(|c| c.id.0 != display_id);
+    configs.push(ModelConfig {
+        id: codypendent_protocol::ModelId(display_id.clone()),
+        provider: "openai-compatible".to_string(),
+        base_url,
+        model: model.to_string(),
+        api_key_env: key_env.unwrap_or_default().to_string(),
+        provider_id: Some(provider_id.to_string()),
+        context_tokens: catalog
+            .model(provider_id, model)
+            .and_then(|row| row.context_tokens),
+    });
+
+    #[derive(serde::Serialize)]
+    struct ModelsToml {
+        #[serde(rename = "model")]
+        model: Vec<ModelConfig>,
+    }
+    let rendered = toml::to_string_pretty(&ModelsToml { model: configs })
+        .context("serializing models.toml")?;
+    let tmp = data_dir.join("models.toml.tmp");
+    std::fs::write(&tmp, rendered.as_bytes())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &models_path)
+        .with_context(|| format!("replacing {}", models_path.display()))?;
+    println!(
+        "{} model {display_id} ({})",
+        if replaced { "updated" } else { "added" },
+        models_path.display()
+    );
+    if key_env.is_none() && !provider.local {
+        println!("verify it with: codypendent models check {display_id}");
+    }
+    Ok(())
+}
+
+/// `codypendent models check <id>`: the headless twin of the `/keys` verify
+/// action. Runs the real [`ModelRegistry::check_model`], so the credential
+/// precedence and the catalog-declared auth headers are exactly the ones a run
+/// would use — an "ok" here means a run authenticates. Exits non-zero when the
+/// provider does not list the configured model.
+pub async fn models_check(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
+    use codypendent_runtime::auth::AuthStore;
+    use codypendent_runtime::models::{load_models, ModelRegistry};
+
+    let models_path = paths.data_dir.join("models.toml");
+    let configs =
+        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?;
+    if !configs.iter().any(|c| c.id.0 == id) {
+        anyhow::bail!(
+            "model `{id}` is not configured in {}",
+            models_path.display()
+        );
+    }
+    let auth = AuthStore::load(&paths.data_dir).unwrap_or_default();
+    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+        &paths.data_dir.join("providers.toml"),
+    )
+    .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+    ModelRegistry::new(configs)
+        .with_auth(auth)
+        .with_catalog(catalog)
+        .check_model(&codypendent_protocol::ModelId(id.to_owned()))
+        .await
+        .with_context(|| format!("checking model `{id}`"))?;
+    println!("{id}: ok — the provider lists this model and the credentials resolve");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // `codypendent models bench <id>` (Phase 7 STEP 7.2.2)
 // ---------------------------------------------------------------------------
 

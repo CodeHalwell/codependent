@@ -542,6 +542,36 @@ enum EvalCommand {
 
 #[derive(Subcommand)]
 enum ModelsCommand {
+    /// List the models configured in `models.toml`, with their provider,
+    /// endpoint, context window, and key status. The headless twin of the
+    /// TUI's `/model` picker.
+    List,
+    /// Add a model from a catalog provider to `models.toml`, exactly as the
+    /// TUI's add-model flow does (same catalog lookup, same auth header
+    /// resolution, same atomic write). With no `--key-env`, a key is read
+    /// from the provider's documented environment variable at call time.
+    Add {
+        /// The catalog provider id (`codypendent models list-providers`
+        /// spellings: `openai`, `nebius`, `azure-openai`, …).
+        provider: String,
+        /// The provider-side model id, as it must be sent on the wire.
+        model: String,
+        /// Store this environment variable NAME on the entry rather than
+        /// relying on the provider's documented default. The VALUE is never
+        /// written to disk — only the name.
+        #[arg(long, value_name = "NAME")]
+        key_env: Option<String>,
+        /// Override the `models.toml` id (defaults to `<provider>/<model>`).
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
+    },
+    /// Verify one configured model end to end: resolve its credentials the way
+    /// a run does, call the provider's `/models`, and confirm the configured
+    /// model is listed. Exits non-zero when it is not.
+    Check {
+        /// The `models.toml` model id to check.
+        id: String,
+    },
     /// Benchmark a local model configured in `models.toml` and persist its
     /// measured profile (Phase 7 STEP 7.2.2): tokens/sec, time-to-first-token,
     /// warm-up, memory, context limit, structured-output reliability, tool-call
@@ -928,6 +958,14 @@ async fn main() -> anyhow::Result<()> {
             } => commands::eval_run(&paths, &suite, policy, candidate_id.as_deref(), &report).await,
         },
         TopCommand::Models { command } => match command {
+            ModelsCommand::List => commands::models_list(&paths),
+            ModelsCommand::Add {
+                provider,
+                model,
+                key_env,
+                id,
+            } => commands::models_add(&paths, &provider, &model, key_env.as_deref(), id.as_deref()),
+            ModelsCommand::Check { id } => commands::models_check(&paths, &id).await,
             ModelsCommand::Bench { id } => commands::models_bench(&paths, &id).await,
         },
         TopCommand::Promote { command } => match command {
