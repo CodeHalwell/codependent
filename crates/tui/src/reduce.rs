@@ -3436,6 +3436,12 @@ fn open_kanban(state: &mut AppState) {
 /// refused move (a concurrent supersede) simply never appears, instead of leaving
 /// the pane lying about where the card is.
 fn move_focused_card(state: &mut AppState, delta: i32) {
+    // The horizontal arrows are global in `Normal` mode, so this MUST check the
+    // open overlay: without it, pressing → while reading the blackboard or the
+    // workflow graph would silently move a board card the operator cannot see.
+    if !matches!(state.overlay, Overlay::Kanban) {
+        return;
+    }
     let Some(card) = state.focused_card() else {
         return;
     };
@@ -5766,6 +5772,23 @@ mod tests {
         s.kanban[0].status = "done".to_owned();
         reduce(&mut s, Action::MoveCardForward);
         assert!(s.outbox.is_empty(), "done has nothing to its right");
+    }
+
+    #[test]
+    fn a_column_move_outside_the_board_is_ignored() {
+        // The horizontal arrows are global in `Normal` mode, so a → pressed
+        // while reading the blackboard must not move a card off-screen.
+        let mut s = AppState::new();
+        s.kanban = vec![card("c1", "wire the DAG viewer", "todo", 0)];
+        for overlay in [Overlay::None, Overlay::Blackboard, Overlay::Workflow] {
+            s.overlay = overlay.clone();
+            s.outbox.clear();
+            reduce(&mut s, Action::MoveCardForward);
+            assert!(
+                s.outbox.is_empty(),
+                "{overlay:?} must not move a board card"
+            );
+        }
     }
 
     #[test]

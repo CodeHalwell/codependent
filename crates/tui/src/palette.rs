@@ -203,7 +203,7 @@ pub const COMMANDS: &[PaletteEntry] = &[
         command: PaletteCommand::Kanban,
         title: "/board  Task board",
         description: "backlog cards in columns; move them, or ask an agent to fill them",
-        key: "",
+        key: "K",
         group: "Workspace",
     },
     PaletteEntry {

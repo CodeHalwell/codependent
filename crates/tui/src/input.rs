@@ -147,6 +147,11 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         description: "enter Remote UI · next extension document · return to composer",
         mouse: Some("click extension chrome"),
     },
+    KeyBinding {
+        keys: "K · ← / → (Board)",
+        description: "open the task board · move the focused card between columns",
+        mouse: Some("click a card or a move chip"),
+    },
 ];
 
 /// One footer chip: a compact display label paired with the real `KEY_BINDINGS`
@@ -347,6 +352,7 @@ fn map_normal_char(c: char) -> Action {
         'G' => Action::OpenEdges,
         'W' => Action::OpenWorkflow,
         'B' => Action::OpenBlackboard,
+        'K' => Action::OpenKanban,
         // Host-owned Remote UI plugin lifecycle controls. They are meaningful
         // only while the `/plugins` surface is open; the reducer ignores them
         // elsewhere.
