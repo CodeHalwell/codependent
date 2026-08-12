@@ -2225,7 +2225,6 @@ enum ReaderSignal {
         repo_id: String,
         quant: String,
         result: Result<String, String>,
->>>>>>> 3245112
     },
     /// The daemon closed the connection.
     Closed,
