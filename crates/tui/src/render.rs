@@ -1095,6 +1095,7 @@ fn for_each_row<'a>(
     theme: &Theme,
     selected_run: usize,
     browsed: Option<usize>,
+    inner_width: u16,
     mut visit: impl FnMut(Row<'a>),
 ) {
     let mut awaiting_header = false;
@@ -1153,6 +1154,7 @@ fn for_each_row<'a>(
                         Style::default().fg(theme.text.muted),
                     ));
                 }
+                push_turn_time(&mut spans, run.entry_time(idx), inner_width, theme);
                 visit(Row::built(Line::from(spans)));
                 produced = true;
                 awaiting_header = false;
@@ -1206,6 +1208,17 @@ fn for_each_row<'a>(
                                 Span::styled("▎", Style::default().fg(theme.focus.active)),
                             );
                         }
+                        // The `You` header carries the turn's clock, mirroring
+                        // the agent header above. Added before measurement, so
+                        // the padded width is the measured width.
+                        if is_user && j == 0 {
+                            push_turn_time(
+                                &mut line.spans,
+                                run.entry_time(idx),
+                                inner_width,
+                                theme,
+                            );
+                        }
                         let mut row = Row::built(line);
                         row.selected = selected;
                         if j == 0 {
@@ -1231,6 +1244,36 @@ fn for_each_row<'a>(
             visit(Row::built(status));
         }
     }
+}
+
+/// Right-align a turn header's wall-clock time in dim text, if the row is wide
+/// enough to carry it without crowding the header (a narrow terminal keeps the
+/// header and drops the clock — it is the least valuable field on the row).
+///
+/// The time is shown in the viewer's LOCAL zone: `occurred_at` is UTC on the
+/// wire, and a clock the user cannot compare with their own is worse than no
+/// clock. This timezone lookup is the only environment read in the renderer;
+/// it touches no session state, so the projection stays pure with respect to
+/// [`AppState`].
+fn push_turn_time<'a>(
+    spans: &mut Vec<Span<'a>>,
+    at: Option<chrono::DateTime<chrono::Utc>>,
+    inner_width: u16,
+    theme: &Theme,
+) {
+    let Some(at) = at else { return };
+    let label = at.with_timezone(&chrono::Local).format("%H:%M").to_string();
+    let used: usize = spans.iter().map(Span::width).sum();
+    // The clock has to read as its own right-hand field, not as text jammed
+    // onto the end of the header, so it needs a visible gap before it.
+    const TURN_TIME_MIN_GAP: usize = 4;
+    let needed = used + label.len() + TURN_TIME_MIN_GAP;
+    if usize::from(inner_width) < needed {
+        return;
+    }
+    let pad = usize::from(inner_width) - used - label.len();
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(label, Style::default().fg(theme.text.muted)));
 }
 
 /// The entry index if this entry renders a clickable fold HEAD (its first
@@ -1265,7 +1308,7 @@ fn measure_transcript(
 ) -> (u16, Option<(u16, u16)>) {
     let mut total: u16 = 0;
     let mut span: Option<(u16, u16)> = None;
-    for_each_row(runs, theme, selected_run, browsed, |row| {
+    for_each_row(runs, theme, selected_run, browsed, inner_width, |row| {
         let start = total;
         total = total.saturating_add(row.rows(inner_width));
         if row.selected {
@@ -1294,7 +1337,7 @@ fn build_transcript_window<'a>(
     let mut cursor: u16 = 0;
     let mut scroll: u16 = 0;
     let mut first_seen = false;
-    for_each_row(runs, theme, selected_run, browsed, |row| {
+    for_each_row(runs, theme, selected_run, browsed, inner_width, |row| {
         let h = row.rows(inner_width);
         let row_start = cursor;
         let row_end = cursor.saturating_add(h);
@@ -10189,7 +10232,8 @@ mod tests {
         let rows: Vec<&str> = out.lines().collect();
         let user_header = rows
             .iter()
-            .position(|r| r.trim_matches('│').trim() == "You")
+            // (the header also carries its dim right-aligned turn clock)
+            .position(|r| r.trim_matches('│').trim_start().starts_with("You"))
             .expect("user turn header");
         assert!(
             !rows[user_header + 1].trim_matches('│').trim().is_empty(),
@@ -10312,8 +10356,10 @@ mod tests {
         );
         assert!(
             // Task 8: the `You` row now carries the container bg, padded to
-            // `inner_width` — trim the trailing fill before the exact match.
-            top_lines.iter().any(|l| l.to_string().trim_end() == "You"),
+            // `inner_width`, and a right-aligned turn clock — match its head.
+            top_lines
+                .iter()
+                .any(|l| l.to_string().trim_start().starts_with("You")),
             "the user role header is one of the virtualized top rows"
         );
         assert!(
@@ -10907,6 +10953,75 @@ mod tests {
         assert!(
             empty.contains("Build"),
             "the session default stands in before the first run:\n{empty}"
+        );
+    }
+
+    /// Turn headers carry a dim, right-aligned clock in the viewer's own
+    /// timezone — the event time that used to be dropped at the fold.
+    #[test]
+    fn turn_headers_carry_a_right_aligned_clock() {
+        let at = Utc::now() - chrono::Duration::hours(2);
+        let expected = at.with_timezone(&chrono::Local).format("%H:%M").to_string();
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        for (sequence, body) in [
+            (
+                1,
+                EventBody::RunStarted {
+                    run_id,
+                    objective: "ship the clock".to_owned(),
+                    mode: codypendent_protocol::AgentMode::Build,
+                },
+            ),
+            (
+                2,
+                EventBody::ModelStreamDelta {
+                    run_id,
+                    text: "on it".to_owned(),
+                },
+            ),
+        ] {
+            reduce(
+                &mut s,
+                Action::daemon_event(SessionEvent {
+                    sequence,
+                    occurred_at: at,
+                    causation_id: None,
+                    correlation_id: None,
+                    actor: Actor::System,
+                    body,
+                }),
+            );
+        }
+
+        let text = render_to_string(&s, 110, 24);
+        let you = text
+            .lines()
+            .find(|row| row.trim_start().starts_with("You"))
+            .expect("the user turn header");
+        assert!(
+            you.trim_end().ends_with(&expected),
+            "the user turn header ends with its clock ({expected}): {you:?}"
+        );
+        let agent = text
+            .lines()
+            .find(|row| row.contains("⏺ codypendent"))
+            .expect("the agent turn header");
+        assert!(
+            agent.trim_end().ends_with(&expected),
+            "the agent turn header ends with its clock ({expected}): {agent:?}"
+        );
+
+        // A narrow terminal keeps the header and drops the clock rather than
+        // crowding the row.
+        let narrow = render_to_string(&s, 12, 24);
+        assert!(
+            narrow.contains("You"),
+            "the header survives at 12 columns:\n{narrow}"
+        );
+        assert!(
+            !narrow.contains(&expected),
+            "the clock is the first field to go on a narrow screen:\n{narrow}"
         );
     }
 }

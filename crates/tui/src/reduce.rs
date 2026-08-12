@@ -1029,9 +1029,16 @@ fn upsert_blackboard_item(state: &mut AppState, item: crate::state::BlackboardIt
     }
 }
 
-/// Fold one durable event into run / transcript / approval state.
+/// Fold one durable event into run / transcript / approval state. The event's
+/// `occurred_at` rides along to `push_entry`, which timestamps the transcript
+/// entry it produces — this is what the transcript's turn-header clocks read.
 fn apply_event(state: &mut AppState, event: SessionEvent) {
-    let SessionEvent { actor, body, .. } = event;
+    let SessionEvent {
+        actor,
+        body,
+        occurred_at: at,
+        ..
+    } = event;
 
     // Learn the serving model from any agent-authored event.
     if let Actor::Agent { run_id, model, .. } = &actor {
@@ -1093,7 +1100,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         expanded: false,
                     },
                 };
-                AppState::push_entry(run, backstage);
+                AppState::push_entry(run, backstage, at);
                 return;
             }
 
@@ -1103,6 +1110,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     text,
                     expanded: false,
                 },
+                at,
             );
         }
         EventBody::SessionClosed => state.session_closed = true,
@@ -1137,7 +1145,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 ) {
                     run.state = RunState::Preparing;
                 }
-                AppState::push_entry(run, TranscriptEntry::User { text: objective });
+                AppState::push_entry(run, TranscriptEntry::User { text: objective }, at);
             }
         }
         EventBody::RunStateChanged { run_id, state: rs } => {
@@ -1160,7 +1168,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
         }
         EventBody::ModelStreamDelta { run_id, text } => {
             if let Some(run) = state.run_mut(run_id) {
-                AppState::append_model_text(run, &text);
+                AppState::append_model_text(run, &text, at);
                 run.activity = RunActivity::Streaming;
             }
         }
@@ -1183,6 +1191,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         approval_id: Some(approval_id),
                         expanded: false,
                     })),
+                    at,
                 );
             }
             // Backfill the run link onto a matching pending approval.
@@ -1219,6 +1228,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         approval_id: None,
                         expanded: false,
                     })),
+                    at,
                 );
                 run.activity = RunActivity::Thinking;
             }
@@ -1259,6 +1269,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             approval_id: None,
                             expanded: false,
                         })),
+                        at,
                     ),
                 }
                 run.activity = RunActivity::RunningTool(tool_name);
@@ -1293,6 +1304,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             approval_id: None,
                             expanded: false,
                         })),
+                        at,
                     ),
                 }
                 // The tool finished; the agent is back to composing its next
@@ -1323,6 +1335,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         preview_truncated,
                         expanded: false,
                     }),
+                    at,
                 );
             }
         }
@@ -1347,7 +1360,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
         }
         EventBody::SteeringQueued { run_id } => {
             if let Some(run) = state.run_mut(run_id) {
-                AppState::push_entry(run, TranscriptEntry::Steering { applied: false });
+                AppState::push_entry(run, TranscriptEntry::Steering { applied: false }, at);
             }
         }
         EventBody::SteeringApplied { run_id } => {
@@ -1358,7 +1371,9 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 });
                 match marked {
                     Some(applied) => *applied = true,
-                    None => AppState::push_entry(run, TranscriptEntry::Steering { applied: true }),
+                    None => {
+                        AppState::push_entry(run, TranscriptEntry::Steering { applied: true }, at);
+                    }
                 }
             }
         }
@@ -1384,6 +1399,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         used,
                         limit,
                     },
+                    at,
                 );
             }
         }
@@ -1400,6 +1416,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         disposition: disposition.clone(),
                         expanded: false,
                     },
+                    at,
                 );
                 run.disposition = Some(disposition);
                 run.activity = RunActivity::Idle;
@@ -1437,6 +1454,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                     TranscriptEntry::Unsupported {
                         label: "unsupported event".to_owned(),
                     },
+                    at,
                 );
             }
         }
@@ -9128,5 +9146,110 @@ mod tests {
         );
         assert!(s.outbox.is_empty(), "nothing is written for a blank key");
         assert!(s.notice.is_some(), "and the operator is told why");
+    }
+
+    // --- turn timestamps: `SessionEvent.occurred_at` survives the fold ---
+
+    /// The event's wall-clock time used to be dropped at the fold. It now rides
+    /// along to the entry it produced, one timestamp per entry, in lockstep.
+    #[test]
+    fn folding_an_event_records_when_it_happened() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        let started = Utc::now() - chrono::Duration::minutes(5);
+        reduce(
+            &mut s,
+            Action::daemon_event(SessionEvent {
+                sequence: 1,
+                occurred_at: started,
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::RunStarted {
+                    run_id,
+                    objective: "o".to_owned(),
+                    mode: AgentMode::Build,
+                },
+            }),
+        );
+        let replied = Utc::now();
+        reduce(
+            &mut s,
+            Action::daemon_event(SessionEvent {
+                sequence: 2,
+                occurred_at: replied,
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::ModelStreamDelta {
+                    run_id,
+                    text: "hello".to_owned(),
+                },
+            }),
+        );
+        assert_eq!(
+            s.runs[0].entry_time(0),
+            Some(started),
+            "the user turn's time"
+        );
+        assert_eq!(s.runs[0].entry_time(1), Some(replied), "the reply's time");
+
+        // A coalesced stream keeps the time of its FIRST delta — when the turn
+        // began, which is what the turn header shows.
+        reduce(
+            &mut s,
+            Action::daemon_event(SessionEvent {
+                sequence: 3,
+                occurred_at: Utc::now() + chrono::Duration::seconds(30),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::ModelStreamDelta {
+                    run_id,
+                    text: " world".to_owned(),
+                },
+            }),
+        );
+        assert_eq!(s.runs[0].transcript.len(), 2, "the deltas coalesced");
+        assert_eq!(s.runs[0].entry_time(1), Some(replied));
+    }
+
+    /// The two vectors are written only by `push_entry`, including through the
+    /// transcript cap's oldest-entry drop — this asserts they never desync.
+    #[test]
+    fn transcript_and_entry_times_stay_in_lockstep() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // Well past MAX_TRANSCRIPT_ENTRIES, so the cap's drop path runs.
+        for i in 0..1_200 {
+            reduce(
+                &mut s,
+                system_ev(EventBody::NoteAppended {
+                    text: format!("note {i}"),
+                    run_id: Some(run_id),
+                }),
+            );
+            reduce(&mut s, system_ev(EventBody::SteeringQueued { run_id }));
+        }
+        let run = &s.runs[0];
+        assert_eq!(
+            run.transcript.len(),
+            run.entry_times.len(),
+            "one timestamp per entry, even after the cap dropped the oldest"
+        );
+        assert!(run.entry_time(run.transcript.len() - 1).is_some());
+        assert_eq!(
+            run.entry_time(run.transcript.len()),
+            None,
+            "no time past the end"
+        );
     }
 }

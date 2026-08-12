@@ -7,6 +7,8 @@
 
 use std::cell::{Cell, RefCell};
 
+use chrono::{DateTime, Utc};
+
 use ratatui::layout::Rect;
 
 use codypendent_protocol::{
@@ -534,6 +536,14 @@ pub struct RunView {
     pub disposition: Option<RunDisposition>,
     /// The ordered transcript.
     pub transcript: Vec<TranscriptEntry>,
+    /// When each transcript entry's originating event occurred
+    /// (`SessionEvent.occurred_at`), parallel to `transcript` — index `i` is
+    /// entry `i`'s time. Kept in lockstep by [`AppState::push_entry`], the one
+    /// writer of both, and read only through [`RunView::entry_time`]. Carried
+    /// as a side vector rather than a field on every `TranscriptEntry` variant
+    /// so that folding a time onto an entry costs nothing at the ~30 match
+    /// sites that do not care about it.
+    pub entry_times: Vec<DateTime<Utc>>,
     /// Selected transcript entry (for expand / detail).
     pub transcript_selected: usize,
     /// Transcript scroll offset in rows (used only when not following).
@@ -559,10 +569,19 @@ impl RunView {
             cost_minor: None,
             disposition: None,
             transcript: Vec::new(),
+            entry_times: Vec::new(),
             transcript_selected: 0,
             scroll: 0,
             follow: true,
         }
+    }
+
+    /// When transcript entry `idx` arrived, if known. `None` for an entry
+    /// pushed by a test straight into `transcript` (the reducer always goes
+    /// through [`AppState::push_entry`]).
+    #[must_use]
+    pub fn entry_time(&self, idx: usize) -> Option<DateTime<Utc>> {
+        self.entry_times.get(idx).copied()
     }
 }
 
@@ -1694,8 +1713,10 @@ impl AppState {
         self.runs.get_mut(self.selected_run)
     }
 
-    /// Append model text, coalescing into a trailing `Model` entry.
-    pub(crate) fn append_model_text(run: &mut RunView, text: &str) {
+    /// Append model text, coalescing into a trailing `Model` entry. The
+    /// coalesced entry keeps the timestamp of its FIRST delta — that is when
+    /// the turn began, which is what the turn header shows.
+    pub(crate) fn append_model_text(run: &mut RunView, text: &str, at: DateTime<Utc>) {
         if let Some(TranscriptEntry::Model {
             text: existing,
             rendered,
@@ -1719,17 +1740,25 @@ impl AppState {
                 text: text.to_owned(),
                 rendered: None,
             },
+            at,
         );
     }
 
-    /// Append a transcript entry, holding the transcript to
-    /// [`MAX_TRANSCRIPT_ENTRIES`] by dropping the oldest — the ledger, not this
-    /// view, is the durable record. Selection/scroll indices shift with the
-    /// drop so the focused entry stays the same one.
-    pub(crate) fn push_entry(run: &mut RunView, entry: TranscriptEntry) {
+    /// Append a transcript entry and the wall-clock time of the event that
+    /// produced it, holding the transcript to [`MAX_TRANSCRIPT_ENTRIES`] by
+    /// dropping the oldest — the ledger, not this view, is the durable record.
+    /// Selection/scroll indices shift with the drop so the focused entry stays
+    /// the same one.
+    ///
+    /// This is the ONLY writer of [`RunView::entry_times`]; keeping the push
+    /// and the timestamp in one call is what holds the two vectors in lockstep
+    /// (asserted by `transcript_and_entry_times_stay_in_lockstep`).
+    pub(crate) fn push_entry(run: &mut RunView, entry: TranscriptEntry, at: DateTime<Utc>) {
         run.transcript.push(entry);
+        run.entry_times.push(at);
         while run.transcript.len() > MAX_TRANSCRIPT_ENTRIES {
             run.transcript.remove(0);
+            run.entry_times.remove(0);
             run.transcript_selected = run.transcript_selected.saturating_sub(1);
             run.scroll = run.scroll.saturating_sub(1);
         }
