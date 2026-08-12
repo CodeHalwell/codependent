@@ -9849,6 +9849,53 @@ mod tests {
     }
 
     #[test]
+    fn kanban_view_renders_columns_and_offers_the_move_affordances() {
+        use crate::state::KanbanCard;
+        let mut state = running_build_state();
+        let card = |id: &str, title: &str, status: &str, assignee: &str| KanbanCard {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            status: status.to_owned(),
+            assignee: assignee.to_owned(),
+            kind: "task".to_owned(),
+            author: "agent".to_owned(),
+            ordinal: 0,
+        };
+        state.kanban = vec![
+            card("c1", "wire the DAG viewer", "todo", "dana"),
+            card("c2", "column-grouped board pane", "doing", "\u{2014}"),
+        ];
+        reduce(&mut state, Action::OpenKanban);
+        let text = render_to_string(&state, 140, 32);
+
+        assert!(text.contains("Task board"), "title missing:\n{text}");
+        for column in crate::state::KANBAN_COLUMNS {
+            assert!(text.contains(column), "column `{column}` missing:\n{text}");
+        }
+        assert!(
+            text.contains("wire the DAG viewer"),
+            "card title missing:\n{text}"
+        );
+        assert!(text.contains("dana"), "assignee missing:\n{text}");
+        assert!(text.contains("task"), "kind missing:\n{text}");
+
+        // Mouse parity: every card is clickable, and both column moves have a
+        // hit target (the keyboard-only affordance would otherwise be a gap).
+        let hits = state.hit_map.borrow();
+        for action in [
+            Action::ActivateRow(0),
+            Action::MoveCardForward,
+            Action::MoveCardBack,
+        ] {
+            assert!(
+                hits.iter()
+                    .any(|(rect, registered)| registered == &action && rect.width > 0),
+                "{action:?} needs a non-empty hit target"
+            );
+        }
+    }
+
+    #[test]
     fn blackboard_view_snapshot_shows_artifact_provenance() {
         use crate::state::BlackboardItemCard;
         let mut state = running_build_state();

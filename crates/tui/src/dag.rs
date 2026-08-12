@@ -93,12 +93,20 @@ pub fn lay_out(nodes: &[DagNode]) -> DagLayout {
         }
     }
 
+    /// A row's lane art before padding: the prefixes are widened to the final
+    /// lane count only at the end, so every row lines up even though lanes open
+    /// as the graph fans out.
+    struct RawRow {
+        lane: usize,
+        connector: Vec<char>,
+        node: Vec<char>,
+        trail: Vec<char>,
+    }
+
     // lanes[l] = the row whose outgoing edges currently occupy lane `l`.
     let mut lanes: Vec<Option<usize>> = Vec::new();
     let mut rows: Vec<DagRow> = Vec::with_capacity(nodes.len());
-    // Provisional rows; the prefixes are padded to the final lane count at the
-    // end, so every row lines up even though lanes open as the graph fans out.
-    let mut raw: Vec<(usize, Vec<char>, Vec<char>, Vec<char>)> = Vec::with_capacity(nodes.len());
+    let mut raw: Vec<RawRow> = Vec::with_capacity(nodes.len());
 
     for (index, node) in nodes.iter().enumerate() {
         let mut dep_lanes: Vec<usize> = node
@@ -206,13 +214,24 @@ pub fn lay_out(nodes: &[DagNode]) -> DagLayout {
             })
             .collect();
 
-        raw.push((own_lane, connector, node_line, trail));
+        raw.push(RawRow {
+            lane: own_lane,
+            connector,
+            node: node_line,
+            trail,
+        });
     }
 
     let width = lanes
         .len()
-        .max(raw.iter().map(|r| r.0 + 1).max().unwrap_or(0));
-    for (lane, connector, node_line, trail) in raw {
+        .max(raw.iter().map(|row| row.lane + 1).max().unwrap_or(0));
+    for RawRow {
+        lane,
+        connector,
+        node: node_line,
+        trail,
+    } in raw
+    {
         let pad = |mut chars: Vec<char>| -> String {
             if chars.is_empty() {
                 return String::new();

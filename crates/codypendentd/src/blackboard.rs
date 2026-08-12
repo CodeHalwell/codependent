@@ -284,28 +284,21 @@ impl BoardOps {
         }
     }
 
-    /// Store a new card and fan it out. `ordinal` absent appends to the end of the
-    /// target column, so a caller that only knows "put this in `todo`" never has
-    /// to compute a position.
+    /// Store a new card and fan it out. `card.ordinal` absent appends to the end
+    /// of the target column, so a caller that only knows "put this in `todo`"
+    /// never has to compute a position.
     async fn post_card(
         &self,
         target: &BoardTarget,
-        kind: BlackboardKind,
-        payload: serde_json::Value,
-        author: serde_json::Value,
-        confidence: Option<f64>,
-        evidence: Vec<serde_json::Value>,
-        status: Option<String>,
-        assignee: Option<String>,
-        ordinal: Option<i64>,
+        card: NewCard,
     ) -> Result<BlackboardItemView, BlackboardError> {
         let (run_id, board_scope) = self.resolve_for_write(target).await?;
-        let status = match status {
+        let status = match card.status {
             Some(status) => Some(codypendent_workflow::normalize_status(&status)?),
-            None if kind == BlackboardKind::Task => Some(DEFAULT_TASK_STATUS.to_string()),
+            None if card.kind == BlackboardKind::Task => Some(DEFAULT_TASK_STATUS.to_string()),
             None => None,
         };
-        let ordinal = match (ordinal, status.as_deref()) {
+        let ordinal = match (card.ordinal, status.as_deref()) {
             (Some(ordinal), _) => Some(ordinal),
             (None, Some(status)) => {
                 Some(self.store.next_ordinal(&self.pool, &run_id, status).await?)
@@ -318,15 +311,15 @@ impl BoardOps {
                 &self.pool,
                 &run_id,
                 NewBlackboardItem {
-                    kind,
-                    payload,
-                    author,
-                    confidence,
-                    evidence,
+                    kind: card.kind,
+                    payload: card.payload,
+                    author: card.author,
+                    confidence: card.confidence,
+                    evidence: card.evidence,
                     board: BoardFields {
                         board_scope,
                         status,
-                        assignee,
+                        assignee: card.assignee,
                         ordinal,
                     },
                 },
@@ -422,6 +415,21 @@ impl BoardOps {
     }
 }
 
+/// An artifact to place on a board. Bundled rather than passed as nine
+/// positional arguments so the two call sites (a client's post, an agent's
+/// `task.create`) read as the card they are storing.
+#[derive(Debug, Clone)]
+struct NewCard {
+    kind: BlackboardKind,
+    payload: serde_json::Value,
+    author: serde_json::Value,
+    confidence: Option<f64>,
+    evidence: Vec<serde_json::Value>,
+    status: Option<String>,
+    assignee: Option<String>,
+    ordinal: Option<i64>,
+}
+
 /// The fields an update may replace; everything else is carried forward from the
 /// superseded card.
 #[derive(Debug, Clone, Default)]
@@ -487,14 +495,16 @@ impl BlackboardWriter for AssemblyBoardWriter {
             })?;
             ops.post_card(
                 &request.target,
-                kind,
-                request.item.payload,
-                operator_author(request.client_id),
-                request.item.confidence,
-                request.item.evidence,
-                request.item.status,
-                request.item.assignee,
-                request.item.ordinal,
+                NewCard {
+                    kind,
+                    payload: request.item.payload,
+                    author: operator_author(request.client_id),
+                    confidence: request.item.confidence,
+                    evidence: request.item.evidence,
+                    status: request.item.status,
+                    assignee: request.item.assignee,
+                    ordinal: request.item.ordinal,
+                },
             )
             .await
             .map_err(map_write_error)
@@ -551,16 +561,18 @@ impl TaskBoardChannel for AssemblyTaskBoardChannel {
         self.ops
             .post_card(
                 &BoardTarget::Repository(repository.to_string()),
-                BlackboardKind::Task,
-                draft.payload,
-                draft.author,
-                None,
-                // A card is a plan, not a claim about the codebase, so it needs no
-                // evidence — the store's `Task` kind is evidence-optional.
-                Vec::new(),
-                draft.status,
-                draft.assignee,
-                draft.ordinal,
+                NewCard {
+                    kind: BlackboardKind::Task,
+                    payload: draft.payload,
+                    author: draft.author,
+                    confidence: None,
+                    // A card is a plan, not a claim about the codebase, so it
+                    // needs no evidence — `Task` is evidence-optional.
+                    evidence: Vec::new(),
+                    status: draft.status,
+                    assignee: draft.assignee,
+                    ordinal: draft.ordinal,
+                },
             )
             .await
             .map_err(map_channel_error)

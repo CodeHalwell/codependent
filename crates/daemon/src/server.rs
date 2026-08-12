@@ -1732,7 +1732,7 @@ async fn handle_request(
                         return Ok(false);
                     };
                     let Some(writer_seam) =
-                        board_writer_or_reject(&state, conn, &request, writer).await?
+                        board_writer_or_reject(state, conn, &request, writer).await?
                     else {
                         return Ok(false);
                     };
@@ -1770,7 +1770,7 @@ async fn handle_request(
                         return Ok(false);
                     };
                     let Some(writer_seam) =
-                        board_writer_or_reject(&state, conn, &request, writer).await?
+                        board_writer_or_reject(state, conn, &request, writer).await?
                     else {
                         return Ok(false);
                     };
@@ -3049,7 +3049,7 @@ async fn authorize_workflow_resource(
     .bind(workflow_run_id)
     .fetch_optional(pool)
     .await?;
-    if !owner.is_some_and(|(owner,)| owner == session_id.to_string()) {
+    if owner.is_none_or(|(owner,)| owner != session_id.to_string()) {
         anyhow::bail!("workflow resource does not belong to the broker session");
     }
     Ok(())

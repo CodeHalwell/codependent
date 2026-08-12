@@ -5695,6 +5695,115 @@ mod tests {
         }
     }
 
+    fn card(id: &str, title: &str, status: &str, ordinal: i64) -> crate::state::KanbanCard {
+        crate::state::KanbanCard {
+            id: id.to_owned(),
+            title: title.to_owned(),
+            status: status.to_owned(),
+            assignee: "\u{2014}".to_owned(),
+            kind: "task".to_owned(),
+            author: "agent".to_owned(),
+            ordinal,
+        }
+    }
+
+    #[test]
+    fn the_board_lays_cards_out_in_column_order_and_never_hides_an_unknown_column() {
+        let mut s = AppState::new();
+        s.kanban = vec![
+            card("c1", "second in todo", "todo", 1),
+            card("c2", "in review", "review", 0),
+            card("c3", "first in todo", "todo", 0),
+            // A team's own column: shown in the FIRST column rather than dropped.
+            card("c4", "triage me", "icebox", 0),
+        ];
+        let columns = s.kanban_columns();
+        assert_eq!(columns.len(), 4);
+        assert_eq!(columns[0].0, "todo");
+        // Within a column, `ordinal` orders the cards, and a tie falls back to
+        // the title so the board is stable rather than arbitrary
+        // ("first in todo" < "triage me", both at ordinal 0).
+        let todo: Vec<&str> = columns[0].1.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(todo, vec!["c3", "c4", "c1"]);
+        assert!(columns[1].1.is_empty(), "doing is empty");
+        assert_eq!(columns[2].1.len(), 1, "review holds one card");
+        // Display order is column-major, and it is what `selected_card` indexes.
+        let order: Vec<&str> = s
+            .kanban_in_display_order()
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(order, vec!["c3", "c4", "c1", "c2"]);
+        s.selected_card = 3;
+        assert_eq!(s.focused_card().unwrap().id, "c2");
+    }
+
+    #[test]
+    fn moving_a_card_emits_the_write_but_does_not_edit_the_pane() {
+        // The pane is a projection of the store: it emits the intent and waits
+        // for the daemon's superseding republish. Editing its own copy would let
+        // the board show a move the daemon refused.
+        let mut s = AppState::new();
+        s.overlay = Overlay::Kanban;
+        s.kanban = vec![card("c1", "wire the DAG viewer", "todo", 0)];
+        reduce(&mut s, Action::MoveCardForward);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::MoveBoardCard {
+                item_id: "c1".to_owned(),
+                status: "doing".to_owned(),
+            }]
+        );
+        assert_eq!(
+            s.kanban[0].status, "todo",
+            "the pane must not move the card itself"
+        );
+
+        // The ends of the board are no-ops, not wrapped moves.
+        s.outbox.clear();
+        reduce(&mut s, Action::MoveCardBack);
+        assert!(s.outbox.is_empty(), "todo has nothing to its left");
+        s.kanban[0].status = "done".to_owned();
+        reduce(&mut s, Action::MoveCardForward);
+        assert!(s.outbox.is_empty(), "done has nothing to its right");
+    }
+
+    #[test]
+    fn a_live_board_delivery_merges_by_id_and_drops_a_superseded_revision() {
+        let mut s = AppState::new();
+        s.kanban = vec![card("c1", "old title", "todo", 0)];
+        // The replacement a move produced arrives as its own delivery.
+        reduce(
+            &mut s,
+            Action::BoardCardUpdated {
+                card: card("c2", "old title", "doing", 0),
+                superseded: false,
+            },
+        );
+        // …and the superseded revision is removed rather than merged, so the
+        // board never shows one card in two columns.
+        reduce(
+            &mut s,
+            Action::BoardCardUpdated {
+                card: card("c1", "old title", "todo", 0),
+                superseded: true,
+            },
+        );
+        assert_eq!(s.kanban.len(), 1);
+        assert_eq!(s.kanban[0].id, "c2");
+        assert_eq!(s.kanban[0].status, "doing");
+    }
+
+    #[test]
+    fn opening_the_board_watches_it_and_toggles_closed() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenKanban);
+        assert_eq!(s.overlay, Overlay::Kanban);
+        assert_eq!(s.outbox, vec![Intent::WatchBoard]);
+        reduce(&mut s, Action::OpenKanban);
+        assert_eq!(s.overlay, Overlay::None);
+    }
+
     #[test]
     fn open_workflow_toggles_the_workflow_view() {
         let mut s = AppState::new();
