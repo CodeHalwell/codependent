@@ -48,13 +48,13 @@ use codypendent_protocol::{
 };
 use codypendent_runtime::models::provider_auth_id;
 use codypendent_tui::{
-    accessible_snapshot, accessible_terminal_capabilities_message, Action, AddModelRow,
-    AppState, BlackboardItemCard, ColorDepth, DocBlockView, DocCard, DocSuggestionView,
-    EDGE_PAGE_SIZE, GraphEdgeCard, Intent, KanbanCard, KeyStatus, KeyTarget,
-    map_accessible_input, map_event, MemoryCard, ModelCard, ModelListOrigin, ModelLocationLabel,
-    ModelReadiness, ProjectionKind, ProviderCard, reduce, render, render_splash,
-    sanitize_accessible_text, SkillCard, terminal_capabilities_message, TerminalGuard, Theme,
-    UnslothQuantCard, UnslothRepoCard, WorkflowNodeCard, WorkflowNodeUpdate,
+    accessible_snapshot, accessible_terminal_capabilities_message, map_accessible_input, map_event,
+    reduce, render, render_splash, sanitize_accessible_text, terminal_capabilities_message, Action,
+    AddModelRow, AppState, BlackboardItemCard, ColorDepth, DocBlockView, DocCard,
+    DocSuggestionView, GraphEdgeCard, Intent, KanbanCard, KeyStatus, KeyTarget, MemoryCard,
+    ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness, ProjectionKind, ProviderCard,
+    SkillCard, TerminalGuard, Theme, UnslothQuantCard, UnslothRepoCard, WorkflowNodeCard,
+    WorkflowNodeUpdate, EDGE_PAGE_SIZE,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -1682,11 +1682,7 @@ async fn event_loop<P: Presentation>(
                                 // catalog metadata for a model that lives
                                 // inside someone else's agent.
                                 result: Ok((
-                                    probe
-                                        .models
-                                        .into_iter()
-                                        .map(AddModelRow::live)
-                                        .collect(),
+                                    probe.models.into_iter().map(AddModelRow::live).collect(),
                                     ModelListOrigin::Live,
                                 )),
                             },

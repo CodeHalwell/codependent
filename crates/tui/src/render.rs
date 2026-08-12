@@ -27,12 +27,12 @@ use crate::dag::DagLayout;
 use crate::reduce::capability_label;
 use crate::remote_ui_host::{TERMINAL_CENTRAL_SLOTS, TERMINAL_OVERLAY_SLOTS};
 use crate::state::{
-    AddModelRow, AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus, DocLeaseState,
-    filter_council_member_models, filter_key_rows, filter_model_names, filter_models,
-    filter_modes, filter_providers, filter_themes, filter_unsloth_quants, filter_unsloth_repos,
-    KeyStatus, LayoutMode, ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness,
-    NOTE_INLINE_LINE_THRESHOLD, Overlay, Pane, PatchSummary, ProviderCard, RunActivity, RunView,
-    ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard, UnslothRepoCard,
+    filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
+    filter_providers, filter_themes, filter_unsloth_quants, filter_unsloth_repos, AddModelRow,
+    AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus, DocLeaseState, KeyStatus,
+    LayoutMode, ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness, Overlay, Pane,
+    PatchSummary, ProviderCard, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    UnslothQuantCard, UnslothRepoCard, NOTE_INLINE_LINE_THRESHOLD,
 };
 use crate::theme::Theme;
 use crate::{render_remote_ui, RemoteUiRenderOptions};

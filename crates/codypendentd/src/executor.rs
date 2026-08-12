@@ -1374,8 +1374,7 @@ impl RuntimeExecutor {
                     .await
             }
         };
-        match assembled
-        {
+        match assembled {
             Ok(manifest) => {
                 let rendered = manifest.render();
                 if let Err(error) = self.emit_note(session_id, run_id, rendered.clone()).await {

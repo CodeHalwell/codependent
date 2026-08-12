@@ -13,8 +13,8 @@ pub mod blackboard;
 // seam (rubric 9) — the same "knowledge stays model-free, the runtime owns the
 // provider call" split as `extractor`, but over a plain `reqwest` call rather
 // than a framework `ChatClient`, so it needs no provider feature.
-pub mod embedding;
 pub mod docs;
+pub mod embedding;
 // The model-backed `FactExtractor` (M3b, smarter-memory): needs `futures` to
 // drain the streaming `ChatClient` response, which is only pulled in behind
 // `provider-openai` (see Cargo.toml).

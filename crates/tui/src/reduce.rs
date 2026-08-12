@@ -23,13 +23,12 @@ use crate::action::{Action, Intent, KeyTarget, ProjectionKind, SecretKey, Workfl
 use crate::remote_ui::{RemoteKey, RemoteUiRenderOutput};
 use crate::remote_ui_host::{empty_message, terminal_viewport_message};
 use crate::state::{
+    filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
+    filter_providers, filter_themes, filter_unsloth_quants, filter_unsloth_repos, key_row_target,
     AddModelRow, AppState, CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft,
-    DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView, EDGE_PAGE_SIZE,
-    filter_council_member_models, filter_key_rows, filter_model_names, filter_models,
-    filter_modes, filter_providers, filter_themes, filter_unsloth_quants, filter_unsloth_repos,
-    key_row_target, KeyStatus, ModelListOrigin, ModelReadiness, Overlay, Pane, PatchSummary,
-    PendingApproval, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
-    UnslothQuantCard, UnslothRepoCard,
+    DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView, KeyStatus, ModelListOrigin,
+    ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView, ToolCard,
+    ToolStatus, TranscriptEntry, UnslothQuantCard, UnslothRepoCard, EDGE_PAGE_SIZE,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -10939,6 +10938,8 @@ mod tests {
         let quants = vec![unsloth_quant("Q4_K_M"), unsloth_quant("UD-Q4_K_XL")];
         assert_eq!(filter_unsloth_quants(&quants, "ud-"), vec![1]);
     }
+
+    #[test]
     fn alt_enter_is_still_a_line_break_when_not_browsing() {
         let mut s = run_with_two_folds();
         reduce(&mut s, Action::InputChar('h'));

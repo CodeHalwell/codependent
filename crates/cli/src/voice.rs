@@ -415,6 +415,12 @@ impl VoiceHost {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
+            // A live microphone must not outlive the UI that opened it. If the
+            // TUI exits, detaches, or loses the daemon between the two
+            // push-to-talk presses, `VoiceHost` is dropped mid-recording;
+            // without this the recorder keeps capturing indefinitely with no
+            // window left to stop it.
+            .kill_on_drop(true)
             .spawn()
         {
             Ok(child) => {

@@ -83,37 +83,37 @@ use codypendent_sandbox::sanitize_untrusted;
 /// `agent-framework-core` directly — can name the trait's parameter type).
 pub use agent_framework_core::tools::ToolDefinition;
 
-use crate::docs::{
-    DocsAuthor, DocsChannel, DocsChannelError, DocsCreate, DocsEdit, DocsSuggest, DocsWriteEffect,
-};
 use crate::blackboard::{
     BlackboardChannel, BlackboardChannelError, BlackboardPost, TaskBoardChannel, TaskCardChange,
     TaskCardDraft, WorkflowQueryChannel,
+};
+use crate::docs::{
+    DocsAuthor, DocsChannel, DocsChannelError, DocsCreate, DocsEdit, DocsSuggest, DocsWriteEffect,
 };
 use crate::models::ModelRegistry;
 #[cfg(feature = "provider-openai")]
 use crate::models::{classify_provider_message, FailureClass};
 use crate::tools::{
-    ApplyPatch, ApplyPatchInput, ArtifactRead, ArtifactReader, ArtifactReadInput, ArtifactSink,
-    BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput, BlackboardQueryTool,
-    CommandRequest, CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
-    CreateDraftPullRequestInput, docs_proposed_action, DocsCreateInput, DocsCreateTool,
+    docs_proposed_action, new_pull_request, parse_artifact_read, parse_blackboard_post,
+    parse_blackboard_query, parse_create_check_run, parse_create_draft_pull_request,
+    parse_docs_create, parse_docs_edit, parse_docs_read, parse_docs_suggest,
+    parse_edit_file as parse_edit_file_args, parse_get_pull_request, parse_list_check_runs,
+    parse_memory_remember, parse_skills_search, parse_task_create, parse_task_list,
+    parse_task_move, parse_task_update, parse_update_pull_request, parse_web_search,
+    parse_workflow_query, parse_write_file as parse_write_file_args, render_check_runs,
+    render_pull_request, render_registry_search, render_search_outcome, task_read_action,
+    task_write_action, tool_label, ApplyPatch, ApplyPatchInput, ArtifactRead, ArtifactReadInput,
+    ArtifactReader, ArtifactSink, BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput,
+    BlackboardQueryTool, CommandRequest, CreateCheckRunInput, CreateCheckRunSummary,
+    CreateDraftPullRequest, CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool,
     DocsEditInput, DocsEditTool, DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool,
     EditFile, EditFileInput, EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff,
-    GitDiffInput, ListCheckRuns, ListCheckRunsInput, MemoryRemember, MemoryRememberInput,
-    new_pull_request, parse_artifact_read, parse_blackboard_post, parse_blackboard_query,
-    parse_create_check_run, parse_create_draft_pull_request, parse_docs_create, parse_docs_edit,
-    parse_docs_read, parse_docs_suggest, parse_edit_file as parse_edit_file_args,
-    parse_get_pull_request, parse_list_check_runs, parse_memory_remember, parse_skills_search,
-    parse_task_create, parse_task_list, parse_task_move, parse_task_update,
-    parse_update_pull_request, parse_web_search, parse_workflow_query,
-    parse_write_file as parse_write_file_args, ReadFile, ReadFileInput, RegistrySearch,
-    RegistrySearchRequest, render_check_runs, render_pull_request, render_registry_search,
-    render_search_outcome, RepositoryTest, Search, SearchInput, Shell, SkillsSearch,
-    SkillsSearchInput, task_read_action, task_write_action, TaskCreateInput, TaskCreateTool,
-    TaskListInput, TaskListTool, TaskMoveTool, TaskUpdateInput, TaskUpdateTool, tool_label,
-    UpdatePullRequestInput, UpdatePullRequestTool, WebSearch, WebSearchInput,
-    WorkflowQueryInput, WorkflowQueryTool, WriteFile, WriteFileInput,
+    GitDiffInput, ListCheckRuns, ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile,
+    ReadFileInput, RegistrySearch, RegistrySearchRequest, RepositoryTest, Search, SearchInput,
+    Shell, SkillsSearch, SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput,
+    TaskListTool, TaskMoveTool, TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput,
+    UpdatePullRequestTool, WebSearch, WebSearchInput, WorkflowQueryInput, WorkflowQueryTool,
+    WriteFile, WriteFileInput,
 };
 
 /// Safety valve: the maximum number of `next_step` calls a single run makes

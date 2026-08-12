@@ -1974,7 +1974,7 @@ impl AppState {
             | Overlay::ConfirmUiPluginReject { .. }
             | Overlay::ConfirmUiPluginRevoke { .. }
             | Overlay::ConfirmCouncilDelete { .. }
-            | Overlay::UnslothConfirmPull { .. } => InputMode::Confirm,
+            | Overlay::UnslothConfirmPull { .. }
             | Overlay::DocDeleteConfirm { .. } => InputMode::Confirm,
             // The palette, the model picker, the provider picker, the mode
             // picker, the `/keys` overlay, and the add-model pick-list all

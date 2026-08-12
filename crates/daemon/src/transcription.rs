@@ -160,8 +160,25 @@ pub async fn transcribe_envelope(
         if audio.transcript.is_some() {
             continue;
         }
-        // (1) The classification gate, on the artifact's OWN classification.
-        transcription_allowed(audio.original.sensitivity, mode, &policy).map_err(|error| {
+        // (1) The classification gate, on the classification the daemon STORED
+        // for these bytes — never the one the client's `ArtifactRef` claims.
+        // The ref is wire data: a client may upload Secret audio, then resend
+        // the returned id marked `Public` and walk the bytes past this gate to
+        // a remote transcriber. Reading the row closes that.
+        let stored_sensitivity = store
+            .classification(pool, audio.original.id)
+            .await
+            .map_err(|error| {
+                CodypendentError::new(
+                    "voice.artifact-missing",
+                    format!(
+                        "audio artifact {} is not in this daemon's store: {error}",
+                        audio.original.id
+                    ),
+                    false,
+                )
+            })?;
+        transcription_allowed(stored_sensitivity, mode, &policy).map_err(|error| {
             CodypendentError::new(
                 "voice.off-device-forbidden",
                 format!(

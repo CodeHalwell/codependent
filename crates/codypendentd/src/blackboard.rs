@@ -371,7 +371,7 @@ impl BoardOps {
                 item_id,
                 NewBlackboardItem {
                     kind: old.kind,
-                    payload: change.payload.unwrap_or(old.payload),
+                    payload: merge_card_payload(old.payload, change.payload),
                     author: change.author.unwrap_or(old.author),
                     confidence: old.confidence,
                     evidence: old.evidence,
@@ -412,6 +412,32 @@ impl BoardOps {
         let view = item_to_view(run_id, item);
         self.hub.publish(run_id, view.clone());
         view
+    }
+}
+
+/// Fold an update's partial card body onto the stored one.
+///
+/// `task.update` sends only the fields it is changing, so treating the incoming
+/// payload as a whole replacement silently drops the rest: renaming a card would
+/// delete its description. Both sides are objects for every card this crate
+/// writes, so a supplied key wins and an omitted key is carried forward. A
+/// non-object payload (or an absent one) keeps the previous replace/keep
+/// behaviour, since there are no fields to merge.
+fn merge_card_payload(
+    old: serde_json::Value,
+    change: Option<serde_json::Value>,
+) -> serde_json::Value {
+    match change {
+        // A pure move/assign carries the stored body forward untouched.
+        None => old,
+        Some(serde_json::Value::Object(patch)) => match old {
+            serde_json::Value::Object(mut base) => {
+                base.extend(patch);
+                serde_json::Value::Object(base)
+            }
+            _ => serde_json::Value::Object(patch),
+        },
+        Some(replacement) => replacement,
     }
 }
 
@@ -619,6 +645,32 @@ mod tests {
     use super::*;
     use codypendent_protocol::ClientId;
     use serde_json::json;
+
+    /// A `task.update` that changes only the title must not blank the
+    /// description (and vice versa): the tool sends just the fields it is
+    /// changing, so the stored body is folded, not replaced.
+    #[test]
+    fn a_partial_card_update_keeps_the_fields_it_did_not_send() {
+        let stored = json!({ "title": "flaky test", "description": "fails on CI only" });
+
+        let renamed = merge_card_payload(stored.clone(), Some(json!({ "title": "flaky suite" })));
+        assert_eq!(
+            renamed,
+            json!({ "title": "flaky suite", "description": "fails on CI only" }),
+            "renaming a card must keep its description"
+        );
+
+        let redescribed =
+            merge_card_payload(stored.clone(), Some(json!({ "description": "now green" })));
+        assert_eq!(
+            redescribed,
+            json!({ "title": "flaky test", "description": "now green" }),
+            "editing a description must keep the title"
+        );
+
+        // A pure move/assign sends no payload at all and carries the body over.
+        assert_eq!(merge_card_payload(stored.clone(), None), stored);
+    }
 
     /// A migrated pool on a tempfile (WAL needs a real file, not `:memory:`); the
     /// shared migrations create `blackboard_items` (0010). The returned `TempDir`
