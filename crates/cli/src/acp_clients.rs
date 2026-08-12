@@ -407,6 +407,9 @@ fn upsert_profiles(paths: &RuntimePaths, profiles: &[(String, String)]) -> anyho
         model: agent.clone(),
         api_key_env: String::new(),
         context_tokens: None,
+        // An ACP agent is launched, not addressed over HTTP, so it has no
+        // catalog provider whose auth header would need resolving.
+        provider_id: None,
     }));
     write_models(&path, &configs)
 }

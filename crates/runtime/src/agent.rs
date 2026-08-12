@@ -5990,6 +5990,7 @@ mod tests {
             model: "qwen2.5-coder:14b".to_string(),
             api_key_env: String::new(),
             context_tokens: Some(32_768),
+            provider_id: None,
         }]);
         let driver = FrameworkModelDriver::from_registry(&known, id.clone())
             .await
@@ -6007,6 +6008,7 @@ mod tests {
             model: "qwen2.5-coder:14b".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         }]);
         let driver = FrameworkModelDriver::from_registry(&unknown, id)
             .await

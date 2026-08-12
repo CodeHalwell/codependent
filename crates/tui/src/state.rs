@@ -151,7 +151,11 @@ impl Default for CouncilBuilderState {
 }
 
 /// The top-most modal / overlay, if any. Text prompts carry their buffer inline.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// `PartialEq` but NOT `Eq`: the add-model pick-list carries catalog prices as
+/// floats, which have no total equality. Every comparison in the codebase is a
+/// structural `==` / `assert_eq!`, which `PartialEq` alone serves.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum Overlay {
     /// No overlay; the base layout is interactive.
     #[default]
@@ -336,15 +340,21 @@ pub enum Overlay {
     },
     /// Add-model flow, the model pick-list — fuzzy-filterable like the
     /// model/provider pickers. `Enter` on a row → `Intent::AddModel { display_id:
-    /// "<provider>/<picked>", provider_id, model: <picked>, api_key }`; `Esc`
-    /// closes. `query` filters `models` by substring; `selected` indexes the
-    /// filtered results (reset to 0 when the query changes).
+    /// "<provider>/<picked>", provider_id, model: <picked>, api_key,
+    /// context_tokens }`; `Esc` closes. `query` filters `models` by substring;
+    /// `selected` indexes the filtered results (reset to 0 when the query
+    /// changes). Rows carry the catalog metadata the harness merged onto the
+    /// live listing (or the catalog rows alone when there is no listing);
+    /// `origin` says which, so the header can be honest about it, and
+    /// `refreshing` marks a manual `Ctrl-R` re-fetch still in flight.
     AddModelPick {
         provider_id: String,
         api_key: Option<SecretKey>,
-        models: Vec<String>,
+        models: Vec<AddModelRow>,
         query: String,
         selected: usize,
+        origin: ModelListOrigin,
+        refreshing: bool,
     },
     /// The `/keys` overlay (D1): a fuzzy-filterable list of every configured
     /// model (see [`AppState::models`]) plus a final `Tavily (web.search)` row,
@@ -1063,18 +1073,82 @@ pub(crate) fn filter_council_member_models(
         .collect()
 }
 
-/// The indices into `models` whose name case-insensitively contains `query` —
-/// the add-model pick-list's substring filter, in list order. Mirrors
-/// [`filter_models`] adapted to plain `String` model names (the provider's
-/// `/models` ids are bare strings, not [`ModelCard`]s). An empty query matches
-/// every name.
+/// One offerable model in the add-model pick-list: the provider-side id plus
+/// whatever metadata could be attached to it. The id is the only required
+/// field — a provider that answers `/models` with bare ids still produces a
+/// complete row, just with empty columns. The CLI harness builds these by
+/// merging the live `/models` response with the built-in catalog's `[[model]]`
+/// rows for that provider (catalog metadata attached where ids match, and
+/// catalog-only rows offered when the provider has no listing endpoint or the
+/// request failed), so the picker is never a dead end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddModelRow {
+    /// The provider-side model id, exactly as it must be sent on the wire.
+    pub id: String,
+    /// A human display name, when the catalog or the provider supplied one.
+    pub name: Option<String>,
+    /// The model's context window in tokens, when known.
+    pub context_tokens: Option<u64>,
+    /// USD per 1M input tokens, when known. DISPLAY-ONLY — never summed into
+    /// a budget (the catalog's own honesty rule).
+    pub cost_per_1m_input_usd: Option<f64>,
+    /// USD per 1M output tokens, when known. Display-only, as above.
+    pub cost_per_1m_output_usd: Option<f64>,
+    /// Whether the provider itself listed this model just now. `false` marks a
+    /// catalog-only row: offerable, but unconfirmed against the live endpoint.
+    pub live: bool,
+}
+
+impl AddModelRow {
+    /// A bare live row — the shape a provider that answers with ids only
+    /// produces, before any catalog metadata is merged onto it.
+    #[must_use]
+    pub fn live(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: None,
+            context_tokens: None,
+            cost_per_1m_input_usd: None,
+            cost_per_1m_output_usd: None,
+            live: true,
+        }
+    }
+}
+
+/// Where an add-model pick-list's rows came from, for an honest header: the
+/// operator must be able to tell a confirmed live listing from a catalog-only
+/// offering (which may name a model this account cannot actually reach).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelListOrigin {
+    /// Fetched from the provider's `/models` endpoint just now.
+    Live,
+    /// Seeded from `<data_dir>/model_lists/<provider>.json`; the string is a
+    /// human age label ("4m ago"), never a raw timestamp to parse.
+    Cached(String),
+    /// The built-in catalog only — the provider has no listing endpoint, or
+    /// the request failed. The string is the key-free reason, when there was
+    /// one.
+    Catalog(String),
+}
+
+/// The indices into `models` whose id or display name case-insensitively
+/// contains `query` — the add-model pick-list's substring filter, in list
+/// order. Mirrors [`filter_models`] adapted to [`AddModelRow`]. An empty query
+/// matches every row.
 #[must_use]
-pub(crate) fn filter_model_names(models: &[String], query: &str) -> Vec<usize> {
+pub(crate) fn filter_model_names(models: &[AddModelRow], query: &str) -> Vec<usize> {
     let needle = query.trim().to_lowercase();
     models
         .iter()
         .enumerate()
-        .filter(|(_, name)| needle.is_empty() || name.to_lowercase().contains(&needle))
+        .filter(|(_, row)| {
+            needle.is_empty()
+                || row.id.to_lowercase().contains(&needle)
+                || row
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.to_lowercase().contains(&needle))
+        })
         .map(|(idx, _)| idx)
         .collect()
 }
@@ -1166,6 +1240,15 @@ pub struct ProviderCard {
     /// cloud-IAM remain discoverable, but are disabled until their runtime
     /// adapter/auth flow is wired — never presented as a successful add.
     pub available: bool,
+    /// How many curated `[[model]]` rows the provider catalog ships for this
+    /// provider. Non-zero means the add flow has something to offer even when
+    /// the provider has no `/models` endpoint (Perplexity) or the request
+    /// fails — the picker is never a free-text dead end.
+    pub catalog_models: usize,
+    /// Whether a key for this provider is already stored in `auth.json` (under
+    /// the provider-wide `provider/<id>` entry). Set by the harness; the
+    /// add-model flow uses it to skip re-prompting for a key it already holds.
+    pub has_key: bool,
 }
 
 /// The indices into `providers` whose id/name/protocol case-insensitively
@@ -1955,11 +2038,14 @@ mod tests {
     use super::*;
 
     /// [`filter_model_names`] mirrors [`filter_models`]/[`filter_providers`]'s
-    /// substring-match shape, adapted to bare `String` model ids (the
-    /// add-model pick-list's fetched names have no [`ModelCard`] wrapper).
+    /// substring-match shape, adapted to the add-model pick-list's
+    /// [`AddModelRow`] cards.
     #[test]
     fn filter_model_names_matches_case_insensitive_substrings() {
-        let models = vec!["llama-3.1-8b".to_owned(), "gpt-oss-20b".to_owned()];
+        let models = vec![
+            AddModelRow::live("llama-3.1-8b"),
+            AddModelRow::live("gpt-oss-20b"),
+        ];
         assert_eq!(
             filter_model_names(&models, ""),
             vec![0, 1],
@@ -1979,6 +2065,23 @@ mod tests {
             filter_model_names(&models, "zzz-no-such-model").is_empty(),
             "no match returns an empty list"
         );
+    }
+
+    /// A catalog row's display NAME is searchable too: an operator who knows a
+    /// model as "Llama 3.3 70B" should not have to guess the provider's id
+    /// spelling to find it.
+    #[test]
+    fn filter_model_names_also_matches_the_display_name() {
+        let models = vec![AddModelRow {
+            id: "meta-llama/Llama-3.3-70B-Instruct".to_owned(),
+            name: Some("Llama 3.3 70B Instruct".to_owned()),
+            context_tokens: Some(128_000),
+            cost_per_1m_input_usd: Some(0.13),
+            cost_per_1m_output_usd: Some(0.4),
+            live: false,
+        }];
+        assert_eq!(filter_model_names(&models, "3.3 70b"), vec![0]);
+        assert_eq!(filter_model_names(&models, "META-LLAMA"), vec![0]);
     }
 
     /// Secret hygiene (model discovery): every new overlay that carries a
@@ -2010,9 +2113,11 @@ mod tests {
                 Overlay::AddModelPick {
                     provider_id: "groq".to_owned(),
                     api_key: Some(SecretKey("sk-secret".to_owned())),
-                    models: vec!["llama-3.1-8b".to_owned()],
+                    models: vec![AddModelRow::live("llama-3.1-8b")],
                     query: String::new(),
                     selected: 0,
+                    origin: ModelListOrigin::Live,
+                    refreshing: false,
                 }
             ),
             format!(

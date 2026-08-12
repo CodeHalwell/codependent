@@ -253,6 +253,9 @@ pub fn register_pulled_model(
         model: reference.clone(),
         api_key_env: String::new(),
         context_tokens,
+        // A pulled GGUF is served by the local `ollama` provider, whose auth is
+        // the catalog's `none` — no header resolution is needed.
+        provider_id: Some("ollama".to_string()),
     });
 
     #[derive(serde::Serialize)]

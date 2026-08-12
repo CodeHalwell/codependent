@@ -24,16 +24,20 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use codypendent_protocol::{AgentMode, ModelId};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthStore;
+use codypendent_providers::Catalog;
 
 #[cfg(feature = "provider-openai")]
 use agent_framework_openai::OpenAIChatCompletionClient;
 
+#[cfg(feature = "provider-openai")]
+use std::collections::BTreeMap;
 #[cfg(feature = "provider-openai")]
 use std::sync::Arc;
 
@@ -78,6 +82,16 @@ pub struct ModelConfig {
     /// endpoint with no auth).
     #[serde(default)]
     pub api_key_env: String,
+    /// The provider-catalog id this model was added from (e.g. `"nebius"`,
+    /// `"azure-openai"`), when known. Additive and optional: it lets the
+    /// registry resolve the provider's auth header/prefix, extra headers, and
+    /// documented key env NAMES from the catalog at call time, so a
+    /// non-bearer provider (Azure OpenAI's `api-key` header, GitHub Models'
+    /// API-version header) authenticates correctly instead of being
+    /// flattened to `Authorization: Bearer`. `None` (every pre-existing
+    /// entry) keeps the legacy bearer behavior exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     /// The model's context window in tokens, if known. Sourced from
     /// `models.toml` (a user-set `context_tokens` key) — there is no
     /// auto-population from the provider catalog in v1. Used for two
@@ -396,6 +410,28 @@ pub fn classify_provider_message(message: &str) -> FailureClass {
 // Registry
 // ---------------------------------------------------------------------------
 
+/// The `auth.json` entry id holding a PROVIDER-wide key (as opposed to a
+/// per-model entry keyed by the model's display id): `provider/<catalog-id>`.
+/// Stored by the add-model flow alongside the per-model entry so one pasted
+/// key serves every model later added from the same provider; read by
+/// [`ModelRegistry::client_for`]/[`check_model`](ModelRegistry::check_model)
+/// after the per-model entry and before the environment. The `provider/`
+/// prefix is reserved (like the Tavily `integrations/tavily` id) and cannot
+/// collide with add-model display ids, which are `<provider>/<model>` for
+/// catalog providers and `acp/<agent>` for ACP agents.
+#[must_use]
+pub fn provider_auth_id(provider_id: &str) -> String {
+    format!("provider/{provider_id}")
+}
+
+/// The process-wide built-in provider catalog, parsed once. The fallback for
+/// registries built without [`ModelRegistry::with_catalog`] (e.g. the daemon
+/// executor), so catalog-declared auth headers resolve there too.
+fn builtin_catalog() -> &'static Catalog {
+    static CATALOG: OnceLock<Catalog> = OnceLock::new();
+    CATALOG.get_or_init(Catalog::builtin)
+}
+
 /// The set of configured model profiles, keyed by [`ModelId`], plus the
 /// resolved [`AuthStore`] (`auth.json`) so [`ModelRegistry::client_for`] can
 /// prefer a stored key over the model's `api_key_env`. The store's own redacting
@@ -404,6 +440,12 @@ pub fn classify_provider_message(message: &str) -> FailureClass {
 pub struct ModelRegistry {
     configs: HashMap<ModelId, ModelConfig>,
     auth: AuthStore,
+    /// The provider catalog auth headers are resolved against (see
+    /// [`ModelConfig::provider_id`]). `None` falls back to the built-ins, so
+    /// a caller that cannot layer the user's `providers.toml` still resolves
+    /// every built-in provider correctly.
+    #[cfg_attr(not(feature = "provider-openai"), allow(dead_code))]
+    catalog: Option<Catalog>,
 }
 
 impl ModelRegistry {
@@ -416,6 +458,7 @@ impl ModelRegistry {
         Self {
             configs,
             auth: AuthStore::default(),
+            catalog: None,
         }
     }
 
@@ -425,6 +468,16 @@ impl ModelRegistry {
     #[must_use]
     pub fn with_auth(mut self, auth: AuthStore) -> Self {
         self.auth = auth;
+        self
+    }
+
+    /// Attach a resolved provider [`Catalog`] (built-ins layered with the
+    /// user's `providers.toml`) for auth-header resolution. Additive: without
+    /// it the embedded built-in catalog is used, so only a user-defined
+    /// provider with a custom auth header needs this to be exact.
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: Catalog) -> Self {
+        self.catalog = Some(catalog);
         self
     }
 
@@ -521,6 +574,7 @@ mod acp_coordinate_tests {
                 model: "demo-acp@1.2.3#agent-model-1".to_string(),
                 api_key_env: String::new(),
                 context_tokens: None,
+                provider_id: None,
             },
             ModelConfig {
                 id: ModelId("acp/demo".to_string()),
@@ -529,6 +583,7 @@ mod acp_coordinate_tests {
                 model: "demo-acp@1.2.3".to_string(),
                 api_key_env: String::new(),
                 context_tokens: None,
+                provider_id: None,
             },
             ModelConfig {
                 id: ModelId("hosted".to_string()),
@@ -537,6 +592,7 @@ mod acp_coordinate_tests {
                 model: "some#model".to_string(),
                 api_key_env: String::new(),
                 context_tokens: None,
+                provider_id: None,
             },
         ]);
         assert_eq!(
@@ -555,12 +611,76 @@ mod acp_coordinate_tests {
     }
 }
 
+/// How a model's endpoint expects its key and extra headers on the wire,
+/// resolved from the provider catalog via [`ModelConfig::provider_id`]. A
+/// config with no (known) provider id resolves to the bearer default, so
+/// every pre-existing `models.toml` entry behaves exactly as before.
+#[cfg(feature = "provider-openai")]
+#[derive(Debug, Clone)]
+struct EndpointAuth {
+    /// The header the key is injected under (default `Authorization`).
+    header: String,
+    /// The value prefix in front of the key (default `"Bearer "`).
+    prefix: String,
+    /// Provider-wide headers sent on every request — an API-version pin, for
+    /// the providers whose catalog entry declares one.
+    extra_headers: BTreeMap<String, String>,
+    /// The provider's documented key env-var NAMES, consulted (first set
+    /// wins) only when the model has no `auth.json` key and no explicit
+    /// `api_key_env` of its own.
+    provider_env: Vec<String>,
+}
+
+#[cfg(feature = "provider-openai")]
+impl EndpointAuth {
+    /// Whether this is the exact shape the stock framework client sends
+    /// (`Authorization: Bearer …`, nothing else) — the fast path.
+    fn is_framework_default(&self) -> bool {
+        self.header == "Authorization" && self.prefix == "Bearer " && self.extra_headers.is_empty()
+    }
+}
+
+/// Resolve a model's [`EndpointAuth`] from the catalog. Defaults to bearer
+/// with no extras when the entry names no provider, or an unknown one.
+#[cfg(feature = "provider-openai")]
+fn endpoint_auth_for(cfg: &ModelConfig, catalog: &Catalog) -> EndpointAuth {
+    let provider = cfg.provider_id.as_deref().and_then(|id| catalog.get(id));
+    let (header, prefix, provider_env) = provider
+        .and_then(|p| {
+            p.auth.iter().find_map(|method| match method {
+                AuthMethod::ApiKey {
+                    env,
+                    header,
+                    prefix,
+                } => Some((header.clone(), prefix.clone(), env.clone())),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| {
+            (
+                "Authorization".to_string(),
+                "Bearer ".to_string(),
+                Vec::new(),
+            )
+        });
+    EndpointAuth {
+        header,
+        prefix,
+        extra_headers: provider
+            .map(|p| p.extra_headers.clone())
+            .unwrap_or_default(),
+        provider_env,
+    }
+}
+
 /// Map a persisted [`ModelConfig`] onto the provider abstraction. Chat profiles
 /// become `(OpenAiChat, ApiKey|None)`; ACP profiles are marked so the assembly
 /// executor can route them to the full-agent runtime instead of a chat client.
-/// This remains the backward-compatible bridge for existing `models.toml` files.
+/// This remains the backward-compatible bridge for existing `models.toml` files;
+/// the `ApiKey` arm carries the catalog-resolved header/prefix (bearer when the
+/// entry names no provider) so Azure-shaped providers stop being flattened.
 #[cfg(feature = "provider-openai")]
-fn config_to_protocol_auth(cfg: &ModelConfig) -> Result<(Protocol, AuthMethod)> {
+fn config_to_protocol_auth(cfg: &ModelConfig, catalog: &Catalog) -> Result<(Protocol, AuthMethod)> {
     if cfg.provider == "acp" {
         return Ok((
             Protocol::Acp,
@@ -580,10 +700,11 @@ fn config_to_protocol_auth(cfg: &ModelConfig) -> Result<(Protocol, AuthMethod)> 
     let auth = if cfg.api_key_env.trim().is_empty() {
         AuthMethod::None
     } else {
+        let endpoint = endpoint_auth_for(cfg, catalog);
         AuthMethod::ApiKey {
             env: vec![cfg.api_key_env.clone()],
-            header: "Authorization".to_string(),
-            prefix: "Bearer ".to_string(),
+            header: endpoint.header,
+            prefix: endpoint.prefix,
         }
     };
     Ok((Protocol::OpenAiChat, auth))
@@ -591,9 +712,20 @@ fn config_to_protocol_auth(cfg: &ModelConfig) -> Result<(Protocol, AuthMethod)> 
 
 #[cfg(feature = "provider-openai")]
 impl ModelRegistry {
+    /// The catalog auth headers are resolved against: the attached one, or
+    /// the process-wide built-ins.
+    fn catalog(&self) -> &Catalog {
+        self.catalog.as_ref().unwrap_or_else(|| builtin_catalog())
+    }
+
     /// Resolve the key exactly as the live client does. Keeping this in one
     /// helper ensures the readiness probe and the first completion cannot
-    /// disagree because they used different credential precedence.
+    /// disagree because they used different credential precedence:
+    /// (1) the model's own `auth.json` entry; (2) the provider-wide
+    /// `auth.json` entry ([`provider_auth_id`]); (3) the model's explicit
+    /// `api_key_env` (missing → a naming error, unchanged); (4) the catalog
+    /// provider's documented env NAMES, best-effort — an unset variable
+    /// falls through to keyless exactly as before, never a new error.
     async fn api_key_for(&self, cfg: &ModelConfig) -> Result<String> {
         if let Some(key) = self
             .auth
@@ -602,10 +734,33 @@ impl ModelRegistry {
         {
             return Ok(key.to_string());
         }
-        let (_, auth) = config_to_protocol_auth(cfg)?;
+        if let Some(key) = cfg
+            .provider_id
+            .as_deref()
+            .and_then(|pid| self.auth.get(&provider_auth_id(pid)))
+            .filter(|key| !key.is_empty())
+        {
+            return Ok(key.to_string());
+        }
+        let (_, auth) = config_to_protocol_auth(cfg, self.catalog())?;
         match credential_for(&auth).resolve().await {
             Ok(ResolvedCredential::ApiKey { value, .. }) => Ok(value),
-            Ok(ResolvedCredential::None) => Ok(String::new()),
+            Ok(ResolvedCredential::None) => {
+                let endpoint = endpoint_auth_for(cfg, self.catalog());
+                if !endpoint.provider_env.is_empty() {
+                    let provider_auth = AuthMethod::ApiKey {
+                        env: endpoint.provider_env,
+                        header: endpoint.header,
+                        prefix: endpoint.prefix,
+                    };
+                    if let Ok(ResolvedCredential::ApiKey { value, .. }) =
+                        credential_for(&provider_auth).resolve().await
+                    {
+                        return Ok(value);
+                    }
+                }
+                Ok(String::new())
+            }
             Err(CredentialError::MissingEnv { var }) => Err(ModelsError::MissingApiKeyEnv {
                 model: cfg.id.clone(),
                 var,
@@ -637,7 +792,7 @@ impl ModelRegistry {
             // RuntimePaths needed to resolve the installed agent.
             return Ok(());
         }
-        let (protocol, _) = config_to_protocol_auth(cfg)?;
+        let (protocol, _) = config_to_protocol_auth(cfg, self.catalog())?;
         if !matches!(protocol, Protocol::OpenAiChat) {
             return Err(ModelsError::ProtocolNotWired {
                 model: id.clone(),
@@ -660,9 +815,26 @@ impl ModelRegistry {
                 base_url: cfg.base_url.clone(),
                 reason: error.to_string(),
             })?;
+        // The exact header/prefix + extra headers the live client sends, so
+        // an Azure-shaped provider (`api-key`) verifies with the same auth it
+        // will run with — never a hardcoded bearer.
+        let auth = endpoint_auth_for(cfg, self.catalog());
         let mut request = client.get(endpoint);
+        for (name, value) in &auth.extra_headers {
+            request = request.header(name, value);
+        }
         if !key.is_empty() {
-            request = request.bearer_auth(key);
+            let mut value =
+                reqwest::header::HeaderValue::from_str(&format!("{}{key}", auth.prefix)).map_err(
+                    |_| ModelsError::ModelUnavailable {
+                        model: id.clone(),
+                        provider_model: cfg.model.clone(),
+                        reason: "the API key is not a valid header value".to_string(),
+                    },
+                )?;
+            // Sensitive: reqwest redacts it from any error/debug output.
+            value.set_sensitive(true);
+            request = request.header(auth.header.as_str(), value);
         }
         let response = request
             .send()
@@ -710,8 +882,10 @@ impl ModelRegistry {
     ///
     /// Resolves the API key right here, at call time, in precedence order:
     /// (1) `auth.json[model_id]`, when present and non-empty; (2) the
-    /// model's `api_key_env` environment variable; (3) no key at all (local
-    /// endpoints with an empty `api_key_env`). Whichever wins is moved
+    /// provider-wide `auth.json` entry ([`provider_auth_id`]); (3) the
+    /// model's `api_key_env` environment variable; (4) the catalog
+    /// provider's documented env NAMES (best-effort); (5) no key at all
+    /// (local endpoints with an empty `api_key_env`). Whichever wins is moved
     /// straight into the client and is never stored on the registry, logged,
     /// or otherwise retained by this function (Chapter 11, "Secrets"). A
     /// required-but-unset variable produces [`ModelsError::MissingApiKeyEnv`]
@@ -723,7 +897,11 @@ impl ModelRegistry {
     /// `OpenAIChatCompletionClient::new(api_key, model).with_base_url(base_url)`
     /// as before — the one code path that serves both the hosted OpenAI
     /// endpoint and any OpenAI-compatible local/self-hosted endpoint (e.g.
-    /// Ollama), per STEP 1.9 — now returned behind `Arc<dyn ChatClient>`. Any
+    /// Ollama), per STEP 1.9 — now returned behind `Arc<dyn ChatClient>`. A
+    /// [`ModelConfig::provider_id`] whose catalog auth is not the bearer
+    /// default (or that declares extra headers) builds the wire-identical
+    /// [`HeaderAuthChatClient`] instead, so Azure OpenAI / GitHub Models
+    /// authenticate with the headers the provider actually expects. Any
     /// other protocol (Anthropic/Gemini native are follow-ups) returns
     /// [`ModelsError::ProtocolNotWired`].
     pub async fn client_for(
@@ -733,18 +911,40 @@ impl ModelRegistry {
         let cfg = self
             .get(id)
             .ok_or_else(|| ModelsError::UnknownModel(id.clone()))?;
-        let (protocol, _) = config_to_protocol_auth(cfg)?;
+        let (protocol, _) = config_to_protocol_auth(cfg, self.catalog())?;
         match protocol {
             Protocol::OpenAiChat => {
                 // Key resolution precedence (additive): (a) an `auth.json` key for
-                // this model id wins → (b) the model's `api_key_env` (today's
-                // path) → (c) none. A model with no `auth.json` entry behaves
-                // exactly as before. The stored key is moved straight into the
-                // client and is never logged or retained by this function.
+                // this model id wins → (b) the provider-wide `auth.json` entry →
+                // (c) the model's `api_key_env` (today's path) → (d) none. A model
+                // with no `auth.json` entry behaves exactly as before. The stored
+                // key is moved straight into the client and is never logged or
+                // retained by this function.
                 let api_key = self.api_key_for(cfg).await?;
-                let client = OpenAIChatCompletionClient::new(api_key, cfg.model.clone())
-                    .with_base_url(cfg.base_url.clone());
-                Ok(Arc::new(client))
+                let auth = endpoint_auth_for(cfg, self.catalog());
+                if auth.is_framework_default() {
+                    let client = OpenAIChatCompletionClient::new(api_key, cfg.model.clone())
+                        .with_base_url(cfg.base_url.clone());
+                    Ok(Arc::new(client))
+                } else {
+                    // A catalog-declared non-bearer header (Azure OpenAI's
+                    // `api-key`) or provider extra headers (GitHub Models):
+                    // the stock framework client hardcodes `bearer_auth`, so
+                    // these run through the wire-identical header-aware client.
+                    let client =
+                        HeaderAuthChatClient::new(cfg, &auth, &api_key).ok_or_else(|| {
+                            ModelsError::ModelUnavailable {
+                                model: id.clone(),
+                                provider_model: cfg.model.clone(),
+                                reason: format!(
+                                    "provider auth header `{}` or its value is not a valid \
+                                     HTTP header",
+                                    auth.header
+                                ),
+                            }
+                        })?;
+                    Ok(Arc::new(client))
+                }
             }
             Protocol::Acp => Err(ModelsError::ProtocolNotWired {
                 model: id.clone(),
@@ -755,6 +955,146 @@ impl ModelRegistry {
                 protocol: format!("{other:?}"),
             }),
         }
+    }
+}
+
+/// An OpenAI-compatible chat client for providers whose auth is NOT the
+/// framework default `Authorization: Bearer …` (Azure OpenAI's `api-key`
+/// header) or that require provider-wide extra headers (GitHub Models'
+/// `X-GitHub-Api-Version`). `OpenAIChatCompletionClient` hardcodes
+/// `bearer_auth` with no header hook, so this client mirrors it
+/// request-for-request by reusing the framework's own public conversion and
+/// SSE-parsing helpers — only header injection differs. The auth header value
+/// is marked sensitive so reqwest never echoes it into an error.
+#[cfg(feature = "provider-openai")]
+struct HeaderAuthChatClient {
+    http: reqwest::Client,
+    base_url: String,
+    model: String,
+    headers: reqwest::header::HeaderMap,
+}
+
+#[cfg(feature = "provider-openai")]
+impl HeaderAuthChatClient {
+    /// Build the client, assembling the fixed header set: the provider's
+    /// extra headers plus (when a key is present) `header: prefix+key`,
+    /// sensitive. `None` when a header name/value cannot be represented —
+    /// the caller maps that to a legible config error naming no key.
+    fn new(cfg: &ModelConfig, auth: &EndpointAuth, api_key: &str) -> Option<Self> {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut headers = HeaderMap::new();
+        for (name, value) in &auth.extra_headers {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).ok()?,
+                HeaderValue::from_str(value).ok()?,
+            );
+        }
+        if !api_key.is_empty() {
+            let mut value = HeaderValue::from_str(&format!("{}{api_key}", auth.prefix)).ok()?;
+            value.set_sensitive(true);
+            headers.insert(HeaderName::from_bytes(auth.header.as_bytes()).ok()?, value);
+        }
+        Some(Self {
+            http: reqwest::Client::new(),
+            base_url: cfg.base_url.clone(),
+            model: cfg.model.clone(),
+            headers,
+        })
+    }
+
+    /// The exact chat-completions body the stock client builds, via the
+    /// framework's own public conversion helpers.
+    fn build_body(
+        &self,
+        messages: &[agent_framework_core::types::Message],
+        options: &agent_framework_core::types::ChatOptions,
+        stream: bool,
+    ) -> serde_json::Value {
+        use agent_framework_openai::convert;
+        let mut body = serde_json::Map::new();
+        let model = options.model.clone().unwrap_or_else(|| self.model.clone());
+        body.insert("model".into(), serde_json::json!(model));
+        body.insert(
+            "messages".into(),
+            serde_json::json!(convert::messages_to_openai(messages)),
+        );
+        convert::apply_options(&mut body, options);
+        let (tools, tool_choice) = convert::tools_to_openai(options);
+        if let Some(tools) = tools {
+            body.insert("tools".into(), tools);
+        }
+        if let Some(choice) = tool_choice {
+            body.insert("tool_choice".into(), choice);
+        }
+        if stream {
+            body.insert("stream".into(), serde_json::json!(true));
+            body.insert(
+                "stream_options".into(),
+                serde_json::json!({ "include_usage": true }),
+            );
+        }
+        serde_json::Value::Object(body)
+    }
+
+    async fn post(
+        &self,
+        body: &serde_json::Value,
+    ) -> agent_framework_core::error::Result<reqwest::Response> {
+        use agent_framework_core::error::Error;
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.headers.clone())
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| Error::service(format!("request failed: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(agent_framework_openai::classify_service_error(
+                status.as_u16(),
+                &text,
+                format!("OpenAI-compatible API error {status}: {text}"),
+                None,
+            ));
+        }
+        Ok(resp)
+    }
+}
+
+#[cfg(feature = "provider-openai")]
+#[async_trait::async_trait]
+impl agent_framework_core::client::ChatClient for HeaderAuthChatClient {
+    async fn get_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        options: agent_framework_core::types::ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::types::ChatResponse> {
+        use agent_framework_core::error::Error;
+        let body = self.build_body(&messages, &options, false);
+        let resp = self.post(&body).await?;
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::service(format!("invalid response json: {e}")))?;
+        Ok(agent_framework_openai::convert::parse_response(&value))
+    }
+
+    async fn get_streaming_response(
+        &self,
+        messages: Vec<agent_framework_core::types::Message>,
+        options: agent_framework_core::types::ChatOptions,
+    ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+        use futures::StreamExt;
+        let body = self.build_body(&messages, &options, true);
+        let resp = self.post(&body).await?;
+        Ok(agent_framework_openai::parse_sse_stream(resp).boxed())
+    }
+
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
     }
 }
 
@@ -1613,6 +1953,7 @@ model = "codex-acp"
             model: "codex-acp".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         };
         let registry = ModelRegistry::new(vec![config]);
         assert!(registry.is_acp(&model_id("acp/codex-acp")));
@@ -1694,6 +2035,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "gpt-5.1-codex".to_string(),
             api_key_env: var_name.to_string(),
             context_tokens: None,
+            provider_id: None,
         }]);
 
         // `Arc<dyn ChatClient>` (the `Ok` type) has no `Debug` impl, so
@@ -1728,6 +2070,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "qwen2.5-coder:14b".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         }]);
 
         // Builds an OpenAI-compatible client with no key (Ok is enough — the
@@ -1755,6 +2098,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "llama-3.1-8b".to_string(),
             api_key_env: var.to_string(),
             context_tokens: None,
+            provider_id: None,
         };
 
         // Without an auth.json entry the env var is required and missing → error.
@@ -1789,6 +2133,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "qwen2.5-coder:14b".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         }])
         .with_auth(AuthStore::default());
         assert!(
@@ -1826,6 +2171,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "llama-3.1-8b".to_string(),
             api_key_env: var.to_string(),
             context_tokens: None,
+            provider_id: None,
         };
 
         let mut auth = AuthStore::default();
@@ -1863,6 +2209,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "claude-sonnet-5".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         }]);
 
         let err = registry
@@ -1934,6 +2281,7 @@ api_key_env = "OPENAI_API_KEY"
                 model: "unused".to_string(),
                 api_key_env: String::new(),
                 context_tokens: None,
+                provider_id: None,
             },
             ModelConfig {
                 id: reachable.clone(),
@@ -1942,6 +2290,7 @@ api_key_env = "OPENAI_API_KEY"
                 model: "unused".to_string(),
                 api_key_env: String::new(),
                 context_tokens: None,
+                provider_id: None,
             },
         ]);
         let policy = ModelPolicy::new()
@@ -1970,6 +2319,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "unused".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         }]);
         let policy = ModelPolicy::new().with_candidates(AgentMode::Build, vec![closed.clone()]);
 
@@ -2011,6 +2361,7 @@ api_key_env = "OPENAI_API_KEY"
             model: "unused".to_string(),
             api_key_env: String::new(),
             context_tokens: None,
+            provider_id: None,
         }]);
         let ghost = model_id("not-in-registry");
         let policy =
@@ -2067,6 +2418,7 @@ api_key_env = "OPENAI_API_KEY"
                 model: "missing-model".to_string(),
                 api_key_env: String::new(),
                 context_tokens: None,
+                provider_id: None,
             },
             ModelConfig {
                 id: healthy.clone(),
@@ -2075,6 +2427,7 @@ api_key_env = "OPENAI_API_KEY"
                 model: "installed-model".to_string(),
                 api_key_env: String::new(),
                 context_tokens: None,
+                provider_id: None,
             },
         ]);
         let policy =
@@ -2242,6 +2595,203 @@ api_key_env = "OPENAI_API_KEY"
         assert_eq!(
             ModelsError::UnknownModel(model_id("nope")).failure_class(),
             FailureClass::Permanent
+        );
+    }
+
+    // -- catalog-resolved auth headers (provider_id) ------------------------
+
+    /// A one-request HTTP server that answers `body` and hands back the raw
+    /// request head it received, so a test can assert on the exact auth
+    /// headers a probe/client sent.
+    #[cfg(feature = "provider-openai")]
+    async fn capture_server(body: &str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 8192];
+            let n = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request[..n]).into_owned()
+        });
+        (format!("http://{address}/v1"), task)
+    }
+
+    /// The HIGH-severity auth-flatten regression: an azure-shaped provider
+    /// (catalog auth `header = "api-key"`, `prefix = ""` — the built-in
+    /// `azure-openai` entry) must round-trip its key under `api-key`, not
+    /// under a hardcoded `Authorization: Bearer`. `check_model` is asserted
+    /// on the wire; `client_for` must agree because both resolve the same
+    /// [`EndpointAuth`].
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn check_model_sends_the_catalog_declared_api_key_header_for_azure() {
+        use crate::auth::AuthStore;
+        let id = model_id("azure-openai/gpt-5.1");
+        let (url, server) = capture_server(r#"{"data":[{"id":"gpt-5.1"}]}"#).await;
+        let mut auth = AuthStore::default();
+        auth.set(id.0.as_str(), "azure-secret-key");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: url,
+            model: "gpt-5.1".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: Some("azure-openai".to_string()),
+        }])
+        .with_auth(auth);
+
+        registry
+            .check_model(&id)
+            .await
+            .expect("the endpoint lists the model");
+        let request = server.await.unwrap();
+        let head = request.to_lowercase();
+        assert!(
+            head.contains("api-key: azure-secret-key"),
+            "the key must ride the catalog-declared `api-key` header:\n{request}"
+        );
+        assert!(
+            !head.contains("authorization:"),
+            "no bearer header may be sent for an api-key provider:\n{request}"
+        );
+    }
+
+    /// The legacy shape (no `provider_id`) keeps the exact bearer wire
+    /// behavior — the back-compat half of the azure round-trip test.
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn check_model_defaults_to_bearer_when_no_provider_id_is_set() {
+        use crate::auth::AuthStore;
+        let id = model_id("groq/llama");
+        let (url, server) = capture_server(r#"{"data":[{"id":"llama-3.1-8b"}]}"#).await;
+        let mut auth = AuthStore::default();
+        auth.set(id.0.as_str(), "sk-legacy");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: url,
+            model: "llama-3.1-8b".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: None,
+        }])
+        .with_auth(auth);
+
+        registry.check_model(&id).await.expect("listed");
+        let request = server.await.unwrap();
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer sk-legacy"),
+            "a legacy entry keeps `Authorization: Bearer`:\n{request}"
+        );
+    }
+
+    /// `client_for` completes a chat call through the header-aware client for
+    /// an azure-shaped provider: the mock asserts `api-key` (no bearer) and
+    /// the provider's extra headers on the actual `/chat/completions` POST.
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn client_for_sends_catalog_headers_on_chat_completions() {
+        use crate::auth::AuthStore;
+        use agent_framework_core::client::ChatClient;
+        use agent_framework_core::types::{ChatOptions, Message};
+
+        // A user-shadowed azure-shaped provider carrying an extra header, so
+        // both the auth header and extra_headers are exercised in one call.
+        let provider_toml = r#"
+[[provider]]
+id = "azure-shaped"
+name = "Azure-shaped"
+protocol = "openai-chat"
+base_url = "https://unused.example/v1"
+extra_headers = { "x-extra-version" = "2026-01-01" }
+[[provider.auth]]
+kind = "api_key"
+env = ["AZURE_SHAPED_KEY_UNSET_TEST"]
+header = "api-key"
+prefix = ""
+"#;
+        let file: codypendent_providers::ProvidersFile =
+            toml::from_str(provider_toml).expect("provider toml");
+        let catalog = Catalog::from_providers(file.providers);
+
+        let body = r#"{"id":"resp-1","model":"gpt-5.1","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#;
+        let (url, server) = capture_server(body).await;
+
+        let id = model_id("azure-shaped/gpt-5.1");
+        let mut auth = AuthStore::default();
+        auth.set(id.0.as_str(), "azure-secret-key");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: url,
+            model: "gpt-5.1".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: Some("azure-shaped".to_string()),
+        }])
+        .with_auth(auth)
+        .with_catalog(catalog);
+
+        let client = registry.client_for(&id).await.expect("client builds");
+        let response = client
+            .get_response(vec![Message::user("ping")], ChatOptions::default())
+            .await
+            .expect("the mock answers");
+        assert_eq!(response.text(), "hi");
+
+        let request = server.await.unwrap();
+        let head = request.to_lowercase();
+        assert!(
+            head.starts_with("post /v1/chat/completions"),
+            "the chat route is the base_url sibling:\n{request}"
+        );
+        assert!(
+            head.contains("api-key: azure-secret-key"),
+            "the key rides the catalog-declared header:\n{request}"
+        );
+        assert!(
+            head.contains("x-extra-version: 2026-01-01"),
+            "provider extra headers are sent:\n{request}"
+        );
+        assert!(
+            !head.contains("authorization:"),
+            "no bearer header for an api-key provider:\n{request}"
+        );
+    }
+
+    /// A stored provider-wide key (`provider/<id>`) satisfies a model that has
+    /// no per-model `auth.json` entry and no env var — the dedupe-key-entry
+    /// seam: one pasted key serves every model added from that provider.
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn provider_wide_auth_json_key_resolves_for_models_of_that_provider() {
+        use crate::auth::AuthStore;
+        let id = model_id("nebius/deepseek");
+        let mut auth = AuthStore::default();
+        auth.set(provider_auth_id("nebius"), "nb-provider-key");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.tokenfactory.nebius.com/v1".to_string(),
+            model: "deepseek-ai/DeepSeek-V4-Flash".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: Some("nebius".to_string()),
+        }])
+        .with_auth(auth);
+        assert!(
+            registry.client_for(&id).await.is_ok(),
+            "a provider-wide stored key must satisfy the model"
         );
     }
 
