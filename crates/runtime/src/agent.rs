@@ -5327,6 +5327,230 @@ mod tests {
         }
     }
 
+    /// A recording task board: the assembly's `AssemblyTaskBoardChannel` stands
+    /// here in production. It stores what the tools actually wrote, so a test can
+    /// assert the CARD — not just that a call happened.
+    #[derive(Default)]
+    struct RecordingTaskBoard {
+        cards: Mutex<Vec<(String, codypendent_protocol::BlackboardItemView)>>,
+    }
+
+    impl RecordingTaskBoard {
+        fn view(
+            id: &str,
+            payload: Value,
+            author: Value,
+            status: &str,
+            assignee: Option<String>,
+        ) -> codypendent_protocol::BlackboardItemView {
+            codypendent_protocol::BlackboardItemView {
+                id: id.to_string(),
+                workflow_run_id: codypendent_protocol::board_scope_id("/repo"),
+                kind: "task".to_string(),
+                payload,
+                author,
+                confidence: None,
+                evidence: Vec::new(),
+                revision: 1,
+                superseded_by: None,
+                board_scope: Some("/repo".to_string()),
+                status: Some(status.to_string()),
+                assignee,
+                ordinal: Some(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TaskBoardChannel for RecordingTaskBoard {
+        async fn create(
+            &self,
+            repository: &str,
+            draft: TaskCardDraft,
+        ) -> Result<codypendent_protocol::BlackboardItemView, BlackboardChannelError> {
+            let mut cards = self.cards.lock().expect("board mutex");
+            let card = Self::view(
+                &format!("card-{}", cards.len() + 1),
+                draft.payload,
+                draft.author,
+                draft.status.as_deref().unwrap_or("todo"),
+                draft.assignee,
+            );
+            cards.push((repository.to_string(), card.clone()));
+            Ok(card)
+        }
+
+        async fn update(
+            &self,
+            repository: &str,
+            item_id: &str,
+            change: TaskCardChange,
+        ) -> Result<codypendent_protocol::BlackboardItemView, BlackboardChannelError> {
+            let mut cards = self.cards.lock().expect("board mutex");
+            let existing = cards
+                .iter()
+                .find(|(_, card)| card.id == item_id)
+                .map(|(_, card)| card.clone())
+                .ok_or_else(|| BlackboardChannelError::NotFound(item_id.to_string()))?;
+            let mut moved = Self::view(
+                item_id,
+                change.payload.unwrap_or(existing.payload),
+                change.author,
+                change
+                    .status
+                    .as_deref()
+                    .or(existing.status.as_deref())
+                    .unwrap_or("todo"),
+                change.assignee.or(existing.assignee),
+            );
+            moved.revision = existing.revision + 1;
+            cards.retain(|(_, card)| card.id != item_id);
+            cards.push((repository.to_string(), moved.clone()));
+            Ok(moved)
+        }
+
+        async fn list(
+            &self,
+            _repository: &str,
+        ) -> Result<Vec<codypendent_protocol::BlackboardItemView>, BlackboardChannelError> {
+            Ok(self
+                .cards
+                .lock()
+                .expect("board mutex")
+                .iter()
+                .map(|(_, card)| card.clone())
+                .collect())
+        }
+    }
+
+    /// Rubric 10, end to end through the loop: a scripted agent in a PLAIN chat
+    /// run (no workflow context) turns a feature request into backlog cards and
+    /// then moves one — the "break this feature into backlog cards" path.
+    ///
+    /// The three things this pins, none of which the parsing unit tests can:
+    /// the tools are dispatchable outside a workflow run; the board they write is
+    /// the run's SERVER-DERIVED repository, never an argument; and the card's
+    /// author is built from the run context, so a model cannot forge provenance.
+    #[tokio::test]
+    async fn a_scripted_agent_fills_the_backlog_and_moves_a_card() {
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::CallTool {
+                tool: TaskCreateTool::NAME.to_string(),
+                args: json!({
+                    "title": "wire the DAG viewer",
+                    "description": "edges on the wire",
+                }),
+            },
+            ModelStep::CallTool {
+                tool: TaskCreateTool::NAME.to_string(),
+                args: json!({ "title": "column-grouped board pane", "status": "doing" }),
+            },
+            ModelStep::CallTool {
+                tool: TaskMoveTool::NAME.to_string(),
+                args: json!({ "item_id": "card-1", "status": "review" }),
+            },
+            ModelStep::CallTool {
+                tool: TaskListTool::NAME.to_string(),
+                args: json!({}),
+            },
+            ModelStep::Finish {
+                summary: "backlog filled".to_string(),
+            },
+        ]);
+        let board = Arc::new(RecordingTaskBoard::default());
+        let (runtime, mut events, session_id) = test_runtime();
+        let runtime = runtime.with_task_board(board.clone());
+        let repo = tempfile::tempdir().expect("tempdir");
+        // A PLAIN chat run: no `WorkflowContext` at all.
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "break this feature into backlog cards",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        )
+        .with_board_repository("/repo");
+
+        // The tools are advertised to this run — a chat agent can reach them.
+        let advertised: Vec<String> = runtime
+            .advertised_tool_definitions(&ctx)
+            .iter()
+            .map(|definition| definition.name.clone())
+            .collect();
+        for tool in [
+            TaskCreateTool::NAME,
+            TaskUpdateTool::NAME,
+            TaskMoveTool::NAME,
+            TaskListTool::NAME,
+        ] {
+            assert!(
+                advertised.iter().any(|name| name == tool),
+                "{tool} must be advertised to a plain chat run: {advertised:?}"
+            );
+        }
+
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("the run completes");
+
+        // Every board write succeeded — no approval gate, no policy denial.
+        let mut outcomes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::ToolCompleted { tool, outcome, .. } = event.body {
+                if tool.starts_with("task.") {
+                    outcomes.push((tool, outcome));
+                }
+            }
+        }
+        assert_eq!(outcomes.len(), 4, "four task.* calls ran: {outcomes:?}");
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, outcome)| matches!(outcome, ToolOutcome::Succeeded)),
+            "a board write is internal state, never approval-gated: {outcomes:?}"
+        );
+
+        let cards = board.cards.lock().expect("board mutex").clone();
+        assert_eq!(cards.len(), 2);
+        // The board is the run's repository identity — the model never named it.
+        assert!(cards.iter().all(|(repository, _)| repository == "/repo"));
+        // The author is built server-side from the run context.
+        assert!(
+            cards
+                .iter()
+                .all(|(_, card)| card.author["role"] == "agent"
+                    && card.author.get("run_id").is_some())
+        );
+        // The second card honored its explicit column; the moved card is at its
+        // new one, at the next revision, with its body carried forward.
+        let moved = cards
+            .iter()
+            .find(|(_, card)| card.id == "card-1")
+            .expect("the moved card");
+        assert_eq!(moved.1.status.as_deref(), Some("review"));
+        assert_eq!(moved.1.revision, 2);
+        assert_eq!(moved.1.payload["title"], "wire the DAG viewer");
+        assert!(cards
+            .iter()
+            .any(|(_, card)| card.status.as_deref() == Some("doing")));
+    }
+
+    /// The gate: with no repository identity there is no board, so the `task.*`
+    /// tools are not offered at all rather than failing at call time.
+    #[test]
+    fn the_task_tools_need_a_repository_identity() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime.with_task_board(Arc::new(RecordingTaskBoard::default()));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let names = runtime.offered_tool_names(&solo_run(session_id, repo.path()));
+        assert!(
+            !names.iter().any(|name| name.starts_with("task.")),
+            "no repository identity → no board tools: {names:?}"
+        );
+    }
+
     /// FIX 1 (advertise/execute mismatch): a plain single-agent run's model must
     /// never be ADVERTISED a tool `prepare`'s dispatch gate will refuse.
     /// `FrameworkAgentRuntime::advertised_tool_definitions` is the exact set the

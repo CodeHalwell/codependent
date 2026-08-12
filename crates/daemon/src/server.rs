@@ -3877,13 +3877,17 @@ async fn read_session_events_page(
     let events = ledger::load_events_between(pool, session_id, after_sequence, through)
         .await
         .map_err(store_error)?;
-    let latest = ledger::next_sequence(pool, session_id)
+    // `next_sequence` is the sequence the NEXT append will take, so the highest
+    // one that exists is one below it — comparing against the next would report
+    // `has_more` on a fully drained ledger and spin a pager forever.
+    let highest = ledger::next_sequence(pool, session_id)
         .await
-        .map_err(store_error)?;
+        .map_err(store_error)?
+        .saturating_sub(1);
     // An empty page keeps the caller's cursor where it was, so paging is a fixed
     // point once drained rather than silently skipping the requested window.
     let reached = events.last().map_or(after_sequence, |event| event.sequence);
-    Ok((events, reached, latest > reached))
+    Ok((events, reached, highest > reached))
 }
 
 async fn send(writer: &SharedWriter, envelope: &Envelope) -> Result<(), FrameError> {

@@ -24,6 +24,7 @@ use codypendent_protocol::{
     ClientRole, Command, CommandBody, CommandId, Envelope, Payload, SessionId, Subscription,
     WorkspaceId, PROTOCOL_V1,
 };
+use codypendent_runtime::blackboard::TaskBoardChannel;
 use codypendent_workflow::{BlackboardStore, NewBlackboardItem};
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -259,4 +260,197 @@ async fn an_observer_reads_the_board_over_the_socket_and_sees_node_authored_item
         "author is the server-built node identity, not the observer"
     );
     assert_eq!(item.confidence, Some(0.9));
+}
+
+/// The repository task board over the real socket (rubric 10) — the other half
+/// of the NL-backlog vertical.
+///
+/// An agent's `task.create` writes through `AssemblyTaskBoardChannel` (exercised
+/// here directly, because a live model is out of scope for a socket test; the
+/// runtime's `a_scripted_agent_fills_the_backlog_and_moves_a_card` drives the
+/// same channel through the actual agent loop). This test pins what that write
+/// looks like from the *client* side: `ReadBlackboard` at board scope sees the
+/// agent's cards over the wire, a Controller can move one with
+/// `UpdateBlackboardItem`, and the move is a supersession that a re-read reflects.
+#[tokio::test]
+async fn an_agents_backlog_cards_are_readable_and_movable_over_the_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::from_data_dir(tmp.path().to_path_buf());
+    paths.ensure_directories().expect("create directories");
+    let repository = tmp.path().join("checkout");
+    let repository = repository.to_string_lossy().into_owned();
+
+    // Seed the board exactly as the `task.create` tool does: through the
+    // assembly channel, with an agent-built author, before the daemon starts.
+    {
+        let pool = open_pool(&paths).await;
+        let board = codypendent_codypendentd::blackboard::AssemblyTaskBoardChannel::new(
+            pool.clone(),
+            codypendent_daemon::blackboard::BlackboardHub::new(),
+        );
+        for (title, status) in [
+            ("wire the DAG viewer", None),
+            ("column-grouped board pane", Some("doing".to_string())),
+        ] {
+            board
+                .create(
+                    &repository,
+                    codypendent_runtime::blackboard::TaskCardDraft {
+                        payload: json!({ "title": title }),
+                        author: json!({ "role": "agent", "run_id": "run-1" }),
+                        status,
+                        assignee: None,
+                        ordinal: None,
+                    },
+                )
+                .await
+                .expect("agent card");
+        }
+        pool.close().await;
+    }
+
+    let _daemon = spawn_daemon(tmp.path());
+    let mut stream = wait_for_socket(&paths).await;
+    let client = ClientId::new();
+    handshake(&mut stream, client).await;
+    let session = create_session(&mut stream, client).await;
+
+    // An Observer may READ the board — the read carries no role gate.
+    attach_as_observer(&mut stream, client, session).await;
+    send(
+        &mut stream,
+        client,
+        CommandBody::ReadBlackboard {
+            workflow_run_id: String::new(),
+            kind: Some("task".to_string()),
+            include_superseded: false,
+            board_repository: Some(repository.clone()),
+        },
+        "read-board",
+    )
+    .await;
+    let cards = recv_blackboard_items(&mut stream).await;
+    assert_eq!(cards.len(), 2, "the agent's cards are on the board");
+    assert!(
+        cards
+            .iter()
+            .all(|card| card.board_scope.as_deref() == Some(repository.as_str())),
+        "board cards carry the repository they serve"
+    );
+    assert!(
+        cards
+            .iter()
+            .all(|card| card.workflow_run_id == codypendent_protocol::board_scope_id(&repository)),
+        "the board's synthetic run id is the hub key clients subscribe to"
+    );
+    assert!(
+        cards.iter().all(|card| card.author["role"] == "agent"),
+        "attribution is the agent's, built server-side"
+    );
+    let todo = cards
+        .iter()
+        .find(|card| card.status.as_deref() == Some("todo"))
+        .expect("a todo card");
+
+    // A WRITE is Controller-only: the Observer above is refused.
+    send(
+        &mut stream,
+        client,
+        CommandBody::UpdateBlackboardItem {
+            scope: codypendent_protocol::BlackboardScope::RepositoryBoard {
+                repository: repository.clone(),
+            },
+            item_id: todo.id.clone(),
+            status: Some("review".to_string()),
+            assignee: None,
+            ordinal: None,
+            payload: None,
+        },
+        "move-denied",
+    )
+    .await;
+    match recv_board_write(&mut stream).await {
+        Err(code) => assert_eq!(code, "protocol.role-denied"),
+        Ok(item) => panic!("an Observer must not move a card, got {item:?}"),
+    }
+
+    // Re-attach as a Controller and move it for real.
+    send(
+        &mut stream,
+        client,
+        CommandBody::AttachSession {
+            session_id: session,
+            last_seen_sequence: None,
+            subscriptions: vec![Subscription::SessionSummary],
+            requested_role: ClientRole::Controller,
+            repository: None,
+        },
+        "attach-controller",
+    )
+    .await;
+    loop {
+        match read_frame(&mut stream).await.payload {
+            Payload::Catchup { .. } => break,
+            Payload::Ping | Payload::Event(_) => continue,
+            other => panic!("expected Catchup, got {other:?}"),
+        }
+    }
+    send(
+        &mut stream,
+        client,
+        CommandBody::UpdateBlackboardItem {
+            scope: codypendent_protocol::BlackboardScope::RepositoryBoard {
+                repository: repository.clone(),
+            },
+            item_id: todo.id.clone(),
+            status: Some("review".to_string()),
+            assignee: Some("dana".to_string()),
+            ordinal: None,
+            payload: None,
+        },
+        "move",
+    )
+    .await;
+    let moved = recv_board_write(&mut stream)
+        .await
+        .expect("a Controller may move a card");
+    assert_eq!(moved.status.as_deref(), Some("review"));
+    assert_eq!(moved.assignee.as_deref(), Some("dana"));
+    assert_eq!(moved.revision, 2, "a move is a supersession");
+    assert_eq!(
+        moved.payload["title"], "wire the DAG viewer",
+        "a pure move carries the card body forward"
+    );
+
+    // The live board now shows the replacement, not the moved-from card.
+    send(
+        &mut stream,
+        client,
+        CommandBody::ReadBlackboard {
+            workflow_run_id: String::new(),
+            kind: Some("task".to_string()),
+            include_superseded: false,
+            board_repository: Some(repository.clone()),
+        },
+        "read-board-2",
+    )
+    .await;
+    let after = recv_blackboard_items(&mut stream).await;
+    assert_eq!(after.len(), 2, "a move replaces, never duplicates");
+    assert!(after.iter().any(|card| card.id == moved.id));
+    assert!(!after.iter().any(|card| card.id == todo.id));
+}
+
+/// Read frames until a board write's reply, returning the stored item or the
+/// rejection code.
+async fn recv_board_write(stream: &mut UnixStream) -> Result<BlackboardItemView, String> {
+    for _ in 0..16 {
+        match read_frame(stream).await.payload {
+            Payload::BlackboardItemApplied { item, .. } => return Ok(item),
+            Payload::CommandRejected(error) => return Err(error.code),
+            Payload::Ping | Payload::Event(_) | Payload::CommandAccepted { .. } => continue,
+            other => panic!("expected a board write reply, got {other:?}"),
+        }
+    }
+    panic!("no board write reply arrived");
 }

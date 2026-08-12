@@ -13,7 +13,10 @@
 //! [`RuntimeExecutor`] that drives the runtime agent loop and injects it into
 //! the server.
 
-mod blackboard;
+/// The concrete blackboard + task-board seams. Public so an integration test can
+/// drive the SAME channel the `task.*` tools use, rather than reproducing the
+/// board's write rules in test SQL (which would then drift from them).
+pub mod blackboard;
 mod documents;
 mod executor;
 mod promotion;
