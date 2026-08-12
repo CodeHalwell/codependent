@@ -395,7 +395,129 @@ codypendent index rebuild
 
 ---
 
-## 5. Agent Modes & Policy Enforcements
+## 5. Voice (Speech-to-Text & Text-to-Speech)
+
+Voice is **optional and off by default**. Turning it on takes two things
+Codypendent deliberately does not ship: a **recorder binary** already on your
+machine, and an **API key for a speech provider**. Nothing below works without
+them, and nothing below is enabled implicitly.
+
+> [!WARNING]
+> Voice was developed and tested on a machine with **no audio hardware**. The
+> request shapes, configuration handling, classification gate, and every failure
+> path are covered by tests (mock HTTP servers and fake recorder/player
+> commands), but **no part of the capture or playback path has been exercised
+> against a real microphone or speaker**. Treat your first recording on real
+> hardware as unverified, and expect to tune `record_command` for your device.
+
+### 5.1 Configuration
+
+All of voice lives in three optional tables in `<data_dir>/models.toml`,
+alongside your `[[model]]` entries:
+
+```toml
+# Speech-to-text: what your voice notes are transcribed with.
+[transcription]
+base_url = "https://api.groq.com/openai/v1"
+model = "whisper-large-v3-turbo"
+api_key_env = "GROQ_API_KEY"
+# local = true    # set ONLY for an on-device engine (see 5.4)
+
+# Text-to-speech: what reads replies aloud. Optional.
+[speech]
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini-tts"
+voice = "alloy"
+format = "mp3"
+api_key_env = "OPENAI_API_KEY"
+
+# The client-side commands voice drives.
+[voice]
+# Omit to auto-detect rec/arecord/ffmpeg on $PATH.
+record_command = ["rec", "-q", "-r", "16000", "-c", "1", "-b", "16", "{path}"]
+# Required to hear replies; the clip is fed to this command on stdin.
+play_command = ["mpv", "--no-terminal", "-"]
+push_to_talk_key = "F4"
+```
+
+Keys resolve exactly as chat models' do: a key saved via `/keys` (in
+`auth.json`) wins, then the named environment variable. Only the variable
+**name** is ever written to disk.
+
+Because `/audio/transcriptions` and `/audio/speech` are the ordinary
+OpenAI-compatible endpoints, any provider serving them works — **Groq**
+(`whisper-large-v3`, `whisper-large-v3-turbo`), **OpenAI**
+(`gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `tts-1`, `gpt-4o-mini-tts`),
+**DeepInfra**, and **Together** among them.
+
+### 5.2 Push-to-talk
+
+Press **F4** (or your `push_to_talk_key`) to start recording; press it again to
+stop and send. While recording, the status line shows a prominent
+`◉ Recording` indicator that outranks every other status message.
+
+On stop, the captured WAV is uploaded to the daemon's content-addressed
+artifact store and submitted as an audio input envelope. The daemon transcribes
+it and **the transcript becomes the run's objective**; a note reading
+`transcribed 4.0 s of audio (model whisper-large-v3-turbo)` is appended to the
+transcript so you can always see that the turn came from speech and what
+produced it. The original audio is kept and linked to its transcript — a
+transcript is an addition, never a replacement.
+
+Codypendent bundles **no recorder**. It probes `$PATH` once at startup, in
+order, for:
+
+| Binary | Package | Notes |
+| :--- | :--- | :--- |
+| `rec` | `sox` | Preferred: portable, no platform-specific device spec. |
+| `arecord` | `alsa-utils` | Linux/ALSA. |
+| `ffmpeg` | `ffmpeg` | Last: its capture device is platform-specific and often needs `record_command` tuning. |
+
+If none is found, pressing the key tells you so and names what to install — it
+never silently does nothing. `record_command` overrides the probe entirely;
+`{path}` is replaced with a temporary `.wav` path your command must write.
+
+### 5.3 Speaking replies
+
+Open the command palette and choose **"Voice: speak replies"**. Each assistant
+turn is read aloud **once it is finished** — never mid-stream, because half a
+sentence read aloud is worse than silence.
+
+Synthesis and playback happen off the UI thread with a queue depth of one: if a
+new turn finishes while a clip is still being produced, the newer one
+**replaces** the queued one rather than queueing behind it, so speech tracks the
+conversation instead of drifting minutes behind it. Playback pipes the clip to
+your `play_command` on stdin and does not wait for it to finish.
+
+With no `[speech]` entry or no `play_command`, the toggle turns itself back off
+and says which one is missing.
+
+### 5.4 Privacy: when audio may leave your machine
+
+Captured audio is classified **Confidential** by default, so it cannot leave
+your device by accident. Whether a transcription may be sent to a hosted
+provider is decided by the daemon against the **same off-device ceiling that
+governs hosted chat models** — `policy.max_off_device` in
+`<data_dir>/routing.toml`. Voice deliberately reuses that ceiling instead of
+adding a second, divergent privacy knob, so tightening it protects voice too.
+
+* `[transcription].local = true` marks an **on-device** engine (e.g. a local
+  whisper.cpp server). On-device transcription is permitted under **any**
+  ceiling.
+* Anything else is treated as leaving the device. Set it only when it is true —
+  the flag defaults to `false`, so the safe classification is the one you get by
+  saying nothing.
+* With no `routing.toml`, the built-in `balanced` ceiling (`Confidential`) does
+  permit remote transcription. To keep voice on-device, either lower the ceiling
+  (e.g. `max_off_device = { type = "Internal" }`) or use a local engine.
+
+When the ceiling forbids it, the submission is refused with
+`voice.off-device-forbidden` **before any audio is read or transmitted** — the
+run does not start, and nothing is sent.
+
+---
+
+## 6. Agent Modes & Policy Enforcements
 
 Codypendent uses 5 distinct agent modes to enforce execution boundaries:
 
