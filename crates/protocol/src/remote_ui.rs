@@ -981,6 +981,23 @@ pub struct UiWorkflowProjection {
     pub nodes: Vec<UiWorkflowNodeProjection>,
 }
 
+/// Canonical daemon-to-SDK blackboard value: one workflow run's board,
+/// projected read-only.
+///
+/// The items are the same [`BlackboardItemView`](crate::BlackboardItemView) the
+/// `ReadBlackboard` socket command replies with, so a field added to the board
+/// reaches a Remote UI producer without another projection change. A board is
+/// part of its workflow run's observable state: the resource id is a workflow
+/// run id, authorized by the same ownership join and the same `workflow-read`
+/// capability as [`UiWorkflowProjection`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiBlackboardProjection {
+    pub workflow_run_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<crate::blackboard::BlackboardItemView>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiWorkflowNodeProjection {
@@ -1151,6 +1168,20 @@ pub struct UiViewport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub density: Option<f64>,
 }
+
+/// Sustained worker-to-host message rate, in messages per second.
+///
+/// A worker's self-imposed budget must never exceed the host's, or a
+/// legitimate burst is a *kill* (the host drops the worker on
+/// `MessageRateExceeded`) instead of a recoverable local error the worker can
+/// coalesce around. These two constants are the single source for both sides
+/// and are mirrored in `sdk/ui/src/protocol.ts` as
+/// `UI_WORKER_MESSAGE_RATE_PER_SECOND` / `UI_WORKER_MESSAGE_BURST`.
+pub const UI_WORKER_MESSAGE_RATE_PER_SECOND: u32 = 240;
+
+/// Burst allowance above [`UI_WORKER_MESSAGE_RATE_PER_SECOND`] for the
+/// snapshot-then-patch storm a surface emits when it first mounts.
+pub const UI_WORKER_MESSAGE_BURST: u32 = 120;
 
 /// Hard resource ceilings applied before a tree or patch reaches a renderer.
 /// Defaults are deliberately conservative enough for a full-screen app while
@@ -3998,5 +4029,39 @@ mod tests {
         .unwrap();
         assert_eq!(workflow["workflowRunId"], "workflow-1");
         assert_eq!(workflow["nodes"][0]["nodeId"], "node-1");
+
+        // The blackboard projection carries the board's own item view, so a
+        // column added to the board reaches a producer without a wire change.
+        let blackboard = serde_json::to_value(UiBlackboardProjection {
+            workflow_run_id: "workflow-1".into(),
+            items: vec![crate::BlackboardItemView {
+                id: "item-1".into(),
+                workflow_run_id: "workflow-1".into(),
+                kind: "finding".into(),
+                payload: json!({ "note": "flaky test" }),
+                author: json!({ "role": "analyst" }),
+                confidence: Some(0.8),
+                evidence: vec![json!({ "path": "src/lib.rs" })],
+                revision: 2,
+                superseded_by: None,
+            }],
+        })
+        .unwrap();
+        assert_eq!(blackboard["workflowRunId"], "workflow-1");
+        assert_eq!(blackboard["items"][0]["kind"], "finding");
+        assert_eq!(blackboard["items"][0]["revision"], 2);
+        assert!(blackboard["items"][0].get("supersededBy").is_none());
+        let empty = serde_json::to_value(UiBlackboardProjection {
+            workflow_run_id: "workflow-1".into(),
+            items: Vec::new(),
+        })
+        .unwrap();
+        assert!(empty.get("items").is_none(), "an empty board omits items");
+        assert_eq!(
+            serde_json::from_value::<UiBlackboardProjection>(empty)
+                .expect("an omitted items array reads back as an empty board")
+                .items,
+            Vec::new()
+        );
     }
 }

@@ -2618,6 +2618,41 @@ async fn run_remote_ui_projection(
                 )?;
             }
         }
+        "blackboard" => {
+            let resource = request
+                .resource_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("blackboard subscription requires resourceId"))?;
+            authorize_workflow_resource(&state.pool, session_id, resource).await?;
+            // Subscribe before the baseline read: a post racing the read is
+            // either already in it or arrives as the next revision.
+            let mut live = state.blackboards.subscribe(resource.to_owned());
+            let mut revision = 1_u64;
+            deliver_remote_ui_projection(
+                &state,
+                session_id,
+                &subscription.producer,
+                &request.subscription_id,
+                Some(revision),
+                read_remote_ui_projection(&state, session_id, &request).await?,
+            )?;
+            loop {
+                match live.recv().await {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+                revision = revision.saturating_add(1);
+                let value = read_remote_ui_projection(&state, session_id, &request).await?;
+                deliver_remote_ui_projection(
+                    &state,
+                    session_id,
+                    &subscription.producer,
+                    &request.subscription_id,
+                    Some(revision),
+                    value,
+                )?;
+            }
+        }
         "session" | "run" | "artifact" => {
             // Subscribe before reading the baseline: a persisted event racing
             // the read is either reflected by it or delivered afterward.
@@ -2874,6 +2909,42 @@ async fn read_remote_ui_projection(
                 })?,
             ))
         }
+        "blackboard" => {
+            let resource = request
+                .resource_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("blackboard subscription requires resourceId"))?;
+            authorize_workflow_resource(&state.pool, session_id, resource).await?;
+            let Some(reader) = &state.blackboard_reader else {
+                anyhow::bail!("blackboard projection transport is unavailable");
+            };
+            // Read-only: a Remote UI producer observes the board, it never
+            // posts to it (only the workflow executor writes).
+            let items = reader
+                .read(ReadBlackboardRequest {
+                    workflow_run_id: resource.to_owned(),
+                    kind: request
+                        .parameters
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    include_superseded: request
+                        .parameters
+                        .get("includeSuperseded")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    client_id: ClientId::new(),
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+            Ok((
+                false,
+                serde_json::to_value(codypendent_protocol::UiBlackboardProjection {
+                    workflow_run_id: resource.to_owned(),
+                    items,
+                })?,
+            ))
+        }
         "command" => {
             let command_id = request
                 .resource_id
@@ -3067,6 +3138,12 @@ async fn mediate_remote_ui_action(
                     "component commands require an attached user renderer",
                     false,
                 )),
+                // Workflow lifecycle control lives outside the session ledger
+                // and is served by the `WorkflowLifecycle` seam, exactly as the
+                // connection-level `PauseWorkflow`/`CancelWorkflow` path does.
+                Some((_, role)) if is_remote_ui_workflow_control(&body) => {
+                    apply_remote_ui_workflow_control(state, role, &body).await
+                }
                 Some((client_id, role)) => {
                     let command_id = codypendent_protocol::CommandId::new();
                     let body_digest = {
@@ -3151,6 +3228,24 @@ async fn ensure_remote_ui_command_session(
         CommandBody::PauseRun { run_id }
         | CommandBody::ResumeRun { run_id }
         | CommandBody::CancelRun { run_id } => *run_id,
+        // A workflow run is owned through the agent run that started it; the
+        // same join the `workflow` projection authorizes with.
+        CommandBody::PauseWorkflow { workflow_run_id }
+        | CommandBody::ResumeWorkflow { workflow_run_id }
+        | CommandBody::RetryWorkflowNode {
+            workflow_run_id, ..
+        }
+        | CommandBody::CancelWorkflow { workflow_run_id } => {
+            return authorize_workflow_resource(pool, session_id, workflow_run_id)
+                .await
+                .map_err(|_| {
+                    codypendent_protocol::CodypendentError::new(
+                        "ui.action.cross-session",
+                        "the requested workflow run does not belong to the Remote UI broker session",
+                        false,
+                    )
+                });
+        }
         _ => return Ok(()),
     };
     match projections::run_session(pool, run_id).await {
@@ -3168,40 +3263,228 @@ async fn ensure_remote_ui_command_session(
     }
 }
 
+/// One allowlisted Remote UI action: the canonical action id a component may
+/// invoke and the daemon command it lowers to.
+///
+/// This table *is* the mediation boundary — an action id absent from it can
+/// never reach a command, whatever a component declares. Adding a mediated
+/// action is one row; every row still passes through the same ownership check
+/// ([`ensure_remote_ui_command_session`]) and the same role gate the equivalent
+/// socket command uses.
+struct RemoteUiAction {
+    /// Canonical action id. The `core.`-prefixed spelling is also accepted, so
+    /// `run.pause` and `core.run.pause` name the same command.
+    action_id: &'static str,
+    lower: fn(
+        &codypendent_protocol::UiActionInvocation,
+    ) -> Result<CommandBody, codypendent_protocol::CodypendentError>,
+}
+
+const REMOTE_UI_ACTIONS: &[RemoteUiAction] = &[
+    RemoteUiAction {
+        action_id: "run.pause",
+        lower: |invocation| {
+            Ok(CommandBody::PauseRun {
+                run_id: remote_ui_run_id(invocation)?,
+            })
+        },
+    },
+    RemoteUiAction {
+        action_id: "run.resume",
+        lower: |invocation| {
+            Ok(CommandBody::ResumeRun {
+                run_id: remote_ui_run_id(invocation)?,
+            })
+        },
+    },
+    RemoteUiAction {
+        action_id: "run.cancel",
+        lower: |invocation| {
+            Ok(CommandBody::CancelRun {
+                run_id: remote_ui_run_id(invocation)?,
+            })
+        },
+    },
+    RemoteUiAction {
+        action_id: "workflow.pause",
+        lower: |invocation| {
+            Ok(CommandBody::PauseWorkflow {
+                workflow_run_id: remote_ui_workflow_run_id(invocation)?,
+            })
+        },
+    },
+    RemoteUiAction {
+        action_id: "workflow.resume",
+        lower: |invocation| {
+            Ok(CommandBody::ResumeWorkflow {
+                workflow_run_id: remote_ui_workflow_run_id(invocation)?,
+            })
+        },
+    },
+    RemoteUiAction {
+        action_id: "workflow.retry_node",
+        lower: |invocation| {
+            Ok(CommandBody::RetryWorkflowNode {
+                workflow_run_id: remote_ui_workflow_run_id(invocation)?,
+                node_id: remote_ui_payload_string(invocation, "nodeId")?,
+            })
+        },
+    },
+    RemoteUiAction {
+        action_id: "workflow.cancel",
+        lower: |invocation| {
+            Ok(CommandBody::CancelWorkflow {
+                workflow_run_id: remote_ui_workflow_run_id(invocation)?,
+            })
+        },
+    },
+];
+
+fn remote_ui_payload_string(
+    invocation: &codypendent_protocol::UiActionInvocation,
+    field: &str,
+) -> Result<String, codypendent_protocol::CodypendentError> {
+    invocation
+        .payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            codypendent_protocol::CodypendentError::new(
+                "ui.action.invalid-payload",
+                format!(
+                    "Remote UI action {:?} requires a {field}",
+                    invocation.action_id
+                ),
+                false,
+            )
+        })
+}
+
+fn remote_ui_run_id(
+    invocation: &codypendent_protocol::UiActionInvocation,
+) -> Result<codypendent_protocol::RunId, codypendent_protocol::CodypendentError> {
+    remote_ui_payload_string(invocation, "runId")?
+        .parse::<codypendent_protocol::RunId>()
+        .map_err(|_| {
+            codypendent_protocol::CodypendentError::new(
+                "ui.action.invalid-payload",
+                "runId is not a valid run identifier",
+                false,
+            )
+        })
+}
+
+fn remote_ui_workflow_run_id(
+    invocation: &codypendent_protocol::UiActionInvocation,
+) -> Result<String, codypendent_protocol::CodypendentError> {
+    remote_ui_payload_string(invocation, "workflowRunId")
+}
+
 fn remote_ui_command(
     invocation: &codypendent_protocol::UiActionInvocation,
 ) -> Result<CommandBody, codypendent_protocol::CodypendentError> {
-    let run_id = || {
-        invocation
-            .payload
-            .get("runId")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                codypendent_protocol::CodypendentError::new(
-                    "ui.action.invalid-payload",
-                    "run command requires a runId",
-                    false,
-                )
-            })?
-            .parse::<codypendent_protocol::RunId>()
-            .map_err(|_| {
-                codypendent_protocol::CodypendentError::new(
-                    "ui.action.invalid-payload",
-                    "runId is not a valid run identifier",
-                    false,
-                )
-            })
+    let action_id = invocation.action_id.as_str();
+    let canonical = action_id.strip_prefix("core.").unwrap_or(action_id);
+    REMOTE_UI_ACTIONS
+        .iter()
+        .find(|action| action.action_id == canonical)
+        .ok_or_else(|| {
+            codypendent_protocol::CodypendentError::new(
+                "ui.action.not-authorized",
+                format!("Remote UI action {action_id:?} is not a mediated daemon command"),
+                false,
+            )
+        })
+        .and_then(|action| (action.lower)(invocation))
+}
+
+fn is_remote_ui_workflow_control(body: &CommandBody) -> bool {
+    matches!(
+        body,
+        CommandBody::PauseWorkflow { .. }
+            | CommandBody::ResumeWorkflow { .. }
+            | CommandBody::RetryWorkflowNode { .. }
+            | CommandBody::CancelWorkflow { .. }
+    )
+}
+
+/// Drive an allowlisted `workflow.*` action through the same
+/// [`WorkflowLifecycle`] seam and the same `Controller`-only gate the
+/// connection-level workflow commands use. A workflow run lives outside the
+/// session ledger, so there is no `CommandService` write path to reuse; the
+/// reply mirrors the connection path's fast accept/reject.
+async fn apply_remote_ui_workflow_control(
+    state: &Arc<ServerState>,
+    role: ClientRole,
+    body: &CommandBody,
+) -> Result<crate::commands::CommandOutcome, codypendent_protocol::CodypendentError> {
+    if role != ClientRole::Controller {
+        return Err(codypendent_protocol::CodypendentError::new(
+            "protocol.role-denied",
+            format!("role {role:?} may not control a workflow run"),
+            false,
+        ));
+    }
+    let Some(lifecycle) = state.lifecycle.as_ref() else {
+        return Err(codypendent_protocol::CodypendentError::new(
+            "workflow.transport-unavailable",
+            "workflow transport is not enabled on this daemon",
+            false,
+        ));
     };
-    match invocation.action_id.as_str() {
-        "run.pause" | "core.run.pause" => Ok(CommandBody::PauseRun { run_id: run_id()? }),
-        "run.resume" | "core.run.resume" => Ok(CommandBody::ResumeRun { run_id: run_id()? }),
-        "run.cancel" | "core.run.cancel" => Ok(CommandBody::CancelRun { run_id: run_id()? }),
-        action_id => Err(codypendent_protocol::CodypendentError::new(
+    let client_id = ClientId::new();
+    match body {
+        CommandBody::PauseWorkflow { workflow_run_id } => {
+            lifecycle
+                .pause(PauseWorkflowRequest {
+                    workflow_run_id: workflow_run_id.clone(),
+                    client_id,
+                })
+                .await
+        }
+        CommandBody::ResumeWorkflow { workflow_run_id } => {
+            lifecycle
+                .resume(ResumeWorkflowRequest {
+                    workflow_run_id: workflow_run_id.clone(),
+                    client_id,
+                })
+                .await
+        }
+        CommandBody::RetryWorkflowNode {
+            workflow_run_id,
+            node_id,
+        } => {
+            lifecycle
+                .retry_node(RetryWorkflowNodeRequest {
+                    workflow_run_id: workflow_run_id.clone(),
+                    node_id: node_id.clone(),
+                    client_id,
+                })
+                .await
+        }
+        CommandBody::CancelWorkflow { workflow_run_id } => {
+            lifecycle
+                .cancel(CancelWorkflowRequest {
+                    workflow_run_id: workflow_run_id.clone(),
+                    client_id,
+                })
+                .await
+        }
+        _ => Err(codypendent_protocol::CodypendentError::new(
             "ui.action.not-authorized",
-            format!("Remote UI action {action_id:?} is not a mediated daemon command"),
+            "not a workflow lifecycle command",
             false,
         )),
     }
+    .map(|()| crate::commands::CommandOutcome {
+        command_id: codypendent_protocol::CommandId::new(),
+        created_session: None,
+        created_run: None,
+        last_sequence: None,
+        newly_applied: true,
+    })
 }
 
 async fn attach_remote_ui(
@@ -3809,13 +4092,130 @@ mod resume {
 #[cfg(test)]
 mod tests {
     use super::{
-        admits_run, claim_ui_plugin_command, persist_ui_plugin_command_result,
-        remote_ui_artifact_range, resume,
+        admits_run, claim_ui_plugin_command, is_remote_ui_workflow_control,
+        persist_ui_plugin_command_result, remote_ui_artifact_range, remote_ui_command, resume,
+        REMOTE_UI_ACTIONS,
     };
     use chrono::Utc;
     use codypendent_protocol::{
         AgentMode, ClientId, CommandBody, CommandId, Payload, RunId, SessionId,
     };
+
+    fn invocation(
+        action_id: &str,
+        payload: serde_json::Value,
+    ) -> codypendent_protocol::UiActionInvocation {
+        codypendent_protocol::UiActionInvocation {
+            invocation_id: "invocation-1".into(),
+            document_id: codypendent_protocol::UiDocumentId::from("document-1"),
+            revision: codypendent_protocol::UiRevision(1),
+            source_node_id: codypendent_protocol::UiNodeId::from("node-1"),
+            action_id: codypendent_protocol::UiActionId::from(action_id),
+            payload,
+            form_data: Default::default(),
+            interaction_token: None,
+            interaction_event_type: None,
+        }
+    }
+
+    #[test]
+    fn the_mediated_action_table_is_the_whole_allowlist() {
+        // Adding a mediated action must be one table row and nothing else.
+        let ids = REMOTE_UI_ACTIONS
+            .iter()
+            .map(|action| action.action_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "run.pause",
+                "run.resume",
+                "run.cancel",
+                "workflow.pause",
+                "workflow.resume",
+                "workflow.retry_node",
+                "workflow.cancel",
+            ]
+        );
+
+        let run_id = RunId::new();
+        assert!(matches!(
+            remote_ui_command(&invocation("run.pause", serde_json::json!({ "runId": run_id.to_string() }))),
+            Ok(CommandBody::PauseRun { run_id: lowered }) if lowered == run_id
+        ));
+        // The `core.` spelling names the same command.
+        assert!(matches!(
+            remote_ui_command(&invocation(
+                "core.run.cancel",
+                serde_json::json!({ "runId": run_id.to_string() })
+            )),
+            Ok(CommandBody::CancelRun { .. })
+        ));
+        assert!(matches!(
+            remote_ui_command(&invocation("workflow.retry_node", serde_json::json!({ "workflowRunId": "wf-1", "nodeId": "build" }))),
+            Ok(CommandBody::RetryWorkflowNode { workflow_run_id, node_id }) if workflow_run_id == "wf-1" && node_id == "build"
+        ));
+        assert!(matches!(
+            remote_ui_command(&invocation("workflow.cancel", serde_json::json!({ "workflowRunId": "wf-1" }))),
+            Ok(CommandBody::CancelWorkflow { workflow_run_id }) if workflow_run_id == "wf-1"
+        ));
+
+        // Everything outside the table is refused, including near-misses and
+        // commands the daemon has but never mediates.
+        for action_id in [
+            "workflow.start",
+            "session.close",
+            "run.pause.extra",
+            "core.core.run.pause",
+            "blackboard.post",
+            "",
+        ] {
+            let error = remote_ui_command(&invocation(
+                action_id,
+                serde_json::json!({ "runId": run_id.to_string() }),
+            ))
+            .expect_err("unlisted action is not mediated");
+            assert_eq!(error.code, "ui.action.not-authorized", "{action_id}");
+        }
+
+        // A listed action with an unusable payload is a payload error, never a
+        // command with a fabricated resource.
+        let error = remote_ui_command(&invocation(
+            "workflow.retry_node",
+            serde_json::json!({ "workflowRunId": "wf-1" }),
+        ))
+        .expect_err("retry needs a node id");
+        assert_eq!(error.code, "ui.action.invalid-payload");
+        let error = remote_ui_command(&invocation("run.pause", serde_json::json!({ "runId": "" })))
+            .expect_err("an empty run id is not a run id");
+        assert_eq!(error.code, "ui.action.invalid-payload");
+    }
+
+    #[test]
+    fn workflow_control_is_routed_off_the_session_ledger() {
+        // Workflow lifecycle lives in its own durable store, so these bodies go
+        // to the `WorkflowLifecycle` seam rather than `CommandService::apply`.
+        for body in [
+            CommandBody::PauseWorkflow {
+                workflow_run_id: "wf-1".into(),
+            },
+            CommandBody::ResumeWorkflow {
+                workflow_run_id: "wf-1".into(),
+            },
+            CommandBody::RetryWorkflowNode {
+                workflow_run_id: "wf-1".into(),
+                node_id: "build".into(),
+            },
+            CommandBody::CancelWorkflow {
+                workflow_run_id: "wf-1".into(),
+            },
+        ] {
+            assert!(is_remote_ui_workflow_control(&body), "{body:?}");
+        }
+        assert!(!is_remote_ui_workflow_control(&CommandBody::PauseRun {
+            run_id: RunId::new()
+        }));
+    }
 
     const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 

@@ -5,7 +5,10 @@ import {
   ApplicationShell,
   ConversationComposer,
   ConversationTranscript,
+  KanbanBoard,
   RunProgress,
+  type BoardCard,
+  type BoardColumn,
   type ConversationMessage,
 } from "../../src/first-party/index.js";
 
@@ -28,6 +31,19 @@ const messages: readonly ConversationMessage[] = [
     createdAt: "2026-08-11T10:00:02Z",
     status: "streaming",
   },
+];
+
+const boardColumns: readonly BoardColumn[] = [
+  { id: "backlog", label: "Backlog", emptyMessage: "Nothing queued" },
+  { id: "in-progress", label: "In progress", limit: 2 },
+  { id: "review", label: "Review" },
+  { id: "done", label: "Done" },
+];
+
+const boardCards: readonly BoardCard[] = [
+  { id: "card-1", title: "Draw the workflow DAG", columnId: "in-progress", status: "running", assignee: "codypendent", kind: "task" },
+  { id: "card-2", title: "Blackboard projection", columnId: "review", status: "waiting", assignee: "daniel", kind: "task", summary: "Read-only board projection for UI producers." },
+  { id: "card-3", title: "Rate limit alignment", columnId: "done", status: "completed", kind: "task" },
 ];
 
 export interface CatalogueExampleProps {
@@ -69,6 +85,17 @@ export function CatalogueExample({ draft, runStatus }: CatalogueExampleProps): R
           elapsed="12s"
           steerIntent={{ action: "run.steer", label: "Steer", shortcut: "Ctrl+Enter" }}
           cancelIntent={{ action: "run.cancel", label: "Cancel", tone: "critical" }}
+        />
+        <KanbanBoard
+          id="board"
+          title="Backlog"
+          description="Move cards with the keyboard; every move is a mediated intent."
+          columns={boardColumns}
+          cards={boardCards}
+          selectedCardId="card-2"
+          selectCardAction="board.card.select"
+          moveCardAction="board.card.move"
+          cardIntents={[{ action: "board.card.assign", label: "Assign to me" }]}
         />
         <ConversationComposer
           id="composer"

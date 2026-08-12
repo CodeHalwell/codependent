@@ -174,6 +174,27 @@ function dimension(value: UiJsonValue | undefined): string | undefined {
   return typeof value === "string" && SAFE_DIMENSION.test(value) ? value : undefined;
 }
 
+/**
+ * `Grid.columns` is a track count or an explicit track list — the same
+ * contract the terminal host normalizes (`crates/tui/src/remote_ui/codec.rs`).
+ * Only the safe subset of track syntax survives into the CSP-restricted
+ * webview: `Nfr`, a safe dimension, `auto`, or a plain number of pixels.
+ */
+function gridTemplateColumns(value: UiJsonValue | undefined): string {
+  if (Array.isArray(value)) {
+    const tracks = value.slice(0, 24).flatMap((track) => {
+      if (typeof track === "number" && Number.isFinite(track) && track >= 0) return [`${track}px`];
+      if (typeof track !== "string") return [];
+      if (/^[0-9]+(?:\.[0-9]+)?fr$/.test(track)) return [track];
+      const safe = dimension(track);
+      return safe === undefined ? [] : [`minmax(0, ${safe})`];
+    });
+    if (tracks.length > 0) return tracks.join(" ");
+  }
+  const count = typeof value === "number" && Number.isFinite(value) ? Math.trunc(value) : 2;
+  return `repeat(${Math.max(1, Math.min(24, count))}, minmax(0, 1fr))`;
+}
+
 function align(value: UiJsonValue | undefined): CSSProperties["alignItems"] {
   switch (value) {
     case "start": return "flex-start";
@@ -291,8 +312,7 @@ function LayoutPrimitive({ node }: { node: UiElementNode }): ReactNode {
   const style = layoutStyle(props, direction);
   if (node.type === "Grid") {
     style.display = "grid";
-    const columns = Math.max(1, Math.min(24, numberProp(props, "columns", 2)));
-    style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
+    style.gridTemplateColumns = gridTemplateColumns(props.columns);
   }
   if (node.type === "ScrollArea") {
     style.overflowX = props.axis === "vertical" ? "hidden" : "auto";
@@ -411,15 +431,214 @@ function CollectionPrimitive({ node }: { node: UiElementNode }): ReactNode {
     const expanded = new Set(arrayValue(props.expandedKeys).map(String));
     return <div role="tree" className="ui-tree"><TreeItems node={node} items={arrayValue(props.items)} level={1} expanded={expanded} /></div>;
   }
-  if (node.type === "Graph") {
-    return <figure className="ui-graph"><figcaption>{nodeLabel(node)}</figcaption><div className="ui-graph-nodes"><GenericItems items={arrayValue(props.nodes)} /></div><div className="ui-graph-edges" aria-label="Edges"><GenericItems items={arrayValue(props.edges)} /></div></figure>;
-  }
+  if (node.type === "Graph") return <GraphView node={node} />;
   if (node.type === "Chart" || node.type === "Sparkline") return <ChartView node={node} />;
   const items = arrayValue(props.items);
   const empty = stringProp(props, "emptyMessage", "No items");
   if (items.length === 0 && node.children.length === 0) return <p className="ui-muted">{empty}</p>;
   const interactive = typeof props.action === "string" || typeof props.selectAction === "string";
   return <>{items.length > 0 ? React.createElement(node.type === "Timeline" ? "ol" : "ul", { className: "ui-list" }, items.slice(0, MAX_STATIC_ITEMS).map((item, index) => { const record = objectValue(item); const label = record === undefined ? displayValue(item) : displayValue(record.label ?? record.title ?? record.value ?? item); const key = record === undefined ? `${index}-${label}` : String(record.id ?? record.key ?? `${index}-${label}`); return <li key={key}>{interactive ? <button onClick={() => actions.dispatch(node, "select", eventPayload(node, { item, index }))}>{label}</button> : label}</li>; }), items.length > MAX_STATIC_ITEMS ? <li className="ui-muted">{items.length - MAX_STATIC_ITEMS} more items omitted.</li> : null) : null}<NodeChildren node={node} /></>;
+}
+
+interface GraphLayoutNode {
+  index: number;
+  id: string;
+  label: string;
+  status: string;
+  layer: number;
+  slot: number;
+  x: number;
+  y: number;
+  width: number;
+  item: UiJsonValue;
+}
+
+interface GraphLayout {
+  nodes: readonly GraphLayoutNode[];
+  edges: readonly { from: GraphLayoutNode; to: GraphLayoutNode; label: string }[];
+  width: number;
+  height: number;
+}
+
+const GRAPH_NODE_HEIGHT = 30;
+const GRAPH_LAYER_GAP = 56;
+const GRAPH_SLOT_GAP = 18;
+const GRAPH_CHAR_WIDTH = 7.4;
+const GRAPH_MAX_NODES = 400;
+
+function graphItemKey(item: UiJsonValue, index: number): string {
+  const record = objectValue(item);
+  const id = record === undefined ? undefined : record.id ?? record.key;
+  return typeof id === "string" && id.length > 0 ? id : graphItemLabel(item, index);
+}
+
+function graphItemLabel(item: UiJsonValue, index: number): string {
+  const record = objectValue(item);
+  if (record === undefined) return displayValue(item) || `Node ${index + 1}`;
+  return displayValue(record.label ?? record.title ?? record.name ?? record.id ?? item) || `Node ${index + 1}`;
+}
+
+/**
+ * Longest-path layering, mirroring `layout_graph_diagram` in the terminal host
+ * so both renderers rank a workflow the same way. Relaxation is bounded by the
+ * node count and capped at `nodes - 1`, so a cycle terminates instead of
+ * running away; the leftover back-edge is still drawn, just not layered.
+ */
+function graphLayers(count: number, edges: readonly (readonly [number, number])[]): number[] {
+  const depth = new Array<number>(count).fill(0);
+  const cap = Math.max(0, count - 1);
+  for (let pass = 0; pass < count; pass += 1) {
+    let changed = false;
+    for (const [from, to] of edges) {
+      if (from === to) continue;
+      const candidate = depth[from] + 1;
+      if (candidate > depth[to] && candidate <= cap) {
+        depth[to] = candidate;
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  const ranks = [...new Set(depth)].sort((left, right) => left - right);
+  return depth.map((value) => ranks.indexOf(value));
+}
+
+/** `undefined` when the data cannot support a diagram; the caller lists instead. */
+function layoutGraph(node: UiElementNode): GraphLayout | undefined {
+  const items = arrayValue(node.props.nodes);
+  if (items.length === 0 || items.length > GRAPH_MAX_NODES) return undefined;
+  const keys = items.map((item, index) => graphItemKey(item, index));
+  const indexOf = (key: string): number | undefined => {
+    const direct = keys.indexOf(key);
+    if (direct >= 0) return direct;
+    const byLabel = items.findIndex((item, index) => graphItemLabel(item, index) === key);
+    return byLabel >= 0 ? byLabel : undefined;
+  };
+  const declared = arrayValue(node.props.edges).flatMap((value) => {
+    const record = objectValue(value);
+    if (record === undefined) return [];
+    const from = record.from ?? record.source;
+    const to = record.to ?? record.target;
+    if (typeof from !== "string" || typeof to !== "string") return [];
+    const fromIndex = indexOf(from);
+    const toIndex = indexOf(to);
+    if (fromIndex === undefined || toIndex === undefined) return [];
+    return [{ from: fromIndex, to: toIndex, label: displayValue(record.label ?? record.condition ?? "") }];
+  });
+  if (declared.length === 0) return undefined;
+  const depth = graphLayers(items.length, declared.map((edge) => [edge.from, edge.to] as const));
+  const layerCount = Math.max(...depth) + 1;
+  if (layerCount < 2) return undefined;
+  const horizontal = node.props.direction === "horizontal";
+  const slots = new Array<number>(layerCount).fill(0);
+  const laid: GraphLayoutNode[] = items.map((item, index) => {
+    const label = graphItemLabel(item, index);
+    const record = objectValue(item);
+    const slot = slots[depth[index]];
+    slots[depth[index]] += 1;
+    return {
+      index, item, label,
+      id: keys[index],
+      status: typeof record?.status === "string" ? record.status : "",
+      layer: depth[index], slot, x: 0, y: 0,
+      width: Math.max(64, Math.min(240, Math.round(label.length * GRAPH_CHAR_WIDTH) + 24)),
+    };
+  });
+  const widest = Math.max(...laid.map((entry) => entry.width));
+  const lanes = Math.max(...slots);
+  for (const entry of laid) {
+    const along = entry.layer * ((horizontal ? widest : GRAPH_NODE_HEIGHT) + GRAPH_LAYER_GAP);
+    const across = entry.slot * ((horizontal ? GRAPH_NODE_HEIGHT : widest) + GRAPH_SLOT_GAP);
+    entry.x = horizontal ? along : across;
+    entry.y = horizontal ? across : along;
+  }
+  const span = (count: number, size: number, gap: number): number => count * size + Math.max(0, count - 1) * gap;
+  return {
+    nodes: laid,
+    edges: declared.map((edge) => ({ from: laid[edge.from], to: laid[edge.to], label: edge.label })),
+    width: horizontal ? span(layerCount, widest, GRAPH_LAYER_GAP) : span(lanes, widest, GRAPH_SLOT_GAP),
+    height: horizontal ? span(lanes, GRAPH_NODE_HEIGHT, GRAPH_SLOT_GAP) : span(layerCount, GRAPH_NODE_HEIGHT, GRAPH_LAYER_GAP),
+  };
+}
+
+function GraphNodeList({ node }: { node: UiElementNode }): ReactNode {
+  return (
+    <>
+      <div className="ui-graph-nodes"><GenericItems items={arrayValue(node.props.nodes)} /></div>
+      <div className="ui-graph-edges" aria-label="Edges"><GenericItems items={arrayValue(node.props.edges)} /></div>
+    </>
+  );
+}
+
+/**
+ * A layered DAG drawn as inline SVG, laid out in the webview. Nodes stay
+ * individually selectable (a `select` event carries the node id), and the
+ * whole diagram degrades to the node/edge lists when the data cannot be
+ * ranked — the same fidelity ladder the terminal host walks.
+ */
+function GraphView({ node }: { node: UiElementNode }): ReactNode {
+  const actions = useRendererActions();
+  const layout = layoutGraph(node);
+  const label = nodeLabel(node);
+  if (layout === undefined) {
+    return <figure className="ui-graph"><figcaption>{label}</figcaption><GraphNodeList node={node} /></figure>;
+  }
+  const selected = stringProp(node.props, "selectedKey");
+  const select = (entry: GraphLayoutNode): void =>
+    actions.dispatch(node, "select", eventPayload(node, { nodeId: entry.id, index: entry.index, item: entry.item }));
+  const marker = `${node.id ?? "graph"}-arrow`;
+  return (
+    <figure className="ui-graph">
+      <figcaption>{label}</figcaption>
+      <svg
+        className="ui-graph-canvas"
+        role="group"
+        aria-label={`${label}: ${layout.nodes.length} nodes, ${layout.edges.length} connections`}
+        viewBox={`-2 -2 ${layout.width + 4} ${layout.height + 4}`}
+        style={{ maxWidth: "100%", height: "auto" }}
+      >
+        <defs>
+          <marker id={marker} markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 Z" fill="currentColor" />
+          </marker>
+        </defs>
+        <g className="ui-graph-edge-layer" fill="none" stroke="currentColor" strokeWidth="1">
+          {layout.edges.map((edge, index) => {
+            const start = { x: edge.from.x + edge.from.width / 2, y: edge.from.y + GRAPH_NODE_HEIGHT };
+            const end = { x: edge.to.x + edge.to.width / 2, y: edge.to.y };
+            const middle = (start.y + end.y) / 2;
+            return (
+              <path
+                key={`${edge.from.id}-${edge.to.id}-${index}`}
+                className="ui-graph-edge"
+                d={`M${start.x},${start.y} C${start.x},${middle} ${end.x},${middle} ${end.x},${end.y}`}
+                markerEnd={`url(#${marker})`}
+              >
+                <title>{edge.label.length > 0 ? `${edge.from.label} → ${edge.to.label}: ${edge.label}` : `${edge.from.label} → ${edge.to.label}`}</title>
+              </path>
+            );
+          })}
+        </g>
+        {layout.nodes.map((entry) => (
+          <g
+            key={entry.id}
+            className={`ui-graph-node status-${entry.status || "unknown"}${entry.id === selected ? " is-selected" : ""}`}
+            data-ui-graph-node={entry.id}
+            role="button"
+            tabIndex={0}
+            aria-label={entry.status.length > 0 ? `${entry.label}, ${entry.status}` : entry.label}
+            aria-pressed={entry.id === selected}
+            onClick={() => select(entry)}
+            onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(entry); } }}
+          >
+            <rect x={entry.x} y={entry.y} width={entry.width} height={GRAPH_NODE_HEIGHT} rx="4" fill="none" stroke="currentColor" />
+            <text x={entry.x + entry.width / 2} y={entry.y + GRAPH_NODE_HEIGHT / 2} textAnchor="middle" dominantBaseline="middle" fill="currentColor">{entry.label}</text>
+          </g>
+        ))}
+      </svg>
+      <details className="ui-graph-detail"><summary>Node and edge list</summary><GraphNodeList node={node} /></details>
+    </figure>
+  );
 }
 
 function VirtualListView({ node }: { node: UiElementNode }): ReactNode {

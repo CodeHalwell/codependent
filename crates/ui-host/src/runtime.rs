@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use codypendent_protocol::{
     UiActionResult, UiCapabilities, UiCapabilitySelection, UiDispose, UiDocumentId, UiEvent,
     UiHardLimits, UiHotReload, UiProjectionUpdate, UiProtocolVersion, UiResyncRequest, UiRevision,
-    UiViewport, UiWireMessage,
+    UiViewport, UiWireMessage, UI_WORKER_MESSAGE_BURST, UI_WORKER_MESSAGE_RATE_PER_SECOND,
 };
 use codypendent_sandbox::{
     checksum_of, enforcing_executor, sanitize_untrusted, CapabilitySet, InstalledPlugin,
@@ -794,8 +794,8 @@ impl Default for UiWorkerConfig {
             shutdown_timeout: Duration::from_secs(3),
             maximum_lifetime: Duration::from_secs(60 * 60),
             maximum_messages: 1_000_000,
-            message_rate_per_second: 240,
-            message_rate_burst: 120,
+            message_rate_per_second: UI_WORKER_MESSAGE_RATE_PER_SECOND,
+            message_rate_burst: UI_WORKER_MESSAGE_BURST,
             byte_rate_per_second: 4 * 1024 * 1024,
             byte_rate_burst: 16 * 1024 * 1024,
             stderr_bytes: 256 * 1024,
@@ -2476,7 +2476,9 @@ fn projection_capability(kind: &str) -> Option<&'static str> {
         "artifact" => Some("artifact-read"),
         "context" | "session" => Some("context-read"),
         "run" => Some("run-read"),
-        "workflow" => Some("workflow-read"),
+        // A run's blackboard is part of that workflow run's observable state:
+        // same resource id, same ownership join, same read-only authority.
+        "workflow" | "blackboard" => Some("workflow-read"),
         "command" => Some("command-invoke"),
         _ => None,
     }
@@ -3221,9 +3223,28 @@ targets = ["shared"]
     }
 
     #[test]
+    fn worker_message_budget_is_the_shared_protocol_ceiling() {
+        // The SDK worker defaults to exactly these numbers
+        // (`sdk/ui/src/protocol.ts`). A worker allowed to send more than the
+        // host accepts turns a legitimate mount-time patch burst into a kill.
+        let config = UiWorkerConfig::default();
+        assert_eq!(
+            config.message_rate_per_second,
+            UI_WORKER_MESSAGE_RATE_PER_SECOND
+        );
+        assert_eq!(config.message_rate_burst, UI_WORKER_MESSAGE_BURST);
+        assert_eq!(UI_WORKER_MESSAGE_RATE_PER_SECOND, 240);
+        assert_eq!(UI_WORKER_MESSAGE_BURST, 120);
+    }
+
+    #[test]
     fn command_descriptors_use_the_command_invoke_capability() {
         assert_eq!(projection_capability("command"), Some("command-invoke"));
         assert_eq!(projection_capability("artifact"), Some("artifact-read"));
+        // A workflow run's blackboard rides the workflow-read capability: same
+        // resource id, same ownership join, read-only either way.
+        assert_eq!(projection_capability("workflow"), Some("workflow-read"));
+        assert_eq!(projection_capability("blackboard"), Some("workflow-read"));
         assert_eq!(projection_capability("raw-daemon-handle"), None);
     }
 

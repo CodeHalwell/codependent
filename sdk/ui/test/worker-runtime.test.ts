@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { PassThrough } from "node:stream";
-import { DEFAULT_UI_HARD_LIMITS, MINIMAL_TERMINAL_CAPABILITIES, type UiWireMessage } from "../src/protocol.js";
+import {
+  DEFAULT_UI_HARD_LIMITS,
+  MINIMAL_TERMINAL_CAPABILITIES,
+  UI_WORKER_MESSAGE_BURST,
+  UI_WORKER_MESSAGE_RATE_PER_SECOND,
+  type UiWireMessage,
+} from "../src/protocol.js";
 import { Button, Stack, Text } from "../src/primitives.js";
 import { HotReloadStateStore } from "../src/hot-reload.js";
 import { createPureUiSurface, UiWorkerRuntime, type UiWorkerTransport } from "../src/worker/runtime.js";
@@ -190,5 +196,52 @@ describe("worker runtime", () => {
     transport.push({ type: "host.dispose", messageId: "dispose", extensions: { control: {} } });
     await waitFor(transport, "worker.disposed");
     await expect(running).resolves.toBeUndefined();
+  });
+  it("defaults its message budget to the host's own ceiling", async () => {
+    // crates/ui-host/src/runtime.rs kills a worker that exceeds
+    // UI_WORKER_MESSAGE_RATE_PER_SECOND + UI_WORKER_MESSAGE_BURST, so the
+    // worker's self-imposed budget must be the same numbers: it then fails
+    // locally (recoverable) instead of being killed.
+    expect(UI_WORKER_MESSAGE_RATE_PER_SECOND).toBe(240);
+    expect(UI_WORKER_MESSAGE_BURST).toBe(120);
+    const transport = new MemoryTransport();
+    let count = 0;
+    const runtime = new UiWorkerRuntime(transport, {
+      capabilityOffer: MINIMAL_TERMINAL_CAPABILITIES,
+      // Only the sustained rate is overridden; the burst stays at its default
+      // so the thrown budget is the one a real worker is held to.
+      messagesPerSecond: 0,
+      surfaces: [createPureUiSurface({
+        documentId: "main",
+        render: () => Stack({ id: "root", children: [
+          Text({ id: "count", value: String(count) }),
+          Button({ id: "local", label: "Increment", localEvents: ["press"] }),
+        ] }),
+        onEvent(event) {
+          if (event.targetId !== "local" || event.type !== "press") return false;
+          count += 1;
+          return true;
+        },
+      })],
+    });
+    const running = runtime.run();
+    transport.push({ type: "capabilities", messageId: "host", capabilities: MINIMAL_TERMINAL_CAPABILITIES });
+    await waitFor(transport, "capabilities");
+    transport.push({ type: "capabilitySelection", messageId: "selection", selection: {
+      protocolVersion: { major: 1, minor: 0 }, primitives: MINIMAL_TERMINAL_CAPABILITIES.primitives,
+      capabilities: [], contributionPoints: [], imageProtocols: [], colorDepth: 1,
+      unicode: false, mouse: false, screenReader: false, viewport: MINIMAL_TERMINAL_CAPABILITIES.viewport,
+      limits: DEFAULT_UI_HARD_LIMITS,
+    } });
+    await waitFor(transport, "snapshot");
+    for (let index = 0; index < UI_WORKER_MESSAGE_BURST + 8; index += 1) {
+      transport.push({
+        type: "event", messageId: `press-${index}`, event: {
+          protocolVersion: { major: 1, minor: 0 }, eventId: `press-${index}`, documentId: "main", revision: index,
+          targetId: "local", type: "press", payload: null,
+        },
+      });
+    }
+    await expect(running).rejects.toThrow(`0/s + ${UI_WORKER_MESSAGE_BURST} burst message budget`);
   });
 });

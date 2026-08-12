@@ -1,4 +1,5 @@
 export * from "./artifacts.js";
+export * from "./board.js";
 export * from "./conversation.js";
 export * from "./execution.js";
 export * from "./foundation.js";

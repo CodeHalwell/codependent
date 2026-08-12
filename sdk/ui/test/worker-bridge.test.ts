@@ -114,4 +114,43 @@ describe("mediated worker bridge", () => {
     await expect(result).rejects.toMatchObject({ name: "AbortError" });
     expect(messages.filter((message) => message.type === "cancelAction")).toHaveLength(1);
   });
+  it("decodes a blackboard projection and preserves fields it does not know", () => {
+    const messages: UiWireMessage[] = [];
+    const bridge = new MediatedUiBridge(async (message) => { messages.push(message); });
+    const board = bridge.blackboard("workflow-1", { kind: "finding" });
+    // The same resource + parameters resolve to one shared subscription.
+    expect(bridge.blackboard("workflow-1", { kind: "finding" })).toBe(board);
+    expect(bridge.blackboard("workflow-1")).not.toBe(board);
+    const stop = board.subscribe(() => undefined);
+    const subscription = messages.find((message) => message.type === "subscription" && message.subscription.kind === "blackboard");
+    if (subscription?.type !== "subscription") throw new Error("missing blackboard subscription");
+    expect(subscription.subscription).toMatchObject({ kind: "blackboard", resourceId: "workflow-1", parameters: { kind: "finding" } });
+
+    expect(bridge.applyProjection({
+      subscriptionId: subscription.subscription.subscriptionId,
+      revision: 1,
+      value: {
+        workflowRunId: "workflow-1",
+        items: [
+          {
+            id: "item-1", workflowRunId: "workflow-1", kind: "finding", revision: 2,
+            payload: { note: "flaky test" }, author: { role: "analyst" }, confidence: 0.8,
+            evidence: [{ path: "src/lib.rs" }], supersededBy: "item-2",
+            // Columns a later daemon adds must survive the decode.
+            boardScope: "run", status: "in-progress",
+          },
+          { id: "malformed", kind: "finding" },
+        ],
+      },
+    })).toBe(true);
+
+    const snapshot = board.getSnapshot();
+    expect(snapshot?.workflowRunId).toBe("workflow-1");
+    expect(snapshot?.items).toHaveLength(1);
+    expect(snapshot?.items[0]).toMatchObject({
+      id: "item-1", kind: "finding", revision: 2, confidence: 0.8, supersededBy: "item-2",
+      extra: { boardScope: "run", status: "in-progress" },
+    });
+    stop();
+  });
 });

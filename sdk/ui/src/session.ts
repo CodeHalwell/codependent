@@ -62,6 +62,36 @@ export interface WorkflowView {
   nodes: readonly WorkflowNodeView[];
 }
 
+/**
+ * One artifact posted to a workflow run's blackboard. Unknown fields survive
+ * in `extra` rather than being dropped, so a board column added daemon-side
+ * reaches a component without an SDK release.
+ */
+export interface BlackboardItemView {
+  id: string;
+  workflowRunId: string;
+  kind: string;
+  payload: UiJsonValue;
+  author: UiJsonValue;
+  confidence?: number;
+  evidence: readonly UiJsonValue[];
+  revision: number;
+  supersededBy?: string;
+  extra: Readonly<Record<string, UiJsonValue>>;
+}
+
+export interface BlackboardView {
+  workflowRunId: string;
+  items: readonly BlackboardItemView[];
+}
+
+export interface BlackboardProjectionOptions {
+  /** Restrict to one artifact kind (`finding`, `decision`, …). */
+  kind?: string;
+  /** Include superseded revisions; `false` returns only the live board. */
+  includeSuperseded?: boolean;
+}
+
 export interface CommandDescriptor<TInput extends UiJsonValue = UiJsonValue, TOutput extends UiJsonValue = UiJsonValue> {
   id: string;
   title: string;
@@ -91,6 +121,8 @@ export interface UiProjectionStore {
   run(id: string): ExternalProjection<RunView | undefined>;
   context(sessionId: string): ExternalProjection<IdeContextView | undefined>;
   workflow(id: string): ExternalProjection<WorkflowView | undefined>;
+  /** A workflow run's blackboard, read-only. `id` is a workflow run id. */
+  blackboard(id: string, options?: BlackboardProjectionOptions): ExternalProjection<BlackboardView | undefined>;
   artifact<T extends UiJsonValue = UiJsonValue>(id: string, options?: ArtifactProjectionOptions): ExternalProjection<ArtifactView<T> | undefined>;
   command<TInput extends UiJsonValue = UiJsonValue, TOutput extends UiJsonValue = UiJsonValue>(id: string): ExternalProjection<CommandDescriptor<TInput, TOutput> | undefined>;
   theme(): ExternalProjection<ThemeTokens>;

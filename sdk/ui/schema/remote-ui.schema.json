@@ -115,6 +115,17 @@
               "items": { "enum": ["action", "press", "change", "submit", "focus", "blur", "select", "expand", "collapse", "navigate", "scroll", "key", "custom"] }
             },
             "inputType": { "enum": ["text", "email", "url", "search", "number", "tel"] },
+            "columns": {
+              "description": "Grid track template: an equal-track count, or an explicit track list (`\"2fr\"`, `\"40%\"`, `\"auto\"`, or a plain cell count). Table reuses the name for its column-descriptor list.",
+              "anyOf": [
+                { "type": "integer", "minimum": 1, "maximum": 24 },
+                { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/jsonValue" } }
+              ]
+            },
+            "ratio": {
+              "description": "Split weight of the first pane; later panes are weighted `1 - ratio`. Hosts clamp to 0.1..=0.9.",
+              "type": "number", "minimum": 0, "maximum": 1
+            },
             "secret": false, "secretName": false, "secretValue": false,
             "password": false, "credential": false, "sensitive": false
           },

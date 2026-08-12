@@ -17,6 +17,7 @@ decides whether an emitted intent is valid and authorized.
 | Trusted decisions | `ApprovalReview`, `CoreDecisionPrompt` |
 | Artifacts | `ArtifactBrowser`, `DocumentViewer`, `CodeViewer`, `DiffReview`, `TestResultsViewer`, `MediaViewer`, `StructuredArtifactViewer` |
 | Workflows | `WorkflowGraphView`, `WorkflowTimeline`, `WorkflowNodeInspector` |
+| Boards | `KanbanBoard` |
 | Extensions | `AgentManagement`, `SkillManagement`, `PluginManagement`, `IntegrationManagement` |
 | Git | `WorktreeDashboard`, `GitStatusReview`, `CommitComposer`, `CodeReviewPanel` |
 | Knowledge and models | `MemoryKnowledgeSearch`, `ModelRoutingView`, `CostQuotaView` |
@@ -71,6 +72,18 @@ bounded. Renderers can window the canonical items for the viewport.
 For active operations, provide `{ phase: "streaming", ... }`. Streaming surfaces
 keep their partial content mounted below an accessible determinate or
 indeterminate progress description.
+
+## Boards and card movement
+
+`KanbanBoard` is a Row of virtualized columns holding cards with status,
+assignee, and kind. There is deliberately no pointer drag-and-drop: the event
+vocabulary carries no `drop`, and a dragged card would be unreachable from the
+keyboard. Movement is an `ActionMenu` intent instead — one entry per
+destination column, carrying `cardId`, `fromColumnId`, and `toColumnId`, which
+the host authorizes like any other command. A column `limit` is advisory: an
+over-limit column is called out in text and tone, never blocked. Cards naming a
+column the board does not define are collected into an explicit `Unplaced`
+column rather than dropped.
 
 ## Terminal and accessibility behavior
 

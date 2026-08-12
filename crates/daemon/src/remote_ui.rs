@@ -1624,7 +1624,9 @@ fn authorize_subscription(
         "artifact" => "artifact-read",
         "context" | "session" => "context-read",
         "run" => "run-read",
-        "workflow" => "workflow-read",
+        // A run's blackboard is part of that workflow run's observable state:
+        // same resource id, same ownership join, same read-only authority.
+        "workflow" | "blackboard" => "workflow-read",
         "command" => "command-invoke",
         other => return Err(UiBrokerError::UnauthorizedSubscription(other.to_owned())),
     };
@@ -2350,6 +2352,37 @@ mod tests {
             seen_order: VecDeque::new(),
             recent_messages: VecDeque::new(),
         }
+    }
+
+    #[test]
+    fn blackboard_subscriptions_need_the_workflow_read_capability() {
+        // A run's board is part of that workflow run's observable state, so it
+        // is gated by the same declared capability, never by nothing.
+        let mut producer = producer_state();
+        let request = UiProjectionSubscription {
+            subscription_id: "subscription-1".to_owned(),
+            kind: "blackboard".to_owned(),
+            resource_id: Some("workflow-run-1".to_owned()),
+            parameters: Default::default(),
+        };
+        assert!(matches!(
+            authorize_subscription(&producer, &request),
+            Err(UiBrokerError::UnauthorizedSubscription(required)) if required == "workflow-read"
+        ));
+        producer
+            .declared_capabilities
+            .insert("workflow-read".to_owned());
+        assert!(authorize_subscription(&producer, &request).is_ok());
+
+        // An unlisted kind stays refused whatever the producer declares.
+        let unknown = UiProjectionSubscription {
+            kind: "raw-daemon-handle".to_owned(),
+            ..request
+        };
+        assert!(matches!(
+            authorize_subscription(&producer, &unknown),
+            Err(UiBrokerError::UnauthorizedSubscription(_))
+        ));
     }
 
     fn producer_state() -> ProducerState {
