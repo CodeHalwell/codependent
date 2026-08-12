@@ -147,6 +147,16 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         description: "enter Remote UI · next extension document · return to composer",
         mouse: Some("click extension chrome"),
     },
+    KeyBinding {
+        keys: "C",
+        description: "agent council browser: list, run, and manage persisted councils",
+        mouse: None,
+    },
+    KeyBinding {
+        keys: "n / r / d (Council)",
+        description: "new council · run deliberation (prompts for objective) · delete",
+        mouse: None,
+    },
 ];
 
 /// One footer chip: a compact display label paired with the real `KEY_BINDINGS`
@@ -342,12 +352,18 @@ fn map_normal_char(c: char) -> Action {
         'G' => Action::OpenEdges,
         'W' => Action::OpenWorkflow,
         'B' => Action::OpenBlackboard,
+        'C' => Action::OpenCouncils,
         // Host-owned Remote UI plugin lifecycle controls. They are meaningful
         // only while the `/plugins` surface is open; the reducer ignores them
         // elsewhere.
         't' => Action::EnableUiPluginSession,
         'u' => Action::EnableUiPluginUser,
         'x' => Action::RevokeUiPlugin,
+        // Council browser controls (rubric 6). `n`/`r` reuse `NewRun`/`Reject`
+        // above (the reducer dispatches on the open overlay, like Workflow's
+        // n/p/r/c); `d` is meaningful only while `/council` is open — the
+        // reducer ignores it elsewhere.
+        'd' => Action::DeleteCouncil,
         '/' => Action::OpenPalette,
         _ => Action::NoOp,
     }

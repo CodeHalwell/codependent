@@ -346,6 +346,12 @@ enum CouncilCommand {
         /// Human-readable purpose for this council.
         #[arg(long)]
         description: Option<String>,
+        /// Evidence mode: members explore the repository with read-only tools
+        /// and cite `file:line`, instead of reasoning with no tools at all.
+        /// The chair then weighs cited evidence over unsupported assertion.
+        /// Stored on the definition; `council run` may also enable it per-run.
+        #[arg(long)]
+        evidence: bool,
     },
     /// List configured councils.
     List {
@@ -357,10 +363,16 @@ enum CouncilCommand {
         name: String,
         #[arg(long)]
         json: bool,
+        /// Render the most recently saved run report instead of the definition.
+        #[arg(long)]
+        last: bool,
     },
     /// Remove a council definition. Its prior durable sessions remain.
     Remove { name: String },
     /// Run member deliberation in parallel, then ask the chair to synthesize.
+    /// Every run — completed, quorum-failed, or chair-failed — persists a
+    /// JSON+Markdown report under the data dir; `council show <name> --last`
+    /// replays it.
     Run {
         name: String,
         /// Question or decision the council should deliberate.
@@ -372,6 +384,11 @@ enum CouncilCommand {
         /// Emit the complete attributed result as JSON.
         #[arg(long)]
         json: bool,
+        /// Run in evidence mode for this run even if the council was not
+        /// created with `--evidence` (ORed with the stored flag; never turns
+        /// evidence mode off for a council that already has it).
+        #[arg(long)]
+        evidence: bool,
     },
 }
 
@@ -1076,10 +1093,19 @@ async fn main() -> anyhow::Result<()> {
                 chair,
                 rounds,
                 description,
-            } => codypendent_cli::council::create(&paths, name, member, chair, rounds, description),
+                evidence,
+            } => codypendent_cli::council::create(
+                &paths,
+                name,
+                member,
+                chair,
+                rounds,
+                description,
+                evidence,
+            ),
             CouncilCommand::List { json } => codypendent_cli::council::list(&paths, json),
-            CouncilCommand::Show { name, json } => {
-                codypendent_cli::council::show(&paths, &name, json)
+            CouncilCommand::Show { name, json, last } => {
+                codypendent_cli::council::show(&paths, &name, json, last)
             }
             CouncilCommand::Remove { name } => codypendent_cli::council::remove(&paths, &name),
             CouncilCommand::Run {
@@ -1087,9 +1113,11 @@ async fn main() -> anyhow::Result<()> {
                 objective,
                 repo,
                 json,
+                evidence,
             } => {
                 let repository = repo.unwrap_or(std::env::current_dir()?);
-                codypendent_cli::council::run(&paths, &name, objective, repository, json).await
+                codypendent_cli::council::run(&paths, &name, objective, repository, json, evidence)
+                    .await
             }
         },
         TopCommand::Open {

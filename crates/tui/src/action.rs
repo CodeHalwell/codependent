@@ -91,6 +91,24 @@ pub enum Action {
     /// Council persistence failed. The reducer keeps the reviewed draft open so
     /// the operator can go back, correct it, and retry without starting over.
     CouncilCreateFailed { name: String, error: String },
+    /// The CLI host removed a council definition. Its saved run reports remain.
+    CouncilDeleted { name: String },
+    /// Council removal failed (e.g. the store could not be rewritten).
+    CouncilDeleteFailed { name: String, error: String },
+    /// One pre-formatted progress line from an off-thread council run (a round
+    /// starting, a member completing/failing, or the chair beginning
+    /// synthesis), pre-formatted host-side since this dependency-free crate
+    /// cannot name `crate::council::CouncilEvent` (a cli-crate type). Folded
+    /// into the active run's transcript as a Note.
+    CouncilProgress { name: String, message: String },
+    /// An off-thread council run finished. `Ok` carries the chair synthesis,
+    /// attributed participants, and measured-cost line, pre-formatted
+    /// host-side; `Err` is a human-readable failure (already naming any
+    /// partial report path the run managed to save).
+    CouncilRunFinished {
+        name: String,
+        result: Result<Box<crate::state::CouncilRunSummary>, String>,
+    },
 
     // --- navigation (from keys / mouse) ---
     /// Move keyboard focus to the next pane (`Tab`).
@@ -199,6 +217,12 @@ pub enum Action {
     OpenBlackboard,
     /// Open the host-owned Remote UI plugin lifecycle surface.
     OpenUiPlugins,
+    /// Toggle the council browser (`C`, rubric 6 TUI wiring): list, run, and
+    /// manage persisted councils.
+    OpenCouncils,
+    /// Begin removal confirmation for the focused council (`d`, council
+    /// browser only).
+    DeleteCouncil,
     /// Smoke-test the selected plugin in the daemon sandbox.
     SmokeTestUiPlugin,
     /// Enable the selected plugin for only the attached session.
@@ -595,6 +619,24 @@ pub enum Intent {
         members: Vec<(String, String)>,
         chair: String,
         rounds: u8,
+    },
+    /// Remove a persisted council definition (rubric 6 TUI wiring). Client-only,
+    /// exactly like `CreateCouncil`: the harness calls
+    /// `council::remove_definition` and reloads the browser projection. Saved
+    /// run reports are left on disk.
+    DeleteCouncil {
+        name: String,
+    },
+    /// Run a persisted council's deliberation for `objective` (rubric 6 TUI
+    /// wiring). Client-only: member/chair runs are independent daemon
+    /// sessions, so the harness drives `council::run_with_progress` off-thread
+    /// over its OWN connection, streaming progress and the final outcome back
+    /// through the `ReaderSignal` channel — never a single `CommandBody`. No
+    /// `repository` field: like `StartRun`, the harness fills it in from the
+    /// attached session's own repository, not from reducer-owned state.
+    RunCouncil {
+        name: String,
+        objective: String,
     },
     /// Create and attach to a fresh session without leaving the TUI. Client-only:
     /// the harness creates the session, swaps this connection's attachment, and

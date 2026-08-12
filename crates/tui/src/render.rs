@@ -2161,6 +2161,23 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::CouncilBuilder(builder) => {
             render_council_builder(frame, area, state, theme, builder);
         }
+        Overlay::CouncilBrowser => render_council_browser(frame, area, state, theme),
+        Overlay::CouncilRunObjective { name, buffer } => render_prompt(
+            frame,
+            area,
+            state,
+            theme,
+            &format!("Objective for council `{name}`"),
+            buffer,
+        ),
+        Overlay::ConfirmCouncilDelete { name } => render_confirm_box(
+            frame,
+            area,
+            state,
+            theme,
+            "Remove this council?",
+            &format!("`{name}` · saved run reports remain on disk"),
+        ),
         Overlay::ModelPicker { query, selected } => {
             render_model_picker(frame, area, state, theme, query, *selected);
         }
@@ -5516,6 +5533,152 @@ fn action_kind(action: &ProposedAction) -> &'static str {
     }
 }
 
+/// The council browser (rubric 6 TUI wiring): a scrollable list of persisted
+/// councils on the left, and a detail panel on the right showing the focused
+/// council's chair, rounds, evidence mode, and every member's model/role —
+/// the same list+detail shape as [`render_ui_plugins`]/[`render_skills`].
+fn render_council_browser(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(90, 86, area);
+    shield_modal(state, rect);
+    frame.render_widget(Clear, rect);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Agent councils ({}) ", state.councils.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(rows[0]);
+
+    const ROW_LINES: usize = 2;
+    let visible = (cols[0].height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(state.selected_council, state.councils.len(), visible);
+    let mut items = Vec::new();
+    if state.councils.is_empty() {
+        items.push(ListItem::new(vec![
+            Line::styled(
+                "  No councils configured",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  Press n to create one",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
+    }
+    for (index, council) in state.councils.iter().enumerate().skip(first).take(visible) {
+        let selected = index == state.selected_council;
+        let head = Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                theme.selection_aware_text_style(selected, theme.focus.active),
+            ),
+            Span::styled(
+                truncate(&council.name, 30),
+                theme.selection_aware_text_style(selected, theme.text.primary),
+            ),
+        ]);
+        let meta = Line::styled(
+            format!(
+                "    {} member(s) · {} round(s){}",
+                council.members.len(),
+                council.rounds,
+                if council.evidence { " · evidence" } else { "" }
+            ),
+            theme.selection_aware_text_style(selected, theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, meta]);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+    for (screen_row, index) in (first..state.councils.len()).take(visible).enumerate() {
+        if let Some(hit) = visible_row_hit(cols[0], screen_row, ROW_LINES as u16) {
+            state.register_hit(hit, Action::ActivateRow(index));
+        }
+    }
+
+    let detail = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive));
+    let detail_inner = detail.inner(cols[1]);
+    frame.render_widget(detail, cols[1]);
+    let mut lines = Vec::new();
+    if let Some(council) = state.focused_council() {
+        lines.push(Line::styled(
+            council.name.clone(),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if !council.description.is_empty() {
+            lines.push(Line::styled(
+                council.description.clone(),
+                Style::default().fg(theme.text.secondary),
+            ));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(format!("  chair: {}", council.chair)));
+        lines.push(Line::from(format!("  rounds: {}", council.rounds)));
+        lines.push(Line::from(format!(
+            "  evidence mode: {}",
+            if council.evidence { "on" } else { "off" }
+        )));
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "Members:",
+            Style::default().fg(theme.text.secondary),
+        ));
+        for (model, role) in &council.members {
+            lines.push(Line::from(format!("  - {model} · {role}")));
+        }
+    } else {
+        lines.push(Line::styled(
+            "No council selected.",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        detail_inner,
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "  ↑/↓ select · n new council",
+                Style::default().fg(theme.text.muted),
+            ),
+            Line::styled(
+                "  r run (prompts for objective) · d delete · Esc close",
+                Style::default().fg(theme.focus.active),
+            ),
+        ]),
+        rows[1],
+    );
+}
+
 fn render_council_builder(
     frame: &mut Frame,
     area: Rect,
@@ -6642,6 +6805,100 @@ mod tests {
         assert!(
             review.contains("Enter create council"),
             "review action:\n{review}"
+        );
+    }
+
+    fn council_card(name: &str, chair: &str, evidence: bool) -> crate::state::CouncilCard {
+        crate::state::CouncilCard {
+            name: name.to_owned(),
+            description: "Independent architecture review".to_owned(),
+            chair: chair.to_owned(),
+            rounds: 2,
+            evidence,
+            members: vec![
+                ("claude-reviewer".to_owned(), "security reviewer".to_owned()),
+                ("kimi-architect".to_owned(), "systems architect".to_owned()),
+            ],
+        }
+    }
+
+    /// Rubric 6 (TUI wiring): the browser's list + detail pane, and the run
+    /// objective / delete confirm overlays that hang off it.
+    #[test]
+    fn council_browser_renders_list_detail_and_its_sub_overlays() {
+        let mut state = AppState::new();
+        state.councils = vec![
+            council_card("design-council", "amp-chair", false),
+            council_card("grounded-council", "amp-chair", true),
+        ];
+        state.overlay = Overlay::CouncilBrowser;
+        let browser = render_to_string(&state, 100, 30);
+        assert!(browser.contains("Agent councils"), "title:\n{browser}");
+        assert!(browser.contains("design-council"), "list row:\n{browser}");
+        assert!(
+            browser.contains("grounded-council"),
+            "second list row:\n{browser}"
+        );
+        // The focused (first) council's detail pane.
+        assert!(browser.contains("amp-chair"), "chair detail:\n{browser}");
+        assert!(
+            browser.contains("security reviewer"),
+            "member detail:\n{browser}"
+        );
+        assert!(
+            browser.contains("evidence mode: off"),
+            "evidence off for the focused (first) council:\n{browser}"
+        );
+        assert!(
+            browser.contains("run") && browser.contains("delete"),
+            "footer hints:\n{browser}"
+        );
+        assert!(state
+            .hit_map
+            .borrow()
+            .iter()
+            .any(|(_, action)| matches!(action, Action::ActivateRow(1))));
+
+        state.overlay = Overlay::CouncilRunObjective {
+            name: "design-council".to_owned(),
+            buffer: "Choose a storage engine".to_owned(),
+        };
+        let prompt = render_to_string(&state, 100, 30);
+        assert!(
+            prompt.contains("design-council"),
+            "run prompt names the council:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Choose a storage engine"),
+            "run prompt shows the typed objective:\n{prompt}"
+        );
+
+        state.overlay = Overlay::ConfirmCouncilDelete {
+            name: "design-council".to_owned(),
+        };
+        let confirm = render_to_string(&state, 100, 30);
+        assert!(
+            confirm.contains("design-council"),
+            "delete confirm names the council:\n{confirm}"
+        );
+        assert!(
+            confirm.contains("remain on disk"),
+            "delete confirm reassures reports survive:\n{confirm}"
+        );
+    }
+
+    #[test]
+    fn council_browser_with_no_councils_prompts_to_create_one() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::CouncilBrowser;
+        let empty = render_to_string(&state, 100, 30);
+        assert!(
+            empty.contains("No councils configured"),
+            "empty state:\n{empty}"
+        );
+        assert!(
+            empty.contains("No council selected"),
+            "empty detail pane:\n{empty}"
         );
     }
 

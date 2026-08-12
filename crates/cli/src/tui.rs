@@ -827,6 +827,9 @@ async fn boot_phase(
     // Task 8: seed the provider-catalog picker projection (the built-in
     // catalog + any user `providers.toml`), exactly like `load_model_cards`.
     state.providers = load_provider_cards(paths, &mut loader_warnings).await;
+    // Rubric 6 TUI wiring: seed the `/council` browser projection (persisted
+    // councils.toml definitions), exactly like `load_model_cards` above.
+    state.councils = load_council_cards(paths, &mut loader_warnings);
     // D1 (/keys): seed the API-key status projection — auth.json entries +
     // models.toml `api_key_env` declarations (the tui crate does no I/O, so
     // the harness reads the files and folds the projection as an Action, the
@@ -1231,6 +1234,12 @@ async fn event_loop<P: Presentation>(
                     let label = workflow_label_for_run(state, &item.workflow_run_id);
                     Action::BlackboardItemUpdated(wire_blackboard_item_card(label, &item))
                 }
+                Some(ReaderSignal::CouncilProgress { name, message }) => {
+                    Action::CouncilProgress { name, message }
+                }
+                Some(ReaderSignal::CouncilRunFinished { name, result }) => {
+                    Action::CouncilRunFinished { name, result }
+                }
                 Some(ReaderSignal::Catchup(catchup)) => {
                     // Fold the gap replay (the daemon already windowed it to
                     // `(last_seen, through]`, and a too-large gap arrives as a
@@ -1505,6 +1514,12 @@ async fn event_loop<P: Presentation>(
                     description: description.clone(),
                     chair: chair.clone(),
                     rounds: *rounds,
+                    // The host-owned wizard has no evidence-mode step yet; a
+                    // council created this way keeps rubric 6's "default
+                    // behavior unchanged" and can still be flipped on later by
+                    // editing councils.toml or recreating via the CLI's
+                    // `--evidence` flag.
+                    evidence: false,
                     members: members
                         .iter()
                         .map(|(model, role)| crate::council::CouncilMember {
@@ -1514,14 +1529,21 @@ async fn event_loop<P: Presentation>(
                         .collect(),
                 };
                 match crate::council::persist_definition(paths, definition) {
-                    Ok(created) => reduce(
-                        state,
-                        Action::CouncilCreated {
-                            name: created.name,
-                            members: created.members.len(),
-                            rounds: created.rounds,
-                        },
-                    ),
+                    Ok(created) => {
+                        let mut warnings = Vec::new();
+                        state.councils = load_council_cards(paths, &mut warnings);
+                        for warning in warnings {
+                            reduce(state, Action::Issue(warning));
+                        }
+                        reduce(
+                            state,
+                            Action::CouncilCreated {
+                                name: created.name,
+                                members: created.members.len(),
+                                rounds: created.rounds,
+                            },
+                        );
+                    }
                     Err(error) => reduce(
                         state,
                         Action::CouncilCreateFailed {
@@ -1530,6 +1552,68 @@ async fn event_loop<P: Presentation>(
                         },
                     ),
                 }
+                continue;
+            }
+            // Council removal (rubric 6 TUI wiring): same client-only shape as
+            // creation above — apply locally, reload the browser projection,
+            // and skip the daemon-command mapping entirely. Saved run reports
+            // are left on disk (only the definition is removed).
+            if let Intent::DeleteCouncil { name } = &intent {
+                match crate::council::remove_definition(paths, name) {
+                    Ok(()) => {
+                        let mut warnings = Vec::new();
+                        state.councils = load_council_cards(paths, &mut warnings);
+                        for warning in warnings {
+                            reduce(state, Action::Issue(warning));
+                        }
+                        reduce(state, Action::CouncilDeleted { name: name.clone() });
+                    }
+                    Err(error) => reduce(
+                        state,
+                        Action::CouncilDeleteFailed {
+                            name: name.clone(),
+                            error: error.to_string(),
+                        },
+                    ),
+                }
+                continue;
+            }
+            // Run a persisted council's deliberation (rubric 6 TUI wiring).
+            // Member/chair runs are independent daemon sessions the base
+            // transcript never subscribes to, so `council::run_with_progress`
+            // is driven off-thread over its OWN connection — exactly the
+            // `AddModel`/ACP-connect off-thread shape above — streaming each
+            // round/member/chair transition back as `ReaderSignal::CouncilProgress`
+            // and the final outcome (or a formatted failure) as
+            // `ReaderSignal::CouncilRunFinished`. `evidence: false` here always
+            // defers to the council's OWN stored flag (`run_with_progress` ORs
+            // the two) — there is no per-run override from this prompt.
+            if let Intent::RunCouncil { name, objective } = &intent {
+                let paths = paths.clone();
+                let name = name.clone();
+                let objective = objective.clone();
+                let repository = PathBuf::from(repository);
+                let tx = live.query_tx.clone();
+                let progress_tx = tx.clone();
+                let progress_name = name.clone();
+                tokio::spawn(async move {
+                    let progress = move |event: crate::council::CouncilEvent| {
+                        let _ = progress_tx.try_send(ReaderSignal::CouncilProgress {
+                            name: progress_name.clone(),
+                            message: council_progress_message(&event),
+                        });
+                    };
+                    let result = crate::council::run_with_progress(
+                        &paths, &name, objective, repository, false, progress,
+                    )
+                    .await;
+                    let result = result
+                        .map(|run| Box::new(council_run_summary(run)))
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = tx
+                        .send(ReaderSignal::CouncilRunFinished { name, result })
+                        .await;
+                });
                 continue;
             }
             // Create and attach to a genuinely fresh session without tearing
@@ -1920,6 +2004,23 @@ enum ReaderSignal {
         items: Vec<codypendent_protocol::BlackboardItemView>,
     },
     BlackboardPosted(codypendent_protocol::BlackboardItemView),
+    /// One pre-formatted progress line from an off-thread council run (rubric
+    /// 6 TUI wiring): a round starting, a member completing/failing, or the
+    /// chair beginning synthesis. Mapped to `Action::CouncilProgress`, which
+    /// folds it into the active run's transcript as a Note.
+    CouncilProgress {
+        name: String,
+        message: String,
+    },
+    /// An off-thread council run finished. `Ok` carries the pre-formatted
+    /// chair synthesis, attributed participants, and measured-cost line;
+    /// `Err` is a human-readable failure (already naming any partial report
+    /// path `run_with_progress` managed to save). Boxed like `WorkflowSnapshot`
+    /// — the synthesis text can be large and every other signal here is tiny.
+    CouncilRunFinished {
+        name: String,
+        result: Result<Box<codypendent_tui::state::CouncilRunSummary>, String>,
+    },
     /// The daemon closed the connection.
     Closed,
 }
@@ -2440,6 +2541,12 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         ),
         Intent::CreateCouncil { .. } => unreachable!(
             "CreateCouncil is validated and persisted locally by the harness, never sent to the daemon"
+        ),
+        Intent::DeleteCouncil { .. } => unreachable!(
+            "DeleteCouncil is applied locally by the harness (council::remove_definition), never sent to the daemon"
+        ),
+        Intent::RunCouncil { .. } => unreachable!(
+            "RunCouncil is driven off-thread by the harness over its own connection, never sent to the daemon"
         ),
         Intent::NewConversation => unreachable!(
             "NewConversation is applied locally by the harness, never sent to the daemon"
@@ -3509,6 +3616,85 @@ fn local_model_endpoint(url: &str) -> bool {
     ["localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1"]
         .iter()
         .any(|host| lower.contains(host))
+}
+
+/// Seed (and re-seed after create/run/delete) the `/council` browser's
+/// projection: every council persisted in `<config_dir>/councils.toml`,
+/// mapped into a self-contained [`codypendent_tui::state::CouncilCard`] — the
+/// TUI crate performs no I/O, so the mapping happens here exactly like
+/// [`load_model_cards`] and the knowledge-fabric loaders above. Never fails
+/// the TUI: an unreadable/unparsable store degrades to an empty browser with
+/// a diagnostic in `warnings`.
+fn load_council_cards(
+    paths: &RuntimePaths,
+    warnings: &mut Vec<String>,
+) -> Vec<codypendent_tui::state::CouncilCard> {
+    match crate::council::list_definitions(paths) {
+        Ok(definitions) => definitions
+            .into_iter()
+            .map(|definition| codypendent_tui::state::CouncilCard {
+                name: definition.name,
+                description: definition.description,
+                chair: definition.chair,
+                rounds: definition.rounds,
+                evidence: definition.evidence,
+                members: definition
+                    .members
+                    .into_iter()
+                    .map(|member| (member.model, member.role))
+                    .collect(),
+            })
+            .collect(),
+        Err(error) => {
+            warnings.push(format!("council browser unavailable: {error}"));
+            Vec::new()
+        }
+    }
+}
+
+/// Format one [`crate::council::CouncilEvent`] as a single display line for the
+/// off-thread council run's progress stream (rubric 6 TUI wiring) — the same
+/// wording the CLI's own non-interactive `council run` prints via `eprintln!`,
+/// so behavior reads identically in both surfaces.
+fn council_progress_message(event: &crate::council::CouncilEvent) -> String {
+    use crate::council::CouncilEvent;
+    match event {
+        CouncilEvent::RoundStarted {
+            round,
+            rounds,
+            members,
+        } => format!("round {round}/{rounds} — launching {members} member(s)"),
+        CouncilEvent::MemberCompleted { round, role, model } => {
+            format!("round {round} — {role} ({model}) completed")
+        }
+        CouncilEvent::MemberFailed { round, error } => {
+            format!("round {round} — member failed: {error}")
+        }
+        CouncilEvent::ChairStarted { chair } => format!("asking chair `{chair}` to synthesize"),
+        CouncilEvent::Warning { message } => format!("warning: {message}"),
+    }
+}
+
+/// Reduce a completed [`crate::council::CouncilRunOutcome`] to the plain,
+/// dependency-free summary the TUI crate can render (it cannot name
+/// `codypendent-cli`'s own `council` module types without a dependency cycle —
+/// `cli` already depends on `tui`).
+fn council_run_summary(
+    run: crate::council::CouncilRunOutcome,
+) -> codypendent_tui::state::CouncilRunSummary {
+    let mut participants: Vec<String> = run
+        .outcome
+        .members
+        .iter()
+        .map(crate::council::participant_line)
+        .collect();
+    participants.push(crate::council::participant_line(&run.outcome.chair));
+    codypendent_tui::state::CouncilRunSummary {
+        synthesis: run.outcome.chair.response,
+        participants,
+        cost_line: crate::council::cost_line(&run.costs),
+        report_markdown: run.report_markdown.display().to_string(),
+    }
 }
 
 /// Map one configured [`ModelConfig`](codypendent_runtime::models::ModelConfig)
