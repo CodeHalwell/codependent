@@ -1051,6 +1051,33 @@ mod tests {
         panic!("timed out waiting for {count} publication(s) on {document_id}");
     }
 
+    /// Poll until the fire-and-forget continuation reaches its durable job
+    /// state. A publication row is recorded before the job is marked
+    /// completed, so observing that row alone is not a completion barrier.
+    async fn wait_for_publish_job_state(
+        pool: &SqlitePool,
+        approval_id: ApprovalId,
+        expected: &str,
+    ) {
+        let mut observed = None;
+        for _ in 0..250 {
+            observed = sqlx::query_scalar::<_, String>(
+                "SELECT state FROM document_publish_jobs WHERE approval_id = ?",
+            )
+            .bind(approval_id.to_string())
+            .fetch_optional(pool)
+            .await
+            .expect("query publish job state");
+            if observed.as_deref() == Some(expected) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "timed out waiting for publish job {approval_id} to reach {expected}; observed {observed:?}"
+        );
+    }
+
     fn build_publisher(
         pool: SqlitePool,
         approvals: ApprovalBroker,
@@ -1205,13 +1232,7 @@ mod tests {
 
         wait_for_publication_count(&pool, document_id, 1).await;
         assert!(repo.join("docs/recovered.md").exists());
-        let state: (String,) =
-            sqlx::query_as("SELECT state FROM document_publish_jobs WHERE approval_id = ?")
-                .bind(parked.approval_id.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(state.0, "completed");
+        wait_for_publish_job_state(&pool, parked.approval_id, "completed").await;
     }
 
     #[tokio::test]
