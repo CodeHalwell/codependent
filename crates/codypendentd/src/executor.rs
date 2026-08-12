@@ -160,6 +160,13 @@ pub struct RuntimeExecutor {
     /// the trait object, like `github`/`mcp`, so the runtime's `with_search`
     /// needs no cast at the call sites.
     search: Option<Arc<dyn SearchApi>>,
+    /// The speech-to-text seam a `SubmitUserInput` carrying voice audio routes
+    /// through (voice v1, rubric 8), built from `models.toml`'s `[transcription]`
+    /// table. `None` (the default — no table configured) leaves the daemon
+    /// rejecting audio submissions `voice.transport-unavailable`; plain-text
+    /// input is unaffected either way. Carried here, like `github`/`mcp`/`search`,
+    /// because the server pulls every assembly-provided seam off the executor.
+    transcriber: Option<Arc<dyn codypendent_daemon::transcription::Transcriber>>,
     /// The workflow-execution host: creates, drives, recovers, and controls durable
     /// workflow runs (Phase 5 STEP 5.2). One shared host backs both the
     /// [`WorkflowStarter`](codypendent_daemon::workflows::WorkflowStarter) and
@@ -275,6 +282,7 @@ impl RuntimeExecutor {
             github: None,
             mcp: None,
             search: None,
+            transcriber: None,
             workflow_host,
             repository_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             promotion,
@@ -292,6 +300,20 @@ impl RuntimeExecutor {
     #[must_use]
     pub fn with_repository_root(mut self, root: PathBuf) -> Self {
         self.repository_root = root;
+        self
+    }
+
+    /// Attach the speech-to-text seam (voice v1, rubric 8), so a
+    /// `SubmitUserInput` carrying an audio `InputEnvelope` can be transcribed.
+    /// Unlike `with_github`/`with_search` this rebuilds nothing: transcription
+    /// happens in the SERVER's command path (before a run exists), not inside
+    /// the agent loop or a workflow node, so the workflow host is unaffected.
+    #[must_use]
+    pub fn with_transcriber(
+        mut self,
+        transcriber: Arc<dyn codypendent_daemon::transcription::Transcriber>,
+    ) -> Self {
+        self.transcriber = Some(transcriber);
         self
     }
 
@@ -2159,6 +2181,13 @@ impl RunExecutor for RuntimeExecutor {
             let repository = scan::repository_id_for(&root);
             executor.ensure_scanned(repository, &root).await;
         });
+    }
+
+    fn transcriber(&self) -> Option<Arc<dyn codypendent_daemon::transcription::Transcriber>> {
+        // Voice v1 (rubric 8): `None` unless `models.toml` declares a
+        // `[transcription]` endpoint, which leaves audio submissions rejected
+        // `voice.transport-unavailable` rather than silently unhandled.
+        self.transcriber.clone()
     }
 }
 
