@@ -1319,6 +1319,18 @@ async fn event_loop<P: Presentation>(
             reduce(state, action);
         }
         if let Some((display_id, provider_id, result)) = connected_acp.take() {
+            // A connect can land while an add-model overlay is still open —
+            // either the "connecting…" step or the "fetching models…" step an
+            // agent with no model selector short-circuits out of. The flow is
+            // over either way, so close it rather than leaving the user parked
+            // on a step that will never resolve.
+            if matches!(
+                state.overlay,
+                codypendent_tui::Overlay::AddModelQuerying { .. }
+                    | codypendent_tui::Overlay::AddModelPick { .. }
+            ) {
+                state.overlay = codypendent_tui::Overlay::None;
+            }
             match result {
                 Ok(coordinate) => {
                     match write_add_model(paths, &display_id, &provider_id, &coordinate, None) {
@@ -1392,21 +1404,21 @@ async fn event_loop<P: Presentation>(
                 api_key,
             } = &intent
             {
-                let acp =
-                    codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir)
-                        .load_cached()
-                        .ok()
-                        .is_some_and(|registry| registry.get(provider_id).is_some());
-                if acp {
+                if is_acp_provider(paths, provider_id) {
+                    // The picker sends `model == provider_id` when the agent
+                    // exposed no model list; anything else is one of the
+                    // agent's OWN model ids, chosen from the pick overlay.
+                    let pin = (model != provider_id).then(|| model.clone());
+                    let display_id = acp_profile_id(provider_id, pin.as_deref());
                     let paths = paths.clone();
                     let repository = PathBuf::from(repository);
-                    let display_id = display_id.clone();
                     let provider_id = provider_id.clone();
                     let tx = live.query_tx.clone();
                     tokio::spawn(async move {
-                        let result = connect_acp_agent(&paths, &provider_id, &repository)
-                            .await
-                            .map_err(|error| error.to_string());
+                        let result =
+                            connect_acp_agent(&paths, &provider_id, &repository, pin.as_deref())
+                                .await
+                                .map_err(|error| error.to_string());
                         let _ = tx
                             .send(ReaderSignal::AcpConnected {
                                 display_id,
@@ -1440,6 +1452,39 @@ async fn event_loop<P: Presentation>(
                 api_key,
             } = &intent
             {
+                // An ACP agent has no `/models` endpoint: its model list comes
+                // from the session-config handshake, so listing means spawning
+                // it. Same off-thread shape, same return signal — the pick
+                // overlay never learns the difference.
+                if is_acp_provider(paths, provider_id) {
+                    let paths = paths.clone();
+                    let repository = PathBuf::from(repository);
+                    let provider_id = provider_id.clone();
+                    let tx = live.query_tx.clone();
+                    tokio::spawn(async move {
+                        let signal = match probe_acp_agent(&paths, &provider_id, &repository).await
+                        {
+                            // No model selector: there is nothing to pick,
+                            // so connect the bare profile directly rather
+                            // than opening an empty list.
+                            Ok(probe) if probe.models.is_empty() => ReaderSignal::AcpConnected {
+                                display_id: acp_profile_id(&provider_id, None),
+                                provider_id,
+                                result: Ok(probe.coordinate(None)),
+                            },
+                            Ok(probe) => ReaderSignal::ProviderModels {
+                                provider_id,
+                                result: Ok(probe.models),
+                            },
+                            Err(error) => ReaderSignal::ProviderModels {
+                                provider_id,
+                                result: Err(error.to_string()),
+                            },
+                        };
+                        let _ = tx.send(signal).await;
+                    });
+                    continue;
+                }
                 use codypendent_providers::{AuthMethod, Catalog};
                 let catalog =
                     Catalog::load_with_user_overrides(&paths.data_dir.join("providers.toml"))
@@ -2603,15 +2648,37 @@ fn write_add_model(
     Ok(())
 }
 
-/// Install (when necessary) and handshake one official ACP agent away from the
-/// render loop. The caller writes `models.toml` only after this succeeds, so a
-/// bad archive, missing runner, or incompatible agent never leaves a broken
-/// selectable profile behind.
-async fn connect_acp_agent(
+/// Whether `provider_id` names an agent from the official ACP registry (rather
+/// than a catalog provider). Read from the CACHED registry only: the picker
+/// already refreshed it when it built its cards, and the intent-drain loop must
+/// never block on the network.
+fn is_acp_provider(paths: &RuntimePaths, provider_id: &str) -> bool {
+    codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir)
+        .load_cached()
+        .ok()
+        .is_some_and(|registry| registry.get(provider_id).is_some())
+}
+
+/// The `models.toml` profile id for a connected ACP agent — `acp/<agent>`, or
+/// `acp/<agent>#<model>` when pinned to one of the agent's own models, mirroring
+/// the coordinate the profile stores.
+fn acp_profile_id(provider_id: &str, model: Option<&str>) -> String {
+    match model {
+        Some(model) => format!("acp/{provider_id}#{model}"),
+        None => format!("acp/{provider_id}"),
+    }
+}
+
+/// One official ACP agent, installed (when necessary) and handshaken away from
+/// the render loop: its pinned coordinate plus the models it advertises over
+/// the session-config handshake. The single place the TUI talks to a live
+/// agent — both the add-model model list and the connect itself go through it,
+/// so neither can disagree with the other about what the agent offers.
+async fn probe_acp_agent(
     paths: &RuntimePaths,
     provider_id: &str,
     repository: &Path,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AcpProbe> {
     let store = codypendent_integrations::acp_registry::AcpRegistryStore::new(&paths.data_dir);
     let spec = store.install(provider_id, false).await?;
     let command = spec.command.to_string_lossy().into_owned();
@@ -2623,11 +2690,64 @@ async fn connect_acp_agent(
     )
     .await
     .with_context(|| format!("ACP handshake with `{provider_id}` failed"))?;
+    let models = client
+        .discovered_models()
+        .into_iter()
+        .map(|model| model.id)
+        .collect();
     drop(client);
-    Ok(codypendent_integrations::acp_registry::agent_coordinate(
-        &spec.registry_id,
-        &spec.version,
-    ))
+    Ok(AcpProbe {
+        registry_id: spec.registry_id,
+        version: spec.version,
+        models,
+    })
+}
+
+/// What a live handshake with an ACP agent taught the TUI.
+struct AcpProbe {
+    registry_id: String,
+    version: String,
+    /// The agent's own model ids, in the agent's order. Empty when it exposes
+    /// no model selector — its default model then applies, as before.
+    models: Vec<String>,
+}
+
+impl AcpProbe {
+    /// The coordinate a profile stores: `id@version`, or `id@version#model`
+    /// when the user picked one of the agent's own models.
+    fn coordinate(&self, model: Option<&str>) -> String {
+        match model {
+            Some(model) => codypendent_integrations::acp_registry::agent_coordinate_with_model(
+                &self.registry_id,
+                &self.version,
+                model,
+            ),
+            None => codypendent_integrations::acp_registry::agent_coordinate(
+                &self.registry_id,
+                &self.version,
+            ),
+        }
+    }
+}
+
+/// Install, handshake, and resolve the coordinate one ACP profile stores. The
+/// caller writes `models.toml` only after this succeeds, so a bad archive,
+/// missing runner, or incompatible agent never leaves a broken selectable
+/// profile behind. A `model` pin is verified against what the agent actually
+/// advertised — a pin it would not honor is never persisted.
+async fn connect_acp_agent(
+    paths: &RuntimePaths,
+    provider_id: &str,
+    repository: &Path,
+    model: Option<&str>,
+) -> anyhow::Result<String> {
+    let probe = probe_acp_agent(paths, provider_id, repository).await?;
+    if let Some(model) = model {
+        if !probe.models.iter().any(|advertised| advertised == model) {
+            bail!("`{provider_id}` does not advertise a model called `{model}`");
+        }
+    }
+    Ok(probe.coordinate(model))
 }
 
 /// Apply the client-only `Intent::AddModel` (the event-loop drain arm,
@@ -3638,6 +3758,7 @@ async fn load_provider_cards(
                 .binary
                 .get(codypendent_integrations::acp_registry::current_platform())
                 .is_some_and(|binary| binary.sha256.is_some());
+            let ready = acp_store.launch_spec(&agent.id).is_ok();
             ProviderCard {
                 id: agent.id.clone(),
                 name: agent.name.clone(),
@@ -3645,11 +3766,16 @@ async fn load_provider_cards(
                 auth: format!("acp: {distribution} · {}", agent.version),
                 local: false,
                 requires_key: false,
-                can_list_models: false,
+                // An ACP agent's models come from its session-config
+                // handshake, so listing them means spawning it — offered only
+                // for an agent already installed and launchable. One that
+                // would first have to be downloaded takes the connect-then-see
+                // path rather than stalling the picker on an install.
+                can_list_models: ready,
                 // Verified platform binaries can be installed in the
                 // background when selected. Package entries are selectable
                 // only when their runner is actually present.
-                available: acp_store.launch_spec(&agent.id).is_ok() || binary_installable,
+                available: ready || binary_installable,
             }
         }));
     }
@@ -3662,7 +3788,8 @@ async fn load_provider_cards(
                 auth: format!("acp: local · {}", spec.version),
                 local: true,
                 requires_key: false,
-                can_list_models: false,
+                // Locally installed, so it can be handshaken for its models.
+                can_list_models: true,
                 available: true,
             });
         }
@@ -6473,6 +6600,43 @@ model = "qwen2.5-coder:14b"
             }],
         );
         assert!(!provider_can_list_models(&oauth));
+    }
+
+    // -- ACP model discovery (the picker's agent-model plumbing) --------------
+
+    #[test]
+    fn acp_profile_ids_mirror_the_coordinate_they_store() {
+        assert_eq!(acp_profile_id("demo-acp", None), "acp/demo-acp");
+        assert_eq!(
+            acp_profile_id("demo-acp", Some("agent-model-1")),
+            "acp/demo-acp#agent-model-1"
+        );
+    }
+
+    #[test]
+    fn an_acp_probe_pins_only_a_model_that_was_asked_for() {
+        let probe = AcpProbe {
+            registry_id: "demo-acp".to_string(),
+            version: "1.2.3".to_string(),
+            models: vec!["agent-model-1".to_string()],
+        };
+        assert_eq!(probe.coordinate(None), "demo-acp@1.2.3");
+        assert_eq!(
+            probe.coordinate(Some("agent-model-1")),
+            "demo-acp@1.2.3#agent-model-1"
+        );
+        // A profile id and its coordinate must agree on the pin, so the
+        // executor asks the agent for the model the picker showed.
+        let coordinate = probe.coordinate(Some("agent-model-1"));
+        assert_eq!(
+            codypendent_integrations::acp_registry::agent_model_from_coordinate(&coordinate),
+            Some("agent-model-1")
+        );
+        assert_eq!(
+            codypendent_integrations::acp_registry::agent_id_from_coordinate(&coordinate),
+            "demo-acp",
+            "a pinned coordinate must still resolve to the same launchable agent"
+        );
     }
 
     // -- models_url + parse_models_response (model-discovery, pure) -----------

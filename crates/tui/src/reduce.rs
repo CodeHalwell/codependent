@@ -3104,6 +3104,10 @@ fn valid_publish_path(path: &str) -> bool {
 ///   model name exists), which on submit queries `<base_url>/models`.
 /// - can-list + local/no-auth → query immediately (no key).
 /// - cannot-list → today's free-text `AddModelId` flow, unchanged.
+///
+/// ACP agents branch first: an installed one joins the can-list query path (its
+/// models come from the session handshake, not an HTTP endpoint), an
+/// uninstalled one connects directly.
 fn enter_add_model_flow(
     state: &mut AppState,
     provider_id: String,
@@ -3112,6 +3116,23 @@ fn enter_add_model_flow(
     can_list_models: bool,
 ) {
     if protocol == "acp" {
+        // An installed ACP agent advertises its own models over the session
+        // handshake, so it takes the SAME query -> pick path a hosted provider
+        // does; the harness spawns the agent instead of GETting `/models`, and
+        // short-circuits to a plain connect if it advertises no model selector.
+        // An agent that is not installed yet has nothing to handshake, so it
+        // keeps the connect-then-see path.
+        if can_list_models {
+            state.outbox.push(Intent::QueryProviderModels {
+                provider_id: provider_id.clone(),
+                api_key: None,
+            });
+            state.overlay = Overlay::AddModelQuerying {
+                provider_id,
+                api_key: None,
+            };
+            return;
+        }
         let display_id = format!("acp/{provider_id}");
         state.outbox.push(Intent::AddModel {
             display_id: display_id.clone(),
@@ -7504,7 +7525,7 @@ mod tests {
     }
 
     #[test]
-    fn available_acp_provider_connects_without_asking_for_a_model_or_key() {
+    fn an_uninstalled_acp_provider_connects_without_asking_for_a_model_or_key() {
         let mut s = AppState::new();
         s.providers = vec![provider_card(
             "mistral-vibe",
@@ -7514,8 +7535,11 @@ mod tests {
             false,
         )];
         // The shared helper derives runtime availability for native chat
-        // providers; this fixture represents the CLI's verified ACP install.
+        // providers; this fixture represents the CLI's verified ACP install
+        // that is NOT yet launchable, so there is nothing to handshake for a
+        // model list.
         s.providers[0].available = true;
+        s.providers[0].can_list_models = false;
         open_provider_picker(&mut s);
         reduce(&mut s, Action::BeginAddModel);
         assert_eq!(
@@ -7528,6 +7552,67 @@ mod tests {
             }]
         );
         assert!(matches!(s.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn an_installed_acp_provider_queries_its_models_before_connecting() {
+        // An installed agent can be handshaken, so it takes the same
+        // query -> pick path a hosted provider does. The harness spawns the
+        // agent instead of GETting `/models`; the overlay cannot tell.
+        let mut s = AppState::new();
+        s.providers = vec![provider_card(
+            "mistral-vibe",
+            "Mistral Vibe",
+            "acp",
+            "acp: binary",
+            false,
+        )];
+        s.providers[0].available = true;
+        s.providers[0].can_list_models = true;
+        open_provider_picker(&mut s);
+        reduce(&mut s, Action::BeginAddModel);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::QueryProviderModels {
+                provider_id: "mistral-vibe".to_string(),
+                // An ACP agent is never asked for an API key.
+                api_key: None,
+            }]
+        );
+        assert!(matches!(
+            &s.overlay,
+            Overlay::AddModelQuerying { provider_id, api_key: None } if provider_id == "mistral-vibe"
+        ));
+    }
+
+    #[test]
+    fn picking_an_acp_agents_model_adds_it_as_that_agents_model() {
+        // The pick overlay carries the agent's OWN model ids; the harness turns
+        // the chosen one into a pinned ACP profile.
+        let mut s = AppState::new();
+        s.overlay = Overlay::AddModelQuerying {
+            provider_id: "mistral-vibe".to_string(),
+            api_key: None,
+        };
+        reduce(
+            &mut s,
+            Action::ProviderModelsLoaded {
+                provider_id: "mistral-vibe".to_string(),
+                models: vec!["agent-model-1".to_string(), "agent-model-2".to_string()],
+            },
+        );
+        assert!(matches!(s.overlay, Overlay::AddModelPick { .. }));
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::AddModel {
+                display_id: "mistral-vibe/agent-model-1".to_string(),
+                provider_id: "mistral-vibe".to_string(),
+                model: "agent-model-1".to_string(),
+                api_key: None,
+            }],
+            "the picked agent model must reach the harness verbatim"
+        );
     }
 
     #[test]
