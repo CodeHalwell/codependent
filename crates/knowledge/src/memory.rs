@@ -22,7 +22,7 @@
 //!   deletes the row, writes a tombstone outbox event, and returns a
 //!   [`ForgetAudit`] that never contains the deleted statement text.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
@@ -198,10 +198,28 @@ impl MemoryStore {
         }
         let rows = q.fetch_all(pool).await?;
         let now = Utc::now();
+        let mut seen = HashSet::new();
         rows.iter()
             .map(memory_from_row)
             .filter_map(|record| match record {
-                Ok(record) if memory_is_retained(&record, now) => Some(Ok(record)),
+                Ok(mut record)
+                    if memory_is_retained(&record, now)
+                        && low_value_memory_reason(record.class, &record.statement).is_none() =>
+                {
+                    normalize_automatic_memory(&mut record);
+                    // Historical versions included a fresh run UUID in every
+                    // failure breadcrumb, defeating fuzzy dedup and filling the
+                    // browser with the same lesson. Collapse those rows at the
+                    // read boundary as well as preventing new duplicates below.
+                    let key = format!(
+                        "{}:{:?}:{:?}:{}",
+                        record.scope.tier(),
+                        record.scope.key(),
+                        record.class,
+                        record.statement.to_ascii_lowercase()
+                    );
+                    seen.insert(key).then_some(Ok(record))
+                }
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             })
@@ -340,7 +358,7 @@ impl MemoryStore {
     pub async fn curate(
         &self,
         pool: &SqlitePool,
-        candidate: CandidateMemory,
+        mut candidate: CandidateMemory,
     ) -> Result<Curation, MemoryError> {
         // (a) secret / sensitivity filter — FIRST, before every other gate.
         if let Some(reason) = detect_secret(&candidate.statement) {
@@ -361,6 +379,16 @@ impl MemoryStore {
                 reason: "candidate sensitivity may not be persisted as reusable memory".into(),
             });
         }
+
+        // Quality gate: raw run lifecycle breadcrumbs and opaque digests are
+        // audit facts, not reusable knowledge. They remain in the immutable
+        // event ledger/chronicle, while durable memory is reserved for facts a
+        // future run can actually act on. This gate also protects existing
+        // callers that bypass the observer and submit a low-value candidate.
+        if let Some(reason) = low_value_memory_reason(candidate.class, &candidate.statement) {
+            return Ok(Curation::Rejected { reason });
+        }
+        normalize_automatic_candidate(&mut candidate);
 
         // (b) scope classification.
         let scope = match classify_scope(&candidate) {
@@ -423,6 +451,57 @@ fn memory_is_retained(record: &MemoryRecord, now: DateTime<Utc>) -> bool {
             .checked_add_signed(chrono::Duration::days(i64::from(days)))
             .is_some_and(|expires| expires > now),
     }
+}
+
+fn low_value_memory_reason(class: MemoryClass, statement: &str) -> Option<String> {
+    let lower = statement.trim().to_ascii_lowercase();
+    let automatic_run_breadcrumb = class == MemoryClass::Episodic
+        && ((lower.starts_with("run ")
+            && (lower.contains(" completed:") || lower.contains(" cancelled")))
+            || lower.starts_with("applied changeset "));
+    if automatic_run_breadcrumb {
+        return Some("routine run lifecycle belongs in the chronicle, not memory".to_owned());
+    }
+    if class == MemoryClass::Procedural && lower.contains("argument digest") {
+        return Some("opaque command digests are not reusable procedures".to_owned());
+    }
+    let generic_reply = [
+        "what can i help you with",
+        "what would you like to work on",
+        "how can i help",
+        "i'm ready to help",
+        "i am ready to help",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase));
+    generic_reply.then(|| "generic assistant greetings are not durable knowledge".to_owned())
+}
+
+fn normalize_automatic_candidate(candidate: &mut CandidateMemory) {
+    if candidate.class == MemoryClass::Failure {
+        candidate.statement = canonical_failure_statement(&candidate.statement);
+    }
+}
+
+fn normalize_automatic_memory(record: &mut MemoryRecord) {
+    if record.class == MemoryClass::Failure {
+        record.statement = canonical_failure_statement(&record.statement);
+    }
+}
+
+fn canonical_failure_statement(statement: &str) -> String {
+    let trimmed = statement.trim();
+    if let Some(rest) = trimmed.strip_prefix("Run ") {
+        if let Some((_, reason)) = rest.split_once(" failed: ") {
+            return format!("Run failed: {reason}");
+        }
+    }
+    if let Some((lesson, run)) = trimmed.rsplit_once(" in run ") {
+        if run.len() >= 32 && run.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-') {
+            return lesson.to_owned();
+        }
+    }
+    trimmed.to_owned()
 }
 
 // --------------------------------------------------------------------------
@@ -980,4 +1059,57 @@ where
     T::Err: std::fmt::Display,
 {
     T::from_str(value).map_err(|e| MemoryError::Corrupt(format!("scope {tier} id `{value}`: {e}")))
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+
+    #[test]
+    fn routine_run_breadcrumbs_and_generic_greetings_are_not_memories() {
+        assert!(low_value_memory_reason(
+            MemoryClass::Episodic,
+            "Run 019ff1 completed: What can I help you with?"
+        )
+        .is_some());
+        assert!(low_value_memory_reason(
+            MemoryClass::Semantic,
+            "I'm ready to help. What would you like to work on?"
+        )
+        .is_some());
+        assert!(low_value_memory_reason(
+            MemoryClass::Episodic,
+            "Applied changeset cs-12 (42 bytes) in run 019ff1"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn durable_decisions_and_failure_lessons_remain_useful() {
+        assert!(low_value_memory_reason(
+            MemoryClass::Semantic,
+            "Use sqlx migrations for every schema change"
+        )
+        .is_none());
+        assert!(
+            low_value_memory_reason(MemoryClass::Failure, "Cline requires re-authentication")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn volatile_run_ids_are_removed_from_failure_lessons() {
+        assert_eq!(
+            canonical_failure_statement(
+                "Run 019ff5ea-f47d-7111-ac9a-666c8ed136cc failed: cline requires re-authentication"
+            ),
+            "Run failed: cline requires re-authentication"
+        );
+        assert_eq!(
+            canonical_failure_statement(
+                "shell.run failed in run 019ff5ea-f47d-7111-ac9a-666c8ed136cc"
+            ),
+            "shell.run failed"
+        );
+    }
 }

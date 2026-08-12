@@ -125,7 +125,14 @@ pub enum Action {
     /// synthesis), pre-formatted host-side since this dependency-free crate
     /// cannot name `crate::council::CouncilEvent` (a cli-crate type). Folded
     /// into the active run's transcript as a Note.
-    CouncilProgress { name: String, message: String },
+    CouncilProgress {
+        name: String,
+        message: String,
+        /// Council members/chair currently executing as independent agent runs.
+        /// Kept explicit so shared UI telemetry treats council workers and
+        /// workflow workers as the same first-class subagent concept.
+        active_subagents: usize,
+    },
     /// An off-thread council run finished. `Ok` carries the chair synthesis,
     /// attributed participants, and measured-cost line, pre-formatted
     /// host-side; `Err` is a human-readable failure (already naming any

@@ -10105,13 +10105,13 @@ mod tests {
         let message = Message {
             contents: vec![
                 Content::text("I'll check the config file first."),
-                Content::FunctionCall(FunctionCallContent {
-                    call_id: "call-1".to_string(),
-                    name: "workspace.read_file".to_string(),
-                    arguments: Some(FunctionArguments::Raw(
+                Content::FunctionCall(FunctionCallContent::new(
+                    "call-1",
+                    "workspace.read_file",
+                    Some(FunctionArguments::Raw(
                         json!({"path": "config.toml"}).to_string(),
                     )),
-                }),
+                )),
             ],
             ..Message::assistant("")
         };
@@ -10143,13 +10143,13 @@ mod tests {
         };
 
         let message = Message {
-            contents: vec![Content::FunctionCall(FunctionCallContent {
-                call_id: "call-1".to_string(),
-                name: "workspace.read_file".to_string(),
-                arguments: Some(FunctionArguments::Raw(
+            contents: vec![Content::FunctionCall(FunctionCallContent::new(
+                "call-1",
+                "workspace.read_file",
+                Some(FunctionArguments::Raw(
                     json!({"path": "config.toml"}).to_string(),
                 )),
-            })],
+            ))],
             ..Message::assistant("")
         };
         let response = ChatResponse {
@@ -10175,11 +10175,11 @@ mod tests {
         };
 
         let call = |id: &str, name: &str, args: Value| {
-            Content::FunctionCall(FunctionCallContent {
-                call_id: id.to_string(),
-                name: name.to_string(),
-                arguments: Some(FunctionArguments::Raw(args.to_string())),
-            })
+            Content::FunctionCall(FunctionCallContent::new(
+                id,
+                name,
+                Some(FunctionArguments::Raw(args.to_string())),
+            ))
         };
         let message = Message {
             contents: vec![

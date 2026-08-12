@@ -3105,10 +3105,10 @@ mod tests {
             "expected a Code memory from the code-ref finding, got {statements:?}"
         );
         assert!(
-            statements
+            !statements
                 .iter()
                 .any(|(class, statement)| class == "episodic" && statement.contains("cs-1")),
-            "expected an Episodic memory from the changeset, got {statements:?}"
+            "routine changeset breadcrumbs belong in the chronicle, not durable memory: {statements:?}"
         );
         assert!(
             statements
@@ -3335,14 +3335,13 @@ mod tests {
                 .any(|(_, s)| s == "retrying without backoff floods the API"),
             "expected the second extractor fact to be curated, got {statements:?}"
         );
-        // The empty chronicle contributes no M1 heuristic candidates, so the
-        // only OTHER thing landing is M0's bounded completed-run breadcrumb
-        // (`extract_candidates` over the `RunCompleted` event itself) —
-        // exactly the two extractor facts plus that one breadcrumb.
+        // The empty chronicle contributes no M1 heuristic candidates. M0's
+        // completed-run breadcrumb remains in the chronicle but the memory
+        // quality gate rejects it, leaving exactly the two reusable facts.
         assert_eq!(
             statements.len(),
-            3,
-            "the two extractor facts plus the M0 completed-run breadcrumb, got {statements:?}"
+            2,
+            "expected only the two reusable extractor facts, got {statements:?}"
         );
     }
 
@@ -3540,13 +3539,13 @@ mod tests {
             "expected the M3 extractor fact to resurface via assemble_context, got {manifest_statements:?}"
         );
 
-        // Deduped + M0 breadcrumb: Code(1) + Semantic-note(1) +
-        // Semantic-llm(1) + Episodic completed-run breadcrumb(1) = 4 total
-        // curated records; the duplicate LLM fact contributed zero.
+        // Code(1) + Semantic-note(1) + Semantic-llm(1) = 3 durable records.
+        // The duplicate LLM fact contributes zero and the routine M0
+        // completed-run breadcrumb stays in the chronicle rather than memory.
         assert_eq!(
             statements.len(),
-            4,
-            "expected exactly 4 curated records (dedup collapsed the 5th), got {statements:?}"
+            3,
+            "expected exactly 3 reusable records, got {statements:?}"
         );
     }
 

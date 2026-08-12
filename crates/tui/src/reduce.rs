@@ -288,7 +288,12 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 state.tick + 80,
             ));
         }
-        Action::CouncilProgress { name, message } => {
+        Action::CouncilProgress {
+            name,
+            message,
+            active_subagents,
+        } => {
+            state.council_subagents = active_subagents;
             let text = format!("council `{name}`: {message}");
             if let Some(run) = state.selected_run_mut() {
                 AppState::push_entry(
@@ -303,48 +308,52 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 state.notice = Some((text, state.tick + 40));
             }
         }
-        Action::CouncilRunFinished { name, result } => match result {
-            Ok(summary) => {
-                let mut text = format!(
-                    "Council `{name}` — chair synthesis\n\n{}",
-                    summary.synthesis.trim()
-                );
-                if !summary.participants.is_empty() {
-                    text.push_str("\n\nParticipants:\n");
-                    for line in &summary.participants {
-                        text.push_str("  - ");
-                        text.push_str(line);
-                        text.push('\n');
+        Action::CouncilRunFinished { name, result } => {
+            state.council_subagents = 0;
+            match result {
+                Ok(summary) => {
+                    let mut text = format!(
+                        "Council `{name}` — chair synthesis\n\n{}",
+                        summary.synthesis.trim()
+                    );
+                    if !summary.participants.is_empty() {
+                        text.push_str("\n\nParticipants:\n");
+                        for line in &summary.participants {
+                            text.push_str("  - ");
+                            text.push_str(line);
+                            text.push('\n');
+                        }
                     }
+                    text.push_str(&summary.cost_line);
+                    text.push_str(&format!("\nreport: {}", summary.report_markdown));
+                    if let Some(run) = state.selected_run_mut() {
+                        AppState::push_entry(
+                            run,
+                            TranscriptEntry::Note {
+                                text,
+                                expanded: false,
+                            },
+                            Utc::now(),
+                        );
+                    }
+                    state.notice = Some((format!("council `{name}` finished"), state.tick + 60));
                 }
-                text.push_str(&summary.cost_line);
-                text.push_str(&format!("\nreport: {}", summary.report_markdown));
-                if let Some(run) = state.selected_run_mut() {
-                    AppState::push_entry(
-                        run,
-                        TranscriptEntry::Note {
-                            text,
-                            expanded: false,
-                        },
-                        Utc::now(),
-                    );
+                Err(error) => {
+                    if let Some(run) = state.selected_run_mut() {
+                        AppState::push_entry(
+                            run,
+                            TranscriptEntry::Note {
+                                text: format!("council `{name}` failed: {error}"),
+                                expanded: false,
+                            },
+                            Utc::now(),
+                        );
+                    }
+                    state.notice =
+                        Some((format!("council `{name}` failed: {error}"), state.tick + 90));
                 }
-                state.notice = Some((format!("council `{name}` finished"), state.tick + 60));
             }
-            Err(error) => {
-                if let Some(run) = state.selected_run_mut() {
-                    AppState::push_entry(
-                        run,
-                        TranscriptEntry::Note {
-                            text: format!("council `{name}` failed: {error}"),
-                            expanded: false,
-                        },
-                        Utc::now(),
-                    );
-                }
-                state.notice = Some((format!("council `{name}` failed: {error}"), state.tick + 90));
-            }
-        },
+        }
         Action::OpenCouncils => {
             state.overlay = match state.overlay {
                 Overlay::CouncilBrowser => Overlay::None,
@@ -3971,6 +3980,28 @@ fn submit_prompt(state: &mut AppState) {
                         state.overlay = Overlay::ModelPicker { query, selected };
                         state.notice =
                             Some((format!("model unavailable — {reason}"), state.tick + 40));
+                        return;
+                    }
+                    // A bare ACP row is both the agent's default profile and
+                    // the doorway to the models advertised by that agent. Do
+                    // not silently stage the default when the user is asking
+                    // to choose a model: handshake off-thread, then open the
+                    // ordinary searchable AddModelPick list. Pinned ACP rows
+                    // (`acp/<agent>#<model>`) still stage directly below.
+                    if let Some(provider_id) = card.acp_supplier().map(str::to_owned) {
+                        state.outbox.push(Intent::QueryProviderModels {
+                            provider_id: provider_id.clone(),
+                            api_key: None,
+                            refresh: false,
+                        });
+                        state.overlay = Overlay::AddModelQuerying {
+                            provider_id: provider_id.clone(),
+                            api_key: None,
+                        };
+                        state.notice = Some((
+                            format!("loading models from {provider_id}…"),
+                            state.tick + 50,
+                        ));
                         return;
                     }
                     let id = card.id.clone();
@@ -9040,6 +9071,48 @@ mod tests {
         assert_eq!(state.selected_model, 0);
     }
 
+    #[test]
+    fn bare_acp_model_row_opens_the_supplier_model_catalogue() {
+        let mut state = AppState::new();
+        state.models = vec![model_card("acp/codex-acp", "acp")];
+        open_model_picker(&mut state);
+
+        reduce(&mut state, Action::InputSubmit);
+
+        assert_eq!(
+            state.outbox,
+            vec![Intent::QueryProviderModels {
+                provider_id: "codex-acp".to_owned(),
+                api_key: None,
+                refresh: false,
+            }]
+        );
+        assert!(matches!(
+            state.overlay,
+            Overlay::AddModelQuerying {
+                ref provider_id,
+                api_key: None,
+            } if provider_id == "codex-acp"
+        ));
+        assert_eq!(state.pending_model, None);
+    }
+
+    #[test]
+    fn pinned_acp_model_row_stages_the_concrete_model() {
+        let mut state = AppState::new();
+        state.models = vec![model_card("acp/codex-acp#gpt-5.6-sol", "acp")];
+        open_model_picker(&mut state);
+
+        reduce(&mut state, Action::InputSubmit);
+
+        assert_eq!(
+            state.pending_model,
+            Some(ModelId("acp/codex-acp#gpt-5.6-sol".to_owned()))
+        );
+        assert!(state.outbox.is_empty());
+        assert_eq!(state.overlay, Overlay::None);
+    }
+
     fn open_council_builder(s: &mut AppState) {
         reduce(s, Action::OpenPalette);
         for c in "council".chars() {
@@ -9445,8 +9518,10 @@ mod tests {
             Action::CouncilProgress {
                 name: "review-board".to_owned(),
                 message: "round 1/1 — launching 2 member(s)".to_owned(),
+                active_subagents: 2,
             },
         );
+        assert_eq!(s.council_subagents, 2);
         let note = s.runs[0]
             .transcript
             .iter()

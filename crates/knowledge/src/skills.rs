@@ -460,7 +460,13 @@ mod tests {
                 .unwrap();
 
         assert_eq!(item.name, "test.installed");
-        assert_eq!(installed, skills_root.join("test.installed"));
+        assert_eq!(
+            installed,
+            skills_root
+                .join("test.installed")
+                .canonicalize()
+                .expect("installed package path canonicalizes")
+        );
         assert!(installed.join("skill.toml").is_file(), "package was copied");
         // Provenance names the INSTALLED path — the one the startup scan re-walks
         // — not the transient source directory.

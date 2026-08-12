@@ -1178,6 +1178,25 @@ pub struct ModelCard {
     pub context_tokens: Option<u64>,
 }
 
+impl ModelCard {
+    /// The ACP supplier represented by an unpinned `acp/<agent>` profile.
+    ///
+    /// Bare ACP profiles are launchable defaults, but in the model picker they
+    /// also act as the entry point to the agent-owned model catalogue. A pinned
+    /// `acp/<agent>#<model>` row is a concrete model and therefore returns
+    /// `None` here.
+    #[must_use]
+    pub fn acp_supplier(&self) -> Option<&str> {
+        if self.provider != "acp" {
+            return None;
+        }
+        self.id
+            .0
+            .strip_prefix("acp/")
+            .filter(|agent| !agent.is_empty() && !agent.contains('#'))
+    }
+}
+
 /// The indices into `models` whose id or provider case-insensitively contains
 /// `query` — the model picker's substring filter, in list order (mirrors
 /// [`crate::palette::filtered`]'s shape, adapted to instance data rather than
@@ -1747,6 +1766,10 @@ pub struct AppState {
     pub councils: Vec<CouncilCard>,
     /// Index into `councils` of the focused council.
     pub selected_council: usize,
+    /// Independent council member/chair runs executing right now. Council
+    /// workers are subagents just like durable workflow agent nodes; the
+    /// persistent footer combines both sources instead of hiding council work.
+    pub council_subagents: usize,
     /// The repository task board (rubric 10): every live `task` card on the
     /// repository's board, mapped to self-contained [`KanbanCard`]s by the CLI.
     /// The [`Overlay::Kanban`] view reads it; a live `BlackboardPosted` on the
@@ -1941,6 +1964,7 @@ impl AppState {
             selected_item: 0,
             councils: Vec::new(),
             selected_council: 0,
+            council_subagents: 0,
             kanban: Vec::new(),
             selected_card: 0,
             models: Vec::new(),

@@ -62,7 +62,7 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // being resized. The full shell has five independently meaningful rows;
     // forcing them into less space used to create a zero-height bordered
     // composer. Render a stable, non-interactive compact frame instead.
-    if area.height < 5 || area.width < 20 {
+    if area.height < 10 || area.width < 20 {
         let compact = vec![
             Line::styled(
                 "codypendent",
@@ -102,7 +102,7 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
             Constraint::Min(3),    // conversation transcript
             Constraint::Length(if has_composer_accessory { 3 } else { 0 }),
             Constraint::Length(composer_height), // inline composer
-            Constraint::Length(if has_status_items { 4 } else { 1 }),
+            Constraint::Length(if has_status_items { 5 } else { 2 }),
         ])
         .split(area);
 
@@ -266,13 +266,115 @@ fn render_status_slot(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     let documents = state
         .remote_ui
         .mounted_documents_for_points(&["status-item"]);
-    if documents.is_empty() || area.width < 24 || area.height < 4 {
+    if documents.is_empty() || area.width < 24 || area.height < 5 {
+        render_footer(frame, area, state, theme);
+        return;
+    }
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    render_remote_documents(frame, rows[0], state, theme, documents);
+    render_footer(frame, rows[1], state, theme);
+}
+
+/// The bottom chrome is deliberately two stable rows: transient actions above,
+/// durable run telemetry below. Notices, recording, approvals and extension
+/// status items may change the first row but can never hide which model is
+/// loaded, how much context it has used, or how many Codypendent-managed
+/// subagents are running.
+fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if area.height < 2 {
         render_status_line(frame, area, state, theme);
         return;
     }
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).split(area);
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
     render_status_line(frame, rows[0], state, theme);
-    render_remote_documents(frame, rows[1], state, theme, documents);
+    render_run_telemetry(frame, rows[1], state, theme);
+}
+
+fn render_run_telemetry(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let status = state.status();
+    let model = status.model.as_ref().or(state.pending_model.as_ref());
+    let model_card = model.and_then(|id| state.models.iter().find(|card| card.id == *id));
+    let model_label = model.map_or("none", |id| id.0.as_str());
+    let context_window = model_card.and_then(|card| card.context_tokens);
+    let context = match (status.context_percent, context_window) {
+        (Some(percent), Some(tokens)) => format!("{percent}% / {}", context_label(Some(tokens))),
+        (Some(percent), None) => format!("{percent}%"),
+        (None, Some(tokens)) => format!("0% / {}", context_label(Some(tokens))),
+        (None, None) => "—".to_owned(),
+    };
+    let workflow_subagents = state
+        .workflow
+        .iter()
+        .filter(|node| {
+            node.kind.eq_ignore_ascii_case("agent")
+                && matches!(
+                    node.state.to_ascii_lowercase().as_str(),
+                    "running" | "preparing" | "queued" | "waiting"
+                )
+        })
+        .count();
+    let active_subagents = workflow_subagents.saturating_add(state.council_subagents);
+
+    if area.width < 42 {
+        let compact_context = status
+            .context_percent
+            .map_or_else(|| "—".to_owned(), |percent| format!("{percent}%"));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" m:", Style::default().fg(theme.text.muted)),
+                Span::styled(
+                    truncate_display_width(model_label, 6),
+                    Style::default().fg(theme.text.primary),
+                ),
+                Span::styled(" c:", Style::default().fg(theme.text.muted)),
+                Span::styled(compact_context, Style::default().fg(theme.status.info)),
+                Span::styled(" a:", Style::default().fg(theme.text.muted)),
+                Span::styled(
+                    active_subagents.to_string(),
+                    Style::default().fg(theme.text.secondary),
+                ),
+            ]))
+            .style(Style::default().bg(theme.surface.background)),
+            area,
+        );
+        return;
+    }
+    let (context_prefix, agent_prefix, max_model) = if area.width >= 72 {
+        ("context ", "subagents ", 34usize)
+    } else {
+        ("ctx ", "agents ", 20usize)
+    };
+    let line = Line::from(vec![
+        Span::raw("  "),
+        Span::styled("model ", Style::default().fg(theme.text.muted)),
+        Span::styled(
+            truncate_display_width(model_label, max_model),
+            Style::default()
+                .fg(theme.text.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {context_prefix}"),
+            Style::default().fg(theme.text.muted),
+        ),
+        Span::styled(context, Style::default().fg(theme.status.info)),
+        Span::styled(
+            format!("  {agent_prefix}"),
+            Style::default().fg(theme.text.muted),
+        ),
+        Span::styled(
+            active_subagents.to_string(),
+            Style::default().fg(if active_subagents > 0 {
+                theme.status.success
+            } else {
+                theme.text.secondary
+            }),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(theme.surface.background)),
+        area,
+    );
 }
 
 fn render_remote_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -838,15 +940,17 @@ fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     );
 }
 
-/// The composer's minimum height: one subtle top rule and one input row.
-const COMPOSER_HEIGHT: u16 = 2;
+/// The composer's minimum height: one subtle top rule plus three comfortable
+/// input rows. A single-line prompt no longer reads like a cramped command bar;
+/// the extra whitespace establishes it as the primary chat input surface.
+const COMPOSER_HEIGHT: u16 = 4;
 
 /// The composer's maximum height in rows. A manual line break (`Alt+Enter`)
 /// or a multi-line paste grows the box by one row per extra line, capped
 /// here so a large paste can't swallow the whole screen; once the draft has
 /// more lines than fit, the box scrolls to keep the cursor (the last line)
 /// in view.
-const COMPOSER_MAX_HEIGHT: u16 = 8;
+const COMPOSER_MAX_HEIGHT: u16 = 10;
 
 /// How tall the composer should be this frame. Both explicit newlines and soft
 /// wraps consume rows; the latter is essential on narrow terminals where a
@@ -1953,6 +2057,33 @@ fn entry_lines<'a>(
 /// else degrades to the outermost segment verbatim. The full raw chain is one
 /// expand away, so no detail is lost.
 fn summarize_error(raw: &str) -> String {
+    // ACP servers often put the only actionable explanation in a JSON-RPC
+    // `details` member nested several error layers deep. The previous summary
+    // discarded it and rendered every auth/setup failure as the identical
+    // "ACP prompt failed". Extract a bounded, single-line detail for the
+    // collapsed card; expanding the card still shows the untouched raw chain.
+    if raw.to_ascii_lowercase().contains("acp") {
+        if let Some(marker) = raw.find("\"details\"") {
+            let tail = &raw[marker + "\"details\"".len()..];
+            if let Some(value) = tail.split_once(':').map(|(_, value)| value.trim()) {
+                if let Some(value) = value.strip_prefix('"') {
+                    let detail = value
+                        .split('"')
+                        .next()
+                        .unwrap_or("")
+                        .replace("\\n", " ")
+                        .trim()
+                        .to_owned();
+                    if !detail.is_empty() {
+                        return format!("ACP — {detail}");
+                    }
+                }
+            }
+        }
+        if raw.to_ascii_lowercase().contains("prompt failed") {
+            return "ACP agent request failed — expand for details".to_owned();
+        }
+    }
     let outer = raw.split(": ").next().unwrap_or("").trim();
     // Recognized categories, checked against any segment of the chain.
     for segment in raw.split(": ") {
@@ -3542,6 +3673,8 @@ fn render_model_picker(
         lines.push(Line::styled(
             if matches!(card.readiness, ModelReadiness::Unavailable(_)) {
                 "  This model cannot be staged until it is available"
+            } else if card.acp_supplier().is_some() {
+                "  Enter browses this supplier's available models"
             } else {
                 "  Enter stages this model for your next run"
             },
@@ -3561,9 +3694,13 @@ fn render_model_picker(
             detail_area,
         );
     }
+    let submit_hint = state
+        .focused_model()
+        .and_then(ModelCard::acp_supplier)
+        .map_or("Enter stage", |_| "Enter browse models");
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "↑/↓ or wheel · PgUp/PgDn · Home/End · Enter stage · Esc close",
+            format!("↑/↓ or wheel · PgUp/PgDn · Home/End · {submit_hint} · Esc close"),
             Style::default().fg(theme.text.muted),
         ))
         .alignment(Alignment::Center),
@@ -8618,7 +8755,7 @@ mod tests {
     #[test]
     fn a_soft_wrapped_composer_keeps_its_cursor_visible() {
         let mut state = AppState::new();
-        state.composer = "a long narrow draft ".repeat(12);
+        state.composer = "a long narrow draft ".repeat(20);
         state.composer_cursor = state.composer.len();
         let theme = Theme::dark();
         let buffer = render_buffer(&state, 40, 18, &theme);
@@ -8715,6 +8852,14 @@ mod tests {
                 limit: 100_000,
             }),
         );
+        s.models.push(ModelCard {
+            id: ModelId("gpt-5.1-codex".to_owned()),
+            provider: "openai".to_owned(),
+            readiness: ModelReadiness::Ready,
+            location: Some(ModelLocationLabel::Hosted),
+            cost_per_1k_usd: None,
+            context_tokens: Some(100_000),
+        });
         s
     }
 
@@ -9583,6 +9728,20 @@ mod tests {
         assert_eq!(summarize_error(""), "run failed");
     }
 
+    #[test]
+    fn summarize_error_surfaces_nested_acp_agent_details() {
+        assert_eq!(
+            summarize_error(
+                "ACP prompt failed: acp prompt failed: session/prompt failed: Internal error: {\n  \"details\": \"cline requires re-authentication.\"\n}"
+            ),
+            "ACP — cline requires re-authentication."
+        );
+        assert_eq!(
+            summarize_error("ACP prompt failed: session/prompt failed"),
+            "ACP agent request failed — expand for details"
+        );
+    }
+
     /// Task 3: a failed run's nested error chain renders collapsed to the
     /// concise summary by default (raw chain hidden), and expanding the
     /// selected `Completed` entry reveals the full raw chain underneath —
@@ -10308,15 +10467,23 @@ mod tests {
             "expected exactly {height} rendered rows:\n{text}"
         );
 
-        // Bottom-most row: the one contextual footer.
-        let footer_row = lines[lines.len() - 1];
+        // The contextual action row sits immediately above the persistent
+        // telemetry row; neither may consume the composer's space.
+        let footer_row = lines[lines.len() - 2];
         assert!(
             footer_row.contains("Running") && footer_row.contains("commands"),
             "bottom row should be the context footer:\n{footer_row:?}"
         );
+        let telemetry_row = lines[lines.len() - 1];
+        assert!(
+            telemetry_row.contains("model gpt-5.1-codex")
+                && telemetry_row.contains("context 42%")
+                && telemetry_row.contains("subagents 0"),
+            "durable telemetry should occupy the final row:\n{telemetry_row:?}"
+        );
 
-        let composer_start = lines.len() - 1 - COMPOSER_HEIGHT as usize;
-        let composer_end = lines.len() - 1;
+        let composer_start = lines.len() - 2 - COMPOSER_HEIGHT as usize;
+        let composer_end = lines.len() - 2;
         let composer_rows = lines[composer_start..composer_end].join("\n");
         assert!(
             composer_rows.contains('❯'),
@@ -10352,7 +10519,7 @@ mod tests {
         state.voice.recording = true;
         state.issues = vec!["model credentials need attention".to_owned()];
         let recording = render_to_string(&state, 120, 20);
-        let recording_footer = recording.lines().last().unwrap_or("");
+        let recording_footer = recording.lines().rev().nth(1).unwrap_or("");
         assert!(recording_footer.contains("Recording"), "{recording_footer}");
         assert!(
             recording_footer.contains("diagnostics"),
@@ -10384,7 +10551,7 @@ mod tests {
             }),
         );
         let noticed = render_to_string(&state, 120, 20);
-        let noticed_footer = noticed.lines().last().unwrap_or("");
+        let noticed_footer = noticed.lines().rev().nth(1).unwrap_or("");
         assert!(
             noticed_footer.contains("Settings saved"),
             "{noticed_footer}"
@@ -10399,34 +10566,29 @@ mod tests {
     fn contextual_footer_narrows_by_dropping_low_priority_fields() {
         let state = running_build_state();
         let narrow = render_to_string(&state, 50, 30);
-        // Operational state survives; duplicated metadata is absent.
+        // Operational state and the compact persistent model telemetry survive.
         assert!(narrow.contains("Running"), "run state kept:\n{narrow}");
         assert!(
-            !narrow.contains("model"),
-            "model dropped when narrow:\n{narrow}"
+            narrow.contains("model gpt-5.1-codex"),
+            "model telemetry remains visible when narrow:\n{narrow}"
         );
     }
 
     #[test]
-    fn the_context_footer_drops_duplicate_model_and_unknown_placeholders() {
-        let state = running_build_state();
+    fn the_context_footer_keeps_persistent_model_context_and_subagents() {
+        let mut state = running_build_state();
+        state.council_subagents = 2;
         let out = render_to_string(&state, 120, 30);
-        // The model is deduped out of the status line's ambient fields — but still
-        // shown in the header chrome + the assistant turn header.
+        // The final row is stable telemetry, independent of the contextual
+        // action row immediately above it.
         let status_row = out.lines().last().unwrap_or("");
         assert!(
-            !status_row.contains("model"),
-            "no `model` field on the status line:\n{status_row}"
+            status_row.contains("model gpt-5.1-codex"),
+            "model should remain on the status line:\n{status_row}"
         );
         assert!(
-            out.contains("gpt-5.1-codex"),
-            "model still shown in chrome/turn header:\n{out}"
-        );
-        // Unknown fields are omitted entirely instead of filling the calm
-        // primary shell with em-dash dashboard slots.
-        assert!(
-            !status_row.contains("—"),
-            "unknown ambient fields should be omitted:\n{status_row}"
+            status_row.contains("context 42% / 100k") && status_row.contains("subagents 2"),
+            "context and subagents should remain on the status line:\n{status_row}"
         );
     }
 

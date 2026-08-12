@@ -1459,8 +1459,8 @@ async fn event_loop<P: Presentation>(
                         Action::BlackboardItemUpdated(wire_blackboard_item_card(label, &item))
                     }
                 }
-                Some(ReaderSignal::CouncilProgress { name, message }) => {
-                    Action::CouncilProgress { name, message }
+                Some(ReaderSignal::CouncilProgress { name, message, active_subagents }) => {
+                    Action::CouncilProgress { name, message, active_subagents }
                 }
                 Some(ReaderSignal::CouncilRunFinished { name, result }) => {
                     Action::CouncilRunFinished { name, result }
@@ -1835,8 +1835,27 @@ async fn event_loop<P: Presentation>(
                             for warning in warnings {
                                 reduce(state, Action::Issue(warning));
                             }
+                            // A successful agent install/handshake makes its
+                            // catalogue immediately browseable without a TUI
+                            // restart. Selecting a supplier-owned model is a
+                            // model-selection action, so stage the resulting
+                            // concrete profile for the next run as well.
+                            if let Some(provider) = state
+                                .providers
+                                .iter_mut()
+                                .find(|provider| provider.id == provider_id)
+                            {
+                                provider.available = true;
+                                provider.can_list_models = true;
+                            }
+                            state.pending_model = Some(ModelId(display_id.clone()));
                             reload_key_statuses(state, paths);
-                            reduce(state, Action::Notice(format!("connected {display_id}")));
+                            reduce(
+                                state,
+                                Action::Notice(format!(
+                                    "connected and selected {display_id} for your next run"
+                                )),
+                            );
                         }
                         Err(error) => reduce(
                             state,
@@ -2331,10 +2350,34 @@ async fn event_loop<P: Presentation>(
                 let progress_tx = tx.clone();
                 let progress_name = name.clone();
                 tokio::spawn(async move {
+                    let active_subagents =
+                        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     let progress = move |event: crate::council::CouncilEvent| {
+                        use std::sync::atomic::Ordering;
+                        let active = match &event {
+                            crate::council::CouncilEvent::RoundStarted { members, .. } => {
+                                active_subagents.store(*members, Ordering::Relaxed);
+                                *members
+                            }
+                            crate::council::CouncilEvent::MemberCompleted { .. }
+                            | crate::council::CouncilEvent::MemberFailed { .. } => active_subagents
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                                    Some(value.saturating_sub(1))
+                                })
+                                .unwrap_or(0)
+                                .saturating_sub(1),
+                            crate::council::CouncilEvent::ChairStarted { .. } => {
+                                active_subagents.store(1, Ordering::Relaxed);
+                                1
+                            }
+                            crate::council::CouncilEvent::Warning { .. } => {
+                                active_subagents.load(Ordering::Relaxed)
+                            }
+                        };
                         let _ = progress_tx.try_send(ReaderSignal::CouncilProgress {
                             name: progress_name.clone(),
                             message: council_progress_message(&event),
+                            active_subagents: active,
                         });
                     };
                     let result = crate::council::run_with_progress(
@@ -2889,6 +2932,7 @@ enum ReaderSignal {
     CouncilProgress {
         name: String,
         message: String,
+        active_subagents: usize,
     },
     /// An off-thread council run finished. `Ok` carries the pre-formatted
     /// chair synthesis, attributed participants, and measured-cost line;
@@ -3885,6 +3929,8 @@ fn is_acp_provider(paths: &RuntimePaths, provider_id: &str) -> bool {
         .load_cached()
         .ok()
         .is_some_and(|registry| registry.get(provider_id).is_some())
+        || codypendent_integrations::acp_registry::local_kimi_code_spec()
+            .is_some_and(|spec| spec.registry_id == provider_id)
 }
 
 /// The `models.toml` profile id for a connected ACP agent — `acp/<agent>`, or
