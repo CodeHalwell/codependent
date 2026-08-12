@@ -4,9 +4,9 @@
 //! set it achieves **mean recall@8 ≥ 0.8** while **excluding 100 %** of the
 //! forbidden (destructive) decoys, and the disclosed cards fit a context budget
 //! that dumping every item's full definition blows past. The pool is seeded with
-//! the five built-in tools, the `rust.fix-ci` reference skill, and 20 synthetic
-//! decoys (three of them High-risk and destructive) so retrieval has to both
-//! rank the right behaviours and filter the dangerous ones.
+//! the production built-in catalogue, the `rust.fix-ci` reference skill, and
+//! 20 synthetic decoys (three of them High-risk and destructive) so retrieval
+//! has to both rank the right behaviours and filter the dangerous ones.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -69,15 +69,11 @@ async fn seed() -> (tempfile::TempDir, Vec<RegistryItem>, RepositoryId) {
     }
 
     let items = registry.list(&pool).await.unwrap();
-    // 9 built-in tools (5 Phase-1 tools + the Phase-5 `repository.test` verification
-    // tool + the 2 Phase-5 blackboard tools + the smarter-memory M2 `memory.remember`
-    // core tool) + 2 built-in commands (`/fix-ci`, `/update-docs`) + the rust.fix-ci
-    // skill + 20 decoys. (The High-risk `/fix-ci` command is filtered by the Medium
-    // risk ceiling the eval queries under; the Low-risk `/update-docs` command, the
-    // Safe-risk `blackboard.*`/`memory.remember` tools, and the `repository.test` tool
-    // are eligible but their docs/blackboard/memory/test intents keep them out of the
-    // CI/tool query top-k, so none perturb recall/exclusion.)
-    assert_eq!(items.len(), 32, "unexpected seeded item count");
+    // 21 production built-ins (tools and commands), the repository-scoped
+    // rust.fix-ci skill, and 20 synthetic decoys. Keeping this count explicit
+    // ensures every newly advertised tool is evaluated against the retrieval
+    // budget and forbidden-item filter instead of silently bypassing the gate.
+    assert_eq!(items.len(), 42, "unexpected seeded item count");
     (tmp, items, repo)
 }
 
