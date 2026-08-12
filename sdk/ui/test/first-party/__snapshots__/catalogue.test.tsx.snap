@@ -1,5 +1,783 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
+exports[`first-party semantic component catalogue > lays a board out as virtualized columns with keyboard-reachable move intents 1`] = `
+"{
+  "children": [
+    {
+      "children": [
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [],
+                  "id": "react-ui-1",
+                  "kind": "element",
+                  "props": {
+                    "accessibleLabel": "Backlog",
+                    "role": "heading",
+                    "value": "Backlog",
+                    "weight": "bold"
+                  },
+                  "type": "Text"
+                }
+              ],
+              "id": "react-ui-2",
+              "kind": "element",
+              "props": {
+                "gap": "xs"
+              },
+              "type": "Stack"
+            }
+          ],
+          "id": "react-ui-3",
+          "kind": "element",
+          "props": {
+            "align": "spaceBetween",
+            "gap": "sm"
+          },
+          "type": "Row"
+        },
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "id": "react-ui-4",
+                      "kind": "element",
+                      "props": {
+                        "role": "heading",
+                        "value": "Backlog",
+                        "weight": "bold"
+                      },
+                      "type": "Text"
+                    },
+                    {
+                      "children": [],
+                      "id": "react-ui-5",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "0 cards",
+                        "role": "status",
+                        "tone": "muted",
+                        "value": "0"
+                      },
+                      "type": "Text"
+                    }
+                  ],
+                  "id": "react-ui-6",
+                  "kind": "element",
+                  "props": {
+                    "align": "spaceBetween",
+                    "gap": "xs"
+                  },
+                  "type": "Row"
+                },
+                {
+                  "children": [],
+                  "id": "board-column-backlog",
+                  "kind": "element",
+                  "props": {
+                    "accessibleLabel": "Backlog cards",
+                    "emptyMessage": "Nothing queued",
+                    "items": [],
+                    "virtualized": true
+                  },
+                  "type": "VirtualList"
+                }
+              ],
+              "id": "react-ui-7",
+              "kind": "element",
+              "props": {
+                "accessibleLabel": "Backlog, 0 cards",
+                "gap": "xs",
+                "grow": 1
+              },
+              "type": "Stack"
+            },
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "id": "react-ui-8",
+                      "kind": "element",
+                      "props": {
+                        "role": "heading",
+                        "value": "Doing",
+                        "weight": "bold"
+                      },
+                      "type": "Text"
+                    },
+                    {
+                      "children": [],
+                      "id": "react-ui-9",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "2 cards, over the limit of 1",
+                        "role": "status",
+                        "tone": "warning",
+                        "value": "2/1"
+                      },
+                      "type": "Text"
+                    }
+                  ],
+                  "id": "react-ui-10",
+                  "kind": "element",
+                  "props": {
+                    "align": "spaceBetween",
+                    "gap": "xs"
+                  },
+                  "type": "Row"
+                },
+                {
+                  "children": [
+                    {
+                      "children": [
+                        {
+                          "children": [
+                            {
+                              "children": [
+                                {
+                                  "children": [],
+                                  "id": "react-ui-11",
+                                  "kind": "element",
+                                  "props": {
+                                    "value": "Draw the DAG",
+                                    "weight": "medium"
+                                  },
+                                  "type": "Text"
+                                },
+                                {
+                                  "children": [],
+                                  "id": "react-ui-12",
+                                  "kind": "element",
+                                  "props": {
+                                    "accessibleLabel": "running: running",
+                                    "message": "running",
+                                    "title": "running",
+                                    "tone": "info"
+                                  },
+                                  "type": "Badge"
+                                }
+                              ],
+                              "id": "react-ui-13",
+                              "kind": "element",
+                              "props": {
+                                "align": "spaceBetween",
+                                "gap": "xs"
+                              },
+                              "type": "Row"
+                            },
+                            {
+                              "children": [],
+                              "id": "react-ui-14",
+                              "kind": "element",
+                              "props": {
+                                "role": "caption",
+                                "tone": "muted",
+                                "value": "task · @codypendent"
+                              },
+                              "type": "Text"
+                            },
+                            {
+                              "children": [
+                                {
+                                  "children": [],
+                                  "id": "react-ui-15",
+                                  "kind": "element",
+                                  "props": {
+                                    "accessibleLabel": "Open Draw the DAG",
+                                    "action": "board.card.select",
+                                    "label": "Open",
+                                    "payload": {
+                                      "cardId": "card-1"
+                                    }
+                                  },
+                                  "type": "Button"
+                                },
+                                {
+                                  "children": [],
+                                  "id": "react-ui-16",
+                                  "kind": "element",
+                                  "props": {
+                                    "accessibleLabel": "Draw the DAG actions",
+                                    "action": "board.card.move",
+                                    "description": "Move this card with the keyboard",
+                                    "items": [
+                                      {
+                                        "action": "board.card.assign",
+                                        "cardId": "card-1",
+                                        "id": "board.card.assign:card-1",
+                                        "label": "Assign to me"
+                                      },
+                                      {
+                                        "action": "board.card.move",
+                                        "cardId": "card-1",
+                                        "fromColumnId": "doing",
+                                        "id": "move:card-1:backlog",
+                                        "label": "Move to Backlog",
+                                        "toColumnId": "backlog"
+                                      },
+                                      {
+                                        "action": "board.card.move",
+                                        "cardId": "card-1",
+                                        "fromColumnId": "doing",
+                                        "id": "move:card-1:done",
+                                        "label": "Move to Done",
+                                        "toColumnId": "done"
+                                      }
+                                    ]
+                                  },
+                                  "type": "ActionMenu"
+                                }
+                              ],
+                              "id": "react-ui-17",
+                              "kind": "element",
+                              "props": {
+                                "gap": "xs"
+                              },
+                              "type": "Row"
+                            }
+                          ],
+                          "id": "react-ui-18",
+                          "kind": "element",
+                          "props": {
+                            "gap": "xs"
+                          },
+                          "type": "Stack"
+                        }
+                      ],
+                      "id": "card-card-1",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "Draw the DAG, in Doing, running, task · @codypendent",
+                        "border": "rounded",
+                        "padding": "xs"
+                      },
+                      "type": "Box"
+                    },
+                    {
+                      "children": [
+                        {
+                          "children": [
+                            {
+                              "children": [
+                                {
+                                  "children": [],
+                                  "id": "react-ui-19",
+                                  "kind": "element",
+                                  "props": {
+                                    "value": "Board projection",
+                                    "weight": "bold"
+                                  },
+                                  "type": "Text"
+                                },
+                                {
+                                  "children": [],
+                                  "id": "react-ui-20",
+                                  "kind": "element",
+                                  "props": {
+                                    "accessibleLabel": "waiting: waiting",
+                                    "message": "waiting",
+                                    "title": "waiting",
+                                    "tone": "warning"
+                                  },
+                                  "type": "Badge"
+                                }
+                              ],
+                              "id": "react-ui-21",
+                              "kind": "element",
+                              "props": {
+                                "align": "spaceBetween",
+                                "gap": "xs"
+                              },
+                              "type": "Row"
+                            },
+                            {
+                              "children": [],
+                              "id": "react-ui-22",
+                              "kind": "element",
+                              "props": {
+                                "role": "caption",
+                                "tone": "muted",
+                                "value": "task · @daniel"
+                              },
+                              "type": "Text"
+                            },
+                            {
+                              "children": [],
+                              "id": "react-ui-23",
+                              "kind": "element",
+                              "props": {
+                                "role": "caption",
+                                "tone": "muted",
+                                "truncate": true,
+                                "value": "Read-only."
+                              },
+                              "type": "Text"
+                            },
+                            {
+                              "children": [
+                                {
+                                  "children": [],
+                                  "id": "react-ui-24",
+                                  "kind": "element",
+                                  "props": {
+                                    "accessibleLabel": "Open Board projection",
+                                    "action": "board.card.select",
+                                    "label": "Open",
+                                    "payload": {
+                                      "cardId": "card-2"
+                                    }
+                                  },
+                                  "type": "Button"
+                                },
+                                {
+                                  "children": [],
+                                  "id": "react-ui-25",
+                                  "kind": "element",
+                                  "props": {
+                                    "accessibleLabel": "Board projection actions",
+                                    "action": "board.card.move",
+                                    "description": "Move this card with the keyboard",
+                                    "items": [
+                                      {
+                                        "action": "board.card.assign",
+                                        "cardId": "card-2",
+                                        "id": "board.card.assign:card-2",
+                                        "label": "Assign to me"
+                                      },
+                                      {
+                                        "action": "board.card.move",
+                                        "cardId": "card-2",
+                                        "fromColumnId": "doing",
+                                        "id": "move:card-2:backlog",
+                                        "label": "Move to Backlog",
+                                        "toColumnId": "backlog"
+                                      },
+                                      {
+                                        "action": "board.card.move",
+                                        "cardId": "card-2",
+                                        "fromColumnId": "doing",
+                                        "id": "move:card-2:done",
+                                        "label": "Move to Done",
+                                        "toColumnId": "done"
+                                      }
+                                    ]
+                                  },
+                                  "type": "ActionMenu"
+                                }
+                              ],
+                              "id": "react-ui-26",
+                              "kind": "element",
+                              "props": {
+                                "gap": "xs"
+                              },
+                              "type": "Row"
+                            }
+                          ],
+                          "id": "react-ui-27",
+                          "kind": "element",
+                          "props": {
+                            "gap": "xs"
+                          },
+                          "type": "Stack"
+                        }
+                      ],
+                      "id": "card-card-2",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "Board projection, in Doing, waiting, task · @daniel",
+                        "border": "rounded",
+                        "padding": "xs"
+                      },
+                      "type": "Box"
+                    }
+                  ],
+                  "id": "board-column-doing",
+                  "kind": "element",
+                  "props": {
+                    "accessibleLabel": "Doing cards",
+                    "emptyMessage": "No cards in Doing",
+                    "items": [
+                      {
+                        "assignee": "codypendent",
+                        "columnId": "doing",
+                        "id": "card-1",
+                        "key": "card-1",
+                        "kind": "task",
+                        "status": "running",
+                        "title": "Draw the DAG"
+                      },
+                      {
+                        "assignee": "daniel",
+                        "columnId": "doing",
+                        "id": "card-2",
+                        "key": "card-2",
+                        "kind": "task",
+                        "status": "waiting",
+                        "summary": "Read-only.",
+                        "title": "Board projection"
+                      }
+                    ],
+                    "selectedKey": "card-2",
+                    "virtualized": true
+                  },
+                  "type": "VirtualList"
+                }
+              ],
+              "id": "react-ui-28",
+              "kind": "element",
+              "props": {
+                "accessibleLabel": "Doing, 2 cards",
+                "gap": "xs",
+                "grow": 1
+              },
+              "type": "Stack"
+            },
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "id": "react-ui-29",
+                      "kind": "element",
+                      "props": {
+                        "role": "heading",
+                        "value": "Done",
+                        "weight": "bold"
+                      },
+                      "type": "Text"
+                    },
+                    {
+                      "children": [],
+                      "id": "react-ui-30",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "0 cards",
+                        "role": "status",
+                        "tone": "muted",
+                        "value": "0"
+                      },
+                      "type": "Text"
+                    }
+                  ],
+                  "id": "react-ui-31",
+                  "kind": "element",
+                  "props": {
+                    "align": "spaceBetween",
+                    "gap": "xs"
+                  },
+                  "type": "Row"
+                },
+                {
+                  "children": [],
+                  "id": "board-column-done",
+                  "kind": "element",
+                  "props": {
+                    "accessibleLabel": "Done cards",
+                    "emptyMessage": "No cards in Done",
+                    "items": [],
+                    "virtualized": true
+                  },
+                  "type": "VirtualList"
+                }
+              ],
+              "id": "react-ui-32",
+              "kind": "element",
+              "props": {
+                "accessibleLabel": "Done, 0 cards",
+                "gap": "xs",
+                "grow": 1
+              },
+              "type": "Stack"
+            },
+            {
+              "children": [
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "id": "react-ui-33",
+                      "kind": "element",
+                      "props": {
+                        "role": "heading",
+                        "value": "Unplaced",
+                        "weight": "bold"
+                      },
+                      "type": "Text"
+                    },
+                    {
+                      "children": [],
+                      "id": "react-ui-34",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "1 cards",
+                        "role": "status",
+                        "tone": "muted",
+                        "value": "1"
+                      },
+                      "type": "Text"
+                    }
+                  ],
+                  "id": "react-ui-35",
+                  "kind": "element",
+                  "props": {
+                    "align": "spaceBetween",
+                    "gap": "xs"
+                  },
+                  "type": "Row"
+                },
+                {
+                  "children": [],
+                  "id": "react-ui-36",
+                  "kind": "element",
+                  "props": {
+                    "role": "caption",
+                    "tone": "muted",
+                    "value": "These cards name a column this board does not define."
+                  },
+                  "type": "Text"
+                },
+                {
+                  "children": [
+                    {
+                      "children": [
+                        {
+                          "children": [
+                            {
+                              "children": [
+                                {
+                                  "children": [],
+                                  "id": "react-ui-37",
+                                  "kind": "element",
+                                  "props": {
+                                    "value": "Ship it",
+                                    "weight": "medium"
+                                  },
+                                  "type": "Text"
+                                },
+                                {
+                                  "children": [],
+                                  "id": "react-ui-38",
+                                  "kind": "element",
+                                  "props": {
+                                    "accessibleLabel": "queued: queued",
+                                    "message": "queued",
+                                    "title": "queued",
+                                    "tone": "warning"
+                                  },
+                                  "type": "Badge"
+                                }
+                              ],
+                              "id": "react-ui-39",
+                              "kind": "element",
+                              "props": {
+                                "align": "spaceBetween",
+                                "gap": "xs"
+                              },
+                              "type": "Row"
+                            },
+                            {
+                              "children": [],
+                              "id": "react-ui-40",
+                              "kind": "element",
+                              "props": {
+                                "role": "caption",
+                                "tone": "muted",
+                                "value": "task"
+                              },
+                              "type": "Text"
+                            },
+                            {
+                              "children": [
+                                {
+                                  "children": [],
+                                  "id": "react-ui-41",
+                                  "kind": "element",
+                                  "props": {
+                                    "accessibleLabel": "Open Ship it",
+                                    "action": "board.card.select",
+                                    "label": "Open",
+                                    "payload": {
+                                      "cardId": "card-3"
+                                    }
+                                  },
+                                  "type": "Button"
+                                },
+                                {
+                                  "children": [],
+                                  "id": "react-ui-42",
+                                  "kind": "element",
+                                  "props": {
+                                    "accessibleLabel": "Ship it actions",
+                                    "action": "board.card.move",
+                                    "description": "Move this card with the keyboard",
+                                    "items": [
+                                      {
+                                        "action": "board.card.assign",
+                                        "cardId": "card-3",
+                                        "id": "board.card.assign:card-3",
+                                        "label": "Assign to me"
+                                      },
+                                      {
+                                        "action": "board.card.move",
+                                        "cardId": "card-3",
+                                        "fromColumnId": "elsewhere",
+                                        "id": "move:card-3:backlog",
+                                        "label": "Move to Backlog",
+                                        "toColumnId": "backlog"
+                                      },
+                                      {
+                                        "action": "board.card.move",
+                                        "cardId": "card-3",
+                                        "fromColumnId": "elsewhere",
+                                        "id": "move:card-3:doing",
+                                        "label": "Move to Doing",
+                                        "toColumnId": "doing"
+                                      },
+                                      {
+                                        "action": "board.card.move",
+                                        "cardId": "card-3",
+                                        "fromColumnId": "elsewhere",
+                                        "id": "move:card-3:done",
+                                        "label": "Move to Done",
+                                        "toColumnId": "done"
+                                      }
+                                    ]
+                                  },
+                                  "type": "ActionMenu"
+                                }
+                              ],
+                              "id": "react-ui-43",
+                              "kind": "element",
+                              "props": {
+                                "gap": "xs"
+                              },
+                              "type": "Row"
+                            }
+                          ],
+                          "id": "react-ui-44",
+                          "kind": "element",
+                          "props": {
+                            "gap": "xs"
+                          },
+                          "type": "Stack"
+                        }
+                      ],
+                      "id": "card-card-3",
+                      "kind": "element",
+                      "props": {
+                        "accessibleLabel": "Ship it, in Unplaced, queued, task",
+                        "border": "rounded",
+                        "padding": "xs"
+                      },
+                      "type": "Box"
+                    }
+                  ],
+                  "id": "board-column-core.board.unplaced",
+                  "kind": "element",
+                  "props": {
+                    "accessibleLabel": "Unplaced cards",
+                    "emptyMessage": "No unplaced cards",
+                    "items": [
+                      {
+                        "columnId": "elsewhere",
+                        "id": "card-3",
+                        "key": "card-3",
+                        "kind": "task",
+                        "status": "queued",
+                        "title": "Ship it"
+                      }
+                    ],
+                    "virtualized": true
+                  },
+                  "type": "VirtualList"
+                }
+              ],
+              "id": "react-ui-45",
+              "kind": "element",
+              "props": {
+                "accessibleLabel": "Unplaced, 1 cards",
+                "gap": "xs",
+                "grow": 1
+              },
+              "type": "Stack"
+            }
+          ],
+          "fallback": {
+            "children": [],
+            "id": "react-ui-0-1--1",
+            "kind": "element",
+            "props": {
+              "accessibleLabel": "Backlog cards, grouped by column",
+              "emptyMessage": "This board has no cards",
+              "items": [
+                {
+                  "assignee": "codypendent",
+                  "columnId": "doing",
+                  "id": "card-1",
+                  "kind": "task",
+                  "label": "Doing: Draw the DAG",
+                  "status": "running"
+                },
+                {
+                  "assignee": "daniel",
+                  "columnId": "doing",
+                  "id": "card-2",
+                  "kind": "task",
+                  "label": "Doing: Board projection",
+                  "status": "waiting"
+                },
+                {
+                  "columnId": "core.board.unplaced",
+                  "id": "card-3",
+                  "kind": "task",
+                  "label": "Unplaced: Ship it",
+                  "status": "queued"
+                }
+              ],
+              "selectAction": "board.card.select",
+              "virtualized": true
+            },
+            "type": "List"
+          },
+          "id": "react-ui-46",
+          "kind": "element",
+          "props": {
+            "accessibleLabel": "Backlog: 3 columns, 3 cards",
+            "align": "start",
+            "gap": "sm"
+          },
+          "type": "Row"
+        }
+      ],
+      "id": "react-ui-47",
+      "kind": "element",
+      "props": {
+        "gap": "sm"
+      },
+      "type": "Stack"
+    }
+  ],
+  "id": "board",
+  "kind": "element",
+  "props": {
+    "accessibleLabel": "Backlog",
+    "border": "rounded",
+    "padding": "sm",
+    "width": "100%"
+  },
+  "type": "Box"
+}"
+`;
+
 exports[`first-party semantic component catalogue > renders explicit load, empty, error, streaming, density, and width variants deterministically 1`] = `
 "{
   "children": [

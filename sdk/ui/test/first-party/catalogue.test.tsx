@@ -7,6 +7,7 @@ import type { UiDocument, UiElementNode, UiNode } from "../../src/protocol.js";
 import { renderForTest, stableUiJson } from "../../src/testing.js";
 import {
   AgentManagement,
+  KanbanBoard,
   ApprovalReview,
   ConversationTranscript,
   CostQuotaView,
@@ -260,5 +261,74 @@ describe("first-party semantic component catalogue", () => {
     expect(() => toUiJson(cyclic)).toThrow("contains a cycle");
     expect(() => toUiJson({ value: Number.NaN })).toThrow("non-finite number");
     expect(coreOnlyData("policy", { scope: "workspace" })).toMatchObject({ governance: "core-only", authority: "intent-only" });
+  });
+  it("lays a board out as virtualized columns with keyboard-reachable move intents", () => {
+    const columns = [
+      { id: "backlog", label: "Backlog", emptyMessage: "Nothing queued" },
+      { id: "doing", label: "Doing", limit: 1 },
+      { id: "done", label: "Done" },
+    ];
+    const cards = [
+      { id: "card-1", title: "Draw the DAG", columnId: "doing", status: "running", assignee: "codypendent", kind: "task" },
+      { id: "card-2", title: "Board projection", columnId: "doing", status: "waiting", assignee: "daniel", kind: "task", summary: "Read-only." },
+      { id: "card-3", title: "Ship it", columnId: "elsewhere", status: "queued", kind: "task" },
+    ];
+    const document = render(
+      <KanbanBoard
+        id="board"
+        title="Backlog"
+        columns={columns}
+        cards={cards}
+        selectedCardId="card-2"
+        selectCardAction="board.card.select"
+        moveCardAction="board.card.move"
+        cardIntents={[{ action: "board.card.assign", label: "Assign to me" }]}
+      />,
+      "kanban-board",
+    );
+    expect(auditAccessibility(document.root).filter((issue) => issue.severity === "error")).toEqual([]);
+
+    // One virtualized column per declared column, plus an explicit Unplaced
+    // column for a card naming a column the board does not define.
+    const lists = allElements(document.root).filter((element) => element.type === "VirtualList");
+    expect(lists.map((list) => list.props.accessibleLabel)).toEqual([
+      "Backlog cards", "Doing cards", "Done cards", "Unplaced cards",
+    ]);
+    expect(lists.every((list) => list.props.virtualized === true)).toBe(true);
+    expect(lists[1]?.props.items).toHaveLength(2);
+    expect(lists[1]?.props.selectedKey).toBe("card-2");
+    expect(lists[0]?.props.emptyMessage).toBe("Nothing queued");
+
+    // An exceeded WIP limit is reported in text, never enforced by hiding cards.
+    const overLimit = elementBy(document.root, (element) => element.props.accessibleLabel === "2 cards, over the limit of 1");
+    expect(overLimit.props.tone).toBe("warning");
+
+    // Movement is a mediated intent per destination, not pointer drag-and-drop.
+    const menu = elementBy(document.root, (element) => element.props.accessibleLabel === "Draw the DAG actions");
+    expect(menu.type).toBe("ActionMenu");
+    expect(menu.props.action).toBe("board.card.move");
+    expect(menu.props.items).toEqual([
+      { id: "board.card.assign:card-1", label: "Assign to me", action: "board.card.assign", cardId: "card-1" },
+      { id: "move:card-1:backlog", label: "Move to Backlog", action: "board.card.move", cardId: "card-1", fromColumnId: "doing", toColumnId: "backlog" },
+      { id: "move:card-1:done", label: "Move to Done", action: "board.card.move", cardId: "card-1", fromColumnId: "doing", toColumnId: "done" },
+    ]);
+
+    // Every card stays openable, and the whole board degrades to one grouped
+    // list for a host that cannot lay columns out side by side.
+    const open = elementBy(document.root, (element) => element.props.accessibleLabel === "Open Board projection");
+    expect(open.props).toMatchObject({ action: "board.card.select", payload: { cardId: "card-2" } });
+    const row = elementBy(document.root, (element) => element.type === "Row" && element.fallback !== undefined);
+    expect(row.fallback).toMatchObject({
+      type: "List",
+      props: { virtualized: true, selectAction: "board.card.select" },
+    });
+    const fallbackItems = (row.fallback as UiElementNode).props.items;
+    expect(fallbackItems).toEqual([
+      { id: "card-1", label: "Doing: Draw the DAG", columnId: "doing", status: "running", assignee: "codypendent", kind: "task" },
+      { id: "card-2", label: "Doing: Board projection", columnId: "doing", status: "waiting", assignee: "daniel", kind: "task" },
+      { id: "card-3", label: "Unplaced: Ship it", columnId: "core.board.unplaced", status: "queued", kind: "task" },
+    ]);
+
+    expect(stableUiJson(document.root)).toMatchSnapshot();
   });
 });
