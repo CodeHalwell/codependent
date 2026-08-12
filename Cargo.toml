@@ -25,7 +25,7 @@ members = [
 exclude = ["benches/crdt-bench"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 # 1.88 is the effective MSRV: the `agent-client-protocol` dep (ACP client) is
 # edition-2024 / requires Rust 1.88. The pinned toolchain (rust-toolchain.toml)
@@ -99,6 +99,7 @@ agent-client-protocol = "2"
 # Async traits and config parsing
 async-trait = "0.1"
 toml = "0.8"
+toml_edit = "0.22"
 # Declarative workflow manifests (Phase 5, STEP 5.1) are YAML — the shape of
 # `docs/specs/workflow.yaml`. Kept out of every other crate's graph: only
 # `codypendent-workflow` depends on it.

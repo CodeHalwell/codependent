@@ -136,6 +136,7 @@ equivalent and the key is the only way in.
 | | `A` | Approve requested action **for the whole run** | Click the `A run` footer chip |
 | | `r` | Reject proposed action | Click the `r reject` footer chip |
 | **Studios & Views** | `/` | Open searchable Command Palette | Click the `/ commands` footer chip |
+| | `Delete` / `Ctrl-D` in `/model` | Remove the highlighted configured model after confirmation; its provider remains available in `/provider` | - |
 | | `S` | Open Skills Studio | Palette row "Skills" (or the `S skills` chip in Memory) |
 | | `M` | Open Memory & Knowledge Fabric Browser | Palette row "Memory" (or the `M memory` chip in Skills) |
 | | `o` | Reveal the focused memory's source | Click the `o source` chip in Memory |
@@ -172,6 +173,7 @@ Input is one command per line:
 | `up`, `down` | Recall composer history, move the current list/approval selection, or forward the semantic key to Remote UI; ignored by text-entry and confirmation dialogs |
 | `pageup`, `pagedown` | Page the palette/approval selection or conversation, or forward the semantic key to Remote UI; ignored by text-entry and confirmation dialogs |
 | `home`, `end` | Move to the first/last palette item, move within a composer line, or forward the key to Remote UI |
+| `delete` | In `/model` or `/keys`, open the highlighted item's removal confirmation; in Remote UI, forward the semantic Delete key |
 | `approve`, `approve-run`, `reject` | Resolve the selected approval |
 | `quit` | Detach; the daemon keeps active runs alive |
 

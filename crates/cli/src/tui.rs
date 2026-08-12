@@ -1962,6 +1962,13 @@ async fn event_loop<P: Presentation>(
                 .await;
                 continue;
             }
+            // Model removal is local configuration, never a daemon command.
+            // Keep it beside AddModel so the same live picker projection is
+            // reloaded immediately after the atomic models.toml edit.
+            if let Intent::RemoveModel { model_id } = &intent {
+                apply_remove_model(state, paths, model_id).await;
+                continue;
+            }
             // `QueryProviderModels` is the other client-only intent (model
             // discovery). Three steps, none of them on the UI thread beyond a
             // cache read: seed the pick-list from `<data_dir>/model_lists/`
@@ -3627,6 +3634,9 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::AddModel { .. } => unreachable!(
             "AddModel is applied locally by the harness (write_add_model), never sent to the daemon"
         ),
+        Intent::RemoveModel { .. } => unreachable!(
+            "RemoveModel is applied locally by the harness (write_remove_model), never sent to the daemon"
+        ),
         Intent::QueryProviderModels { .. } => unreachable!(
             "QueryProviderModels is applied locally by the harness (background GET), never sent to the daemon"
         ),
@@ -4062,6 +4072,156 @@ async fn apply_add_model(
                 Action::Notice(format!("could not add model: {error}")),
             );
         }
+    }
+}
+
+/// Remove one exact `[[model]]` entry without reserializing the surrounding
+/// document. `models.toml` also contains voice, speech, embedding, retrieval,
+/// and user-defined future tables; `toml_edit` preserves all of them — plus
+/// comments and formatting — while only the matching array-of-tables row is
+/// removed.
+///
+/// The model-specific `auth.json` credential is removed as part of the same
+/// operation. Provider-wide credentials remain because other models from that
+/// provider may still use them. Both inputs are fully parsed before either is
+/// changed, so malformed configuration cannot cause a partial deletion.
+fn write_remove_model(paths: &RuntimePaths, model_id: &str) -> anyhow::Result<()> {
+    use codypendent_runtime::auth::AuthStore;
+    use toml_edit::DocumentMut;
+
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        bail!("model id must not be blank");
+    }
+    let models_path = paths.data_dir.join("models.toml");
+    let raw = std::fs::read_to_string(&models_path)
+        .with_context(|| format!("reading {}", models_path.display()))?;
+    let mut document = raw
+        .parse::<DocumentMut>()
+        .with_context(|| format!("parsing {}", models_path.display()))?;
+    let models = document
+        .get_mut("model")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .ok_or_else(|| anyhow!("models.toml has no [[model]] entries"))?;
+    let matching: Vec<usize> = models
+        .iter()
+        .enumerate()
+        .filter_map(|(index, table)| {
+            (table.get("id").and_then(toml_edit::Item::as_str) == Some(model_id)).then_some(index)
+        })
+        .collect();
+    if matching.is_empty() {
+        bail!("model `{model_id}` is not configured");
+    }
+    for index in matching.into_iter().rev() {
+        models.remove(index);
+    }
+    if models.is_empty() {
+        document.remove("model");
+    }
+
+    // Validate the key store before touching models.toml. A corrupt auth.json
+    // must never be silently overwritten or leave the operator unsure which
+    // half of the requested cleanup happened.
+    let mut auth = AuthStore::load(&paths.data_dir)
+        .with_context(|| format!("reading {}", paths.data_dir.join("auth.json").display()))?;
+    let original_auth = auth.clone();
+    let removed_key = auth.remove(model_id);
+
+    let parent = models_path
+        .parent()
+        .ok_or_else(|| anyhow!("models.toml path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(".models-remove-{}.tmp", std::process::id()));
+    let rendered = document.to_string();
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        file.write_all(rendered.as_bytes())?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&tmp, rendered.as_bytes())?;
+    // Commit the secret cleanup first, then make the already-written model
+    // temp visible. If that final rename fails, restore the original auth
+    // store so a failed operation never leaves half of the requested cleanup
+    // applied.
+    if removed_key {
+        if let Err(error) = auth.save(&paths.data_dir) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error).with_context(|| {
+                format!("writing {}", paths.data_dir.join("auth.json").display())
+            });
+        }
+    }
+    if let Err(error) = std::fs::rename(&tmp, &models_path) {
+        let _ = std::fs::remove_file(&tmp);
+        if removed_key {
+            original_auth.save(&paths.data_dir).with_context(|| {
+                format!(
+                    "restoring {} after models.toml replacement failed",
+                    paths.data_dir.join("auth.json").display()
+                )
+            })?;
+        }
+        return Err(error).with_context(|| format!("replacing {}", models_path.display()));
+    }
+    Ok(())
+}
+
+/// Apply the model-removal intent and keep the open picker coherent. A removed
+/// pending pin is cleared so the next run cannot reference a configuration row
+/// that no longer exists; an already-running model is unaffected.
+async fn apply_remove_model(state: &mut AppState, paths: &RuntimePaths, model_id: &str) {
+    match write_remove_model(paths, model_id) {
+        Ok(()) => {
+            if state
+                .pending_model
+                .as_ref()
+                .is_some_and(|id| id.0 == model_id)
+            {
+                state.pending_model = None;
+            }
+            let mut warnings = Vec::new();
+            state.models = load_model_cards(paths, &mut warnings).await;
+            for warning in warnings {
+                reduce(state, Action::Issue(warning));
+            }
+            reload_key_statuses(state, paths);
+            if let codypendent_tui::Overlay::ModelPicker { query, selected } = &mut state.overlay {
+                let needle = query.to_ascii_lowercase();
+                let matches: Vec<usize> = state
+                    .models
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, card)| {
+                        (needle.is_empty()
+                            || card.id.0.to_ascii_lowercase().contains(&needle)
+                            || card.provider.to_ascii_lowercase().contains(&needle))
+                        .then_some(index)
+                    })
+                    .collect();
+                *selected = (*selected).min(matches.len().saturating_sub(1));
+                state.selected_model = matches.get(*selected).copied().unwrap_or(0);
+            } else {
+                state.selected_model = state
+                    .selected_model
+                    .min(state.models.len().saturating_sub(1));
+            }
+            reduce(state, Action::Notice(format!("removed model {model_id}")));
+        }
+        Err(error) => reduce(
+            state,
+            Action::Notice(format!("could not remove model {model_id}: {error}")),
+        ),
     }
 }
 
@@ -8223,6 +8383,83 @@ prefix = ""
         .expect("write");
         let meta = std::fs::metadata(paths.data_dir.join("auth.json")).expect("metadata");
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn write_remove_model_is_exact_and_preserves_comments_and_unrelated_settings() {
+        use codypendent_runtime::auth::AuthStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            r#"# removed with the profile below
+[[model]]
+id = "remove/me"
+provider = "openai-compatible"
+base_url = "https://example.test/v1"
+model = "old"
+
+# keep this model comment
+[[model]]
+id = "keep/me"
+provider = "openai-compatible"
+base_url = "https://example.test/v1"
+model = "new"
+
+# keep this operator note
+[voice]
+play_command = ["mpv", "-"]
+
+[retrieval]
+mcp_top_k = 7
+
+[future_settings]
+enabled = true
+"#,
+        )
+        .expect("write models");
+        let mut auth = AuthStore::default();
+        auth.set("remove/me", "secret-to-remove");
+        auth.set("keep/me", "secret-to-keep");
+        auth.set("provider/acme", "provider-wide-stays");
+        auth.save(&paths.data_dir).expect("write auth");
+
+        write_remove_model(&paths, "remove/me").expect("remove exact model");
+
+        let raw = std::fs::read_to_string(paths.data_dir.join("models.toml")).expect("read models");
+        assert!(!raw.contains("remove/me"));
+        assert!(raw.contains("keep/me"));
+        assert!(raw.contains("# keep this operator note"));
+        assert!(raw.contains("# keep this model comment"));
+        assert!(raw.contains("[voice]"));
+        assert!(raw.contains("[retrieval]"));
+        assert!(raw.contains("[future_settings]"));
+
+        let auth = AuthStore::load(&paths.data_dir).expect("read auth");
+        assert_eq!(auth.get("remove/me"), None);
+        assert_eq!(auth.get("keep/me"), Some("secret-to-keep"));
+        assert_eq!(auth.get("provider/acme"), Some("provider-wide-stays"));
+    }
+
+    #[test]
+    fn write_remove_model_rejects_an_unknown_id_without_changing_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        let original = r#"# untouched
+[[model]]
+id = "keep/me"
+provider = "acp"
+model = "keep-agent"
+"#;
+        std::fs::write(paths.data_dir.join("models.toml"), original).expect("write models");
+
+        let error = write_remove_model(&paths, "missing").expect_err("unknown id is rejected");
+        assert!(error.to_string().contains("not configured"));
+        assert_eq!(
+            std::fs::read_to_string(paths.data_dir.join("models.toml")).expect("read models"),
+            original
+        );
     }
 
     #[test]

@@ -69,6 +69,9 @@ directories = { workspace = true }
 # Serializes an appended `[[model]]` back to `models.toml` in the add-model flow
 # (`write_add_model`). Already a transitive dep via the config loaders.
 toml = { workspace = true }
+# Surgical model removal must preserve comments and every unrelated table in
+# models.toml; `toml::Value` round-tripping cannot preserve that formatting.
+toml_edit = { workspace = true }
 async-trait = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }

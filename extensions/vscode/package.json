@@ -2,7 +2,7 @@
   "name": "codypendent",
   "displayName": "Codypendent",
   "description": "Editor-aware client for the Codypendent daemon: attach to a session, watch the transcript and run state, resolve approvals, and push IDE context. The extension never executes tools locally.",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "publisher": "codypendent",
   "license": "MIT",
   "engines": {

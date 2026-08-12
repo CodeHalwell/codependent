@@ -438,7 +438,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::Expand => expand_selected(state),
         Action::BrowseFoldPrev => browse_fold(state, -1),
         Action::BrowseFoldNext => browse_fold(state, 1),
-        Action::RemoveApiKey => begin_remove_key(state),
+        Action::RemoveSelected => begin_remove_selected(state),
         Action::VerifyApiKey => begin_verify_key(state),
         Action::RefreshProviderModels => refresh_provider_models(state),
 
@@ -665,13 +665,17 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::Detach => state.should_detach = true,
         Action::Dismiss => {
-            state.overlay = match state.overlay {
+            let overlay = std::mem::take(&mut state.overlay);
+            state.overlay = match overlay {
                 Overlay::ConfirmWorkflowCancel { .. } => Overlay::Workflow,
                 Overlay::ConfirmUiPluginApprove { .. }
                 | Overlay::ConfirmUiPluginReject { .. }
                 | Overlay::ConfirmUiPluginEnable { .. }
                 | Overlay::ConfirmUiPluginRevoke { .. } => Overlay::UiPlugins,
                 Overlay::ConfirmCouncilDelete { .. } => Overlay::CouncilBrowser,
+                Overlay::ConfirmModelRemove {
+                    query, selected, ..
+                } => Overlay::ModelPicker { query, selected },
                 // Backing out of the delete confirmation returns to the Docs
                 // Studio it floats over, not the base view.
                 Overlay::DocDeleteConfirm { .. } => Overlay::Docs,
@@ -2514,9 +2518,8 @@ fn confirm_cancel(state: &mut AppState) {
 
 /// `y`/`Enter` on a confirm-style overlay (the shared `InputMode::Confirm` key
 /// table maps both to [`Action::ConfirmCancel`]). Dispatches by which confirm
-/// is open: the run-cancel confirm, the workflow-cancel confirm, or the `/keys`
-/// remove confirm (a client-only `RemoveApiKey` intent). A no-op when no confirm
-/// is open.
+/// is open, including client-only model/key removal. A no-op when no confirm is
+/// open.
 fn confirm_top(state: &mut AppState) {
     match &state.overlay {
         Overlay::ConfirmCancel => confirm_cancel(state),
@@ -2583,6 +2586,18 @@ fn confirm_top(state: &mut AppState) {
             if let Overlay::ConfirmCouncilDelete { name } = std::mem::take(&mut state.overlay) {
                 state.outbox.push(Intent::DeleteCouncil { name });
                 state.overlay = Overlay::CouncilBrowser;
+            }
+        }
+        Overlay::ConfirmModelRemove { .. } => {
+            if let Overlay::ConfirmModelRemove {
+                model_id,
+                query,
+                selected,
+                ..
+            } = std::mem::take(&mut state.overlay)
+            {
+                state.outbox.push(Intent::RemoveModel { model_id });
+                state.overlay = Overlay::ModelPicker { query, selected };
             }
         }
         // Confirmed: drive the pull. The overlay moves to the live-progress
@@ -3313,7 +3328,25 @@ fn input_char(state: &mut AppState, c: char) {
 /// row, but only when that row actually has a stored (`auth.json`) key — on a
 /// row with no stored key there is nothing to remove, so the key is a no-op
 /// rather than a confusing confirm.
-fn begin_remove_key(state: &mut AppState) {
+fn begin_remove_selected(state: &mut AppState) {
+    if let Overlay::ModelPicker { query, selected } = &state.overlay {
+        let query = query.clone();
+        let selected = *selected;
+        let Some(&idx) = filter_models(&state.models, &query).get(selected) else {
+            return;
+        };
+        let Some(card) = state.models.get(idx) else {
+            return;
+        };
+        state.overlay = Overlay::ConfirmModelRemove {
+            model_id: card.id.0.clone(),
+            provider: card.provider.clone(),
+            query,
+            selected,
+        };
+        return;
+    }
+
     let Overlay::ApiKeys { query, selected } = &state.overlay else {
         return;
     };
@@ -9072,6 +9105,70 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_delete_confirms_exact_row_then_emits_removal() {
+        let mut state = AppState::new();
+        state.models = vec![
+            model_card("ollama/qwen", "openai-compatible"),
+            model_card("acp/codex-acp#gpt-5.6-sol", "acp"),
+        ];
+        open_model_picker(&mut state);
+        reduce(&mut state, Action::SelectNext);
+        reduce(&mut state, Action::RemoveSelected);
+
+        assert_eq!(
+            state.overlay,
+            Overlay::ConfirmModelRemove {
+                model_id: "acp/codex-acp#gpt-5.6-sol".to_owned(),
+                provider: "acp".to_owned(),
+                query: String::new(),
+                selected: 1,
+            }
+        );
+        assert_eq!(state.input_mode(), crate::state::InputMode::Confirm);
+
+        reduce(&mut state, Action::ConfirmCancel);
+        assert_eq!(
+            state.overlay,
+            Overlay::ModelPicker {
+                query: String::new(),
+                selected: 1,
+            }
+        );
+        assert_eq!(
+            state.drain_outbox(),
+            vec![Intent::RemoveModel {
+                model_id: "acp/codex-acp#gpt-5.6-sol".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn model_picker_remove_cancel_restores_filter_and_cursor() {
+        let mut state = AppState::new();
+        state.models = vec![
+            model_card("ollama/qwen", "openai-compatible"),
+            model_card("ollama/coder", "openai-compatible"),
+        ];
+        state.overlay = Overlay::ModelPicker {
+            query: "ollama".to_owned(),
+            selected: 1,
+        };
+        state.selected_model = 1;
+
+        reduce(&mut state, Action::RemoveSelected);
+        reduce(&mut state, Action::Dismiss);
+
+        assert_eq!(
+            state.overlay,
+            Overlay::ModelPicker {
+                query: "ollama".to_owned(),
+                selected: 1,
+            }
+        );
+        assert!(state.drain_outbox().is_empty());
+    }
+
+    #[test]
     fn bare_acp_model_row_opens_the_supplier_model_catalogue() {
         let mut state = AppState::new();
         state.models = vec![model_card("acp/codex-acp", "acp")];
@@ -10296,7 +10393,7 @@ mod tests {
         let mut s = AppState::new();
         open_api_keys(&mut s);
         // Row 0 (groq/llama) has KeyStatus::Stored.
-        reduce(&mut s, Action::RemoveApiKey);
+        reduce(&mut s, Action::RemoveSelected);
         assert_eq!(
             s.overlay,
             Overlay::ApiKeyRemoveConfirm {
@@ -10321,7 +10418,7 @@ mod tests {
         let mut s = AppState::new();
         open_api_keys(&mut s);
         reduce(&mut s, Action::SelectNext); // openai/gpt: Env, not Stored
-        reduce(&mut s, Action::RemoveApiKey);
+        reduce(&mut s, Action::RemoveSelected);
         assert_eq!(
             s.overlay,
             Overlay::ApiKeys {
@@ -10341,7 +10438,7 @@ mod tests {
     fn api_key_remove_confirm_dismisses_without_an_intent() {
         let mut s = AppState::new();
         open_api_keys(&mut s);
-        reduce(&mut s, Action::RemoveApiKey);
+        reduce(&mut s, Action::RemoveSelected);
         reduce(&mut s, Action::Dismiss); // `n`/Esc
         assert_eq!(s.overlay, Overlay::None);
         assert!(s.drain_outbox().is_empty());

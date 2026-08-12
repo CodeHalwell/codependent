@@ -130,8 +130,8 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: None,
     },
     KeyBinding {
-        keys: "Delete",
-        description: "remove a saved key, or clear resolved diagnostics",
+        keys: "Delete / Ctrl-D",
+        description: "remove a configured model/key, or clear resolved diagnostics",
         mouse: None,
     },
     KeyBinding {
@@ -366,13 +366,14 @@ fn map_palette_key(key: &KeyEvent) -> Action {
         KeyCode::PageDown => Action::SelectPageNext,
         KeyCode::Home => Action::SelectFirst,
         KeyCode::End => Action::SelectLast,
-        KeyCode::Delete => Action::RemoveApiKey,
+        KeyCode::Delete => Action::RemoveSelected,
         KeyCode::Char('c') if ctrl(key) => Action::InputCancel,
         // Ctrl-chords stay out of the query buffer: `Ctrl-T` tests the focused
         // `/keys` row's key, `Ctrl-R` re-fetches an open add-model pick-list.
         // Both are no-ops in every other palette-mode overlay.
         KeyCode::Char('t') if ctrl(key) => Action::VerifyApiKey,
         KeyCode::Char('r') if ctrl(key) => Action::RefreshProviderModels,
+        KeyCode::Char('d') if ctrl(key) => Action::RemoveSelected,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
         KeyCode::Tab => Action::BeginAddModel,
         _ => Action::NoOp,
@@ -681,6 +682,14 @@ mod tests {
         assert_eq!(
             map_event(&key(KeyCode::End), InputMode::Palette, W, &[]),
             Action::SelectLast
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Delete), InputMode::Palette, W, &[]),
+            Action::RemoveSelected
+        );
+        assert_eq!(
+            map_event(&ctrl(KeyCode::Char('d')), InputMode::Palette, W, &[]),
+            Action::RemoveSelected
         );
     }
 

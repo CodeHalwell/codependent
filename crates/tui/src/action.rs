@@ -484,10 +484,11 @@ pub enum Action {
     /// a can-list provider queries its `/models` list; a cannot-list one opens
     /// the free-text name prompt. A no-op outside the provider picker.
     BeginAddModel,
-    /// Remove the stored key for the focused `/keys` row (`Delete`). A no-op
-    /// outside that overlay, or when the row is backed only by an environment
-    /// variable / has no key.
-    RemoveApiKey,
+    /// Begin removal of the focused persisted item (`Delete`): a configured
+    /// model in `/model`, or a stored credential in `/keys`. The reducer owns
+    /// the overlay-specific confirmation and makes this a no-op everywhere
+    /// else.
+    RemoveSelected,
     /// Verify the focused `/keys` row's key against its provider (`Ctrl-T`):
     /// one `/models` call, then `ModelKeyVerified`. A no-op outside that
     /// overlay, and on the Tavily row (it has no model endpoint to probe).
@@ -758,6 +759,15 @@ pub enum Intent {
         model: String,
         api_key: Option<SecretKey>,
         context_tokens: Option<u64>,
+    },
+
+    /// Remove one configured model from `models.toml` (client-only — NOT a
+    /// daemon command). The harness performs a formatting-preserving atomic
+    /// edit, removes any model-specific `auth.json` credential, and reloads
+    /// the picker projection. Provider catalogue entries and ACP registry
+    /// installations are deliberately outside this operation.
+    RemoveModel {
+        model_id: String,
     },
 
     /// Query a provider's OpenAI-compatible model list (client-only — NOT a

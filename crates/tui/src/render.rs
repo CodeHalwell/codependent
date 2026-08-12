@@ -2753,6 +2753,18 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             "Remove this council?",
             &format!("`{name}` · saved run reports remain on disk"),
         ),
+        Overlay::ConfirmModelRemove {
+            model_id, provider, ..
+        } => render_confirm_box(
+            frame,
+            area,
+            state,
+            theme,
+            "Remove this configured model?",
+            &format!(
+                "{model_id}\nprovider: {provider}\n\nThis removes its models.toml entry and model-specific saved key. The provider catalogue remains available."
+            ),
+        ),
         Overlay::ModelPicker { query, selected } => {
             render_model_picker(frame, area, state, theme, query, *selected);
         }
@@ -3700,7 +3712,9 @@ fn render_model_picker(
         .map_or("Enter stage", |_| "Enter browse models");
     frame.render_widget(
         Paragraph::new(Line::styled(
-            format!("↑/↓ or wheel · PgUp/PgDn · Home/End · {submit_hint} · Esc close"),
+            format!(
+                "↑/↓ or wheel · PgUp/PgDn · Home/End · {submit_hint} · Ctrl-D remove · Esc close"
+            ),
             Style::default().fg(theme.text.muted),
         ))
         .alignment(Alignment::Center),
@@ -11063,6 +11077,10 @@ mod tests {
         assert!(
             text.contains("PgUp/PgDn"),
             "paging controls need to be discoverable:\n{text}"
+        );
+        assert!(
+            text.contains("Ctrl-D remove"),
+            "model removal needs a visible key hint:\n{text}"
         );
     }
 

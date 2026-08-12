@@ -371,6 +371,13 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
             "Confirmation: remove council {}? Saved run reports remain on disk.",
             clean(name)
         )),
+        Overlay::ConfirmModelRemove {
+            model_id, provider, ..
+        } => lines.push(format!(
+            "Confirmation: remove configured model {} (provider {}) and its model-specific saved key? The provider catalogue remains available.",
+            clean(model_id),
+            clean(provider)
+        )),
         Overlay::CouncilBrowser => {
             lines.push(format!(
                 "Agent councils: {} configured",
@@ -538,6 +545,7 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::CouncilBrowser => "agent councils",
         Overlay::CouncilRunObjective { .. } => "council objective",
         Overlay::ConfirmCouncilDelete { .. } => "remove council confirmation",
+        Overlay::ConfirmModelRemove { .. } => "remove model confirmation",
         Overlay::AddModelId { .. }
         | Overlay::AddModelKey { .. }
         | Overlay::AddModelProviderKey { .. }
@@ -577,7 +585,7 @@ fn controls_for(mode: InputMode) -> &'static str {
             "Controls: Tab or backtab move focus, Enter activates, type TEXT edits, Shift-F6 changes document, Esc returns"
         }
         InputMode::Palette => {
-            "Controls: type TEXT filters, up/down/pageup/pagedown/home/end select, Enter chooses, Esc closes"
+            "Controls: type TEXT filters, up/down/pageup/pagedown/home/end select, Enter chooses, Delete removes a saved model/key, Esc closes"
         }
         InputMode::Editing => "Controls: type TEXT, Enter submits, Esc cancels",
         InputMode::Confirm => "Controls: yes or Enter confirms, no or Esc cancels",
@@ -619,6 +627,20 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
         "pagedown" | "page-down" => return vec![page_action(mode, false)],
         "home" => return vec![edge_action(mode, true)],
         "end" => return vec![edge_action(mode, false)],
+        "delete" => {
+            return vec![match mode {
+                InputMode::RemoteUi => Action::RemoteUiKey {
+                    key: RemoteKey::Delete,
+                    character: None,
+                },
+                InputMode::Palette => Action::RemoveSelected,
+                InputMode::Normal => Action::ClearIssues,
+                InputMode::Composer
+                | InputMode::Editing
+                | InputMode::Confirm
+                | InputMode::Approval => Action::NoOp,
+            }];
+        }
         "approve" => return vec![Action::Approve(ApprovalScope::Once)],
         "approve-run" => return vec![Action::Approve(ApprovalScope::Run)],
         "reject" => return vec![Action::Reject],
@@ -976,6 +998,17 @@ mod tests {
             map_accessible_input("home", InputMode::RemoteUi),
             vec![Action::RemoteUiKey {
                 key: RemoteKey::Home,
+                character: None,
+            }]
+        );
+        assert_eq!(
+            map_accessible_input("delete", InputMode::Palette),
+            vec![Action::RemoveSelected]
+        );
+        assert_eq!(
+            map_accessible_input("delete", InputMode::RemoteUi),
+            vec![Action::RemoteUiKey {
+                key: RemoteKey::Delete,
                 character: None,
             }]
         );

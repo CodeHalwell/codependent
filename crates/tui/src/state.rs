@@ -305,6 +305,15 @@ pub enum Overlay {
     /// focused row on [`AppState::pending_model`] (advisory only this task —
     /// MP2 wires it to actually pin the next run's model).
     ModelPicker { query: String, selected: usize },
+    /// Host-owned confirmation for removing one configured model. The picker
+    /// filter/cursor travel with the prompt so `n`/`Esc`, success, and failure
+    /// all return to the same browsing context.
+    ConfirmModelRemove {
+        model_id: String,
+        provider: String,
+        query: String,
+        selected: usize,
+    },
     /// The provider-catalog picker (Task 8): a fuzzy-filterable list of the
     /// providers selectable for a run (see [`AppState::providers`]), opened
     /// from the command palette's `/provider` entry. `query` filters by
@@ -2058,6 +2067,7 @@ impl AppState {
             | Overlay::ConfirmUiPluginEnable { .. }
             | Overlay::ConfirmUiPluginRevoke { .. }
             | Overlay::ConfirmCouncilDelete { .. }
+            | Overlay::ConfirmModelRemove { .. }
             | Overlay::UnslothConfirmPull { .. }
             | Overlay::DocDeleteConfirm { .. } => InputMode::Confirm,
             // The palette, the model picker, the provider picker, the mode
