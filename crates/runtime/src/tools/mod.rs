@@ -31,6 +31,7 @@
 //!
 //! [`ArtifactStore`]: codypendent_daemon::artifacts::ArtifactStore
 
+mod artifact;
 mod blackboard;
 mod docs;
 mod edit_file;
@@ -53,8 +54,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use codypendent_daemon::artifacts::Provenance;
-use codypendent_protocol::ArtifactRef;
+use codypendent_protocol::{ArtifactId, ArtifactRef};
 
+pub use artifact::{parse_artifact_read, ArtifactRead, ArtifactReadInput};
 pub use blackboard::{
     parse_blackboard_post, parse_blackboard_query, BlackboardPostInput, BlackboardPostTool,
     BlackboardQueryInput, BlackboardQueryTool,
@@ -255,6 +257,47 @@ pub trait ArtifactSink: Send + Sync {
         provenance: Provenance,
         bytes: &[u8],
     ) -> anyhow::Result<ArtifactRef>;
+}
+
+/// The READ side of the artifact boundary, mirroring [`ArtifactSink`]: the
+/// `artifact.read` tool rehydrates a stored artifact's bytes by id through
+/// this seam, for the same reason the spill goes through a sink — the store's
+/// `get` needs a pool this crate cannot name (see the module docs). `Ok(None)`
+/// means "no such artifact", surfaced to the model as a legible tool failure;
+/// implementations must also answer `Ok(None)` for content the model may not
+/// see (e.g. secret-classified artifacts), never hand it back.
+#[async_trait]
+pub trait ArtifactReader: Send + Sync {
+    /// Load the stored bytes (and their media type) for `id`, or `None` when
+    /// no such artifact exists / it may not be disclosed.
+    async fn load(&self, id: ArtifactId) -> anyhow::Result<Option<LoadedArtifact>>;
+}
+
+/// An artifact's stored bytes plus the media type they were stored under —
+/// what [`ArtifactReader::load`] hands back for rendering.
+#[derive(Debug, Clone)]
+pub struct LoadedArtifact {
+    /// The media type recorded when the artifact was stored.
+    pub media_type: String,
+    /// The full stored bytes (bounded rendering is the TOOL's job, so the
+    /// reader stays a dumb byte fetch).
+    pub bytes: Vec<u8>,
+}
+
+/// An [`ArtifactReader`] built from a closure — the [`ClosureSink`] idiom for
+/// the read side, so a caller can capture an `ArtifactStore` + pool value and
+/// forward to the store's `get`.
+pub struct ClosureReader<F>(pub F);
+
+#[async_trait]
+impl<F, Fut> ArtifactReader for ClosureReader<F>
+where
+    F: Fn(ArtifactId) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = anyhow::Result<Option<LoadedArtifact>>> + Send,
+{
+    async fn load(&self, id: ArtifactId) -> anyhow::Result<Option<LoadedArtifact>> {
+        (self.0)(id).await
+    }
 }
 
 /// An [`ArtifactSink`] built from a closure, so a caller can capture an

@@ -60,6 +60,10 @@ sqlx = { workspace = true }
 # no audio hardware and no provider credentials, so `/audio/transcriptions` and
 # `/audio/speech` are exercised against wiremock, exactly as the GitHub client is.
 wiremock = { workspace = true }
+# `test-util` gives the retry-with-backoff tests `#[tokio::test(start_paused =
+# true)]`: the driver's 1 s/2 s/4 s backoff is auto-advanced instead of slept,
+# so the escalation is pinned exactly without adding seconds to the suite.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = ["provider-openai"]
