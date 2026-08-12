@@ -164,6 +164,15 @@ pub enum Payload {
         command_id: CommandId,
         plugins: Vec<crate::command::UiPluginLifecycleStatus>,
     },
+    /// A `PutArtifact` command's reply (voice v1, rubric 8): the freshly minted
+    /// [`ArtifactRef`](crate::artifact::ArtifactRef) for the stored bytes. A
+    /// distinct reply from `CommandAccepted` because the client needs the ref
+    /// back — it is what an [`InputEnvelope`](crate::input::InputEnvelope)
+    /// audio block references on the next `SubmitUserInput`.
+    ArtifactStored {
+        command_id: CommandId,
+        artifact: crate::artifact::ArtifactRef,
+    },
     /// A `ReadBlackboard` command's reply (Phase 5 STEP 5.3): the matching typed
     /// artifacts on the workflow run's board. A distinct reply from
     /// `CommandAccepted` because the client needs the items back, not just an
@@ -516,6 +525,35 @@ mod tests {
                 assert!(git_action.contains("docs/architecture.md"));
             }
             other => panic!("expected DocumentPublishRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn artifact_stored_payload_round_trips() {
+        use crate::artifact::{ArtifactRef, DataClassification};
+        use crate::ids::ArtifactId;
+
+        let command_id = CommandId::new();
+        let artifact = ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "audio/wav".to_string(),
+            byte_length: 64_000,
+            sha256: "c".repeat(64),
+            sensitivity: DataClassification::Confidential,
+        };
+        let stored = Payload::ArtifactStored {
+            command_id,
+            artifact: artifact.clone(),
+        };
+        match round_trip_payload(stored) {
+            Payload::ArtifactStored {
+                command_id: id,
+                artifact: got,
+            } => {
+                assert_eq!(id, command_id);
+                assert_eq!(got, artifact);
+            }
+            other => panic!("expected ArtifactStored, got {other:?}"),
         }
     }
 

@@ -56,6 +56,9 @@ tempfile = { workspace = true }
 sqlx = { workspace = true }
 # The mock OpenAI-compatible `/embeddings` endpoint the `HttpEmbedder` tests
 # drive (`tests/embedding_it.rs`) — the same harness the GitHub client uses.
+# The mock HTTP server for the audio (STT/TTS) clients' tests — this machine has
+# no audio hardware and no provider credentials, so `/audio/transcriptions` and
+# `/audio/speech` are exercised against wiremock, exactly as the GitHub client is.
 wiremock = { workspace = true }
 
 [features]

@@ -283,6 +283,21 @@ pub trait RunExecutor: Send + Sync {
     /// executor-less server path (`server::run`, the daemon's own tests)
     /// exactly as before — nothing to scan without a runtime behind it.
     fn ensure_repository_scanned(&self, _root: std::path::PathBuf) {}
+
+    /// The assembly-provided [`Transcriber`](crate::transcription::Transcriber)
+    /// that turns a stored audio artifact into text for a `SubmitUserInput`
+    /// carrying a voice [`InputEnvelope`](codypendent_protocol::InputEnvelope)
+    /// (voice v1, rubric 8). Bundled with the executor like the document and
+    /// workflow seams — it names an HTTP speech-to-text client in
+    /// `codypendent-runtime`, which this crate cannot depend on (that edge runs
+    /// the other way). The default `None` leaves voice input unwired: the
+    /// executor-less server and the daemon's own tests then reject an
+    /// un-transcribed audio envelope with `voice.transport-unavailable`,
+    /// exactly as `StartWorkflow` is rejected without a starter. Plain-text
+    /// `SubmitUserInput` is completely unaffected.
+    fn transcriber(&self) -> Option<std::sync::Arc<dyn crate::transcription::Transcriber>> {
+        None
+    }
 }
 
 #[cfg(test)]

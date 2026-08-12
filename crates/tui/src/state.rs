@@ -1500,9 +1500,28 @@ pub struct AppState {
     pub tick: u64,
     /// A transient status-line notice and the tick at which it expires.
     pub notice: Option<(String, u64)>,
+    /// Voice input/output state (voice v1, rubric 8). Purely presentational
+    /// here: the capture and speech work itself lives in the CLI's voice host
+    /// (`codypendent_cli::voice`), which owns the recorder/player subprocesses.
+    /// This state is what the status line renders and what the host reads to
+    /// decide whether to speak a finalized reply.
+    pub voice: VoiceState,
     /// Semantic commands the CLI must send to the daemon. Drained by the CLI
     /// after every reduce; never touched by the renderer.
     pub outbox: Vec<Intent>,
+}
+
+/// Voice input/output state (voice v1, rubric 8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VoiceState {
+    /// Whether push-to-talk capture is running right now. Rendered as a
+    /// prominent status-line indicator: a hot microphone must never be
+    /// invisible.
+    pub recording: bool,
+    /// Whether finalized assistant turns are spoken aloud. Toggled from the
+    /// palette; read by the CLI's voice host, which does the synthesis
+    /// off-thread so a slow provider never stalls the UI.
+    pub speak_replies: bool,
 }
 
 impl Default for AppState {
@@ -1570,6 +1589,7 @@ impl AppState {
             should_detach: false,
             tick: 0,
             notice: None,
+            voice: VoiceState::default(),
             outbox: Vec::new(),
         }
     }

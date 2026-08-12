@@ -891,6 +891,555 @@ pub async fn resolve_model_with_probe(
     Err(ModelsError::AllCandidatesFailed { mode, attempts })
 }
 
+// ===========================================================================
+// Audio: speech-to-text and text-to-speech (voice v1, rubric 8)
+// ===========================================================================
+//
+// Both ride the SAME OpenAI-compatible plumbing the chat profiles use — the
+// `/audio/transcriptions` and `/audio/speech` endpoints are served by Groq
+// (`whisper-large-v3`, `whisper-large-v3-turbo`), OpenAI (`gpt-4o-transcribe`,
+// `gpt-4o-mini-transcribe`, `tts-1`, `gpt-4o-mini-tts`), DeepInfra and Together,
+// so voice needs no new provider protocol. Configuration is two OPTIONAL tables
+// in the existing `models.toml`, parsed independently of `[[model]]` so a file
+// without them is unchanged:
+//
+// ```toml
+// [transcription]
+// base_url = "https://api.groq.com/openai/v1"
+// model = "whisper-large-v3-turbo"
+// api_key_env = "GROQ_API_KEY"
+// # local = true   # set for an on-device engine, so classified audio is
+// #                # allowed to be transcribed under any policy ceiling
+//
+// [speech]
+// base_url = "https://api.openai.com/v1"
+// model = "gpt-4o-mini-tts"
+// voice = "alloy"
+// api_key_env = "OPENAI_API_KEY"
+// ```
+//
+// NOTE ON VERIFICATION: the machine this was written on has NO audio hardware
+// and no provider credentials. Every test below drives a wiremock server and
+// fixture bytes. Nothing here is evidence that a real provider's response shape
+// or a real audio device behaves as expected.
+
+/// One `[transcription]` / `[speech]` table in `models.toml`.
+///
+/// Deliberately its own type rather than a reuse of [`ModelConfig`]: an audio
+/// profile has no [`ModelId`] (there is exactly one of each, selected by the
+/// table name, not by a policy candidate list) and TTS carries a `voice` that
+/// means nothing to a chat profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioModelConfig {
+    /// The OpenAI-compatible base URL, e.g. `https://api.groq.com/openai/v1`.
+    /// The endpoint path (`/audio/transcriptions`, `/audio/speech`) is appended.
+    pub base_url: String,
+    /// The provider-side model name, e.g. `whisper-large-v3-turbo`.
+    pub model: String,
+    /// The NAME of the environment variable holding the API key, read at call
+    /// time and never stored. Empty means no key (a local endpoint).
+    #[serde(default)]
+    pub api_key_env: String,
+    /// TTS only: the provider's voice name, e.g. `alloy`. Ignored for STT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// TTS only: the requested container, e.g. `mp3`/`wav`/`opus`. Sent verbatim
+    /// as `response_format`; omitted lets the provider choose its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Whether this endpoint runs ON THIS DEVICE (a local whisper.cpp server,
+    /// an Ollama-hosted ASR). This is the single knob that decides whether the
+    /// daemon's classification gate treats a transcription as
+    /// [`TranscriptionMode::Local`](codypendent_protocol::input::TranscriptionMode)
+    /// — under which even `Confidential` audio may be transcribed — or as
+    /// `Remote`, which the operator's off-device ceiling governs. It defaults to
+    /// `false`: an unmarked endpoint is assumed to leave the device, so the
+    /// safe classification is the one you get by saying nothing.
+    #[serde(default)]
+    pub local: bool,
+    /// Request timeout in seconds. Audio requests are slower than chat ones (a
+    /// minute of speech is a megabyte-scale upload), hence the generous default.
+    #[serde(default = "default_audio_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_audio_timeout_secs() -> u64 {
+    120
+}
+
+/// The optional audio tables in `models.toml`. Parsed with its OWN struct
+/// (rather than by extending the `[[model]]` file shape) so an existing
+/// `models.toml` — and every existing reader of it — is entirely unaffected.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AudioModels {
+    /// The `[transcription]` table: the speech-to-text endpoint.
+    #[serde(default)]
+    pub transcription: Option<AudioModelConfig>,
+    /// The `[speech]` table: the text-to-speech endpoint.
+    #[serde(default)]
+    pub speech: Option<AudioModelConfig>,
+}
+
+/// Parse the `[transcription]` / `[speech]` tables from `models.toml`.
+///
+/// A missing FILE yields an empty [`AudioModels`] (voice is simply not
+/// configured — the overwhelmingly common case), but a file that exists and
+/// does not parse is an error, so a typo in a voice table surfaces instead of
+/// silently disabling voice.
+pub fn load_audio_models(path: &Path) -> Result<AudioModels> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AudioModels::default())
+        }
+        Err(source) => {
+            return Err(ModelsError::ReadConfig {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    toml::from_str(&text).map_err(|source| ModelsError::ParseConfig {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Errors from the audio clients and the playback command.
+///
+/// Its own enum rather than new [`ModelsError`] variants: the audio path has
+/// failure modes (no player configured, a spawn failure) that have nothing to
+/// do with chat model resolution, and keeping them separate means a caller can
+/// exhaustively match one without the other.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AudioError {
+    /// `models.toml` has no `[transcription]` / `[speech]` table.
+    #[error("no [{table}] entry in models.toml; voice {feature} is not configured")]
+    NotConfigured {
+        /// The missing table name.
+        table: &'static str,
+        /// What it would have enabled, for the message.
+        feature: &'static str,
+    },
+    /// The configured `api_key_env` names an unset environment variable.
+    #[error("environment variable {var} is not set (needed by the [{table}] entry)")]
+    MissingApiKeyEnv {
+        /// The table whose `api_key_env` could not be resolved.
+        table: &'static str,
+        /// The environment variable NAME (never a value).
+        var: String,
+    },
+    /// The request could not be sent (DNS, TLS, connect, timeout).
+    #[error("audio request to {url} failed: {source}")]
+    Transport {
+        /// The endpoint that was called.
+        url: String,
+        /// The underlying transport error.
+        source: reqwest::Error,
+    },
+    /// The provider answered with a non-success status.
+    #[error("audio endpoint {url} returned {status}: {body}")]
+    Status {
+        /// The endpoint that was called.
+        url: String,
+        /// The HTTP status.
+        status: u16,
+        /// The (truncated) response body, for diagnosis.
+        body: String,
+    },
+    /// The provider's response did not have the documented shape.
+    #[error("audio endpoint {url} returned an unreadable response: {detail}")]
+    MalformedResponse {
+        /// The endpoint that was called.
+        url: String,
+        /// What was wrong.
+        detail: String,
+    },
+    /// Playback was requested with no `play_command` configured.
+    #[error("no voice play_command is configured; set voice.play_command in config.toml (e.g. [\"mpv\", \"--no-terminal\", \"-\"])")]
+    NoPlayer,
+    /// The playback command could not be started or fed.
+    #[error("could not run the playback command {command:?}: {source}")]
+    Playback {
+        /// The configured command, for the message.
+        command: Vec<String>,
+        /// The spawn/write failure.
+        source: std::io::Error,
+    },
+}
+
+/// Join a base URL and an endpoint path without doubling or dropping the slash.
+fn audio_url(base_url: &str, path: &str) -> String {
+    format!("{}/{}", base_url.trim_end_matches('/'), path)
+}
+
+/// Resolve an audio profile's API key with the SAME precedence a chat profile
+/// uses: an `auth.json` entry first (keyed by the table name, so a TUI-saved key
+/// applies), then the configured environment variable via the shared
+/// [`credential_for`](codypendent_providers::credential_for) seam. An empty
+/// `api_key_env` means "no key needed" and resolves to an empty string.
+async fn audio_api_key(
+    config: &AudioModelConfig,
+    auth: &AuthStore,
+    table: &'static str,
+) -> std::result::Result<String, AudioError> {
+    if let Some(key) = auth.get(table).filter(|key| !key.is_empty()) {
+        return Ok(key.to_string());
+    }
+    if config.api_key_env.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let method = codypendent_providers::AuthMethod::ApiKey {
+        env: vec![config.api_key_env.clone()],
+        header: "Authorization".to_string(),
+        prefix: "Bearer ".to_string(),
+    };
+    match codypendent_providers::credential_for(&method)
+        .resolve()
+        .await
+    {
+        Ok(codypendent_providers::ResolvedCredential::ApiKey { value, .. }) => Ok(value),
+        Ok(codypendent_providers::ResolvedCredential::None) => Ok(String::new()),
+        Err(codypendent_providers::CredentialError::MissingEnv { var }) => {
+            Err(AudioError::MissingApiKeyEnv { table, var })
+        }
+        Err(other) => Err(AudioError::MissingApiKeyEnv {
+            table,
+            var: other.to_string(),
+        }),
+    }
+}
+
+/// Read a response body as text, truncated so a provider's HTML error page
+/// cannot flood a log line or an error message.
+async fn error_body(response: reqwest::Response) -> String {
+    let mut body = response.text().await.unwrap_or_default();
+    body.truncate(512);
+    body
+}
+
+/// A speech-to-text client over an OpenAI-compatible
+/// `{base_url}/audio/transcriptions` endpoint.
+///
+/// The request is `multipart/form-data` with a `file` part (the audio bytes)
+/// and a `model` part, exactly as Groq/OpenAI/DeepInfra/Together document. The
+/// multipart body is assembled by hand rather than through `reqwest`'s
+/// `multipart` feature, so voice adds no new feature flag to the workspace's
+/// shared HTTP dependency; the boundary is derived from the payload's own
+/// SHA-256, which cannot collide with content it is a digest of.
+#[derive(Debug, Clone)]
+pub struct AudioTranscriber {
+    config: AudioModelConfig,
+    auth: AuthStore,
+    http: reqwest::Client,
+}
+
+impl AudioTranscriber {
+    /// Build a transcriber from the `[transcription]` table, or
+    /// [`AudioError::NotConfigured`] when there is none.
+    pub fn new(models: &AudioModels, auth: AuthStore) -> std::result::Result<Self, AudioError> {
+        let config = models
+            .transcription
+            .clone()
+            .ok_or(AudioError::NotConfigured {
+                table: "transcription",
+                feature: "input (speech-to-text)",
+            })?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_default();
+        Ok(Self { config, auth, http })
+    }
+
+    /// The configured profile (endpoint, model name, locality).
+    #[must_use]
+    pub fn config(&self) -> &AudioModelConfig {
+        &self.config
+    }
+
+    /// Whether this endpoint runs on-device — what the daemon's classification
+    /// gate reads to pick `Local` vs `Remote`.
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        self.config.local
+    }
+
+    /// Transcribe `bytes` (an audio container named `filename`, whose extension
+    /// is how most providers detect the format) and return the recognized text.
+    pub async fn transcribe(
+        &self,
+        bytes: &[u8],
+        filename: &str,
+        media_type: &str,
+    ) -> std::result::Result<String, AudioError> {
+        let url = audio_url(&self.config.base_url, "audio/transcriptions");
+        let key = audio_api_key(&self.config, &self.auth, "transcription").await?;
+        let boundary = multipart_boundary(bytes);
+        let body = multipart_body(&boundary, bytes, filename, media_type, &self.config.model);
+
+        let mut request = self
+            .http
+            .post(&url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body);
+        if !key.is_empty() {
+            request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|source| AudioError::Transport {
+                url: url.clone(),
+                source,
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AudioError::Status {
+                url,
+                status: status.as_u16(),
+                body: error_body(response).await,
+            });
+        }
+        let payload: serde_json::Value =
+            response
+                .json()
+                .await
+                .map_err(|source| AudioError::MalformedResponse {
+                    url: url.clone(),
+                    detail: source.to_string(),
+                })?;
+        payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or(AudioError::MalformedResponse {
+                url,
+                detail: "no string `text` field in the response".to_string(),
+            })
+    }
+}
+
+/// A boundary derived from the payload's SHA-256. A multipart boundary must not
+/// occur inside any part; a digest of the very bytes it delimits cannot, short
+/// of a preimage the payload would have to contain of itself.
+fn multipart_boundary(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("codypendentaudio{}", hex::encode(&hasher.finalize()[..12]))
+}
+
+/// Assemble the `multipart/form-data` body: a `file` part then a `model` part.
+fn multipart_body(
+    boundary: &str,
+    bytes: &[u8],
+    filename: &str,
+    media_type: &str,
+    model: &str,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(bytes.len() + 512);
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {media_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n");
+    body.extend_from_slice(model.as_bytes());
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// Audio a [`AudioSynthesizer`] produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynthesizedSpeech {
+    /// The encoded audio bytes, in whatever container the provider returned.
+    pub bytes: Vec<u8>,
+    /// The `Content-Type` the provider reported, e.g. `audio/mpeg`.
+    pub media_type: String,
+}
+
+/// A text-to-speech client over an OpenAI-compatible `{base_url}/audio/speech`
+/// endpoint (Groq, OpenAI, DeepInfra, Together). The reply is raw audio bytes,
+/// not JSON.
+#[derive(Debug, Clone)]
+pub struct AudioSynthesizer {
+    config: AudioModelConfig,
+    auth: AuthStore,
+    http: reqwest::Client,
+}
+
+impl AudioSynthesizer {
+    /// Build a synthesizer from the `[speech]` table, or
+    /// [`AudioError::NotConfigured`] when there is none.
+    pub fn new(models: &AudioModels, auth: AuthStore) -> std::result::Result<Self, AudioError> {
+        let config = models.speech.clone().ok_or(AudioError::NotConfigured {
+            table: "speech",
+            feature: "output (text-to-speech)",
+        })?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.timeout_secs))
+            .build()
+            .unwrap_or_default();
+        Ok(Self { config, auth, http })
+    }
+
+    /// The configured profile.
+    #[must_use]
+    pub fn config(&self) -> &AudioModelConfig {
+        &self.config
+    }
+
+    /// Synthesize `text` into audio bytes.
+    pub async fn synthesize(
+        &self,
+        text: &str,
+    ) -> std::result::Result<SynthesizedSpeech, AudioError> {
+        let url = audio_url(&self.config.base_url, "audio/speech");
+        let key = audio_api_key(&self.config, &self.auth, "speech").await?;
+        let mut payload = serde_json::json!({
+            "model": self.config.model,
+            "input": text,
+        });
+        if let Some(voice) = &self.config.voice {
+            payload["voice"] = serde_json::Value::String(voice.clone());
+        }
+        if let Some(format) = &self.config.format {
+            payload["response_format"] = serde_json::Value::String(format.clone());
+        }
+
+        let mut request = self.http.post(&url).json(&payload);
+        if !key.is_empty() {
+            request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|source| AudioError::Transport {
+                url: url.clone(),
+                source,
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AudioError::Status {
+                url,
+                status: status.as_u16(),
+                body: error_body(response).await,
+            });
+        }
+        let media_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("audio/mpeg")
+            .to_string();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|source| AudioError::Transport {
+                url: url.clone(),
+                source,
+            })?
+            .to_vec();
+        if bytes.is_empty() {
+            return Err(AudioError::MalformedResponse {
+                url,
+                detail: "the speech endpoint returned no audio bytes".to_string(),
+            });
+        }
+        Ok(SynthesizedSpeech { bytes, media_type })
+    }
+}
+
+/// Plays synthesized audio by piping it to a USER-CONFIGURED command's stdin.
+///
+/// There is no bundled audio backend on purpose: shipping one would mean a
+/// platform-specific native dependency for a strictly optional feature, and
+/// every desktop already has a player that reads stdin (`mpv --no-terminal -`,
+/// `ffplay -nodisp -autoexit -`, `paplay`, `afplay` via a temp file). The
+/// operator names theirs in `config.toml`.
+///
+/// The child is spawned **detached**: its handle is dropped immediately, so a
+/// long clip never blocks the caller's task, and its stdout/stderr are silenced
+/// so a chatty player cannot corrupt a TUI's terminal. Nothing here has been
+/// exercised against a real audio device — this container has none; the tests
+/// substitute a `cat > file` "player" and assert the bytes arrive on its stdin.
+#[derive(Debug, Clone, Default)]
+pub struct AudioPlayer {
+    command: Vec<String>,
+}
+
+impl AudioPlayer {
+    /// A player driven by `command` (program plus arguments). An empty command
+    /// means "unconfigured": [`play`](Self::play) then fails
+    /// [`AudioError::NoPlayer`] instead of guessing a binary.
+    #[must_use]
+    pub fn new(command: Vec<String>) -> Self {
+        Self { command }
+    }
+
+    /// Whether a playback command is configured.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        !self.command.is_empty()
+    }
+
+    /// Pipe `bytes` to the configured command's stdin and return without
+    /// waiting for it to finish.
+    ///
+    /// The write itself is awaited (so a spawn/pipe failure is reported rather
+    /// than silently swallowed) but the process is NOT waited on. A player that
+    /// outlives the caller is intentional: playback continues while the UI
+    /// carries on. Note this leaves the child unreaped by this process; callers
+    /// that spawn many should run this from a task whose runtime reaps children
+    /// (tokio's `Command` does so via its signal handling).
+    pub async fn play(&self, bytes: &[u8]) -> std::result::Result<(), AudioError> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let Some((program, args)) = self.command.split_first() else {
+            return Err(AudioError::NoPlayer);
+        };
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(false)
+            .spawn()
+            .map_err(|source| AudioError::Playback {
+                command: self.command.clone(),
+                source,
+            })?;
+        let mut stdin = child.stdin.take().ok_or_else(|| AudioError::Playback {
+            command: self.command.clone(),
+            source: std::io::Error::other("the playback command has no stdin"),
+        })?;
+        stdin
+            .write_all(bytes)
+            .await
+            .map_err(|source| AudioError::Playback {
+                command: self.command.clone(),
+                source,
+            })?;
+        // Closing stdin is what tells the player the clip is complete.
+        stdin.shutdown().await.ok();
+        drop(stdin);
+        // Detach: the clip plays on while this task returns immediately.
+        drop(child);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

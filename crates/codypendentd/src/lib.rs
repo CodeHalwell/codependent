@@ -22,6 +22,9 @@ mod retrieval;
 mod routing;
 mod scan;
 mod session_history;
+// Voice v1 (rubric 8): the speech-to-text seam, implemented over the runtime's
+// OpenAI-compatible `/audio/transcriptions` client.
+mod transcription;
 mod workflow_exec;
 mod workflows;
 
@@ -173,6 +176,17 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         ),
     ));
     info!("tavily web search adapter enabled (credentials resolve per call)");
+
+    // Voice input (voice v1, rubric 8): enabled only when `models.toml` declares
+    // a `[transcription]` endpoint — an affirmative operator act. Absent (the
+    // default), audio submissions are rejected `voice.transport-unavailable`
+    // and text input is entirely unaffected. Whether a transcription may leave
+    // the device is decided by the daemon against `routing.toml`'s existing
+    // off-device ceiling, NOT by the transcriber.
+    match crate::transcription::HostedTranscriber::arc_from_paths(&paths) {
+        Some(transcriber) => executor = executor.with_transcriber(transcriber),
+        None => info!("no [transcription] entry in models.toml; voice input disabled"),
+    }
 
     // MCP client (PR B): load the operator-declared server list from
     // `<config_dir>/mcp.toml` (sibling to `policy.toml`) and hand the registry

@@ -1897,6 +1897,32 @@ fn backstage_lines<'a>(
 
 fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let bg = Style::default().bg(theme.surface.background);
+    // Voice v1 (rubric 8): a hot microphone outranks every other status,
+    // including a transient notice — the one thing a user must never fail to
+    // notice is that they are being recorded.
+    if state.voice.recording {
+        let line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "◉ ",
+                Style::default()
+                    .fg(theme.status.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Recording",
+                Style::default()
+                    .fg(theme.status.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  ·  press the push-to-talk key again to stop and send",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line).style(bg), area);
+        return;
+    }
     if let Some((notice, _)) = &state.notice {
         let line = Line::from(vec![
             Span::raw("  "),

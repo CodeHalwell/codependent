@@ -1146,6 +1146,15 @@ async fn event_loop<P: Presentation>(
     // Correlate empty blackboard baselines back to the run they were requested
     // for (the reply carries only command_id when `items` is empty).
     let mut blackboard_reads: HashMap<CommandId, String> = HashMap::new();
+    // --- voice host (voice v1, rubric 8) -----------------------------------
+    // Probes for a recorder ONCE here (the result is cached for the process)
+    // and owns every subprocess voice needs, so `codypendent-tui` stays a pure
+    // render/reduce crate. With nothing configured this is entirely inert.
+    let mut voice = crate::voice::VoiceHost::new(paths);
+    // Captured voice notes awaiting their `ArtifactStored` reply, keyed by the
+    // `PutArtifact` command that uploaded them; the value is the measured
+    // capture duration, carried into the audio block.
+    let mut pending_voice: HashMap<CommandId, u64> = HashMap::new();
 
     loop {
         // A CRDT sync needs an async merge (+ a suggestion re-read) that cannot run
@@ -1157,6 +1166,12 @@ async fn event_loop<P: Presentation>(
         let selected = tokio::select! {
             signal = live.event_rx.recv() => PendingActions::One(match signal {
                 Some(ReaderSignal::Event(event)) => {
+                    // Voice v1 (rubric 8): the host watches the same durable
+                    // stream the reducer folds, accumulating each run's
+                    // assistant text and speaking it only once that run is
+                    // FINISHED. Reading half a sentence aloud is worse than
+                    // silence, so nothing is spoken mid-stream.
+                    voice.observe_event(&event, state.voice.speak_replies);
                     match tracker.on_event(*event, Instant::now()) {
                         GapAction::Ignore => Action::NoOp,
                         GapAction::Apply(event) => Action::DaemonEvent(event),
@@ -1272,6 +1287,37 @@ async fn event_loop<P: Presentation>(
                 Some(ReaderSignal::CouncilRunFinished { name, result }) => {
                     Action::CouncilRunFinished { name, result }
                 }
+                // Voice v1 (rubric 8): the upload landed, so submit the turn
+                // that references it. The envelope carries NO transcript — the
+                // daemon produces one behind its classification gate, and the
+                // client must never pretend to know what was said.
+                Some(ReaderSignal::ArtifactStored {
+                    command_id,
+                    artifact,
+                }) => match pending_voice.remove(&command_id) {
+                    Some(duration_ms) => {
+                        let envelope = crate::voice::voice_envelope(artifact, duration_ms);
+                        let submit = command_envelope(
+                            live.client_id,
+                            CommandBody::SubmitUserInput {
+                                session_id,
+                                // Empty on purpose: the transcript the daemon
+                                // produces becomes the run's objective.
+                                text: String::new(),
+                                mode: state.default_mode,
+                                model: state.pending_model.clone(),
+                                envelope: Some(envelope),
+                            },
+                        );
+                        if live.out_tx.send(submit).await.is_err() {
+                            return Ok(());
+                        }
+                        Action::Notice("voice note sent \u{2014} transcribing\u{2026}".to_owned())
+                    }
+                    // An artifact this loop did not upload (or a duplicate
+                    // reply): nothing to submit, and nothing to complain about.
+                    None => Action::NoOp,
+                },
                 Some(ReaderSignal::Catchup(catchup)) => {
                     // Fold the gap replay (the daemon already windowed it to
                     // `(last_seen, through]`, and a too-large gap arrives as a
@@ -1309,6 +1355,47 @@ async fn event_loop<P: Presentation>(
                 Some(ClientInput::Terminal(CrosstermEvent::Resize(w, h))) => {
                     *width = w;
                     PendingActions::One(Action::RemoteUiViewport { width: w, height: h })
+                }
+                // Voice v1 (rubric 8): push-to-talk is intercepted BEFORE the
+                // key reaches the reducer, so `codypendent-tui` never has to
+                // know about recorders, subprocesses, or audio. A stop reads
+                // the captured WAV, uploads it with `PutArtifact`, and remembers
+                // the command so the reply can carry the submission (see the
+                // `ArtifactStored` arm above). Every failure becomes a visible,
+                // actionable notice — the one thing a dead microphone must not
+                // do is nothing.
+                Some(ClientInput::Terminal(event)) if voice.is_push_to_talk(&event) => {
+                    match voice.toggle().await {
+                        crate::voice::CaptureOutcome::Started => {
+                            PendingActions::One(Action::VoiceRecording(true))
+                        }
+                        crate::voice::CaptureOutcome::Captured { bytes, duration_ms } => {
+                            let upload = command_envelope(
+                                live.client_id,
+                                CommandBody::PutArtifact {
+                                    media_type: crate::voice::CAPTURE_MEDIA_TYPE.to_owned(),
+                                    bytes_base64: {
+                                        use base64::Engine as _;
+                                        base64::engine::general_purpose::STANDARD.encode(&bytes)
+                                    },
+                                    // Captured media is Confidential by default,
+                                    // so a recording never leaves the device
+                                    // unless the operator's ceiling allows it.
+                                    sensitivity: crate::voice::capture_classification(),
+                                },
+                            );
+                            if let Payload::Command(command) = &upload.payload {
+                                pending_voice.insert(command.command_id, duration_ms);
+                            }
+                            if live.out_tx.send(upload).await.is_err() {
+                                return Ok(());
+                            }
+                            PendingActions::One(Action::VoiceRecording(false))
+                        }
+                        crate::voice::CaptureOutcome::Failed(message) => PendingActions::Many(
+                            vec![Action::VoiceRecording(false), Action::Notice(message)],
+                        ),
+                    }
                 }
                 Some(ClientInput::Terminal(event)) => PendingActions::One(map_event(
                     &event,
@@ -1358,6 +1445,18 @@ async fn event_loop<P: Presentation>(
 
         for action in actions {
             reduce(state, action);
+        }
+        // Voice v1 (rubric 8). A TUI cannot log — stderr would corrupt the
+        // display — so the off-thread speech worker's failures surface as
+        // status-line notices here rather than vanishing. And turning the
+        // palette toggle on with nothing configured says exactly what is
+        // missing instead of appearing to work and staying silent.
+        if let Some(message) = voice.take_speech_error() {
+            reduce(state, Action::Notice(message));
+        }
+        if state.voice.speak_replies && !voice.can_speak() {
+            state.voice.speak_replies = false;
+            reduce(state, Action::Notice(voice.speech_unavailable_message()));
         }
         if let Some((display_id, provider_id, result)) = connected_acp.take() {
             // A connect can land while an add-model overlay is still open —
@@ -2226,6 +2325,14 @@ enum ReaderSignal {
         quant: String,
         result: Result<String, String>,
     },
+    /// A `PutArtifact` reply (voice v1, rubric 8): the daemon stored a captured
+    /// voice note and minted its ref. The loop turns this into the follow-up
+    /// `SubmitUserInput` whose audio envelope references it — the second half of
+    /// the two-step upload-then-submit the audio path requires.
+    ArtifactStored {
+        command_id: CommandId,
+        artifact: codypendent_protocol::ArtifactRef,
+    },
     /// The daemon closed the connection.
     Closed,
 }
@@ -2529,6 +2636,23 @@ async fn read_loop(
                         break;
                     }
                 }
+                // Voice v1 (rubric 8): a stored voice note's ref comes back so
+                // the loop can submit the envelope that references it.
+                Payload::ArtifactStored {
+                    command_id,
+                    artifact,
+                } => {
+                    if event_tx
+                        .send(ReaderSignal::ArtifactStored {
+                            command_id,
+                            artifact,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Payload::BlackboardPosted(item) => {
                     if event_tx
                         .send(ReaderSignal::BlackboardPosted(item))
@@ -2715,6 +2839,10 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
             text,
             mode,
             model,
+            // The composer path submits plain text; the voice host builds its
+            // audio-envelope submission directly (see `crate::voice`), never
+            // through this intent mapping.
+            envelope: None,
         },
         Intent::ResolveApproval {
             approval_id,
@@ -5411,6 +5539,7 @@ mod tests {
                 text: "also add tests".into(),
                 mode: AgentMode::Build,
                 model: Some(codypendent_protocol::ModelId("pinned-model-x".into())),
+                envelope: None,
             }
         );
         // And an unpinned follow-up carries no model on the wire (inherit).
@@ -5429,6 +5558,7 @@ mod tests {
                 text: "keep going".into(),
                 mode: AgentMode::Build,
                 model: None,
+                envelope: None,
             }
         );
 
