@@ -82,7 +82,7 @@ skills/fix-rust-ci/
 
 ## Collaborative Docs Studio
 
-- CRDT-backed live collaboration (Automerge-suitable)
+- CRDT-backed live collaboration (Loro — selected by measured benchmark, ADR-016)
 - Git as reviewed/publication snapshot storage
 - explicit AI editing modes: Ask, Suggest, Edit, Co-author, Review, Maintain
 - AST-backed document model with typed blocks and authorship records
