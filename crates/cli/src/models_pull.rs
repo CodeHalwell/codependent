@@ -14,6 +14,7 @@
 //! case) — nothing here claims device-tested behavior.
 
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::Context;
 use tokio::io::AsyncReadExt;
@@ -114,16 +115,26 @@ pub async fn pull_via_ollama(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Err(PullError::BinaryNotFound);
-        }
-        Err(source) => {
-            return Err(PullError::Spawn {
-                program: ollama_bin.to_string(),
-                source,
-            });
+    // Unix may briefly return ETXTBSY while an executable is being atomically
+    // installed or replaced. Retry only that transient condition; missing
+    // binaries and all other spawn failures remain immediate and actionable.
+    let mut busy_retries = 0_u32;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PullError::BinaryNotFound);
+            }
+            Err(source) if executable_file_busy(&source) && busy_retries < 4 => {
+                busy_retries += 1;
+                tokio::time::sleep(Duration::from_millis(10 * u64::from(busy_retries))).await;
+            }
+            Err(source) => {
+                return Err(PullError::Spawn {
+                    program: ollama_bin.to_string(),
+                    source,
+                });
+            }
         }
     };
 
@@ -156,6 +167,19 @@ pub async fn pull_via_ollama(
             format!(" — {tail_text}")
         },
     })
+}
+
+fn executable_file_busy(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        // ETXTBSY is 26 on the Unix targets Codypendent ships.
+        error.raw_os_error() == Some(26)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 /// The last few captured lines, joined for a one-line diagnostic suffix.
