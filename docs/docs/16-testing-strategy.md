@@ -159,7 +159,10 @@ Separate:
 - keyboard and mouse equivalence;
 - terminal capability fallbacks;
 - resize behavior;
-- screen-reader-friendly text exports;
+- screen-reader-friendly cooked snapshots with ANSI, alternate-screen, mouse,
+  and bidirectional controls removed;
+- cooked Remote UI focus/edit/activation metadata and semantic key-command
+  parity (`Tab`, paging, `Home`/`End`, `Enter`, and `Space`);
 - no blocking operation on render thread.
 
 ## Release gates

@@ -111,24 +111,18 @@ fn allocate_axis(
     if fixed < distributable {
         let spare = distributable - fixed;
         if grow_total > 0.0 {
-            let mut assigned = 0_u16;
-            for (index, node) in nodes.iter().enumerate() {
-                let grow = node
-                    .props
-                    .layout
-                    .as_ref()
-                    .and_then(|layout| layout.grow)
-                    .unwrap_or(0.0)
-                    .max(0.0);
-                let addition = if index + 1 == nodes.len() {
-                    spare.saturating_sub(assigned)
-                } else {
-                    ((f64::from(spare) * grow / grow_total).floor() as u16)
-                        .min(spare.saturating_sub(assigned))
-                };
-                sizes[index] = sizes[index].saturating_add(addition);
-                assigned = assigned.saturating_add(addition);
-            }
+            let weights = nodes
+                .iter()
+                .map(|node| {
+                    node.props
+                        .layout
+                        .as_ref()
+                        .and_then(|layout| layout.grow)
+                        .unwrap_or(0.0)
+                        .max(0.0)
+                })
+                .collect::<Vec<_>>();
+            distribute_weighted(&mut sizes, spare, &weights);
         }
     } else if fixed > distributable {
         shrink_to_fit(nodes, &mut sizes, fixed - distributable);
@@ -238,27 +232,36 @@ fn grid_tracks(available: u16, count: usize, declared: &[UiDimension], gap: u16)
         return equal_tracks(usable, count);
     }
     let mut tracks = vec![0_u16; count];
-    let mut fixed = 0_u16;
-    let mut fractions = 0.0_f64;
+    let mut fixed = 0_u32;
+    let mut weights = vec![0.0_f64; count];
     for (index, dimension) in declared.iter().take(count).enumerate() {
         match dimension.unit.as_str() {
-            "fr" => fractions += dimension.value.max(0.0),
+            "fr" => weights[index] = dimension.value.max(0.0),
             _ => {
                 tracks[index] = resolve_dimension(dimension, usable).unwrap_or(0);
-                fixed = fixed.saturating_add(tracks[index]);
+                fixed = fixed.saturating_add(u32::from(tracks[index]));
             }
         }
     }
-    let remaining = usable.saturating_sub(fixed);
-    for (index, dimension) in declared.iter().take(count).enumerate() {
-        if dimension.unit == "fr" && fractions > 0.0 {
-            tracks[index] =
-                (f64::from(remaining) * dimension.value.max(0.0) / fractions).floor() as u16;
+
+    // Explicit cell/percent tracks are requests, not permission to paint past
+    // the viewport. Shrink them deterministically before assigning fractions.
+    let mut overflow = fixed.saturating_sub(u32::from(usable));
+    for (index, track) in tracks.iter_mut().enumerate().rev() {
+        if overflow == 0 {
+            break;
+        }
+        if weights[index] == 0.0 {
+            let reduction = u32::from(*track).min(overflow) as u16;
+            *track -= reduction;
+            overflow -= u32::from(reduction);
         }
     }
+
     let assigned = tracks.iter().copied().fold(0_u16, u16::saturating_add);
-    if let Some(last) = tracks.last_mut() {
-        *last = last.saturating_add(usable.saturating_sub(assigned));
+    let remaining = usable.saturating_sub(assigned);
+    if weights.iter().any(|weight| *weight > 0.0) {
+        distribute_weighted(&mut tracks, remaining, &weights);
     }
     tracks
 }
@@ -267,11 +270,45 @@ fn equal_tracks(available: u16, count: usize) -> Vec<u16> {
     let count_u16 = u16::try_from(count).unwrap_or(u16::MAX).max(1);
     let each = available / count_u16;
     let mut result = vec![each; count];
-    let assigned = each.saturating_mul(count_u16);
-    if let Some(last) = result.last_mut() {
-        *last = last.saturating_add(available.saturating_sub(assigned));
+    let remainder = available.saturating_sub(each.saturating_mul(count_u16));
+    for track in result.iter_mut().take(usize::from(remainder)) {
+        *track = track.saturating_add(1);
     }
     result
+}
+
+fn distribute_weighted(sizes: &mut [u16], total: u16, weights: &[f64]) {
+    let weight_total = weights
+        .iter()
+        .copied()
+        .filter(|weight| *weight > 0.0)
+        .sum::<f64>();
+    if total == 0 || weight_total <= 0.0 {
+        return;
+    }
+    let mut assigned = 0_u16;
+    let mut fractions = Vec::new();
+    for (index, weight) in weights.iter().copied().enumerate() {
+        if weight <= 0.0 {
+            continue;
+        }
+        let exact = f64::from(total) * weight / weight_total;
+        let addition = exact.floor() as u16;
+        sizes[index] = sizes[index].saturating_add(addition);
+        assigned = assigned.saturating_add(addition);
+        fractions.push((index, exact - exact.floor()));
+    }
+    fractions.sort_by(|(left_index, left), (right_index, right)| {
+        right
+            .total_cmp(left)
+            .then_with(|| left_index.cmp(right_index))
+    });
+    for (index, _) in fractions
+        .into_iter()
+        .take(usize::from(total.saturating_sub(assigned)))
+    {
+        sizes[index] = sizes[index].saturating_add(1);
+    }
 }
 
 pub(crate) fn resolve_dimension(dimension: &UiDimension, parent: u16) -> Option<u16> {
@@ -349,5 +386,76 @@ mod tests {
             ),
             Some(40)
         );
+    }
+
+    #[test]
+    fn grow_remainder_only_goes_to_growing_children() {
+        let mut growing = UiNode::text("growing");
+        growing.props.layout = Some(UiLayout {
+            grow: Some(1.0),
+            ..UiLayout::default()
+        });
+        let fixed = UiNode::text("fixed");
+        let rects = horizontal(Rect::new(0, 0, 5, 1), &[growing, fixed], &[1, 1], 0);
+        assert_eq!(rects[0].width, 4);
+        assert_eq!(rects[1].width, 1);
+    }
+
+    #[test]
+    fn fixed_grid_tracks_never_overflow_the_available_width() {
+        let tracks = grid_tracks(
+            10,
+            2,
+            &[
+                UiDimension {
+                    value: 8.0,
+                    unit: "cells".into(),
+                },
+                UiDimension {
+                    value: 8.0,
+                    unit: "cells".into(),
+                },
+            ],
+            0,
+        );
+        assert_eq!(tracks.iter().copied().sum::<u16>(), 10);
+        assert_eq!(
+            grid_tracks(
+                10,
+                2,
+                &[
+                    UiDimension {
+                        value: 2.0,
+                        unit: "cells".into()
+                    },
+                    UiDimension {
+                        value: 2.0,
+                        unit: "cells".into()
+                    },
+                ],
+                0
+            ),
+            vec![2, 2]
+        );
+    }
+
+    #[test]
+    fn grid_remainders_are_distributed_from_the_first_track() {
+        assert_eq!(equal_tracks(10, 3), vec![4, 3, 3]);
+        let fractions = vec![
+            UiDimension {
+                value: 1.0,
+                unit: "fr".into(),
+            },
+            UiDimension {
+                value: 1.0,
+                unit: "fr".into(),
+            },
+            UiDimension {
+                value: 1.0,
+                unit: "fr".into(),
+            },
+        ];
+        assert_eq!(grid_tracks(10, 3, &fractions, 0), vec![4, 3, 3]);
     }
 }

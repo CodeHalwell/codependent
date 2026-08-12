@@ -10,9 +10,9 @@
 use chrono::Utc;
 use codypendent_protocol::{
     Actor, ApprovalDecision, ApprovalScope, BudgetDimension, DocumentId, DocumentMutation,
-    EventBody, ProposedAction, RunDisposition, RunState, SessionEvent, ToolOutcome,
-    UiActionBinding, UiDocumentId, UiEvent, UiEventId, UiEventModifiers, UiEventType, UiNodeId,
-    UiProtocolVersion, UiResyncRequest, UiRevision, UiWireMessage,
+    EventBody, ProposedAction, Risk, RiskLevel, RunDisposition, RunState, SessionEvent,
+    ToolOutcome, UiActionBinding, UiDocumentId, UiEvent, UiEventId, UiEventModifiers, UiEventType,
+    UiNodeId, UiProtocolVersion, UiResyncRequest, UiRevision, UiWireMessage,
 };
 use codypendent_ui_host::UiSessionUpdate;
 use serde_json::{Map, Value};
@@ -27,8 +27,9 @@ use crate::state::{
     filter_providers, filter_themes, filter_unsloth_quants, filter_unsloth_repos, key_row_target,
     AddModelRow, AppState, CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft,
     DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView, KeyStatus, ModelListOrigin,
-    ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView, ToolCard,
-    ToolStatus, TranscriptEntry, UnslothQuantCard, UnslothRepoCard, EDGE_PAGE_SIZE,
+    ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, PendingRunStart, RunActivity,
+    RunStartDraftTarget, RunView, ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard,
+    UnslothRepoCard, EDGE_PAGE_SIZE,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -69,7 +70,15 @@ pub fn reduce(state: &mut AppState, action: Action) {
     // detach, or a session close) must release it immediately rather than
     // leaving collaborators blocked until the server-side TTL expires. The two
     // Docs sub-prompts are part of the same flow and deliberately retain it.
-    let docs_surface_was_open = matches!(state.overlay, Overlay::Docs);
+    let docs_surface_was_open = matches!(
+        state.overlay,
+        Overlay::Docs
+            | Overlay::DocEdit { .. }
+            | Overlay::DocNew { .. }
+            | Overlay::DocInsert { .. }
+            | Overlay::DocDeleteConfirm { .. }
+            | Overlay::DocPublishPath { .. }
+    );
     match action {
         Action::DaemonEvent(event) => {
             apply_event(state, *event);
@@ -110,21 +119,50 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
             if state.tick.is_multiple_of(25) {
                 refresh_open_projection(state);
+                if matches!(state.overlay, Overlay::Edges) && !state.edge_loading {
+                    request_edge_page(state, state.edge_page);
+                }
+                if matches!(state.overlay, Overlay::Blackboard) {
+                    watch_focused_blackboard_run(state);
+                }
             }
         }
         // ~5 seconds at the 5 fps tick.
         Action::Notice(text) => state.notice = Some((text, state.tick + 25)),
+        Action::RunStartRejected { reason } => {
+            if let Some(pending) = state.pending_run_start.take() {
+                match pending.target {
+                    RunStartDraftTarget::Composer if state.composer.is_empty() => {
+                        state.composer = pending.draft;
+                        state.composer_cursor = state.composer.len();
+                    }
+                    // Preserve a newer composer draft by restoring the rejected
+                    // objective in its own prompt. The original remains
+                    // editable and the newer draft remains untouched beneath it.
+                    RunStartDraftTarget::Composer | RunStartDraftTarget::NewRunPrompt => {
+                        state.overlay = Overlay::NewRun(pending.draft);
+                    }
+                }
+                state.notice = Some((
+                    format!("run was not started: {reason} · draft restored"),
+                    state.tick + 40,
+                ));
+            } else {
+                state.notice = Some((format!("run was not started: {reason}"), state.tick + 40));
+            }
+        }
         // Voice v1 (rubric 8): the host reports capture start/stop; the flag
         // only drives the status-line indicator.
         Action::VoiceRecording(recording) => state.voice.recording = recording,
         Action::Issue(text) => {
-            if !state.issues.iter().any(|issue| issue == &text) {
+            let inserted = !state.issues.iter().any(|issue| issue == &text);
+            if inserted {
                 state.issues.push(text.clone());
+                state.notice = Some((
+                    format!("setup needs attention — {} issue(s)", state.issues.len()),
+                    state.tick + 40,
+                ));
             }
-            state.notice = Some((
-                format!("setup needs attention — {} issue(s)", state.issues.len()),
-                state.tick + 40,
-            ));
         }
         Action::RemoteUiMessage(message) => apply_remote_ui_message(state, *message),
         Action::RemoteUiSetActive(active) => {
@@ -155,6 +193,53 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
             state.ui_plugins.sort_by(|a, b| a.id.cmp(&b.id));
             clamp(&mut state.selected_ui_plugin, state.ui_plugins.len());
+        }
+        Action::DocumentCreated { document_id } => {
+            state.pending_document_selection = Some(document_id);
+            state.outbox.push(Intent::RefreshProjection {
+                kind: ProjectionKind::Docs,
+            });
+            let id = document_id.to_string();
+            state.notice = Some((
+                format!("document created · {}", id.get(..8).unwrap_or(&id)),
+                state.tick + 30,
+            ));
+        }
+        Action::DocumentPublishPrepared {
+            approval_id,
+            document_id,
+            target,
+            changed_files,
+            git_action,
+        } => {
+            let pending = PendingApproval {
+                approval_id,
+                action: ProposedAction::PublishDocument {
+                    document_id,
+                    target: target.clone(),
+                    changed_files,
+                    git_action: git_action.clone(),
+                },
+                risk: Risk {
+                    level: RiskLevel::High,
+                    reasons: vec!["publishing writes document content to a Git target".to_owned()],
+                },
+                run_id: None,
+            };
+            if let Some(existing) = state
+                .pending_approvals
+                .iter_mut()
+                .find(|approval| approval.approval_id == approval_id)
+            {
+                *existing = pending;
+            } else {
+                state.pending_approvals.push(pending);
+            }
+            clamp(&mut state.selected_approval, state.pending_approvals.len());
+            state.notice = Some((
+                format!("publish awaiting approval · {target} · {git_action}"),
+                state.tick + 50,
+            ));
         }
         Action::CouncilCreated {
             name,
@@ -333,6 +418,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::SelectPrev => nav(state, -1),
         Action::SelectNext => nav(state, 1),
+        Action::SelectPagePrev => nav(state, -6),
+        Action::SelectPageNext => nav(state, 6),
+        Action::SelectFirst => nav_to_edge(state, false),
+        Action::SelectLast => nav_to_edge(state, true),
         Action::ScrollPageUp => scroll_page(state, true),
         Action::ScrollPageDown => scroll_page(state, false),
         Action::ScrollLinesUp => scroll_transcript(state, true, WHEEL_LINES),
@@ -351,6 +440,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 start_focused_workflow(state);
             } else if matches!(state.overlay, Overlay::CouncilBrowser) {
                 state.overlay = Overlay::CouncilBuilder(CouncilBuilderState::default());
+                state.notice = None;
             } else if matches!(state.overlay, Overlay::Docs) {
                 // In the Docs Studio, `n` creates a DOCUMENT — the same
                 // overlay-contextual routing the workflow browser uses above.
@@ -387,7 +477,9 @@ pub fn reduce(state: &mut AppState, action: Action) {
         // gates on the Approver/Controller role); otherwise they resolve a pending
         // approval, exactly as before.
         Action::Approve(scope) => {
-            if matches!(state.overlay, Overlay::UiPlugins) {
+            if !state.pending_approvals.is_empty() {
+                resolve_focused(state, ApprovalDecision::Approve, scope);
+            } else if matches!(state.overlay, Overlay::UiPlugins) {
                 begin_approve_ui_plugin(state);
             } else if matches!(state.overlay, Overlay::Docs) {
                 resolve_focused_suggestion(state, true);
@@ -396,7 +488,9 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::Reject => {
-            if matches!(state.overlay, Overlay::Workflow) {
+            if !state.pending_approvals.is_empty() {
+                resolve_focused(state, ApprovalDecision::Reject, ApprovalScope::Once);
+            } else if matches!(state.overlay, Overlay::Workflow) {
                 retry_focused_workflow_node(state);
             } else if matches!(state.overlay, Overlay::UiPlugins) {
                 begin_reject_ui_plugin(state);
@@ -562,19 +656,20 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::Detach => state.should_detach = true,
         Action::Dismiss => {
-            // Leaving the Docs browser releases any block lease this client holds.
-            if matches!(state.overlay, Overlay::Docs) {
-                release_doc_lease(state);
-            }
             state.overlay = match state.overlay {
                 Overlay::ConfirmWorkflowCancel { .. } => Overlay::Workflow,
                 Overlay::ConfirmUiPluginApprove { .. }
                 | Overlay::ConfirmUiPluginReject { .. }
+                | Overlay::ConfirmUiPluginEnable { .. }
                 | Overlay::ConfirmUiPluginRevoke { .. } => Overlay::UiPlugins,
                 Overlay::ConfirmCouncilDelete { .. } => Overlay::CouncilBrowser,
                 // Backing out of the delete confirmation returns to the Docs
                 // Studio it floats over, not the base view.
                 Overlay::DocDeleteConfirm { .. } => Overlay::Docs,
+                Overlay::DocEdit { .. }
+                | Overlay::DocNew { .. }
+                | Overlay::DocInsert { .. }
+                | Overlay::DocPublishPath { .. } => Overlay::Docs,
                 _ => Overlay::None,
             };
         }
@@ -720,6 +815,20 @@ fn apply_remote_ui_message(state: &mut AppState, message: UiWireMessage) {
             if error.recoverable {
                 if let Some(document_id) = error.document_id {
                     request_remote_ui_resync(state, document_id);
+                } else {
+                    // A transport/broker lag error may be route-wide and omit a
+                    // document id. Resync every authoritative mounted document
+                    // rather than leaving all extension surfaces stale.
+                    let documents: Vec<_> = state
+                        .remote_ui
+                        .host
+                        .documents()
+                        .documents()
+                        .map(|document| document.document_id.clone())
+                        .collect();
+                    for document_id in documents {
+                        request_remote_ui_resync(state, document_id);
+                    }
                 }
             }
         }
@@ -1277,13 +1386,27 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 at,
             );
         }
-        EventBody::SessionClosed => state.session_closed = true,
+        EventBody::SessionClosed => {
+            state.session_closed = true;
+            for run in &mut state.runs {
+                run.activity = RunActivity::Idle;
+            }
+            state.notice = Some((
+                "Session closed · transcript remains available".to_owned(),
+                u64::MAX,
+            ));
+        }
 
         EventBody::RunStarted {
             run_id,
             objective,
             mode,
         } => {
+            // The first durable acknowledgement clears the local admission
+            // guard. Replayed/other-client starts are harmless here: with a run
+            // now projected, future submits follow the ordinary active/terminal
+            // routing rather than the empty-session StartRun path.
+            state.pending_run_start = None;
             let already_announced = state
                 .runs
                 .iter()
@@ -1315,19 +1438,15 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
         EventBody::RunStateChanged { run_id, state: rs } => {
             if let Some(run) = state.run_mut(run_id) {
                 run.state = rs;
-                // Only the states this task's transition table names move
-                // `activity`; anything else (paused, awaiting approval/input,
-                // recovering, unknown) leaves whatever activity was last
-                // observed in place.
-                match rs {
-                    RunState::Preparing | RunState::Running => {
-                        run.activity = RunActivity::Thinking;
+                // Run state is authoritative over an older streaming/tool
+                // activity. In particular, pause and both waiting states must
+                // stop the spinner instead of looking like work is continuing.
+                run.activity = match rs {
+                    RunState::Preparing | RunState::Running | RunState::Recovering => {
+                        RunActivity::Thinking
                     }
-                    RunState::Completed | RunState::Failed | RunState::Cancelled => {
-                        run.activity = RunActivity::Idle;
-                    }
-                    _ => {}
-                }
+                    _ => RunActivity::Idle,
+                };
             }
         }
         EventBody::ModelStreamDelta { run_id, text } => {
@@ -1373,27 +1492,34 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             reasons,
         } => {
             if let Some(run) = state.run_mut(run_id) {
-                AppState::push_entry(
-                    run,
-                    TranscriptEntry::Tool(Box::new(ToolCard {
-                        tool: String::new(),
-                        status: ToolStatus::Completed,
-                        action: Some(action),
-                        args_digest: None,
-                        label: None,
-                        outcome: Some(ToolOutcome::Failed {
-                            message: if reasons.is_empty() {
-                                "denied by policy".to_string()
-                            } else {
-                                reasons.join("; ")
-                            },
-                        }),
-                        artifact: None,
-                        approval_id: None,
-                        expanded: false,
-                    })),
-                    at,
-                );
+                let outcome = ToolOutcome::Failed {
+                    message: if reasons.is_empty() {
+                        "denied by policy".to_string()
+                    } else {
+                        reasons.join("; ")
+                    },
+                };
+                if let Some(card) = last_card(run, |card| {
+                    card.status != ToolStatus::Completed && card.action.as_ref() == Some(&action)
+                }) {
+                    finish_tool_card(card, None, outcome, None);
+                } else {
+                    AppState::push_entry(
+                        run,
+                        TranscriptEntry::Tool(Box::new(ToolCard {
+                            tool: String::new(),
+                            status: ToolStatus::Completed,
+                            action: Some(action),
+                            args_digest: None,
+                            label: None,
+                            outcome: Some(outcome),
+                            artifact: None,
+                            approval_id: None,
+                            expanded: false,
+                        })),
+                        at,
+                    );
+                }
                 run.activity = RunActivity::Thinking;
             }
         }
@@ -1446,16 +1572,8 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             artifact,
         } => {
             if let Some(run) = state.run_mut(run_id) {
-                match last_card(run, |c| c.status == ToolStatus::Running && c.tool == tool) {
-                    Some(card) => {
-                        if card.tool.is_empty() {
-                            card.tool = tool;
-                        }
-                        card.status = ToolStatus::Completed;
-                        card.outcome = Some(outcome);
-                        card.artifact = artifact;
-                    }
-                    None => AppState::push_entry(
+                if !reconcile_tool_completion(run, &tool, outcome.clone(), artifact.clone()) {
+                    AppState::push_entry(
                         run,
                         TranscriptEntry::Tool(Box::new(ToolCard {
                             tool,
@@ -1469,7 +1587,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             expanded: false,
                         })),
                         at,
-                    ),
+                    );
                 }
                 // The tool finished; the agent is back to composing its next
                 // step.
@@ -1509,18 +1627,46 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             risk,
         } => {
             let run_id = run_of_approval(state, approval_id);
-            state.pending_approvals.push(PendingApproval {
+            let pending = PendingApproval {
                 approval_id,
                 action,
                 risk,
                 run_id,
-            });
+            };
+            if let Some(existing) = state
+                .pending_approvals
+                .iter_mut()
+                .find(|approval| approval.approval_id == approval_id)
+            {
+                *existing = pending;
+            } else {
+                state.pending_approvals.push(pending);
+            }
         }
-        EventBody::ApprovalResolved { approval_id, .. } => {
+        EventBody::ApprovalResolved {
+            approval_id,
+            decision,
+        } => {
             state
                 .pending_approvals
                 .retain(|p| p.approval_id != approval_id);
             clamp(&mut state.selected_approval, state.pending_approvals.len());
+            if decision == ApprovalDecision::Reject {
+                if let Some(card) = state.runs.iter_mut().find_map(|run| {
+                    last_card(run, |card| {
+                        card.status == ToolStatus::Proposed && card.approval_id == Some(approval_id)
+                    })
+                }) {
+                    finish_tool_card(
+                        card,
+                        None,
+                        ToolOutcome::Failed {
+                            message: "approval rejected".to_owned(),
+                        },
+                        None,
+                    );
+                }
+            }
         }
         EventBody::SteeringQueued { run_id } => {
             if let Some(run) = state.run_mut(run_id) {
@@ -1573,6 +1719,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
             ..
         } => {
             if let Some(run) = state.run_mut(run_id) {
+                terminalize_open_tool_cards(run, &disposition);
                 run.state = terminal_state(&disposition);
                 AppState::push_entry(
                     run,
@@ -1643,6 +1790,88 @@ fn last_card(run: &mut RunView, pred: impl Fn(&ToolCard) -> bool) -> Option<&mut
         TranscriptEntry::Tool(card) if pred(card) => Some(card.as_mut()),
         _ => None,
     })
+}
+
+fn finish_tool_card(
+    card: &mut ToolCard,
+    tool: Option<&str>,
+    outcome: ToolOutcome,
+    artifact: Option<codypendent_protocol::ArtifactRef>,
+) {
+    if card.tool.is_empty() {
+        if let Some(tool) = tool {
+            card.tool = tool.to_owned();
+        }
+    }
+    card.status = ToolStatus::Completed;
+    card.outcome = Some(outcome);
+    card.artifact = artifact;
+}
+
+/// Reconcile a completion with the most specific preceding lifecycle card.
+/// The wire has no invocation id, so precedence is important: exact Running,
+/// then capability-compatible Proposed (approval rejected before start), then a
+/// just-completed unnamed denial card (the runtime emits ToolDenied followed by
+/// ToolCompleted). Returning false asks the caller to append a standalone card.
+fn reconcile_tool_completion(
+    run: &mut RunView,
+    tool: &str,
+    outcome: ToolOutcome,
+    artifact: Option<codypendent_protocol::ArtifactRef>,
+) -> bool {
+    if let Some(card) = last_card(run, |card| {
+        card.status == ToolStatus::Running && card.tool == tool
+    }) {
+        finish_tool_card(card, Some(tool), outcome, artifact);
+        return true;
+    }
+    if let Some(card) = last_card(run, |card| {
+        card.status == ToolStatus::Proposed
+            && card
+                .action
+                .as_ref()
+                .is_some_and(|action| tool_matches_action(tool, action))
+    }) {
+        finish_tool_card(card, Some(tool), outcome, artifact);
+        return true;
+    }
+    if let Some(card) = last_card(run, |card| {
+        card.status == ToolStatus::Completed
+            && card.tool.is_empty()
+            && card
+                .action
+                .as_ref()
+                .is_some_and(|action| tool_matches_action(tool, action))
+    }) {
+        finish_tool_card(card, Some(tool), outcome, artifact);
+        return true;
+    }
+    false
+}
+
+/// A terminal run cannot still have an executing/awaiting tool. Close every
+/// open card with an honest client-derived failure so cancellation and a lost
+/// lifecycle event never leave a permanent spinner in transcript history.
+fn terminalize_open_tool_cards(run: &mut RunView, disposition: &RunDisposition) {
+    let message = match disposition {
+        RunDisposition::Cancelled { .. } => "run cancelled before the tool completed",
+        RunDisposition::Failed { .. } => "run failed before the tool completed",
+        _ => "run ended before the tool reported completion",
+    };
+    for entry in &mut run.transcript {
+        if let TranscriptEntry::Tool(card) = entry {
+            if card.status != ToolStatus::Completed {
+                finish_tool_card(
+                    card,
+                    None,
+                    ToolOutcome::Failed {
+                        message: message.to_owned(),
+                    },
+                    None,
+                );
+            }
+        }
+    }
 }
 
 /// Correlate a started tool with the action shown on its approval card. The
@@ -1923,6 +2152,90 @@ fn nav(state: &mut AppState, delta: i32) {
     }
 }
 
+/// Jump a filterable picker to its first/last result. Kept separate from
+/// transcript paging so `Home`/`End` remain model-list navigation while a
+/// palette-mode overlay owns input.
+fn nav_to_edge(state: &mut AppState, last: bool) {
+    let edge = |len: usize| if last { len.saturating_sub(1) } else { 0 };
+    match &mut state.overlay {
+        Overlay::Palette { query, selected } => {
+            *selected = edge(crate::palette::filtered_len(query));
+        }
+        Overlay::ModelPicker { query, selected } => {
+            let indices = filter_models(&state.models, query);
+            *selected = edge(indices.len());
+            state.selected_model = indices.get(*selected).copied().unwrap_or(0);
+        }
+        Overlay::ProviderPicker { query, selected } => {
+            let indices = filter_providers(&state.providers, query);
+            *selected = edge(indices.len());
+            state.selected_provider = indices.get(*selected).copied().unwrap_or(0);
+        }
+        Overlay::ModePicker { query, selected } => {
+            *selected = edge(filter_modes(query).len());
+        }
+        Overlay::ThemePicker { query, selected } => {
+            *selected = edge(filter_themes(&state.themes, query).len());
+        }
+        Overlay::ApiKeys { query, selected } => {
+            *selected = edge(filter_key_rows(&state.models, query).len());
+        }
+        Overlay::AddModelPick {
+            models,
+            query,
+            selected,
+            ..
+        } => {
+            *selected = edge(filter_model_names(models, query).len());
+        }
+        Overlay::UnslothRepos {
+            repos,
+            query,
+            selected,
+            ..
+        } => {
+            *selected = edge(filter_unsloth_repos(repos, query).len());
+        }
+        Overlay::UnslothQuants {
+            quants,
+            query,
+            selected,
+            ..
+        } => {
+            *selected = edge(filter_unsloth_quants(quants, query).len());
+        }
+        Overlay::CouncilBuilder(builder) => {
+            let len = match builder.step {
+                CouncilBuilderStep::MemberModel => {
+                    let continue_row =
+                        usize::from(builder.members.len() >= 2 && builder.query.trim().is_empty());
+                    let remove_row =
+                        usize::from(!builder.members.is_empty() && builder.query.trim().is_empty());
+                    let available = if builder.members.len() >= 8 {
+                        0
+                    } else {
+                        filter_council_member_models(
+                            &state.models,
+                            &builder.query,
+                            &builder.members,
+                        )
+                        .len()
+                    };
+                    continue_row + available + remove_row
+                }
+                CouncilBuilderStep::Chair => filter_models(&state.models, &builder.query).len(),
+                CouncilBuilderStep::Rounds => 3,
+                _ => 0,
+            };
+            builder.selected = edge(len);
+            if builder.step == CouncilBuilderStep::Rounds {
+                builder.rounds = u8::try_from(builder.selected + 1).unwrap_or(3).clamp(1, 3);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `PgUp`/`PgDn`: a viewport-sized-ish jump.
 const PAGE: u16 = 10;
 
@@ -1931,6 +2244,24 @@ const PAGE: u16 = 10;
 const WHEEL_LINES: u16 = 3;
 
 fn scroll_page(state: &mut AppState, up: bool) {
+    // A workspace side pane owns page navigation just as it owns ↑/↓. Those
+    // panes are selection-backed rather than pixel-scroll-backed; jumping the
+    // selection makes the renderer bring the landing row into view. Chat mode
+    // deliberately ignores a retained side focus and keeps paging transcript.
+    if matches!(state.overlay, Overlay::None)
+        && state.layout == crate::state::LayoutMode::Workspace
+        && state.focus != Pane::Transcript
+    {
+        nav(
+            state,
+            if up {
+                -i32::from(PAGE)
+            } else {
+                i32::from(PAGE)
+            },
+        );
+        return;
+    }
     scroll_transcript(state, up, PAGE);
 }
 
@@ -2039,7 +2370,13 @@ fn expand_selected(state: &mut AppState) {
     // (`ActivateRow`) or by `Alt-Enter` while browsing — and from the
     // workspace transcript pane. An open browser overlay owns `Enter` for its
     // own list, so it must not silently toggle a fold behind the modal.
-    if !matches!(state.overlay, Overlay::None) && state.focus != Pane::Transcript {
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    // In Workspace a side pane genuinely owns Enter. Chat retains the old
+    // conversation-centric behavior even if a stale/remembered pane value is
+    // not Transcript.
+    if state.layout == crate::state::LayoutMode::Workspace && state.focus != Pane::Transcript {
         return;
     }
     let idx = state.selected_run;
@@ -2189,13 +2526,31 @@ fn confirm_top(state: &mut AppState) {
             }
         }
         Overlay::ConfirmUiPluginApprove { .. } => {
-            if let Overlay::ConfirmUiPluginApprove { plugin_id, receipt } =
-                std::mem::take(&mut state.overlay)
+            if let Overlay::ConfirmUiPluginApprove {
+                plugin_id,
+                receipt,
+                permission_diff: _,
+            } = std::mem::take(&mut state.overlay)
             {
                 state
                     .outbox
                     .push(Intent::ApproveUiPluginUpdate { plugin_id, receipt });
                 state.overlay = Overlay::UiPlugins;
+            }
+        }
+        Overlay::ConfirmUiPluginEnable { .. } => {
+            if let Overlay::ConfirmUiPluginEnable {
+                plugin_id,
+                scope,
+                permission_summary: _,
+            } = std::mem::take(&mut state.overlay)
+            {
+                state.outbox.push(Intent::EnableUiPlugin {
+                    plugin_id,
+                    scope: scope.clone(),
+                });
+                state.overlay = Overlay::UiPlugins;
+                state.notice = Some((format!("enabling plugin for {scope}…"), state.tick + 40));
             }
         }
         Overlay::ConfirmUiPluginReject { .. } => {
@@ -2282,29 +2637,52 @@ fn enable_ui_plugin(state: &mut AppState, scope: &str) {
     if !matches!(state.overlay, Overlay::UiPlugins) {
         return;
     }
-    if let Some(plugin_id) = state.focused_ui_plugin().map(|p| p.id.clone()) {
-        state.outbox.push(Intent::EnableUiPlugin {
+    if let Some((plugin_id, permission_summary)) = state.focused_ui_plugin().map(|plugin| {
+        (
+            plugin.id.clone(),
+            plugin
+                .update_permission_diff
+                .clone()
+                .unwrap_or_else(|| {
+                    "No pending permission expansion. Enabling grants the permissions declared by the verified installed package."
+                        .to_owned()
+                }),
+        )
+    }) {
+        state.overlay = Overlay::ConfirmUiPluginEnable {
             plugin_id,
             scope: scope.to_owned(),
-        });
-        state.notice = Some((format!("enabling plugin for {scope}…"), state.tick + 40));
+            permission_summary,
+        };
     }
 }
 
 fn begin_approve_ui_plugin(state: &mut AppState) {
-    let Some((plugin_id, receipt)) = state.focused_ui_plugin().and_then(|plugin| {
-        plugin
-            .update_approval_receipt
-            .as_ref()
-            .map(|receipt| (plugin.id.clone(), receipt.clone()))
-    }) else {
+    let Some((plugin_id, receipt, permission_diff)) =
+        state.focused_ui_plugin().and_then(|plugin| {
+            plugin.update_approval_receipt.as_ref().map(|receipt| {
+                (
+                    plugin.id.clone(),
+                    receipt.clone(),
+                    plugin
+                        .update_permission_diff
+                        .clone()
+                        .unwrap_or_else(|| "No permission changes reported.".to_owned()),
+                )
+            })
+        })
+    else {
         state.notice = Some((
             "selected plugin has no pending update".to_owned(),
             state.tick + 25,
         ));
         return;
     };
-    state.overlay = Overlay::ConfirmUiPluginApprove { plugin_id, receipt };
+    state.overlay = Overlay::ConfirmUiPluginApprove {
+        plugin_id,
+        receipt,
+        permission_diff,
+    };
 }
 
 fn begin_reject_ui_plugin(state: &mut AppState) {
@@ -2361,13 +2739,8 @@ fn begin_steering(state: &mut AppState) {
 }
 
 fn resolve_focused(state: &mut AppState, decision: ApprovalDecision, scope: ApprovalScope) {
-    // A decision must only be possible while its card is on screen. The
-    // approval modal renders only when no overlay is open — with a browser or
-    // Help overlay covering it, `a`/`r` are live Normal-mode keys and would
-    // otherwise resolve an action the user cannot see.
-    if !matches!(state.overlay, Overlay::None) {
-        return;
-    }
+    // The host-owned approval card is always drawn above ordinary overlays,
+    // and input_mode gives it exclusive decision keys until it is resolved.
     if let Some(pending) = state.focused_approval() {
         let approval_id = pending.approval_id;
         state.outbox.push(Intent::ResolveApproval {
@@ -2508,8 +2881,9 @@ fn start_doc_edit(
 }
 
 /// The daemon granted the requested lease: mark the edit held and fire its queued
-/// mutation exactly once. Ignores a grant for a document that is no longer the
-/// in-flight edit (e.g. the browser was closed before it arrived).
+/// mutation exactly once. A late grant for an edit that is no longer in flight
+/// must be released explicitly; otherwise closing Docs while acquisition is in
+/// flight leaves collaborators blocked until the server-side lease TTL expires.
 fn on_lease_granted(state: &mut AppState, document_id: DocumentId, lease_id: String) {
     let mutation = match state.doc_edit.as_mut() {
         Some(edit) if edit.document_id == document_id => {
@@ -2517,7 +2891,10 @@ fn on_lease_granted(state: &mut AppState, document_id: DocumentId, lease_id: Str
             edit.lease_id = Some(lease_id);
             edit.pending.take()
         }
-        _ => return,
+        _ => {
+            state.outbox.push(Intent::ReleaseDocumentLease { lease_id });
+            return;
+        }
     };
     if let Some(mutation) = mutation {
         state.outbox.push(Intent::MutateDocument {
@@ -3217,18 +3594,36 @@ fn activate_row(state: &mut AppState, n: usize) {
 }
 
 fn submit_prompt(state: &mut AppState) {
+    // Validation belongs to the current attempted council transition. Clear a
+    // stale message first so a corrected value never carries the old error
+    // into the next tab; failing arms below install a fresh inline explanation.
+    if matches!(state.overlay, Overlay::CouncilBuilder(_)) {
+        state.notice = None;
+    }
     match std::mem::take(&mut state.overlay) {
         Overlay::NewRun(text) => {
             let objective = text.trim().to_owned();
             if !objective.is_empty() {
+                if state.pending_run_start.is_some() {
+                    state.overlay = Overlay::NewRun(text);
+                    state.notice = Some((
+                        "a run is already starting — wait for it to attach".to_owned(),
+                        state.tick + 25,
+                    ));
+                    return;
+                }
                 state.outbox.push(Intent::StartRun {
-                    objective,
+                    objective: objective.clone(),
                     mode: state.default_mode,
                     // Pin the operator's chosen model (STEP MP2). Session-default:
                     // `pending_model` is NOT cleared here, so one pick applies to
                     // this run and every subsequent one until the operator changes
                     // it in the `/model` picker.
                     model: state.pending_model.clone(),
+                });
+                state.pending_run_start = Some(PendingRunStart {
+                    draft: objective,
+                    target: RunStartDraftTarget::NewRunPrompt,
                 });
             }
         }
@@ -3701,6 +4096,17 @@ fn submit_prompt(state: &mut AppState) {
         Overlay::None => {
             let text = state.composer.trim().to_owned();
             if !text.is_empty() {
+                // An empty session has no durable run id with which to route a
+                // second message. Retain it as a draft until the first
+                // `RunStarted` attaches, instead of accidentally launching a
+                // second independent run during a slow round trip.
+                if state.selected_run().is_none() && state.pending_run_start.is_some() {
+                    state.notice = Some((
+                        "a run is already starting — your draft is retained".to_owned(),
+                        state.tick + 25,
+                    ));
+                    return;
+                }
                 // Shell-style history: record the submission (skip a
                 // consecutive duplicate) and end any in-flight recall — the
                 // walk-back state from *this* submission is stale now.
@@ -3732,11 +4138,15 @@ fn submit_prompt(state: &mut AppState) {
                 } else {
                     // No run yet this session: nothing to continue — start one.
                     state.outbox.push(Intent::StartRun {
-                        objective: text,
+                        objective: text.clone(),
                         mode: state.default_mode,
                         // Carry the pinned model (STEP MP2); session-default, so
                         // it is not cleared and applies to subsequent runs too.
                         model: state.pending_model.clone(),
+                    });
+                    state.pending_run_start = Some(PendingRunStart {
+                        draft: text,
+                        target: RunStartDraftTarget::Composer,
                     });
                 }
             }
@@ -4120,6 +4530,13 @@ fn on_model_key_verified(state: &mut AppState, model_id: &str, ok: bool, reason:
 /// catalog provider. A no-op outside the provider picker, or when the filtered
 /// selection matches no provider (the same zero-match guard the Enter arm uses).
 fn begin_add_model(state: &mut AppState) {
+    // Council creation is also a stepwise picker. `Tab` is advertised and
+    // expected as Continue there, so route it through the exact same validated
+    // transition as Enter; all non-council/non-provider overlays remain no-ops.
+    if matches!(state.overlay, Overlay::CouncilBuilder(_)) {
+        submit_prompt(state);
+        return;
+    }
     let (provider_id, protocol, requires_key, can_list_models, available, catalog_models, has_key) = {
         let Overlay::ProviderPicker { query, selected } = &state.overlay else {
             return;
@@ -4651,9 +5068,9 @@ fn step(index: &mut usize, len: usize, delta: i32) {
     }
     let max = len - 1;
     if delta < 0 {
-        *index = index.saturating_sub(1);
+        *index = index.saturating_sub(delta.unsigned_abs() as usize);
     } else {
-        *index = (*index + 1).min(max);
+        *index = index.saturating_add(delta as usize).min(max);
     }
 }
 
@@ -4888,6 +5305,41 @@ mod tests {
             outbox_before,
             "traversal is not activation"
         );
+    }
+
+    #[test]
+    fn route_wide_recoverable_remote_error_resyncs_every_document() {
+        let mut state = AppState::new();
+        mount_focus_document(&mut state, "alpha", &["a"]);
+        mount_focus_document(&mut state, "beta", &["b"]);
+        let _ = state.drain_outbox();
+
+        let mut error = empty_message("error", "route-lag");
+        error.error = Some(codypendent_protocol::UiRemoteError {
+            code: "ui.transport.lagged".to_owned(),
+            message: "renderer fell behind".to_owned(),
+            recoverable: true,
+            document_id: None,
+            node_id: None,
+            patch_index: None,
+            recovery: Some("resync".to_owned()),
+            fallback: None,
+            details: serde_json::Value::Null,
+        });
+        reduce(&mut state, Action::RemoteUiMessage(Box::new(error)));
+
+        let mut documents: Vec<_> = state
+            .drain_outbox()
+            .into_iter()
+            .filter_map(|intent| match intent {
+                Intent::RemoteUiMessage(message) => message
+                    .resync
+                    .map(|request| request.document_id.to_string()),
+                _ => None,
+            })
+            .collect();
+        documents.sort();
+        assert_eq!(documents, vec!["alpha", "beta"]);
     }
 
     #[test]
@@ -5644,11 +6096,11 @@ mod tests {
     }
 
     #[test]
-    fn approval_keys_are_inert_while_an_overlay_hides_the_card() {
+    fn approval_preempts_an_open_overlay_and_resolves_visibly() {
         let mut s = AppState::new();
-        // A browser overlay is open when the approval arrives: the modal is
-        // covered (it renders only with no overlay), yet `a`/`r` are live
-        // Normal-mode keys — they must not resolve a card the user cannot see.
+        // A browser overlay is open when the approval arrives. The host card
+        // must preempt it rather than leaving a run blocked behind invisible
+        // normal-mode controls.
         reduce(&mut s, Action::OpenSkills);
         let _ = s.drain_outbox(); // client-only projection refresh
         let approval_id = ApprovalId::new();
@@ -5668,24 +6120,91 @@ mod tests {
                 },
             }),
         );
-        assert!(!s.show_approval_modal(), "overlay covers the modal");
+        assert!(s.show_approval_modal(), "approval preempts the overlay");
+        assert_eq!(s.input_mode(), crate::state::InputMode::Approval);
 
-        reduce(&mut s, Action::Approve(ApprovalScope::Once));
-        reduce(&mut s, Action::Reject);
-        assert!(
-            s.drain_outbox().is_empty(),
-            "no decision may fire while the card is hidden"
-        );
-        assert_eq!(s.pending_approvals.len(), 1);
-
-        // Dismissing the overlay reveals the card and re-arms the keys.
-        reduce(&mut s, Action::Dismiss);
-        assert!(s.show_approval_modal());
         reduce(&mut s, Action::Approve(ApprovalScope::Once));
         let intents = s.drain_outbox();
         assert!(
             matches!(intents.as_slice(), [Intent::ResolveApproval { .. }]),
             "the visible card resolves normally, got {intents:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_enable_requires_host_confirmation_before_emitting() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UiPlugins;
+        s.ui_plugins = vec![codypendent_protocol::UiPluginLifecycleStatus {
+            id: "acme.review".to_owned(),
+            version: "1.2.3".to_owned(),
+            state: "installed".to_owned(),
+            enabled_scope: None,
+            update_approval_receipt: None,
+            update_permission_diff: Some("+ network: api.acme.test".to_owned()),
+        }];
+
+        reduce(&mut s, Action::EnableUiPluginSession);
+        assert_eq!(
+            s.overlay,
+            Overlay::ConfirmUiPluginEnable {
+                plugin_id: "acme.review".to_owned(),
+                scope: "session".to_owned(),
+                permission_summary: "+ network: api.acme.test".to_owned(),
+            }
+        );
+        assert!(
+            s.outbox.is_empty(),
+            "opening the trust prompt grants nothing"
+        );
+
+        reduce(&mut s, Action::Dismiss);
+        assert_eq!(s.overlay, Overlay::UiPlugins);
+        assert!(s.outbox.is_empty());
+
+        reduce(&mut s, Action::EnableUiPluginSession);
+        reduce(&mut s, Action::ConfirmCancel);
+        assert_eq!(s.overlay, Overlay::UiPlugins);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::EnableUiPlugin {
+                plugin_id: "acme.review".to_owned(),
+                scope: "session".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn plugin_update_confirmation_retains_the_decisive_permission_diff() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::UiPlugins;
+        s.ui_plugins = vec![codypendent_protocol::UiPluginLifecycleStatus {
+            id: "acme.review".to_owned(),
+            version: "1.2.3".to_owned(),
+            state: "update_pending".to_owned(),
+            enabled_scope: Some("session".to_owned()),
+            update_approval_receipt: Some("receipt-1".to_owned()),
+            update_permission_diff: Some("+ filesystem_write: repo".to_owned()),
+        }];
+
+        reduce(&mut s, Action::Approve(ApprovalScope::Once));
+        assert_eq!(
+            s.overlay,
+            Overlay::ConfirmUiPluginApprove {
+                plugin_id: "acme.review".to_owned(),
+                receipt: "receipt-1".to_owned(),
+                permission_diff: "+ filesystem_write: repo".to_owned(),
+            }
+        );
+        assert!(s.outbox.is_empty());
+
+        reduce(&mut s, Action::ConfirmCancel);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::ApproveUiPluginUpdate {
+                plugin_id: "acme.review".to_owned(),
+                receipt: "receipt-1".to_owned(),
+            }]
         );
     }
 
@@ -5797,6 +6316,165 @@ mod tests {
         assert_eq!(card.status, ToolStatus::Completed);
         assert_eq!(card.outcome, Some(ToolOutcome::Succeeded));
         assert!(card.artifact.is_some());
+    }
+
+    #[test]
+    fn denied_tool_then_terminal_completion_reconciles_to_one_card() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        let action = ProposedAction::ExecuteCommand {
+            program: "cargo".to_owned(),
+            args: vec!["test".to_owned()],
+            environment: Vec::new(),
+            cwd: None,
+        };
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolDenied {
+                run_id,
+                action,
+                reasons: vec!["blocked by policy".to_owned()],
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolCompleted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                outcome: ToolOutcome::Failed {
+                    message: "policy denied".to_owned(),
+                },
+                artifact: None,
+            }),
+        );
+
+        let cards: Vec<_> = s.runs[0]
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Tool(card) => Some(card.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards.len(), 1, "one invocation must render one card");
+        assert_eq!(cards[0].tool, "shell.run");
+        assert_eq!(cards[0].status, ToolStatus::Completed);
+        assert_eq!(
+            cards[0].outcome,
+            Some(ToolOutcome::Failed {
+                message: "policy denied".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejected_approval_closes_and_reuses_the_proposed_tool_card() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        let approval_id = ApprovalId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolProposed {
+                run_id,
+                approval_id,
+                action: ProposedAction::ExecuteCommand {
+                    program: "cargo".to_owned(),
+                    args: vec!["test".to_owned()],
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ApprovalResolved {
+                approval_id,
+                decision: ApprovalDecision::Reject,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolCompleted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                outcome: ToolOutcome::Failed {
+                    message: "operator rejected".to_owned(),
+                },
+                artifact: None,
+            }),
+        );
+
+        let cards: Vec<_> = s.runs[0]
+            .transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Tool(card) => Some(card.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].status, ToolStatus::Completed);
+        assert_eq!(cards[0].tool, "shell.run");
+    }
+
+    #[test]
+    fn run_completion_terminalizes_every_open_tool_card() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "shell.run".to_owned(),
+                args_digest: "abc".to_owned(),
+                label: None,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Cancelled {
+                    reason: Some("operator cancelled".to_owned()),
+                },
+                chronicle: artifact(),
+            }),
+        );
+
+        let card = s.runs[0]
+            .transcript
+            .iter()
+            .find_map(|entry| match entry {
+                TranscriptEntry::Tool(card) => Some(card.as_ref()),
+                _ => None,
+            })
+            .expect("tool card");
+        assert_eq!(card.status, ToolStatus::Completed);
+        assert!(matches!(card.outcome, Some(ToolOutcome::Failed { .. })));
     }
 
     #[test]
@@ -5975,6 +6653,49 @@ mod tests {
             }),
         );
         assert_eq!(s.runs[0].activity, RunActivity::Idle);
+    }
+
+    #[test]
+    fn paused_and_waiting_run_states_stop_stale_activity_spinners() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+
+        for waiting in [
+            RunState::Paused,
+            RunState::WaitingForApproval,
+            RunState::WaitingForUserInput,
+        ] {
+            s.runs[0].activity = RunActivity::RunningTool("stale".to_owned());
+            reduce(
+                &mut s,
+                system_ev(EventBody::RunStateChanged {
+                    run_id,
+                    state: waiting,
+                }),
+            );
+            assert_eq!(
+                s.runs[0].activity,
+                RunActivity::Idle,
+                "{waiting:?} must not keep an old tool spinner"
+            );
+        }
+
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Recovering,
+            }),
+        );
+        assert_eq!(s.runs[0].activity, RunActivity::Thinking);
     }
 
     #[test]
@@ -6278,9 +6999,12 @@ mod tests {
             }],
             suggestions: vec![crate::state::DocSuggestionView {
                 id: "s1".to_owned(),
+                block_id: "b1".to_owned(),
+                source_revision: 3,
                 status: "pending".to_owned(),
                 author: "agent".to_owned(),
                 range: "0..4".to_owned(),
+                original: title.to_owned(),
                 replacement: "new".to_owned(),
                 rationale: Some("clearer".to_owned()),
             }],
@@ -6347,9 +7071,12 @@ mod tests {
         });
         first.suggestions.push(crate::state::DocSuggestionView {
             id: "s2".to_owned(),
+            block_id: "b2".to_owned(),
+            source_revision: 3,
             status: "pending".to_owned(),
             author: "reviewer".to_owned(),
             range: "1..2".to_owned(),
+            original: "e".to_owned(),
             replacement: "replacement".to_owned(),
             rationale: None,
         });
@@ -6732,6 +7459,62 @@ mod tests {
     }
 
     #[test]
+    fn a_late_or_mismatched_lease_grant_is_released_immediately() {
+        let late_document_id = codypendent_protocol::DocumentId::new();
+        let mut closed = AppState::new();
+
+        reduce(
+            &mut closed,
+            Action::DocumentLeaseGranted {
+                document_id: late_document_id,
+                lease_id: "lease-after-close".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            closed.outbox,
+            vec![Intent::ReleaseDocumentLease {
+                lease_id: "lease-after-close".to_owned(),
+            }],
+            "a grant arriving after Docs closed must not live until its TTL"
+        );
+
+        let mut acquiring_other = AppState::new();
+        let active_document_id = codypendent_protocol::DocumentId::new();
+        acquiring_other.overlay = Overlay::Docs;
+        acquiring_other.doc_edit = Some(DocEdit {
+            document_id: active_document_id,
+            block_id: Some("active-block".to_owned()),
+            lease: DocLeaseState::Acquiring,
+            lease_id: None,
+            pending: None,
+        });
+
+        reduce(
+            &mut acquiring_other,
+            Action::DocumentLeaseGranted {
+                document_id: late_document_id,
+                lease_id: "lease-wrong-document".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            acquiring_other.outbox,
+            vec![Intent::ReleaseDocumentLease {
+                lease_id: "lease-wrong-document".to_owned(),
+            }]
+        );
+        assert!(matches!(
+            acquiring_other.doc_edit,
+            Some(DocEdit {
+                document_id,
+                lease: DocLeaseState::Acquiring,
+                ..
+            }) if document_id == active_document_id
+        ));
+    }
+
+    #[test]
     fn a_lease_rejection_blocks_the_edit_and_shows_a_notice() {
         let mut s = AppState::new();
         s.docs = vec![doc("a")];
@@ -6847,6 +7630,84 @@ mod tests {
             },
         );
         assert_eq!(s.docs[0].revision, "r3", "no card matched, nothing changed");
+    }
+
+    #[test]
+    fn document_created_refreshes_the_docs_projection_and_notices_the_id() {
+        let mut s = AppState::new();
+        let document_id = DocumentId::new();
+        reduce(&mut s, Action::DocumentCreated { document_id });
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::RefreshProjection {
+                kind: ProjectionKind::Docs,
+            }]
+        );
+        assert_eq!(s.pending_document_selection, Some(document_id));
+        let notice = s.notice.expect("create acknowledgement is visible").0;
+        assert!(notice.contains("document created"));
+        assert!(notice.contains(&document_id.to_string()[..8]));
+    }
+
+    #[test]
+    fn document_publish_prepared_projects_a_full_approval_without_duplication() {
+        let mut s = AppState::new();
+        let approval_id = ApprovalId::new();
+        let document_id = DocumentId::new();
+        let prepared = Action::DocumentPublishPrepared {
+            approval_id,
+            document_id,
+            target: "repository file docs/runbook.md".to_owned(),
+            changed_files: vec!["docs/runbook.md".to_owned()],
+            git_action: "commit on branch docs/publish".to_owned(),
+        };
+        reduce(&mut s, prepared.clone());
+        reduce(&mut s, prepared);
+
+        assert_eq!(s.pending_approvals.len(), 1);
+        let approval = &s.pending_approvals[0];
+        assert_eq!(approval.approval_id, approval_id);
+        assert_eq!(approval.risk.level, RiskLevel::High);
+        assert_eq!(approval.run_id, None);
+        assert_eq!(
+            approval.action,
+            ProposedAction::PublishDocument {
+                document_id,
+                target: "repository file docs/runbook.md".to_owned(),
+                changed_files: vec!["docs/runbook.md".to_owned()],
+                git_action: "commit on branch docs/publish".to_owned(),
+            }
+        );
+        assert!(s.show_approval_modal());
+    }
+
+    #[test]
+    fn dismissing_a_docs_subprompt_returns_to_docs_without_dropping_its_lease() {
+        let mut s = AppState::new();
+        let document_id = DocumentId::new();
+        s.overlay = Overlay::DocEdit {
+            block_id: "b1".to_owned(),
+            buffer: "draft".to_owned(),
+            original: "original".to_owned(),
+        };
+        s.doc_edit = Some(DocEdit {
+            document_id,
+            block_id: Some("b1".to_owned()),
+            lease: DocLeaseState::Held,
+            lease_id: Some("lease-keep".to_owned()),
+            pending: None,
+        });
+
+        reduce(&mut s, Action::Dismiss);
+
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert_eq!(
+            s.doc_edit
+                .as_ref()
+                .and_then(|edit| edit.lease_id.as_deref()),
+            Some("lease-keep")
+        );
+        assert!(s.outbox.is_empty(), "returning to Docs retains the lease");
     }
 
     #[test]
@@ -7578,6 +8439,110 @@ mod tests {
     }
 
     #[test]
+    fn a_second_empty_session_submit_is_retained_until_run_started() {
+        let mut s = AppState::new();
+        for c in "first".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.drain_outbox().len(), 1);
+        assert!(s.pending_run_start.is_some());
+
+        for c in "second".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert!(s.outbox.is_empty(), "must not launch a duplicate run");
+        assert_eq!(s.composer, "second", "the second message remains editable");
+
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "first".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        assert!(s.pending_run_start.is_none());
+        assert_eq!(s.composer, "second");
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::QueueSteering {
+                run_id,
+                text: "second".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unacknowledged_start_guard_does_not_expire() {
+        let mut s = AppState::new();
+        s.composer = "first".to_owned();
+        s.composer_cursor = s.composer.len();
+        reduce(&mut s, Action::InputSubmit);
+        let _ = s.drain_outbox();
+        for _ in 0..500 {
+            reduce(&mut s, Action::Tick);
+        }
+        assert!(s.pending_run_start.is_some());
+
+        s.composer = "retry".to_owned();
+        s.composer_cursor = s.composer.len();
+        reduce(&mut s, Action::InputSubmit);
+        assert!(s.drain_outbox().is_empty());
+        assert_eq!(s.composer, "retry");
+    }
+
+    #[test]
+    fn a_correlated_start_rejection_restores_the_original_composer_draft() {
+        let mut s = AppState::new();
+        s.composer = "first objective".to_owned();
+        s.composer_cursor = s.composer.len();
+        reduce(&mut s, Action::InputSubmit);
+        let _ = s.drain_outbox();
+        assert!(s.composer.is_empty());
+        assert!(s.pending_run_start.is_some());
+
+        reduce(
+            &mut s,
+            Action::RunStartRejected {
+                reason: "session is closed".to_owned(),
+            },
+        );
+
+        assert!(s.pending_run_start.is_none());
+        assert_eq!(s.composer, "first objective");
+        assert_eq!(s.composer_cursor, s.composer.len());
+        assert!(s
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("draft restored")));
+    }
+
+    #[test]
+    fn start_rejection_preserves_a_newer_composer_draft() {
+        let mut s = AppState::new();
+        s.composer = "first objective".to_owned();
+        s.composer_cursor = s.composer.len();
+        reduce(&mut s, Action::InputSubmit);
+        let _ = s.drain_outbox();
+        s.composer = "newer draft".to_owned();
+        s.composer_cursor = s.composer.len();
+
+        reduce(
+            &mut s,
+            Action::RunStartRejected {
+                reason: "not admitted".to_owned(),
+            },
+        );
+
+        assert_eq!(s.composer, "newer draft");
+        assert_eq!(s.overlay, Overlay::NewRun("first objective".to_owned()));
+    }
+
+    #[test]
     fn alt_enter_inserts_a_newline_without_submitting() {
         let mut s = AppState::new();
         for c in "line one".chars() {
@@ -7603,6 +8568,9 @@ mod tests {
         assert_eq!(s.composer_history, vec!["first message".to_owned()]);
 
         // A repeat of the very same message is not pushed again.
+        // No daemon is running in this reducer-only history test, so simulate
+        // the durable acknowledgement that would clear admission in production.
+        s.pending_run_start = None;
         for c in "first message".chars() {
             reduce(&mut s, Action::InputChar(c));
         }
@@ -7614,6 +8582,7 @@ mod tests {
         );
 
         // A genuinely new message is appended.
+        s.pending_run_start = None;
         for c in "second message".chars() {
             reduce(&mut s, Action::InputChar(c));
         }
@@ -7628,6 +8597,7 @@ mod tests {
     fn history_prev_stashes_the_in_progress_draft_and_walks_backward() {
         let mut s = AppState::new();
         for text in ["oldest", "newest"] {
+            s.pending_run_start = None;
             for c in text.chars() {
                 reduce(&mut s, Action::InputChar(c));
             }
@@ -7662,6 +8632,7 @@ mod tests {
     fn history_next_walks_forward_and_restores_the_stash_past_the_newest() {
         let mut s = AppState::new();
         for text in ["oldest", "newest"] {
+            s.pending_run_start = None;
             for c in text.chars() {
                 reduce(&mut s, Action::InputChar(c));
             }
@@ -7954,6 +8925,70 @@ mod tests {
         assert_eq!(s.layout, LayoutMode::Workspace);
     }
 
+    #[test]
+    fn workspace_side_pane_arrows_and_pages_move_that_panes_selection() {
+        use crate::state::LayoutMode;
+
+        let mut s = AppState::new();
+        for index in 0..25 {
+            reduce(
+                &mut s,
+                system_ev(EventBody::RunStarted {
+                    run_id: RunId::new(),
+                    objective: format!("run {index}"),
+                    mode: AgentMode::Build,
+                }),
+            );
+        }
+        s.layout = LayoutMode::Workspace;
+        s.focus = Pane::Sessions;
+        s.selected_run = 0;
+        s.composer = "draft must survive side-pane navigation".to_owned();
+        s.composer_cursor = s.composer.len();
+
+        reduce(&mut s, Action::SelectNext);
+        assert_eq!(s.selected_run, 1);
+        reduce(&mut s, Action::ScrollPageDown);
+        assert_eq!(s.selected_run, 11, "PgDn jumps through the run pane");
+        reduce(&mut s, Action::ScrollPageUp);
+        assert_eq!(s.selected_run, 1);
+        assert_eq!(s.composer, "draft must survive side-pane navigation");
+
+        // Once focus returns to the center, the same page action scrolls the
+        // selected transcript rather than moving the run cursor.
+        s.focus = Pane::Transcript;
+        s.transcript_max_scroll.set(50);
+        reduce(&mut s, Action::ScrollPageUp);
+        assert_eq!(s.selected_run, 1);
+        assert_eq!(s.runs[1].scroll, 40);
+        assert!(!s.runs[1].follow);
+    }
+
+    #[test]
+    fn approval_page_keys_jump_the_preempting_approval_stack() {
+        let mut s = AppState::new();
+        for index in 0..15 {
+            reduce(
+                &mut s,
+                system_ev(EventBody::ApprovalRequested {
+                    approval_id: ApprovalId::new(),
+                    action: ProposedAction::GitCommit {
+                        repository: format!("acme/repo-{index}"),
+                    },
+                    risk: Risk {
+                        level: RiskLevel::High,
+                        reasons: vec!["writes Git history".to_owned()],
+                    },
+                }),
+            );
+        }
+        assert_eq!(s.input_mode(), crate::state::InputMode::Approval);
+        reduce(&mut s, Action::SelectPageNext);
+        assert_eq!(s.selected_approval, 6);
+        reduce(&mut s, Action::SelectPagePrev);
+        assert_eq!(s.selected_approval, 0);
+    }
+
     fn model_card(id: &str, provider: &str) -> crate::state::ModelCard {
         crate::state::ModelCard {
             id: ModelId(id.to_owned()),
@@ -7973,6 +9008,36 @@ mod tests {
             reduce(s, Action::InputChar(c));
         }
         reduce(s, Action::InputSubmit);
+    }
+
+    #[test]
+    fn model_picker_pages_and_jumps_across_the_full_catalog() {
+        let mut state = AppState::new();
+        state.models = (0..30)
+            .map(|index| model_card(&format!("model-{index:02}"), "catalog"))
+            .collect();
+        open_model_picker(&mut state);
+
+        reduce(&mut state, Action::SelectPageNext);
+        assert!(matches!(
+            state.overlay,
+            Overlay::ModelPicker { selected: 6, .. }
+        ));
+        assert_eq!(state.selected_model, 6);
+
+        reduce(&mut state, Action::SelectLast);
+        assert!(matches!(
+            state.overlay,
+            Overlay::ModelPicker { selected: 29, .. }
+        ));
+        assert_eq!(state.selected_model, 29);
+
+        reduce(&mut state, Action::SelectFirst);
+        assert!(matches!(
+            state.overlay,
+            Overlay::ModelPicker { selected: 0, .. }
+        ));
+        assert_eq!(state.selected_model, 0);
     }
 
     fn open_council_builder(s: &mut AppState) {
@@ -8069,6 +9134,71 @@ mod tests {
         // Rubric 6: a successful save returns to the browser (its only entry
         // point is `n` from inside it), not the base view.
         assert_eq!(s.overlay, Overlay::CouncilBrowser);
+    }
+
+    #[test]
+    fn council_builder_home_and_end_cover_each_list_step() {
+        let mut state = AppState::new();
+        state.models = vec![
+            model_card("claude", "acp"),
+            model_card("kimi", "acp"),
+            model_card("amp", "acp"),
+        ];
+        state.overlay = Overlay::CouncilBuilder(CouncilBuilderState {
+            step: CouncilBuilderStep::MemberModel,
+            members: vec![
+                CouncilMemberDraft {
+                    model: "claude".to_owned(),
+                    role: "reviewer".to_owned(),
+                },
+                CouncilMemberDraft {
+                    model: "kimi".to_owned(),
+                    role: "architect".to_owned(),
+                },
+            ],
+            ..CouncilBuilderState::default()
+        });
+        reduce(&mut state, Action::SelectLast);
+        assert!(matches!(
+            state.overlay,
+            Overlay::CouncilBuilder(CouncilBuilderState { selected: 2, .. })
+        ));
+        reduce(&mut state, Action::SelectFirst);
+        assert!(matches!(
+            state.overlay,
+            Overlay::CouncilBuilder(CouncilBuilderState { selected: 0, .. })
+        ));
+
+        if let Overlay::CouncilBuilder(builder) = &mut state.overlay {
+            builder.step = CouncilBuilderStep::Chair;
+        }
+        reduce(&mut state, Action::SelectLast);
+        assert!(matches!(
+            state.overlay,
+            Overlay::CouncilBuilder(CouncilBuilderState { selected: 2, .. })
+        ));
+
+        if let Overlay::CouncilBuilder(builder) = &mut state.overlay {
+            builder.step = CouncilBuilderStep::Rounds;
+        }
+        reduce(&mut state, Action::SelectLast);
+        assert!(matches!(
+            state.overlay,
+            Overlay::CouncilBuilder(CouncilBuilderState {
+                selected: 2,
+                rounds: 3,
+                ..
+            })
+        ));
+        reduce(&mut state, Action::SelectFirst);
+        assert!(matches!(
+            state.overlay,
+            Overlay::CouncilBuilder(CouncilBuilderState {
+                selected: 0,
+                rounds: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -10202,6 +11332,40 @@ mod tests {
     }
 
     #[test]
+    fn expand_is_inert_while_any_overlay_owns_enter() {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "o".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::NoteAppended {
+                text: "folded detail".to_owned(),
+                run_id: Some(run_id),
+            }),
+        );
+        s.focus = Pane::Transcript;
+        s.runs[0].transcript_selected = 1;
+        s.overlay = Overlay::Skills;
+
+        reduce(&mut s, Action::Expand);
+
+        let TranscriptEntry::Note { expanded, .. } = &s.runs[0].transcript[1] else {
+            unreachable!()
+        };
+        assert!(
+            !expanded,
+            "an overlay must not toggle transcript content behind it"
+        );
+    }
+
+    #[test]
     fn activate_row_with_no_overlay_selects_and_toggles_the_transcript_fold() {
         // A click on a transcript row (no overlay open) is "select it + Enter":
         // it focuses the transcript, moves the selection to entry N, and toggles
@@ -11015,16 +12179,23 @@ mod tests {
     }
 
     #[test]
-    fn expand_no_longer_needs_the_unreachable_transcript_pane_focus() {
-        // The old guard required `focus == Pane::Transcript`, which `Tab` could
-        // not reach from the base view — that is what made tool cards and patch
-        // diffs dead UI. In the base view (no overlay) the fold expands from
-        // whatever the vestigial pane focus happens to be.
+    fn chat_expand_ignores_retained_focus_but_workspace_side_focus_owns_enter() {
+        // Chat is conversation-centric, so a pane value retained from a prior
+        // Workspace visit cannot make folds unreachable.
         let mut s = run_with_two_folds();
         s.focus = Pane::Sessions;
         s.runs[0].transcript_selected = 1;
         reduce(&mut s, Action::Expand);
         assert!(tool_expanded(&s));
+
+        // In Workspace that same focus is real: Enter belongs to the run list
+        // and must not toggle transcript content behind it.
+        let mut s = run_with_two_folds();
+        s.layout = crate::state::LayoutMode::Workspace;
+        s.focus = Pane::Sessions;
+        s.runs[0].transcript_selected = 1;
+        reduce(&mut s, Action::Expand);
+        assert!(!tool_expanded(&s));
 
         // A browser overlay still owns Enter for its own list: no silent
         // toggling of a fold hidden behind the modal.
@@ -11708,5 +12879,24 @@ mod tests {
                 id: "solarized".to_owned()
             }]
         );
+    }
+
+    #[test]
+    fn duplicate_integration_issues_do_not_reflash_the_notice() {
+        let mut state = AppState::new();
+        reduce(
+            &mut state,
+            Action::Issue("MCP server unavailable".to_owned()),
+        );
+        assert_eq!(state.issues, vec!["MCP server unavailable"]);
+        state.notice = None;
+
+        reduce(
+            &mut state,
+            Action::Issue("MCP server unavailable".to_owned()),
+        );
+
+        assert_eq!(state.issues, vec!["MCP server unavailable"]);
+        assert!(state.notice.is_none());
     }
 }

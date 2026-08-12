@@ -546,6 +546,7 @@ fn envelope_vectors() -> Vec<Vector> {
                 session_count: 2,
                 build_id: "0.1.0+a1b2c3d4e5f6".to_string(),
                 active_run_count: 1,
+                integration_issues: Vec::new(),
             }),
         ),
         vec_of(

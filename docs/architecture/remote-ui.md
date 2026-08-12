@@ -323,6 +323,15 @@ reduced-motion, Unicode-safe and narrow-terminal representations. Graphical
 renderers map the same semantics to appropriate ARIA roles. A screen-reader or
 headless client can request a structured textual representation of any view.
 
+The cooked terminal client uses that projection as an interactive surface, not
+only as descriptive output. It builds the same bounded focus, form-field, hit,
+and keyboard-action metadata as the full-screen terminal renderer, then maps
+line commands such as `tab`, `backtab`, `pageup`, `pagedown`, `home`, `end`,
+`enter`, and `space` to semantic Remote UI keys. Its snapshots are append-only
+linear text with terminal and bidirectional controls removed; extension
+controls consequently remain focusable, editable, and activatable without raw
+mode, an alternate screen, mouse capture, or cursor-addressed repainting.
+
 ## Developer tooling
 
 The SDK and CLI provide scaffolding, development, component stories, fixtures,

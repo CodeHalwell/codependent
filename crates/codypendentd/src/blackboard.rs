@@ -345,6 +345,7 @@ impl BoardOps {
             .get(&self.pool, &run_id, item_id)
             .await?
             .ok_or_else(|| BlackboardError::NotFound(item_id.to_string()))?;
+        let mut superseded = old.clone();
 
         let moved_column = change
             .status
@@ -384,6 +385,14 @@ impl BoardOps {
                 },
             )
             .await?;
+        // A supersession creates a new id, so publishing only the replacement
+        // cannot tell an incremental client which old card to remove. Deliver a
+        // tombstone for the old revision first, followed by the live replacement.
+        // Both frames are full stored views and the transaction above has already
+        // committed, so a reconnect remains authoritative even if a client misses
+        // either live frame.
+        superseded.superseded_by = Some(item.id.clone());
+        self.publish(&run_id, superseded);
         Ok(self.publish(&run_id, item))
     }
 
@@ -911,7 +920,9 @@ mod tests {
     async fn a_move_supersedes_the_card_and_appends_it_to_the_target_column() {
         let (_dir, pool) = temp_pool().await;
         let repository = "/home/user/project";
-        let writer = AssemblyBoardWriter::new(pool.clone(), BlackboardHub::new());
+        let hub = BlackboardHub::new();
+        let writer = AssemblyBoardWriter::new(pool.clone(), hub.clone());
+        let mut live = hub.subscribe(board_scope_id(repository));
         let post = |draft| {
             let writer = writer.clone();
             async move {
@@ -929,6 +940,9 @@ mod tests {
         post(card("first", Some("doing"))).await;
         post(card("second", Some("doing"))).await;
         let moving = post(card("third", Some("todo"))).await;
+        for _ in 0..3 {
+            live.recv().await.expect("initial post delivered");
+        }
 
         let moved = writer
             .update(UpdateBlackboardRequest {
@@ -952,6 +966,12 @@ mod tests {
         );
         // The card's body survives a pure move — nothing named a payload.
         assert_eq!(moved.payload["title"], "third");
+
+        let tombstone = live.recv().await.expect("superseded card delivered");
+        assert_eq!(tombstone.id, moving.id);
+        assert_eq!(tombstone.superseded_by.as_deref(), Some(moved.id.as_str()));
+        let replacement = live.recv().await.expect("replacement delivered");
+        assert_eq!(replacement, moved);
 
         // Moving the SAME (now superseded) card again is refused rather than
         // forking the chain.

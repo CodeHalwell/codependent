@@ -124,6 +124,7 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
     // working directory before it can serve clients.
     let workdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let repository = scan::repository_id_for(&workdir);
+    let integration_health = server::IntegrationHealth::default();
 
     // Register the operator's installed skill packages, so retrieval has
     // something to disclose beyond the built-ins. `register_package` previously
@@ -145,7 +146,7 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
     // so publication uses this same startup root, as the code-graph scan does).
     let mut executor =
         RuntimeExecutor::new(pool.clone(), paths.clone(), repository, workdir.clone())
-            .with_repository_root(workdir)
+            .with_repository_root(workdir.clone())
             // Rubric 9: the SAME embedder the maintenance job persists vectors
             // with (one shared content-hash cache), plus the `[retrieval]`
             // tuning each run's agent runtime gates its MCP advertisement by.
@@ -167,11 +168,24 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
                     info!("github personal-mode client enabled");
                 }
                 Err(error) => {
-                    warn!(%error, "could not build the github client; github tools disabled")
+                    warn!(%error, "could not build the github client; github tools disabled");
+                    integration_health.report(
+                        "GitHub tools disabled: the personal-mode client could not be initialized; see daemon.log",
+                    );
                 }
             }
         }
-        Err(_) => info!("no github token found; github tools disabled"),
+        Err(_) => {
+            info!("no github token found; github tools disabled");
+            // Missing credentials are actionable only for a GitHub checkout;
+            // local/non-GitHub repositories should not get a permanent warning
+            // for an optional integration they never selected.
+            if executor::resolve_github_repo(&workdir).await.is_some() {
+                integration_health.report(
+                    "GitHub tools unavailable for this checkout: run `gh auth login` or set GITHUB_TOKEN",
+                );
+            }
+        }
     }
 
     // Web search resolves its key per call. A TUI key update therefore applies
@@ -215,7 +229,14 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
             // Fire-and-forget pre-warm (the code-graph scan precedent): a
             // server that won't start is logged inside `warm_all`, never
             // fatal — its tools stay unoffered until a lazy spawn succeeds.
-            tokio::spawn(async move { registry.warm_all().await });
+            let health = integration_health.clone();
+            tokio::spawn(async move {
+                for (server, _reason) in registry.warm_all_with_failures().await {
+                    health.report(format!(
+                        "MCP server `{server}` failed to start; check mcp.toml and daemon.log"
+                    ));
+                }
+            });
             info!(
                 servers = server_count,
                 "mcp registry enabled; warming servers in the background"
@@ -224,6 +245,10 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
         Ok(_) => info!("no mcp servers configured; mcp tools disabled"),
         Err(error) => {
             error!(%error, "malformed mcp config; continuing with NO mcp servers");
+            integration_health.report(format!(
+                "MCP tools disabled: {} is invalid; run `codypendent mcp list` for details",
+                paths.global_mcp_path().display()
+            ));
         }
     }
 
@@ -268,9 +293,17 @@ pub async fn run_daemon(paths: RuntimePaths) -> anyhow::Result<()> {
     // their `X-GitHub-Delivery` GUID, and normalized; they never trigger
     // workflows here (that requires explicit policy, wired in a later phase). The
     // listener runs concurrently with the blocking socket server below.
-    maybe_start_webhook_listener(&paths, &pool).await;
+    maybe_start_webhook_listener(&paths, &pool, &integration_health).await;
 
-    server::run_with_executor_on(listener, pool, paths, boot, Some(executor)).await
+    server::run_with_executor_on_and_health(
+        listener,
+        pool,
+        paths,
+        boot,
+        Some(executor),
+        integration_health,
+    )
+    .await
 }
 
 /// Register every skill package installed under the two well-known roots into
@@ -315,7 +348,11 @@ async fn scan_installed_skills(
 /// Start the webhook listener if `<data_dir>/webhooks.toml` enables it. Any
 /// failure is logged and never blocks daemon startup — the webhook endpoint is
 /// an optional, opt-in surface.
-async fn maybe_start_webhook_listener(paths: &RuntimePaths, pool: &sqlx::SqlitePool) {
+async fn maybe_start_webhook_listener(
+    paths: &RuntimePaths,
+    pool: &sqlx::SqlitePool,
+    health: &server::IntegrationHealth,
+) {
     use codypendent_integrations::webhook::{config, SqliteDeliveryStore, WebhookIngestor};
 
     let config_path = paths.data_dir.join("webhooks.toml");
@@ -324,6 +361,10 @@ async fn maybe_start_webhook_listener(paths: &RuntimePaths, pool: &sqlx::SqliteP
         Ok(_) => return, // absent or disabled — the default
         Err(error) => {
             warn!(%error, "failed to load webhooks configuration; listener not started");
+            health.report(format!(
+                "Webhook listener disabled: {} is invalid; see daemon.log",
+                config_path.display()
+            ));
             return;
         }
     };
@@ -344,19 +385,27 @@ async fn maybe_start_webhook_listener(paths: &RuntimePaths, pool: &sqlx::SqliteP
                 signed = webhooks.secret.is_some(),
                 "webhook listener enabled"
             );
+            let health = health.clone();
             tokio::spawn(async move {
                 if let Err(error) =
                     codypendent_integrations::webhook::server::serve(listener, ingestor).await
                 {
                     warn!(%error, "webhook listener stopped");
+                    health.report("Webhook listener stopped unexpectedly; see daemon.log");
                 }
             });
         }
-        Err(error) => warn!(
-            %error,
-            addr = %webhooks.listen_addr,
-            "could not bind the webhook listener"
-        ),
+        Err(error) => {
+            warn!(
+                %error,
+                addr = %webhooks.listen_addr,
+                "could not bind the webhook listener"
+            );
+            health.report(format!(
+                "Webhook listener could not bind {}; check webhooks.toml and daemon.log",
+                webhooks.listen_addr
+            ));
+        }
     }
 }
 

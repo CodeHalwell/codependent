@@ -170,7 +170,7 @@ pub async fn connect(
             agent_coordinate_with_model(&spec.registry_id, &spec.version, &model.id),
         ));
     }
-    upsert_profiles(paths, &profiles)?;
+    replace_profile_family(paths, &base, &profiles)?;
 
     println!(
         "connected {} {} as model `{base}` (agent default)",
@@ -325,7 +325,11 @@ pub fn disconnect(paths: &RuntimePaths, profile: &str) -> anyhow::Result<()> {
     }
     let mut configs = load_models(&models_path)?;
     let before = configs.len();
-    configs.retain(|config| !(config.id.0 == profile && config.provider == "acp"));
+    let child_prefix = format!("{profile}#");
+    configs.retain(|config| {
+        !(config.provider == "acp"
+            && (config.id.0 == profile || config.id.0.starts_with(&child_prefix)))
+    });
     if configs.len() == before {
         bail!("ACP profile `{profile}` is not configured");
     }
@@ -382,13 +386,27 @@ fn connected_profiles(paths: &RuntimePaths) -> anyhow::Result<Vec<(String, Strin
         .collect())
 }
 
-/// Replace `profiles` (id → ACP coordinate) in `models.toml` in ONE
+/// Replace one ACP profile family (base id plus its discovered `#model`
+/// children) in `models.toml` in ONE
 /// load-modify-write, so connecting an agent that advertises many models does
 /// not rewrite the file once per model — and never leaves a half-written set
-/// behind if one id turns out to be invalid.
-fn upsert_profiles(paths: &RuntimePaths, profiles: &[(String, String)]) -> anyhow::Result<()> {
+/// behind if one id turns out to be invalid. Reconnecting is an exact
+/// replacement: children the agent no longer advertises are removed.
+fn replace_profile_family(
+    paths: &RuntimePaths,
+    base: &str,
+    profiles: &[(String, String)],
+) -> anyhow::Result<()> {
+    if base.is_empty() || base.len() > 256 || base.contains(['\0', '\n', '\r']) {
+        bail!("invalid ACP profile id");
+    }
+    let family_prefix = format!("{base}#");
     for (profile, _) in profiles {
-        if profile.is_empty() || profile.len() > 256 || profile.contains(['\0', '\n', '\r']) {
+        if profile.is_empty()
+            || profile.len() > 256
+            || profile.contains(['\0', '\n', '\r'])
+            || (profile != base && !profile.starts_with(&family_prefix))
+        {
             bail!("invalid ACP profile id");
         }
     }
@@ -399,7 +417,19 @@ fn upsert_profiles(paths: &RuntimePaths, profiles: &[(String, String)]) -> anyho
     } else {
         Vec::new()
     };
-    configs.retain(|config| !profiles.iter().any(|(profile, _)| config.id.0 == *profile));
+    if let Some(conflict) = configs.iter().find(|config| {
+        config.provider != "acp" && profiles.iter().any(|(profile, _)| config.id.0 == *profile)
+    }) {
+        bail!(
+            "ACP profile `{}` conflicts with an existing {} model",
+            conflict.id.0,
+            conflict.provider
+        );
+    }
+    configs.retain(|config| {
+        !(config.provider == "acp"
+            && (config.id.0 == base || config.id.0.starts_with(&family_prefix)))
+    });
     configs.extend(profiles.iter().map(|(profile, agent)| ModelConfig {
         id: ModelId(profile.clone()),
         provider: "acp".to_string(),
@@ -415,12 +445,22 @@ fn upsert_profiles(paths: &RuntimePaths, profiles: &[(String, String)]) -> anyho
 }
 
 fn write_models(path: &Path, configs: &[ModelConfig]) -> anyhow::Result<()> {
-    #[derive(serde::Serialize)]
-    struct ModelsToml<'a> {
-        #[serde(rename = "model")]
-        model: &'a [ModelConfig],
-    }
-    let bytes = toml::to_string_pretty(&ModelsToml { model: configs })?;
+    // `models.toml` is a shared configuration document: voice,
+    // transcription, embeddings, and retrieval live beside `[[model]]`.
+    // Replacing the whole file from a model-only struct silently erased those
+    // tables whenever an ACP client connected or disconnected.
+    let mut document = if path.exists() {
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        toml::from_str::<toml::Value>(&raw).with_context(|| format!("parse {}", path.display()))?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let table = document
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("models.toml root must be a table"))?;
+    table.insert("model".to_string(), toml::Value::try_from(configs)?);
+    let bytes = toml::to_string_pretty(&document)?;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("models path has no parent"))?;
@@ -473,10 +513,10 @@ fn agent_status(
 mod tests {
     use super::*;
 
-    /// The single-profile shorthand the tests below drive `upsert_profiles`
+    /// The single-profile shorthand the tests below drive `replace_profile_family`
     /// with (`connect` always writes a whole set at once).
     fn upsert_profile(paths: &RuntimePaths, profile: &str, agent: &str) -> anyhow::Result<()> {
-        upsert_profiles(paths, &[(profile.to_string(), agent.to_string())])
+        replace_profile_family(paths, profile, &[(profile.to_string(), agent.to_string())])
     }
 
     #[test]
@@ -515,7 +555,7 @@ mod tests {
                 agent_coordinate_with_model("demo-acp", "1.2.3", "agent-model-2"),
             ),
         ];
-        upsert_profiles(&paths, &profiles).expect("persist profiles");
+        replace_profile_family(&paths, &base, &profiles).expect("persist profiles");
 
         let configs = load_models(&paths.data_dir.join("models.toml")).expect("load");
         assert_eq!(configs.len(), 3);
@@ -547,20 +587,27 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
         upsert_profile(&paths, "acp/other", "other-acp@9.9.9").expect("unrelated profile");
-        upsert_profiles(
+        replace_profile_family(
             &paths,
+            "acp/demo",
             &[
                 ("acp/demo".to_string(), "demo-acp@1.0.0".to_string()),
                 (
                     "acp/demo#agent-model-1".to_string(),
                     "demo-acp@1.0.0#agent-model-1".to_string(),
                 ),
+                (
+                    "acp/demo#removed-model".to_string(),
+                    "demo-acp@1.0.0#removed-model".to_string(),
+                ),
             ],
         )
         .expect("first connect");
-        // A second connect at a newer version rewrites the same ids in place.
-        upsert_profiles(
+        // A second connect at a newer version replaces the entire family,
+        // including removing a model the agent stopped advertising.
+        replace_profile_family(
             &paths,
+            "acp/demo",
             &[
                 ("acp/demo".to_string(), "demo-acp@2.0.0".to_string()),
                 (
@@ -584,14 +631,21 @@ mod tests {
             configs.iter().any(|config| config.id.0 == "acp/other"),
             "an unrelated ACP profile must survive"
         );
+        assert!(
+            configs
+                .iter()
+                .all(|config| config.id.0 != "acp/demo#removed-model"),
+            "a stale discovered-model child must be removed"
+        );
     }
 
     #[test]
     fn an_invalid_profile_id_writes_nothing_at_all() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
-        let error = upsert_profiles(
+        let error = replace_profile_family(
             &paths,
+            "acp/demo",
             &[
                 ("acp/demo".to_string(), "demo-acp@1.0.0".to_string()),
                 ("bad\nid".to_string(), "demo-acp@1.0.0#x".to_string()),
@@ -603,6 +657,89 @@ mod tests {
             !paths.data_dir.join("models.toml").exists(),
             "a rejected set must leave no half-written file behind"
         );
+    }
+
+    #[test]
+    fn acp_updates_preserve_non_model_configuration_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).expect("data dir");
+        let path = paths.data_dir.join("models.toml");
+        std::fs::write(
+            &path,
+            r#"
+[voice]
+enabled = true
+
+[transcription]
+model = "whisper"
+
+[embedding]
+model = "nomic"
+
+[retrieval]
+mcp_top_k = 7
+
+[[model]]
+id = "local/existing"
+provider = "ollama"
+base_url = "http://localhost:11434/v1"
+model = "qwen"
+api_key_env = ""
+"#,
+        )
+        .expect("seed config");
+
+        upsert_profile(&paths, "acp/demo", "demo-acp@1.0.0").expect("connect");
+        let after_connect: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).expect("read after connect"))
+                .expect("parse after connect");
+        assert_eq!(after_connect["voice"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            after_connect["transcription"]["model"].as_str(),
+            Some("whisper")
+        );
+        assert_eq!(after_connect["embedding"]["model"].as_str(), Some("nomic"));
+        assert_eq!(
+            after_connect["retrieval"]["mcp_top_k"].as_integer(),
+            Some(7)
+        );
+
+        disconnect(&paths, "acp/demo").expect("disconnect");
+        let after_disconnect: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&path).expect("read after disconnect"))
+                .expect("parse after disconnect");
+        for table in ["voice", "transcription", "embedding", "retrieval"] {
+            assert_eq!(
+                after_disconnect.get(table),
+                after_connect.get(table),
+                "{table} must survive ACP disconnect"
+            );
+        }
+    }
+
+    #[test]
+    fn disconnecting_a_base_profile_removes_all_discovered_children() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        replace_profile_family(
+            &paths,
+            "acp/demo",
+            &[
+                ("acp/demo".to_string(), "demo@1".to_string()),
+                ("acp/demo#one".to_string(), "demo@1#one".to_string()),
+                ("acp/demo#two".to_string(), "demo@1#two".to_string()),
+            ],
+        )
+        .expect("connect family");
+        upsert_profile(&paths, "acp/other", "other@1").expect("other family");
+
+        disconnect(&paths, "acp/demo").expect("disconnect family");
+        let configs = load_models(&paths.data_dir.join("models.toml")).expect("load");
+        assert!(configs
+            .iter()
+            .all(|config| { config.id.0 != "acp/demo" && !config.id.0.starts_with("acp/demo#") }));
+        assert!(configs.iter().any(|config| config.id.0 == "acp/other"));
     }
 
     #[test]

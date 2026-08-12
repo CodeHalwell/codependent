@@ -369,6 +369,127 @@ async fn a_voice_note_is_uploaded_transcribed_and_becomes_the_runs_objective() {
 }
 
 #[tokio::test]
+async fn a_retried_voice_command_replays_without_retranscribing_or_relaunching() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (transcriber, seen) = fake(
+        TranscriptionMode::Local,
+        OffDevicePolicy::restrictive(),
+        "retry-safe transcript",
+    );
+    let (injected, handle) = executor(Some(transcriber));
+    let (paths, task) = start_server(&tmp, injected).await;
+
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+    handshake(&mut stream, client_id).await;
+    let session_id = open_session(&mut stream, client_id, ClientRole::Controller, "voice").await;
+    let stored = put_fixture(&mut stream, client_id, "put-once").await;
+    let body = CommandBody::SubmitUserInput {
+        session_id,
+        text: String::new(),
+        mode: AgentMode::Build,
+        model: None,
+        envelope: Some(voice_envelope(stored)),
+    };
+
+    let first = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(body.clone(), "voice-retry-key")),
+        ),
+    )
+    .await;
+    let second = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(body, "voice-retry-key")),
+        ),
+    )
+    .await;
+    let accepted = |payload: Payload| match payload {
+        Payload::CommandAccepted {
+            command_id,
+            created_run,
+            ..
+        } => (command_id, created_run),
+        other => panic!("expected CommandAccepted, got {other:?}"),
+    };
+    assert_eq!(accepted(first.payload), accepted(second.payload));
+    assert_eq!(seen.lock().expect("seen lock").len(), 1);
+    assert_eq!(handle.launches.lock().expect("launches lock").len(), 1);
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn retried_artifact_upload_returns_the_original_ref_and_command_id() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (injected, _handle) = executor(None);
+    let (paths, task) = start_server(&tmp, injected).await;
+
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+    handshake(&mut stream, client_id).await;
+    open_session(&mut stream, client_id, ClientRole::Controller, "voice").await;
+    let body = CommandBody::PutArtifact {
+        media_type: "audio/wav".to_string(),
+        bytes_base64: base64::engine::general_purpose::STANDARD.encode(fixture_wav()),
+        sensitivity: DEFAULT_MEDIA_CLASSIFICATION,
+    };
+    let first_request = command(body.clone(), "artifact-retry-key");
+    let first_command_id = first_request.command_id;
+    let first = send_recv(
+        &mut stream,
+        &Envelope::request(client_id, Payload::Command(first_request)),
+    )
+    .await;
+    let second = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(body, "artifact-retry-key")),
+        ),
+    )
+    .await;
+    let stored = |payload: Payload| match payload {
+        Payload::ArtifactStored {
+            command_id,
+            artifact,
+        } => (command_id, artifact),
+        other => panic!("expected ArtifactStored, got {other:?}"),
+    };
+    let first = stored(first.payload);
+    let second = stored(second.payload);
+    assert_eq!(first.0, first_command_id);
+    assert_eq!(first, second, "retry must replay the original occurrence");
+
+    let conflict = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::PutArtifact {
+                    media_type: "audio/wav".to_string(),
+                    bytes_base64: base64::engine::general_purpose::STANDARD
+                        .encode(b"different bytes"),
+                    sensitivity: DEFAULT_MEDIA_CLASSIFICATION,
+                },
+                "artifact-retry-key",
+            )),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        conflict.payload,
+        Payload::CommandRejected(ref error) if error.code == "artifact.idempotency-conflict"
+    ));
+
+    task.abort();
+}
+
+#[tokio::test]
 async fn a_transcription_appends_a_note_naming_the_duration_and_model() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (transcriber, _) = fake(

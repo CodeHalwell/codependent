@@ -77,6 +77,58 @@ const HEARTBEAT_MISS_LIMIT: u32 = 3;
 /// The catch-up cutover: a client at most this many events behind is replayed
 /// event-by-event; further behind, it receives a projection snapshot instead.
 const CATCHUP_EVENT_LIMIT: u64 = 500;
+const MAX_INTEGRATION_ISSUES: usize = 128;
+const MAX_INTEGRATION_ISSUE_CHARS: usize = 512;
+
+/// Live, process-scoped health for optional integrations assembled above the
+/// daemon crate. Reports are sanitized and de-duplicated before they can cross
+/// the status protocol; raw provider/server output and secrets stay in logs.
+#[derive(Clone, Default)]
+pub struct IntegrationHealth {
+    issues: Arc<std::sync::RwLock<Vec<String>>>,
+}
+
+impl IntegrationHealth {
+    /// Record one actionable integration issue. Terminal controls and bidi
+    /// overrides are discarded so a local config value cannot inject status UI.
+    pub fn report(&self, issue: impl AsRef<str>) {
+        let issue = sanitize_health_issue(issue.as_ref());
+        if issue.is_empty() {
+            return;
+        }
+        let mut issues = self
+            .issues
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if issues.len() < MAX_INTEGRATION_ISSUES && !issues.contains(&issue) {
+            issues.push(issue);
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<String> {
+        self.issues
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+fn sanitize_health_issue(issue: &str) -> String {
+    issue
+        .chars()
+        .filter(|character| {
+            !character.is_control()
+                && !matches!(
+                    *character as u32,
+                    0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069
+                )
+        })
+        .take(MAX_INTEGRATION_ISSUE_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
 type RemoteUiRunRow = (
     String,
     String,
@@ -97,6 +149,8 @@ pub struct ServerState {
     pub paths: RuntimePaths,
     pub instance: InstanceRecord,
     pub started_at: DateTime<Utc>,
+    /// Optional integration failures projected through `DaemonStatus`.
+    pub integration_health: IntegrationHealth,
     pub shutdown: watch::Sender<bool>,
     /// The crash-consistent command write path (persist-before-publish); shares
     /// its [`SubscriptionHub`] with `subscriptions` below.
@@ -106,6 +160,11 @@ pub struct ServerState {
     /// Content-addressed artifact store (`<data_dir>/artifacts`); held here so
     /// the session server owns it for later steps (tool output, chronicles).
     pub artifacts: ArtifactStore,
+    /// Serializes the lookup/transaction for connection-level artifact upload
+    /// idempotency. The database journal is the durable authority; this lock
+    /// prevents two live sockets from racing the same unique key before either
+    /// transaction commits.
+    pub artifact_uploads: Arc<Mutex<()>>,
     /// The per-user secret (32 bytes) that signs resume tokens.
     pub secret: Vec<u8>,
     /// Executes accepted runs. `None` in a lib-only / test embedding (the run
@@ -192,6 +251,12 @@ pub struct ServerState {
     /// (dependency inversion — see [`crate::transcription`]). The classification
     /// gate itself lives in the daemon, never in the implementation.
     pub transcriber: Option<Arc<dyn Transcriber>>,
+    /// Serializes the lookup → transcription → command-commit sequence for
+    /// voice submissions. The durable command lookup prevents normal retries
+    /// from re-transcribing; this lock also closes the concurrent-duplicate
+    /// window in which two sockets could both observe a missing key before
+    /// either committed it.
+    pub voice_resolution: Arc<Mutex<()>>,
     /// Serializes run admission against an idle-guarded shutdown
     /// (`Payload::ShutdownIfIdle`), closing the auto-restart TOCTOU window. Every
     /// write-path command apply is held under a `read()` guard; the idle-guarded
@@ -282,6 +347,27 @@ pub async fn run_with_executor_on(
     paths: RuntimePaths,
     instance: InstanceRecord,
     executor: Option<Arc<dyn RunExecutor>>,
+) -> anyhow::Result<()> {
+    run_with_executor_on_and_health(
+        listener,
+        pool,
+        paths,
+        instance,
+        executor,
+        IntegrationHealth::default(),
+    )
+    .await
+}
+
+/// Like [`run_with_executor_on`], with the assembly's live optional-integration
+/// health projection attached to daemon status responses.
+pub async fn run_with_executor_on_and_health(
+    listener: UnixListener,
+    pool: SqlitePool,
+    paths: RuntimePaths,
+    instance: InstanceRecord,
+    executor: Option<Arc<dyn RunExecutor>>,
+    integration_health: IntegrationHealth,
 ) -> anyhow::Result<()> {
     info!(socket = %paths.socket_path.display(), pid = std::process::id(), "daemon listening");
 
@@ -413,10 +499,12 @@ pub async fn run_with_executor_on(
         paths: paths.clone(),
         instance,
         started_at: Utc::now(),
+        integration_health,
         shutdown: shutdown_tx,
         commands,
         subscriptions,
         artifacts,
+        artifact_uploads: Arc::new(Mutex::new(())),
         secret,
         executor,
         documents,
@@ -434,6 +522,7 @@ pub async fn run_with_executor_on(
         workflows,
         workflow_reader,
         transcriber,
+        voice_resolution: Arc::new(Mutex::new(())),
         run_admission: Arc::new(tokio::sync::RwLock::new(())),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         scanned_repos: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -767,10 +856,13 @@ const MAX_PUT_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
 /// verbatim on the occurrence row — the store never guesses it from the bytes,
 /// and a later occurrence of the same bytes never inherits an earlier row's
 /// (lower) classification.
+#[allow(clippy::too_many_arguments)]
 async fn handle_put_artifact(
     state: &Arc<ServerState>,
     role: ClientRole,
+    client_id: ClientId,
     command_id: CommandId,
+    idempotency_key: &str,
     media_type: &str,
     bytes_base64: &str,
     sensitivity: DataClassification,
@@ -808,21 +900,46 @@ async fn handle_put_artifact(
             false,
         ));
     }
+    let request_hash = {
+        use sha2::{Digest as _, Sha256};
+        let encoded = match serde_json::to_vec(&(media_type, bytes_base64, sensitivity)) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                    "artifact.request-invalid",
+                    format!("could not canonicalize the artifact upload: {error}"),
+                    false,
+                ));
+            }
+        };
+        hex::encode(Sha256::digest(encoded))
+    };
+    let _upload_guard = state.artifact_uploads.lock().await;
     match state
         .artifacts
-        .put(
+        .put_user_upload_idempotent(
             &state.pool,
+            client_id,
+            command_id,
+            idempotency_key,
+            &request_hash,
             media_type,
             sensitivity,
-            crate::artifacts::Provenance::user_upload(),
             &bytes,
         )
         .await
     {
-        Ok(artifact) => Payload::ArtifactStored {
-            command_id,
-            artifact,
+        Ok(upload) => Payload::ArtifactStored {
+            command_id: upload.command_id,
+            artifact: upload.artifact,
         },
+        Err(crate::artifacts::ArtifactUploadError::Conflict) => {
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "artifact.idempotency-conflict",
+                "idempotency key was already used for a different artifact upload",
+                false,
+            ))
+        }
         Err(error) => Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
             "artifact.store-failed",
             format!("could not store the uploaded artifact: {error}"),
@@ -842,6 +959,18 @@ struct ResolvedVoiceInput {
     transcribed: Option<crate::transcription::TranscribedAudio>,
 }
 
+fn has_untranscribed_audio(command: &Command) -> bool {
+    matches!(
+        &command.body,
+        CommandBody::SubmitUserInput {
+            envelope: Some(envelope),
+            ..
+        } if envelope.blocks.iter().any(
+            |block| matches!(block, InputBlock::Audio(audio) if audio.transcript.is_none())
+        )
+    )
+}
+
 /// Resolve a `SubmitUserInput`'s [`InputEnvelope`](codypendent_protocol::InputEnvelope)
 /// into the text the run will actually execute (voice v1, rubric 8).
 ///
@@ -856,11 +985,6 @@ struct ResolvedVoiceInput {
 /// submission with no envelope — returns [`ResolvedVoiceInput::default`] and is
 /// applied byte-for-byte as the client sent it.
 ///
-/// A duplicate delivery of a voice submission re-transcribes before the write
-/// path's idempotency check replays the recorded outcome, so the second delivery
-/// pays a redundant transcription. That is deliberate: the alternative (peeking
-/// at the idempotency table from out here) would duplicate the write path's
-/// claim logic for a case that costs one wasted request on an already-rare retry.
 async fn resolve_voice_input(
     state: &Arc<ServerState>,
     command: &Command,
@@ -1550,6 +1674,18 @@ async fn handle_request(
                         document_id: *document_id,
                         target: target.clone(),
                         client_id: conn.client_id_or(request.client_id),
+                        // Prefer an explicitly framed attached session, otherwise
+                        // use the connection's sole/latest attachment. A one-shot
+                        // CLI that only bootstraps its role has no attachment and
+                        // intentionally falls back to the publisher's synthetic
+                        // session; an attached TUI gets the approval on its own
+                        // durable event stream.
+                        session_id: request
+                            .session_id
+                            .filter(|session_id| {
+                                conn.attached.iter().any(|(id, _)| id == session_id)
+                            })
+                            .or_else(|| conn.attached.last().map(|(id, _)| *id)),
                     };
                     let reply = match publisher.publish(publish).await {
                         Ok(parked) => Envelope::reply_to(
@@ -2205,7 +2341,9 @@ async fn handle_request(
                     let reply = handle_put_artifact(
                         state,
                         conn.role,
+                        conn.client_id_or(request.client_id),
                         command.command_id,
+                        &command.idempotency_key,
                         media_type,
                         bytes_base64,
                         *sensitivity,
@@ -2251,6 +2389,47 @@ async fn handle_request(
                     // silent audio — so transcription happens on this side of the
                     // write path and its refusals are ordinary `CommandRejected`s.
                     // Every non-voice command falls straight through untouched.
+                    // A voice retry must cross the durable idempotency boundary
+                    // BEFORE transcription. Hold the narrow lock through apply
+                    // so concurrent copies cannot both observe a missing key and
+                    // disclose/process the same audio twice.
+                    let _voice_guard = if has_untranscribed_audio(command) {
+                        Some(state.voice_resolution.lock().await)
+                    } else {
+                        None
+                    };
+                    if _voice_guard.is_some() {
+                        match state
+                            .commands
+                            .replay_existing(&state.pool, &command.idempotency_key)
+                            .await
+                        {
+                            Ok(Some(outcome)) => {
+                                let mut reply = Envelope::reply_to(
+                                    &request,
+                                    Payload::CommandAccepted {
+                                        command_id: outcome.command_id,
+                                        sequence: outcome.last_sequence,
+                                        created_run: outcome.created_run,
+                                    },
+                                );
+                                if let Some(created) = outcome.created_session {
+                                    reply.session_id = Some(created);
+                                }
+                                send(writer, &reply).await?;
+                                return Ok(false);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                send(
+                                    writer,
+                                    &Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                                )
+                                .await?;
+                                return Ok(false);
+                            }
+                        }
+                    }
                     let resolved = match resolve_voice_input(state, command).await {
                         Ok(resolved) => resolved,
                         Err(error) => {
@@ -4045,6 +4224,7 @@ async fn attach_remote_ui(
     let writer = Arc::clone(writer);
     let handle = tokio::spawn(forward_remote_ui(
         writer,
+        state.remote_ui.clone(),
         client_id,
         session_id,
         subscription.receiver,
@@ -4055,27 +4235,38 @@ async fn attach_remote_ui(
 
 async fn forward_remote_ui(
     writer: SharedWriter,
+    broker: RemoteUiBroker,
     client_id: ClientId,
     session_id: SessionId,
     mut receiver: broadcast::Receiver<UiBrokerFrame>,
 ) {
     loop {
-        let message = match receiver.recv().await {
+        let messages = match receiver.recv().await {
             Ok(frame) => match frame.target {
-                UiBrokerTarget::AllRenderers => frame.message,
-                UiBrokerTarget::Renderer(target) if target == client_id => frame.message,
+                UiBrokerTarget::AllRenderers => vec![frame.message],
+                UiBrokerTarget::Renderer(target) if target == client_id => vec![frame.message],
                 UiBrokerTarget::Renderer(_) | UiBrokerTarget::Producer(_) => continue,
             },
-            Err(broadcast::error::RecvError::Lagged(skipped)) => broker_error(format!(
-                "Remote UI fan-out dropped {skipped} messages; request a resync"
-            )),
+            // Recover with a complete, renderer-filtered baseline sent directly
+            // over the socket. A generic recoverable error has no document id,
+            // so clients cannot turn it into a per-document resync request.
+            Err(broadcast::error::RecvError::Lagged(skipped)) => match broker
+                .renderer_baseline(session_id, client_id)
+            {
+                Ok(baseline) => baseline,
+                Err(error) => vec![broker_error(format!(
+                    "Remote UI fan-out dropped {skipped} messages and baseline recovery failed: {error}"
+                ))],
+            },
             Err(broadcast::error::RecvError::Closed) => break,
         };
-        if send(&writer, &remote_ui_envelope(client_id, session_id, message))
-            .await
-            .is_err()
-        {
-            break;
+        for message in messages {
+            if send(&writer, &remote_ui_envelope(client_id, session_id, message))
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
     }
 }
@@ -4621,6 +4812,7 @@ async fn status(state: &ServerState) -> anyhow::Result<DaemonStatus> {
         // it is safe to restart this daemon without losing in-flight work.
         build_id: BUILD_ID.to_string(),
         active_run_count: u64::try_from(ledger::active_run_count(&state.pool).await?)?,
+        integration_issues: state.integration_health.snapshot(),
     })
 }
 
@@ -4757,8 +4949,30 @@ mod tests {
     use super::{
         admits_run, claim_ui_plugin_command, is_remote_ui_workflow_control,
         persist_ui_plugin_command_result, remote_ui_artifact_range, remote_ui_command, resume,
-        REMOTE_UI_ACTIONS,
+        IntegrationHealth, REMOTE_UI_ACTIONS,
     };
+
+    #[test]
+    fn integration_health_is_sanitized_and_deduplicated() {
+        let health = IntegrationHealth::default();
+        health.report("MCP failed\u{1b}[31m\u{202e}");
+        health.report("MCP failed[31m");
+        assert_eq!(health.snapshot(), vec!["MCP failed[31m"]);
+    }
+
+    #[test]
+    fn integration_health_is_bounded() {
+        let health = IntegrationHealth::default();
+        health.report("x".repeat(super::MAX_INTEGRATION_ISSUE_CHARS + 20));
+        assert_eq!(
+            health.snapshot()[0].chars().count(),
+            super::MAX_INTEGRATION_ISSUE_CHARS
+        );
+        for index in 0..(super::MAX_INTEGRATION_ISSUES + 20) {
+            health.report(format!("issue {index}"));
+        }
+        assert_eq!(health.snapshot().len(), super::MAX_INTEGRATION_ISSUES);
+    }
     use chrono::Utc;
     use codypendent_protocol::{
         AgentMode, ClientId, CommandBody, CommandId, Payload, RunId, SessionId,

@@ -287,6 +287,17 @@ fn render_status_text(status: &DaemonStatus) -> String {
     out.push_str(&format!("  socket       {}\n", status.socket_path));
     out.push_str(&format!("  sessions     {}\n", status.session_count));
     out.push_str(&format!("  active runs  {}\n", status.active_run_count));
+    if status.integration_issues.is_empty() {
+        out.push_str("  integrations  healthy\n");
+    } else {
+        out.push_str(&format!(
+            "  integrations  {} issue(s)\n",
+            status.integration_issues.len()
+        ));
+        for issue in &status.integration_issues {
+            out.push_str(&format!("    - {issue}\n"));
+        }
+    }
     out
 }
 
@@ -3469,6 +3480,7 @@ mod daemon_status_render_tests {
             session_count: 2,
             build_id: "0.1.0+a1b2c3d4e5f6".to_string(),
             active_run_count: 3,
+            integration_issues: Vec::new(),
         }
     }
 
@@ -3483,6 +3495,16 @@ mod daemon_status_render_tests {
         // The existing fields are still there — this is additive, not a rewrite.
         assert!(text.contains("version      0.1.0"));
         assert!(text.contains("sessions     2"));
+        assert!(text.contains("integrations  healthy"));
+    }
+
+    #[test]
+    fn render_status_text_lists_integration_issues() {
+        let mut status = sample_status();
+        status.integration_issues = vec!["MCP server `local` failed to start".to_string()];
+        let text = render_status_text(&status);
+        assert!(text.contains("integrations  1 issue(s)"));
+        assert!(text.contains("- MCP server `local` failed to start"));
     }
 }
 

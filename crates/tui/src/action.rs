@@ -8,8 +8,8 @@
 //! `Action`, and it performs no I/O.
 
 use codypendent_protocol::{
-    ApprovalScope, DocumentId, DocumentMutation, PendingApprovalProjection, RunId, SessionEvent,
-    UiActionBinding, UiDocumentId, UiNodeId, UiRevision, UiWireMessage,
+    ApprovalId, ApprovalScope, DocumentId, DocumentMutation, PendingApprovalProjection, RunId,
+    SessionEvent, UiActionBinding, UiDocumentId, UiNodeId, UiRevision, UiWireMessage,
 };
 
 use crate::remote_ui::RemoteKey;
@@ -52,6 +52,10 @@ pub enum Action {
     /// A transient status-line notice from the harness (e.g. a rejected
     /// command's code + message). Cleared automatically a few seconds later.
     Notice(String),
+    /// The daemon rejected the exact in-flight first-run command. The reducer
+    /// clears its admission guard and restores the submitted draft instead of
+    /// leaving the composer blank or silently reopening admission.
+    RunStartRejected { reason: String },
     /// Push-to-talk capture started (`true`) or stopped (`false`), reported by
     /// the CLI's voice host (voice v1, rubric 8). Purely presentational: it
     /// drives the status-line recording indicator so a hot microphone is always
@@ -90,6 +94,19 @@ pub enum Action {
     RemoteUiViewport { width: u16, height: u16 },
     /// Authoritative lifecycle rows returned by a host-owned plugin command.
     UiPluginsLoaded(Vec<codypendent_protocol::UiPluginLifecycleStatus>),
+    /// The daemon created a document. The reducer refreshes the Docs projection
+    /// so the new row lands in the tree instead of dropping this reply.
+    DocumentCreated { document_id: DocumentId },
+    /// A document publish plan is durably parked for approval. Unlike a notice,
+    /// this preserves every field the ordinary approval card needs, including
+    /// the originating document id correlated by the CLI command host.
+    DocumentPublishPrepared {
+        approval_id: ApprovalId,
+        document_id: DocumentId,
+        target: String,
+        changed_files: Vec<String>,
+        git_action: String,
+    },
     /// The CLI host successfully persisted the reviewed council draft.
     CouncilCreated {
         name: String,
@@ -140,6 +157,14 @@ pub enum Action {
     SelectPrev,
     /// Select the next item / scroll down in the focused pane (`Down`/`j`/wheel-down).
     SelectNext,
+    /// Move backward by a visible chunk in a picker (`PageUp`).
+    SelectPagePrev,
+    /// Move forward by a visible chunk in a picker (`PageDown`).
+    SelectPageNext,
+    /// Jump to the first picker result (`Home`).
+    SelectFirst,
+    /// Jump to the last picker result (`End`).
+    SelectLast,
     /// Scroll the transcript up a page (`PageUp`).
     ScrollPageUp,
     /// Scroll the transcript down a page (`PageDown`).

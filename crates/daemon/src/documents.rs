@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use codypendent_protocol::{
     ApprovalId, ClientId, CodypendentError, DocumentId, DocumentLeaseGrant, DocumentMutation,
-    DocumentSync, PublishTarget,
+    DocumentSync, PublishTarget, SessionId,
 };
 use tokio::sync::broadcast;
 
@@ -290,6 +290,11 @@ pub struct PublishDocumentRequest {
     /// The identity of the requesting client, for attribution (mirrors
     /// [`DocumentMutationRequest::client_id`]).
     pub client_id: ClientId,
+    /// The caller's attached session, when there is one. Parking against this
+    /// session makes the ordinary `ApprovalRequested` event reachable by the
+    /// same live client. Headless one-shot callers may leave it `None`; the
+    /// publisher then retains its synthetic bookkeeping-session fallback.
+    pub session_id: Option<SessionId>,
 }
 
 /// What a `PublishDocument` command parks for approval: everything a client

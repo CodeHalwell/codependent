@@ -152,7 +152,7 @@ impl Theme {
                 keyword: Color::Rgb(0xc6, 0x92, 0xff),
                 literal: Color::Rgb(0xe6, 0xb4, 0x50),
                 string: Color::Rgb(0x9c, 0xd6, 0x7a),
-                comment: Color::Rgb(0x6b, 0x74, 0x84),
+                comment: Color::Rgb(0x85, 0x8d, 0x9d),
                 r#type: Color::Rgb(0x5c, 0xc2, 0xc0),
                 function: Color::Rgb(0x6c, 0xb0, 0xf0),
                 operator: Color::Rgb(0xc3, 0xca, 0xd6),
@@ -211,7 +211,7 @@ impl Theme {
                 keyword: Color::Rgb(0x7a, 0x30, 0xc0),
                 literal: Color::Rgb(0x9a, 0x6b, 0x00),
                 string: Color::Rgb(0x1a, 0x7f, 0x4b),
-                comment: Color::Rgb(0x8a, 0x92, 0xa1),
+                comment: Color::Rgb(0x62, 0x6b, 0x78),
                 r#type: Color::Rgb(0x0a, 0x7a, 0x78),
                 function: Color::Rgb(0x08, 0x4a, 0xc0),
                 operator: Color::Rgb(0x4a, 0x52, 0x5e),
@@ -393,7 +393,7 @@ impl Theme {
                 keyword: Color::Indexed(141),
                 literal: Color::Indexed(179),
                 string: Color::Indexed(114),
-                comment: Color::Indexed(242),
+                comment: Color::Indexed(248),
                 r#type: Color::Indexed(80),
                 function: Color::Indexed(75),
                 operator: Color::Indexed(249),
@@ -472,7 +472,7 @@ impl Theme {
                 thinking: Color::Gray,
             },
             focus: FocusTokens {
-                active: Color::LightBlue,
+                active: Color::LightCyan,
                 inactive: Color::DarkGray,
             },
             selection: SelectionTokens {
@@ -829,6 +829,28 @@ mod tests {
                 theme.selection_aware_text_style(true, theme.text.muted).fg,
                 Some(theme.selection.foreground),
                 "{variant:?}: selected child spans must override their normal token"
+            );
+        }
+    }
+
+    #[test]
+    fn comments_and_focus_indicators_are_legible_in_every_builtin_theme() {
+        for variant in [
+            ThemeVariant::Dark,
+            ThemeVariant::Light,
+            ThemeVariant::HighContrast,
+            ThemeVariant::ColorBlindSafe,
+            ThemeVariant::Ansi256,
+            ThemeVariant::Ansi16,
+            ThemeVariant::Monochrome,
+        ] {
+            let theme = Theme::variant(variant);
+            let comment = contrast_ratio(theme.syntax.comment, theme.surface.panel);
+            assert!(comment >= 4.5, "{variant:?}: comment contrast {comment:.2}");
+            let focus = contrast_ratio(theme.focus.active, theme.surface.background);
+            assert!(
+                focus >= 3.0,
+                "{variant:?}: focus indicator contrast {focus:.2}"
             );
         }
     }

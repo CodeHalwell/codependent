@@ -388,11 +388,13 @@ mod tests {
             session_count: 2,
             build_id: "0.1.0+a1b2c3d4e5f6".to_string(),
             active_run_count: 3,
+            integration_issues: vec!["MCP server `local` failed to start".to_string()],
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let parsed: DaemonStatus = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.build_id, original.build_id);
         assert_eq!(parsed.active_run_count, original.active_run_count);
+        assert_eq!(parsed.integration_issues, original.integration_issues);
     }
 
     #[test]
@@ -414,6 +416,7 @@ mod tests {
         let parsed: DaemonStatus = serde_json::from_value(legacy).expect("legacy status parses");
         assert_eq!(parsed.build_id, "");
         assert_eq!(parsed.active_run_count, 0);
+        assert!(parsed.integration_issues.is_empty());
     }
 
     #[test]
@@ -886,6 +889,11 @@ pub struct DaemonStatus {
     /// daemons predating this field.
     #[serde(default)]
     pub active_run_count: u64,
+    /// Sanitized, de-duplicated optional-integration failures observed by the
+    /// running daemon. Defaulted so older daemon/client pairs remain wire
+    /// compatible. Secrets and raw extension output must never enter this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integration_issues: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

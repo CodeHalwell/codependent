@@ -544,7 +544,12 @@ impl<E: NodeExecutor + 'static> WorkflowLifecycle for WorkflowConductorHost<E> {
             host.conductor
                 .pause(&host.pool, &request.workflow_run_id)
                 .await
-                .map_err(conductor_error_to_protocol)
+                .map_err(conductor_error_to_protocol)?;
+            // The durable flip is complete before this full-state event is
+            // published. Do not wait for an in-flight node to drain before the
+            // controller can render Resume instead of Pause.
+            host.publish_run_phase(&request.workflow_run_id, WorkflowRunState::Paused);
+            Ok(())
         })
     }
 
@@ -559,6 +564,10 @@ impl<E: NodeExecutor + 'static> WorkflowLifecycle for WorkflowConductorHost<E> {
                 .prepare_resume(&host.pool, &request.workflow_run_id)
                 .await
                 .map_err(conductor_error_to_protocol)?;
+            // `prepare_resume` has already persisted Running. Publish that prompt
+            // phase synchronously; the background drive also announces Running,
+            // but the duplicate is an idempotent full-state update.
+            host.publish_run_phase(&request.workflow_run_id, WorkflowRunState::Running);
             host.spawn_drive(request.workflow_run_id.clone());
             Ok(())
         })
@@ -1193,6 +1202,49 @@ steps:
             .await
             .expect_err("cannot resume a completed run");
         assert_eq!(resume_err.code, "workflow.illegal-transition");
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_publish_the_persisted_prompt_phase_immediately() {
+        let (_tmp, pool) = temp_pool().await;
+        let hub = WorkflowHub::new();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let executor = Arc::new(GatedExecutor::new("inspect", gate.clone()));
+        let host = WorkflowConductorHost::new(pool.clone(), executor)
+            .with_streaming(hub.clone(), WorkflowRunCancellations::default());
+        let run_id = host.start(start_request("cmd-prompt-phase")).await.unwrap();
+        wait_for_node_state(&pool, &run_id, "inspect", NodeState::Running).await;
+        let mut live = hub.subscribe(run_id.clone());
+
+        host.pause(PauseWorkflowRequest {
+            workflow_run_id: run_id.clone(),
+            client_id: ClientId::new(),
+        })
+        .await
+        .expect("pause accepted");
+        assert!(matches!(
+            live.recv().await.expect("paused phase delivered"),
+            WorkflowEvent::RunPhaseChanged {
+                phase: WorkflowRunPhase::Paused,
+                ..
+            }
+        ));
+
+        host.resume(ResumeWorkflowRequest {
+            workflow_run_id: run_id.clone(),
+            client_id: ClientId::new(),
+        })
+        .await
+        .expect("resume accepted");
+        assert!(matches!(
+            live.recv().await.expect("running phase delivered"),
+            WorkflowEvent::RunPhaseChanged {
+                phase: WorkflowRunPhase::Running,
+                ..
+            }
+        ));
+
+        gate.notify_one();
     }
 
     #[tokio::test]

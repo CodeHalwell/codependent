@@ -300,6 +300,22 @@ impl RemoteUiBroker {
         })
     }
 
+    /// Return a point-in-time authoritative baseline for an attached renderer.
+    /// This is also the broadcast-lag recovery path: the socket forwarder sends
+    /// these messages directly, outside the lossy fan-out, so a slow renderer
+    /// converges without having to guess which document lost a patch.
+    pub fn renderer_baseline(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+    ) -> Result<Vec<UiWireMessage>, UiBrokerError> {
+        let sessions = self.sessions.lock().expect("remote UI broker poisoned");
+        let session = sessions
+            .get(&session_id)
+            .ok_or(UiBrokerError::RendererNotAttached)?;
+        renderer_baseline_messages(session, client_id)
+    }
+
     /// Register a component producer only after the sandbox layer constructed a
     /// verified UiWorkerLaunch. Socket roles cannot mint this handle.
     pub fn register_verified_producer(
@@ -1899,6 +1915,27 @@ fn append_renderer_baseline(
     renderer_id: ClientId,
     direct: &mut Vec<UiWireMessage>,
 ) -> Result<(), UiBrokerError> {
+    let baseline = renderer_baseline_messages(session, renderer_id)?;
+    let renderer = session
+        .renderers
+        .get_mut(&renderer_id)
+        .ok_or(UiBrokerError::RendererNotAttached)?;
+    let mut next_host = renderer.host.clone();
+    for message in &baseline {
+        let message = renderer_message(message);
+        let _ = next_host
+            .handle(message, RegistrationTrust::Extension)
+            .map_err(host_error)?;
+    }
+    renderer.host = next_host;
+    direct.extend(baseline);
+    Ok(())
+}
+
+fn renderer_baseline_messages(
+    session: &SessionBroker,
+    renderer_id: ClientId,
+) -> Result<Vec<UiWireMessage>, UiBrokerError> {
     let client_kind = session
         .renderers
         .get(&renderer_id)
@@ -1944,21 +1981,8 @@ fn append_renderer_baseline(
         .collect();
     contributions.sort_by(|left, right| left.message_id.cmp(&right.message_id));
     coalesced.extend(contributions);
-    let renderer = session
-        .renderers
-        .get_mut(&renderer_id)
-        .ok_or(UiBrokerError::RendererNotAttached)?;
-    let mut next_host = renderer.host.clone();
-    for message in coalesced.iter().chain(snapshots.iter()) {
-        let message = renderer_message(message);
-        let _ = next_host
-            .handle(message, RegistrationTrust::Extension)
-            .map_err(host_error)?;
-    }
-    renderer.host = next_host;
-    direct.extend(coalesced);
-    direct.extend(snapshots);
-    Ok(())
+    coalesced.extend(snapshots);
+    Ok(coalesced)
 }
 
 fn apply_to_renderers(
@@ -3000,6 +3024,72 @@ mod tests {
             ),
             Err(UiBrokerError::RendererDirection { kind, .. }) if kind == "capabilities-collision"
         ));
+    }
+
+    #[test]
+    fn renderer_baseline_replays_coalesced_state_and_visible_snapshots() {
+        let broker = RemoteUiBroker::default();
+        let session_id = SessionId::new();
+        let client_id = ClientId::new();
+        broker
+            .subscribe_renderer(session_id, client_id)
+            .expect("subscribe renderer");
+
+        let owner = Uuid::now_v7();
+        let document_id = UiDocumentId::from("latest-document");
+        let document = codypendent_protocol::UiDocument {
+            protocol_version: UiProtocolVersion::V1,
+            document_id: document_id.clone(),
+            revision: codypendent_protocol::UiRevision(9),
+            root: codypendent_protocol::UiNode::element("root", "Stack"),
+            capabilities: None,
+            metadata: BTreeMap::new(),
+            compatibility: None,
+        };
+        let contribution = ui_message("contributions", "latest-contribution", |wire| {
+            wire.contributions = vec![codypendent_protocol::UiContributionRegistration {
+                id: codypendent_protocol::UiContributionId::from("latest"),
+                extension_id: codypendent_protocol::UiExtensionId::from("ui-producer:test"),
+                point: UiContributionPoint::from("panel"),
+                slot: UiSlotId::from("panel"),
+                document_id: document_id.clone(),
+                priority: 0,
+                when: None,
+                requires: Vec::new(),
+                metadata: BTreeMap::new(),
+            }];
+        });
+        {
+            let mut sessions = broker.sessions.lock().expect("broker lock");
+            let session = sessions.get_mut(&session_id).expect("session");
+            session
+                .renderers
+                .get_mut(&client_id)
+                .expect("renderer")
+                .client_kind = Some("terminal".to_owned());
+            session.documents.mount(document).expect("mount document");
+            session.document_owners.insert(document_id.clone(), owner);
+            session
+                .document_targets
+                .insert(document_id, "terminal".to_owned());
+            session
+                .latest_contributions
+                .insert((owner, "terminal".to_owned()), contribution);
+        }
+
+        let baseline = broker
+            .renderer_baseline(session_id, client_id)
+            .expect("authoritative baseline");
+        assert_eq!(
+            baseline
+                .iter()
+                .map(|message| message.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["theme", "contributions", "snapshot"]
+        );
+        let snapshot = baseline[2].snapshot.as_ref().expect("snapshot payload");
+        assert_eq!(snapshot.document.revision.0, 9);
+        assert_eq!(snapshot.reason.as_deref(), Some("reconnect"));
     }
 
     #[test]

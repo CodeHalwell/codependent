@@ -51,7 +51,7 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "PgUp / PgDn",
-        description: "scroll the conversation",
+        description: "page the focused pane (or scroll the conversation)",
         mouse: Some("wheel"),
     },
     KeyBinding {
@@ -86,7 +86,7 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         keys: "↑ / ↓",
-        description: "move selection in a browser or the palette",
+        description: "move selection in a browser, palette, or workspace side pane",
         mouse: Some("wheel"),
     },
     KeyBinding {
@@ -123,6 +123,11 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         keys: "Alt-Enter",
         description: "expand / collapse the browsed fold, else insert a line break",
         mouse: Some("click a fold line"),
+    },
+    KeyBinding {
+        keys: "F4 (default)",
+        description: "push to talk; press again to stop and send the voice note",
+        mouse: None,
     },
     KeyBinding {
         keys: "Delete",
@@ -336,6 +341,10 @@ fn map_editing_key(key: &KeyEvent) -> Action {
         KeyCode::Enter => Action::InputSubmit,
         KeyCode::Esc => Action::InputCancel,
         KeyCode::Backspace => Action::InputBackspace,
+        // In a multi-step text wizard, Tab is an ergonomic synonym for the
+        // visible Continue action. Other editing prompts ignore this reducer
+        // action, so their behavior is unchanged.
+        KeyCode::Tab => Action::BeginAddModel,
         KeyCode::Char('c') if ctrl(key) => Action::InputCancel,
         KeyCode::Char(c) if !ctrl(key) => Action::InputChar(c),
         _ => Action::NoOp,
@@ -353,6 +362,10 @@ fn map_palette_key(key: &KeyEvent) -> Action {
         KeyCode::Backspace => Action::InputBackspace,
         KeyCode::Up => Action::SelectPrev,
         KeyCode::Down => Action::SelectNext,
+        KeyCode::PageUp => Action::SelectPagePrev,
+        KeyCode::PageDown => Action::SelectPageNext,
+        KeyCode::Home => Action::SelectFirst,
+        KeyCode::End => Action::SelectLast,
         KeyCode::Delete => Action::RemoveApiKey,
         KeyCode::Char('c') if ctrl(key) => Action::InputCancel,
         // Ctrl-chords stay out of the query buffer: `Ctrl-T` tests the focused
@@ -429,6 +442,8 @@ fn map_approval_key(key: &KeyEvent) -> Action {
         KeyCode::Char('r') => Action::Reject,
         KeyCode::Up => Action::SelectPrev,
         KeyCode::Down => Action::SelectNext,
+        KeyCode::PageUp => Action::SelectPagePrev,
+        KeyCode::PageDown => Action::SelectPageNext,
         KeyCode::F(2) => Action::ToggleLayout,
         _ => Action::NoOp,
     }
@@ -651,6 +666,22 @@ mod tests {
             map_event(&key(KeyCode::Esc), InputMode::Palette, W, &[]),
             Action::InputCancel
         );
+        assert_eq!(
+            map_event(&key(KeyCode::PageDown), InputMode::Palette, W, &[]),
+            Action::SelectPageNext
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::PageUp), InputMode::Palette, W, &[]),
+            Action::SelectPagePrev
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Home), InputMode::Palette, W, &[]),
+            Action::SelectFirst
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::End), InputMode::Palette, W, &[]),
+            Action::SelectLast
+        );
     }
 
     #[test]
@@ -679,6 +710,10 @@ mod tests {
         assert_eq!(
             map_event(&key(KeyCode::Backspace), InputMode::Editing, W, &[]),
             Action::InputBackspace
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::Tab), InputMode::Editing, W, &[]),
+            Action::BeginAddModel
         );
         assert_eq!(
             map_event(
@@ -935,6 +970,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workspace_side_focus_selects_the_navigation_keymap() {
+        let mut state = crate::state::AppState::new();
+        state.layout = crate::state::LayoutMode::Workspace;
+
+        for pane in [Pane::Sessions, Pane::Approvals] {
+            state.focus = pane;
+            let mode = state.input_mode();
+            assert_eq!(mode, InputMode::Normal, "{pane:?} must own keyboard input");
+            assert_eq!(
+                map_event(&key(KeyCode::Up), mode, W, &[]),
+                Action::SelectPrev
+            );
+            assert_eq!(
+                map_event(&key(KeyCode::Down), mode, W, &[]),
+                Action::SelectNext
+            );
+            assert_eq!(
+                map_event(&key(KeyCode::PageDown), mode, W, &[]),
+                Action::ScrollPageDown
+            );
+        }
+
+        state.focus = Pane::Transcript;
+        assert_eq!(state.input_mode(), InputMode::Composer);
+        assert_eq!(
+            map_event(&key(KeyCode::Up), state.input_mode(), W, &[]),
+            Action::HistoryPrev,
+            "the center pane keeps composer history/editing semantics"
+        );
+
+        state.layout = crate::state::LayoutMode::Chat;
+        state.focus = Pane::Sessions;
+        assert_eq!(
+            state.input_mode(),
+            InputMode::Composer,
+            "Chat ignores a retained workspace side focus"
+        );
+    }
+
     /// Every binding advertising a mouse gesture must name keys that the
     /// mapper actually produces somewhere — the help overlay renders this
     /// table verbatim, so a stale row is a lie to the user (RULE 3).
@@ -990,6 +1065,10 @@ mod tests {
         assert_eq!(
             map_event(&key(KeyCode::Up), InputMode::Approval, W, &[]),
             Action::SelectPrev
+        );
+        assert_eq!(
+            map_event(&key(KeyCode::PageDown), InputMode::Approval, W, &[]),
+            Action::SelectPageNext
         );
     }
 

@@ -16,9 +16,12 @@
 //! (RULE 2).
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
-use codypendent_protocol::{ArtifactId, ArtifactRef, DataClassification, RunId};
+use codypendent_protocol::{
+    ArtifactId, ArtifactRef, ClientId, CommandId, DataClassification, RunId,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
@@ -103,6 +106,23 @@ pub struct ArtifactStore {
     root: PathBuf,
 }
 
+/// The stable result of one idempotent client upload. A retry may carry a new
+/// transport message and even a newly generated command id; the reply still
+/// uses the command id/result recorded by the first accepted occurrence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotentArtifactUpload {
+    pub command_id: CommandId,
+    pub artifact: ArtifactRef,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ArtifactUploadError {
+    #[error("idempotency key was already used by a different client or artifact upload")]
+    Conflict,
+    #[error(transparent)]
+    Store(#[from] anyhow::Error),
+}
+
 impl ArtifactStore {
     /// Create a store rooted at `root` (`<data_dir>/artifacts`). The `sha256/`
     /// and `tmp/` subdirectories are created lazily on the first [`put`].
@@ -137,35 +157,7 @@ impl ArtifactStore {
         provenance: Provenance,
         bytes: &[u8],
     ) -> anyhow::Result<ArtifactRef> {
-        // `bytes` is already fully in memory, so hash it directly — no disk write
-        // is needed to learn the content address. A dedup hit therefore touches
-        // no temp file at all.
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        let sha256 = hex::encode(hasher.finalize());
-
-        let blob_path = self.blob_path(&sha256);
-        if !tokio::fs::try_exists(&blob_path).await? {
-            // New blob: stage it in tmp/ with a single write + fsync, then
-            // atomically rename into place. A crash leaves only tmp/ garbage.
-            let tmp_dir = self.tmp_dir();
-            tokio::fs::create_dir_all(&tmp_dir).await?;
-            let tmp_path = tmp_dir.join(Uuid::now_v7().to_string());
-            {
-                let mut file = tokio::fs::File::create(&tmp_path).await?;
-                file.write_all(bytes).await?;
-                file.flush().await?;
-                // Durability of the blob's bytes before we publish it by rename.
-                file.sync_all().await?;
-            }
-            if let Some(parent) = blob_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            // Atomic publish. A concurrent put of the same new bytes may have
-            // won the race; renaming over it replaces the file with identical
-            // content, which is harmless.
-            tokio::fs::rename(&tmp_path, &blob_path).await?;
-        }
+        let sha256 = self.store_blob(bytes).await?;
 
         // Per-occurrence metadata row: its own id, this classification and
         // provenance — never inherited from an earlier occurrence.
@@ -194,6 +186,113 @@ impl ArtifactStore {
             sha256,
             sensitivity: classification,
         })
+    }
+
+    /// Store a controller upload exactly once for `idempotency_key`.
+    ///
+    /// The blob publish may precede the SQL transaction (an unreferenced
+    /// content-addressed blob is harmless and sweepable), but the artifact
+    /// occurrence row and replay journal commit atomically. The server
+    /// serializes this method's lookup/insert sequence, while the unique key is
+    /// the durable cross-restart authority.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_user_upload_idempotent(
+        &self,
+        pool: &SqlitePool,
+        client_id: ClientId,
+        command_id: CommandId,
+        idempotency_key: &str,
+        request_hash: &str,
+        media_type: &str,
+        classification: DataClassification,
+        bytes: &[u8],
+    ) -> Result<IdempotentArtifactUpload, ArtifactUploadError> {
+        if let Some(existing) = lookup_upload(pool, idempotency_key)
+            .await
+            .map_err(ArtifactUploadError::Store)?
+        {
+            if existing.client_id != client_id.to_string() || existing.request_hash != request_hash
+            {
+                return Err(ArtifactUploadError::Conflict);
+            }
+            return existing.into_result().map_err(ArtifactUploadError::Store);
+        }
+
+        let sha256 = self
+            .store_blob(bytes)
+            .await
+            .map_err(ArtifactUploadError::Store)?;
+        let artifact_id = ArtifactId::new();
+        let byte_length = u64::try_from(bytes.len()).map_err(anyhow::Error::from)?;
+        let created_at = Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await.map_err(anyhow::Error::from)?;
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (id, sha256, media_type, byte_length, classification, created_at, provenance_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(artifact_id.to_string())
+        .bind(&sha256)
+        .bind(media_type)
+        .bind(i64::try_from(byte_length).map_err(anyhow::Error::from)?)
+        .bind(classification_to_str(classification))
+        .bind(&created_at)
+        .bind(serde_json::to_string(&Provenance::user_upload()).map_err(anyhow::Error::from)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
+        sqlx::query(
+            "INSERT INTO artifact_upload_commands \
+             (idempotency_key, client_id, command_id, request_hash, artifact_id, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(idempotency_key)
+        .bind(client_id.to_string())
+        .bind(command_id.to_string())
+        .bind(request_hash)
+        .bind(artifact_id.to_string())
+        .bind(&created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
+        tx.commit().await.map_err(anyhow::Error::from)?;
+
+        Ok(IdempotentArtifactUpload {
+            command_id,
+            artifact: ArtifactRef {
+                id: artifact_id,
+                media_type: media_type.to_string(),
+                byte_length,
+                sha256,
+                sensitivity: classification,
+            },
+        })
+    }
+
+    async fn store_blob(&self, bytes: &[u8]) -> anyhow::Result<String> {
+        // `bytes` is already fully in memory, so hash it directly — no disk
+        // write is needed to learn the content address. A dedup hit therefore
+        // touches no temp file at all.
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let sha256 = hex::encode(hasher.finalize());
+        let blob_path = self.blob_path(&sha256);
+        if !tokio::fs::try_exists(&blob_path).await? {
+            let tmp_dir = self.tmp_dir();
+            tokio::fs::create_dir_all(&tmp_dir).await?;
+            let tmp_path = tmp_dir.join(Uuid::now_v7().to_string());
+            {
+                let mut file = tokio::fs::File::create(&tmp_path).await?;
+                file.write_all(bytes).await?;
+                file.flush().await?;
+                file.sync_all().await?;
+            }
+            if let Some(parent) = blob_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::rename(&tmp_path, &blob_path).await?;
+        }
+        Ok(sha256)
     }
 
     /// Open the blob backing the artifact row `id` for reading.
@@ -272,6 +371,69 @@ impl ArtifactStore {
     }
 }
 
+struct StoredUpload {
+    client_id: String,
+    command_id: String,
+    request_hash: String,
+    artifact_id: String,
+    sha256: String,
+    media_type: String,
+    byte_length: i64,
+    classification: String,
+}
+
+impl StoredUpload {
+    fn into_result(self) -> anyhow::Result<IdempotentArtifactUpload> {
+        Ok(IdempotentArtifactUpload {
+            command_id: CommandId::from_str(&self.command_id)?,
+            artifact: ArtifactRef {
+                id: ArtifactId::from_str(&self.artifact_id)?,
+                media_type: self.media_type,
+                byte_length: u64::try_from(self.byte_length)?,
+                sha256: self.sha256,
+                sensitivity: classification_from_str(&self.classification),
+            },
+        })
+    }
+}
+
+async fn lookup_upload(
+    pool: &SqlitePool,
+    idempotency_key: &str,
+) -> anyhow::Result<Option<StoredUpload>> {
+    type Row = (String, String, String, String, String, String, i64, String);
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT u.client_id, u.command_id, u.request_hash, a.id, a.sha256, \
+                a.media_type, a.byte_length, a.classification \
+         FROM artifact_upload_commands u JOIN artifacts a ON a.id = u.artifact_id \
+         WHERE u.idempotency_key = ?",
+    )
+    .bind(idempotency_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(
+            client_id,
+            command_id,
+            request_hash,
+            artifact_id,
+            sha256,
+            media_type,
+            byte_length,
+            classification,
+        )| StoredUpload {
+            client_id,
+            command_id,
+            request_hash,
+            artifact_id,
+            sha256,
+            media_type,
+            byte_length,
+            classification,
+        },
+    ))
+}
+
 /// The lowercase-hex SHA-256 of a file's contents, hashed by streaming so large
 /// blobs are never held in memory whole.
 async fn hash_file(path: &Path) -> anyhow::Result<String> {
@@ -299,6 +461,16 @@ fn classification_to_str(classification: DataClassification) -> &'static str {
         DataClassification::Confidential => "Confidential",
         DataClassification::Secret => "Secret",
         _ => "Unknown",
+    }
+}
+
+fn classification_from_str(classification: &str) -> DataClassification {
+    match classification {
+        "Public" => DataClassification::Public,
+        "Internal" => DataClassification::Internal,
+        "Confidential" => DataClassification::Confidential,
+        "Secret" => DataClassification::Secret,
+        _ => DataClassification::Unknown,
     }
 }
 
@@ -352,6 +524,101 @@ mod tests {
         let mut read_back = Vec::new();
         file.read_to_end(&mut read_back).await.unwrap();
         assert_eq!(read_back, bytes);
+    }
+
+    #[tokio::test]
+    async fn user_upload_retry_replays_the_original_occurrence() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+        let client = ClientId::new();
+        let command = CommandId::new();
+
+        let first = store
+            .put_user_upload_idempotent(
+                &pool,
+                client,
+                command,
+                "voice-upload-1",
+                "request-hash",
+                "audio/wav",
+                DataClassification::Confidential,
+                b"RIFF idempotent voice",
+            )
+            .await
+            .unwrap();
+        let replay = store
+            .put_user_upload_idempotent(
+                &pool,
+                client,
+                CommandId::new(),
+                "voice-upload-1",
+                "request-hash",
+                "audio/wav",
+                DataClassification::Confidential,
+                b"RIFF idempotent voice",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(replay, first);
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM artifacts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn user_upload_retry_rejects_a_different_client_or_request() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+        let client = ClientId::new();
+        store
+            .put_user_upload_idempotent(
+                &pool,
+                client,
+                CommandId::new(),
+                "voice-upload-2",
+                "request-hash",
+                "audio/wav",
+                DataClassification::Confidential,
+                b"RIFF",
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .put_user_upload_idempotent(
+                    &pool,
+                    ClientId::new(),
+                    CommandId::new(),
+                    "voice-upload-2",
+                    "request-hash",
+                    "audio/wav",
+                    DataClassification::Confidential,
+                    b"RIFF",
+                )
+                .await,
+            Err(ArtifactUploadError::Conflict)
+        ));
+        assert!(matches!(
+            store
+                .put_user_upload_idempotent(
+                    &pool,
+                    client,
+                    CommandId::new(),
+                    "voice-upload-2",
+                    "different-request",
+                    "audio/wav",
+                    DataClassification::Confidential,
+                    b"different",
+                )
+                .await,
+            Err(ArtifactUploadError::Conflict)
+        ));
     }
 
     #[tokio::test]

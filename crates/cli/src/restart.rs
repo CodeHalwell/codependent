@@ -679,6 +679,7 @@ mod reconcile_interactive_tests {
             session_count: 0,
             build_id: build_id.to_string(),
             active_run_count,
+            integration_issues: Vec::new(),
         }
     }
 

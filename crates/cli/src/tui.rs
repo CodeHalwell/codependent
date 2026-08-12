@@ -249,7 +249,7 @@ pub async fn run(
     }
 
     if accessible {
-        return run_accessible(paths, repo).await;
+        return run_accessible(paths, repo, theme_override).await;
     }
 
     // STEP 6.6 wiring: terminal color-depth detection (NO_COLOR/COLORTERM/TERM)
@@ -309,7 +309,8 @@ pub async fn run(
                 .themes
                 .iter()
                 .position(|choice| choice.id.eq_ignore_ascii_case(id))
-        });
+        })
+        .or_else(|| state.themes.iter().position(|choice| choice.theme == theme));
 
     // Drive boot and the splash concurrently: poll the pinned boot future to
     // completion while redrawing the splash on each tick. Once boot is ready,
@@ -422,7 +423,11 @@ pub async fn run(
 /// Run the full client over ordinary cooked stdin/stdout. Unlike the Ratatui
 /// path this never constructs [`TerminalGuard`], so it cannot emit alternate
 /// screen, raw-mode, mouse-capture, or bracketed-paste control sequences.
-async fn run_accessible(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<()> {
+async fn run_accessible(
+    paths: &RuntimePaths,
+    repo: PathBuf,
+    theme_override: Option<String>,
+) -> anyhow::Result<()> {
     let mut stdout = io::stdout();
     writeln!(stdout, "Codypendent accessible mode")?;
     writeln!(stdout, "Starting daemon and restoring the session.")?;
@@ -430,6 +435,36 @@ async fn run_accessible(paths: &RuntimePaths, repo: PathBuf) -> anyhow::Result<(
 
     let mut state = AppState::new();
     let mut store = SessionStore::load(paths);
+    let resolved_theme = crate::theme_select::resolve_theme(
+        paths,
+        theme_override.as_deref(),
+        store.theme.as_deref(),
+    )?;
+    state.themes.extend(
+        crate::theme_select::discover_theme_packs(paths)
+            .into_iter()
+            .map(|(id, theme)| codypendent_tui::ThemeChoice {
+                id,
+                summary: "installed theme pack".to_owned(),
+                theme,
+                pack: true,
+            }),
+    );
+    state.theme_selected = theme_override
+        .as_deref()
+        .or(store.theme.as_deref())
+        .and_then(|id| {
+            state
+                .themes
+                .iter()
+                .position(|choice| choice.id.eq_ignore_ascii_case(id))
+        })
+        .or_else(|| {
+            state
+                .themes
+                .iter()
+                .position(|choice| choice.theme == resolved_theme)
+        });
     let (stage_tx, mut stage_rx) = watch::channel(SplashStage::StartingDaemon);
     let boot_warnings: BootWarnings = BootWarnings::default();
     let booted = {
@@ -719,8 +754,13 @@ impl LiveIo {
         let (out_tx, out_rx) = mpsc::channel::<Envelope>(256);
         let (event_tx, event_rx) = mpsc::channel::<ReaderSignal>(256);
         let query_tx = event_tx.clone();
-        let reader = tokio::spawn(read_loop(read_half, event_tx, out_tx.clone(), client_id));
-        let writer = tokio::spawn(write_loop(write_half, out_rx));
+        let reader = tokio::spawn(read_loop(
+            read_half,
+            event_tx.clone(),
+            out_tx.clone(),
+            client_id,
+        ));
+        let writer = tokio::spawn(write_loop(write_half, out_rx, event_tx));
         (
             Self {
                 client_id,
@@ -820,6 +860,21 @@ async fn boot_phase(
     });
     let mut conn = restart_ops.into_connection();
 
+    // Assembly/integration failures are actionable product state, not log-only
+    // diagnostics. The daemon returns sanitized, de-duplicated summaries; feed
+    // them into the existing persistent Issues rail before the welcome gate.
+    match crate::client::daemon_status(&paths.socket_path).await {
+        Ok(status) => {
+            for issue in status.integration_issues {
+                reduce(state, Action::Issue(issue));
+            }
+        }
+        Err(error) => push_boot_warning(
+            boot_warnings,
+            format!("could not read daemon integration health: {error}"),
+        ),
+    }
+
     let _ = stage_tx.send(SplashStage::RestoringSession);
     let (session_id, workspace_id, catchup) =
         resolve_or_create_session(&mut conn, store, paths, repo).await?;
@@ -827,12 +882,19 @@ async fn boot_phase(
     // Seed the state from catch-up, then from any live event that outraced the
     // attach reply and was buffered during setup — both before the loop reads a
     // single new frame, so no event is dropped or reordered.
-    let mut attach_watermark = fold_catchup(state, catchup);
+    let mut attach_watermark =
+        fold_catchup_with_history(state, &mut conn, session_id, catchup, boot_warnings).await;
     let (live, pending) = LiveIo::start(conn);
     for envelope in pending {
         if let Payload::Event(event) = envelope.payload {
-            attach_watermark = attach_watermark.max(event.sequence);
-            reduce(state, Action::DaemonEvent(Box::new(event)));
+            // A paged snapshot restore and the live forwarder share the socket.
+            // Events that arrived while the history pages were being read are
+            // buffered by `Connection`; ignore any already covered by the page
+            // watermark so reopening a busy session cannot duplicate turns.
+            if event.sequence > attach_watermark {
+                attach_watermark = event.sequence;
+                reduce(state, Action::DaemonEvent(Box::new(event)));
+            }
         }
     }
 
@@ -1151,7 +1213,9 @@ async fn event_loop<P: Presentation>(
         .await
         .is_err()
     {
-        return Ok(());
+        return Err(anyhow!(
+            "daemon connection closed during Remote UI capability setup"
+        ));
     }
     presentation.draw(state, false)?;
 
@@ -1185,11 +1249,27 @@ async fn event_loop<P: Presentation>(
     // Captured voice notes awaiting their `ArtifactStored` reply, keyed by the
     // `PutArtifact` command that uploaded them; the value is the measured
     // capture duration, carried into the audio block.
-    let mut pending_voice: HashMap<CommandId, u64> = HashMap::new();
+    let mut pending_voice: HashMap<CommandId, PendingVoiceUpload> = HashMap::new();
+    // Publish replies omit the document id because it is already present in
+    // the request. Preserve that exact correlation so the host can construct
+    // the ordinary approval card from the reply without guessing.
+    let mut pending_document_publishes: HashMap<CommandId, DocumentId> = HashMap::new();
+    // Exact first-run request retained until its durable RunStarted arrives.
+    // Reconnect retries this same message/command/idempotency identity.
+    let mut pending_start_run = PendingStartRunCommand::default();
+    // Lifecycle mutations are daemon-owned and can fail after their confirmation
+    // overlays have already closed. Retain the request message id so only the
+    // matching rejection becomes a persistent issue; unrelated command failures
+    // keep their ordinary transient-notice behaviour.
+    let mut pending_ui_plugin_commands = PendingUiPluginCommands::default();
     // Command ids of board-scoped `ReadBlackboard`s, so an EMPTY board baseline
     // (a repository whose board has never been written) still clears the pane
     // rather than being mistaken for a workflow-run read.
     let mut board_reads: std::collections::HashSet<CommandId> = std::collections::HashSet::new();
+    // MCP warming and webhook listeners finish after boot. Re-read the daemon's
+    // sanitized health projection periodically so failures that race initial
+    // startup still reach the persistent Issues rail.
+    let mut next_integration_health_tick = state.tick.saturating_add(150);
 
     loop {
         // A CRDT sync needs an async merge (+ a suggestion re-read) that cannot run
@@ -1226,11 +1306,39 @@ async fn event_loop<P: Presentation>(
                         }
                     }
                 }
-                Some(ReaderSignal::Rejected { code, message }) => {
-                    Action::Notice(format!("command rejected: {message} ({code})"))
+                Some(ReaderSignal::Rejected {
+                    code,
+                    message,
+                    correlation_id,
+                }) => {
+                    if pending_start_run.matches_rejection(correlation_id) {
+                        pending_start_run.clear();
+                        Action::RunStartRejected {
+                            reason: format!("{message} ({code})"),
+                        }
+                    } else if let Some(command_id) = correlation_id.and_then(|message_id| {
+                        pending_voice.iter().find_map(|(command_id, pending)| {
+                            (pending.request_message_id == message_id).then_some(*command_id)
+                        })
+                    }) {
+                        pending_voice.remove(&command_id);
+                        Action::Notice(format!("voice upload rejected: {message} ({code})"))
+                    } else if let Some(pending) =
+                        pending_ui_plugin_commands.resolve(correlation_id)
+                    {
+                        Action::Issue(pending.rejection_message(&code, &message))
+                    } else {
+                        Action::Notice(format!("command rejected: {message} ({code})"))
+                    }
                 }
                 Some(ReaderSignal::RemoteUi(message)) => Action::RemoteUiMessage(message),
-                Some(ReaderSignal::UiPlugins(plugins)) => Action::UiPluginsLoaded(plugins),
+                Some(ReaderSignal::UiPlugins {
+                    plugins,
+                    correlation_id,
+                }) => {
+                    pending_ui_plugin_commands.resolve(correlation_id);
+                    Action::UiPluginsLoaded(plugins)
+                }
                 // Phase 4 STEP 4.3 live document editing. A sync is merged after the
                 // select (it needs an async replica merge + suggestion re-read); the
                 // lease replies fold directly.
@@ -1246,13 +1354,28 @@ async fn event_loop<P: Presentation>(
                     lease_id,
                 },
                 Some(ReaderSignal::DocumentLeaseBlocked) => Action::DocumentLeaseBlocked,
+                Some(ReaderSignal::DocumentCreated { document_id }) => {
+                    Action::DocumentCreated { document_id }
+                }
                 Some(ReaderSignal::DocumentPublishPrepared {
+                    command_id,
+                    approval_id,
                     target,
                     changed_files,
                     git_action,
-                }) => Action::Notice(format!(
-                    "publish plan ready: {target} · {changed_files} file(s) · {git_action}"
-                )),
+                }) => match pending_document_publishes.remove(&command_id) {
+                    Some(document_id) => Action::DocumentPublishPrepared {
+                        approval_id,
+                        document_id,
+                        target,
+                        changed_files,
+                        git_action,
+                    },
+                    None => Action::Notice(format!(
+                        "publish awaiting approval {approval_id}: {target} · {} file(s) · {git_action}",
+                        changed_files.len()
+                    )),
+                },
                 Some(ReaderSignal::ProviderModels { provider_id, result }) => match result {
                     Ok((models, origin)) => Action::ProviderModelsLoaded { provider_id, models, origin },
                     Err(reason) => Action::ProviderModelsFailed { provider_id, reason },
@@ -1350,8 +1473,9 @@ async fn event_loop<P: Presentation>(
                     command_id,
                     artifact,
                 }) => match pending_voice.remove(&command_id) {
-                    Some(duration_ms) => {
-                        let envelope = crate::voice::voice_envelope(artifact, duration_ms);
+                    Some(pending) => {
+                        let envelope =
+                            crate::voice::voice_envelope(artifact, pending.duration_ms);
                         let submit = command_envelope(
                             live.client_id,
                             CommandBody::SubmitUserInput {
@@ -1365,7 +1489,9 @@ async fn event_loop<P: Presentation>(
                             },
                         );
                         if live.out_tx.send(submit).await.is_err() {
-                            return Ok(());
+                            return Err(anyhow!(
+                                "daemon connection closed while submitting a voice note"
+                            ));
                         }
                         Action::Notice("voice note sent \u{2014} transcribing\u{2026}".to_owned())
                     }
@@ -1381,8 +1507,40 @@ async fn event_loop<P: Presentation>(
                     // itself still reveals a missing span (more loss while
                     // repairing), the tracker asks to repair again and keeps the
                     // tail.
+                    let missing_range = match catchup.as_ref() {
+                        Catchup::Snapshot { through, .. } if tracker.last_seen() < *through => {
+                            Some((tracker.last_seen(), *through))
+                        }
+                        _ => None,
+                    };
                     let through = fold_catchup(state, *catchup);
-                    let drain = tracker.on_catchup(through, Instant::now());
+                    let mut history_restored = true;
+                    if let Some((after, target)) = missing_range {
+                        match read_session_event_range(paths, session_id, after, target).await {
+                            Ok(events) => {
+                                for event in events {
+                                    reduce(state, Action::DaemonEvent(Box::new(event)));
+                                }
+                            }
+                            Err(error) => {
+                                history_restored = false;
+                                reduce(
+                                    state,
+                                    Action::Issue(format!(
+                                        "could not restore the live event gap; retrying: {error}"
+                                    )),
+                                );
+                            }
+                        }
+                    }
+                    let drain = if history_restored {
+                        tracker.on_catchup(through, Instant::now())
+                    } else {
+                        CatchupDrain {
+                            apply: Vec::new(),
+                            reattach: Some(tracker.last_seen()),
+                        }
+                    };
                     for event in drain.apply {
                         reduce(state, Action::DaemonEvent(Box::new(event)));
                     }
@@ -1400,9 +1558,128 @@ async fn event_loop<P: Presentation>(
                     }
                     Action::NoOp
                 }
-                // The daemon closed the stream (shutdown / dropped client). The
-                // run is unaffected; we simply leave the TUI.
-                Some(ReaderSignal::Closed) | None => return Ok(()),
+                Some(ReaderSignal::Closed) | None => {
+                    reduce(state, Action::Notice("connection lost · reconnecting…".to_owned()));
+                    presentation.draw(state, false)?;
+                    let last_seen = tracker.last_seen();
+                    let mut failure = None;
+                    let mut replacement = None;
+                    for attempt in 0_u32..5 {
+                        if attempt > 0 {
+                            tokio::time::sleep(Duration::from_millis(
+                                250_u64.saturating_mul(1_u64 << attempt.min(4)),
+                            ))
+                            .await;
+                        }
+                        match reconnect_live_session(
+                            paths,
+                            store,
+                            session_id,
+                            last_seen,
+                            &subscriptions,
+                            repository,
+                        )
+                        .await
+                        {
+                            Ok(connected) => {
+                                replacement = Some(connected);
+                                break;
+                            }
+                            Err(error) => failure = Some(error),
+                        }
+                    }
+                    let Some((next_live, catchup, pending)) = replacement else {
+                        return Err(failure.unwrap_or_else(|| anyhow!("reconnect failed")));
+                    };
+                    let missing_range = match &catchup {
+                        Catchup::Snapshot { through, .. } if last_seen < *through => {
+                            Some((last_seen, *through))
+                        }
+                        _ => None,
+                    };
+                    let mut watermark = fold_catchup(state, catchup);
+                    let mut reconnect_history_restored = true;
+                    if let Some((after, target)) = missing_range {
+                        match read_session_event_range(paths, session_id, after, target).await {
+                            Ok(events) => {
+                                for event in events {
+                                    reduce(state, Action::DaemonEvent(Box::new(event)));
+                                }
+                            }
+                            Err(error) => {
+                                reconnect_history_restored = false;
+                                watermark = last_seen;
+                                reduce(
+                                    state,
+                                    Action::Issue(format!(
+                                        "reconnected, but complete history is still restoring: {error}"
+                                    )),
+                                );
+                            }
+                        }
+                    }
+                    for envelope in pending {
+                        if let Payload::Event(event) = envelope.payload {
+                            if reconnect_history_restored && event.sequence > watermark {
+                                watermark = event.sequence;
+                                reduce(state, Action::DaemonEvent(Box::new(event)));
+                            }
+                        }
+                    }
+                    let old = std::mem::replace(live, next_live);
+                    old.shutdown();
+                    // Generic lifecycle commands are not replayed across a
+                    // transport swap. A later reply from the retired socket
+                    // cannot be authoritative for this live connection.
+                    pending_ui_plugin_commands.clear();
+                    if live
+                        .out_tx
+                        .send(remote_ui_envelope(
+                            live.client_id,
+                            session_id,
+                            presentation.capabilities_message(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return Err(anyhow!("reconnected socket closed during capability setup"));
+                    }
+                    for pending in pending_voice.values() {
+                        let mut upload = pending.upload.clone();
+                        upload.client_id = live.client_id;
+                        if live.out_tx.send(upload).await.is_err() {
+                            return Err(anyhow!(
+                                "reconnected socket closed while resuming a voice upload"
+                            ));
+                        }
+                    }
+                    // Catch-up/history may have delivered the durable start
+                    // while this socket was down. Otherwise replay the exact
+                    // request so daemon idempotency can finish it once without
+                    // orphaning the reducer's admission guard.
+                    if state.pending_run_start.is_none() {
+                        pending_start_run.clear();
+                    } else if let Some(envelope) = pending_start_run.retry_envelope() {
+                        if live.out_tx.send(envelope).await.is_err() {
+                            return Err(anyhow!(
+                                "reconnected socket closed while retrying the pending run"
+                            ));
+                        }
+                    }
+                    tracker = GapTracker::new(watermark);
+                    if !reconnect_history_restored {
+                        send_reattach(
+                            &live.out_tx,
+                            live.client_id,
+                            session_id,
+                            watermark,
+                            &subscriptions,
+                        )
+                        .await;
+                    }
+                    replicas.clear();
+                    Action::Notice("reconnected · session restored".to_owned())
+                }
             }),
             input = input_rx.recv() => match input {
                 // Track width for mouse-column → pane mapping; the draw below
@@ -1440,10 +1717,19 @@ async fn event_loop<P: Presentation>(
                                 },
                             );
                             if let Payload::Command(command) = &upload.payload {
-                                pending_voice.insert(command.command_id, duration_ms);
+                                pending_voice.insert(
+                                    command.command_id,
+                                    PendingVoiceUpload {
+                                        duration_ms,
+                                        request_message_id: upload.message_id,
+                                        upload: upload.clone(),
+                                    },
+                                );
                             }
                             if live.out_tx.send(upload).await.is_err() {
-                                return Ok(());
+                                return Err(anyhow!(
+                                    "daemon connection closed while uploading a voice note"
+                                ));
                             }
                             PendingActions::One(Action::VoiceRecording(false))
                         }
@@ -1500,6 +1786,19 @@ async fn event_loop<P: Presentation>(
 
         for action in actions {
             reduce(state, action);
+        }
+        // RunStarted and an explicit fresh-session reset are authoritative over
+        // any client-local retry record.
+        if state.pending_run_start.is_none() {
+            pending_start_run.clear();
+        }
+        if tick_action && state.tick >= next_integration_health_tick {
+            next_integration_health_tick = state.tick.saturating_add(150);
+            if let Ok(status) = crate::client::daemon_status(&paths.socket_path).await {
+                for issue in status.integration_issues {
+                    reduce(state, Action::Issue(issue));
+                }
+            }
         }
         // Voice v1 (rubric 8). A TUI cannot log — stderr would corrupt the
         // display — so the off-thread speech worker's failures surface as
@@ -1591,7 +1890,9 @@ async fn event_loop<P: Presentation>(
                     .await
                     .is_err()
                 {
-                    return Ok(());
+                    return Err(anyhow!(
+                        "daemon connection closed while sending Remote UI data"
+                    ));
                 }
                 continue;
             }
@@ -2075,6 +2376,7 @@ async fn event_loop<P: Presentation>(
                 {
                     Ok(fresh) => {
                         state.begin_new_session();
+                        pending_start_run.clear();
                         let mut watermark = fold_catchup(state, fresh.catchup);
                         for envelope in fresh.pending {
                             if let Payload::Event(event) = envelope.payload {
@@ -2087,14 +2389,33 @@ async fn event_loop<P: Presentation>(
                         old_live.shutdown();
                         session_id = fresh.session_id;
                         let capabilities = presentation.capabilities_message();
-                        let _ = live
+                        if live
                             .out_tx
                             .send(remote_ui_envelope(live.client_id, session_id, capabilities))
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return Err(anyhow!(
+                                "fresh session socket closed during Remote UI capability setup"
+                            ));
+                        }
                         tracker = GapTracker::new(watermark);
                         subscriptions = next_subscriptions;
                         replicas.clear();
                         blackboard_reads.clear();
+                        board_reads.clear();
+                        pending_document_publishes.clear();
+                        pending_ui_plugin_commands.clear();
+                        if !pending_voice.is_empty() {
+                            pending_voice.clear();
+                            reduce(
+                                state,
+                                Action::Issue(
+                                    "a voice note upload was cancelled when the conversation changed"
+                                        .to_owned(),
+                                ),
+                            );
+                        }
 
                         if let Some(token) = fresh.resume_token {
                             store.resume_token = Some(token);
@@ -2173,7 +2494,9 @@ async fn event_loop<P: Presentation>(
                         }
                     }
                     ProjectionKind::Docs => {
-                        let selected = state.focused_doc().map(|card| card.document_id);
+                        let selected = state
+                            .pending_document_selection
+                            .or_else(|| state.focused_doc().map(|card| card.document_id));
                         state.docs = load_docs(pool, &scopes, &mut warnings).await;
                         state.selected_doc = selected
                             .and_then(|document_id| {
@@ -2183,6 +2506,14 @@ async fn event_loop<P: Presentation>(
                                     .position(|card| card.document_id == document_id)
                             })
                             .unwrap_or(0);
+                        if selected.is_some_and(|document_id| {
+                            state
+                                .docs
+                                .get(state.selected_doc)
+                                .is_some_and(|doc| doc.document_id == document_id)
+                        }) {
+                            state.pending_document_selection = None;
+                        }
                         if let Some(document_id) = state.focused_doc().map(|card| card.document_id)
                         {
                             state.outbox.push(Intent::WatchDocument { document_id });
@@ -2289,7 +2620,9 @@ async fn event_loop<P: Presentation>(
                         },
                     );
                     if live.out_tx.send(attach).await.is_err() {
-                        return Ok(());
+                        return Err(anyhow!(
+                            "daemon connection closed while attaching a workflow"
+                        ));
                     }
                 }
 
@@ -2300,7 +2633,7 @@ async fn event_loop<P: Presentation>(
                     },
                 );
                 if live.out_tx.send(snapshot).await.is_err() {
-                    return Ok(());
+                    return Err(anyhow!("daemon connection closed while reading a workflow"));
                 }
                 let board = command_envelope(
                     live.client_id,
@@ -2315,7 +2648,9 @@ async fn event_loop<P: Presentation>(
                     blackboard_reads.insert(command.command_id, workflow_run_id.clone());
                 }
                 if live.out_tx.send(board).await.is_err() {
-                    return Ok(());
+                    return Err(anyhow!(
+                        "daemon connection closed while reading a blackboard"
+                    ));
                 }
                 continue;
             }
@@ -2347,7 +2682,9 @@ async fn event_loop<P: Presentation>(
                         },
                     );
                     if live.out_tx.send(attach).await.is_err() {
-                        return Ok(());
+                        return Err(anyhow!(
+                            "daemon connection closed while attaching the board"
+                        ));
                     }
                 }
                 let read = command_envelope(
@@ -2363,7 +2700,7 @@ async fn event_loop<P: Presentation>(
                     board_reads.insert(command.command_id);
                 }
                 if live.out_tx.send(read).await.is_err() {
-                    return Ok(());
+                    return Err(anyhow!("daemon connection closed while reading the board"));
                 }
                 continue;
             }
@@ -2390,23 +2727,62 @@ async fn event_loop<P: Presentation>(
                         },
                     );
                     if live.out_tx.send(attach).await.is_err() {
-                        return Ok(());
+                        return Err(anyhow!(
+                            "daemon connection closed while watching a document"
+                        ));
                     }
                 }
             }
             if matches!(intent, Intent::WatchDocument { .. }) {
                 continue;
             }
-            let envelope = command_envelope(
+            let intent_publish_document = match &intent {
+                Intent::PublishDocument { document_id, .. } => Some(*document_id),
+                _ => None,
+            };
+            let intent_starts_run = matches!(&intent, Intent::StartRun { .. });
+            let pending_ui_plugin = PendingUiPluginCommand::from_intent(&intent);
+            let mut envelope = command_envelope(
                 live.client_id,
                 intent_to_command(intent, session_id, repository),
             );
+            // Session-bound intercepted commands (notably document publish)
+            // need the caller's attached session so durable approvals land on
+            // the visible rail instead of an unrelated synthetic session.
+            envelope.session_id = Some(session_id);
+            if let (Some(document_id), Payload::Command(command)) =
+                (intent_publish_document, &envelope.payload)
+            {
+                pending_document_publishes.insert(command.command_id, document_id);
+            }
+            if intent_starts_run {
+                pending_start_run.observe_outbound(&envelope);
+            }
+            if let Some(pending) = pending_ui_plugin {
+                pending_ui_plugin_commands.observe(envelope.message_id, pending);
+            }
             if live.out_tx.send(envelope).await.is_err() {
-                return Ok(()); // writer gone → connection is down; leave cleanly
+                if intent_starts_run {
+                    // LiveIo's writer also emits `Closed`; retain the exact
+                    // request until that arm replaces the transport and retries.
+                    reduce(
+                        state,
+                        Action::Notice(
+                            "connection lost while starting the run · reconnecting…".to_owned(),
+                        ),
+                    );
+                    continue;
+                }
+                return Err(anyhow!(
+                    "daemon connection closed while sending a command; reopen to reconnect"
+                ));
             }
         }
 
-        if state.should_detach || state.session_closed {
+        // A durable SessionClosed event is state to present, not an implicit
+        // process-exit instruction. Keep the final transcript/status visible;
+        // Esc or the explicit detach action still leaves normally.
+        if state.should_detach {
             return Ok(());
         }
 
@@ -2426,7 +2802,10 @@ enum ReaderSignal {
     /// A validated Remote UI frame for the reducer-owned host session.
     RemoteUi(Box<codypendent_protocol::UiWireMessage>),
     /// Host-owned lifecycle projection for `/plugins`.
-    UiPlugins(Vec<codypendent_protocol::UiPluginLifecycleStatus>),
+    UiPlugins {
+        plugins: Vec<codypendent_protocol::UiPluginLifecycleStatus>,
+        correlation_id: Option<codypendent_protocol::MessageId>,
+    },
     /// A live session event to fold into state (boxed: it is a large payload and
     /// every other message here is tiny).
     Event(Box<SessionEvent>),
@@ -2436,6 +2815,7 @@ enum ReaderSignal {
     Rejected {
         code: String,
         message: String,
+        correlation_id: Option<codypendent_protocol::MessageId>,
     },
     /// A catch-up reply (from the loop's own gap-triggered re-attach).
     Catchup(Box<Catchup>),
@@ -2451,11 +2831,18 @@ enum ReaderSignal {
     /// The daemon refused an edit lease: the block range is held by another writer
     /// (`document.range-leased`) — surfaced as the presence-lite "blocked" signal.
     DocumentLeaseBlocked,
+    /// A newly-created collaborative document. The reducer refreshes the Docs
+    /// projection and selects the resulting row once it is loaded.
+    DocumentCreated {
+        document_id: DocumentId,
+    },
     /// Human-readable acknowledgement that the publish plan is now parked on
     /// the ordinary approval rail; no document write has happened yet.
     DocumentPublishPrepared {
+        command_id: CommandId,
+        approval_id: codypendent_protocol::ApprovalId,
         target: String,
-        changed_files: usize,
+        changed_files: Vec<String>,
         git_action: String,
     },
     /// A provider's fetched model list (model-discovery): the result of the
@@ -2546,6 +2933,13 @@ enum ReaderSignal {
     },
     /// The daemon closed the connection.
     Closed,
+}
+
+#[derive(Clone, Debug)]
+struct PendingVoiceUpload {
+    duration_ms: u64,
+    request_message_id: codypendent_protocol::MessageId,
+    upload: Envelope,
 }
 
 fn workflow_phase_label(phase: codypendent_protocol::WorkflowRunPhase) -> &'static str {
@@ -2721,172 +3115,192 @@ async fn read_loop(
 ) {
     loop {
         match read_envelope(&mut read_half).await {
-            Ok(Some(envelope)) => match envelope.payload {
-                Payload::Ping => {
-                    let pong = Envelope::request(client_id, Payload::Pong);
-                    if out_tx.send(pong).await.is_err() {
-                        break;
-                    }
-                }
-                Payload::Event(event) => {
-                    if event_tx
-                        .send(ReaderSignal::Event(Box::new(event)))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Payload::RemoteUi { message } => {
-                    if event_tx
-                        .send(ReaderSignal::RemoteUi(message))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Payload::UiPluginLifecycle { plugins, .. } => {
-                    if event_tx
-                        .send(ReaderSignal::UiPlugins(plugins))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Payload::CommandRejected(error) => {
-                    // A refused edit lease drives the presence-lite "blocked"
-                    // indicator; every other rejection is a transient notice.
-                    let signal = if error.code == "document.range-leased" {
-                        ReaderSignal::DocumentLeaseBlocked
-                    } else {
-                        ReaderSignal::Rejected {
-                            code: error.code,
-                            message: error.message,
+            Ok(Some(envelope)) => {
+                let correlation_id = envelope.correlation_id;
+                match envelope.payload {
+                    Payload::Ping => {
+                        let pong = Envelope::request(client_id, Payload::Pong);
+                        if out_tx.send(pong).await.is_err() {
+                            break;
                         }
-                    };
-                    if event_tx.send(signal).await.is_err() {
-                        break;
                     }
-                }
-                Payload::DocumentLeaseGranted { grant, .. } => {
-                    if event_tx
-                        .send(ReaderSignal::DocumentLeaseGranted {
-                            document_id: grant.document_id,
-                            lease_id: grant.lease_id,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    Payload::Event(event) => {
+                        if event_tx
+                            .send(ReaderSignal::Event(Box::new(event)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }
-                Payload::DocumentPublishRequested {
-                    target,
-                    changed_files,
-                    git_action,
-                    ..
-                } => {
-                    if event_tx
-                        .send(ReaderSignal::DocumentPublishPrepared {
-                            target,
-                            changed_files: changed_files.len(),
-                            git_action,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    Payload::RemoteUi { message } => {
+                        if event_tx
+                            .send(ReaderSignal::RemoteUi(message))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }
-                Payload::DocumentSync(sync) => {
-                    if event_tx
-                        .send(ReaderSignal::DocumentSync(Box::new(sync)))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    Payload::UiPluginLifecycle { plugins, .. } => {
+                        if event_tx
+                            .send(ReaderSignal::UiPlugins {
+                                plugins,
+                                correlation_id,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }
-                Payload::WorkflowRunStarted {
-                    workflow_run_id, ..
-                } => {
-                    if event_tx
-                        .send(ReaderSignal::WorkflowRunStarted { workflow_run_id })
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    Payload::CommandRejected(error) => {
+                        // A refused edit lease drives the presence-lite "blocked"
+                        // indicator; every other rejection is a transient notice.
+                        let signal = if error.code == "document.range-leased" {
+                            ReaderSignal::DocumentLeaseBlocked
+                        } else {
+                            ReaderSignal::Rejected {
+                                code: error.code,
+                                message: error.message,
+                                correlation_id,
+                            }
+                        };
+                        if event_tx.send(signal).await.is_err() {
+                            break;
+                        }
                     }
-                }
-                Payload::WorkflowRunSnapshot { snapshot, .. } => {
-                    if event_tx
-                        .send(ReaderSignal::WorkflowSnapshot(Box::new(snapshot)))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    Payload::DocumentLeaseGranted { grant, .. } => {
+                        if event_tx
+                            .send(ReaderSignal::DocumentLeaseGranted {
+                                document_id: grant.document_id,
+                                lease_id: grant.lease_id,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }
-                Payload::WorkflowEvent { event } => {
-                    if event_tx
-                        .send(ReaderSignal::WorkflowEvent(event))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    Payload::DocumentCreated { document_id, .. } => {
+                        if event_tx
+                            .send(ReaderSignal::DocumentCreated { document_id })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }
-                Payload::BlackboardItems { command_id, items } => {
-                    if event_tx
-                        .send(ReaderSignal::BlackboardItems { command_id, items })
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    Payload::DocumentPublishRequested {
+                        command_id,
+                        approval_id,
+                        target,
+                        changed_files,
+                        git_action,
+                        ..
+                    } => {
+                        if event_tx
+                            .send(ReaderSignal::DocumentPublishPrepared {
+                                command_id,
+                                approval_id,
+                                target,
+                                changed_files,
+                                git_action,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }
-                // Voice v1 (rubric 8): a stored voice note's ref comes back so
-                // the loop can submit the envelope that references it.
-                Payload::ArtifactStored {
-                    command_id,
-                    artifact,
-                } => {
-                    if event_tx
-                        .send(ReaderSignal::ArtifactStored {
-                            command_id,
-                            artifact,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    Payload::DocumentSync(sync) => {
+                        if event_tx
+                            .send(ReaderSignal::DocumentSync(Box::new(sync)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }
-                Payload::BlackboardPosted(item) => {
-                    if event_tx
-                        .send(ReaderSignal::BlackboardPosted(item))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    Payload::WorkflowRunStarted {
+                        workflow_run_id, ..
+                    } => {
+                        if event_tx
+                            .send(ReaderSignal::WorkflowRunStarted { workflow_run_id })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                }
-                Payload::Catchup { catchup } => {
-                    if event_tx
-                        .send(ReaderSignal::Catchup(Box::new(catchup)))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    Payload::WorkflowRunSnapshot { snapshot, .. } => {
+                        if event_tx
+                            .send(ReaderSignal::WorkflowSnapshot(Box::new(snapshot)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
+                    Payload::WorkflowEvent { event } => {
+                        if event_tx
+                            .send(ReaderSignal::WorkflowEvent(event))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Payload::BlackboardItems { command_id, items } => {
+                        if event_tx
+                            .send(ReaderSignal::BlackboardItems { command_id, items })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // Voice v1 (rubric 8): a stored voice note's ref comes back so
+                    // the loop can submit the envelope that references it.
+                    Payload::ArtifactStored {
+                        command_id,
+                        artifact,
+                    } => {
+                        if event_tx
+                            .send(ReaderSignal::ArtifactStored {
+                                command_id,
+                                artifact,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Payload::BlackboardPosted(item) => {
+                        if event_tx
+                            .send(ReaderSignal::BlackboardPosted(item))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Payload::Catchup { catchup } => {
+                        if event_tx
+                            .send(ReaderSignal::Catchup(Box::new(catchup)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // Everything else (CommandAccepted, stray replies) is not an
+                    // input to the reducer's live loop — the TUI's state is driven
+                    // by durable events (Chapter 03). Drop it.
+                    _ => {}
                 }
-                // Everything else (CommandAccepted, stray replies) is not an
-                // input to the reducer's live loop — the TUI's state is driven
-                // by durable events (Chapter 03). Drop it.
-                _ => {}
-            },
+            }
             Ok(None) | Err(_) => {
                 let _ = event_tx.send(ReaderSignal::Closed).await;
                 break;
@@ -2897,9 +3311,14 @@ async fn read_loop(
 
 /// Own the write half: serialize every outgoing envelope (loop commands + reader
 /// pongs) so the two producers never interleave a frame on the socket.
-async fn write_loop(mut write_half: OwnedWriteHalf, mut out_rx: mpsc::Receiver<Envelope>) {
+async fn write_loop(
+    mut write_half: OwnedWriteHalf,
+    mut out_rx: mpsc::Receiver<Envelope>,
+    event_tx: mpsc::Sender<ReaderSignal>,
+) {
     while let Some(envelope) = out_rx.recv().await {
         if write_envelope(&mut write_half, &envelope).await.is_err() {
+            let _ = event_tx.send(ReaderSignal::Closed).await;
             break;
         }
     }
@@ -3363,14 +3782,32 @@ fn write_add_model(
         context_tokens,
     });
 
-    // Serialize back to `[[model]]` tables and write atomically.
+    // Replace only the `[[model]]` array. Voice, transcription, embedding,
+    // retrieval and future top-level settings share this file and must survive
+    // adding a model from the TUI.
     #[derive(serde::Serialize)]
     struct ModelsToml {
         #[serde(rename = "model")]
         model: Vec<ModelConfig>,
     }
-    let rendered = toml::to_string_pretty(&ModelsToml { model: configs })
-        .context("serializing models.toml")?;
+    let mut root = if models_path.exists() {
+        let raw = std::fs::read_to_string(&models_path)
+            .with_context(|| format!("reading {}", models_path.display()))?;
+        raw.parse::<toml::Value>()
+            .with_context(|| format!("parsing {}", models_path.display()))?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let replacement =
+        toml::Value::try_from(ModelsToml { model: configs }).context("serializing models.toml")?;
+    let model = replacement
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| toml::Value::Array(Vec::new()));
+    root.as_table_mut()
+        .ok_or_else(|| anyhow!("models.toml must contain a TOML table"))?
+        .insert("model".to_owned(), model);
+    let rendered = toml::to_string_pretty(&root).context("serializing models.toml")?;
     let models_tmp = data_dir.join("models.toml.tmp");
     std::fs::write(&models_tmp, rendered.as_bytes())
         .with_context(|| format!("writing {}", models_tmp.display()))?;
@@ -4209,6 +4646,103 @@ fn command_envelope(client_id: ClientId, body: CommandBody) -> Envelope {
     )
 }
 
+/// One in-flight daemon-owned UI plugin mutation.
+///
+/// The plugin overlay closes as soon as its intent is emitted, so the request's
+/// message id is the only reliable way to distinguish a later lifecycle refusal
+/// from an unrelated command rejection on the same multiplexed connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingUiPluginCommand {
+    operation: &'static str,
+    plugin_id: String,
+}
+
+impl PendingUiPluginCommand {
+    fn from_intent(intent: &Intent) -> Option<Self> {
+        let (operation, plugin_id) = match intent {
+            Intent::SmokeTestUiPlugin { plugin_id } => ("smoke test", plugin_id),
+            Intent::EnableUiPlugin { plugin_id, .. } => ("enable", plugin_id),
+            Intent::ApproveUiPluginUpdate { plugin_id, .. } => ("approve update", plugin_id),
+            Intent::RejectUiPluginUpdate { plugin_id, .. } => ("reject update", plugin_id),
+            Intent::RevokeUiPlugin { plugin_id } => ("revoke", plugin_id),
+            _ => return None,
+        };
+        Some(Self {
+            operation,
+            plugin_id: plugin_id.clone(),
+        })
+    }
+
+    fn rejection_message(&self, code: &str, message: &str) -> String {
+        format!(
+            "UI plugin {} failed for {}: {message} ({code})",
+            self.operation, self.plugin_id
+        )
+    }
+}
+
+/// Correlation table for lifecycle mutations awaiting a daemon result.
+#[derive(Debug, Default)]
+struct PendingUiPluginCommands {
+    by_message: HashMap<codypendent_protocol::MessageId, PendingUiPluginCommand>,
+}
+
+impl PendingUiPluginCommands {
+    fn observe(
+        &mut self,
+        message_id: codypendent_protocol::MessageId,
+        pending: PendingUiPluginCommand,
+    ) {
+        self.by_message.insert(message_id, pending);
+    }
+
+    fn resolve(
+        &mut self,
+        correlation_id: Option<codypendent_protocol::MessageId>,
+    ) -> Option<PendingUiPluginCommand> {
+        correlation_id.and_then(|message_id| self.by_message.remove(&message_id))
+    }
+
+    fn clear(&mut self) {
+        self.by_message.clear();
+    }
+}
+
+/// Owns the exact unacknowledged first-run request across transport swaps.
+/// Keeping the whole envelope is deliberate: retry must preserve both reply
+/// correlation and the command's daemon-side idempotency identity.
+#[derive(Debug, Default)]
+struct PendingStartRunCommand {
+    envelope: Option<Envelope>,
+}
+
+impl PendingStartRunCommand {
+    fn observe_outbound(&mut self, envelope: &Envelope) {
+        debug_assert!(matches!(
+            &envelope.payload,
+            Payload::Command(Command {
+                body: CommandBody::StartRun { .. },
+                ..
+            })
+        ));
+        self.envelope = Some(envelope.clone());
+    }
+
+    fn matches_rejection(&self, correlation_id: Option<codypendent_protocol::MessageId>) -> bool {
+        self.envelope
+            .as_ref()
+            .is_some_and(|envelope| correlation_id == Some(envelope.message_id))
+    }
+
+    fn retry_envelope(&self) -> Option<Envelope> {
+        self.envelope.clone()
+    }
+
+    fn clear(&mut self) {
+        self.envelope = None;
+    }
+}
+
 fn remote_ui_envelope(
     client_id: ClientId,
     session_id: SessionId,
@@ -4313,10 +4847,10 @@ async fn create_fresh_session_live(
 }
 
 /// Fold an attach-time [`Catchup`] into fresh state. `Catchup::Events` replays
-/// each missed event through the reducer; `Catchup::Snapshot` (the client was
-/// too far behind — Chapter 03's cap) and a future `Unknown` variant carry no
-/// individual events, so the transcript simply begins from the next live event
-/// (Phase 1 keeps runs short enough that this is rare).
+/// each missed event through the reducer. A caller that owns a command socket
+/// should use [`fold_catchup_with_history`] for `Catchup::Snapshot`; this pure
+/// fallback still projects the session/run summary when paged history cannot be
+/// read. Future unknown variants remain inert.
 fn fold_catchup(state: &mut AppState, catchup: Catchup) -> u64 {
     match catchup {
         Catchup::Events {
@@ -4346,6 +4880,178 @@ fn fold_catchup(state: &mut AppState, catchup: Catchup) -> u64 {
         }
         _ => 0,
     }
+}
+
+/// Restore a snapshot catch-up from the durable paged event log before the live
+/// reader starts. A snapshot is intentionally compact and cannot carry the
+/// transcript, but `ReadSessionEvents` can rebuild exactly the stable range the
+/// snapshot's `through` watermark names. Failures degrade to the snapshot and a
+/// persistent boot issue rather than making the entire TUI unavailable.
+async fn fold_catchup_with_history(
+    state: &mut AppState,
+    conn: &mut Connection,
+    session_id: SessionId,
+    catchup: Catchup,
+    boot_warnings: &BootWarnings,
+) -> u64 {
+    let target = match &catchup {
+        Catchup::Snapshot { through, .. } => *through,
+        _ => return fold_catchup(state, catchup),
+    };
+
+    let mut after = 0_u64;
+    let mut history = Vec::new();
+    while after < target {
+        let remaining = target.saturating_sub(after);
+        let limit = u32::try_from(remaining.min(500)).unwrap_or(500);
+        let reply = match conn
+            .send_command(CommandBody::ReadSessionEvents {
+                session_id,
+                after_sequence: after,
+                limit,
+            })
+            .await
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                push_boot_warning(
+                    boot_warnings,
+                    format!("could not restore complete session history: {error}"),
+                );
+                return fold_catchup(state, catchup);
+            }
+        };
+        let (events, through) = match reply.payload {
+            Payload::SessionEventsPage {
+                session_id: reply_session,
+                events,
+                through,
+                ..
+            } if reply_session == session_id => (events, through.min(target)),
+            Payload::CommandRejected(error) => {
+                push_boot_warning(
+                    boot_warnings,
+                    format!(
+                        "could not restore complete session history: {} ({})",
+                        error.message, error.code
+                    ),
+                );
+                return fold_catchup(state, catchup);
+            }
+            other => {
+                push_boot_warning(
+                    boot_warnings,
+                    format!("unexpected session-history reply: {other:?}"),
+                );
+                return fold_catchup(state, catchup);
+            }
+        };
+        history.extend(events.into_iter().filter(|event| event.sequence <= target));
+        if through <= after {
+            push_boot_warning(
+                boot_warnings,
+                format!(
+                    "session history stopped at event {after} before snapshot watermark {target}"
+                ),
+            );
+            return fold_catchup(state, catchup);
+        }
+        after = through;
+    }
+    for event in history {
+        reduce(state, Action::DaemonEvent(Box::new(event)));
+    }
+    target
+}
+
+/// Read an exact missing live range on an auxiliary handshaken connection.
+/// The primary socket remains owned by its reader/writer tasks, so a large-gap
+/// snapshot can restore every transcript event without racing their framing.
+async fn read_session_event_range(
+    paths: &RuntimePaths,
+    session_id: SessionId,
+    mut after: u64,
+    target: u64,
+) -> anyhow::Result<Vec<SessionEvent>> {
+    let mut conn = Connection::connect(&paths.socket_path).await?;
+    conn.handshake(
+        "codypendent-tui-history",
+        codypendent_protocol::BUILD_ID,
+        None,
+    )
+    .await?;
+    let mut history = Vec::new();
+    while after < target {
+        let reply = conn
+            .send_command(CommandBody::ReadSessionEvents {
+                session_id,
+                after_sequence: after,
+                limit: u32::try_from(target.saturating_sub(after).min(500)).unwrap_or(500),
+            })
+            .await?;
+        let (events, through) = match reply.payload {
+            Payload::SessionEventsPage {
+                session_id: returned,
+                events,
+                through,
+                ..
+            } if returned == session_id => (events, through.min(target)),
+            Payload::CommandRejected(error) => {
+                bail!("{} ({})", error.message, error.code);
+            }
+            other => bail!("unexpected history reply: {other:?}"),
+        };
+        history.extend(events.into_iter().filter(|event| event.sequence <= target));
+        if through <= after {
+            bail!("history stopped at event {after} before {target}");
+        }
+        after = through;
+    }
+    Ok(history)
+}
+
+/// Re-establish the handshaken session socket after an unexpected EOF. The
+/// attach resumes from the reducer's durable watermark and preserves every
+/// document/workflow subscription accumulated by the old connection.
+async fn reconnect_live_session(
+    paths: &RuntimePaths,
+    store: &mut SessionStore,
+    session_id: SessionId,
+    last_seen_sequence: u64,
+    subscriptions: &[Subscription],
+    repository: &str,
+) -> anyhow::Result<(LiveIo, Catchup, std::collections::VecDeque<Envelope>)> {
+    let mut conn = Connection::connect(&paths.socket_path).await?;
+    let hello = conn
+        .handshake(
+            "codypendent-tui",
+            codypendent_protocol::BUILD_ID,
+            store
+                .resume_token
+                .clone()
+                .map(codypendent_protocol::ResumeToken),
+        )
+        .await?;
+    if let Some(token) = hello.resume_token {
+        store.resume_token = Some(token.0);
+        store.save(paths);
+    }
+    let reply = conn
+        .send_command(CommandBody::AttachSession {
+            session_id,
+            last_seen_sequence: Some(last_seen_sequence),
+            subscriptions: subscriptions.to_vec(),
+            requested_role: ClientRole::Controller,
+            repository: Some(repository.to_owned()),
+        })
+        .await?;
+    let catchup = match reply.payload {
+        Payload::Catchup { catchup } => catchup,
+        Payload::CommandRejected(error) => bail!("{} ({})", error.message, error.code),
+        other => bail!("unexpected reconnect reply: {other:?}"),
+    };
+    let (live, pending) = LiveIo::start(conn);
+    Ok((live, catchup, pending))
 }
 
 /// Resolve the session for `repo`, reusing the one this repo last used when it
@@ -5351,6 +6057,9 @@ fn block_view(block: &DocumentBlock) -> DocBlockView {
 fn suggestion_view(suggestion: &Suggestion) -> DocSuggestionView {
     DocSuggestionView {
         id: suggestion.id.clone(),
+        block_id: suggestion.block_id.clone(),
+        source_revision: suggestion.source_revision,
+        original: suggestion.original.clone(),
         status: suggestion_status_label(suggestion.status).to_owned(),
         author: document_author_label(&suggestion.author),
         range: format!("{}..{}", suggestion.range_start, suggestion.range_end),
@@ -5970,6 +6679,81 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     #[test]
+    fn ui_plugin_pending_commands_cover_only_lifecycle_mutations() {
+        let cases = [
+            (
+                Intent::SmokeTestUiPlugin {
+                    plugin_id: "demo".to_owned(),
+                },
+                "smoke test",
+            ),
+            (
+                Intent::EnableUiPlugin {
+                    plugin_id: "demo".to_owned(),
+                    scope: "session".to_owned(),
+                },
+                "enable",
+            ),
+            (
+                Intent::ApproveUiPluginUpdate {
+                    plugin_id: "demo".to_owned(),
+                    receipt: "receipt".to_owned(),
+                },
+                "approve update",
+            ),
+            (
+                Intent::RejectUiPluginUpdate {
+                    plugin_id: "demo".to_owned(),
+                    receipt: "receipt".to_owned(),
+                },
+                "reject update",
+            ),
+            (
+                Intent::RevokeUiPlugin {
+                    plugin_id: "demo".to_owned(),
+                },
+                "revoke",
+            ),
+        ];
+
+        for (intent, operation) in cases {
+            assert_eq!(
+                PendingUiPluginCommand::from_intent(&intent),
+                Some(PendingUiPluginCommand {
+                    operation,
+                    plugin_id: "demo".to_owned(),
+                })
+            );
+        }
+        assert!(PendingUiPluginCommand::from_intent(&Intent::ListUiPlugins).is_none());
+    }
+
+    #[test]
+    fn ui_plugin_pending_commands_resolve_only_the_correlated_reply() {
+        let request = codypendent_protocol::MessageId::new();
+        let unrelated = codypendent_protocol::MessageId::new();
+        let mut pending = PendingUiPluginCommands::default();
+        pending.observe(
+            request,
+            PendingUiPluginCommand {
+                operation: "enable",
+                plugin_id: "demo".to_owned(),
+            },
+        );
+
+        assert!(pending.resolve(Some(unrelated)).is_none());
+        assert_eq!(pending.by_message.len(), 1);
+        let matched = pending
+            .resolve(Some(request))
+            .expect("the correlated lifecycle request should resolve");
+        assert_eq!(
+            matched.rejection_message("plugin.lifecycle-refused", "signature changed"),
+            "UI plugin enable failed for demo: signature changed (plugin.lifecycle-refused)"
+        );
+        assert!(pending.by_message.is_empty());
+    }
+
+    #[test]
     fn splash_gate_requires_a_fresh_enter_and_keeps_quit_and_resize_responsive() {
         let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(splash_gate_decision(&enter), SplashGateDecision::Continue);
@@ -6111,6 +6895,48 @@ mod tests {
         assert_eq!(page, 0);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].relation, "calls-special");
+    }
+
+    #[test]
+    fn pending_start_retry_preserves_wire_and_idempotency_identity() {
+        let client_id = ClientId::new();
+        let session_id = SessionId::new();
+        let mut envelope = command_envelope(
+            client_id,
+            CommandBody::StartRun {
+                session_id,
+                objective: "repair reconnect".to_owned(),
+                mode: AgentMode::Build,
+                repository: Some("/repo".to_owned()),
+                model: None,
+            },
+        );
+        envelope.session_id = Some(session_id);
+        let message_id = envelope.message_id;
+        let (command_id, idempotency_key) = match &envelope.payload {
+            Payload::Command(command) => (command.command_id, command.idempotency_key.clone()),
+            other => panic!("expected command, got {other:?}"),
+        };
+
+        let mut pending = PendingStartRunCommand::default();
+        pending.observe_outbound(&envelope);
+        assert!(pending.matches_rejection(Some(message_id)));
+        assert!(!pending.matches_rejection(Some(codypendent_protocol::MessageId::new())));
+
+        let retry = pending.retry_envelope().expect("pending retry");
+        assert_eq!(retry.message_id, message_id);
+        assert_eq!(retry.client_id, client_id);
+        assert_eq!(retry.session_id, Some(session_id));
+        match retry.payload {
+            Payload::Command(command) => {
+                assert_eq!(command.command_id, command_id);
+                assert_eq!(command.idempotency_key, idempotency_key);
+            }
+            other => panic!("expected command, got {other:?}"),
+        }
+
+        pending.clear();
+        assert!(pending.retry_envelope().is_none());
     }
 
     #[test]
@@ -7487,6 +8313,40 @@ prefix = ""
                 .get("groq/llama"),
             Some("k1")
         );
+    }
+
+    #[test]
+    fn write_add_model_preserves_non_model_configuration_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            r#"
+[voice]
+push_to_talk = "F4"
+
+[transcription]
+provider = "local"
+
+[embedding]
+model = "embed-v1"
+
+[retrieval]
+limit = 12
+"#,
+        )
+        .expect("seed settings");
+
+        write_add_model(&paths, "ollama/test", "ollama", "test", None, Some(8192))
+            .expect("add model");
+
+        let raw = std::fs::read_to_string(paths.data_dir.join("models.toml")).expect("read models");
+        let parsed: toml::Value = raw.parse().expect("valid toml");
+        assert_eq!(parsed["voice"]["push_to_talk"].as_str(), Some("F4"));
+        assert_eq!(parsed["transcription"]["provider"].as_str(), Some("local"));
+        assert_eq!(parsed["embedding"]["model"].as_str(), Some("embed-v1"));
+        assert_eq!(parsed["retrieval"]["limit"].as_integer(), Some(12));
+        assert_eq!(parsed["model"].as_array().map(Vec::len), Some(1));
     }
 
     /// Hard requirement: a blank/whitespace-only display id is rejected with a

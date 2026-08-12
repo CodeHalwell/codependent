@@ -39,10 +39,11 @@
 //!
 //! A document has no `run_id`/`session_id` of its own (documents live outside
 //! the session ledger), yet the shared [`ApprovalBroker`] — reused exactly as
-//! a `GitHubMutation` parks — needs both to append its ledger events. A fresh
-//! session + run is minted per publish purely as that bookkeeping context (its
-//! objective is the plan's own Git-action sentence); nothing about a normal
-//! run's lifecycle is otherwise assumed; the run's state is flipped to
+//! a `GitHubMutation` parks — needs both to append its ledger events. An attached
+//! caller's session is used when supplied, so its ordinary approval rail observes
+//! the request; headless callers fall back to a fresh bookkeeping session. A run
+//! is minted in either case (its objective is the plan's own Git-action sentence);
+//! its state is flipped to
 //! `Completed`/`Cancelled`/`Failed` once the decision is known so an operator
 //! inspecting it sees a sensible outcome.
 
@@ -212,6 +213,7 @@ impl DocumentPublisher for KnowledgePublisher {
             let PublishDocumentRequest {
                 document_id,
                 target,
+                session_id,
                 ..
             } = request;
 
@@ -232,14 +234,14 @@ impl DocumentPublisher for KnowledgePublisher {
             let target_description = describe_target(&plan.target);
             let (risk, capabilities) = risk_and_capabilities(&plan.target);
 
-            // A document has no run/session of its own; mint a fresh pair
-            // purely to give the shared `ApprovalBroker` the ledger context it
-            // needs (its events append to a session, its row FKs to a run) —
-            // exactly the machinery a `GitHubMutation` parks against, reused
-            // rather than reinvented.
-            let (session_id, run_id) = mint_publish_run(&pool, &doc.title, &plan.git_action)
-                .await
-                .map_err(internal_error)?;
+            // A document has no run of its own. Mint one in the caller's attached
+            // session when available so the approval event reaches that session's
+            // subscribers; otherwise preserve the one-shot CLI's synthetic-session
+            // fallback.
+            let (session_id, run_id) =
+                mint_publish_run(&pool, session_id, &doc.title, &plan.git_action)
+                    .await
+                    .map_err(internal_error)?;
 
             let action = ProposedAction::PublishDocument {
                 document_id,
@@ -781,11 +783,19 @@ enum PublishExecError {
 /// operator inspecting the run sees exactly what it will do.
 async fn mint_publish_run(
     pool: &SqlitePool,
+    session_id: Option<SessionId>,
     document_title: &str,
     objective: &str,
 ) -> anyhow::Result<(SessionId, RunId)> {
-    let session_id = SessionId::new();
-    ledger::create_session(pool, session_id, &format!("docs publish: {document_title}")).await?;
+    let session_id = match session_id {
+        Some(session_id) => session_id,
+        None => {
+            let session_id = SessionId::new();
+            ledger::create_session(pool, session_id, &format!("docs publish: {document_title}"))
+                .await?;
+            session_id
+        }
+    };
     let run_id = RunId::new();
     projections::insert_run(
         pool,
@@ -907,6 +917,7 @@ mod tests {
     use std::time::Duration;
 
     use codypendent_daemon::db;
+    use codypendent_daemon::subscriptions::SubscriptionHub;
     use codypendent_integrations::github::idempotency;
     use codypendent_integrations::github::model::{
         CheckRun, NewCheckRun, PullRequest, ReviewComment, UpdatePullRequest,
@@ -915,7 +926,7 @@ mod tests {
         BlockContent, DocumentAuthor, DocumentBlock, DocumentMetadata, NewDocument, Publication,
         Scope,
     };
-    use codypendent_protocol::{ApprovalScope, ClientId};
+    use codypendent_protocol::{ApprovalScope, ClientId, EventBody};
 
     async fn temp_pool(dir: &Path) -> SqlitePool {
         db::open_database(&dir.join("codypendent.db"))
@@ -998,6 +1009,7 @@ mod tests {
             document_id,
             target,
             client_id: ClientId::new(),
+            session_id: None,
         }
     }
 
@@ -1051,6 +1063,48 @@ mod tests {
             repo,
             ArtifactStore::new(dir.join("artifacts")),
         )
+    }
+
+    #[tokio::test]
+    async fn attached_publish_parks_approval_in_the_callers_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = temp_pool(dir.path()).await;
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let document_id = seed_document(&pool, "Reachable approval").await;
+        let session_id = SessionId::new();
+        ledger::create_session(&pool, session_id, "workspace")
+            .await
+            .expect("create caller session");
+        let subscriptions = SubscriptionHub::new();
+        let mut live = subscriptions.subscribe(session_id);
+        let approvals = ApprovalBroker::new().with_subscriptions(subscriptions);
+        let publisher = build_publisher(pool.clone(), approvals, repo, dir.path());
+
+        let parked = publisher
+            .publish(PublishDocumentRequest {
+                document_id,
+                target: wire_target("docs/reachable.md"),
+                client_id: ClientId::new(),
+                session_id: Some(session_id),
+            })
+            .await
+            .expect("publish parks an approval");
+
+        let event = live.recv().await.expect("approval reaches caller session");
+        assert!(matches!(
+            event.body,
+            EventBody::ApprovalRequested { approval_id, .. }
+                if approval_id == parked.approval_id
+        ));
+        let run_session: String = sqlx::query_scalar(
+            "SELECT r.session_id FROM approvals a JOIN runs r ON r.id = a.run_id WHERE a.id = ?",
+        )
+        .bind(parked.approval_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("publish run exists");
+        assert_eq!(run_session, session_id.to_string());
     }
 
     #[tokio::test]

@@ -1,14 +1,15 @@
 //! The common IDE bridge contract (Chapter 10).
 //!
-//! [`IdeBridge`] is the transport-agnostic surface the daemon depends on: reads
+//! [`IdeBridge`] is the transport-agnostic outbound surface planned for reads
 //! of the editor's live state and requests for the editor to act. The IDE
 //! applies edits *semantically* in the editor and never executes tools itself
 //! (invariant 2), so every mutating direction here is a request, not an action
 //! the daemon performs.
 //!
-//! [`RecordingIdeBridge`] is an in-memory implementation for tests and for the
-//! assembly layer to exercise the wiring before a real editor is attached: it
-//! returns configurable state and records every request it is asked to perform.
+//! [`RecordingIdeBridge`] is an in-memory implementation for contract tests. No
+//! production assembly currently injects this trait: `UpdateIdeContext` is the
+//! wired IDE-to-daemon seam, while daemon-to-IDE actions still need correlated
+//! protocol payloads and routing to a connected contributor client.
 
 use async_trait::async_trait;
 use codypendent_protocol::ide::{

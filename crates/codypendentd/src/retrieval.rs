@@ -19,7 +19,9 @@
 //!    same funnel `assemble_context` uses, and reads a disclosed skill's
 //!    `SKILL.md` from its registered package directory.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::io::Read as _;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +38,7 @@ use codypendent_runtime::tools::{
     SEARCH_CARD_LIMIT,
 };
 use codypendent_runtime::HttpEmbedder;
+use sha2::{Digest as _, Sha256};
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
@@ -153,11 +156,14 @@ impl PoolRegistrySearch {
     /// Read a registered skill's `SKILL.md`.
     ///
     /// The package directory comes from the item's own `Provenance::Package`
-    /// row and the file name from its validated manifest — never from the model,
-    /// so this can only ever open a file inside a package the operator
-    /// registered (`load_package` already rejected escaping entrypoints at
-    /// registration). Returns `Err(note)` with a legible reason the tool renders
-    /// rather than swallowing.
+    /// row and the file name from its validated manifest — never from the model.
+    /// The package is revalidated against the exact registered content hash and
+    /// every path component is opened relative to a pinned package-directory
+    /// descriptor with `O_NOFOLLOW`. Registration-time validation alone is not
+    /// enough: a local process could otherwise replace the manifest or retarget
+    /// a symlink after registration and turn `open` into an arbitrary-file read.
+    /// Returns `Err(note)` with a legible reason the tool renders rather than
+    /// swallowing.
     fn read_skill_document(item: &RegistryItem) -> Result<SkillDocument, String> {
         let codypendent_knowledge::Provenance::Package { path } = &item.provenance else {
             return Err(format!(
@@ -166,21 +172,227 @@ impl PoolRegistrySearch {
             ));
         };
         let dir = PathBuf::from(path);
-        let manifest_text = std::fs::read_to_string(dir.join("skill.toml"))
+        let root = open_package_root(&dir)
+            .map_err(|error| format!("could not secure `{}`'s package: {error}", item.name))?;
+        let snapshot = snapshot_open_package(&root)
+            .map_err(|error| format!("could not verify `{}`'s package: {error}", item.name))?;
+        if snapshot.content_hash != item.content_hash {
+            return Err(format!(
+                "`{}` changed after registration; re-register it before opening",
+                item.name
+            ));
+        }
+        let manifest_text = snapshot
+            .text(Path::new("skill.toml"))
             .map_err(|error| format!("could not read `{}`'s manifest: {error}", item.name))?;
         let manifest: codypendent_knowledge::SkillManifest = toml::from_str(&manifest_text)
             .map_err(|error| format!("could not parse `{}`'s manifest: {error}", item.name))?;
+        if manifest.id != item.name || manifest.version != item.version.0 {
+            return Err(format!(
+                "`{}` no longer matches its registered identity",
+                item.name
+            ));
+        }
         let instructions = manifest
             .entrypoints
             .instructions
             .ok_or_else(|| format!("`{}` declares no instructions entrypoint", item.name))?;
-        let content = std::fs::read_to_string(dir.join(&instructions))
+        let content = snapshot
+            .text(Path::new(&instructions))
             .map_err(|error| format!("could not read `{}`: {error}", instructions))?;
         Ok(SkillDocument {
             name: item.name.clone(),
             content,
         })
     }
+}
+
+const MAX_OPEN_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[cfg(unix)]
+struct OpenPackageFile {
+    relative: String,
+    file: std::fs::File,
+    size: u64,
+}
+
+struct OpenPackageSnapshot {
+    content_hash: String,
+    files: HashMap<String, Vec<u8>>,
+}
+
+impl OpenPackageSnapshot {
+    fn text(&self, relative: &Path) -> std::io::Result<String> {
+        let mut normalized = String::new();
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "package path must be relative and may not contain `..`",
+                ));
+            };
+            let name = name.to_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "package path is not valid UTF-8",
+                )
+            })?;
+            if !normalized.is_empty() {
+                normalized.push('/');
+            }
+            normalized.push_str(name);
+        }
+        let bytes = self.files.get(&normalized).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("package file `{normalized}` is missing"),
+            )
+        })?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })
+    }
+}
+
+/// Recompute the registry's deterministic package digest entirely through the
+/// pinned directory descriptor. This closes the validate/open race: replacing
+/// the path while the tool runs cannot change which tree or regular-file
+/// descriptors are read.
+#[cfg(unix)]
+fn snapshot_open_package(root: &std::fs::File) -> std::io::Result<OpenPackageSnapshot> {
+    let mut files = Vec::new();
+    collect_open_package_files(root, "", &mut files)?;
+    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+
+    let mut hasher = Sha256::new();
+    let mut contents = HashMap::new();
+    let mut total = 0_u64;
+    let mut chunk = vec![0_u8; 64 * 1024];
+    for mut entry in files {
+        total = total.saturating_add(entry.size);
+        if total > MAX_OPEN_PACKAGE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "skill package exceeds the 64 MiB read ceiling",
+            ));
+        }
+        hasher.update((entry.relative.len() as u64).to_le_bytes());
+        hasher.update(entry.relative.as_bytes());
+        hasher.update(entry.size.to_le_bytes());
+        let mut bytes = Vec::with_capacity(usize::try_from(entry.size).unwrap_or_default());
+        loop {
+            let count = entry.file.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&chunk[..count]);
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        contents.insert(entry.relative, bytes);
+    }
+    Ok(OpenPackageSnapshot {
+        content_hash: hex::encode(hasher.finalize()),
+        files: contents,
+    })
+}
+
+#[cfg(unix)]
+fn collect_open_package_files(
+    directory: &std::fs::File,
+    prefix: &str,
+    out: &mut Vec<OpenPackageFile>,
+) -> std::io::Result<()> {
+    use rustix::fs::{openat, statat, AtFlags, Dir, FileType, Mode, OFlags};
+
+    let mut entries = Dir::read_from(directory).map_err(std::io::Error::from)?;
+    while let Some(entry) = entries.read() {
+        let entry = entry.map_err(std::io::Error::from)?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let name_text = name.to_str().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "package path is not valid UTF-8",
+            )
+        })?;
+        let relative = if prefix.is_empty() {
+            name_text.to_owned()
+        } else {
+            format!("{prefix}/{name_text}")
+        };
+        let stat =
+            statat(directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from)?;
+        let file_type = FileType::from_raw_mode(stat.st_mode);
+        if file_type.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("package contains symlink `{relative}`"),
+            ));
+        }
+        if file_type.is_dir() {
+            let fd = openat(
+                directory,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?;
+            let child = std::fs::File::from(fd);
+            collect_open_package_files(&child, &relative, out)?;
+        } else if file_type.is_file() {
+            let fd = openat(
+                directory,
+                name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?;
+            let file = std::fs::File::from(fd);
+            let size = file.metadata()?.len();
+            out.push(OpenPackageFile {
+                relative,
+                file,
+                size,
+            });
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("package contains non-regular entry `{relative}`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn snapshot_open_package(_root: &std::fs::File) -> std::io::Result<OpenPackageSnapshot> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure skill package verification is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn open_package_root(dir: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{open, Mode, OFlags};
+
+    let canonical = dir.canonicalize()?;
+    let fd = open(
+        canonical,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(std::fs::File::from(fd))
+}
+
+#[cfg(not(unix))]
+fn open_package_root(dir: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(dir.canonicalize()?)
 }
 
 /// Project a disclosed card + its authoritative item into the tool's card shape.
@@ -403,6 +615,92 @@ publisher = "local-user"
             .content
             .contains("reproduce locally with cargo test"));
         assert_eq!(outcome.open_note, None);
+    }
+
+    #[tokio::test]
+    async fn opening_rejects_a_package_mutated_after_registration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = db::open(&tmp.path().join("codypendent.db"))
+            .await
+            .expect("pool");
+        let package = tmp.path().join("fix-ci");
+        write_package(
+            &package,
+            "rust.fix-ci",
+            "diagnose a failing continuous integration build",
+            "registered procedure",
+        );
+        Registry::new()
+            .register_package(&pool, &package, Scope::System)
+            .await
+            .expect("registers");
+        let item = Registry::new()
+            .list(&pool)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|item| item.name == "rust.fix-ci")
+            .expect("registered item");
+
+        std::fs::write(tmp.path().join("outside-secret.md"), "DO NOT DISCLOSE")
+            .expect("outside file");
+        let manifest = std::fs::read_to_string(package.join("skill.toml"))
+            .expect("read manifest")
+            .replace(
+                "instructions = \"SKILL.md\"",
+                "instructions = \"../outside-secret.md\"",
+            );
+        std::fs::write(package.join("skill.toml"), manifest).expect("retarget manifest");
+
+        let error = PoolRegistrySearch::read_skill_document(&item)
+            .expect_err("post-registration escape must fail closed");
+        assert!(
+            error.contains("changed after registration") || error.contains("escape"),
+            "unexpected refusal: {error}"
+        );
+        assert!(!error.contains("DO NOT DISCLOSE"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opening_rejects_a_post_registration_instruction_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = db::open(&tmp.path().join("codypendent.db"))
+            .await
+            .expect("pool");
+        let package = tmp.path().join("fix-ci");
+        write_package(
+            &package,
+            "rust.fix-ci",
+            "diagnose a failing continuous integration build",
+            "registered procedure",
+        );
+        Registry::new()
+            .register_package(&pool, &package, Scope::System)
+            .await
+            .expect("registers");
+        let item = Registry::new()
+            .list(&pool)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|item| item.name == "rust.fix-ci")
+            .expect("registered item");
+
+        let secret = tmp.path().join("outside-secret.md");
+        std::fs::write(&secret, "DO NOT DISCLOSE").expect("outside file");
+        std::fs::remove_file(package.join("SKILL.md")).expect("remove instructions");
+        symlink(&secret, package.join("SKILL.md")).expect("replace with symlink");
+
+        let error = PoolRegistrySearch::read_skill_document(&item)
+            .expect_err("a post-registration symlink must fail closed");
+        assert!(
+            error.contains("symlink") || error.contains("changed after registration"),
+            "unexpected refusal: {error}"
+        );
+        assert!(!error.contains("DO NOT DISCLOSE"));
     }
 
     /// `open` resolves ONLY against the skills this search disclosed, so it can

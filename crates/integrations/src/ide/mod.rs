@@ -3,11 +3,12 @@
 //! The daemon owns the session; an IDE extension is a thin, editor-aware client
 //! (Chapter 10). This module carries the *daemon-side* half of that contract:
 //!
-//! - [`bridge`] — the transport-agnostic [`IdeBridge`] trait the daemon calls to
-//!   read the editor's live state (workspace, open documents, selection,
-//!   diagnostics) and to ask the editor to act (apply an edit, reveal a
-//!   location, show a diff). A [`RecordingIdeBridge`] proves the contract is
-//!   usable end-to-end without a real editor.
+//! - [`bridge`] — the proposed transport-agnostic outbound [`IdeBridge`] API.
+//!   It is test-backed but not yet connected to the socket server: the wire has
+//!   no correlated daemon-to-IDE apply/reveal/diff request and response payloads.
+//!   Production IDE context currently travels in the opposite direction via
+//!   `CommandBody::UpdateIdeContext`, is persisted latest-wins, and is consumed
+//!   when a run starts.
 //! - [`provenance`] — [`resolve_source`] labels every file excerpt entering
 //!   model context with a [`codypendent_protocol::ide::SourceProvenance`],
 //!   preferring an unsaved editor buffer over the filesystem when their digests

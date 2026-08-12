@@ -77,6 +77,7 @@ pub(super) fn render(
         output,
         visited: 0,
         focus_sequence: 0,
+        visibility_clip: area,
         measure_cache: RefCell::new(HashMap::new()),
     };
 
@@ -147,6 +148,10 @@ struct Painter<'a> {
     output: RemoteUiRenderOutput,
     visited: u32,
     focus_sequence: i32,
+    /// Region that contributes to `visible_nodes`. Usually identical to
+    /// `clip`; a partially visible scroll child is rendered into a logical
+    /// off-screen buffer and uses the source viewport here instead.
+    visibility_clip: Rect,
     /// Per-frame memoization of [`Painter::measure`], keyed by node identity,
     /// available width, and depth. Containers re-measure the same immutable
     /// subtree several times per frame (collapse checks, grids, tabs); every
@@ -214,8 +219,10 @@ impl Painter<'_> {
         if area.is_empty() {
             return;
         }
-        if let Some(id) = &node.id {
-            self.output.visible_nodes.insert(id.clone());
+        if !area.intersection(self.visibility_clip).is_empty() {
+            if let Some(id) = &node.id {
+                self.output.visible_nodes.insert(id.clone());
+            }
         }
         if node.kind.as_str() == node_kinds::TEXT {
             self.text_lines(
@@ -417,14 +424,25 @@ impl Painter<'_> {
         self.draw_border(node, area, border, None);
         let inner = layout::content_box(area, node.props.layout.as_ref(), border);
         let offset = self.scroll_offset(node);
-        let heights = node
+        let gap = layout::gap(node.props.layout.as_ref(), Axis::Vertical);
+        let mut content_area = inner;
+        let mut heights = node
             .children
             .iter()
             .map(|child| self.measure(child, inner.width, depth + 1).max(1))
             .collect::<Vec<_>>();
-        let gap = layout::gap(node.props.layout.as_ref(), Axis::Vertical);
+        let mut total = content_height(&heights, gap);
+        if total > u32::from(inner.height) && inner.width > 1 {
+            content_area.width -= 1;
+            heights = node
+                .children
+                .iter()
+                .map(|child| self.measure(child, content_area.width, depth + 1).max(1))
+                .collect();
+            total = content_height(&heights, gap);
+        }
         let mut logical_y = 0_u32;
-        let viewport_end = offset.saturating_add(u32::from(inner.height));
+        let viewport_end = offset.saturating_add(u32::from(content_area.height));
         for (child, height) in node.children.iter().zip(heights) {
             let child_start = logical_y;
             let child_end = child_start.saturating_add(u32::from(height));
@@ -434,14 +452,21 @@ impl Painter<'_> {
                     .min(viewport_end)
                     .saturating_sub(child_start.max(offset))
                     as u16;
-                let y = inner
+                let y = content_area
                     .y
                     .saturating_add(child_start.saturating_sub(offset) as u16);
-                // If the first block is partially clipped, render its remaining
-                // viewport. Text-like children apply their own line offset.
-                let child_area = Rect::new(inner.x, y, inner.width, visible_height);
-                if clipped_top == 0 || visible_height > 0 {
+                let child_area = Rect::new(content_area.x, y, content_area.width, visible_height);
+                if clipped_top == 0 && visible_height == height {
                     self.node(child, child_area, depth + 1);
+                } else if visible_height > 0 {
+                    self.scrolled_child(
+                        child,
+                        content_area.width,
+                        height,
+                        clipped_top as u16,
+                        child_area,
+                        depth + 1,
+                    );
                 }
             }
             logical_y = child_end.saturating_add(u32::from(gap));
@@ -449,7 +474,84 @@ impl Painter<'_> {
                 break;
             }
         }
-        self.scrollbar(area, logical_y, offset, inner.height);
+        self.scrollbar(inner, total, offset, inner.height);
+    }
+
+    /// Paint a partially visible child at its full logical height, then crop
+    /// the requested rows into the real viewport. Passing a shortened area
+    /// directly to a Stack/Grid would make that container lay itself out again
+    /// from row zero, which produces the wrong rows for nested scroll content.
+    fn scrolled_child(
+        &mut self,
+        child: &UiNode,
+        width: u16,
+        height: u16,
+        clipped_top: u16,
+        destination: Rect,
+        depth: u16,
+    ) {
+        let logical_area = Rect::new(0, 0, width, height);
+        let source_viewport = Rect::new(0, clipped_top, width, destination.height);
+        let mut scratch = Buffer::empty(logical_area);
+        let mut nested = Painter {
+            buffer: &mut scratch,
+            clip: logical_area,
+            theme: self.theme,
+            capabilities: self.capabilities,
+            state: self.state,
+            options: self.options,
+            output: RemoteUiRenderOutput::default(),
+            visited: self.visited,
+            focus_sequence: self.focus_sequence,
+            visibility_clip: source_viewport,
+            measure_cache: RefCell::new(HashMap::new()),
+        };
+        nested.node(child, logical_area, depth);
+        self.visited = nested.visited;
+        self.focus_sequence = nested.focus_sequence;
+        let mut nested_output = std::mem::take(&mut nested.output);
+        drop(nested);
+
+        for row in 0..destination.height {
+            let source_y = clipped_top.saturating_add(row);
+            let destination_y = destination.y.saturating_add(row);
+            for column in 0..destination.width {
+                let Some(source) = scratch.cell((column, source_y)).cloned() else {
+                    continue;
+                };
+                if let Some(target) = self
+                    .buffer
+                    .cell_mut((destination.x.saturating_add(column), destination_y))
+                {
+                    *target = source;
+                }
+            }
+        }
+
+        nested_output.focus_order.retain_mut(|descriptor| {
+            translate_scrolled_rect(&mut descriptor.area, source_viewport, destination)
+        });
+        nested_output.hit_regions.retain_mut(|region| {
+            translate_scrolled_rect(&mut region.area, source_viewport, destination)
+        });
+        nested_output
+            .form_fields
+            .retain(|field| nested_output.visible_nodes.contains(&field.node_id));
+        self.output
+            .focus_order
+            .append(&mut nested_output.focus_order);
+        self.output
+            .hit_regions
+            .append(&mut nested_output.hit_regions);
+        self.output
+            .form_fields
+            .append(&mut nested_output.form_fields);
+        self.output
+            .diagnostics
+            .append(&mut nested_output.diagnostics);
+        self.output
+            .visible_nodes
+            .append(&mut nested_output.visible_nodes);
     }
 
     fn portal(&mut self, node: &UiNode, area: Rect, depth: u16) {
@@ -2421,6 +2523,24 @@ impl Painter<'_> {
     }
 }
 
+fn translate_scrolled_rect(area: &mut Rect, source_viewport: Rect, destination: Rect) -> bool {
+    let visible = area.intersection(source_viewport);
+    if visible.is_empty() {
+        return false;
+    }
+    *area = Rect::new(
+        destination
+            .x
+            .saturating_add(visible.x.saturating_sub(source_viewport.x)),
+        destination
+            .y
+            .saturating_add(visible.y.saturating_sub(source_viewport.y)),
+        visible.width.min(destination.width),
+        visible.height.min(destination.height),
+    );
+    true
+}
+
 fn diagnostic_panel(buffer: &mut Buffer, area: Rect, theme: &Theme, title: &str, message: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2460,6 +2580,15 @@ fn bounded_height(value: usize) -> u16 {
     u16::try_from(value)
         .unwrap_or(u16::MAX)
         .min(MAX_MEASURED_HEIGHT)
+}
+
+fn content_height(heights: &[u16], gap: u16) -> u32 {
+    heights
+        .iter()
+        .copied()
+        .map(u32::from)
+        .sum::<u32>()
+        .saturating_add(u32::from(gap).saturating_mul(heights.len().saturating_sub(1) as u32))
 }
 
 fn edge_cells(value: f64) -> u16 {
@@ -3521,6 +3650,147 @@ mod tests {
     }
 
     #[test]
+    fn scroll_area_applies_partial_child_line_offset() {
+        let mut root = UiNode::element("scroll", primitives::SCROLL_AREA);
+        root.children = vec![text("lines", "zero\none\ntwo")];
+        let mut view = RemoteUiViewState::default();
+        view.scroll_offsets.insert(UiNodeId::from("scroll"), 1);
+        let area = Rect::new(0, 0, 8, 2);
+        let mut buffer = Buffer::empty(area);
+        render_remote_ui(
+            &mut buffer,
+            area,
+            &document(root),
+            &Theme::dark(),
+            &TerminalUiCapabilities::native(),
+            &view,
+            RemoteUiRenderOptions::default(),
+        );
+        assert!(buffer_snapshot(&buffer)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .starts_with("one"));
+    }
+
+    #[test]
+    fn scroll_area_preserves_nested_stack_layout_when_partially_clipped() {
+        let mut stack = UiNode::element("stack", primitives::STACK);
+        stack.children = vec![
+            text("zero", "zero"),
+            text("one", "one"),
+            text("two", "two"),
+            text("three", "three"),
+        ];
+        let mut root = UiNode::element("scroll", primitives::SCROLL_AREA);
+        root.children = vec![stack];
+        let mut view = RemoteUiViewState::default();
+        view.scroll_offsets.insert(UiNodeId::from("scroll"), 2);
+        let area = Rect::new(0, 0, 8, 2);
+        let mut buffer = Buffer::empty(area);
+        let output = render_remote_ui(
+            &mut buffer,
+            area,
+            &document(root),
+            &Theme::dark(),
+            &TerminalUiCapabilities::native(),
+            &view,
+            RemoteUiRenderOptions::default(),
+        );
+
+        let snapshot = buffer_snapshot(&buffer);
+        assert!(snapshot
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .starts_with("two"));
+        assert!(snapshot
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .starts_with("three"));
+        assert!(output.visible_nodes.contains(&UiNodeId::from("two")));
+        assert!(output.visible_nodes.contains(&UiNodeId::from("three")));
+        assert!(!output.visible_nodes.contains(&UiNodeId::from("zero")));
+        assert!(!output.visible_nodes.contains(&UiNodeId::from("one")));
+    }
+
+    #[test]
+    fn scroll_area_translates_nested_interactions_into_the_viewport() {
+        let mut button = UiNode::element("run", primitives::BUTTON);
+        button
+            .props
+            .attributes
+            .insert("label".to_owned(), Value::String("Run".to_owned()));
+        button.props.event_bindings.push(UiActionBinding {
+            event: UiEventType::from("press"),
+            action_id: UiActionId::from("run.execute"),
+            payload: Value::Null,
+            requires: Vec::new(),
+            disabled: false,
+            confirmation: None,
+        });
+        let mut stack = UiNode::element("stack", primitives::STACK);
+        stack.children = vec![text("zero", "zero"), text("one", "one"), button];
+        let mut root = UiNode::element("scroll", primitives::SCROLL_AREA);
+        root.children = vec![stack];
+        let mut view = RemoteUiViewState::default();
+        view.scroll_offsets.insert(UiNodeId::from("scroll"), 1);
+        let area = Rect::new(0, 0, 8, 2);
+        let mut buffer = Buffer::empty(area);
+        let output = render_remote_ui(
+            &mut buffer,
+            area,
+            &document(root),
+            &Theme::dark(),
+            &TerminalUiCapabilities::native(),
+            &view,
+            RemoteUiRenderOptions::default(),
+        );
+
+        assert!(buffer_snapshot(&buffer)
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .starts_with("▐ Run ▌"));
+        assert_eq!(output.focus_order.len(), 1);
+        assert_eq!(output.focus_order[0].node_id, UiNodeId::from("run"));
+        assert_eq!(output.focus_order[0].area, Rect::new(0, 1, 7, 1));
+        assert_eq!(output.hit_regions.len(), 1);
+        assert_eq!(output.hit_regions[0].area, Rect::new(0, 1, 7, 1));
+    }
+
+    #[test]
+    fn scroll_area_reserves_a_column_for_its_scrollbar() {
+        let mut root = UiNode::element("scroll", primitives::SCROLL_AREA);
+        root.children = vec![text("lines", "ABCDE\nFGHIJ\nKLMNO")];
+        let area = Rect::new(0, 0, 6, 2);
+        let mut buffer = Buffer::empty(area);
+        render_remote_ui(
+            &mut buffer,
+            area,
+            &document(root),
+            &Theme::dark(),
+            &TerminalUiCapabilities::native(),
+            &RemoteUiViewState::default(),
+            RemoteUiRenderOptions::default(),
+        );
+        let first = buffer_snapshot(&buffer)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            first.starts_with("ABCDE"),
+            "content was overwritten: {first:?}"
+        );
+        assert!(
+            first.chars().count() >= 6,
+            "scrollbar column missing: {first:?}"
+        );
+    }
+
+    #[test]
     fn narrow_table_switches_to_stacked_records() {
         let mut table = UiNode::element("table", primitives::TABLE);
         table.props.structured_data = Some(UiData {
@@ -3995,6 +4265,7 @@ mod tests {
             output: RemoteUiRenderOutput::default(),
             visited: 0,
             focus_sequence: 0,
+            visibility_clip: area,
             measure_cache: RefCell::new(HashMap::new()),
         };
         let first = painter.measure(&document.root, 40, 0);

@@ -119,6 +119,13 @@ impl McpRegistry {
     /// in [`McpBridge::call_tool`] shares the same per-server warm logic
     /// ([`ensure_ready`](Self::ensure_ready)).
     pub async fn warm_all(&self) {
+        let _ = self.warm_all_with_failures().await;
+    }
+
+    /// Warm every server and return the failures as `(server, reason)` pairs.
+    /// The assembly uses this to update its live health projection while this
+    /// registry remains responsible for logging the detailed transport error.
+    pub async fn warm_all_with_failures(&self) -> Vec<(String, String)> {
         futures::future::join_all(self.servers.keys().map(|server| async move {
             if let Err(error) = self.ensure_ready(server).await {
                 tracing::warn!(
@@ -126,9 +133,15 @@ impl McpRegistry {
                     %error,
                     "mcp server failed to warm; its tools stay unavailable"
                 );
+                Some((server.clone(), error.to_string()))
+            } else {
+                None
             }
         }))
-        .await;
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// Ensure `server` is ready — spawning, handshaking, and listing tools on
@@ -539,6 +552,16 @@ mod tests {
             .expect("the failure did not latch; retry succeeds");
         assert_eq!(text, "ok from tool");
         assert_eq!(spawns.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn warm_failures_are_returned_for_health_projection() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let registry = scripted_registry(Behavior::FailFirstSpawn, Arc::clone(&spawns));
+        let failures = registry.warm_all_with_failures().await;
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "fake");
+        assert!(failures[0].1.contains("scripted spawn failure"));
     }
 
     #[tokio::test]

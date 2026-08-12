@@ -6,6 +6,16 @@ The daemon owns the session. IDE extensions are thin, editor-aware clients.
 
 ### Common bridge
 
+The production seam today is IDE-to-daemon: a contributor sends the latest
+selection, open-document, diagnostic, and dirty-buffer digest projection with
+`UpdateIdeContext`; the daemon stores one latest-wins row per session and seeds
+new runs from it. The Rust trait below is the contract for the reverse direction
+and is not yet attached to a live editor. Completing it requires correlated
+daemon-to-IDE apply/reveal/show-diff request and response payloads plus routing
+those requests to the correct connected contributor. Presence alone is not a
+safe transport handle, so the daemon must not silently use the test recorder as
+a production substitute.
+
 ```rust
 #[async_trait]
 pub trait IdeBridge {

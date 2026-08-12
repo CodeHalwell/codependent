@@ -50,8 +50,8 @@ impl Pane {
 
 /// Which base layout the shell renders. Toggled at runtime (`F2` or the palette);
 /// the composer and status footer are identical in both — only the region above
-/// them changes, and the input model (composer / palette / approval modal) is the
-/// same in each, so the panes are at-a-glance context, not a separate mode.
+/// them changes. In Workspace, `Tab` can give a side pane keyboard focus so its
+/// arrows/page keys navigate that pane; the center pane retains the composer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LayoutMode {
     /// The single-column conversation (the Claude Code / Codex feel). Default.
@@ -219,9 +219,24 @@ pub enum Overlay {
     UiPlugins,
     /// Confirm the exact daemon-issued update receipt after its permission diff
     /// has been shown in the plugin detail rail.
-    ConfirmUiPluginApprove { plugin_id: String, receipt: String },
+    ConfirmUiPluginApprove {
+        plugin_id: String,
+        receipt: String,
+        /// The exact daemon-supplied permission delta being approved. Kept on
+        /// the host-owned confirmation so the decisive prompt never loses the
+        /// evidence the operator is consenting to.
+        permission_diff: String,
+    },
     /// Reject the exact pending update receipt.
     ConfirmUiPluginReject { plugin_id: String, receipt: String },
+    /// Confirm enabling an installed plugin at the requested scope. Enabling is
+    /// a trust transition, so the browser key opens this host-owned prompt and
+    /// only confirmation emits the enable intent.
+    ConfirmUiPluginEnable {
+        plugin_id: String,
+        scope: String,
+        permission_summary: String,
+    },
     /// Revoke the selected plugin and tear down its workers.
     ConfirmUiPluginRevoke { plugin_id: String },
     /// Confirm cancellation of a durable workflow run.
@@ -626,6 +641,25 @@ pub enum RunActivity {
     RunningTool(String),
 }
 
+/// Where an unacknowledged first-run draft came from. A rejected wire command
+/// is restored to the same editing surface, so admission failure never eats
+/// operator input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStartDraftTarget {
+    Composer,
+    NewRunPrompt,
+}
+
+/// The exact draft held while a first `StartRun` waits for its durable
+/// `RunStarted` event. This is client-local admission state, not a timeout:
+/// transport loss is repaired by the CLI resending the original idempotent
+/// envelope, and a correlated rejection restores this draft for editing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRunStart {
+    pub draft: String,
+    pub target: RunStartDraftTarget,
+}
+
 /// Everything known about one run, and its transcript.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunView {
@@ -849,12 +883,19 @@ pub struct DocSuggestionView {
     /// `MutateDocument` (never rendered; carried so the reducer can resolve the
     /// focused suggestion without a second lookup).
     pub id: String,
+    /// Stable block the proposal targets.
+    pub block_id: String,
+    /// Document revision the proposer reviewed. Accepting a stale proposal is
+    /// refused by the daemon; surfacing it here lets review UI explain why.
+    pub source_revision: u64,
     /// The suggestion status (`pending` for the review rail).
     pub status: String,
     /// Who proposed it, pre-rendered (e.g. `"agent"` / `"human"`).
     pub author: String,
     /// The character range it targets, pre-rendered (e.g. `"12..40"`).
     pub range: String,
+    /// The exact source text the proposer intends to replace.
+    pub original: String,
     /// The proposed replacement text.
     pub replacement: String,
     /// The proposer's rationale, when given.
@@ -1627,6 +1668,12 @@ pub struct AppState {
     pub runs: Vec<RunView>,
     /// Index into `runs` of the selected run.
     pub selected_run: usize,
+    /// A locally-issued first `StartRun` whose durable `RunStarted` has not yet
+    /// folded back. While present, another empty-session submit remains
+    /// editable instead of launching a duplicate run. It is cleared only by a
+    /// durable start, a correlated rejection, or an explicit fresh-session
+    /// swap; the CLI retries the same idempotent envelope across reconnects.
+    pub pending_run_start: Option<PendingRunStart>,
     /// Pending approvals across the session.
     pub pending_approvals: Vec<PendingApproval>,
     /// Index into `pending_approvals` of the focused approval.
@@ -1649,6 +1696,10 @@ pub struct AppState {
     pub docs: Vec<DocCard>,
     /// Index into `docs` of the focused document.
     pub selected_doc: usize,
+    /// A just-created document to focus after the host reloads the Docs
+    /// projection. The host consumes this only when that id appears, preserving
+    /// the current selection across unrelated refreshes.
+    pub pending_document_selection: Option<DocumentId>,
     /// Index into the focused document's `blocks` of the focused block (the editor
     /// rail cursor; the edit action targets this block).
     pub selected_block: usize,
@@ -1744,8 +1795,8 @@ pub struct AppState {
     pub issues: Vec<String>,
     /// Index into [`AppState::issues`] for the diagnostics overlay.
     pub selected_issue: usize,
-    /// The focused pane. Vestigial in the conversation-centred shell (the
-    /// transcript is the single main surface); retained for catch-up/mouse code.
+    /// The focused pane. In Workspace this owns side-pane navigation; in Chat
+    /// the persistent composer remains active regardless of the retained value.
     pub focus: Pane,
     /// The persistent composer buffer (the always-present bottom input). Typed
     /// text lands here; Enter sends it (starting a run, or steering the active
@@ -1864,6 +1915,7 @@ impl AppState {
             session_closed: false,
             runs: Vec::new(),
             selected_run: 0,
+            pending_run_start: None,
             pending_approvals: Vec::new(),
             selected_approval: 0,
             skills: Vec::new(),
@@ -1872,6 +1924,7 @@ impl AppState {
             selected_memory: 0,
             docs: Vec::new(),
             selected_doc: 0,
+            pending_document_selection: None,
             selected_block: 0,
             selected_suggestion: 0,
             doc_focus: DocFocus::default(),
@@ -1924,6 +1977,12 @@ impl AppState {
     /// The input mode the next key should be interpreted in.
     #[must_use]
     pub fn input_mode(&self) -> InputMode {
+        // A daemon approval is a security boundary, not a background badge.
+        // It preempts ordinary browsers/prompts so the action cannot disappear
+        // behind an overlay while its run waits indefinitely.
+        if !self.pending_approvals.is_empty() {
+            return InputMode::Approval;
+        }
         if let Overlay::CouncilBuilder(builder) = &self.overlay {
             return match builder.step {
                 CouncilBuilderStep::Name
@@ -1972,6 +2031,7 @@ impl AppState {
             | Overlay::ApiKeyRemoveConfirm { .. }
             | Overlay::ConfirmUiPluginApprove { .. }
             | Overlay::ConfirmUiPluginReject { .. }
+            | Overlay::ConfirmUiPluginEnable { .. }
             | Overlay::ConfirmUiPluginRevoke { .. }
             | Overlay::ConfirmCouncilDelete { .. }
             | Overlay::UnslothConfirmPull { .. }
@@ -2017,6 +2077,8 @@ impl AppState {
                     InputMode::Approval
                 } else if self.remote_ui.active && !self.remote_ui.mounted_documents().is_empty() {
                     InputMode::RemoteUi
+                } else if self.layout == LayoutMode::Workspace && self.focus != Pane::Transcript {
+                    InputMode::Normal
                 } else {
                     InputMode::Composer
                 }
@@ -2043,11 +2105,11 @@ impl AppState {
         })
     }
 
-    /// Whether the approval modal should be shown: there is at least one pending
-    /// approval and no other overlay is competing for the foreground.
+    /// Whether the host-owned approval modal should be shown. Approvals always
+    /// sit above extension and ordinary TUI overlays until decided.
     #[must_use]
     pub fn show_approval_modal(&self) -> bool {
-        !self.pending_approvals.is_empty() && matches!(self.overlay, Overlay::None)
+        !self.pending_approvals.is_empty()
     }
 
     /// The focused pending approval, if any.
@@ -2253,8 +2315,10 @@ impl AppState {
         self.session_closed = false;
         self.runs.clear();
         self.selected_run = 0;
+        self.pending_run_start = None;
         self.pending_approvals.clear();
         self.selected_approval = 0;
+        self.pending_document_selection = None;
         self.composer.clear();
         self.composer_stash = None;
         self.history_cursor = None;

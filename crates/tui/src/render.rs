@@ -12,7 +12,10 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 use ratatui::Frame;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -54,6 +57,27 @@ pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
         Block::default().style(Style::default().bg(theme.surface.background)),
         area,
     );
+
+    // Ratatui may legitimately hand us a 0-4 row viewport while a terminal is
+    // being resized. The full shell has five independently meaningful rows;
+    // forcing them into less space used to create a zero-height bordered
+    // composer. Render a stable, non-interactive compact frame instead.
+    if area.height < 5 || area.width < 20 {
+        let compact = vec![
+            Line::styled(
+                "codypendent",
+                Style::default()
+                    .fg(theme.text.heading)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                "resize terminal to continue",
+                Style::default().fg(theme.text.muted),
+            ),
+        ];
+        frame.render_widget(Paragraph::new(compact), area);
+        return;
+    }
 
     // A conversation-centred shell: one calm project header, the transcript,
     // an inline composer, and one contextual footer. Secondary surfaces remain
@@ -1081,7 +1105,10 @@ fn style_for(role: SpanRole, theme: &Theme) -> Style {
         SpanRole::Rule => base.fg(theme.text.muted),
         SpanRole::TableHeader => base.fg(theme.text.heading).add_modifier(Modifier::BOLD),
         SpanRole::TableCell => base.fg(theme.agent.model_text),
-        SpanRole::TableRule => base.fg(theme.surface.border),
+        // A table rule is meaningful content, not decorative panel chrome. It
+        // therefore needs text contrast rather than the deliberately subtle
+        // border token.
+        SpanRole::TableRule => base.fg(theme.text.muted),
         SpanRole::CodePlain => base.fg(theme.text.primary),
         SpanRole::CodeToken(SyntaxRole::Keyword) => base.fg(theme.syntax.keyword),
         SpanRole::CodeToken(SyntaxRole::Literal) => base.fg(theme.syntax.literal),
@@ -1370,8 +1397,12 @@ fn push_turn_time<'a>(
     // The clock has to read as its own right-hand field, not as text jammed
     // onto the end of the header, so it needs a visible gap before it.
     const TURN_TIME_MIN_GAP: usize = 4;
+    // Even a short header can technically leave four cells at 24 columns, but
+    // spending a quarter of that scarce row on a clock makes the primary turn
+    // identity feel crowded. Treat the clock as wide-screen metadata.
+    const TURN_TIME_MIN_WIDTH: usize = 32;
     let needed = used + label.len() + TURN_TIME_MIN_GAP;
-    if usize::from(inner_width) < needed {
+    if usize::from(inner_width) < needed.max(TURN_TIME_MIN_WIDTH) {
         return;
     }
     let pad = usize::from(inner_width) - used - label.len();
@@ -1755,7 +1786,7 @@ fn render_composer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     // Belt-and-braces: the full-screen scrim (`render_overlays`) already
     // returns to typing on an outside click; this covers the composer
     // specifically in case it ever renders above the scrim.
-    if !matches!(state.overlay, Overlay::None) {
+    if !matches!(state.overlay, Overlay::None) && !state.show_approval_modal() {
         state.register_hit(area, Action::Dismiss);
     }
 }
@@ -2237,49 +2268,63 @@ fn backstage_lines<'a>(
 
 fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let bg = Style::default().bg(theme.surface.background);
-    // Voice v1 (rubric 8): a hot microphone outranks every other status,
-    // including a transient notice — the one thing a user must never fail to
-    // notice is that they are being recorded.
-    if state.voice.recording {
-        let line = Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                "◉ ",
-                Style::default()
-                    .fg(theme.status.warning)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "Recording",
-                Style::default()
-                    .fg(theme.status.warning)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  ·  press the push-to-talk key again to stop and send",
-                Style::default().fg(theme.text.muted),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line).style(bg), area);
-        return;
-    }
-    if let Some((notice, _)) = &state.notice {
-        let line = Line::from(vec![
-            Span::raw("  "),
-            Span::styled("● ", Style::default().fg(theme.status.warning)),
-            Span::styled(notice.clone(), Style::default().fg(theme.text.secondary)),
-        ]);
-        frame.render_widget(Paragraph::new(line).style(bg), area);
-        return;
-    }
-
     let status = state.status();
 
     // The right-hand hints are real chips: each one measured, each one a click
     // target for the very Action its key produces. (The old curated
     // `FOOTER_HINTS` table was never rendered at all; these contextual chips
     // supersede it.)
-    let (left, right): (Vec<Span>, Vec<Chip>) = if status.pending_approvals > 0 {
+    let (left, right): (Vec<Span>, Vec<Chip>) = if state.voice.recording {
+        let right = if status.pending_approvals > 0 {
+            vec![
+                Chip::new("a", "once", Action::Approve(ApprovalScope::Once)),
+                Chip::new("A", "run", Action::Approve(ApprovalScope::Run)),
+                Chip::new("r", "reject", Action::Reject),
+            ]
+        } else if !state.issues.is_empty() {
+            vec![Chip::new("/", "diagnostics", Action::OpenIssues)]
+        } else {
+            Vec::new()
+        };
+        (
+            vec![
+                Span::raw("  "),
+                Span::styled(
+                    "◉ ",
+                    Style::default()
+                        .fg(theme.status.warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "Recording · press push-to-talk again to stop",
+                    Style::default()
+                        .fg(theme.status.warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ],
+            right,
+        )
+    } else if let Some((notice, _)) = &state.notice {
+        let right = if status.pending_approvals > 0 {
+            vec![
+                Chip::new("a", "once", Action::Approve(ApprovalScope::Once)),
+                Chip::new("A", "run", Action::Approve(ApprovalScope::Run)),
+                Chip::new("r", "reject", Action::Reject),
+            ]
+        } else if !state.issues.is_empty() {
+            vec![Chip::new("/", "diagnostics", Action::OpenIssues)]
+        } else {
+            Vec::new()
+        };
+        (
+            vec![
+                Span::raw("  "),
+                Span::styled("● ", Style::default().fg(theme.status.warning)),
+                Span::styled(notice.clone(), Style::default().fg(theme.text.secondary)),
+            ],
+            right,
+        )
+    } else if status.pending_approvals > 0 {
         (
             vec![
                 Span::raw("  "),
@@ -2309,6 +2354,15 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                 ),
             ],
             vec![Chip::new("/", "diagnostics", Action::OpenIssues)],
+        )
+    } else if state.session_closed {
+        (
+            vec![
+                Span::raw("  "),
+                Span::styled("■ ", Style::default().fg(theme.text.muted)),
+                Span::styled("Session closed", Style::default().fg(theme.text.secondary)),
+            ],
+            vec![Chip::new("/", "commands", Action::OpenPalette)],
         )
     } else if !state.composer.is_empty() {
         (
@@ -2501,13 +2555,19 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::Blackboard => render_blackboard(frame, area, state, theme),
         Overlay::Kanban => render_kanban(frame, area, state, theme),
         Overlay::UiPlugins => render_ui_plugins(frame, area, state, theme),
-        Overlay::ConfirmUiPluginApprove { plugin_id, receipt } => render_confirm_box(
+        Overlay::ConfirmUiPluginApprove {
+            plugin_id,
+            receipt,
+            permission_diff,
+        } => render_confirm_box(
             frame,
             area,
             state,
             theme,
             "Approve this verified permission update?",
-            &format!("plugin {plugin_id} · exact receipt {receipt}"),
+            &format!(
+                "plugin {plugin_id}\n\nHost-verified permission delta:\n{permission_diff}\n\nExact receipt: {receipt}"
+            ),
         ),
         Overlay::ConfirmUiPluginReject { plugin_id, receipt } => render_confirm_box(
             frame,
@@ -2516,6 +2576,20 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
             theme,
             "Reject this verified permission update?",
             &format!("plugin {plugin_id} · exact receipt {receipt}"),
+        ),
+        Overlay::ConfirmUiPluginEnable {
+            plugin_id,
+            scope,
+            permission_summary,
+        } => render_confirm_box(
+            frame,
+            area,
+            state,
+            theme,
+            "Enable this verified Remote UI plugin?",
+            &format!(
+                "plugin {plugin_id}\nscope: {scope}\n\nHost-verified permissions:\n{permission_summary}"
+            ),
         ),
         Overlay::ConfirmUiPluginRevoke { plugin_id } => render_confirm_box(
             frame,
@@ -2757,11 +2831,17 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 registered_id.as_deref(),
             );
         }
-        Overlay::None => {
-            if state.show_approval_modal() {
-                render_approval_modal(frame, area, state, theme);
-            }
-        }
+        Overlay::None => {}
+    }
+    // Approval is drawn last and therefore owns both visual and hit-test
+    // z-order, even when it arrived while a browser/prompt was open.
+    if state.show_approval_modal() {
+        // Own the entire scrim, not merely the approval rectangle. Otherwise
+        // an outside click could still activate or dismiss the pre-empted
+        // browser underneath it. Decision controls register after this shield
+        // and therefore remain the topmost targets.
+        state.register_hit(area, Action::NoOp);
+        render_approval_modal(frame, area, state, theme);
     }
 }
 
@@ -3297,7 +3377,11 @@ fn render_model_picker(
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(inner);
     render_modal_search(frame, rows[0], query, theme);
 
@@ -3326,7 +3410,7 @@ fn render_model_picker(
             Style::default().fg(theme.text.muted),
         )));
     }
-    for (row, &idx) in matches.iter().enumerate().skip(first) {
+    for (row, &idx) in matches.iter().enumerate().skip(first).take(visible_rows) {
         let card = &state.models[idx];
         let is_selected = row == selected;
         let is_current = current == Some(&card.id);
@@ -3375,6 +3459,17 @@ fn render_model_picker(
         List::new(items).style(Style::default().bg(theme.surface.panel)),
         list_area,
     );
+    if matches.len() > visible_rows {
+        let mut scrollbar = ScrollbarState::new(matches.len()).position(selected);
+        frame.render_stateful_widget(
+            Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
+            list_region.inner(Margin {
+                horizontal: 0,
+                vertical: 1,
+            }),
+            &mut scrollbar,
+        );
+    }
     // Each visible row is a fixed 3 lines tall (head/provider/badges) — register
     // a rect of that height per rendered row (offset by the scroll window) so a
     // click maps to the right index even after the list has scrolled.
@@ -3458,11 +3553,6 @@ fn render_model_picker(
             Style::default().fg(theme.text.muted),
         ));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "  ↑/↓ select · Enter stage · Esc close",
-        Style::default().fg(theme.text.muted),
-    ));
     if let Some(detail_area) = detail_region {
         frame.render_widget(
             Paragraph::new(lines)
@@ -3471,6 +3561,14 @@ fn render_model_picker(
             detail_area,
         );
     }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ or wheel · PgUp/PgDn · Home/End · Enter stage · Esc close",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
 }
 
 /// A model card's badges, space-joined: `local ✓` / `hosted` (or nothing when
@@ -4372,6 +4470,8 @@ fn render_memory(
 /// decisions, live CRDT sync, and approval-gated Markdown publishing all use
 /// this surface. Colors are Theme tokens only (RULE 7).
 fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let docs_footer_primary = " Tab rail · ↑/↓ · a accept · r reject · Esc";
+    let docs_footer_secondary = " n new · e edit · i ins · X del · P publish";
     let rect = centered_rect(86, 86, area);
     shield_modal(state, rect);
     frame.render_widget(Clear, rect);
@@ -4413,8 +4513,8 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Style::default().fg(theme.text.secondary),
             ),
             Line::styled(
-                "  Creation is not wired here yet; this view edits existing documents.",
-                Style::default().fg(theme.status.warning),
+                "  Press n to create one, or ask an agent to draft it from this session.",
+                Style::default().fg(theme.text.muted),
             ),
         ]));
     }
@@ -4596,8 +4696,14 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .as_deref()
                 .map_or_else(String::new, |text| format!(" · {text}"));
             let summary = format!(
-                "{} @ {}{} → {}",
-                suggestion.author, suggestion.range, rationale, suggestion.replacement
+                "{} · {}@r{} {}{} · {:?} → {:?}",
+                suggestion.author,
+                suggestion.block_id,
+                suggestion.source_revision,
+                suggestion.range,
+                rationale,
+                suggestion.original,
+                suggestion.replacement
             );
             review_lines.push(Line::from(vec![
                 Span::styled(bullet, bullet_style),
@@ -4631,12 +4737,9 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             // Both lines are sized to the narrowest rail this footer is pinned
             // in (43 columns at an 80-wide terminal), so no control is silently
             // truncated away.
+            Line::styled(docs_footer_primary, Style::default().fg(theme.text.muted)),
             Line::styled(
-                " Tab rail · ↑/↓ · a accept · r reject · Esc",
-                Style::default().fg(theme.text.muted),
-            ),
-            Line::styled(
-                " n new · e edit · i ins · X del · P publish",
+                docs_footer_secondary,
                 Style::default().fg(theme.focus.active),
             ),
         ]),
@@ -4645,35 +4748,57 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     // Fixed footer controls stay clickable even when long documents or review
     // queues make the content rails scroll.
-    state.register_hit(
-        Rect {
-            x: review_rows[1].x + 1,
-            y: review_rows[1].y,
-            width: 8.min(review_rows[1].width.saturating_sub(1)),
-            height: 1,
-        },
-        Action::CyclePane,
-    );
-    let mut x = review_rows[1].x + 1;
-    for (width, action) in [
-        (6, Action::EditDoc),
+    for (line, y, label, action) in [
         (
-            8,
+            docs_footer_primary,
+            review_rows[1].y,
+            "Tab rail",
+            Action::CyclePane,
+        ),
+        (
+            docs_footer_primary,
+            review_rows[1].y,
+            "a accept",
             Action::Approve(codypendent_protocol::ApprovalScope::Once),
         ),
-        (8, Action::Reject),
-        (9, Action::PublishDoc),
+        (
+            docs_footer_primary,
+            review_rows[1].y,
+            "r reject",
+            Action::Reject,
+        ),
+        (
+            docs_footer_secondary,
+            review_rows[1].y + 1,
+            "n new",
+            Action::NewDoc,
+        ),
+        (
+            docs_footer_secondary,
+            review_rows[1].y + 1,
+            "e edit",
+            Action::EditDoc,
+        ),
+        (
+            docs_footer_secondary,
+            review_rows[1].y + 1,
+            "i ins",
+            Action::InsertDocBlock,
+        ),
+        (
+            docs_footer_secondary,
+            review_rows[1].y + 1,
+            "X del",
+            Action::DeleteDocBlock,
+        ),
+        (
+            docs_footer_secondary,
+            review_rows[1].y + 1,
+            "P publish",
+            Action::PublishDoc,
+        ),
     ] {
-        state.register_hit(
-            Rect {
-                x,
-                y: review_rows[1].y + 1,
-                width: width.min(review_rows[1].right().saturating_sub(x)),
-                height: 1,
-            },
-            action,
-        );
-        x = x.saturating_add(width + 3);
+        register_text_hit(state, review_rows[1], line, y, label, action);
     }
 }
 
@@ -5872,7 +5997,7 @@ fn render_approval_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
     let Some(approval) = state.focused_approval() else {
         return;
     };
-    let rect = centered_rect(70, 60, area);
+    let rect = centered_rect_min(70, 60, 60, 14, area);
     shield_modal(state, rect);
     frame.render_widget(Clear, rect);
 
@@ -5905,18 +6030,6 @@ fn render_approval_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
     ));
     lines.push(Line::raw(""));
 
-    lines.push(Line::from(vec![
-        Span::styled(
-            "[a] approve once   ",
-            Style::default().fg(theme.status.success),
-        ),
-        Span::styled(
-            "[A] approve for run   ",
-            Style::default().fg(theme.status.success),
-        ),
-        Span::styled("[r] reject", Style::default().fg(theme.status.error)),
-    ]));
-
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Approval ")
@@ -5932,6 +6045,48 @@ fn render_approval_modal(frame: &mut Frame, area: Rect, state: &AppState, theme:
             .wrap(Wrap { trim: false }),
         rect,
     );
+
+    // Pin the decisive controls to the modal footer. Keeping them out of the
+    // wrapping body makes their painted and clickable rows identical even
+    // when a long risk explanation fills the card.
+    let controls = " [a] approve once · [A] approve for run · [r] reject";
+    let controls_area = Rect::new(
+        rect.x.saturating_add(1),
+        rect.bottom().saturating_sub(2),
+        rect.width.saturating_sub(2),
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "[a] approve once",
+                Style::default().fg(theme.status.success),
+            ),
+            Span::styled(" · ", Style::default().fg(theme.text.muted)),
+            Span::styled(
+                "[A] approve for run",
+                Style::default().fg(theme.status.success),
+            ),
+            Span::styled(" · ", Style::default().fg(theme.text.muted)),
+            Span::styled("[r] reject", Style::default().fg(theme.status.error)),
+        ])),
+        controls_area,
+    );
+    for (label, action) in [
+        ("[a] approve once", Action::Approve(ApprovalScope::Once)),
+        ("[A] approve for run", Action::Approve(ApprovalScope::Run)),
+        ("[r] reject", Action::Reject),
+    ] {
+        register_text_hit(
+            state,
+            controls_area,
+            controls,
+            controls_area.y,
+            label,
+            action,
+        );
+    }
 }
 
 fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -7049,27 +7204,36 @@ fn render_council_builder(
     }
 
     let footer = match builder.step {
-        CouncilBuilderStep::Name => "  Enter continue · Esc close",
-        CouncilBuilderStep::Description => "  Enter continue · Esc back",
+        CouncilBuilderStep::Name => "  Enter/Tab continue · Esc close",
+        CouncilBuilderStep::Description => "  Enter/Tab continue · Esc back",
         CouncilBuilderStep::MemberModel => {
             if builder.members.len() < 2 {
-                "  ↑/↓ choose model · Enter add role · at least 2 members · Esc back"
+                "  ↑/↓ choose model · Enter/Tab add role · at least 2 members · Esc back"
             } else {
-                "  ↑/↓ choose · Enter add/continue · 2–8 unique profiles · Esc back"
+                "  ↑/↓ choose · Enter/Tab add/continue · 2–8 unique profiles · Esc back"
             }
         }
-        CouncilBuilderStep::MemberRole => "  Enter add member · blank role = member · Esc back",
-        CouncilBuilderStep::Chair => "  ↑/↓ choose synthesis chair · Enter continue · Esc back",
-        CouncilBuilderStep::Rounds => "  ↑/↓ choose deliberation depth · Enter review · Esc back",
-        CouncilBuilderStep::Review => "  Enter create council · Esc back",
+        CouncilBuilderStep::MemberRole => "  Enter/Tab add member · blank role = member · Esc back",
+        CouncilBuilderStep::Chair => "  ↑/↓ choose synthesis chair · Enter/Tab continue · Esc back",
+        CouncilBuilderStep::Rounds => {
+            "  ↑/↓ choose deliberation depth · Enter/Tab review · Esc back"
+        }
+        CouncilBuilderStep::Review => "  Enter/Tab create council · Esc back",
     };
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            footer,
-            Style::default().fg(theme.focus.active),
-        )),
-        rows[2],
-    );
+    let mut footer_lines = vec![Line::styled(
+        footer,
+        Style::default().fg(theme.focus.active),
+    )];
+    if let Some((notice, _)) = &state.notice {
+        footer_lines.push(Line::from(vec![
+            Span::styled("  ! ", Style::default().fg(theme.status.warning)),
+            Span::styled(
+                truncate_display_width(notice, usize::from(rows[2].width.saturating_sub(4))),
+                Style::default().fg(theme.text.secondary),
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(footer_lines), rows[2]);
     if rows[2].height > 0 {
         state.register_hit(rows[2], Action::InputSubmit);
     }
@@ -7576,7 +7740,17 @@ fn modal_surface(
             shadow,
         );
     }
+    // Clear and then write a full rectangle of spaces. `Clear` resets the
+    // in-memory cells, while the explicit fill guarantees the diff backend
+    // emits opaque cells even when the previous frame contained transcript
+    // glyphs at the same coordinates (the slash-palette ghost-text bug).
     frame.render_widget(Clear, rect);
+    let blank = " ".repeat(usize::from(rect.width));
+    frame.render_widget(
+        Paragraph::new(vec![Line::raw(blank); usize::from(rect.height)])
+            .style(Style::default().bg(theme.surface.overlay)),
+        rect,
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -7648,6 +7822,43 @@ fn render_modal_search(frame: &mut Frame, area: Rect, query: &str, theme: &Theme
 fn shield_modal(state: &AppState, rect: Rect) {
     if rect.width > 0 && rect.height > 0 {
         state.register_hit(rect, Action::NoOp);
+    }
+}
+
+/// Register a hit target over the exact displayed cells of `label` within a
+/// rendered text line. This avoids the brittle hand-maintained x offsets that
+/// previously made Docs controls invoke their neighbours.
+fn register_text_hit(
+    state: &AppState,
+    area: Rect,
+    line: &str,
+    y: u16,
+    label: &str,
+    action: Action,
+) {
+    let Some(byte_index) = line.find(label) else {
+        return;
+    };
+    let prefix_width = UnicodeWidthStr::width(&line[..byte_index]);
+    let label_width = UnicodeWidthStr::width(label);
+    let Ok(prefix_width) = u16::try_from(prefix_width) else {
+        return;
+    };
+    let Ok(label_width) = u16::try_from(label_width) else {
+        return;
+    };
+    let x = area.x.saturating_add(prefix_width);
+    let width = label_width.min(area.right().saturating_sub(x));
+    if width > 0 && y < area.bottom() {
+        state.register_hit(
+            Rect {
+                x,
+                y,
+                width,
+                height: 1,
+            },
+            action,
+        );
     }
 }
 
@@ -8012,6 +8223,60 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    #[test]
+    fn tiny_terminals_render_a_compact_non_panicking_frame() {
+        let state = AppState::new();
+        for (width, height) in [(1, 1), (18, 1), (18, 4), (20, 1), (80, 4)] {
+            let buffer = render_buffer(&state, width, height, &Theme::dark());
+            let text = buffer_text(&buffer);
+            if width >= 11 {
+                assert!(
+                    text.contains("codypendent"),
+                    "compact brand missing at {width}x{height}:\n{text}"
+                );
+            }
+            assert!(state.hit_map.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn modal_surface_opaquely_repaints_every_interior_cell() {
+        let theme = Theme::dark();
+        let state = AppState::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::raw("G".repeat(usize::from(area.width)));
+                        usize::from(area.height)
+                    ]),
+                    area,
+                );
+            })
+            .expect("background draw");
+        let rect = centered_modal(Rect::new(0, 0, 80, 24), 60, 18);
+        let mut inner = Rect::default();
+        terminal
+            .draw(|frame| {
+                inner = modal_surface(frame, rect, "Command palette", &state, &theme);
+            })
+            .expect("modal draw");
+
+        let buffer = terminal.backend().buffer();
+        for y in inner.top()..inner.bottom() {
+            for x in inner.left()..inner.right() {
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.symbol(), " ", "stale glyph at {x},{y}");
+                assert_eq!(
+                    cell.bg, theme.surface.overlay,
+                    "transparent modal cell at {x},{y}"
+                );
+            }
+        }
+    }
+
     fn council_model(id: &str, provider: &str) -> ModelCard {
         ModelCard {
             id: ModelId(id.to_owned()),
@@ -8091,8 +8356,16 @@ mod tests {
         assert!(review.contains("design-council"), "review name:\n{review}");
         assert!(review.contains("amp-chair"), "review chair:\n{review}");
         assert!(
-            review.contains("Enter create council"),
+            review.contains("Enter/Tab create council"),
             "review action:\n{review}"
+        );
+
+        state.overlay = Overlay::CouncilBuilder(CouncilBuilderState::default());
+        reduce(&mut state, Action::InputSubmit);
+        let invalid = render_to_string(&state, 80, 24);
+        assert!(
+            invalid.contains("council name: use 1–64"),
+            "an invalid Enter must explain why the step did not advance:\n{invalid}"
         );
     }
 
@@ -9630,6 +9903,61 @@ mod tests {
     }
 
     #[test]
+    fn approval_preemption_owns_the_scrim_and_exact_decision_labels() {
+        let mut state = running_build_state();
+        state.overlay = Overlay::Skills;
+        reduce(
+            &mut state,
+            system_ev(EventBody::ApprovalRequested {
+                approval_id: ApprovalId::new(),
+                action: ProposedAction::ExecuteCommand {
+                    program: "cargo".to_owned(),
+                    args: vec!["test".to_owned()],
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+                risk: Risk {
+                    level: RiskLevel::High,
+                    reasons: vec!["runs a command".to_owned()],
+                },
+            }),
+        );
+
+        let text = render_to_string(&state, 110, 34);
+        assert!(
+            text.contains("Approval required"),
+            "approval preempts the Skills browser:\n{text}"
+        );
+        assert_eq!(
+            click_at(&state, 0, 0),
+            Some(Action::NoOp),
+            "the approval scrim must shield the underlying overlay"
+        );
+
+        let (row, controls) = text
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("[a] approve once"))
+            .expect("approval controls are visible");
+        let y = u16::try_from(row).expect("row fits");
+        for (label, action) in [
+            ("[a] approve once", Action::Approve(ApprovalScope::Once)),
+            ("[A] approve for run", Action::Approve(ApprovalScope::Run)),
+            ("[r] reject", Action::Reject),
+        ] {
+            let byte = controls
+                .find(label)
+                .unwrap_or_else(|| panic!("{label:?} is visible: {controls:?}"));
+            let x = u16::try_from(UnicodeWidthStr::width(&controls[..byte])).expect("column fits");
+            assert_eq!(
+                click_at(&state, x, y),
+                Some(action.clone()),
+                "{label:?} must own its painted cells"
+            );
+        }
+    }
+
+    #[test]
     fn approval_modal_snapshot_shows_publish_document_plan_verbatim() {
         // STEP 4.4.2: every publish displays target, changed files, and the
         // resulting Git action before approval — the generic approval card
@@ -10019,6 +10347,55 @@ mod tests {
     }
 
     #[test]
+    fn recording_and_notices_keep_urgent_status_actions_reachable() {
+        let mut state = AppState::new();
+        state.voice.recording = true;
+        state.issues = vec!["model credentials need attention".to_owned()];
+        let recording = render_to_string(&state, 120, 20);
+        let recording_footer = recording.lines().last().unwrap_or("");
+        assert!(recording_footer.contains("Recording"), "{recording_footer}");
+        assert!(
+            recording_footer.contains("diagnostics"),
+            "recording must not hide the only route to setup issues: {recording_footer}"
+        );
+        assert!(state
+            .hit_map
+            .borrow()
+            .iter()
+            .any(|(_, action)| action == &Action::OpenIssues));
+
+        state.voice.recording = false;
+        state.notice = Some(("Settings saved".to_owned(), 3));
+        state.issues.clear();
+        reduce(
+            &mut state,
+            system_ev(EventBody::ApprovalRequested {
+                approval_id: ApprovalId::new(),
+                action: ProposedAction::ExecuteCommand {
+                    program: "cargo".to_owned(),
+                    args: vec!["test".to_owned()],
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+                risk: Risk {
+                    level: RiskLevel::Medium,
+                    reasons: vec!["executes tests".to_owned()],
+                },
+            }),
+        );
+        let noticed = render_to_string(&state, 120, 20);
+        let noticed_footer = noticed.lines().last().unwrap_or("");
+        assert!(
+            noticed_footer.contains("Settings saved"),
+            "{noticed_footer}"
+        );
+        assert!(
+            noticed_footer.contains("a once") && noticed_footer.contains("r reject"),
+            "a transient notice must not hide approval decisions: {noticed_footer}"
+        );
+    }
+
+    #[test]
     fn contextual_footer_narrows_by_dropping_low_priority_fields() {
         let state = running_build_state();
         let narrow = render_to_string(&state, 50, 30);
@@ -10261,6 +10638,9 @@ mod tests {
             ],
             suggestions: vec![DocSuggestionView {
                 id: "s1".to_owned(),
+                block_id: "b1".to_owned(),
+                source_revision: 7,
+                original: "Charging".to_owned(),
                 status: "pending".to_owned(),
                 author: "agent".to_owned(),
                 range: "0..8".to_owned(),
@@ -10285,6 +10665,14 @@ mod tests {
         // Review rail: the pending suggestion with its author and rationale.
         assert!(text.contains("Review rail"), "review rail missing:\n{text}");
         assert!(text.contains("agent"), "suggestion author missing:\n{text}");
+        assert!(
+            text.contains("b1@r7"),
+            "suggestion provenance missing:\n{text}"
+        );
+        assert!(
+            text.contains("Charging"),
+            "suggestion original missing:\n{text}"
+        );
         assert!(
             text.contains("match the code path"),
             "suggestion rationale missing:\n{text}"
@@ -10313,6 +10701,9 @@ mod tests {
         state.docs[0].suggestions = (0..12)
             .map(|index| DocSuggestionView {
                 id: format!("s{index}"),
+                block_id: "b1".to_owned(),
+                source_revision: 7,
+                original: "o".to_owned(),
                 status: "pending".to_owned(),
                 author: format!("reviewer-{index}"),
                 range: "0..1".to_owned(),
@@ -10330,7 +10721,10 @@ mod tests {
         let hits = state.hit_map.borrow();
         for action in [
             Action::CyclePane,
+            Action::NewDoc,
             Action::EditDoc,
+            Action::InsertDocBlock,
+            Action::DeleteDocBlock,
             Action::Approve(codypendent_protocol::ApprovalScope::Once),
             Action::Reject,
             Action::PublishDoc,
@@ -10473,6 +10867,40 @@ mod tests {
         assert!(
             text.contains("32k"),
             "the profiled model's context missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn model_picker_scrolls_to_the_end_of_a_long_catalog() {
+        let mut state = running_build_state();
+        state.models = (0..40)
+            .map(|index| ModelCard {
+                id: ModelId(format!("catalog/model-{index:02}")),
+                provider: "catalog".to_owned(),
+                readiness: ModelReadiness::Ready,
+                location: Some(ModelLocationLabel::Hosted),
+                cost_per_1k_usd: None,
+                context_tokens: None,
+            })
+            .collect();
+        state.overlay = Overlay::ModelPicker {
+            query: String::new(),
+            selected: 39,
+        };
+        state.selected_model = 39;
+
+        let text = render_to_string(&state, 80, 24);
+        assert!(
+            text.contains("catalog/model-39"),
+            "the selected tail row must be in the viewport:\n{text}"
+        );
+        assert!(
+            !text.contains("catalog/model-00"),
+            "the list should have scrolled away from its first row:\n{text}"
+        );
+        assert!(
+            text.contains("PgUp/PgDn"),
+            "paging controls need to be discoverable:\n{text}"
         );
     }
 
@@ -12678,10 +13106,10 @@ mod tests {
 
         // A narrow terminal keeps the header and drops the clock rather than
         // crowding the row.
-        let narrow = render_to_string(&s, 12, 24);
+        let narrow = render_to_string(&s, 24, 24);
         assert!(
             narrow.contains("You"),
-            "the header survives at 12 columns:\n{narrow}"
+            "the header survives at 24 columns:\n{narrow}"
         );
         assert!(
             !narrow.contains(&expected),
@@ -12843,6 +13271,64 @@ mod tests {
             Some(Action::OpenMemory),
             "the whole label is the target, not just its first cell"
         );
+    }
+
+    #[test]
+    fn the_docs_footer_labels_hit_only_their_exact_actions() {
+        use crate::state::{DocBlockView, DocCard};
+
+        let mut state = AppState::new();
+        state.docs = vec![DocCard {
+            document_id: codypendent_protocol::DocumentId::new(),
+            title: "Runbook".to_owned(),
+            scope: "repository".to_owned(),
+            status: "draft".to_owned(),
+            mode: "suggest".to_owned(),
+            revision: "r1".to_owned(),
+            blocks: vec![DocBlockView {
+                id: "b1".to_owned(),
+                kind: "paragraph".to_owned(),
+                text: "Keep this current.".to_owned(),
+                editable: Some("Keep this current.".to_owned()),
+            }],
+            suggestions: Vec::new(),
+        }];
+        state.overlay = Overlay::Docs;
+        let text = render_to_string(&state, 120, 40);
+
+        for (label, action) in [
+            ("Tab rail", Action::CyclePane),
+            ("a accept", Action::Approve(ApprovalScope::Once)),
+            ("r reject", Action::Reject),
+            ("n new", Action::NewDoc),
+            ("e edit", Action::EditDoc),
+            ("i ins", Action::InsertDocBlock),
+            ("X del", Action::DeleteDocBlock),
+            ("P publish", Action::PublishDoc),
+        ] {
+            let (row, footer) = text
+                .lines()
+                .enumerate()
+                .find(|(_, line)| line.contains(label))
+                .unwrap_or_else(|| panic!("{label:?} is visible in Docs:\n{text}"));
+            let byte = footer.find(label).expect("label found on selected row");
+            let x = u16::try_from(UnicodeWidthStr::width(&footer[..byte])).expect("column fits");
+            let y = u16::try_from(row).expect("row fits");
+            assert_eq!(
+                click_at(&state, x, y),
+                Some(action.clone()),
+                "the first cell of {label:?} must invoke {action:?}"
+            );
+            assert_eq!(
+                click_at(
+                    &state,
+                    x + u16::try_from(UnicodeWidthStr::width(label)).unwrap() - 1,
+                    y
+                ),
+                Some(action.clone()),
+                "the last cell of {label:?} must invoke {action:?}"
+            );
+        }
     }
 
     /// The `/theme` picker previews across the WHOLE shell, not just its own

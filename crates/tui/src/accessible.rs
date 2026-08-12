@@ -6,17 +6,24 @@
 //! pure makes the no-alternate-screen path deterministic and script-testable.
 
 use codypendent_protocol::{ApprovalScope, RunDisposition};
+use ratatui::{buffer::Buffer, layout::Rect};
 
 use crate::action::Action;
 use crate::input::KEY_BINDINGS;
-use crate::remote_ui::{project_accessibility, RemoteKey};
-use crate::state::{AppState, InputMode, Overlay, RunActivity, TranscriptEntry};
+use crate::remote_ui::{project_accessibility, render_remote_ui, RemoteKey, RemoteUiRenderOptions};
+use crate::state::{
+    filter_council_member_models, filter_models, filter_modes, filter_providers, AppState,
+    CouncilBuilderStep, InputMode, ModelReadiness, Overlay, RunActivity, TranscriptEntry,
+    MODE_CARDS,
+};
+use crate::Theme;
 
 /// Render the complete current application state as a stable, linear document.
 /// UI chrome is ASCII-only; user/model/extension content retains Unicode but is
 /// stripped of terminal and bidi controls before it reaches cooked stdout.
 #[must_use]
 pub fn accessible_snapshot(state: &AppState) -> String {
+    refresh_remote_ui_render_cache(state);
     let mut lines = vec!["Codypendent accessible view".to_owned()];
     lines.push(format!(
         "Session: {}",
@@ -95,6 +102,31 @@ pub fn accessible_snapshot(state: &AppState) -> String {
     // several protocol enums use `Debug` formatting above and future variants
     // must not accidentally reintroduce terminal controls through that path.
     clean(&lines.join("\n"))
+}
+
+/// The normal renderer populates the interaction descriptors consumed by the
+/// Remote UI reducer. Cooked-terminal mode has no frame renderer, so build the
+/// same bounded metadata here to keep its announced controls operable.
+fn refresh_remote_ui_render_cache(state: &AppState) {
+    let documents = state.remote_ui.mounted_documents();
+    let mut cache = state.remote_ui.last_render.borrow_mut();
+    cache.clear();
+    for document in documents {
+        let projection = project_accessibility(&document.root, &state.remote_ui.capabilities);
+        let height = projection.nodes.len().saturating_mul(2).clamp(24, 512) as u16;
+        let area = Rect::new(0, 0, 120, height);
+        let mut buffer = Buffer::empty(area);
+        let output = render_remote_ui(
+            &mut buffer,
+            area,
+            document,
+            &Theme::default(),
+            &state.remote_ui.capabilities,
+            &state.remote_ui.view,
+            RemoteUiRenderOptions::default(),
+        );
+        cache.insert(document.document_id.clone(), output);
+    }
 }
 
 fn append_transcript(lines: &mut Vec<String>, entry: &TranscriptEntry) {
@@ -271,21 +303,52 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
             clean(query),
             selected + 1
         )),
-        Overlay::ModelPicker { query, selected } => lines.push(format!(
-            "Model picker: query {}; selected result {}",
-            clean(query),
-            selected + 1
-        )),
-        Overlay::ProviderPicker { query, selected } => lines.push(format!(
-            "Provider picker: query {}; selected result {}",
-            clean(query),
-            selected + 1
-        )),
-        Overlay::ModePicker { query, selected } => lines.push(format!(
-            "Mode picker: query {}; selected result {}",
-            clean(query),
-            selected + 1
-        )),
+        Overlay::ModelPicker { query, selected } => {
+            lines.push(format!("Model picker: query {}", clean(query)));
+            let rows = filter_models(&state.models, query)
+                .into_iter()
+                .filter_map(|index| state.models.get(index))
+                .map(|card| {
+                    format!(
+                        "{}; provider {}; {}",
+                        clean(&card.id.0),
+                        clean(&card.provider),
+                        model_readiness_label(&card.readiness)
+                    )
+                })
+                .collect();
+            append_picker_rows(lines, "model", rows, *selected);
+        }
+        Overlay::ProviderPicker { query, selected } => {
+            lines.push(format!("Provider picker: query {}", clean(query)));
+            let rows = filter_providers(&state.providers, query)
+                .into_iter()
+                .filter_map(|index| state.providers.get(index))
+                .map(|card| {
+                    format!(
+                        "{} ({}); protocol {}; {}",
+                        clean(&card.name),
+                        clean(&card.id),
+                        clean(&card.protocol),
+                        if card.available {
+                            "available"
+                        } else {
+                            "not yet executable"
+                        }
+                    )
+                })
+                .collect();
+            append_picker_rows(lines, "provider", rows, *selected);
+        }
+        Overlay::ModePicker { query, selected } => {
+            lines.push(format!("Mode picker: query {}", clean(query)));
+            let rows = filter_modes(query)
+                .into_iter()
+                .filter_map(|index| MODE_CARDS.get(index))
+                .map(|card| format!("{}; {}", card.label, card.summary))
+                .collect();
+            append_picker_rows(lines, "mode", rows, *selected);
+        }
         Overlay::NewRun(buffer) => {
             lines.push(format!("New run prompt: {}", clean(buffer)));
         }
@@ -344,8 +407,115 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
                     clean(&member.role)
                 ));
             }
+            match builder.step {
+                CouncilBuilderStep::MemberModel => {
+                    let continue_row =
+                        builder.members.len() >= 2 && builder.query.trim().is_empty();
+                    let remove_row = !builder.members.is_empty() && builder.query.trim().is_empty();
+                    let mut rows = Vec::new();
+                    if continue_row {
+                        rows.push(format!("Continue with {} members", builder.members.len()));
+                    }
+                    if builder.members.len() < 8 {
+                        rows.extend(
+                            filter_council_member_models(
+                                &state.models,
+                                &builder.query,
+                                &builder.members,
+                            )
+                            .into_iter()
+                            .filter_map(|index| state.models.get(index))
+                            .map(|card| {
+                                format!(
+                                    "{}; provider {}; {}",
+                                    clean(&card.id.0),
+                                    clean(&card.provider),
+                                    model_readiness_label(&card.readiness)
+                                )
+                            }),
+                        );
+                    }
+                    if remove_row {
+                        let model = builder
+                            .members
+                            .last()
+                            .map_or("member", |member| member.model.as_str());
+                        rows.push(format!("Remove last member; {}", clean(model)));
+                    }
+                    append_picker_rows(lines, "council member choice", rows, builder.selected);
+                }
+                CouncilBuilderStep::Chair => {
+                    let rows = filter_models(&state.models, &builder.query)
+                        .into_iter()
+                        .filter_map(|index| state.models.get(index))
+                        .map(|card| {
+                            format!(
+                                "{}; provider {}; {}",
+                                clean(&card.id.0),
+                                clean(&card.provider),
+                                model_readiness_label(&card.readiness)
+                            )
+                        })
+                        .collect();
+                    append_picker_rows(lines, "council chair", rows, builder.selected);
+                }
+                CouncilBuilderStep::Name
+                | CouncilBuilderStep::Description
+                | CouncilBuilderStep::MemberRole
+                | CouncilBuilderStep::Rounds
+                | CouncilBuilderStep::Review => {}
+            }
         }
         other => lines.push(format!("Open dialog: {}", overlay_name(other))),
+    }
+}
+
+/// Announce both the exact highlighted choice and a bounded neighbourhood of
+/// useful rows. Cooked-terminal users receive a fresh snapshot after every
+/// navigation action, so a window around the cursor is more usable than
+/// dumping an arbitrarily large provider/model catalogue each time.
+fn append_picker_rows(lines: &mut Vec<String>, kind: &str, rows: Vec<String>, selected: usize) {
+    const WINDOW: usize = 9;
+
+    let Some(highlighted) = rows.get(selected) else {
+        lines.push(format!("Available {kind} rows: none"));
+        return;
+    };
+    lines.push(format!(
+        "Highlighted {kind} {} of {}: {highlighted}",
+        selected + 1,
+        rows.len()
+    ));
+
+    let start = selected
+        .saturating_sub(WINDOW / 2)
+        .min(rows.len().saturating_sub(WINDOW));
+    let end = (start + WINDOW).min(rows.len());
+    lines.push(format!(
+        "Available {kind} rows {} through {} of {}:",
+        start + 1,
+        end,
+        rows.len()
+    ));
+    for (index, row) in rows.iter().enumerate().take(end).skip(start) {
+        lines.push(format!(
+            "  {}{}: {}",
+            index + 1,
+            if index == selected {
+                " highlighted"
+            } else {
+                ""
+            },
+            row
+        ));
+    }
+}
+
+fn model_readiness_label(readiness: &ModelReadiness) -> &'static str {
+    match readiness {
+        ModelReadiness::Ready => "ready",
+        ModelReadiness::Unverified => "unverified",
+        ModelReadiness::Unavailable(_) => "unavailable",
     }
 }
 
@@ -383,7 +553,8 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::DocPublishPath { .. } => "document publish path",
         Overlay::ConfirmUiPluginApprove { .. }
         | Overlay::ConfirmUiPluginReject { .. }
-        | Overlay::ConfirmUiPluginRevoke { .. } => "Remote UI plugin confirmation",
+        | Overlay::ConfirmUiPluginRevoke { .. }
+        | Overlay::ConfirmUiPluginEnable { .. } => "Remote UI plugin confirmation",
         Overlay::Help
         | Overlay::None
         | Overlay::NewRun(_)
@@ -400,17 +571,19 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
 fn controls_for(mode: InputMode) -> &'static str {
     match mode {
         InputMode::Composer => {
-            "Controls: type a message and press Enter, or use help, /, F6, Shift-F6, quit"
+            "Controls: type a message and press Enter, Home/End move within a line, or use help, /, F6, Shift-F6, quit"
         }
         InputMode::RemoteUi => {
             "Controls: Tab or backtab move focus, Enter activates, type TEXT edits, Shift-F6 changes document, Esc returns"
         }
         InputMode::Palette => {
-            "Controls: type TEXT filters, up/down select, Enter chooses, Esc closes"
+            "Controls: type TEXT filters, up/down/pageup/pagedown/home/end select, Enter chooses, Esc closes"
         }
         InputMode::Editing => "Controls: type TEXT, Enter submits, Esc cancels",
         InputMode::Confirm => "Controls: yes or Enter confirms, no or Esc cancels",
-        InputMode::Approval => "Controls: approve, approve-run, reject, up, down",
+        InputMode::Approval => {
+            "Controls: approve, approve-run, reject, up, down, pageup, pagedown"
+        }
         InputMode::Normal => "Controls: up, down, Enter, Esc, help, quit",
     }
 }
@@ -444,27 +617,37 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
         "down" => return vec![navigation_action(mode, false)],
         "pageup" | "page-up" => return vec![page_action(mode, true)],
         "pagedown" | "page-down" => return vec![page_action(mode, false)],
+        "home" => return vec![edge_action(mode, true)],
+        "end" => return vec![edge_action(mode, false)],
         "approve" => return vec![Action::Approve(ApprovalScope::Once)],
         "approve-run" => return vec![Action::Approve(ApprovalScope::Run)],
         "reject" => return vec![Action::Reject],
         "backspace" => {
-            return vec![if mode == InputMode::RemoteUi {
-                Action::RemoteUiKey {
+            return vec![match mode {
+                InputMode::RemoteUi => Action::RemoteUiKey {
                     key: RemoteKey::Backspace,
                     character: None,
+                },
+                InputMode::Composer | InputMode::Editing | InputMode::Palette => {
+                    Action::InputBackspace
                 }
-            } else {
-                Action::InputBackspace
+                InputMode::Normal | InputMode::Confirm | InputMode::Approval => Action::NoOp,
             }];
         }
         _ => {}
     }
 
     if lower.starts_with("send ") {
+        if !accepts_text(mode) {
+            return vec![unsupported_command()];
+        }
         let text = &command["send ".len()..];
         return vec![paste_action(mode, text.to_owned()), submit_action(mode)];
     }
     if lower.starts_with("type ") {
+        if !accepts_text(mode) {
+            return vec![unsupported_command()];
+        }
         let text = &command["type ".len()..];
         return vec![paste_action(mode, text.to_owned())];
     }
@@ -473,10 +656,19 @@ pub fn map_accessible_input(line: &str, mode: InputMode) -> Vec<Action> {
         InputMode::RemoteUi | InputMode::Editing | InputMode::Palette => {
             vec![paste_action(mode, line.to_owned())]
         }
-        _ => vec![Action::Notice(
-            "unrecognised accessible command; type help for commands".to_owned(),
-        )],
+        _ => vec![unsupported_command()],
     }
+}
+
+fn accepts_text(mode: InputMode) -> bool {
+    matches!(
+        mode,
+        InputMode::Composer | InputMode::RemoteUi | InputMode::Editing | InputMode::Palette
+    )
+}
+
+fn unsupported_command() -> Action {
+    Action::Notice("unrecognised accessible command; type help for commands".to_owned())
 }
 
 fn submit_action(mode: InputMode) -> Action {
@@ -486,6 +678,7 @@ fn submit_action(mode: InputMode) -> Action {
             character: None,
         },
         InputMode::Confirm => Action::ConfirmCancel,
+        InputMode::Approval => Action::NoOp,
         InputMode::Normal => Action::Expand,
         _ => Action::InputSubmit,
     }
@@ -495,6 +688,7 @@ fn cancel_action(mode: InputMode) -> Action {
     match mode {
         InputMode::RemoteUi => Action::RemoteUiSetActive(false),
         InputMode::Editing | InputMode::Palette | InputMode::Composer => Action::InputCancel,
+        InputMode::Approval => Action::NoOp,
         _ => Action::Dismiss,
     }
 }
@@ -509,44 +703,98 @@ fn tab_action(mode: InputMode, reverse: bool) -> Action {
             },
             character: None,
         }
-    } else if mode == InputMode::Palette {
+    } else if reverse {
+        Action::NoOp
+    } else if matches!(mode, InputMode::Palette | InputMode::Editing) {
         Action::BeginAddModel
-    } else {
+    } else if matches!(mode, InputMode::Normal | InputMode::Composer) {
         Action::CyclePane
+    } else {
+        Action::NoOp
     }
 }
 
 fn navigation_action(mode: InputMode, previous: bool) -> Action {
-    if mode == InputMode::RemoteUi {
-        Action::RemoteUiKey {
+    match mode {
+        InputMode::RemoteUi => Action::RemoteUiKey {
             key: if previous {
                 RemoteKey::Up
             } else {
                 RemoteKey::Down
             },
             character: None,
+        },
+        InputMode::Composer => {
+            if previous {
+                Action::HistoryPrev
+            } else {
+                Action::HistoryNext
+            }
         }
-    } else if previous {
-        Action::SelectPrev
-    } else {
-        Action::SelectNext
+        InputMode::Normal | InputMode::Palette | InputMode::Approval => {
+            if previous {
+                Action::SelectPrev
+            } else {
+                Action::SelectNext
+            }
+        }
+        InputMode::Editing | InputMode::Confirm => Action::NoOp,
     }
 }
 
 fn page_action(mode: InputMode, previous: bool) -> Action {
-    if mode == InputMode::RemoteUi {
-        Action::RemoteUiKey {
+    match mode {
+        InputMode::RemoteUi => Action::RemoteUiKey {
             key: if previous {
                 RemoteKey::PageUp
             } else {
                 RemoteKey::PageDown
             },
             character: None,
+        },
+        InputMode::Palette | InputMode::Approval => {
+            if previous {
+                Action::SelectPagePrev
+            } else {
+                Action::SelectPageNext
+            }
         }
-    } else if previous {
-        Action::ScrollPageUp
-    } else {
-        Action::ScrollPageDown
+        InputMode::Composer | InputMode::Normal => {
+            if previous {
+                Action::ScrollPageUp
+            } else {
+                Action::ScrollPageDown
+            }
+        }
+        InputMode::Editing | InputMode::Confirm => Action::NoOp,
+    }
+}
+
+fn edge_action(mode: InputMode, start: bool) -> Action {
+    match mode {
+        InputMode::RemoteUi => Action::RemoteUiKey {
+            key: if start {
+                RemoteKey::Home
+            } else {
+                RemoteKey::End
+            },
+            character: None,
+        },
+        InputMode::Palette => {
+            if start {
+                Action::SelectFirst
+            } else {
+                Action::SelectLast
+            }
+        }
+        InputMode::Composer => {
+            if start {
+                Action::CursorLineStart
+            } else {
+                Action::CursorLineEnd
+            }
+        }
+        _ => Action::NoOp,
     }
 }
 
@@ -649,11 +897,39 @@ fn clean(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft};
+    use crate::state::{
+        CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft, ModelCard, ProviderCard,
+    };
     use codypendent_protocol::{
-        Actor, EventBody, RunId, SessionEvent, UiContributionId, UiContributionPoint,
+        Actor, EventBody, ModelId, RunId, SessionEvent, UiContributionId, UiContributionPoint,
         UiContributionRegistration, UiDocument, UiDocumentId, UiExtensionId, UiSlotId,
     };
+
+    fn picker_model(id: &str, provider: &str) -> ModelCard {
+        ModelCard {
+            id: ModelId(id.to_owned()),
+            provider: provider.to_owned(),
+            readiness: ModelReadiness::Ready,
+            location: None,
+            cost_per_1k_usd: None,
+            context_tokens: None,
+        }
+    }
+
+    fn picker_provider(id: &str, name: &str, protocol: &str, available: bool) -> ProviderCard {
+        ProviderCard {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            protocol: protocol.to_owned(),
+            auth: "none".to_owned(),
+            local: false,
+            requires_key: false,
+            can_list_models: false,
+            available,
+            catalog_models: 0,
+            has_key: false,
+        }
+    }
 
     #[test]
     fn composer_lines_send_and_remote_lines_edit_without_activation() {
@@ -671,6 +947,89 @@ mod tests {
         assert_eq!(
             map_accessible_input("shift-f6", InputMode::RemoteUi),
             vec![Action::RemoteUiNextDocument]
+        );
+    }
+
+    #[test]
+    fn cooked_navigation_matches_graphical_modes() {
+        assert_eq!(
+            map_accessible_input("tab", InputMode::Editing),
+            vec![Action::BeginAddModel]
+        );
+        assert_eq!(
+            map_accessible_input("pageup", InputMode::Palette),
+            vec![Action::SelectPagePrev]
+        );
+        assert_eq!(
+            map_accessible_input("pagedown", InputMode::Palette),
+            vec![Action::SelectPageNext]
+        );
+        assert_eq!(
+            map_accessible_input("home", InputMode::Palette),
+            vec![Action::SelectFirst]
+        );
+        assert_eq!(
+            map_accessible_input("end", InputMode::Composer),
+            vec![Action::CursorLineEnd]
+        );
+        assert_eq!(
+            map_accessible_input("home", InputMode::RemoteUi),
+            vec![Action::RemoteUiKey {
+                key: RemoteKey::Home,
+                character: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn cooked_modal_commands_do_not_mutate_hidden_state() {
+        let no_op = vec![Action::NoOp];
+        let unsupported = vec![Action::Notice(
+            "unrecognised accessible command; type help for commands".to_owned(),
+        )];
+
+        assert_eq!(
+            map_accessible_input("pageup", InputMode::Approval),
+            vec![Action::SelectPagePrev]
+        );
+        assert_eq!(
+            map_accessible_input("pagedown", InputMode::Approval),
+            vec![Action::SelectPageNext]
+        );
+        for mode in [InputMode::Editing, InputMode::Confirm] {
+            assert_eq!(map_accessible_input("pageup", mode), no_op);
+            assert_eq!(map_accessible_input("up", mode), no_op);
+        }
+        for mode in [InputMode::Approval, InputMode::Confirm] {
+            assert_eq!(map_accessible_input("tab", mode), no_op);
+            assert_eq!(map_accessible_input("backtab", mode), no_op);
+            assert_eq!(map_accessible_input("backspace", mode), no_op);
+            assert_eq!(map_accessible_input("type hidden", mode), unsupported);
+            assert_eq!(map_accessible_input("send hidden", mode), unsupported);
+        }
+        assert_eq!(map_accessible_input("enter", InputMode::Approval), no_op);
+        assert_eq!(map_accessible_input("esc", InputMode::Approval), no_op);
+        assert_eq!(map_accessible_input("home", InputMode::Editing), no_op);
+        assert_eq!(map_accessible_input("end", InputMode::Confirm), no_op);
+    }
+
+    #[test]
+    fn cooked_composer_navigation_matches_history_and_cursor_keys() {
+        assert_eq!(
+            map_accessible_input("up", InputMode::Composer),
+            vec![Action::HistoryPrev]
+        );
+        assert_eq!(
+            map_accessible_input("down", InputMode::Composer),
+            vec![Action::HistoryNext]
+        );
+        assert_eq!(
+            map_accessible_input("home", InputMode::Composer),
+            vec![Action::CursorLineStart]
+        );
+        assert_eq!(
+            map_accessible_input("backtab", InputMode::Composer),
+            vec![Action::NoOp]
         );
     }
 
@@ -697,6 +1056,158 @@ mod tests {
         assert!(snapshot.contains("design-board"));
         assert!(snapshot.contains("Council member: kimi-code; role systems architect"));
         assert!(snapshot.contains("chair amp; rounds 2"));
+    }
+
+    #[test]
+    fn model_provider_and_mode_pickers_announce_highlighted_and_available_rows() {
+        let mut state = AppState::new();
+        state.models = vec![
+            picker_model("alpha", "ollama"),
+            picker_model("beta", "claude-code"),
+            picker_model("gamma", "kimi-code"),
+        ];
+        state.overlay = Overlay::ModelPicker {
+            query: String::new(),
+            selected: 1,
+        };
+        let models = accessible_snapshot(&state);
+        assert!(
+            models.contains("Highlighted model 2 of 3: beta; provider claude-code; ready"),
+            "{models}"
+        );
+        assert!(
+            models.contains("1: alpha; provider ollama; ready"),
+            "{models}"
+        );
+        assert!(
+            models.contains("3: gamma; provider kimi-code; ready"),
+            "{models}"
+        );
+
+        state.providers = vec![
+            picker_provider("ollama", "Ollama", "openai-chat", true),
+            picker_provider("claude", "Claude Code", "acp", false),
+        ];
+        state.overlay = Overlay::ProviderPicker {
+            query: String::new(),
+            selected: 1,
+        };
+        let providers = accessible_snapshot(&state);
+        assert!(
+            providers.contains(
+                "Highlighted provider 2 of 2: Claude Code (claude); protocol acp; not yet executable"
+            ),
+            "{providers}"
+        );
+        assert!(
+            providers.contains("1: Ollama (ollama); protocol openai-chat; available"),
+            "{providers}"
+        );
+
+        state.overlay = Overlay::ModePicker {
+            query: String::new(),
+            selected: 2,
+        };
+        let modes = accessible_snapshot(&state);
+        assert!(
+            modes.contains("Highlighted mode 3 of 5: Plan; investigate read-only"),
+            "{modes}"
+        );
+        assert!(modes.contains("1: Ask; read-only Q&A"), "{modes}");
+        assert!(
+            modes.contains("5: Review; read-only verification"),
+            "{modes}"
+        );
+    }
+
+    #[test]
+    fn council_member_and_chair_steps_announce_the_highlighted_candidate() {
+        let mut state = AppState::new();
+        state.models = vec![
+            picker_model("alpha", "ollama"),
+            picker_model("beta", "claude-code"),
+            picker_model("gamma", "kimi-code"),
+        ];
+        let members = vec![
+            CouncilMemberDraft {
+                model: "alpha".to_owned(),
+                role: "planner".to_owned(),
+            },
+            CouncilMemberDraft {
+                model: "beta".to_owned(),
+                role: "reviewer".to_owned(),
+            },
+        ];
+        state.overlay = Overlay::CouncilBuilder(CouncilBuilderState {
+            step: CouncilBuilderStep::MemberModel,
+            members: members.clone(),
+            selected: 1,
+            ..CouncilBuilderState::default()
+        });
+        let member_picker = accessible_snapshot(&state);
+        assert!(
+            member_picker.contains(
+                "Highlighted council member choice 2 of 3: gamma; provider kimi-code; ready"
+            ),
+            "{member_picker}"
+        );
+        assert!(
+            member_picker.contains("1: Continue with 2 members"),
+            "{member_picker}"
+        );
+        assert!(
+            member_picker.contains("3: Remove last member; beta"),
+            "{member_picker}"
+        );
+
+        state.overlay = Overlay::CouncilBuilder(CouncilBuilderState {
+            step: CouncilBuilderStep::Chair,
+            members,
+            selected: 2,
+            ..CouncilBuilderState::default()
+        });
+        let chair_picker = accessible_snapshot(&state);
+        assert!(
+            chair_picker
+                .contains("Highlighted council chair 3 of 3: gamma; provider kimi-code; ready"),
+            "{chair_picker}"
+        );
+        assert!(
+            chair_picker.contains("1: alpha; provider ollama; ready"),
+            "{chair_picker}"
+        );
+    }
+
+    #[test]
+    fn cooked_home_and_end_drive_council_picker_steps() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::CouncilBuilder(CouncilBuilderState {
+            step: CouncilBuilderStep::Rounds,
+            ..CouncilBuilderState::default()
+        });
+        assert_eq!(state.input_mode(), InputMode::Palette);
+        for action in map_accessible_input("end", state.input_mode()) {
+            crate::reduce(&mut state, action);
+        }
+        assert!(matches!(
+            state.overlay,
+            Overlay::CouncilBuilder(CouncilBuilderState {
+                selected: 2,
+                rounds: 3,
+                ..
+            })
+        ));
+        for action in map_accessible_input("home", state.input_mode()) {
+            crate::reduce(&mut state, action);
+        }
+        assert!(matches!(
+            state.overlay,
+            Overlay::CouncilBuilder(CouncilBuilderState {
+                selected: 0,
+                rounds: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -783,6 +1294,14 @@ mod tests {
         assert!(output.contains("Starts the workflow"));
         assert!(output.contains("keyboard Enter"));
         assert!(output.contains("live region polite"));
+        let cache = state.remote_ui.last_render.borrow();
+        let rendered = cache
+            .get(&UiDocumentId::from("accessible-extension"))
+            .expect("cooked snapshot populated Remote UI interaction metadata");
+        assert!(rendered
+            .focus_order
+            .iter()
+            .any(|control| control.node_id.as_str() == "launch"));
     }
 
     #[test]

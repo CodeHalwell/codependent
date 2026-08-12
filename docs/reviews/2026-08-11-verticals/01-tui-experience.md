@@ -24,7 +24,7 @@
 | Edges (:4043) + loading/empty (:4243/:4273) | Polished empty/loading states; DB-paged search |
 | Workflow (:4348) / Blackboard (:4579) | Solid list+detail; no DAG drawing (see Gaps) |
 | Remote UI surfaces (:98-266; remote_ui/paint.rs) | Serious engineering: 60+ primitives, sanitization, capability fallback, a11y projection |
-| Accessible cooked mode (accessible.rs; cli/tui.rs:393) | Exemplary: full parity commands, ANSI/bidi stripping (:539-601) |
+| Accessible cooked mode (accessible.rs; cli/tui.rs) | Operable semantic Remote UI controls, documented cooked-key parity, and ANSI/bidi stripping |
 
 ## Verified working (file:line)
 

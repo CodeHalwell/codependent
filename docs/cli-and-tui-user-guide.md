@@ -166,14 +166,28 @@ Input is one command per line:
 | `type TEXT` / `send TEXT` | Insert text / insert and submit in the current input surface |
 | `help` or `?` | Show the complete command and key reference |
 | `f6` / `shift-f6` / `esc` | Enter Remote UI / next document / return |
-| `tab` / `backtab` | Move semantic focus forward / backward |
-| `enter` / `space` | Activate the focused control |
-| `up`, `down`, `pageup`, `pagedown` | Navigate the current list or document |
+| `tab` | In Remote UI, move semantic focus forward; otherwise follow the active surface's Tab behavior (ignored by confirmation and approval dialogs) |
+| `backtab` | In Remote UI, move semantic focus backward; ignored elsewhere |
+| `enter` / `space` | In Remote UI, activate the focused control (`enter` submits or chooses on other input surfaces) |
+| `up`, `down` | Recall composer history, move the current list/approval selection, or forward the semantic key to Remote UI; ignored by text-entry and confirmation dialogs |
+| `pageup`, `pagedown` | Page the palette/approval selection or conversation, or forward the semantic key to Remote UI; ignored by text-entry and confirmation dialogs |
+| `home`, `end` | Move to the first/last palette item, move within a composer line, or forward the key to Remote UI |
 | `approve`, `approve-run`, `reject` | Resolve the selected approval |
 | `quit` | Detach; the daemon keeps active runs alive |
 
 `COLUMNS` and `LINES` set the viewport advertised to extension components;
 defaults are `80` by `24`.
+
+The cooked client derives focus order, form fields, activation targets, and
+keyboard actions from the same validated Remote UI document as the full-screen
+renderer. `F6` therefore enters an operable extension surface rather than a
+text-only transcript: focus, editing, and activation remain semantic and never
+depend on mouse coordinates or cursor-addressed terminal output.
+
+Confirmation and approval dialogs own their input just as they do in the
+full-screen client. Cooked `type`, `send`, navigation, and editing commands that
+the active dialog does not support are ignored or reported as unrecognised;
+they never edit or submit a composer hidden behind the dialog.
 
 ---
 

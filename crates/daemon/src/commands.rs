@@ -118,6 +118,25 @@ impl CommandProcessor {
         &self.approvals
     }
 
+    /// Replay an already-recorded command outcome without admitting a new
+    /// command. The server uses this before an expensive external input
+    /// preprocessing step (voice transcription): a lost reply must not send the
+    /// same audio off-device again merely to discover that the write path had
+    /// already applied its idempotency key.
+    pub async fn replay_existing(
+        &self,
+        pool: &SqlitePool,
+        idempotency_key: &str,
+    ) -> Result<Option<CommandOutcome>, CodypendentError> {
+        let existing = lookup_command(pool, idempotency_key)
+            .await
+            .map_err(internal_error)?;
+        match existing {
+            Some(existing) => self.handle_existing(pool, existing).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Apply one command through the full six-step sequence. Idempotent on
     /// `idempotency_key`; returns a structured [`CodypendentError`] on any bad
     /// input, never panics.
