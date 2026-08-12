@@ -598,6 +598,14 @@ pub enum Intent {
         api_key: Option<SecretKey>,
     },
 
+    /// Remember the theme picked in `/theme` so the next launch starts in it
+    /// (client-only — a display preference, never a daemon command). The
+    /// harness persists the id beside its session store; `theme_select` reads
+    /// it at boot, below `--theme`/`CODYPENDENT_THEME`. The live switch does
+    /// not depend on this: the renderer already draws in the picked theme.
+    SetTheme {
+        id: String,
+    },
     /// Set (or replace) an API key from the `/keys` overlay (D1; client-only —
     /// NOT a daemon command, keeping the key off the wire exactly like
     /// `AddModel`). The harness writes it to `auth.json` (load-before-write,

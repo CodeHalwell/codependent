@@ -47,6 +47,8 @@ pub enum PaletteCommand {
     ApiKeys,
     /// Surface the persisted multi-provider council workflow.
     Council,
+    /// Open the theme picker (7 built-in variants + installed packs).
+    Theme,
     /// Flip between the chat and workspace layouts.
     ToggleLayout,
     /// Toggle the help overlay.
@@ -219,6 +221,14 @@ pub const COMMANDS: &[PaletteEntry] = &[
         group: "Workspace",
     },
     // --- Session: client-level and housekeeping commands. ---
+    PaletteEntry {
+        command: PaletteCommand::Theme,
+        title: "/theme  Theme picker",
+        description: "switch the colour theme — previews live as you move",
+        // Palette-only, like the model/provider/mode pickers.
+        key: "—",
+        group: "Session",
+    },
     PaletteEntry {
         command: PaletteCommand::ToggleLayout,
         title: "Toggle layout",

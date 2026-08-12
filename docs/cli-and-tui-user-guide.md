@@ -73,11 +73,26 @@ codypendent
 - `ansi256` / `ansi16` (legacy terminal fallbacks)
 - `monochrome` (grayscale / no-color mode)
 
+#### Switching themes while running
+
+Open the command palette with `/` and choose **`/theme`  Theme picker**. It
+lists the seven built-in variants plus any data-only theme packs installed
+under `<data-dir>/themes/*.toml`. Moving the cursor previews the theme across
+the whole interface; `Enter` keeps it, `Esc` goes back to the one in force.
+
+A kept theme is remembered for the next launch. Resolution order at boot is:
+`--theme` / `CODYPENDENT_THEME` (an explicit override always wins) → the theme
+last kept in the picker → terminal capability detection. A remembered theme
+that no longer resolves (an uninstalled pack) quietly falls back to detection
+rather than failing the launch.
+
 ---
 
 ### 3.2 Keyboard & Mouse Parity Reference
 
-The TUI guarantees 100% feature parity between keyboard hotkeys and mouse actions.
+Every mouse gesture the TUI recognizes has a keyboard equivalent; the reverse
+is not claimed — some keys (steering, run switching, cursor motion) have no
+mouse gesture at all, and the table below says so with `-`.
 
 ```mermaid
 graph LR
@@ -128,6 +143,7 @@ equivalent and the key is the only way in.
 | | `G` | Open Code Graph Edge Inspector | Palette row "Code graph" |
 | | `W` | Open Workflow Conductor View | Palette row "Workflows" |
 | | `B` | Open Agent Blackboard / Claims View | Palette row "Blackboard" |
+| | `/theme` | Switch the colour theme (previews live) | Palette row "/theme  Theme picker" |
 | | `?` | Toggle Help Overlay | Palette row "Help" |
 | | `Esc` | Clear draft, exit prompt, or close overlay | Click outside an overlay, or its `Esc close` chip |
 

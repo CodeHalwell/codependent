@@ -18,6 +18,7 @@ use codypendent_protocol::{
 
 use crate::action::{Action, Intent, KeyTarget, SecretKey};
 use crate::remote_ui_host::RemoteUiHostState;
+use crate::theme::{Theme, ThemeVariant};
 
 /// Maximum code-graph rows held in UI state at once. Shared by the renderer,
 /// reducer paging logic, and the CLI's SQLite query so range labels and page
@@ -262,6 +263,13 @@ pub enum Overlay {
     /// `Enter` sets [`AppState::default_mode`]; the current default is marked
     /// in the list.
     ModePicker { query: String, selected: usize },
+    /// The theme picker, opened from the command palette's `/theme` entry: the
+    /// seven built-in variants plus any data-only packs the CLI loaded at boot
+    /// ([`AppState::themes`]). The same filter/selection shape as
+    /// [`Overlay::ModePicker`]; moving the cursor previews the focused theme
+    /// across the WHOLE shell (see [`AppState::effective_theme`]), and `Enter`
+    /// keeps it and asks the harness to persist it.
+    ThemePicker { query: String, selected: usize },
     /// Add-model flow, free-text fallback (step 2): the provider-side model name,
     /// for the catalog provider chosen in step 1 (`provider_id`). `requires_key`
     /// was read from that provider's card. `api_key`:
@@ -1151,6 +1159,84 @@ pub(crate) const MODE_CARDS: &[ModeCard] = &[
     },
 ];
 
+/// One selectable theme: a built-in variant, or a data-only theme pack the CLI
+/// loaded from `<data-dir>/themes/<id>.toml` at boot. The resolved [`Theme`]
+/// travels with the row so the picker can preview it live — the TUI crate
+/// performs no I/O, so a pack's colours must arrive already parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeChoice {
+    /// The id `--theme`/`CODYPENDENT_THEME` and the persisted preference use.
+    pub id: String,
+    /// What this theme is for, in one line.
+    pub summary: String,
+    /// The colours themselves.
+    pub theme: Theme,
+    /// `true` for a data-only pack, `false` for a built-in variant.
+    pub pack: bool,
+}
+
+/// The seven built-in variants, in the order the picker lists them: the two
+/// everyday themes first, then the accessibility variants, then the
+/// reduced-depth fallbacks.
+#[must_use]
+pub fn builtin_theme_choices() -> Vec<ThemeChoice> {
+    [
+        ("dark", "true-colour dark — the default", ThemeVariant::Dark),
+        ("light", "true-colour light terminals", ThemeVariant::Light),
+        (
+            "high-contrast",
+            "pure black on white, maximum contrast",
+            ThemeVariant::HighContrast,
+        ),
+        (
+            "color-blind-safe",
+            "Okabe–Ito hues, safe for all common colour vision",
+            ThemeVariant::ColorBlindSafe,
+        ),
+        (
+            "ansi256",
+            "xterm-256 indexed palette",
+            ThemeVariant::Ansi256,
+        ),
+        (
+            "ansi16",
+            "basic ANSI palette for 16-colour terminals",
+            ThemeVariant::Ansi16,
+        ),
+        (
+            "monochrome",
+            "no colour at all — white, grey, black",
+            ThemeVariant::Monochrome,
+        ),
+    ]
+    .into_iter()
+    .map(|(id, summary, variant)| ThemeChoice {
+        id: id.to_owned(),
+        summary: summary.to_owned(),
+        theme: Theme::variant(variant),
+        pack: false,
+    })
+    .collect()
+}
+
+/// The indices into `themes` whose id or summary case-insensitively contains
+/// `query`, in list order — the theme picker's substring filter, the same
+/// shape as [`filter_models`]. An empty query matches every theme.
+#[must_use]
+pub fn filter_themes(themes: &[ThemeChoice], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    themes
+        .iter()
+        .enumerate()
+        .filter(|(_, choice)| {
+            needle.is_empty()
+                || choice.id.to_lowercase().contains(&needle)
+                || choice.summary.to_lowercase().contains(&needle)
+        })
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 /// The indices into [`MODE_CARDS`] whose label or summary case-insensitively
 /// contains `query` — the mode picker's substring filter, in table order.
 /// Mirrors [`filter_models`], adapted to a static table (no state list to
@@ -1354,6 +1440,15 @@ pub struct AppState {
     /// `Esc` — every gesture that means "I am driving the composer/view
     /// again". Client-only view state; never on the wire.
     pub transcript_browse: bool,
+    /// Every theme the `/theme` picker offers: the seven built-in variants,
+    /// plus any data-only packs the CLI loaded from `<data-dir>/themes/` at
+    /// boot (the TUI crate does no I/O, so a pack arrives already parsed).
+    pub themes: Vec<ThemeChoice>,
+    /// Index into [`AppState::themes`] of the theme in force, once the operator
+    /// has picked one. `None` means "whatever the harness resolved at boot"
+    /// (the `--theme` flag, `CODYPENDENT_THEME`, a persisted preference, or
+    /// terminal detection) — see [`AppState::effective_theme`].
+    pub theme_selected: Option<usize>,
     /// Which base layout is rendered (chat single-column vs. workspace panes).
     /// Toggled with `F2`; defaults to [`LayoutMode::Chat`].
     pub layout: LayoutMode,
@@ -1445,6 +1540,8 @@ impl AppState {
             history_cursor: None,
             composer_stash: None,
             transcript_browse: false,
+            themes: builtin_theme_choices(),
+            theme_selected: None,
             layout: LayoutMode::Chat,
             transcript_max_scroll: Cell::new(0),
             hit_map: RefCell::new(Vec::new()),
@@ -1496,6 +1593,7 @@ impl AppState {
             | Overlay::ModelPicker { .. }
             | Overlay::ProviderPicker { .. }
             | Overlay::ModePicker { .. }
+            | Overlay::ThemePicker { .. }
             | Overlay::ApiKeys { .. }
             | Overlay::AddModelPick { .. } => InputMode::Palette,
             // The Skills / Memory / Docs / Edges / Workflow / Help browsers are
@@ -1643,6 +1741,27 @@ impl AppState {
             worktree: run.and_then(|r| r.worktree.clone()),
             pending_approvals: self.pending_approvals.len(),
         }
+    }
+
+    /// The theme this frame draws in: the row the `/theme` picker is focused on
+    /// (so moving the cursor previews the whole shell in that theme), else the
+    /// operator's kept choice, else `boot` — whatever the harness resolved from
+    /// `--theme`/`CODYPENDENT_THEME`/the persisted preference/terminal
+    /// detection. Pure, so the renderer stays a projection of state.
+    #[must_use]
+    pub fn effective_theme(&self, boot: &Theme) -> Theme {
+        if let Overlay::ThemePicker { query, selected } = &self.overlay {
+            let filtered = filter_themes(&self.themes, query);
+            if let Some(choice) = filtered
+                .get(*selected)
+                .and_then(|&idx| self.themes.get(idx))
+            {
+                return choice.theme;
+            }
+        }
+        self.theme_selected
+            .and_then(|idx| self.themes.get(idx))
+            .map_or(*boot, |choice| choice.theme)
     }
 
     /// Whether any surface on screen right now has a moving part — a run that

@@ -27,9 +27,9 @@ use crate::reduce::capability_label;
 use crate::remote_ui_host::{TERMINAL_CENTRAL_SLOTS, TERMINAL_OVERLAY_SLOTS};
 use crate::state::{
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
-    filter_providers, AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus, DocLeaseState,
-    KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, ModelReadiness, Overlay, Pane,
-    PatchSummary, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    filter_providers, filter_themes, AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus,
+    DocLeaseState, KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, ModelReadiness, Overlay,
+    Pane, PatchSummary, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
     NOTE_INLINE_LINE_THRESHOLD,
 };
 use crate::theme::Theme;
@@ -37,6 +37,12 @@ use crate::{render_remote_ui, RemoteUiRenderOptions};
 
 /// Draw the whole UI for the current frame.
 pub fn render(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    // `theme` is what the harness resolved at boot; the operator's `/theme`
+    // choice — and, while the picker is open, the row the cursor is on — takes
+    // precedence, so the WHOLE shell previews live as the cursor moves. Purely
+    // derived: no cache to invalidate, and the next frame follows the state.
+    let previewed = state.effective_theme(theme);
+    let theme = &previewed;
     let area = frame.area();
     // Rebuilt fresh every frame (mirrors `transcript_max_scroll`): a stale hit
     // from a previous layout must never survive to resolve this frame's clicks.
@@ -2505,6 +2511,9 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::ModePicker { query, selected } => {
             render_mode_picker(frame, area, state, theme, query, *selected);
         }
+        Overlay::ThemePicker { query, selected } => {
+            render_theme_picker(frame, area, state, theme, query, *selected);
+        }
         // D1: the `/keys` overlay, its masked set/replace prompt, and its two
         // confirms. The set prompt reuses `render_masked_prompt` (the key can
         // never appear on screen); neither confirm ever carries key material.
@@ -3663,6 +3672,130 @@ fn render_mode_picker(
     frame.render_widget(
         Paragraph::new(Line::styled(
             "↑/↓ select  ·  Enter use  ·  Esc close",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
+}
+
+/// The `/theme` picker: the same filter-line + list shape as
+/// [`render_mode_picker`], over the seven built-in variants plus any installed
+/// packs.
+///
+/// `theme` here is already the FOCUSED row's theme — `render` resolves it
+/// through [`AppState::effective_theme`] before drawing anything — so the
+/// whole shell behind this modal, and the modal itself, are the live preview.
+/// Moving the cursor is the preview; `Enter` only makes it stick.
+fn render_theme_picker(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    query: &str,
+    selected: usize,
+) {
+    let matches = filter_themes(&state.themes, query);
+    // Tall enough for all seven built-ins at two lines each, plus the search
+    // line, the panel/modal borders, and the footer — so the list needs no
+    // scrolling on an ordinary 80x24 terminal.
+    let rect = centered_modal(area, 72, 22);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!(
+            "Theme picker  ·  {} of {} themes",
+            matches.len(),
+            state.themes.len()
+        ),
+        state,
+        theme,
+    );
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    render_modal_search(frame, rows[0], query, theme);
+
+    const ROW_LINES: usize = 2;
+    let list_block = modal_panel(
+        format!("Themes  ·  {} of {}", matches.len(), state.themes.len()),
+        theme,
+    );
+    let list_area = list_block.inner(rows[1]);
+    frame.render_widget(list_block, rows[1]);
+    let visible_rows = (usize::from(list_area.height) / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
+    let mut items: Vec<ListItem> = Vec::new();
+    if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching theme",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate().skip(first) {
+        let choice = &state.themes[idx];
+        let is_selected = row == selected;
+        let is_current = state.theme_selected == Some(idx);
+        let mut head = vec![
+            Span::styled(
+                if is_selected { "▎ " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.focus.active),
+            ),
+            Span::styled(
+                if is_current { "● " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.status.success),
+            ),
+            Span::styled(
+                choice.id.clone(),
+                theme.selection_aware_text_style(is_selected, theme.text.primary),
+            ),
+        ];
+        if choice.pack {
+            head.push(Span::styled(
+                "  pack",
+                theme.selection_aware_text_style(is_selected, theme.text.muted),
+            ));
+        }
+        // A row's own swatch, drawn in ITS colours rather than the previewed
+        // theme's: the list is the comparison, so each row has to show what it
+        // would look like even while another row is previewing.
+        let swatch = Line::from(vec![
+            Span::raw("      "),
+            Span::styled("███", Style::default().fg(choice.theme.focus.active)),
+            Span::styled("███", Style::default().fg(choice.theme.agent.tool)),
+            Span::styled("███", Style::default().fg(choice.theme.status.success)),
+            Span::styled("███", Style::default().fg(choice.theme.status.error)),
+            Span::styled(
+                format!("  {}", choice.summary),
+                theme.selection_aware_text_style(is_selected, theme.text.muted),
+            ),
+        ]);
+        let item = ListItem::new(vec![Line::from(head), swatch]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
+        list_area,
+    );
+    for (row, _) in matches.iter().enumerate().skip(first) {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
+            break;
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ preview  ·  Enter keep  ·  Esc cancel",
             Style::default().fg(theme.text.muted),
         ))
         .alignment(Alignment::Center),
@@ -11289,5 +11422,55 @@ mod tests {
             Some(Action::OpenMemory),
             "the whole label is the target, not just its first cell"
         );
+    }
+
+    /// The `/theme` picker previews across the WHOLE shell, not just its own
+    /// modal: the frame is drawn in the focused row's theme, so what the
+    /// operator sees before pressing Enter is what they will get.
+    #[test]
+    fn the_theme_picker_previews_the_whole_shell_live() {
+        let mut state = running_build_state();
+        // The harness resolved dark at boot; the picker opens on it.
+        reduce(&mut state, Action::OpenPalette);
+        for c in "theme picker".chars() {
+            reduce(&mut state, Action::InputChar(c));
+        }
+        reduce(&mut state, Action::InputSubmit);
+        let text = render_to_string(&state, 100, 30);
+        assert!(text.contains("Theme picker"), "the picker draws:\n{text}");
+        assert!(
+            text.contains("monochrome") && text.contains("high-contrast"),
+            "every built-in variant is listed:\n{text}"
+        );
+        assert!(
+            text.contains("↑/↓ preview"),
+            "the footer says what the arrows do:\n{text}"
+        );
+
+        let boot = Theme::dark();
+        let dark_frame = render_buffer(&state, 100, 30, &boot);
+        // Move to `light`: the frame's background must change even though the
+        // harness still passes the boot theme in.
+        reduce(&mut state, Action::SelectNext);
+        let light_frame = render_buffer(&state, 100, 30, &boot);
+        let background = |buffer: &Buffer| buffer[(0, 0)].bg;
+        assert_ne!(
+            background(&dark_frame),
+            background(&light_frame),
+            "moving the cursor repaints the whole shell in the focused theme"
+        );
+        // Keeping it holds after the picker closes — and the result is
+        // indistinguishable from having booted in that theme.
+        reduce(&mut state, Action::InputSubmit);
+        let kept = render_buffer(&state, 100, 30, &boot);
+        let mut booted_light = state.clone();
+        booted_light.theme_selected = None;
+        let direct = render_buffer(&booted_light, 100, 30, &Theme::light());
+        assert_eq!(
+            kept.content(),
+            direct.content(),
+            "a kept theme renders exactly as booting in it would"
+        );
+        assert_ne!(background(&kept), background(&dark_frame));
     }
 }

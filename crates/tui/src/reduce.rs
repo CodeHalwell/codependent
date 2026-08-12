@@ -23,10 +23,10 @@ use crate::remote_ui::{RemoteKey, RemoteUiRenderOutput};
 use crate::remote_ui_host::{empty_message, terminal_viewport_message};
 use crate::state::{
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
-    filter_providers, key_row_target, AppState, CouncilBuilderState, CouncilBuilderStep,
-    CouncilMemberDraft, DocBlockView, DocEdit, DocFocus, DocLeaseState, DocSuggestionView,
-    KeyStatus, ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, RunActivity, RunView,
-    ToolCard, ToolStatus, TranscriptEntry, EDGE_PAGE_SIZE,
+    filter_providers, filter_themes, key_row_target, AppState, CouncilBuilderState,
+    CouncilBuilderStep, CouncilMemberDraft, DocBlockView, DocEdit, DocFocus, DocLeaseState,
+    DocSuggestionView, KeyStatus, ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval,
+    RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry, EDGE_PAGE_SIZE,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -1632,6 +1632,16 @@ fn nav(state: &mut AppState, delta: i32) {
             step(selected, indices.len(), delta);
             return;
         }
+        // The theme picker: the same shape again. Moving the cursor is all the
+        // preview needs — the renderer reads the focused row every frame.
+        Overlay::ThemePicker {
+            ref query,
+            ref mut selected,
+        } => {
+            let indices = filter_themes(&state.themes, query);
+            step(selected, indices.len(), delta);
+            return;
+        }
         // The `/keys` overlay (D1): the same filtered-cursor shape, over the
         // model list plus the final Tavily row — no resolved `AppState` index
         // (like the mode picker).
@@ -2507,6 +2517,13 @@ fn edit_prompt(state: &mut AppState, edit: &Edit) {
             append(query, edit);
             *selected = 0;
         }
+        // Same shape as the mode picker: editing the theme query changes the
+        // filtered set, so the selection (and therefore the live preview)
+        // returns to the top of the new results.
+        Overlay::ThemePicker { query, selected } => {
+            append(query, edit);
+            *selected = 0;
+        }
         // Same shape as the mode picker (D1): editing the `/keys` query
         // changes the filtered set, so the selection returns to the top.
         Overlay::ApiKeys { query, selected } => {
@@ -2739,8 +2756,11 @@ fn set_overlay_selected(state: &mut AppState, n: usize) {
         } => {
             *selected = n;
         }
-        // Same for the `/keys` overlay (D1).
-        Overlay::ApiKeys {
+        // Same for the theme picker and the `/keys` overlay (D1).
+        Overlay::ThemePicker {
+            ref mut selected, ..
+        }
+        | Overlay::ApiKeys {
             ref mut selected, ..
         } => {
             *selected = n;
@@ -2802,6 +2822,7 @@ fn activate_row(state: &mut AppState, n: usize) {
         | Overlay::ModelPicker { .. }
         | Overlay::ProviderPicker { .. }
         | Overlay::ModePicker { .. }
+        | Overlay::ThemePicker { .. }
         | Overlay::ApiKeys { .. }
         | Overlay::AddModelPick { .. }
         | Overlay::CouncilBuilder(_) => {
@@ -3193,6 +3214,19 @@ fn submit_prompt(state: &mut AppState) {
                     format!("mode set to {} — applies to your next run", card.label),
                     state.tick + 25,
                 ));
+            }
+        }
+        // Enter keeps the previewed theme: the renderer already draws in it
+        // (`AppState::effective_theme`), so this only makes the choice sticky
+        // and asks the harness to remember it for the next launch. Same
+        // zero-match guard as every other picker. `mem::take` already closed
+        // the picker.
+        Overlay::ThemePicker { query, selected } => {
+            if let Some(&idx) = filter_themes(&state.themes, &query).get(selected) {
+                state.theme_selected = Some(idx);
+                let id = state.themes[idx].id.clone();
+                state.notice = Some((format!("theme set to {id}"), state.tick + 25));
+                state.outbox.push(Intent::SetTheme { id });
             }
         }
         // Enter on a `/keys` row (D1) opens the masked set/replace prompt for
@@ -3651,6 +3685,14 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
                     .iter()
                     .position(|card| card.mode == state.default_mode)
                     .unwrap_or(0),
+            };
+        }
+        // Open on the theme in force, so the first thing the cursor previews is
+        // what is already on screen.
+        PaletteCommand::Theme => {
+            state.overlay = Overlay::ThemePicker {
+                query: String::new(),
+                selected: state.theme_selected.unwrap_or(0),
             };
         }
         // D1: open the `/keys` overlay (rows come from `state.models` +
@@ -9299,5 +9341,146 @@ mod tests {
         assert!(s.is_animating());
         s.overlay = Overlay::None;
         assert!(!s.is_animating());
+    }
+
+    // --- /theme: pick a theme at runtime, preview it live, keep it ---
+
+    /// Open the theme picker through the palette front door, exactly as an
+    /// operator does: `/` → filter → Enter.
+    fn open_theme_picker(s: &mut AppState) {
+        reduce(s, Action::OpenPalette);
+        for c in "theme picker".chars() {
+            reduce(s, Action::InputChar(c));
+        }
+        reduce(s, Action::InputSubmit);
+    }
+
+    #[test]
+    fn the_theme_palette_entry_opens_the_picker_on_the_current_theme() {
+        let mut s = AppState::new();
+        assert_eq!(
+            s.themes.len(),
+            7,
+            "the seven built-in variants are always offered"
+        );
+        s.theme_selected = Some(2);
+        open_theme_picker(&mut s);
+        assert_eq!(
+            s.overlay,
+            Overlay::ThemePicker {
+                query: String::new(),
+                selected: 2,
+            },
+            "the picker opens on the theme already in force"
+        );
+        assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
+    }
+
+    #[test]
+    fn moving_the_theme_cursor_previews_and_enter_keeps_it() {
+        let mut s = AppState::new();
+        let boot = crate::Theme::dark();
+        assert_eq!(
+            s.effective_theme(&boot),
+            boot,
+            "with no choice, the harness's boot theme stands"
+        );
+
+        open_theme_picker(&mut s);
+        reduce(&mut s, Action::SelectNext); // → light
+        assert_eq!(
+            s.effective_theme(&boot),
+            s.themes[1].theme,
+            "moving the cursor previews that theme across the whole shell"
+        );
+        assert_eq!(
+            s.theme_selected, None,
+            "previewing is not choosing — nothing is kept until Enter"
+        );
+
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.overlay, Overlay::None);
+        assert_eq!(s.theme_selected, Some(1));
+        assert_eq!(
+            s.effective_theme(&boot),
+            s.themes[1].theme,
+            "the kept theme survives the picker closing"
+        );
+        assert_eq!(
+            s.outbox,
+            vec![Intent::SetTheme {
+                id: "light".to_owned()
+            }],
+            "the harness is asked to remember it for the next launch"
+        );
+
+        // Esc abandons a preview: the kept theme comes back.
+        open_theme_picker(&mut s);
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.theme_selected, Some(1));
+        assert_eq!(s.effective_theme(&boot), s.themes[1].theme);
+    }
+
+    #[test]
+    fn the_theme_picker_filters_and_guards_a_zero_match_submit() {
+        let mut s = AppState::new();
+        open_theme_picker(&mut s);
+        for c in "mono".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        let Overlay::ThemePicker { query, selected } = &s.overlay else {
+            unreachable!("the picker stays open while filtering")
+        };
+        assert_eq!(query, "mono");
+        assert_eq!(*selected, 0, "editing the query returns to the top");
+        let matches = crate::state::filter_themes(&s.themes, "mono");
+        assert_eq!(matches.len(), 1);
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.themes[s.theme_selected.expect("kept")].id, "monochrome");
+
+        // A query matching nothing keeps nothing (the zero-match guard every
+        // other picker uses).
+        let before = s.theme_selected;
+        s.outbox.clear();
+        open_theme_picker(&mut s);
+        for c in "zzzz".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(s.theme_selected, before);
+        assert!(s.outbox.is_empty());
+    }
+
+    #[test]
+    fn an_installed_pack_is_offered_and_previewed_like_a_builtin() {
+        // The harness parses packs and hands them over as rows; the reducer
+        // treats them exactly like the built-ins.
+        let mut s = AppState::new();
+        let mut pack_theme = crate::Theme::light();
+        pack_theme.focus.active = ratatui::style::Color::Rgb(1, 2, 3);
+        s.themes.push(crate::state::ThemeChoice {
+            id: "solarized".to_owned(),
+            summary: "installed theme pack".to_owned(),
+            theme: pack_theme,
+            pack: true,
+        });
+        open_theme_picker(&mut s);
+        for c in "solar".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        assert_eq!(
+            s.effective_theme(&crate::Theme::dark()),
+            pack_theme,
+            "live preview"
+        );
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::SetTheme {
+                id: "solarized".to_owned()
+            }]
+        );
     }
 }

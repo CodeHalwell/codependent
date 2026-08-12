@@ -328,6 +328,7 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::Workflow | Overlay::WorkflowInputs { .. } => "workflow",
         Overlay::Blackboard => "blackboard",
         Overlay::UiPlugins => "Remote UI plugins",
+        Overlay::ThemePicker { .. } => "theme picker",
         Overlay::ApiKeys { .. } => "API keys",
         Overlay::ApiKeySet { .. } => "API key entry",
         Overlay::ApiKeyRemoveConfirm { .. } => "remove API key confirmation",
