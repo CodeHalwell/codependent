@@ -445,8 +445,13 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn fake_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::io::Write as _;
+
         let path = dir.join(name);
-        std::fs::write(&path, body).expect("write fake script");
+        let mut file = std::fs::File::create(&path).expect("create fake script");
+        file.write_all(body.as_bytes()).expect("write fake script");
+        file.sync_all().expect("flush fake script");
+        drop(file);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
