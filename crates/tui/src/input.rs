@@ -109,9 +109,6 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         description: "focus the next workspace pane (same as clicking it)",
         mouse: Some("click a pane"),
     },
-    // FOOTER_HINTS below references entries by fixed index (all of them under
-    // this point), so new bindings are appended here or later — never inserted
-    // above — to keep those indices stable.
     KeyBinding {
         keys: "↑ / ↓ (composer)",
         description: "recall the previous / next composer message",
@@ -153,61 +150,6 @@ pub const KEY_BINDINGS: &[KeyBinding] = &[
         mouse: Some("click extension chrome"),
     },
 ];
-
-/// One footer chip: a compact display label paired with the real `KEY_BINDINGS`
-/// entry it derives from (so it can never drift) and the `Action` a click fires.
-#[derive(Debug, Clone)]
-pub struct FooterHint {
-    pub binding: &'static KeyBinding,
-    pub label: &'static str,
-    pub action: Action,
-}
-
-/// The curated, ordered footer strip. Each entry references a real binding by
-/// index (the drift-guard test asserts each is present in `KEY_BINDINGS`).
-static FOOTER_HINTS: &[FooterHint] = &[
-    FooterHint {
-        binding: &KEY_BINDINGS[1],
-        label: "⏎ send",
-        action: Action::InputSubmit,
-    },
-    FooterHint {
-        binding: &KEY_BINDINGS[2],
-        label: "/ commands",
-        action: Action::OpenPalette,
-    },
-    FooterHint {
-        binding: &KEY_BINDINGS[3],
-        label: "PgUp",
-        action: Action::ScrollPageUp,
-    },
-    FooterHint {
-        binding: &KEY_BINDINGS[3],
-        label: "PgDn",
-        action: Action::ScrollPageDown,
-    },
-    FooterHint {
-        binding: &KEY_BINDINGS[5],
-        label: "F2 layout",
-        action: Action::ToggleLayout,
-    },
-    FooterHint {
-        binding: &KEY_BINDINGS[9],
-        label: "? help",
-        action: Action::Help,
-    },
-    FooterHint {
-        binding: &KEY_BINDINGS[12],
-        label: "Ctrl-C detach",
-        action: Action::Detach,
-    },
-];
-
-/// The persistent, derived shortcut strip (curated subset of `KEY_BINDINGS`).
-#[must_use]
-pub fn footer_hints() -> &'static [FooterHint] {
-    FOOTER_HINTS
-}
 
 /// Resolve a left click at `(col,row)` to the topmost registered rect's Action.
 /// Iterates in reverse so the last-registered (top-of-z-order) rect wins.
@@ -518,12 +460,18 @@ fn map_mouse(
     }
 }
 
-/// Resolve which pane a column falls in, using the same 30 / 40 / 30 split the
-/// renderer lays out (see [`crate::render`]).
+/// Resolve which pane a column falls in, using the same 26 / 48 / 26 split
+/// `render_workspace` lays out (see [`crate::render`]). The doc comment and
+/// the arithmetic both used to say 30 / 40 / 30, which had drifted from the
+/// renderer — a click near a pane seam resolved to the neighbour.
+///
+/// The live mouse path resolves clicks through the renderer's own hit map, so
+/// this is the geometry answer for callers outside a frame (and the assertion
+/// that the two splits agree).
 #[must_use]
 pub fn pane_at(column: u16, width: u16) -> Pane {
-    let left = width * 3 / 10;
-    let right_start = width.saturating_sub(width * 3 / 10);
+    let left = width * 26 / 100;
+    let right_start = width.saturating_sub(width * 26 / 100);
     if column < left {
         Pane::Sessions
     } else if column >= right_start {
@@ -736,6 +684,20 @@ mod tests {
         assert_eq!(pane_at(1, W), Pane::Sessions);
         assert_eq!(pane_at(W / 2, W), Pane::Transcript);
         assert_eq!(pane_at(W - 2, W), Pane::Approvals);
+
+        // The seams are the renderer's 26 / 48 / 26 split, not the 30 / 40 / 30
+        // this function's arithmetic and doc comment had drifted to. At 200
+        // columns that is a 8-column difference at each seam — enough to
+        // resolve a click to the wrong pane.
+        let wide = 200_u16;
+        assert_eq!(
+            pane_at(51, wide),
+            Pane::Sessions,
+            "26% of 200 is 52 columns"
+        );
+        assert_eq!(pane_at(52, wide), Pane::Transcript);
+        assert_eq!(pane_at(147, wide), Pane::Transcript);
+        assert_eq!(pane_at(148, wide), Pane::Approvals);
     }
 
     fn ctrl(code: KeyCode) -> Event {
@@ -1103,21 +1065,6 @@ mod tests {
             map_event(&key(KeyCode::Tab), InputMode::Normal, W, &[]),
             Action::CyclePane
         );
-    }
-
-    /// Drift guard: every footer chip must derive from a real `KEY_BINDINGS`
-    /// entry (Task 5) — the footer strip can never silently diverge from the
-    /// actual bindings table.
-    #[test]
-    fn footer_hints_are_all_backed_by_real_bindings() {
-        for hint in footer_hints() {
-            assert!(
-                KEY_BINDINGS.iter().any(|b| b.keys == hint.binding.keys),
-                "footer hint {:?} must derive from a real KEY_BINDINGS entry",
-                hint.label
-            );
-            assert!(!hint.label.is_empty());
-        }
     }
 
     #[test]

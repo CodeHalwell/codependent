@@ -18,7 +18,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use codypendent_protocol::{
-    AgentMode, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition, RunState, BUILD_ID,
+    AgentMode, ApprovalScope, BudgetDimension, ProposedAction, Risk, RiskLevel, RunDisposition,
+    RunState, BUILD_ID,
 };
 
 use crate::action::{Action, KeyTarget};
@@ -1261,6 +1262,73 @@ fn for_each_row<'a>(runs: &'a [RunView], view: TranscriptView<'_>, mut visit: im
     }
 }
 
+/// One labelled control chip: a key cap, what it does, and the `Action` a
+/// click on it fires — the same `Action` its key produces, so mouse/keyboard
+/// parity is structural (RULE 3) rather than something a comment claims.
+struct Chip {
+    key: &'static str,
+    label: &'static str,
+    action: Action,
+}
+
+impl Chip {
+    fn new(key: &'static str, label: &'static str, action: Action) -> Self {
+        Chip { key, label, action }
+    }
+}
+
+/// Lay a chip row out into spans, returning each chip's MEASURED `(offset,
+/// width)` in columns from the row's first cell.
+///
+/// Every chip-row footer used to register its click targets from
+/// hand-counted offsets (`x + 14`, width 8, …) that had to be kept in step
+/// with the label string by eye — and some had already drifted. Callers now
+/// place the returned spans and register hits from these measurements, so a
+/// label edit moves the click target with it, always.
+///
+/// Chips are dropped whole once the row runs out of columns; a half-drawn
+/// chip with a live hit region would be worse than an absent one.
+fn chip_row(chips: &[Chip], width: u16, theme: &Theme) -> (Vec<Span<'static>>, Vec<(u16, u16)>) {
+    let key_style = Style::default().fg(theme.focus.active);
+    let label_style = Style::default().fg(theme.text.muted);
+    let mut spans = vec![Span::raw("  ")];
+    let mut placed: Vec<(u16, u16)> = Vec::new();
+    let mut cursor: u16 = 2;
+    for (index, chip) in chips.iter().enumerate() {
+        let separator = if index == 0 { "" } else { " · " };
+        let text = format!("{separator}{} ", chip.key);
+        let chip_width = u16::try_from(
+            UnicodeWidthStr::width(text.as_str()) + UnicodeWidthStr::width(chip.label),
+        )
+        .unwrap_or(u16::MAX);
+        if cursor.saturating_add(chip_width) > width {
+            break;
+        }
+        let lead = u16::try_from(UnicodeWidthStr::width(separator)).unwrap_or(0);
+        spans.push(Span::styled(text, key_style));
+        spans.push(Span::styled(chip.label, label_style));
+        // The hit region covers the key cap and its label, not the separator.
+        placed.push((cursor + lead, chip_width - lead));
+        cursor = cursor.saturating_add(chip_width);
+    }
+    (spans, placed)
+}
+
+/// Register the measured chip rects of a row whose first cell is at `(x, y)`.
+fn register_chip_hits(state: &AppState, x: u16, y: u16, placed: &[(u16, u16)], chips: &[Chip]) {
+    for ((offset, width), chip) in placed.iter().zip(chips) {
+        state.register_hit(
+            Rect {
+                x: x.saturating_add(*offset),
+                y,
+                width: *width,
+                height: 1,
+            },
+            chip.action.clone(),
+        );
+    }
+}
+
 /// The braille-dot spinner frames CLI spinners conventionally use. One table
 /// for every animated surface, so they all turn at the same rate and in the
 /// same direction.
@@ -2172,10 +2240,12 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     }
 
     let status = state.status();
-    let key = |text: &'static str| Span::styled(text, Style::default().fg(theme.focus.active));
-    let hint = |text: &'static str| Span::styled(text, Style::default().fg(theme.text.muted));
 
-    let (left, right): (Vec<Span>, Vec<Span>) = if status.pending_approvals > 0 {
+    // The right-hand hints are real chips: each one measured, each one a click
+    // target for the very Action its key produces. (The old curated
+    // `FOOTER_HINTS` table was never rendered at all; these contextual chips
+    // supersede it.)
+    let (left, right): (Vec<Span>, Vec<Chip>) = if status.pending_approvals > 0 {
         (
             vec![
                 Span::raw("  "),
@@ -2188,12 +2258,9 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                 ),
             ],
             vec![
-                key("a"),
-                hint(" once  "),
-                key("A"),
-                hint(" run  "),
-                key("r"),
-                hint(" reject"),
+                Chip::new("a", "once", Action::Approve(ApprovalScope::Once)),
+                Chip::new("A", "run", Action::Approve(ApprovalScope::Run)),
+                Chip::new("r", "reject", Action::Reject),
             ],
         )
     } else if !state.issues.is_empty() {
@@ -2207,7 +2274,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     Style::default().fg(theme.status.warning),
                 ),
             ],
-            vec![key("/"), hint(" diagnostics")],
+            vec![Chip::new("/", "diagnostics", Action::OpenIssues)],
         )
     } else if !state.composer.is_empty() {
         (
@@ -2217,12 +2284,9 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                 Span::styled("Draft ready", Style::default().fg(theme.text.secondary)),
             ],
             vec![
-                key("Enter"),
-                hint(" send  "),
-                key("⌥Enter"),
-                hint(" newline  "),
-                key("Esc"),
-                hint(" clear"),
+                Chip::new("Enter", "send", Action::InputSubmit),
+                Chip::new("⌥Enter", "newline", Action::InputNewline),
+                Chip::new("Esc", "clear", Action::InputCancel),
             ],
         )
     } else if !central_remote_ui_is_active(state)
@@ -2241,7 +2305,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     Style::default().fg(theme.text.secondary),
                 ),
             ],
-            vec![key("F6"), hint(" focus")],
+            vec![Chip::new("F6", "focus", Action::RemoteUiSetActive(true))],
         )
     } else if state.selected_run().is_some_and(|run| !run.follow) {
         (
@@ -2253,7 +2317,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     Style::default().fg(theme.text.secondary),
                 ),
             ],
-            vec![key("PgDn"), hint(" latest")],
+            vec![Chip::new("PgDn", "latest", Action::ScrollPageDown)],
         )
     } else if let Some(run_state) = status.run_state {
         state.register_hit(area, Action::OpenPalette);
@@ -2274,7 +2338,10 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     Style::default().fg(theme.text.secondary),
                 ),
             ],
-            vec![key("/"), hint(" commands  "), key("F2"), hint(" workspace")],
+            vec![
+                Chip::new("/", "commands", Action::OpenPalette),
+                Chip::new("F2", "workspace", Action::ToggleLayout),
+            ],
         )
     } else {
         state.register_hit(area, Action::OpenPalette);
@@ -2285,34 +2352,37 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                 Span::styled("Ready", Style::default().fg(theme.text.secondary)),
             ],
             vec![
-                key("Enter"),
-                hint(" send  "),
-                key("⌥Enter"),
-                hint(" newline  "),
-                key("/"),
-                hint(" commands"),
+                Chip::new("Enter", "send", Action::InputSubmit),
+                Chip::new("⌥Enter", "newline", Action::InputNewline),
+                Chip::new("/", "commands", Action::OpenPalette),
             ],
         )
     };
 
-    let left_width: usize = left.iter().map(|span| span.width()).sum();
-    // Footer hints are emitted as key/description pairs in priority order.
-    // Keep only complete pairs that fit; clipping half a shortcut is noisier
-    // than omitting its lower-priority hint on a compact terminal.
-    let mut packed_right = Vec::new();
-    let mut packed_width = 0_usize;
-    for pair in right.chunks(2) {
-        let pair_width = pair.iter().map(Span::width).sum::<usize>();
-        if left_width + packed_width + pair_width + 2 > usize::from(area.width) {
-            break;
-        }
-        packed_right.extend(pair.iter().cloned());
-        packed_width += pair_width;
-    }
-    let pad = usize::from(area.width).saturating_sub(left_width + packed_width + 2);
+    let left_width = u16::try_from(left.iter().map(Span::width).sum::<usize>()).unwrap_or(u16::MAX);
+    // Chips are laid out into whatever columns the status text leaves, and
+    // dropped whole once they run out — clipping half a shortcut is noisier
+    // than omitting the lowest-priority one on a compact terminal.
+    let room = area.width.saturating_sub(left_width).saturating_sub(2);
+    let (chip_spans, placed) = chip_row(&right, room, theme);
+    let chips_width =
+        u16::try_from(chip_spans.iter().map(Span::width).sum::<usize>()).unwrap_or(u16::MAX);
+    let pad = area
+        .width
+        .saturating_sub(left_width)
+        .saturating_sub(chips_width)
+        .saturating_sub(2);
+    // Register from the MEASURED offsets, at the row's real origin.
+    register_chip_hits(
+        state,
+        area.x + left_width + pad,
+        area.y,
+        &placed,
+        &right[..placed.len()],
+    );
     let mut spans = left;
-    spans.push(Span::raw(" ".repeat(pad)));
-    spans.extend(packed_right);
+    spans.push(Span::raw(" ".repeat(usize::from(pad))));
+    spans.extend(chip_spans);
     spans.push(Span::raw("  "));
 
     frame.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
@@ -3019,26 +3089,23 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         detail_rows[0],
     );
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            "  ↑/↓ skill · M memory · Esc close",
-            Style::default().fg(theme.text.muted),
-        )),
-        detail_rows[1],
-    );
-
+    // Measured chips, not hand-counted offsets: the `M memory` target used to
+    // be declared at x+14 width 8 over a label whose real span is elsewhere.
+    let chips = [
+        Chip::new("↑/↓", "skill", Action::SelectNext),
+        Chip::new("M", "memory", Action::OpenMemory),
+        Chip::new("Esc", "close", Action::Dismiss),
+    ];
+    let (spans, placed) = chip_row(&chips, detail_rows[1].width, theme);
+    frame.render_widget(Paragraph::new(Line::from(spans)), detail_rows[1]);
     if detail_rows[1].height >= 1 {
-        for (offset, width, action) in [(14, 8, Action::OpenMemory), (25, 9, Action::Dismiss)] {
-            state.register_hit(
-                Rect {
-                    x: detail_rows[1].x.saturating_add(offset),
-                    y: detail_rows[1].y,
-                    width: width.min(detail_rows[1].width.saturating_sub(offset)),
-                    height: 1,
-                },
-                action,
-            );
-        }
+        register_chip_hits(
+            state,
+            detail_rows[1].x,
+            detail_rows[1].y,
+            &placed,
+            &chips[..placed.len()],
+        );
     }
 }
 
@@ -3953,43 +4020,39 @@ fn render_memory(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         card_rows[0],
     );
+    // Two measured chip rows (see `chip_row`), replacing per-row offsets that
+    // had to be re-counted by hand whenever a label changed.
+    let primary = [
+        Chip::new("↑/↓", "memory", Action::SelectNext),
+        Chip::new("o", "source", Action::OpenSource),
+    ];
+    let secondary = [
+        Chip::new("S", "skills", Action::OpenSkills),
+        Chip::new("Esc", "close", Action::Dismiss),
+    ];
+    let (primary_spans, primary_placed) = chip_row(&primary, card_rows[1].width, theme);
+    let (secondary_spans, secondary_placed) = chip_row(&secondary, card_rows[1].width, theme);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                "  ↑/↓ memory · o source",
-                Style::default().fg(theme.focus.active),
-            ),
-            Line::styled(
-                "  S skills · Esc close",
-                Style::default().fg(theme.text.muted),
-            ),
-        ]),
+        Paragraph::new(vec![Line::from(primary_spans), Line::from(secondary_spans)]),
         card_rows[1],
     );
-
     if card_rows[1].height >= 1 {
-        state.register_hit(
-            Rect {
-                x: card_rows[1].x.saturating_add(15),
-                y: card_rows[1].y,
-                width: 8.min(card_rows[1].width.saturating_sub(15)),
-                height: 1,
-            },
-            Action::OpenSource,
+        register_chip_hits(
+            state,
+            card_rows[1].x,
+            card_rows[1].y,
+            &primary_placed,
+            &primary[..primary_placed.len()],
         );
     }
     if card_rows[1].height >= 2 {
-        for (offset, width, action) in [(2, 8, Action::OpenSkills), (13, 9, Action::Dismiss)] {
-            state.register_hit(
-                Rect {
-                    x: card_rows[1].x.saturating_add(offset),
-                    y: card_rows[1].y.saturating_add(1),
-                    width: width.min(card_rows[1].width.saturating_sub(offset)),
-                    height: 1,
-                },
-                action,
-            );
-        }
+        register_chip_hits(
+            state,
+            card_rows[1].x,
+            card_rows[1].y + 1,
+            &secondary_placed,
+            &secondary[..secondary_placed.len()],
+        );
     }
 }
 
@@ -11113,6 +11176,118 @@ mod tests {
         assert!(
             spun.contains(spinner_frame(3)) && spinner_frame(3) != spinner_frame(0),
             "the fetch spinner advanced with the tick:\n{spun}"
+        );
+    }
+
+    // --- measured chip rows replace hand-counted hit offsets ---
+
+    /// Resolve what a click at `(x, y)` would do, through the same topmost-wins
+    /// rule the input layer uses.
+    fn click_at(state: &AppState, x: u16, y: u16) -> Option<Action> {
+        state
+            .hit_map
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(r, _)| x >= r.x && x < r.right() && y >= r.y && y < r.bottom())
+            .map(|(_, action)| action.clone())
+    }
+
+    /// A chip's hit region is derived from its measured span, so it lands on
+    /// the label the user actually sees — not on an offset counted by hand.
+    #[test]
+    fn chip_hit_regions_are_measured_from_their_spans() {
+        let theme = Theme::dark();
+        let chips = [
+            Chip::new("↑/↓", "skill", Action::SelectNext),
+            Chip::new("M", "memory", Action::OpenMemory),
+            Chip::new("Esc", "close", Action::Dismiss),
+        ];
+        let (spans, placed) = chip_row(&chips, 80, &theme);
+        assert_eq!(placed.len(), 3, "all three chips fit in 80 columns");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "  ↑/↓ skill · M memory · Esc close");
+        for ((offset, width), chip) in placed.iter().zip(&chips) {
+            let slice: String = UnicodeSegmentation::graphemes(text.as_str(), true)
+                .skip(usize::from(*offset))
+                .take(usize::from(*width))
+                .collect();
+            assert_eq!(
+                slice.trim_end(),
+                format!("{} {}", chip.key, chip.label),
+                "chip {:?}'s region must cover exactly its own text",
+                chip.key
+            );
+        }
+
+        // A row too narrow for every chip drops whole chips, never half of one
+        // (a half-drawn chip with a live hit region is worse than none).
+        let (spans, placed) = chip_row(&chips, 16, &theme);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(placed.len() < 3, "the row cannot hold every chip");
+        for (offset, width) in &placed {
+            assert!(
+                usize::from(offset + width) <= UnicodeWidthStr::width(text.as_str()),
+                "a chip region must stay inside the drawn row"
+            );
+        }
+    }
+
+    /// The footer's contextual hints are now real, clickable chips. (The
+    /// curated `FOOTER_HINTS` table they replace was never rendered at all —
+    /// its drift-guard test protected a feature that did not exist.)
+    #[test]
+    fn the_status_footer_chips_are_clickable_where_they_are_drawn() {
+        let mut state = AppState::new();
+        state.composer = "a draft".to_owned();
+        state.composer_cursor = state.composer.len();
+        let text = render_to_string(&state, 100, 20);
+        let (row, footer) = text
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("Enter send"))
+            .expect("the draft footer");
+        let y = u16::try_from(row).expect("row fits");
+
+        // Every drawn chip resolves to the Action its key produces.
+        for (label, action) in [
+            ("Enter send", Action::InputSubmit),
+            ("⌥Enter newline", Action::InputNewline),
+            ("Esc clear", Action::InputCancel),
+        ] {
+            let column = footer
+                .find(label)
+                .map(|byte| UnicodeWidthStr::width(&footer[..byte]))
+                .unwrap_or_else(|| panic!("{label} is drawn in the footer: {footer:?}"));
+            let x = u16::try_from(column).expect("column fits");
+            assert_eq!(
+                click_at(&state, x, y),
+                Some(action.clone()),
+                "clicking {label:?} at column {x} must fire {action:?}: {footer:?}"
+            );
+        }
+    }
+
+    /// The Skills footer's `M memory` chip: its old hit region was declared at
+    /// x+14 width 8, which no longer matched the label it was meant to cover.
+    #[test]
+    fn the_skills_footer_chips_hit_their_own_labels() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::Skills;
+        let text = render_to_string(&state, 120, 40);
+        let (row, footer) = text
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("M memory"))
+            .expect("the skills footer");
+        let y = u16::try_from(row).expect("row fits");
+        let column = footer.find("M memory").expect("the memory chip");
+        let x = u16::try_from(UnicodeWidthStr::width(&footer[..column])).expect("column fits");
+        assert_eq!(click_at(&state, x, y), Some(Action::OpenMemory));
+        assert_eq!(
+            click_at(&state, x + 3, y),
+            Some(Action::OpenMemory),
+            "the whole label is the target, not just its first cell"
         );
     }
 }
