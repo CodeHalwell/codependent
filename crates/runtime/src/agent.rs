@@ -77,6 +77,8 @@ pub use agent_framework_core::tools::ToolDefinition;
 
 use crate::blackboard::{BlackboardChannel, BlackboardChannelError, BlackboardPost};
 use crate::models::ModelRegistry;
+#[cfg(feature = "provider-openai")]
+use crate::models::{classify_provider_message, FailureClass};
 use crate::tools::{
     new_pull_request, parse_artifact_read, parse_blackboard_post, parse_blackboard_query,
     parse_create_check_run, parse_create_draft_pull_request,
@@ -4501,6 +4503,76 @@ impl ModelDriver for FrameworkModelDriver {
         tools: &[ToolDefinition],
         sink: &mut dyn DeltaSink,
     ) -> anyhow::Result<StepOutcome> {
+        // Retry-with-backoff around the model request. A transient blip used to
+        // fail the ENTIRE run: the loop's only handling of a driver error is
+        // `Terminal::Failed`, so one refused connection or 503 threw away every
+        // tool result the run had accumulated.
+        let mut attempt = 0usize;
+        loop {
+            // Reset per attempt: `streamed` is the retry veto (see below), and
+            // a fresh request must not inherit the previous attempt's bytes.
+            let mut streamed = false;
+            let error = match self
+                .stream_once(transcript, tools, sink, &mut streamed)
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) => error,
+            };
+            // THE hard rule: once ANY delta has gone through the sink, the
+            // failure is unretryable regardless of its class. The loop has
+            // already journaled and published that text as `ModelStreamDelta`s;
+            // a second attempt would re-stream the response from the top, so
+            // the client would see the opening of the reply twice and the
+            // transcript would carry it twice. A duplicated reply is worse than
+            // a failed step, so a mid-stream failure after first byte is final.
+            let retryable = !streamed
+                && attempt < MODEL_RETRY_BACKOFF.len()
+                && classify_provider_message(&error.to_string()) == FailureClass::Transient;
+            if !retryable {
+                return Err(error);
+            }
+            // The loop races `next_step` against cancellation and the wall
+            // clock, so dropping this future cancels the wait — a backoff can
+            // never outlive a cancelled run or extend its budget.
+            tokio::time::sleep(MODEL_RETRY_BACKOFF[attempt]).await;
+            attempt += 1;
+        }
+    }
+}
+
+/// The backoff waited BEFORE each successive retry of a transient model
+/// request: one bounded escalation (1 s, 2 s, 4 s), so at most three retries
+/// follow the initial attempt and a wedged provider costs 7 s rather than an
+/// unbounded stall. Only failures classified
+/// [`Transient`](FailureClass::Transient) — refused/reset connections,
+/// timeouts, 408/429/5xx, provider overload — are retried at all; a permanent
+/// refusal (bad credentials, unknown model, contract violation) surfaces
+/// immediately, since repeating it can only repeat the refusal.
+#[cfg(feature = "provider-openai")]
+const MODEL_RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+#[cfg(feature = "provider-openai")]
+impl FrameworkModelDriver {
+    /// One model request, start to finish: open the stream, push every text
+    /// delta through `sink` as it arrives, and assemble the result. Split out
+    /// of [`ModelDriver::next_step`] so the retry wrapper there has a unit of
+    /// work it can repeat.
+    ///
+    /// `streamed` is set the moment the FIRST delta reaches `sink` — the
+    /// caller's veto on retrying, because from that instant a retry would
+    /// duplicate already-published text (see the call site).
+    async fn stream_once(
+        &self,
+        transcript: &[TurnItem],
+        tools: &[ToolDefinition],
+        sink: &mut dyn DeltaSink,
+        streamed: &mut bool,
+    ) -> anyhow::Result<StepOutcome> {
         use agent_framework_core::client::ChatClient;
         use agent_framework_core::types::{ChatOptions, ChatResponse};
         use futures::StreamExt;
@@ -4520,10 +4592,9 @@ impl ModelDriver for FrameworkModelDriver {
         // Consume the provider stream, pushing each update's text delta through
         // `sink` AS IT ARRIVES (the agent loop turns each into a live
         // `ModelStreamDelta`) and collecting the updates for assembly. A
-        // mid-stream error propagates via `?` — the loop's existing "driver
-        // error fails the run" path; chunks already pushed to `sink` stay emitted
-        // (they went out as they arrived) and no usage is fabricated (the
-        // assembly below is never reached).
+        // mid-stream error propagates via `?`; chunks already pushed to `sink`
+        // stay emitted (they went out as they arrived) and no usage is
+        // fabricated (the assembly below is never reached).
         let mut assembled = ChatResponse::default();
         let mut stream_bytes = 0usize;
         while let Some(update) = stream.next().await {
@@ -4536,6 +4607,7 @@ impl ModelDriver for FrameworkModelDriver {
                 );
             }
             if let Some(text) = update_text_delta(&update) {
+                *streamed = true;
                 sink.on_text(&text);
             }
             // Coalesce incrementally. Retaining every raw update allowed an
@@ -4731,6 +4803,8 @@ fn measured_usage(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::tools::ClosureSink;
 
@@ -7837,6 +7911,217 @@ mod tests {
         assert_eq!(
             outcome.preface.as_deref(),
             Some("Reading both files, then searching.")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Retry with backoff around the model request. `start_paused` auto-advances
+    // the driver's 1 s/2 s/4 s waits, so these pin the escalation exactly
+    // without spending 7 s of wall clock.
+    // -----------------------------------------------------------------------
+
+    /// A `ChatClient` scripted for the retry tests. It fails in one of two
+    /// places, which is exactly the distinction the retry rule turns on:
+    /// BEFORE the stream opens (nothing streamed — retryable if transient), or
+    /// AFTER some text has already gone out (never retryable). It counts the
+    /// requests it received, which is what "did it retry?" means.
+    #[cfg(feature = "provider-openai")]
+    struct FlakyChatClient {
+        /// Requests still to be refused before the stream opens.
+        remaining_failures: Mutex<usize>,
+        message: String,
+        chunks: Vec<String>,
+        /// Deliver the failure as the last stream item instead, after `chunks`.
+        fail_mid_stream: bool,
+        requests: std::sync::Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "provider-openai")]
+    impl FlakyChatClient {
+        /// Refuse the first `failures` requests outright, then stream a reply.
+        fn new(failures: usize, message: &str) -> (Self, std::sync::Arc<AtomicUsize>) {
+            let requests = std::sync::Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    remaining_failures: Mutex::new(failures),
+                    message: message.to_string(),
+                    chunks: vec!["recovered".to_string()],
+                    fail_mid_stream: false,
+                    requests: requests.clone(),
+                },
+                requests,
+            )
+        }
+
+        /// Stream `chunks` and only THEN fail — the shape that must never be
+        /// retried, because the text is already published.
+        fn failing_mid_stream(
+            message: &str,
+            chunks: &[&str],
+        ) -> (Self, std::sync::Arc<AtomicUsize>) {
+            let requests = std::sync::Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    remaining_failures: Mutex::new(0),
+                    message: message.to_string(),
+                    chunks: chunks.iter().map(|c| c.to_string()).collect(),
+                    fail_mid_stream: true,
+                    requests: requests.clone(),
+                },
+                requests,
+            )
+        }
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[async_trait]
+    impl agent_framework_core::client::ChatClient for FlakyChatClient {
+        async fn get_response(
+            &self,
+            _messages: Vec<agent_framework_core::types::Message>,
+            _options: agent_framework_core::types::ChatOptions,
+        ) -> agent_framework_core::error::Result<agent_framework_core::types::ChatResponse>
+        {
+            unreachable!("the driver only ever uses the streaming path")
+        }
+
+        async fn get_streaming_response(
+            &self,
+            _messages: Vec<agent_framework_core::types::Message>,
+            _options: agent_framework_core::types::ChatOptions,
+        ) -> agent_framework_core::error::Result<agent_framework_core::client::ChatStream> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut remaining = self.remaining_failures.lock().expect("flaky client mutex");
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    // Failure BEFORE the stream opens — nothing streamed yet.
+                    return Err(agent_framework_core::error::Error::Service(
+                        self.message.clone(),
+                    ));
+                }
+            }
+            let mut items: Vec<agent_framework_core::error::Result<_>> = self
+                .chunks
+                .iter()
+                .map(|c| Ok(agent_framework_core::types::ChatResponseUpdate::text(c)))
+                .collect();
+            if self.fail_mid_stream {
+                items.push(Err(agent_framework_core::error::Error::Service(
+                    self.message.clone(),
+                )));
+            }
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
+    }
+
+    /// Collect every chunk a driver pushes through its sink.
+    #[cfg(feature = "provider-openai")]
+    #[derive(Default)]
+    struct CollectingSink(Vec<String>);
+
+    #[cfg(feature = "provider-openai")]
+    impl DeltaSink for CollectingSink {
+        fn on_text(&mut self, chunk: &str) {
+            self.0.push(chunk.to_string());
+        }
+    }
+
+    #[cfg(feature = "provider-openai")]
+    fn flaky_driver(client: FlakyChatClient) -> FrameworkModelDriver {
+        FrameworkModelDriver::new(std::sync::Arc::new(client), ModelId("flaky".to_string()))
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_stream_failure_is_retried_until_it_succeeds() {
+        // Two refused connections then a good response: the run must survive.
+        // Before this, ONE blip failed the whole run and discarded every tool
+        // result it had accumulated.
+        let (client, requests) = FlakyChatClient::new(2, "connection refused (os error 111)");
+        let driver = flaky_driver(client);
+        let mut sink = CollectingSink::default();
+
+        let outcome = driver
+            .next_step(&[TurnItem::Objective("go".to_string())], &[], &mut sink)
+            .await
+            .expect("a transient failure must be retried, not fatal");
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            3,
+            "two retries after the initial attempt"
+        );
+        assert!(matches!(outcome.step, ModelStep::Finish { .. }));
+        assert_eq!(sink.0.concat(), "recovered");
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_failure_is_surfaced_without_a_single_retry() {
+        // A refused credential cannot be fixed by waiting: retrying only
+        // repeats the refusal while the user waits 7 s for the same answer.
+        let (client, requests) = FlakyChatClient::new(1, "HTTP 401 Unauthorized: invalid api key");
+        let driver = flaky_driver(client);
+        let mut sink = CollectingSink::default();
+
+        let error = driver
+            .next_step(&[TurnItem::Objective("go".to_string())], &[], &mut sink)
+            .await
+            .expect_err("a permanent failure must surface immediately");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "no retry at all");
+        assert!(error.to_string().contains("401"), "got {error}");
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test(start_paused = true)]
+    async fn retries_stop_after_the_backoff_schedule_is_exhausted() {
+        // A provider that is down stays down: the driver gives up after the
+        // scheduled retries rather than looping forever inside one step.
+        let (client, requests) = FlakyChatClient::new(usize::MAX, "503 Service Unavailable");
+        let driver = flaky_driver(client);
+        let mut sink = CollectingSink::default();
+
+        driver
+            .next_step(&[TurnItem::Objective("go".to_string())], &[], &mut sink)
+            .await
+            .expect_err("an exhausted retry budget must surface the failure");
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1 + MODEL_RETRY_BACKOFF.len(),
+            "the initial attempt plus exactly the scheduled retries"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_after_a_delta_was_emitted_is_never_retried() {
+        // THE rule that makes retrying safe: the two chunks below have already
+        // been journaled and published as `ModelStreamDelta`s by the time the
+        // stream fails. Retrying would re-stream the reply from the top, so the
+        // reader would see its opening twice — a duplicated reply is worse than
+        // a failed step. Transient though this failure is, it must be final.
+        let (client, requests) =
+            FlakyChatClient::failing_mid_stream("connection reset by peer", &["par", "tial"]);
+        let driver = flaky_driver(client);
+        let mut sink = CollectingSink::default();
+
+        driver
+            .next_step(&[TurnItem::Objective("go".to_string())], &[], &mut sink)
+            .await
+            .expect_err("a post-delta failure must not be retried into a duplicate");
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "streamed text vetoes the retry even for a transient class"
+        );
+        assert_eq!(
+            sink.0.concat(),
+            "partial",
+            "the text streamed before the failure is emitted exactly once"
         );
     }
 }
