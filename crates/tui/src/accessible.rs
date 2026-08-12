@@ -337,6 +337,10 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         | Overlay::AddModelProviderKey { .. }
         | Overlay::AddModelQuerying { .. }
         | Overlay::AddModelPick { .. } => "add model",
+        Overlay::UnslothRepos { .. }
+        | Overlay::UnslothQuants { .. }
+        | Overlay::UnslothConfirmPull { .. }
+        | Overlay::UnslothPulling { .. } => "local models: unsloth catalog",
         Overlay::DocEdit { .. } => "document editor",
         Overlay::DocPublishPath { .. } => "document publish path",
         Overlay::ConfirmUiPluginApprove { .. }

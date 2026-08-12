@@ -13,7 +13,10 @@ use codypendent_protocol::{
 };
 
 use crate::remote_ui::RemoteKey;
-use crate::state::{BlackboardItemCard, DocBlockView, DocSuggestionView, KeyStatus, Pane};
+use crate::state::{
+    BlackboardItemCard, DocBlockView, DocSuggestionView, KeyStatus, Pane, UnslothQuantCard,
+    UnslothRepoCard,
+};
 
 /// One live workflow-node projection carried from the socket-owning harness to
 /// the pure reducer.
@@ -295,6 +298,42 @@ pub enum Action {
     /// in-flight query into the free-text `Overlay::AddModelId` fallback (carrying
     /// any already-entered key).
     ProviderModelsFailed { provider_id: String, reason: String },
+
+    /// The Unsloth org's GGUF repo listing arrived (Hugging Face Hub
+    /// discovery). Folds into the in-flight `Overlay::UnslothRepos { loading:
+    /// true, .. }`, flipping `loading` false and filling `repos`.
+    UnslothReposLoaded(Vec<UnslothRepoCard>),
+    /// The repo listing failed (unreachable / non-200 / unparseable).
+    /// `reason` is a human message. Closes the overlay with a notice — this
+    /// flow has no free-text fallback to fall back to.
+    UnslothReposFailed(String),
+    /// The quant-variant listing for `repo_id` arrived. `repo_id` guards
+    /// against a stale reply landing after the operator picked a different
+    /// repo (mirrors `ProviderModelsLoaded`'s `provider_id` guard) — folds
+    /// into `Overlay::UnslothQuants` only when it still names this repo.
+    UnslothQuantsLoaded {
+        repo_id: String,
+        quants: Vec<UnslothQuantCard>,
+    },
+    /// The quant-variant listing failed. `repo_id` guards exactly like
+    /// [`Action::UnslothQuantsLoaded`].
+    UnslothQuantsFailed { repo_id: String, reason: String },
+    /// One parsed line of `ollama pull` output. Appended to the in-flight
+    /// `Overlay::UnslothPulling` only when `repo_id`/`quant` still match (a
+    /// late line after the operator dismissed the overlay is dropped).
+    UnslothPullProgress {
+        repo_id: String,
+        quant: String,
+        line: String,
+    },
+    /// The pull (and, on success, the `models.toml` registration) finished.
+    /// `result` is `Ok(registered_id)` or `Err(human message)`. Guarded by
+    /// `repo_id`/`quant` exactly like [`Action::UnslothPullProgress`].
+    UnslothPullFinished {
+        repo_id: String,
+        quant: String,
+        result: Result<String, String>,
+    },
 
     /// The `/keys` status projection (D1), loaded by the harness after the
     /// other projections (it reads `auth.json` + `models.toml` — the tui crate
@@ -600,6 +639,27 @@ pub enum Intent {
     /// the harness creates the session, swaps this connection's attachment, and
     /// updates the repo→session continuity store while the old run continues.
     NewConversation,
+
+    /// List the Unsloth org's GGUF repos from the Hugging Face Hub
+    /// (client-only — NOT a daemon command, and never touches the network on
+    /// this thread). The harness fetches off the UI thread and feeds the
+    /// result back as `Action::UnslothReposLoaded` / `UnslothReposFailed`.
+    ListUnslothRepos,
+    /// List `repo_id`'s quant variants (client-only), mirroring
+    /// [`Intent::ListUnslothRepos`]. Feeds back as
+    /// `Action::UnslothQuantsLoaded` / `UnslothQuantsFailed`.
+    ListUnslothQuants {
+        repo_id: String,
+    },
+    /// Drive `ollama pull hf.co/<repo_id>:<quant>` and, on success, register
+    /// the model in `models.toml` against the `ollama` provider
+    /// (client-only). Feeds back zero or more `Action::UnslothPullProgress`
+    /// as the pull streams output, then exactly one
+    /// `Action::UnslothPullFinished`.
+    PullUnslothModel {
+        repo_id: String,
+        quant: String,
+    },
 }
 
 #[cfg(test)]

@@ -26,9 +26,10 @@ use crate::reduce::capability_label;
 use crate::remote_ui_host::{TERMINAL_CENTRAL_SLOTS, TERMINAL_OVERLAY_SLOTS};
 use crate::state::{
     filter_council_member_models, filter_key_rows, filter_model_names, filter_models, filter_modes,
-    filter_providers, AppState, CouncilBuilderState, CouncilBuilderStep, DocFocus, DocLeaseState,
-    KeyStatus, LayoutMode, ModelCard, ModelLocationLabel, ModelReadiness, Overlay, Pane,
-    PatchSummary, RunActivity, RunView, ToolCard, ToolStatus, TranscriptEntry,
+    filter_providers, filter_unsloth_quants, filter_unsloth_repos, AppState, CouncilBuilderState,
+    CouncilBuilderStep, DocFocus, DocLeaseState, KeyStatus, LayoutMode, ModelCard,
+    ModelLocationLabel, ModelReadiness, Overlay, Pane, PatchSummary, RunActivity, RunView,
+    ToolCard, ToolStatus, TranscriptEntry, UnslothQuantCard, UnslothRepoCard,
 };
 use crate::theme::Theme;
 use crate::{render_remote_ui, RemoteUiRenderOptions};
@@ -2279,6 +2280,62 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 models,
                 query,
                 *selected,
+            );
+        }
+        // Local models: browse the Unsloth GGUF catalog (steps 1-4).
+        Overlay::UnslothRepos {
+            repos,
+            query,
+            selected,
+            loading,
+        } => {
+            render_unsloth_repos(frame, area, state, theme, repos, query, *selected, *loading);
+        }
+        Overlay::UnslothQuants {
+            repo_id,
+            quants,
+            query,
+            selected,
+            loading,
+        } => {
+            render_unsloth_quants(
+                frame, area, state, theme, repo_id, quants, query, *selected, *loading,
+            );
+        }
+        Overlay::UnslothConfirmPull {
+            repo_id,
+            quant,
+            size_label,
+        } => render_confirm_box(
+            frame,
+            area,
+            state,
+            theme,
+            &format!("Pull {repo_id}:{quant} via ollama?"),
+            &format!(
+                "Downloads ~{size_label} through `ollama pull hf.co/{repo_id}:{quant}`, then \
+                 registers it as a local model."
+            ),
+        ),
+        Overlay::UnslothPulling {
+            repo_id,
+            quant,
+            lines,
+            done,
+            error,
+            registered_id,
+        } => {
+            render_unsloth_pulling(
+                frame,
+                area,
+                state,
+                theme,
+                repo_id,
+                quant,
+                lines,
+                *done,
+                error.as_deref(),
+                registered_id.as_deref(),
             );
         }
         Overlay::None => {
@@ -5326,6 +5383,362 @@ fn render_add_model_pick(
         ))
         .alignment(Alignment::Center),
         rows[2],
+    );
+}
+
+/// Compact centered message for a loading step of the Unsloth catalog flow
+/// (repo listing / quant listing) — the same two-line shape as
+/// [`render_querying`], but a standalone function rather than a call into
+/// that sibling-owned one (it is specific to the add-model flow's wording).
+fn render_unsloth_loading(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    message: &str,
+) {
+    let rect = centered_rect_min(60, 20, 48, 6, area);
+    shield_modal(state, rect);
+    frame.render_widget(Clear, rect);
+    let lines = vec![
+        Line::styled(message.to_owned(), Style::default().fg(theme.text.heading)),
+        Line::styled("Esc to cancel", Style::default().fg(theme.text.muted)),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Local models: Unsloth catalog ")
+        .border_style(Style::default().fg(theme.surface.border))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
+
+/// Step 1: the Unsloth GGUF repo browser — a fuzzy-filterable list of repos
+/// (id, downloads, likes, last updated), the same shape as
+/// [`render_add_model_pick`]. `Enter` on a row moves to step 2 (its quant
+/// variants).
+#[allow(clippy::too_many_arguments)]
+fn render_unsloth_repos(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    repos: &[UnslothRepoCard],
+    query: &str,
+    selected: usize,
+    loading: bool,
+) {
+    if loading {
+        render_unsloth_loading(
+            frame,
+            area,
+            state,
+            theme,
+            "Fetching the Unsloth catalog from Hugging Face…",
+        );
+        return;
+    }
+    let matches = filter_unsloth_repos(repos, query);
+    let rect = centered_modal(area, 108, 30);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!(
+            "Local models: Unsloth catalog  ·  {} of {} repos",
+            matches.len(),
+            repos.len()
+        ),
+        state,
+        theme,
+    );
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    render_modal_search(frame, rows[0], query, theme);
+
+    const ROW_LINES: usize = 2;
+    let list_block = modal_panel("Repos (by downloads)", theme);
+    let list_area = list_block.inner(rows[1]);
+    frame.render_widget(list_block, rows[1]);
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
+    let mut items: Vec<ListItem> = Vec::new();
+    if repos.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no repos returned",
+            Style::default().fg(theme.text.muted),
+        )));
+    } else if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching repo",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate().skip(first) {
+        let card = &repos[idx];
+        let is_selected = row == selected;
+        let head = Line::from(vec![
+            Span::styled(
+                if is_selected { "▎ " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.focus.active),
+            ),
+            Span::styled(
+                truncate_display_width(&card.id, usize::from(list_area.width.saturating_sub(2))),
+                theme.selection_aware_text_style(is_selected, theme.text.primary),
+            ),
+        ]);
+        let metadata_line = Line::styled(
+            format!(
+                "      {} · {} · {}",
+                card.downloads_label, card.likes_label, card.updated_label
+            ),
+            theme.selection_aware_text_style(is_selected, theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, metadata_line]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
+        list_area,
+    );
+    for (row, _) in matches.iter().enumerate().skip(first) {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
+            break;
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ select  ·  Enter browse quants  ·  Esc close",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
+}
+
+/// Step 2: the quant-variant browser for the repo chosen in step 1 — the
+/// same fuzzy-filterable shape as [`render_unsloth_repos`], one row per quant
+/// with its download size. `Enter` on a row moves to step 3 (confirm pull).
+#[allow(clippy::too_many_arguments)]
+fn render_unsloth_quants(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    repo_id: &str,
+    quants: &[UnslothQuantCard],
+    query: &str,
+    selected: usize,
+    loading: bool,
+) {
+    if loading {
+        render_unsloth_loading(
+            frame,
+            area,
+            state,
+            theme,
+            &format!("Fetching quant variants for {repo_id}…"),
+        );
+        return;
+    }
+    let matches = filter_unsloth_quants(quants, query);
+    let rect = centered_modal(area, 90, 28);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!(
+            "{}  ·  {} of {} quants",
+            truncate_display_width(repo_id, 60),
+            matches.len(),
+            quants.len()
+        ),
+        state,
+        theme,
+    );
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    render_modal_search(frame, rows[0], query, theme);
+
+    const ROW_LINES: usize = 2;
+    let list_block = modal_panel("Quants (smallest first)", theme);
+    let list_area = list_block.inner(rows[1]);
+    frame.render_widget(list_block, rows[1]);
+    let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(selected, matches.len(), visible_rows);
+    let mut items: Vec<ListItem> = Vec::new();
+    if quants.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no GGUF quants found in this repo",
+            Style::default().fg(theme.text.muted),
+        )));
+    } else if matches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  no matching quant",
+            Style::default().fg(theme.text.muted),
+        )));
+    }
+    for (row, &idx) in matches.iter().enumerate().skip(first) {
+        let card = &quants[idx];
+        let is_selected = row == selected;
+        let head = Line::from(vec![
+            Span::styled(
+                if is_selected { "▎ " } else { "  " },
+                theme.selection_aware_text_style(is_selected, theme.focus.active),
+            ),
+            Span::styled(
+                card.quant.clone(),
+                theme.selection_aware_text_style(is_selected, theme.text.primary),
+            ),
+        ]);
+        let files_label = if card.file_count == 1 {
+            "1 file".to_string()
+        } else {
+            format!("{} files", card.file_count)
+        };
+        let metadata_line = Line::styled(
+            format!("      {} · {files_label}", card.size_label),
+            theme.selection_aware_text_style(is_selected, theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, metadata_line]);
+        items.push(if is_selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
+        list_area,
+    );
+    for (row, _) in matches.iter().enumerate().skip(first) {
+        let Some(hit) = visible_row_hit(list_area, row - first, ROW_LINES as u16) else {
+            break;
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "↑/↓ select  ·  Enter choose  ·  Esc close",
+            Style::default().fg(theme.text.muted),
+        ))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
+}
+
+/// Step 4: live `ollama pull` progress, then the registered-model (or
+/// failure) notice once it completes. Non-interactive except `Esc`: closing
+/// this view does NOT cancel the pull, which keeps running detached (see
+/// [`Overlay::UnslothPulling`]'s doc comment).
+#[allow(clippy::too_many_arguments)]
+fn render_unsloth_pulling(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    repo_id: &str,
+    quant: &str,
+    lines: &[String],
+    done: bool,
+    error: Option<&str>,
+    registered_id: Option<&str>,
+) {
+    let rect = centered_modal(area, 104, 26);
+    let inner = modal_surface(
+        frame,
+        rect,
+        format!("Pulling {repo_id}:{quant}"),
+        state,
+        theme,
+    );
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    let log_block = modal_panel("ollama pull output", theme);
+    let log_area = log_block.inner(rows[0]);
+    frame.render_widget(log_block, rows[0]);
+    let visible = usize::from(log_area.height).max(1);
+    let reserved = if done {
+        3.min(visible.saturating_sub(1))
+    } else {
+        0
+    };
+    let start = lines
+        .len()
+        .saturating_sub(visible.saturating_sub(reserved).max(1));
+    let mut text: Vec<Line> = if lines.is_empty() {
+        vec![Line::styled(
+            "waiting for ollama to start…",
+            Style::default().fg(theme.text.muted),
+        )]
+    } else {
+        lines[start..]
+            .iter()
+            .map(|l| Line::styled(l.clone(), Style::default().fg(theme.text.secondary)))
+            .collect()
+    };
+    if done {
+        text.push(Line::raw(""));
+        if let Some(id) = registered_id {
+            text.push(Line::styled(
+                format!("Registered as `{id}`."),
+                Style::default()
+                    .fg(theme.status.success)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            text.push(Line::styled(
+                format!("Run `codypendent models bench {id}` to measure it for routing."),
+                Style::default().fg(theme.text.muted),
+            ));
+        } else if let Some(error) = error {
+            text.push(Line::styled(
+                format!("Pull failed: {error}"),
+                Style::default()
+                    .fg(theme.status.error)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), log_area);
+
+    let footer = if done {
+        "pull finished  ·  Esc close"
+    } else {
+        "pulling…  ·  Esc closes this view (the pull keeps running)"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(footer, Style::default().fg(theme.text.muted)))
+            .alignment(Alignment::Center),
+        rows[1],
     );
 }
 
@@ -9305,6 +9718,176 @@ mod tests {
         assert!(
             !text.contains("gpt-oss-20b"),
             "a non-matching model is filtered out:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unsloth_repos_loading_shows_a_fetching_message() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothRepos {
+            repos: Vec::new(),
+            query: String::new(),
+            selected: 0,
+            loading: true,
+        };
+        let text = render_to_string(&state, 80, 24);
+        assert!(
+            text.contains("Fetching the Unsloth catalog"),
+            "the loading message:\n{text}"
+        );
+        assert!(text.contains("Esc to cancel"), "the cancel hint:\n{text}");
+    }
+
+    #[test]
+    fn unsloth_repos_lists_and_filters_by_id() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothRepos {
+            repos: vec![
+                UnslothRepoCard {
+                    id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+                    downloads_label: "6.6M downloads".to_owned(),
+                    likes_label: "891 likes".to_owned(),
+                    updated_label: "updated 2026-01-30".to_owned(),
+                },
+                UnslothRepoCard {
+                    id: "unsloth/gpt-oss-20b-GGUF".to_owned(),
+                    downloads_label: "519.5K downloads".to_owned(),
+                    likes_label: "771 likes".to_owned(),
+                    updated_label: "updated 2025-12-19".to_owned(),
+                },
+            ],
+            query: "qwen3".to_owned(),
+            selected: 0,
+            loading: false,
+        };
+        let text = render_to_string(&state, 110, 30);
+        assert!(
+            text.contains("Local models: Unsloth catalog"),
+            "the browser title:\n{text}"
+        );
+        assert!(
+            text.contains("unsloth/Qwen3-32B-GGUF"),
+            "the matching repo lists:\n{text}"
+        );
+        assert!(
+            text.contains("6.6M downloads"),
+            "download count renders:\n{text}"
+        );
+        assert!(
+            !text.contains("gpt-oss-20b"),
+            "a non-matching repo is filtered out:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unsloth_quants_lists_sizes_and_file_counts() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothQuants {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quants: vec![
+                UnslothQuantCard {
+                    quant: "Q4_K_M".to_owned(),
+                    size_label: "19.8 GB".to_owned(),
+                    file_count: 1,
+                    size_bytes: 19_800_000_000,
+                },
+                UnslothQuantCard {
+                    quant: "BF16".to_owned(),
+                    size_label: "61.0 GB".to_owned(),
+                    file_count: 2,
+                    size_bytes: 61_000_000_000,
+                },
+            ],
+            query: String::new(),
+            selected: 0,
+            loading: false,
+        };
+        let text = render_to_string(&state, 90, 26);
+        assert!(
+            text.contains("unsloth/Qwen3-32B-GGUF"),
+            "the repo id is in the title:\n{text}"
+        );
+        assert!(text.contains("Q4_K_M"), "the quant tag:\n{text}");
+        assert!(text.contains("19.8 GB"), "the size label:\n{text}");
+        assert!(text.contains("2 files"), "the split-file count:\n{text}");
+    }
+
+    #[test]
+    fn unsloth_confirm_pull_names_the_repo_quant_and_size() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothConfirmPull {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            size_label: "18.7 GB".to_owned(),
+        };
+        let text = render_to_string(&state, 80, 24);
+        assert!(
+            text.contains("unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL"),
+            "the confirm names the exact pull reference:\n{text}"
+        );
+        assert!(text.contains("18.7 GB"), "the size estimate:\n{text}");
+    }
+
+    #[test]
+    fn unsloth_pulling_shows_progress_lines() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothPulling {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            lines: vec!["pulling manifest".to_owned(), "verifying sha256".to_owned()],
+            done: false,
+            error: None,
+            registered_id: None,
+        };
+        let text = render_to_string(&state, 90, 26);
+        assert!(text.contains("pulling manifest"), "progress line:\n{text}");
+        assert!(
+            text.contains("the pull keeps running"),
+            "the non-cancelling hint:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unsloth_pulling_done_shows_the_registered_id_and_bench_hint() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothPulling {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            lines: vec!["success".to_owned()],
+            done: true,
+            error: None,
+            registered_id: Some("hf.co/unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL".to_owned()),
+        };
+        let text = render_to_string(&state, 100, 26);
+        assert!(
+            text.contains("hf.co/unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL"),
+            "the registered id:\n{text}"
+        );
+        assert!(
+            text.contains("models bench"),
+            "the suggested next command:\n{text}"
+        );
+    }
+
+    #[test]
+    fn unsloth_pulling_done_with_error_shows_the_failure() {
+        let mut state = AppState::new();
+        state.overlay = Overlay::UnslothPulling {
+            repo_id: "unsloth/Qwen3-32B-GGUF".to_owned(),
+            quant: "UD-Q4_K_XL".to_owned(),
+            lines: Vec::new(),
+            done: true,
+            error: Some("ollama not found on PATH".to_owned()),
+            registered_id: None,
+        };
+        let text = render_to_string(&state, 100, 26);
+        assert!(
+            text.contains("Pull failed"),
+            "the failure is surfaced:\n{text}"
+        );
+        assert!(
+            text.contains("ollama not found on PATH"),
+            "the real error text:\n{text}"
         );
     }
 

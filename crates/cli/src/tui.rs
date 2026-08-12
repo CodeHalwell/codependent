@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
+use codypendent_integrations::unsloth::HfCatalogApi;
 use codypendent_knowledge::{
     db as knowledge_db, BlockContent, CapabilityRequest, CollaborationMode, DocumentAuthor,
     DocumentBlock, DocumentReplica, DocumentStore, EvidenceRef, KnowledgeDocument, MemoryClass,
@@ -51,7 +52,7 @@ use codypendent_tui::{
     AppState, BlackboardItemCard, ColorDepth, DocBlockView, DocCard, DocSuggestionView,
     GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard, ModelLocationLabel,
     ModelReadiness, ProjectionKind, ProviderCard, SkillCard, TerminalGuard, Theme,
-    WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
+    UnslothQuantCard, UnslothRepoCard, WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -1203,6 +1204,37 @@ async fn event_loop<P: Presentation>(
                     Ok(models) => Action::ProviderModelsLoaded { provider_id, models },
                     Err(reason) => Action::ProviderModelsFailed { provider_id, reason },
                 },
+                Some(ReaderSignal::UnslothRepos(result)) => match result {
+                    Ok(repos) => Action::UnslothReposLoaded(
+                        repos.into_iter().map(unsloth_repo_card).collect(),
+                    ),
+                    Err(reason) => Action::UnslothReposFailed(reason),
+                },
+                Some(ReaderSignal::UnslothQuants { repo_id, result }) => match result {
+                    Ok(quants) => Action::UnslothQuantsLoaded {
+                        repo_id,
+                        quants: quants.into_iter().map(unsloth_quant_card).collect(),
+                    },
+                    Err(reason) => Action::UnslothQuantsFailed { repo_id, reason },
+                },
+                Some(ReaderSignal::UnslothPullProgress {
+                    repo_id,
+                    quant,
+                    line,
+                }) => Action::UnslothPullProgress {
+                    repo_id,
+                    quant,
+                    line,
+                },
+                Some(ReaderSignal::UnslothPullFinished {
+                    repo_id,
+                    quant,
+                    result,
+                }) => Action::UnslothPullFinished {
+                    repo_id,
+                    quant,
+                    result,
+                },
                 Some(ReaderSignal::AcpConnected { display_id, provider_id, result }) => {
                     connected_acp = Some((display_id, provider_id, result));
                     Action::NoOp
@@ -1470,6 +1502,110 @@ async fn event_loop<P: Presentation>(
                     let _ = tx
                         .send(ReaderSignal::ProviderModels {
                             provider_id,
+                            result,
+                        })
+                        .await;
+                });
+                continue;
+            }
+            // Local models: Unsloth catalog (client-only intents, off-thread —
+            // the same `tokio::spawn` + `ReaderSignal` round trip as
+            // `QueryProviderModels` above). `ListUnslothRepos`/
+            // `ListUnslothQuants` are read-only Hub GETs; `PullUnslothModel`
+            // drives the real `ollama pull` subprocess via
+            // `codypendent_cli::models_pull`, streaming each parsed line back
+            // before the terminal result.
+            if let Intent::ListUnslothRepos = &intent {
+                let tx = live.query_tx.clone();
+                tokio::spawn(async move {
+                    let result = match codypendent_integrations::unsloth::HfHubClient::hub() {
+                        Ok(client) => client
+                            .list_gguf_repos(
+                                codypendent_integrations::unsloth::DEFAULT_UNSLOTH_ORG,
+                                30,
+                            )
+                            .await
+                            .map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    let _ = tx.send(ReaderSignal::UnslothRepos(result)).await;
+                });
+                continue;
+            }
+            if let Intent::ListUnslothQuants { repo_id } = &intent {
+                let repo_id = repo_id.clone();
+                let tx = live.query_tx.clone();
+                tokio::spawn(async move {
+                    let result = match codypendent_integrations::unsloth::HfHubClient::hub() {
+                        Ok(client) => client
+                            .list_quant_variants(&repo_id)
+                            .await
+                            .map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    let _ = tx
+                        .send(ReaderSignal::UnslothQuants { repo_id, result })
+                        .await;
+                });
+                continue;
+            }
+            if let Intent::PullUnslothModel { repo_id, quant } = &intent {
+                let repo_id = repo_id.clone();
+                let quant = quant.clone();
+                let paths = paths.clone();
+                let tx = live.query_tx.clone();
+                tokio::spawn(async move {
+                    let (progress_tx, mut progress_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<String>();
+                    let pull_repo = repo_id.clone();
+                    let pull_quant = quant.clone();
+                    let pull_task = tokio::spawn(async move {
+                        crate::models_pull::pull_via_ollama(
+                            crate::models_pull::OLLAMA_BIN,
+                            &pull_repo,
+                            &pull_quant,
+                            progress_tx,
+                        )
+                        .await
+                    });
+                    while let Some(line) = progress_rx.recv().await {
+                        let _ = tx
+                            .send(ReaderSignal::UnslothPullProgress {
+                                repo_id: repo_id.clone(),
+                                quant: quant.clone(),
+                                line,
+                            })
+                            .await;
+                    }
+                    let result = match pull_task.await {
+                        Ok(Ok(())) => {
+                            // Best-effort: a failed/absent metadata lookup
+                            // registers with `context_tokens: None` rather
+                            // than losing an otherwise-successful pull.
+                            let context_tokens =
+                                match codypendent_integrations::unsloth::HfHubClient::hub() {
+                                    Ok(client) => client
+                                        .repo_metadata(&repo_id)
+                                        .await
+                                        .ok()
+                                        .and_then(|metadata| metadata.context_length),
+                                    Err(_) => None,
+                                };
+                            crate::models_pull::register_pulled_model(
+                                &paths,
+                                &repo_id,
+                                &quant,
+                                context_tokens,
+                            )
+                            .map_err(|error| error.to_string())
+                        }
+                        Ok(Err(pull_error)) => Err(pull_error.to_string()),
+                        Err(join_error) => Err(format!("pull task panicked: {join_error}")),
+                    };
+                    let _ = tx
+                        .send(ReaderSignal::UnslothPullFinished {
+                            repo_id,
+                            quant,
                             result,
                         })
                         .await;
@@ -1920,6 +2056,30 @@ enum ReaderSignal {
         items: Vec<codypendent_protocol::BlackboardItemView>,
     },
     BlackboardPosted(codypendent_protocol::BlackboardItemView),
+    /// The Unsloth org's GGUF repo listing, fetched from the Hugging Face Hub
+    /// (Local models catalog browse). Mapped by the loop's `select!` to
+    /// `Action::UnslothReposLoaded` (Ok, pre-rendered into `UnslothRepoCard`s)
+    /// / `UnslothReposFailed` (Err).
+    UnslothRepos(Result<Vec<codypendent_integrations::unsloth::HfRepoSummary>, String>),
+    /// A repo's quant-variant listing, keyed by `repo_id` so a stale reply
+    /// (the operator navigated to a different repo before it landed) is
+    /// dropped — mirrors `ProviderModels`'s `provider_id` guard.
+    UnslothQuants {
+        repo_id: String,
+        result: Result<Vec<codypendent_integrations::unsloth::QuantVariant>, String>,
+    },
+    /// One parsed line of `ollama pull` output.
+    UnslothPullProgress {
+        repo_id: String,
+        quant: String,
+        line: String,
+    },
+    /// The pull (and, on success, the `models.toml` registration) finished.
+    UnslothPullFinished {
+        repo_id: String,
+        quant: String,
+        result: Result<String, String>,
+    },
     /// The daemon closed the connection.
     Closed,
 }
@@ -2018,6 +2178,71 @@ fn wire_blackboard_cards(
             wire_blackboard_item_card(workflow_label_for_run(state, &item.workflow_run_id), item)
         })
         .collect()
+}
+
+/// Project one Hub-fetched repo summary into its pre-rendered display card
+/// (Local models: Unsloth catalog) — the tui crate performs no formatting, so
+/// this happens here, mirroring `model_card`/`load_provider_cards`.
+fn unsloth_repo_card(repo: codypendent_integrations::unsloth::HfRepoSummary) -> UnslothRepoCard {
+    UnslothRepoCard {
+        id: repo.id,
+        downloads_label: format!("{} downloads", human_count(repo.downloads)),
+        likes_label: format!("{} likes", human_count(repo.likes)),
+        // The Hub reports an ISO-8601 timestamp; only the date is shown. A
+        // missing value renders as "unknown" — never a fabricated date.
+        updated_label: match repo.updated_at.as_deref().and_then(|s| s.split('T').next()) {
+            Some(date) if !date.is_empty() => format!("updated {date}"),
+            _ => "updated unknown".to_string(),
+        },
+    }
+}
+
+/// Project one Hub-fetched quant variant into its pre-rendered display card,
+/// mirroring [`unsloth_repo_card`].
+fn unsloth_quant_card(
+    variant: codypendent_integrations::unsloth::QuantVariant,
+) -> UnslothQuantCard {
+    UnslothQuantCard {
+        quant: variant.quant,
+        size_label: human_bytes(variant.total_size_bytes),
+        file_count: variant.files.len(),
+        size_bytes: variant.total_size_bytes,
+    }
+}
+
+/// A compact human count (`891` / `6.6K` / `6.6M`), for the catalog browser's
+/// downloads/likes columns. Display-only, matching `render_node_cost`'s own
+/// "the harness pre-renders" convention.
+fn human_count(n: u64) -> String {
+    const THOUSAND: f64 = 1_000.0;
+    const MILLION: f64 = 1_000_000.0;
+    let n = n as f64;
+    if n >= MILLION {
+        format!("{:.1}M", n / MILLION)
+    } else if n >= THOUSAND {
+        format!("{:.1}K", n / THOUSAND)
+    } else {
+        format!("{n:.0}")
+    }
+}
+
+/// A human-readable byte size (`18.7 GB` / `512.0 MB` / `900 B`), for a
+/// quant's download size. Binary (1024-based) units, matching how disk/RAM
+/// capacity is conventionally reported.
+fn human_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Own the read half: forward each live [`SessionEvent`], answer heartbeat
@@ -2443,6 +2668,19 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         ),
         Intent::NewConversation => unreachable!(
             "NewConversation is applied locally by the harness, never sent to the daemon"
+        ),
+        // Local models: Unsloth catalog — CLIENT-ONLY for the same reason as
+        // `AddModel`/`QueryProviderModels` above (Hub GETs and the `ollama
+        // pull` subprocess run off-thread in the harness; intercepted in the
+        // drain loop, never mapped to a daemon command).
+        Intent::ListUnslothRepos => unreachable!(
+            "ListUnslothRepos is applied locally by the harness (background Hub GET), never sent to the daemon"
+        ),
+        Intent::ListUnslothQuants { .. } => unreachable!(
+            "ListUnslothQuants is applied locally by the harness (background Hub GET), never sent to the daemon"
+        ),
+        Intent::PullUnslothModel { .. } => unreachable!(
+            "PullUnslothModel is applied locally by the harness (ollama pull subprocess), never sent to the daemon"
         ),
     }
 }
