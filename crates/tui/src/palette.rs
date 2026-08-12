@@ -164,8 +164,8 @@ pub const COMMANDS: &[PaletteEntry] = &[
     PaletteEntry {
         command: PaletteCommand::Council,
         title: "/council  Agent council",
-        description: "create a council from multiple model profiles, roles, and a synthesis chair",
-        key: "—",
+        description: "list, run, and manage persisted multi-model councils; `n` inside creates one",
+        key: "C",
         group: "Models",
     },
     // --- Workspace: live studios, workflow controls, and inspectors. ---

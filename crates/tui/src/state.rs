@@ -223,6 +223,21 @@ pub enum Overlay {
     /// Host-owned council creation wizard. It selects only configured model
     /// profiles; persistence and final validation happen in the CLI harness.
     CouncilBuilder(CouncilBuilderState),
+    /// The council browser (rubric 6 TUI wiring): the [`AppState::councils`]
+    /// list on the left and, for the focused council, its chair/rounds/
+    /// evidence/members on the right — the same list+detail shape as
+    /// [`Overlay::Skills`]/[`Overlay::UiPlugins`]. `n` opens
+    /// [`Overlay::CouncilBuilder`] to create a new one; `r` prompts for an
+    /// objective and runs the focused council; `d` asks to remove it.
+    CouncilBrowser,
+    /// The council run-objective prompt (`r` from the browser): a free-text
+    /// buffer for what the focused council should deliberate. Submitting
+    /// emits `Intent::RunCouncil` and returns to the browser, which shows
+    /// progress as it streams back until the host-driven run completes.
+    CouncilRunObjective { name: String, buffer: String },
+    /// Confirm removal of a council definition (`d` from the browser). Its
+    /// prior saved run reports remain on disk — only the definition goes.
+    ConfirmCouncilDelete { name: String },
     /// The Docs Studio block-edit prompt (Phase 4 STEP 4.3 client wiring): a
     /// single-line buffer for the text to insert into the focused block. On submit
     /// the reducer acquires the block's edit lease and, once granted, sends the
@@ -566,6 +581,42 @@ pub struct SkillCard {
     pub description: String,
     /// The requested capabilities, one verbatim string per capability.
     pub permissions: Vec<String>,
+}
+
+/// A council browser row (rubric 6 TUI wiring): one persisted council
+/// definition projected for the `/council` browser. Self-contained — the CLI
+/// maps a `councils.toml` entry (`crate::council::CouncilDefinition`, a
+/// cli-crate-only type this dependency-free crate cannot name) into this
+/// plain struct, exactly like [`SkillCard`]/[`ModelCard`] above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CouncilCard {
+    pub name: String,
+    pub description: String,
+    pub chair: String,
+    pub rounds: u8,
+    /// Evidence mode (rubric 6): members explore the repository read-only and
+    /// cite `file:line` instead of reasoning with no tools.
+    pub evidence: bool,
+    /// `(model, role)` per member, in the order they deliberate.
+    pub members: Vec<(String, String)>,
+}
+
+/// The plain, host-formatted result of one off-thread council run (rubric 6
+/// TUI wiring), handed back through `ReaderSignal::CouncilRunFinished` and
+/// folded into the transcript by [`crate::reduce::reduce`]. Pre-formatted
+/// host-side (participant lines, cost line) so this dependency-free crate
+/// never needs to name `crate::council`'s types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CouncilRunSummary {
+    /// The chair's final synthesis text, verbatim.
+    pub synthesis: String,
+    /// One attributed line per member plus the chair (model, role, session,
+    /// run id, and measured usage where measured).
+    pub participants: Vec<String>,
+    /// The measured-only aggregate cost line (never a fabricated estimate).
+    pub cost_line: String,
+    /// Where the durable JSON+Markdown report landed, for the transcript note.
+    pub report_markdown: String,
 }
 
 /// A memory provenance card (STEP 2.6): one curated memory projected for the
@@ -1229,6 +1280,13 @@ pub struct AppState {
     pub blackboard: Vec<BlackboardItemCard>,
     /// Index into `blackboard` of the focused item.
     pub selected_item: usize,
+    /// The council browser projection (rubric 6 TUI wiring): every council
+    /// persisted in `councils.toml`, mapped to a self-contained
+    /// [`CouncilCard`] by the CLI harness. Populated at attach and reloaded
+    /// after every create/run/delete. The [`Overlay::CouncilBrowser`] reads it.
+    pub councils: Vec<CouncilCard>,
+    /// Index into `councils` of the focused council.
+    pub selected_council: usize,
     /// The model-picker projection (MP1): every model configured in
     /// `models.toml`, enriched with its measured profile from
     /// `model_profiles` when one exists, mapped to a self-contained
@@ -1368,6 +1426,8 @@ impl AppState {
             selected_node: 0,
             blackboard: Vec::new(),
             selected_item: 0,
+            councils: Vec::new(),
+            selected_council: 0,
             models: Vec::new(),
             selected_model: 0,
             pending_model: None,
@@ -1418,13 +1478,15 @@ impl AppState {
             | Overlay::AddModelId { .. }
             | Overlay::AddModelKey { .. }
             | Overlay::AddModelProviderKey { .. }
-            | Overlay::ApiKeySet { .. } => InputMode::Editing,
+            | Overlay::ApiKeySet { .. }
+            | Overlay::CouncilRunObjective { .. } => InputMode::Editing,
             Overlay::ConfirmCancel
             | Overlay::ConfirmWorkflowCancel { .. }
             | Overlay::ApiKeyRemoveConfirm { .. }
             | Overlay::ConfirmUiPluginApprove { .. }
             | Overlay::ConfirmUiPluginReject { .. }
-            | Overlay::ConfirmUiPluginRevoke { .. } => InputMode::Confirm,
+            | Overlay::ConfirmUiPluginRevoke { .. }
+            | Overlay::ConfirmCouncilDelete { .. } => InputMode::Confirm,
             // The palette, the model picker, the provider picker, the mode
             // picker, the `/keys` overlay, and the add-model pick-list all
             // filter on printable keys while staying arrow-navigable, so they
@@ -1448,6 +1510,7 @@ impl AppState {
             | Overlay::Workflow
             | Overlay::Blackboard
             | Overlay::UiPlugins
+            | Overlay::CouncilBrowser
             | Overlay::AddModelQuerying { .. } => InputMode::Normal,
             Overlay::CouncilBuilder(_) => {
                 unreachable!("council builder input mode is resolved above")
@@ -1553,6 +1616,12 @@ impl AppState {
     #[must_use]
     pub fn focused_ui_plugin(&self) -> Option<&codypendent_protocol::UiPluginLifecycleStatus> {
         self.ui_plugins.get(self.selected_ui_plugin)
+    }
+
+    /// The focused council browser card, if any (rubric 6 TUI wiring).
+    #[must_use]
+    pub fn focused_council(&self) -> Option<&CouncilCard> {
+        self.councils.get(self.selected_council)
     }
 
     /// The focused model-picker card, if any.

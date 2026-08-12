@@ -297,6 +297,37 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
             "Confirmation: cancel workflow run {}?",
             clean(workflow_run_id)
         )),
+        Overlay::CouncilRunObjective { name, buffer } => {
+            lines.push(format!(
+                "Objective for council {}: {}",
+                clean(name),
+                clean(buffer)
+            ));
+        }
+        Overlay::ConfirmCouncilDelete { name } => lines.push(format!(
+            "Confirmation: remove council {}? Saved run reports remain on disk.",
+            clean(name)
+        )),
+        Overlay::CouncilBrowser => {
+            lines.push(format!(
+                "Agent councils: {} configured",
+                state.councils.len()
+            ));
+            if let Some(council) = state.focused_council() {
+                lines.push(format!(
+                    "Focused council: {}; chair {}; {} round(s); {} member(s){}",
+                    clean(&council.name),
+                    clean(&council.chair),
+                    council.rounds,
+                    council.members.len(),
+                    if council.evidence {
+                        "; evidence mode"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
         Overlay::CouncilBuilder(builder) => {
             lines.push(format!(
                 "Council builder: step {:?}; name {}; {} member(s); chair {}; rounds {}",
@@ -332,6 +363,9 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::ApiKeySet { .. } => "API key entry",
         Overlay::ApiKeyRemoveConfirm { .. } => "remove API key confirmation",
         Overlay::CouncilBuilder(_) => "council builder",
+        Overlay::CouncilBrowser => "agent councils",
+        Overlay::CouncilRunObjective { .. } => "council objective",
+        Overlay::ConfirmCouncilDelete { .. } => "remove council confirmation",
         Overlay::AddModelId { .. }
         | Overlay::AddModelKey { .. }
         | Overlay::AddModelProviderKey { .. }

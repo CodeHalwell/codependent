@@ -56,11 +56,12 @@ pub use remote_ui_host::{
 };
 pub use render::{render, render_splash};
 pub use state::{
-    AppState, BlackboardItemCard, CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft,
-    DocBlockView, DocCard, DocEdit, DocFocus, DocLeaseState, DocSuggestionView, GraphEdgeCard,
-    InputMode, KeyStatus, LayoutMode, MemoryCard, ModelCard, ModelLocationLabel, ModelReadiness,
-    Overlay, Pane, PatchSummary, PendingApproval, ProviderCard, RunView, SkillCard,
-    StatusProjection, ToolCard, ToolStatus, TranscriptEntry, WorkflowNodeCard, EDGE_PAGE_SIZE,
+    AppState, BlackboardItemCard, CouncilBuilderState, CouncilBuilderStep, CouncilCard,
+    CouncilMemberDraft, CouncilRunSummary, DocBlockView, DocCard, DocEdit, DocFocus, DocLeaseState,
+    DocSuggestionView, GraphEdgeCard, InputMode, KeyStatus, LayoutMode, MemoryCard, ModelCard,
+    ModelLocationLabel, ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, ProviderCard,
+    RunView, SkillCard, StatusProjection, ToolCard, ToolStatus, TranscriptEntry, WorkflowNodeCard,
+    EDGE_PAGE_SIZE,
 };
 pub use terminal::TerminalGuard;
 pub use theme::{ColorDepth, Theme, ThemePreferences, ThemeVariant};

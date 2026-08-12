@@ -154,11 +154,20 @@ pub fn reduce(state: &mut AppState, action: Action) {
             members,
             rounds,
         } => {
+            // Return to the browser (rubric 6): the wizard's only entry point
+            // is now `n` from inside it, so a successful save should surface
+            // the new council in the freshly reloaded list, not drop to the
+            // base view.
             if matches!(
                 &state.overlay,
                 Overlay::CouncilBuilder(builder) if builder.name == name
             ) {
-                state.overlay = Overlay::None;
+                state.selected_council = state
+                    .councils
+                    .iter()
+                    .position(|council| council.name == name)
+                    .unwrap_or(0);
+                state.overlay = Overlay::CouncilBrowser;
             }
             state.notice = Some((
                 format!("created council `{name}` · {members} members · {rounds} round(s)"),
@@ -171,6 +180,83 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 state.tick + 80,
             ));
         }
+        Action::CouncilDeleted { name } => {
+            clamp(&mut state.selected_council, state.councils.len());
+            if matches!(
+                &state.overlay,
+                Overlay::ConfirmCouncilDelete { name: pending } if pending == &name
+            ) {
+                state.overlay = Overlay::CouncilBrowser;
+            }
+            state.notice = Some((format!("removed council `{name}`"), state.tick + 40));
+        }
+        Action::CouncilDeleteFailed { name, error } => {
+            state.notice = Some((
+                format!("could not remove council `{name}`: {error}"),
+                state.tick + 80,
+            ));
+        }
+        Action::CouncilProgress { name, message } => {
+            let text = format!("council `{name}`: {message}");
+            if let Some(run) = state.selected_run_mut() {
+                AppState::push_entry(
+                    run,
+                    TranscriptEntry::Note {
+                        text,
+                        expanded: false,
+                    },
+                );
+            } else {
+                state.notice = Some((text, state.tick + 40));
+            }
+        }
+        Action::CouncilRunFinished { name, result } => match result {
+            Ok(summary) => {
+                let mut text = format!(
+                    "Council `{name}` — chair synthesis\n\n{}",
+                    summary.synthesis.trim()
+                );
+                if !summary.participants.is_empty() {
+                    text.push_str("\n\nParticipants:\n");
+                    for line in &summary.participants {
+                        text.push_str("  - ");
+                        text.push_str(line);
+                        text.push('\n');
+                    }
+                }
+                text.push_str(&summary.cost_line);
+                text.push_str(&format!("\nreport: {}", summary.report_markdown));
+                if let Some(run) = state.selected_run_mut() {
+                    AppState::push_entry(
+                        run,
+                        TranscriptEntry::Note {
+                            text,
+                            expanded: false,
+                        },
+                    );
+                }
+                state.notice = Some((format!("council `{name}` finished"), state.tick + 60));
+            }
+            Err(error) => {
+                if let Some(run) = state.selected_run_mut() {
+                    AppState::push_entry(
+                        run,
+                        TranscriptEntry::Note {
+                            text: format!("council `{name}` failed: {error}"),
+                            expanded: false,
+                        },
+                    );
+                }
+                state.notice = Some((format!("council `{name}` failed: {error}"), state.tick + 90));
+            }
+        },
+        Action::OpenCouncils => {
+            state.overlay = match state.overlay {
+                Overlay::CouncilBrowser => Overlay::None,
+                _ => Overlay::CouncilBrowser,
+            };
+        }
+        Action::DeleteCouncil => begin_delete_council(state),
         Action::RemoteUiActivate {
             document_id,
             revision,
@@ -247,6 +333,8 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::NewRun => {
             if matches!(state.overlay, Overlay::Workflow) {
                 start_focused_workflow(state);
+            } else if matches!(state.overlay, Overlay::CouncilBrowser) {
+                state.overlay = Overlay::CouncilBuilder(CouncilBuilderState::default());
             } else {
                 state.overlay = Overlay::NewRun(String::new());
             }
@@ -294,6 +382,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 begin_reject_ui_plugin(state);
             } else if matches!(state.overlay, Overlay::Docs) {
                 resolve_focused_suggestion(state, false);
+            } else if matches!(state.overlay, Overlay::CouncilBrowser) {
+                // Council browser: the same physical `r` key runs the focused
+                // council (prompts for an objective) — same pattern as
+                // Workflow's `r` meaning "retry" above.
+                begin_run_council(state);
             } else {
                 resolve_focused(state, ApprovalDecision::Reject, ApprovalScope::Once);
             }
@@ -441,6 +534,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 Overlay::ConfirmUiPluginApprove { .. }
                 | Overlay::ConfirmUiPluginReject { .. }
                 | Overlay::ConfirmUiPluginRevoke { .. } => Overlay::UiPlugins,
+                Overlay::ConfirmCouncilDelete { .. } => Overlay::CouncilBrowser,
                 _ => Overlay::None,
             };
         }
@@ -1553,6 +1647,10 @@ fn nav(state: &mut AppState, delta: i32) {
             step(&mut state.selected_ui_plugin, state.ui_plugins.len(), delta);
             return;
         }
+        Overlay::CouncilBrowser => {
+            step(&mut state.selected_council, state.councils.len(), delta);
+            return;
+        }
         Overlay::Palette {
             ref query,
             ref mut selected,
@@ -1901,6 +1999,12 @@ fn confirm_top(state: &mut AppState) {
                 state.overlay = Overlay::UiPlugins;
             }
         }
+        Overlay::ConfirmCouncilDelete { .. } => {
+            if let Overlay::ConfirmCouncilDelete { name } = std::mem::take(&mut state.overlay) {
+                state.outbox.push(Intent::DeleteCouncil { name });
+                state.overlay = Overlay::CouncilBrowser;
+            }
+        }
         _ => {}
     }
 }
@@ -1968,6 +2072,31 @@ fn begin_reject_ui_plugin(state: &mut AppState) {
 fn begin_revoke_ui_plugin(state: &mut AppState) {
     if let Some(plugin_id) = state.focused_ui_plugin().map(|p| p.id.clone()) {
         state.overlay = Overlay::ConfirmUiPluginRevoke { plugin_id };
+    }
+}
+
+/// `r` in the council browser (rubric 6 TUI wiring): open the objective prompt
+/// for the focused council. A no-op with an empty browser.
+fn begin_run_council(state: &mut AppState) {
+    if !matches!(state.overlay, Overlay::CouncilBrowser) {
+        return;
+    }
+    if let Some(name) = state.focused_council().map(|council| council.name.clone()) {
+        state.overlay = Overlay::CouncilRunObjective {
+            name,
+            buffer: String::new(),
+        };
+    }
+}
+
+/// `d` in the council browser (rubric 6 TUI wiring): open the removal confirm
+/// for the focused council. A no-op with an empty browser.
+fn begin_delete_council(state: &mut AppState) {
+    if !matches!(state.overlay, Overlay::CouncilBrowser) {
+        return;
+    }
+    if let Some(name) = state.focused_council().map(|council| council.name.clone()) {
+        state.overlay = Overlay::ConfirmCouncilDelete { name };
     }
 }
 
@@ -2157,6 +2286,7 @@ fn edit_prompt(state: &mut AppState, edit: impl FnOnce(&mut String)) {
     match &mut state.overlay {
         Overlay::NewRun(buf) | Overlay::Steering(buf) => edit(buf),
         Overlay::WorkflowInputs { buffer, .. } => edit(buffer),
+        Overlay::CouncilRunObjective { buffer, .. } => edit(buffer),
         Overlay::EdgeSearch(buffer) => edit(buffer),
         Overlay::DocEdit { buffer, .. } => edit(buffer),
         Overlay::DocPublishPath { buffer, .. } => edit(buffer),
@@ -2370,6 +2500,7 @@ fn input_cancel(state: &mut AppState) {
         Overlay::EdgeSearch(_) => state.overlay = Overlay::Edges,
         Overlay::WorkflowInputs { .. } => state.overlay = Overlay::Workflow,
         Overlay::ConfirmWorkflowCancel { .. } => state.overlay = Overlay::Workflow,
+        Overlay::CouncilRunObjective { .. } => state.overlay = Overlay::CouncilBrowser,
         _ => state.overlay = Overlay::None,
     }
 }
@@ -2474,6 +2605,11 @@ fn activate_row(state: &mut AppState, n: usize) {
             clamp(&mut selected, state.ui_plugins.len());
             state.selected_ui_plugin = selected;
         }
+        Overlay::CouncilBrowser => {
+            let mut selected = n;
+            clamp(&mut selected, state.councils.len());
+            state.selected_council = selected;
+        }
         Overlay::Palette { .. }
         | Overlay::ModelPicker { .. }
         | Overlay::ProviderPicker { .. }
@@ -2519,6 +2655,23 @@ fn submit_prompt(state: &mut AppState) {
             let run_id = state.selected_run().map(|r| r.run_id);
             if let (false, Some(run_id)) = (text.is_empty(), run_id) {
                 state.outbox.push(Intent::QueueSteering { run_id, text });
+            }
+        }
+        Overlay::CouncilRunObjective { name, buffer } => {
+            let objective = buffer.trim().to_owned();
+            if objective.is_empty() {
+                state.overlay = Overlay::CouncilRunObjective { name, buffer };
+                state.notice = Some((
+                    "council objective must not be empty".to_owned(),
+                    state.tick + 30,
+                ));
+            } else {
+                state.outbox.push(Intent::RunCouncil {
+                    name: name.clone(),
+                    objective,
+                });
+                state.overlay = Overlay::CouncilBrowser;
+                state.notice = Some((format!("council `{name}` running…"), state.tick + 60));
             }
         }
         Overlay::WorkflowInputs {
@@ -3324,8 +3477,11 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
                 selected: 0,
             };
         }
+        // Rubric 6 TUI wiring: `/council` opens the browser (list/run/delete),
+        // matching every other workspace command's list-first shape; `n`
+        // reaches the creation wizard from inside it.
         PaletteCommand::Council => {
-            state.overlay = Overlay::CouncilBuilder(CouncilBuilderState::default());
+            state.overlay = Overlay::CouncilBrowser;
         }
         PaletteCommand::ToggleLayout => {
             state.layout = state.layout.toggled();

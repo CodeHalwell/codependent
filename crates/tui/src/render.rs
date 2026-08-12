@@ -2161,6 +2161,23 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::CouncilBuilder(builder) => {
             render_council_builder(frame, area, state, theme, builder);
         }
+        Overlay::CouncilBrowser => render_council_browser(frame, area, state, theme),
+        Overlay::CouncilRunObjective { name, buffer } => render_prompt(
+            frame,
+            area,
+            state,
+            theme,
+            &format!("Objective for council `{name}`"),
+            buffer,
+        ),
+        Overlay::ConfirmCouncilDelete { name } => render_confirm_box(
+            frame,
+            area,
+            state,
+            theme,
+            "Remove this council?",
+            &format!("`{name}` · saved run reports remain on disk"),
+        ),
         Overlay::ModelPicker { query, selected } => {
             render_model_picker(frame, area, state, theme, query, *selected);
         }
@@ -5514,6 +5531,152 @@ fn action_kind(action: &ProposedAction) -> &'static str {
         ProposedAction::AcpToolCall { .. } => "acp tool",
         _ => "unsupported",
     }
+}
+
+/// The council browser (rubric 6 TUI wiring): a scrollable list of persisted
+/// councils on the left, and a detail panel on the right showing the focused
+/// council's chair, rounds, evidence mode, and every member's model/role —
+/// the same list+detail shape as [`render_ui_plugins`]/[`render_skills`].
+fn render_council_browser(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(90, 86, area);
+    shield_modal(state, rect);
+    frame.render_widget(Clear, rect);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Agent councils ({}) ", state.councils.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(rows[0]);
+
+    const ROW_LINES: usize = 2;
+    let visible = (cols[0].height as usize / ROW_LINES).max(1);
+    let first = first_visible_row(state.selected_council, state.councils.len(), visible);
+    let mut items = Vec::new();
+    if state.councils.is_empty() {
+        items.push(ListItem::new(vec![
+            Line::styled(
+                "  No councils configured",
+                Style::default().fg(theme.text.secondary),
+            ),
+            Line::styled(
+                "  Press n to create one",
+                Style::default().fg(theme.text.muted),
+            ),
+        ]));
+    }
+    for (index, council) in state.councils.iter().enumerate().skip(first).take(visible) {
+        let selected = index == state.selected_council;
+        let head = Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                theme.selection_aware_text_style(selected, theme.focus.active),
+            ),
+            Span::styled(
+                truncate(&council.name, 30),
+                theme.selection_aware_text_style(selected, theme.text.primary),
+            ),
+        ]);
+        let meta = Line::styled(
+            format!(
+                "    {} member(s) · {} round(s){}",
+                council.members.len(),
+                council.rounds,
+                if council.evidence { " · evidence" } else { "" }
+            ),
+            theme.selection_aware_text_style(selected, theme.text.muted),
+        );
+        let item = ListItem::new(vec![head, meta]);
+        items.push(if selected {
+            item.style(theme.selection_style())
+        } else {
+            item
+        });
+    }
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.overlay)),
+        cols[0],
+    );
+    for (screen_row, index) in (first..state.councils.len()).take(visible).enumerate() {
+        if let Some(hit) = visible_row_hit(cols[0], screen_row, ROW_LINES as u16) {
+            state.register_hit(hit, Action::ActivateRow(index));
+        }
+    }
+
+    let detail = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(theme.focus.inactive));
+    let detail_inner = detail.inner(cols[1]);
+    frame.render_widget(detail, cols[1]);
+    let mut lines = Vec::new();
+    if let Some(council) = state.focused_council() {
+        lines.push(Line::styled(
+            council.name.clone(),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if !council.description.is_empty() {
+            lines.push(Line::styled(
+                council.description.clone(),
+                Style::default().fg(theme.text.secondary),
+            ));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(format!("  chair: {}", council.chair)));
+        lines.push(Line::from(format!("  rounds: {}", council.rounds)));
+        lines.push(Line::from(format!(
+            "  evidence mode: {}",
+            if council.evidence { "on" } else { "off" }
+        )));
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "Members:",
+            Style::default().fg(theme.text.secondary),
+        ));
+        for (model, role) in &council.members {
+            lines.push(Line::from(format!("  - {model} · {role}")));
+        }
+    } else {
+        lines.push(Line::styled(
+            "No council selected.",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        detail_inner,
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "  ↑/↓ select · n new council",
+                Style::default().fg(theme.text.muted),
+            ),
+            Line::styled(
+                "  r run (prompts for objective) · d delete · Esc close",
+                Style::default().fg(theme.focus.active),
+            ),
+        ]),
+        rows[1],
+    );
 }
 
 fn render_council_builder(
