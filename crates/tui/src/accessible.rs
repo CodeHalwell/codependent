@@ -327,6 +327,7 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::Edges | Overlay::EdgeSearch(_) => "code graph",
         Overlay::Workflow | Overlay::WorkflowInputs { .. } => "workflow",
         Overlay::Blackboard => "blackboard",
+        Overlay::Kanban => "task board",
         Overlay::UiPlugins => "Remote UI plugins",
         Overlay::ApiKeys { .. } => "API keys",
         Overlay::ApiKeySet { .. } => "API key entry",

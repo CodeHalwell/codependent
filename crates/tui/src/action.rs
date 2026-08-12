@@ -13,7 +13,9 @@ use codypendent_protocol::{
 };
 
 use crate::remote_ui::RemoteKey;
-use crate::state::{BlackboardItemCard, DocBlockView, DocSuggestionView, KeyStatus, Pane};
+use crate::state::{
+    BlackboardItemCard, DocBlockView, DocSuggestionView, KanbanCard, KeyStatus, Pane,
+};
 
 /// One live workflow-node projection carried from the socket-owning harness to
 /// the pure reducer.
@@ -197,6 +199,14 @@ pub enum Action {
     /// Toggle the blackboard view (`B`): the typed artifacts agents share within
     /// a workflow run, with author, confidence, evidence, and payload summary.
     OpenBlackboard,
+    /// Toggle the repository task board (rubric 10): backlog cards laid out in
+    /// status columns, live over the board's blackboard channel.
+    OpenKanban,
+    /// Move the focused board card one column to the right (`todo` → `doing` →
+    /// `review` → `done`). A no-op on the last column.
+    MoveCardForward,
+    /// Move the focused board card one column to the left. A no-op on the first.
+    MoveCardBack,
     /// Open the host-owned Remote UI plugin lifecycle surface.
     OpenUiPlugins,
     /// Smoke-test the selected plugin in the daemon sandbox.
@@ -281,6 +291,14 @@ pub enum Action {
     },
     /// Merge one live `BlackboardPosted` delivery by stable artifact id.
     BlackboardItemUpdated(BlackboardItemCard),
+    /// Replace the repository task board's baseline after a board-scoped
+    /// `ReadBlackboard` (rubric 10).
+    BoardLoaded(Vec<KanbanCard>),
+    /// Merge one live board delivery by card id — an agent's `task.create`, or
+    /// the replacement a move produced. A card carrying a supersession is dropped
+    /// rather than merged: its replacement arrives as its own delivery, so the
+    /// board never shows both revisions of one card.
+    BoardCardUpdated { card: KanbanCard, superseded: bool },
 
     /// A provider's model list, fetched by the harness (client-only add-model
     /// flow). Folds into the in-flight `Overlay::AddModelQuerying` (matched by
@@ -541,6 +559,20 @@ pub enum Intent {
     },
     CancelWorkflow {
         workflow_run_id: String,
+    },
+
+    // --- repository task board (rubric 10) ---
+    /// Subscribe to and read the repository's task board. Client-only, exactly
+    /// like [`WatchWorkflow`](Intent::WatchWorkflow): the harness grows the attach
+    /// subscriptions to the board's channel and issues the `ReadBlackboard`
+    /// baseline before swallowing the intent. The repository is supplied by the
+    /// harness (the client is not authoritative for it), so this carries nothing.
+    WatchBoard,
+    /// Move a board card into another column. Applied as a supersession by the
+    /// daemon, so the card's history survives the move.
+    MoveBoardCard {
+        item_id: String,
+        status: String,
     },
 
     /// Add a usable model from the TUI (client-only — NOT a daemon command). The

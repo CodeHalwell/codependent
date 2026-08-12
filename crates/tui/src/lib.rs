@@ -59,8 +59,8 @@ pub use render::{render, render_splash};
 pub use state::{
     AppState, BlackboardItemCard, CouncilBuilderState, CouncilBuilderStep, CouncilMemberDraft,
     DocBlockView, DocCard, DocEdit, DocFocus, DocLeaseState, DocSuggestionView, GraphEdgeCard,
-    InputMode, KeyStatus, LayoutMode, MemoryCard, ModelCard, ModelLocationLabel, ModelReadiness,
-    Overlay, Pane, PatchSummary, PendingApproval, ProviderCard, RunView, SkillCard,
+    InputMode, KanbanCard, KeyStatus, LayoutMode, MemoryCard, ModelCard, ModelLocationLabel,
+    ModelReadiness, Overlay, Pane, PatchSummary, PendingApproval, ProviderCard, RunView, SkillCard,
     StatusProjection, ToolCard, ToolStatus, TranscriptEntry, WorkflowNodeCard, EDGE_PAGE_SIZE,
 };
 pub use terminal::TerminalGuard;

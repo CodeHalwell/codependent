@@ -311,6 +311,11 @@ fn map_normal_key(key: &KeyEvent) -> Action {
         KeyCode::Enter => Action::Expand,
         KeyCode::Up => Action::SelectPrev,
         KeyCode::Down => Action::SelectNext,
+        // The task board's column moves (rubric 10). Horizontal arrows had no
+        // meaning in a navigable overlay before, and the reducer ignores them
+        // outside the board, so this costs no existing binding.
+        KeyCode::Left => Action::MoveCardBack,
+        KeyCode::Right => Action::MoveCardForward,
         KeyCode::PageUp => Action::ScrollPageUp,
         KeyCode::PageDown => Action::ScrollPageDown,
         KeyCode::Delete => Action::ClearIssues,

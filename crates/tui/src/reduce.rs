@@ -388,6 +388,9 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 watch_focused_blackboard_run(state);
             }
         }
+        Action::OpenKanban => open_kanban(state),
+        Action::MoveCardForward => move_focused_card(state, 1),
+        Action::MoveCardBack => move_focused_card(state, -1),
         Action::OpenUiPlugins => open_ui_plugins(state),
         Action::SmokeTestUiPlugin => smoke_test_ui_plugin(state),
         Action::EnableUiPluginSession => enable_ui_plugin(state, "session"),
@@ -482,6 +485,22 @@ pub fn reduce(state: &mut AppState, action: Action) {
             items,
         } => replace_blackboard_run(state, &workflow_run_id, items),
         Action::BlackboardItemUpdated(item) => upsert_blackboard_item(state, item),
+        Action::BoardLoaded(cards) => {
+            state.kanban = cards;
+            let count = state.kanban_in_display_order().len();
+            clamp(&mut state.selected_card, count);
+        }
+        Action::BoardCardUpdated { card, superseded } => {
+            // A superseded revision is REMOVED, not merged: the replacement
+            // arrives as its own delivery, so the board never shows a card twice
+            // (once in its old column and once in its new one).
+            state.kanban.retain(|existing| existing.id != card.id);
+            if !superseded {
+                state.kanban.push(card);
+            }
+            let count = state.kanban_in_display_order().len();
+            clamp(&mut state.selected_card, count);
+        }
 
         // --- model discovery: the harness's fetched-list return path ---
         Action::ProviderModelsLoaded {
@@ -1549,6 +1568,13 @@ fn nav(state: &mut AppState, delta: i32) {
             watch_focused_blackboard_run(state);
             return;
         }
+        Overlay::Kanban => {
+            // Selection walks the board's DISPLAY order (column by column), so
+            // ↑/↓ runs down a column and then continues into the next one.
+            let count = state.kanban_in_display_order().len();
+            step(&mut state.selected_card, count, delta);
+            return;
+        }
         Overlay::UiPlugins => {
             step(&mut state.selected_ui_plugin, state.ui_plugins.len(), delta);
             return;
@@ -2469,6 +2495,11 @@ fn activate_row(state: &mut AppState, n: usize) {
             state.selected_item = selected;
             watch_focused_blackboard_run(state);
         }
+        Overlay::Kanban => {
+            let mut selected = n;
+            clamp(&mut selected, state.kanban_in_display_order().len());
+            state.selected_card = selected;
+        }
         Overlay::UiPlugins => {
             let mut selected = n;
             clamp(&mut selected, state.ui_plugins.len());
@@ -3289,6 +3320,7 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
             state.overlay = Overlay::Blackboard;
             watch_focused_blackboard_run(state);
         }
+        PaletteCommand::Kanban => open_kanban(state),
         PaletteCommand::UiPlugins => open_ui_plugins(state),
         PaletteCommand::Model => {
             state.selected_model = 0;
@@ -3381,6 +3413,51 @@ fn watch_focused_workflow(state: &mut AppState) {
     {
         state.outbox.push(Intent::WatchWorkflow { workflow_run_id });
     }
+}
+
+/// Open (or close) the repository task board, subscribing to the board's live
+/// channel and reading its baseline on the way in (rubric 10). Closing does not
+/// unsubscribe — the board is cheap and staying attached means reopening it is
+/// already current, exactly as the workflow panes behave.
+fn open_kanban(state: &mut AppState) {
+    if matches!(state.overlay, Overlay::Kanban) {
+        state.overlay = Overlay::None;
+        return;
+    }
+    state.overlay = Overlay::Kanban;
+    state.outbox.push(Intent::WatchBoard);
+}
+
+/// Move the focused card `delta` columns and emit the daemon write.
+///
+/// The pane does NOT mutate its own card: the daemon applies the move as a
+/// supersession and publishes the replacement on the board channel, which merges
+/// back in by id. So the rendered board always shows what is actually stored — a
+/// refused move (a concurrent supersede) simply never appears, instead of leaving
+/// the pane lying about where the card is.
+fn move_focused_card(state: &mut AppState, delta: i32) {
+    let Some(card) = state.focused_card() else {
+        return;
+    };
+    let current = crate::state::KANBAN_COLUMNS
+        .iter()
+        .position(|column| card.status.eq_ignore_ascii_case(column))
+        // A card in a team's own column moves from the first column, matching
+        // where `kanban_columns` renders it.
+        .unwrap_or(0);
+    let target = current.saturating_add_signed(delta as isize);
+    let Some(status) = crate::state::KANBAN_COLUMNS.get(target) else {
+        // Off either end of the board: nothing to do, and no command sent.
+        return;
+    };
+    if target == current {
+        return;
+    }
+    let item_id = card.id.clone();
+    state.outbox.push(Intent::MoveBoardCard {
+        item_id,
+        status: (*status).to_string(),
+    });
 }
 
 fn watch_focused_blackboard_run(state: &mut AppState) {

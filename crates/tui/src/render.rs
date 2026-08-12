@@ -2131,6 +2131,7 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         }
         Overlay::Workflow => render_workflow(frame, area, state, theme),
         Overlay::Blackboard => render_blackboard(frame, area, state, theme),
+        Overlay::Kanban => render_kanban(frame, area, state, theme),
         Overlay::UiPlugins => render_ui_plugins(frame, area, state, theme),
         Overlay::ConfirmUiPluginApprove { plugin_id, receipt } => render_confirm_box(
             frame,
@@ -4641,6 +4642,180 @@ fn node_state_color(state: &str, theme: &Theme) -> Color {
         "failed" | "blocked" => theme.status.error,
         "pending" => theme.status.info,
         _ => theme.text.muted,
+    }
+}
+
+/// Lines a board card occupies: title, then assignee/kind.
+const CARD_LINES: u16 = 2;
+
+/// Color for a board column, so the eye reads progress left to right — the same
+/// status palette the workflow pane uses, applied to columns instead of nodes.
+fn kanban_column_color(status: &str, theme: &Theme) -> Color {
+    match status {
+        "done" => theme.status.success,
+        "doing" => theme.status.running,
+        "review" => theme.status.warning,
+        _ => theme.status.info,
+    }
+}
+
+/// The repository task board (rubric 10): backlog cards laid out in status
+/// columns, live over the board's blackboard channel.
+///
+/// The counterpart of [`render_blackboard`] — the same durable rows, the same
+/// live channel — but arranged as a board rather than a feed, and *writable*: the
+/// focused card moves between columns with `→`/`←`, which the daemon applies as a
+/// supersession. Colors are Theme tokens only (RULE 7).
+fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let rect = centered_rect(90, 86, area);
+    shield_modal(state, rect);
+    frame.render_widget(Clear, rect);
+
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Task board ({} card(s)) ", state.kanban.len()),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme.focus.active))
+        .style(
+            Style::default()
+                .bg(theme.surface.overlay)
+                .fg(theme.text.primary),
+        );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(2)])
+        .split(inner);
+
+    let columns = state.kanban_columns();
+    let lanes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(
+            columns
+                .iter()
+                .map(|_| Constraint::Ratio(1, columns.len() as u32))
+                .collect::<Vec<_>>(),
+        )
+        .split(rows[0]);
+
+    // `selected_card` indexes the board's flattened DISPLAY order, so the running
+    // offset below turns it back into "which card in which column" — one ordering
+    // shared by the renderer, the keyboard, and the hit regions.
+    let mut display_index = 0usize;
+    for (lane_index, (status, cards)) in columns.iter().enumerate() {
+        let lane = lanes[lane_index];
+        let column_color = kanban_column_color(status, theme);
+        let block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(theme.focus.inactive))
+            .title(Span::styled(
+                format!(" {status} ({}) ", cards.len()),
+                Style::default()
+                    .fg(column_color)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(theme.surface.overlay));
+        let body = block.inner(lane);
+        frame.render_widget(block, lane);
+
+        let capacity = (body.height / CARD_LINES) as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        if cards.is_empty() {
+            lines.push(Line::styled("  —", Style::default().fg(theme.text.muted)));
+        }
+        for (slot, card) in cards.iter().enumerate().take(capacity) {
+            let index = display_index + slot;
+            let selected = index == state.selected_card;
+            let marker = if selected { "\u{203a} " } else { "  " };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    marker,
+                    theme.selection_aware_text_style(selected, theme.focus.active),
+                ),
+                Span::styled(
+                    truncate(&card.title, lane.width.saturating_sub(4) as usize),
+                    theme.selection_aware_text_style(selected, theme.text.primary),
+                ),
+            ]));
+            lines.push(Line::styled(
+                format!("    {} \u{b7} {}", card.assignee, card.kind),
+                theme.selection_aware_text_style(selected, theme.text.muted),
+            ));
+            if let Some(hit) = visible_row_hit(body, slot, CARD_LINES) {
+                state.register_hit(hit, Action::ActivateRow(index));
+            }
+        }
+        // A column taller than the pane says so rather than silently hiding work.
+        if cards.len() > capacity {
+            lines.push(Line::styled(
+                format!("  +{} more", cards.len() - capacity),
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(theme.surface.overlay)),
+            body,
+        );
+        display_index += cards.len();
+    }
+
+    let footer = match state.focused_card() {
+        Some(card) => vec![
+            Line::from(vec![
+                Span::styled("  card: ", Style::default().fg(theme.text.muted)),
+                Span::styled(
+                    truncate(&card.title, 48),
+                    Style::default().fg(theme.text.primary),
+                ),
+                Span::styled(
+                    format!("  by {}", card.author),
+                    Style::default().fg(theme.text.secondary),
+                ),
+            ]),
+            Line::styled(
+                "  \u{2190}/\u{2192} move column \u{b7} \u{2191}/\u{2193} card \u{b7} Esc close",
+                Style::default().fg(theme.focus.active),
+            ),
+        ],
+        None => vec![
+            Line::styled("  No cards yet", Style::default().fg(theme.text.secondary)),
+            Line::styled(
+                "  Ask an agent to break a feature into backlog cards, or add one from chat.",
+                Style::default().fg(theme.text.muted),
+            ),
+        ],
+    };
+    frame.render_widget(Paragraph::new(footer), rows[1]);
+
+    // Mouse parity for the two column-move affordances named on the footer line.
+    if rows[1].height >= 2 && state.focused_card().is_some() {
+        let y = rows[1].y.saturating_add(1);
+        let x = rows[1].x.saturating_add(2);
+        state.register_hit(
+            Rect {
+                x,
+                y,
+                width: 1.min(rows[1].right().saturating_sub(x)),
+                height: 1,
+            },
+            Action::MoveCardBack,
+        );
+        let forward = x.saturating_add(2);
+        state.register_hit(
+            Rect {
+                x: forward,
+                y,
+                width: 1.min(rows[1].right().saturating_sub(forward)),
+                height: 1,
+            },
+            Action::MoveCardForward,
+        );
     }
 }
 

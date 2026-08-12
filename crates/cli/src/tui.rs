@@ -49,9 +49,9 @@ use codypendent_tui::{
     accessible_snapshot, accessible_terminal_capabilities_message, map_accessible_input, map_event,
     reduce, render, render_splash, sanitize_accessible_text, terminal_capabilities_message, Action,
     AppState, BlackboardItemCard, ColorDepth, DocBlockView, DocCard, DocSuggestionView,
-    GraphEdgeCard, Intent, KeyStatus, KeyTarget, MemoryCard, ModelCard, ModelLocationLabel,
-    ModelReadiness, ProjectionKind, ProviderCard, SkillCard, TerminalGuard, Theme,
-    WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
+    GraphEdgeCard, Intent, KanbanCard, KeyStatus, KeyTarget, MemoryCard, ModelCard,
+    ModelLocationLabel, ModelReadiness, ProjectionKind, ProviderCard, SkillCard, TerminalGuard,
+    Theme, WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -1142,6 +1142,10 @@ async fn event_loop<P: Presentation>(
     // Correlate empty blackboard baselines back to the run they were requested
     // for (the reply carries only command_id when `items` is empty).
     let mut blackboard_reads: HashMap<CommandId, String> = HashMap::new();
+    // Command ids of board-scoped `ReadBlackboard`s, so an EMPTY board baseline
+    // (a repository whose board has never been written) still clears the pane
+    // rather than being mistaken for a workflow-run read.
+    let mut board_reads: std::collections::HashSet<CommandId> = std::collections::HashSet::new();
 
     loop {
         // A CRDT sync needs an async merge (+ a suggestion re-read) that cannot run
@@ -1216,20 +1220,36 @@ async fn event_loop<P: Presentation>(
                 }
                 Some(ReaderSignal::WorkflowEvent(event)) => workflow_event_action(event),
                 Some(ReaderSignal::BlackboardItems { command_id, items }) => {
-                    let workflow_run_id = blackboard_reads
-                        .remove(&command_id)
-                        .or_else(|| items.first().map(|item| item.workflow_run_id.clone()));
-                    match workflow_run_id {
-                        Some(workflow_run_id) => Action::BlackboardLoaded {
-                            items: wire_blackboard_cards(state, &items),
-                            workflow_run_id,
-                        },
-                        None => Action::NoOp,
+                    if board_reads.remove(&command_id) {
+                        // The repository task board (rubric 10): the same command
+                        // and the same rows, read at board scope.
+                        Action::BoardLoaded(wire_board_cards(&items))
+                    } else {
+                        let workflow_run_id = blackboard_reads
+                            .remove(&command_id)
+                            .or_else(|| items.first().map(|item| item.workflow_run_id.clone()));
+                        match workflow_run_id {
+                            Some(workflow_run_id) => Action::BlackboardLoaded {
+                                items: wire_blackboard_cards(state, &items),
+                                workflow_run_id,
+                            },
+                            None => Action::NoOp,
+                        }
                     }
                 }
                 Some(ReaderSignal::BlackboardPosted(item)) => {
-                    let label = workflow_label_for_run(state, &item.workflow_run_id);
-                    Action::BlackboardItemUpdated(wire_blackboard_item_card(label, &item))
+                    // One live channel serves both surfaces: a board card carries
+                    // `board_scope`, a workflow artifact does not, so the delivery
+                    // routes itself without a second subscription kind.
+                    if item.board_scope.is_some() {
+                        Action::BoardCardUpdated {
+                            card: wire_board_card(&item),
+                            superseded: item.superseded_by.is_some(),
+                        }
+                    } else {
+                        let label = workflow_label_for_run(state, &item.workflow_run_id);
+                        Action::BlackboardItemUpdated(wire_blackboard_item_card(label, &item))
+                    }
                 }
                 Some(ReaderSignal::Catchup(catchup)) => {
                     // Fold the gap replay (the daemon already windowed it to
@@ -1791,12 +1811,61 @@ async fn event_loop<P: Presentation>(
                         workflow_run_id: workflow_run_id.clone(),
                         kind: None,
                         include_superseded: true,
+                        board_repository: None,
                     },
                 );
                 if let Payload::Command(command) = &board.payload {
                     blackboard_reads.insert(command.command_id, workflow_run_id.clone());
                 }
                 if live.out_tx.send(board).await.is_err() {
+                    return Ok(());
+                }
+                continue;
+            }
+            // Opening the task board grows this connection's subscription to the
+            // repository BOARD's channel and reads its baseline (rubric 10). The
+            // board rides the existing per-run blackboard machinery: its channel
+            // key is the synthetic board run id, so nothing new is needed on the
+            // wire beyond the board-scoped read.
+            if matches!(intent, Intent::WatchBoard) {
+                let board_id = codypendent_protocol::board_scope_id(repository);
+                let subscribed = subscriptions.iter().any(|subscription| {
+                    matches!(
+                        subscription,
+                        Subscription::Blackboard { workflow_run_id: id } if *id == board_id
+                    )
+                });
+                if !subscribed {
+                    subscriptions.push(Subscription::Blackboard {
+                        workflow_run_id: board_id,
+                    });
+                    let attach = command_envelope(
+                        live.client_id,
+                        CommandBody::AttachSession {
+                            session_id,
+                            last_seen_sequence: Some(tracker.last_seen()),
+                            subscriptions: subscriptions.clone(),
+                            requested_role: ClientRole::Controller,
+                            repository: None,
+                        },
+                    );
+                    if live.out_tx.send(attach).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                let read = command_envelope(
+                    live.client_id,
+                    CommandBody::ReadBlackboard {
+                        workflow_run_id: String::new(),
+                        kind: Some("task".to_owned()),
+                        include_superseded: false,
+                        board_repository: Some(repository.to_owned()),
+                    },
+                );
+                if let Payload::Command(command) = &read.payload {
+                    board_reads.insert(command.command_id);
+                }
+                if live.out_tx.send(read).await.is_err() {
                     return Ok(());
                 }
                 continue;
@@ -2407,6 +2476,22 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::WatchWorkflow { .. } => unreachable!(
             "WatchWorkflow is applied locally by the harness, never sent to the daemon"
         ),
+        Intent::WatchBoard => unreachable!(
+            "WatchBoard is applied locally by the harness, never sent to the daemon"
+        ),
+        // A column move is a SUPERSESSION server-side: the daemon carries the
+        // card's body forward, re-ordinals it to the end of its new column, and
+        // publishes the replacement — so the pane never edits its own copy.
+        Intent::MoveBoardCard { item_id, status } => CommandBody::UpdateBlackboardItem {
+            scope: codypendent_protocol::BlackboardScope::RepositoryBoard {
+                repository: repository.to_owned(),
+            },
+            item_id,
+            status: Some(status),
+            assignee: None,
+            ordinal: None,
+            payload: None,
+        },
         Intent::PauseWorkflow { workflow_run_id } => {
             CommandBody::PauseWorkflow { workflow_run_id }
         }
@@ -4513,6 +4598,36 @@ fn wire_blackboard_item_card(
     }
 }
 
+/// Project one stored board item into a self-contained [`KanbanCard`] (rubric
+/// 10). The board's rows ARE blackboard items — the card view just renders the
+/// board-specific fields the artifact view has no place for.
+fn wire_board_card(item: &codypendent_protocol::BlackboardItemView) -> KanbanCard {
+    KanbanCard {
+        id: item.id.clone(),
+        title: summarize_json(&item.payload),
+        status: item.status.clone().unwrap_or_else(|| "todo".to_owned()),
+        assignee: item
+            .assignee
+            .clone()
+            .unwrap_or_else(|| "\u{2014}".to_owned()),
+        kind: item.kind.clone(),
+        author: summarize_author(&item.author),
+        // A card with no recorded position sorts to the top of its column rather
+        // than to an arbitrary place.
+        ordinal: item.ordinal.unwrap_or(0),
+    }
+}
+
+/// Project a board read's items into cards, dropping any superseded revision
+/// that slipped into the reply — the board shows the live card only.
+fn wire_board_cards(items: &[codypendent_protocol::BlackboardItemView]) -> Vec<KanbanCard> {
+    items
+        .iter()
+        .filter(|item| item.superseded_by.is_none())
+        .map(wire_board_card)
+        .collect()
+}
+
 /// The first 8 characters of a run id, for a compact run label.
 fn short_run_id(id: &str) -> String {
     id.chars().take(8).collect()
@@ -5396,6 +5511,7 @@ steps:
             evidence: vec![json!({ "artifact": "a1" }), json!({ "artifact": "a2" })],
             revision: 1,
             superseded_by: None,
+            board: Default::default(),
         };
         let card = blackboard_item_card(
             "workflow-run-1",
@@ -5432,6 +5548,7 @@ steps:
             evidence: vec![],
             revision: 3,
             superseded_by: Some("2".to_owned()),
+            board: Default::default(),
         };
         let card = blackboard_item_card("workflow-run-1", "run", &item);
         assert_eq!(card.summary, "a guess");

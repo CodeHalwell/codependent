@@ -741,6 +741,7 @@ mod tests {
         let items = reader
             .read(ReadBlackboardRequest {
                 workflow_run_id: run.to_string(),
+                board_repository: None,
                 kind: None,
                 include_superseded: false,
                 client_id: ClientId::new(),
@@ -754,6 +755,7 @@ mod tests {
         let err = reader
             .read(ReadBlackboardRequest {
                 workflow_run_id: run.to_string(),
+                board_repository: None,
                 kind: Some("test-result".to_string()),
                 include_superseded: false,
                 client_id: ClientId::new(),
@@ -761,5 +763,216 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, "workflow.unknown-blackboard-kind");
+    }
+
+    // -----------------------------------------------------------------------
+    // The repository task board (rubric 10)
+    // -----------------------------------------------------------------------
+
+    fn card(title: &str, status: Option<&str>) -> codypendent_protocol::BlackboardItemDraft {
+        codypendent_protocol::BlackboardItemDraft {
+            kind: "task".to_string(),
+            payload: json!({ "title": title }),
+            confidence: None,
+            evidence: Vec::new(),
+            status: status.map(str::to_string),
+            assignee: None,
+            ordinal: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repository_board_is_created_on_first_write_and_read_back() {
+        // The board's synthetic run does not exist until something is written —
+        // and a READ never creates it, so an untouched repository simply reads
+        // empty rather than littering `workflow_runs`.
+        let (_dir, pool) = temp_pool().await;
+        let hub = BlackboardHub::new();
+        let repository = "/home/user/project";
+        let reader = WorkflowBlackboardReader::new(pool.clone());
+        let empty = reader
+            .read(ReadBlackboardRequest {
+                workflow_run_id: String::new(),
+                board_repository: Some(repository.to_string()),
+                kind: None,
+                include_superseded: false,
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("an unwritten board reads empty");
+        assert!(empty.is_empty());
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0, "a read must not create the board run");
+
+        let writer = AssemblyBoardWriter::new(pool.clone(), hub.clone());
+        let mut live = hub.subscribe(board_scope_id(repository));
+        let posted = writer
+            .post(PostBlackboardRequest {
+                target: BoardTarget::Repository(repository.to_string()),
+                item: card("wire the DAG viewer", None),
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("post");
+        // A `task` with no column lands in `todo`, at the end of that column,
+        // stamped with the board it serves.
+        assert_eq!(posted.status.as_deref(), Some("todo"));
+        assert_eq!(posted.ordinal, Some(0));
+        assert_eq!(posted.board_scope.as_deref(), Some(repository));
+        assert_eq!(posted.workflow_run_id, board_scope_id(repository));
+        // The author is built server-side — the client supplied none.
+        assert_eq!(posted.author["role"], "operator");
+        // …and the write fans out on the board's channel, which is what lets the
+        // kanban pane converge without a re-read.
+        assert_eq!(live.recv().await.expect("delivered").id, posted.id);
+
+        let items = reader
+            .read(ReadBlackboardRequest {
+                workflow_run_id: String::new(),
+                board_repository: Some(repository.to_string()),
+                kind: Some("task".to_string()),
+                include_superseded: false,
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("read the board");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, posted.id);
+    }
+
+    #[tokio::test]
+    async fn a_move_supersedes_the_card_and_appends_it_to_the_target_column() {
+        let (_dir, pool) = temp_pool().await;
+        let repository = "/home/user/project";
+        let writer = AssemblyBoardWriter::new(pool.clone(), BlackboardHub::new());
+        let post = |draft| {
+            let writer = writer.clone();
+            async move {
+                writer
+                    .post(PostBlackboardRequest {
+                        target: BoardTarget::Repository(repository.to_string()),
+                        item: draft,
+                        client_id: ClientId::new(),
+                    })
+                    .await
+                    .expect("post")
+            }
+        };
+        // Two cards already in `doing`, so the move must land AFTER them.
+        post(card("first", Some("doing"))).await;
+        post(card("second", Some("doing"))).await;
+        let moving = post(card("third", Some("todo"))).await;
+
+        let moved = writer
+            .update(UpdateBlackboardRequest {
+                target: BoardTarget::Repository(repository.to_string()),
+                item_id: moving.id.clone(),
+                status: Some("doing".to_string()),
+                assignee: None,
+                ordinal: None,
+                payload: None,
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("move");
+        assert_eq!(moved.status.as_deref(), Some("doing"));
+        assert_eq!(moved.revision, 2, "a move is a supersession, not an edit");
+        assert_ne!(moved.id, moving.id, "the replacement is a new row");
+        assert_eq!(
+            moved.ordinal,
+            Some(2),
+            "a moved card appends to its new column rather than keeping a stale index"
+        );
+        // The card's body survives a pure move — nothing named a payload.
+        assert_eq!(moved.payload["title"], "third");
+
+        // Moving the SAME (now superseded) card again is refused rather than
+        // forking the chain.
+        let err = writer
+            .update(UpdateBlackboardRequest {
+                target: BoardTarget::Repository(repository.to_string()),
+                item_id: moving.id,
+                status: Some("done".to_string()),
+                assignee: None,
+                ordinal: None,
+                payload: None,
+                client_id: ClientId::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "blackboard.already-superseded");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_column_is_refused_legibly() {
+        let (_dir, pool) = temp_pool().await;
+        let writer = AssemblyBoardWriter::new(pool, BlackboardHub::new());
+        let err = writer
+            .post(PostBlackboardRequest {
+                target: BoardTarget::Repository("/home/user/project".to_string()),
+                item: card("bad column", Some("   ")),
+                client_id: ClientId::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "blackboard.invalid-status");
+    }
+
+    #[tokio::test]
+    async fn an_agent_card_and_an_operator_card_share_one_board() {
+        // The point of sharing `BoardOps`: a card the model creates through
+        // `task.create` is the same durable row as one a human posts, differing
+        // only in attribution — so the TUI shows both and either can move either.
+        let (_dir, pool) = temp_pool().await;
+        let hub = BlackboardHub::new();
+        let repository = "/home/user/project";
+        let agent = AssemblyTaskBoardChannel::new(pool.clone(), hub.clone());
+        let human = AssemblyBoardWriter::new(pool.clone(), hub);
+
+        let by_agent = agent
+            .create(
+                repository,
+                codypendent_runtime::blackboard::TaskCardDraft {
+                    payload: json!({ "title": "split the parser" }),
+                    author: json!({ "role": "agent", "run_id": "r1" }),
+                    status: None,
+                    assignee: None,
+                    ordinal: None,
+                },
+            )
+            .await
+            .expect("agent card");
+        human
+            .post(PostBlackboardRequest {
+                target: BoardTarget::Repository(repository.to_string()),
+                item: card("write the spec", Some("review")),
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("operator card");
+
+        let board = agent.list(repository).await.expect("list");
+        assert_eq!(board.len(), 2);
+        assert!(board.iter().any(|c| c.author["role"] == "agent"));
+        assert!(board.iter().any(|c| c.author["role"] == "operator"));
+
+        // And a human can move the agent's card: one board, one write path.
+        let moved = human
+            .update(UpdateBlackboardRequest {
+                target: BoardTarget::Repository(repository.to_string()),
+                item_id: by_agent.id,
+                status: Some("done".to_string()),
+                assignee: Some("dana".to_string()),
+                ordinal: None,
+                payload: None,
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("human moves the agent's card");
+        assert_eq!(moved.status.as_deref(), Some("done"));
+        assert_eq!(moved.assignee.as_deref(), Some("dana"));
     }
 }
