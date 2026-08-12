@@ -227,6 +227,49 @@ enum TopCommand {
         /// Install a specific release tag instead of the latest.
         tag: Option<String>,
     },
+    /// Scaffold and check a local Unsloth QLoRA fine-tuning project.
+    /// Subprocess orchestration only — no Python in this workspace; the
+    /// scaffolded project is a standalone Python project you run yourself.
+    Finetune {
+        #[command(subcommand)]
+        command: FinetuneCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum FinetuneCommand {
+    /// Scaffold an Unsloth QLoRA project: pinned requirements, a `train.py`
+    /// for the chosen base model, a JSONL chat-transcript dataset stub, and a
+    /// README covering GPU requirements, training, GGUF export, and the
+    /// `ollama create` step. Refuses if the target directory already exists.
+    Init {
+        /// The Hugging Face base model to fine-tune. Defaults to a small,
+        /// popular Unsloth QLoRA-ready repo.
+        #[arg(long)]
+        model: Option<String>,
+        /// Directory to scaffold into (must not already exist). Defaults to
+        /// `./finetune`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Verify Python and CUDA are present for running the scaffolded
+    /// `train.py`. Read-only; exits non-zero only when Python itself is
+    /// missing (no GPU warns instead of failing — the scaffold is still
+    /// useful without one, e.g. editing the dataset).
+    Check,
+    /// Work with the fine-tuning dataset.
+    Dataset {
+        #[command(subcommand)]
+        command: FinetuneDatasetCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum FinetuneDatasetCommand {
+    /// Export the repo's own session/eval history into `dataset/train.jsonl`
+    /// as fine-tuning data, when a clean seam exists to do so. Today: prints
+    /// exactly why that seam doesn't exist yet rather than silently no-op'ing.
+    Export,
 }
 
 /// The IDEs `codypendent open --in <IDE>` knows how to launch.
@@ -1152,6 +1195,47 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        TopCommand::Finetune { command } => match command {
+            FinetuneCommand::Init { model, out } => {
+                let options = codypendent_cli::finetune::InitOptions {
+                    base_model: model.unwrap_or_else(|| {
+                        codypendent_cli::finetune::DEFAULT_BASE_MODEL.to_string()
+                    }),
+                    out_dir: out.unwrap_or_else(|| {
+                        PathBuf::from(codypendent_cli::finetune::DEFAULT_OUT_DIR)
+                    }),
+                };
+                let report = codypendent_cli::finetune::init(&options)?;
+                println!(
+                    "codypendent finetune init: scaffolded {} file(s) in {}",
+                    report.files_written.len(),
+                    report.out_dir.display()
+                );
+                println!(
+                    "next: cd {} && pip install -r requirements.txt",
+                    report.out_dir.display()
+                );
+                println!("      codypendent finetune check   # verify python/CUDA first");
+                Ok(())
+            }
+            FinetuneCommand::Check => {
+                // Same exit-decision-lives-in-main convention as `doctor`
+                // above: the library never calls `std::process::exit`. Only a
+                // missing Python fails the process; a missing GPU warns.
+                let report = codypendent_cli::finetune::check("python3", "nvidia-smi");
+                print!("{}", report.render_text());
+                if report.worst() == codypendent_cli::doctor::Status::Fail {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            FinetuneCommand::Dataset { command } => match command {
+                FinetuneDatasetCommand::Export => {
+                    println!("{}", codypendent_cli::finetune::dataset_export());
+                    Ok(())
+                }
+            },
+        },
     }
 }
 
