@@ -1,0 +1,24 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`WorkflowGraphCard > shows an empty state until a workflow projection arrives 1`] = `
+{
+  "children": [],
+  "fallback": {
+    "children": [],
+    "id": "react-ui--1",
+    "kind": "element",
+    "props": {
+      "value": "No workflow run",
+    },
+    "type": "Text",
+  },
+  "id": "root",
+  "kind": "element",
+  "props": {
+    "accessibleLabel": "No workflow run",
+    "message": "Waiting for a projection of workflow-run-1.",
+    "title": "No workflow run",
+  },
+  "type": "EmptyState",
+}
+`;

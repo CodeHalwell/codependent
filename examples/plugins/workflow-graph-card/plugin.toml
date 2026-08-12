@@ -1,0 +1,48 @@
+schema_version = 1
+id = "workflow-graph-card"
+name = "WorkflowGraphCard"
+version = "0.1.0"
+kind = "ui-component"
+publisher = "codypendent-example"
+scopes = ["user", "organization", "repository"]
+
+[ui]
+schema_version = 1
+# The card reads one workflow run's node states and nothing else. It requests
+# no artifact, context, or command authority, so an installer's permission
+# diff is a single line.
+requested_capabilities = ["workflow-read"]
+
+[ui.compatibility]
+protocol = ">=1.0,<2.0"
+sdk = "^1.0"
+
+[ui.entrypoints]
+shared = "dist/worker.mjs"
+
+[[ui.contributions]]
+id = "workflow-graph-card.dashboard"
+point = "dashboard-card"
+renderer = "workflow-graph-card.WorkflowGraphCard"
+targets = ["shared"]
+
+[[ui.contributions]]
+id = "workflow-graph-card.inspector"
+point = "workflow-inspector"
+renderer = "workflow-graph-card.WorkflowGraphCard"
+targets = ["shared"]
+
+[resources]
+memory_mb = 256
+cpu_seconds = 300
+wall_seconds = 3600
+maximum_output_mb = 32
+
+[security]
+checksum = "sha256:7e3b416f75a57d65063ac55597e76a6d1db2f01916890f43d9c3f8a5b6c44f0b"
+signature = "PnB4b/O+oiAmPuIgIgmGy74k8HMuY+NmjJ7klAhRgU41AHxK07MPnaJyMxHgtJ+eZ5AgbdOr+yF7/4Bij2RoAw=="
+sandbox_profile = "ui-component"
+
+[update]
+channel = "stable"
+permission_change_requires_approval = true
