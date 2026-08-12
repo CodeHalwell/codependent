@@ -326,8 +326,8 @@ struct EndpointAuth {
     header: String,
     /// The value prefix in front of the key (default `"Bearer "`).
     prefix: String,
-    /// Provider-wide headers sent on every request (e.g. GitHub Models'
-    /// `X-GitHub-Api-Version`, Anthropic's `anthropic-version`).
+    /// Provider-wide headers sent on every request — an API-version pin, for
+    /// the providers whose catalog entry declares one.
     extra_headers: BTreeMap<String, String>,
     /// The provider's documented key env-var NAMES, consulted (first set
     /// wins) only when the model has no `auth.json` key and no explicit
