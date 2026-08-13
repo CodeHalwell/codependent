@@ -3879,8 +3879,19 @@ async fn workflow_run_session(
 /// A **repository task board** (`board:<canonical repo>`) is deliberately
 /// allowed: it is a synthetic run with no owning session, it is the shared
 /// kanban for a checkout on this machine, and every principal that can reach it
-/// is by definition the local user. Anything else must resolve to a session this
-/// principal owns.
+/// is by definition the local user.
+///
+/// An **unbound workflow run** — one whose `workflow_runs.run_id` is NULL — is
+/// allowed for the same reason. That column is nullable on purpose (migration
+/// 0010: "the session run this workflow drives, *when bound*… so workflow
+/// storage is self-contained"), so a run that was never bound to a session has
+/// no owner recorded anywhere. Denying it protects nobody and makes the run
+/// permanently unreadable by every principal including the one that created it;
+/// the transport's peer-credential check is the boundary that applies.
+///
+/// A run that IS bound must resolve to a session this principal owns. Note the
+/// asymmetry is safe in the direction that matters: binding a run can only ever
+/// narrow who may read it.
 async fn principal_may_read_workflow(
     state: &ServerState,
     principal: PeerPrincipal,
@@ -3889,10 +3900,47 @@ async fn principal_may_read_workflow(
     if is_repository_board_id(workflow_run_id) {
         return Ok(true);
     }
-    match workflow_run_session(state, workflow_run_id).await? {
-        Some(session_id) => principal_may_use_session(state, principal, session_id).await,
-        None => Ok(false),
+    match workflow_run_owner(state, workflow_run_id).await? {
+        WorkflowOwner::Session(session_id) => {
+            principal_may_use_session(state, principal, session_id).await
+        }
+        WorkflowOwner::Unbound => Ok(true),
+        WorkflowOwner::Missing => Ok(false),
     }
+}
+
+/// Who owns a workflow run, distinguishing "no such run" from "a real run that
+/// was never bound to a session" — a distinction [`workflow_run_session`]
+/// collapsed into `None`, which is what made every unbound run unreadable.
+enum WorkflowOwner {
+    /// The run is bound to a session run; that session's owner governs.
+    Session(SessionId),
+    /// The run exists but has no session bound (see the note above).
+    Unbound,
+    /// No such workflow run.
+    Missing,
+}
+
+async fn workflow_run_owner(
+    state: &ServerState,
+    workflow_run_id: &str,
+) -> anyhow::Result<WorkflowOwner> {
+    // LEFT JOIN, so an unbound run still yields a row (with a NULL session).
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT r.session_id FROM workflow_runs w \
+         LEFT JOIN runs r ON r.id = w.run_id WHERE w.id = ?",
+    )
+    .bind(workflow_run_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    Ok(match row {
+        None => WorkflowOwner::Missing,
+        Some((None,)) => WorkflowOwner::Unbound,
+        Some((Some(id),)) => match SessionId::from_str(&id) {
+            Ok(session_id) => WorkflowOwner::Session(session_id),
+            Err(_) => WorkflowOwner::Unbound,
+        },
+    })
 }
 
 /// Whether `workflow_run_id` names a repository task board rather than a real
