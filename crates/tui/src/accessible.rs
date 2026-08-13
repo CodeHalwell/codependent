@@ -850,7 +850,10 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::DocEdit { .. } | Overlay::DocInsert { .. } => "document editor",
         Overlay::DocNew { .. } => "new document",
         Overlay::DocDeleteConfirm { .. } => "delete block confirmation",
+        Overlay::DocPublishTarget { .. } => "document publish target",
         Overlay::DocPublishPath { .. } => "document publish path",
+        Overlay::DocPublishBranch { .. } => "document publish branch",
+        Overlay::DocPublishTitle { .. } => "document publish pull request title",
         Overlay::ConfirmUiPluginApprove { .. }
         | Overlay::ConfirmUiPluginReject { .. }
         | Overlay::ConfirmUiPluginRevoke { .. }

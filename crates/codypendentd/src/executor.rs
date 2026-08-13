@@ -869,7 +869,13 @@ impl RuntimeExecutor {
             // this daemon's own scan wrote, so it is wired unconditionally like
             // the registry search above; a repository with no folded graph
             // simply answers "no results".
-            .with_code_graph(Arc::new(crate::scan::PoolCodeGraph::new(self.pool.clone())));
+            .with_code_graph(Arc::new(crate::scan::PoolCodeGraph::new(self.pool.clone())))
+            // Outcome 11: the writeback that fills `performance.task_class_success`.
+            // Unconditional like the reads above — the store no-ops for a model
+            // with no benched profile, so an unbenched deployment is unaffected.
+            .with_routing_outcomes(Arc::new(crate::routing_outcomes::PoolRoutingOutcomes::new(
+                self.pool.clone(),
+            )));
         // The `docs.*` tools (rubric #4): always wired — this daemon always has
         // the knowledge fabric. What an agent may actually do to a document is
         // bounded by the document's collaboration mode inside the channel, not
@@ -999,6 +1005,31 @@ impl RuntimeExecutor {
             .await
             {
                 warn!(run_id = %launch.run_id, %error, "could not record the run's measured usage");
+            }
+            // …and the same measurement over the wire, so a client learns a
+            // run's cost without reading the daemon's database. Nothing is
+            // emitted when the provider measured nothing: an all-`None` event
+            // would be indistinguishable from a genuinely free run.
+            if usage.is_some() {
+                match ledger::append_next_event(
+                    &self.pool,
+                    launch.session_id,
+                    &Actor::System,
+                    &EventBody::RunUsage {
+                        run_id: launch.run_id,
+                        prompt_tokens,
+                        completion_tokens,
+                        cost_micros,
+                    },
+                    Utc::now(),
+                )
+                .await
+                {
+                    Ok(event) => self.subscriptions.publish(launch.session_id, event),
+                    Err(error) => {
+                        warn!(run_id = %launch.run_id, %error, "could not publish the run's measured usage")
+                    }
+                }
             }
         }
         let result = outcome.map(|_| ()).map_err(|e| format!("run failed: {e}"));
@@ -2604,6 +2635,17 @@ impl RunExecutor for RuntimeExecutor {
         Some(Arc::new(self.promotion.clone()))
     }
 
+    fn memory_gateway(&self) -> Option<Arc<dyn codypendent_daemon::memory::MemoryGateway>> {
+        // Inspect/correct/forget a curated memory, and open the evidence behind
+        // one (outcome 17). Needs the artifact store as well as the pool: a
+        // correction's own receipt is written there, and evidence may BE an
+        // artifact.
+        Some(Arc::new(crate::memory_ops::MemoryStoreGateway::new(
+            self.pool.clone(),
+            self.artifacts(),
+        )))
+    }
+
     fn blackboard_reader(&self) -> Option<Arc<dyn BlackboardReader>> {
         // Read a durable run's board for a `ReadBlackboard` command over the
         // workflow `BlackboardStore` on the shared pool (Phase 5 STEP 5.3).
@@ -2886,6 +2928,36 @@ pub(crate) async fn release_run_worktree(
     }
 }
 
+/// Release a run's worktree whose contents are ALREADY captured durably
+/// elsewhere — a workflow agent node whose diff became a content-addressed
+/// `proposed_patch` artifact before this call.
+///
+/// `force` is safe here for exactly that reason, and only that reason. The
+/// protective (`force: false`) path retains the directory whenever the tree is
+/// dirty or the branch holds unmerged commits, which is *always* true of an
+/// implementer node — it edits files by design — so a fan-out of eight workers
+/// left eight retained trees and eight `codypendent/run-*` refs per run, each a
+/// second copy of bytes that were already durable and already reachable
+/// (F15.5).
+///
+/// The manager still exports a patch spanning `base_commit -> working tree`
+/// before removing anything, and still refuses to remove when that export comes
+/// back empty, so this cannot destroy work the node's own capture missed
+/// (staged-but-uncommitted edits, or commits, which `git diff` alone does not
+/// carry).
+pub(crate) async fn release_captured_run_worktree(
+    pool: &SqlitePool,
+    artifacts: &ArtifactStore,
+    manager: &WorktreeManager,
+    binding: &WorktreeBinding,
+) {
+    if let Some(lease_id) = binding.lease {
+        if let Err(error) = manager.release(pool, artifacts, lease_id, true).await {
+            warn!(%lease_id, %error, "could not release the run's captured worktree");
+        }
+    }
+}
+
 /// Releases a run's bound worktree **even if the drive panics**. A plain
 /// post-await `release_run_worktree` is skipped when the agent loop unwinds,
 /// leaking the lease + worktree for the process lifetime — startup reconciliation
@@ -2926,6 +2998,18 @@ impl WorktreeReleaseGuard {
     pub(crate) async fn release(mut self) {
         if let Some(binding) = self.binding.take() {
             release_run_worktree(&self.pool, &self.artifacts, &self.manager, &binding).await;
+        }
+    }
+
+    /// Teardown for a worktree whose contents are already durable elsewhere —
+    /// see [`release_captured_run_worktree`]. The caller must have proof of that
+    /// capture in hand (a `Some` patch artifact), never merely an expectation of
+    /// one. Consumes the guard, so an unwind before this point still takes the
+    /// protective path.
+    pub(crate) async fn release_captured(mut self) {
+        if let Some(binding) = self.binding.take() {
+            release_captured_run_worktree(&self.pool, &self.artifacts, &self.manager, &binding)
+                .await;
         }
     }
 }

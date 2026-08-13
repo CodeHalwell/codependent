@@ -17,6 +17,7 @@
 use codypendent_daemon::promotion::{
     AdvancePromotionRequest, ApprovePromotionRequest, PromotionActionFuture, PromotionGateway,
     PromotionProposeFuture, ProposePromotionRequest, RollbackPromotionRequest,
+    SubmitEvalEvidenceRequest,
 };
 use codypendent_eval::{
     ArtifactKind, ArtifactVersion, CanaryOutcome, PromotionStore, PromotionStoreError, SuiteReport,
@@ -76,6 +77,97 @@ impl PromotionGateway for PromotionStoreGateway {
                 )
                 .await
                 .map_err(store_error_to_protocol)
+        })
+    }
+
+    fn submit_eval_evidence(
+        &self,
+        request: SubmitEvalEvidenceRequest,
+    ) -> PromotionActionFuture<'_> {
+        let host = self.clone();
+        Box::pin(async move {
+            // Re-derive the artifact this evidence is about from the daemon's
+            // own candidate row. The caller names only a candidate id; every
+            // other column on the evidence row comes from here, so evidence
+            // gathered against one artifact can never be filed against another.
+            let artifact: Option<(String, String, i64)> = sqlx::query_as(
+                "SELECT artifact_kind, artifact_name, artifact_version \
+                 FROM promotion_candidates WHERE id = ?",
+            )
+            .bind(&request.candidate_id)
+            .fetch_optional(&host.pool)
+            .await
+            .map_err(|error| {
+                CodypendentError::new("promotion.store-error", error.to_string(), true)
+            })?;
+            let Some((kind, name, version)) = artifact else {
+                return Err(CodypendentError::new(
+                    "promotion.unknown-candidate",
+                    format!("no such promotion candidate: {}", request.candidate_id),
+                    false,
+                ));
+            };
+            // A router candidate is only exercised by a suite that RAN under the
+            // candidate policy. This check used to live in the CLI, where it was
+            // advisory — a caller that skipped `--policy` simply skipped the
+            // check. Here it is a condition of the row existing at all.
+            if kind == "router" && request.routing_policy != name {
+                return Err(CodypendentError::new(
+                    "promotion.evidence-wrong-policy",
+                    format!(
+                        "router candidate `{name}` needs evidence produced under policy \
+                         `{name}`, got `{}`",
+                        request.routing_policy
+                    ),
+                    false,
+                ));
+            }
+            // Parse rather than store-and-hope: a report the gate could not read
+            // later would surface as `promotion.corrupt` at advancement time,
+            // long after the caller could do anything about it. An empty suite
+            // is refused here for the same reason `RunRegression` refuses it —
+            // zero cases is not evidence of anything.
+            let report: SuiteReport =
+                serde_json::from_str(&request.report_json).map_err(|error| {
+                    CodypendentError::new(
+                        "promotion.invalid-evidence",
+                        format!("submitted evidence is not a suite report: {error}"),
+                        false,
+                    )
+                })?;
+            if report.results.is_empty() {
+                return Err(CodypendentError::new(
+                    "promotion.regression-evidence-empty",
+                    "an empty eval suite is not regression evidence".to_string(),
+                    false,
+                ));
+            }
+            // Re-serialize the PARSED report, not the caller's bytes: whatever
+            // the gate reads back is exactly what this validation covered, with
+            // no room for unread fields to ride along.
+            let report_json = serde_json::to_string(&report).map_err(|error| {
+                CodypendentError::new("promotion.store-error", error.to_string(), true)
+            })?;
+            sqlx::query(
+                "INSERT INTO eval_suite_reports \
+                 (id, candidate_id, artifact_kind, artifact_name, artifact_version, suite, \
+                  routing_policy, report_json, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            )
+            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(&request.candidate_id)
+            .bind(kind)
+            .bind(name)
+            .bind(version)
+            .bind(&request.suite)
+            .bind(&request.routing_policy)
+            .bind(report_json)
+            .execute(&host.pool)
+            .await
+            .map_err(|error| {
+                CodypendentError::new("promotion.store-error", error.to_string(), true)
+            })?;
+            Ok(())
         })
     }
 
@@ -417,6 +509,160 @@ mod tests {
             run_id: RunId::new(),
             model: ModelId("claude-sonnet-5".into()),
         }
+    }
+
+    /// Evidence submitted over the socket must land as a row the regression gate
+    /// can consume, with the artifact identity taken from the CANDIDATE rather
+    /// than from anything the caller said.
+    #[tokio::test]
+    async fn submitted_evidence_becomes_the_row_the_regression_gate_reads() {
+        let (_tmp, pool) = temp_pool().await;
+        let gateway = PromotionStoreGateway::new(pool.clone());
+        let client_id = human_client_id();
+        let candidate_id = gateway
+            .propose(ProposePromotionRequest {
+                kind: "skill".to_string(),
+                name: "rust.fix-ci".to_string(),
+                version: 3,
+                requires_permission_review: false,
+                idempotency_key: "propose-evidence".to_string(),
+                client_id,
+            })
+            .await
+            .expect("propose accepted");
+
+        gateway
+            .submit_eval_evidence(SubmitEvalEvidenceRequest {
+                candidate_id: candidate_id.clone(),
+                suite: "core".to_string(),
+                routing_policy: "daemon-default".to_string(),
+                report_json: serde_json::to_string(&passing_report()).unwrap(),
+                client_id,
+            })
+            .await
+            .expect("evidence accepted");
+
+        // The row carries the candidate's OWN artifact identity — the submitter
+        // never supplied kind/name/version, so no report can be filed against an
+        // artifact it did not exercise.
+        let (kind, name, version): (String, String, i64) = sqlx::query_as(
+            "SELECT artifact_kind, artifact_name, artifact_version FROM eval_suite_reports \
+             WHERE candidate_id = ?",
+        )
+        .bind(&candidate_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (kind.as_str(), name.as_str(), version),
+            ("skill", "rust.fix-ci", 3)
+        );
+
+        // …and the gate reads it: permission review first (a skill candidate
+        // requires it), then the regression leg consumes the submitted row.
+        for action in [
+            PromotionAction::ReviewPermissions,
+            PromotionAction::RunRegression,
+        ] {
+            gateway
+                .advance(AdvancePromotionRequest {
+                    candidate_id: candidate_id.clone(),
+                    action,
+                    client_id,
+                })
+                .await
+                .expect("advance accepted on daemon-written evidence");
+        }
+    }
+
+    /// Three ways a submission is refused, all of them before a row exists: an
+    /// unknown candidate, evidence that is not a suite report, and an empty
+    /// suite. A stored-then-validated design would leave junk rows behind.
+    #[tokio::test]
+    async fn unusable_evidence_is_refused_rather_than_stored() {
+        let (_tmp, pool) = temp_pool().await;
+        let gateway = PromotionStoreGateway::new(pool.clone());
+        let client_id = human_client_id();
+        let candidate_id = gateway
+            .propose(ProposePromotionRequest {
+                kind: "router".to_string(),
+                name: "tool-selection".to_string(),
+                version: 9,
+                requires_permission_review: false,
+                idempotency_key: "propose-refusals".to_string(),
+                client_id,
+            })
+            .await
+            .expect("propose accepted");
+
+        let submit = |candidate: String, policy: String, json: String| {
+            let gateway = gateway.clone();
+            async move {
+                gateway
+                    .submit_eval_evidence(SubmitEvalEvidenceRequest {
+                        candidate_id: candidate,
+                        suite: "core".to_string(),
+                        routing_policy: policy,
+                        report_json: json,
+                        client_id,
+                    })
+                    .await
+            }
+        };
+
+        let report = serde_json::to_string(&passing_report()).unwrap();
+        assert_eq!(
+            submit(
+                "cand-nonexistent".to_string(),
+                "tool-selection".to_string(),
+                report.clone()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "promotion.unknown-candidate"
+        );
+        // A router candidate needs evidence produced under the candidate policy;
+        // the CLI used to be the only place this was checked.
+        assert_eq!(
+            submit(
+                candidate_id.clone(),
+                "daemon-default".to_string(),
+                report.clone()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "promotion.evidence-wrong-policy"
+        );
+        assert_eq!(
+            submit(
+                candidate_id.clone(),
+                "tool-selection".to_string(),
+                "not json".to_string()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "promotion.invalid-evidence"
+        );
+        assert_eq!(
+            submit(
+                candidate_id.clone(),
+                "tool-selection".to_string(),
+                serde_json::to_string(&SuiteReport::new(Vec::new())).unwrap()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "promotion.regression-evidence-empty"
+        );
+
+        let rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM eval_suite_reports")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.0, 0, "a refused submission must leave no row behind");
     }
 
     #[tokio::test]

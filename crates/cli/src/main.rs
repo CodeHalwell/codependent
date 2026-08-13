@@ -333,6 +333,32 @@ enum SkillCommand {
         /// The package directory — the one holding `skill.toml`.
         directory: PathBuf,
     },
+    /// Author a new skill package and register it as a `draft` — installed and
+    /// inspectable, but never disclosed to a run until a human promotes it
+    /// (outcome 4). Validated and installed through the same pipeline `add`
+    /// runs; nothing here can register an `active` skill.
+    New {
+        /// The skill's manifest id (also its directory name under
+        /// `<data_dir>/skills/`).
+        id: String,
+        /// Human-readable name.
+        #[arg(long)]
+        name: String,
+        /// One sentence on what the skill is for — what retrieval matches on.
+        #[arg(long)]
+        description: String,
+        /// `user` (this machine's operator) or `repository` (anchored to the
+        /// checkout this command runs in).
+        #[arg(long, default_value = "user")]
+        scope: String,
+        /// A Markdown file holding the `SKILL.md` procedure body.
+        #[arg(long)]
+        procedure: PathBuf,
+        /// Where to author the package before installing. Defaults to a
+        /// temporary directory; pass one to keep the authored source to edit.
+        #[arg(long)]
+        directory: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1090,9 +1116,28 @@ async fn main() -> anyhow::Result<()> {
         TopCommand::Index {
             command: IndexCommand::Rebuild,
         } => commands::index_rebuild(&paths).await,
-        TopCommand::Skill {
-            command: SkillCommand::Add { directory },
-        } => commands::skill_add(&paths, &directory).await,
+        TopCommand::Skill { command } => match command {
+            SkillCommand::Add { directory } => commands::skill_add(&paths, &directory).await,
+            SkillCommand::New {
+                id,
+                name,
+                description,
+                scope,
+                procedure,
+                directory,
+            } => {
+                commands::skill_new(
+                    &paths,
+                    &id,
+                    &name,
+                    &description,
+                    &scope,
+                    &procedure,
+                    directory.as_deref(),
+                )
+                .await
+            }
+        },
         TopCommand::Workflow { command } => match command {
             WorkflowCommand::Validate { file, agents } => {
                 commands::workflow_validate(&file, agents.as_deref())

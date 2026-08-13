@@ -54,7 +54,7 @@ use crate::principal::PeerPrincipal;
 use crate::projections;
 use crate::promotion::{
     AdvancePromotionRequest, ApprovePromotionRequest, PromotionGateway, ProposePromotionRequest,
-    RollbackPromotionRequest,
+    RollbackPromotionRequest, SubmitEvalEvidenceRequest,
 };
 use crate::remote_ui::{
     broker_error, RemoteUiBroker, UiBrokerFrame, UiBrokerTarget, UiMediatedAction,
@@ -253,6 +253,11 @@ pub struct ServerState {
     /// `promotion.transport-unavailable`); the assembly injects a
     /// `codypendent-eval`-backed implementation over the pool.
     pub promotion: Option<Arc<dyn PromotionGateway>>,
+    /// Backs the client-facing memory inspect/correct/forget commands (outcome
+    /// 17). `None` in a lib-only / test embedding (every memory command is then
+    /// rejected `memory.transport-unavailable`); the assembly injects a
+    /// `codypendent-knowledge`-backed implementation over the pool.
+    pub memory: Option<Arc<dyn crate::memory::MemoryGateway>>,
     /// Turns a `SubmitUserInput`'s stored audio into text (voice v1, rubric 8).
     /// `None` in a lib-only / test embedding (an un-transcribed audio envelope is
     /// then rejected `voice.transport-unavailable`); the assembly injects an
@@ -404,6 +409,7 @@ pub async fn run_with_executor_on_and_health(
     let starter = executor.as_ref().and_then(|e| e.workflow_starter());
     let lifecycle = executor.as_ref().and_then(|e| e.workflow_lifecycle());
     let promotion = executor.as_ref().and_then(|e| e.promotion_gateway());
+    let memory = executor.as_ref().and_then(|e| e.memory_gateway());
     let documents = DocumentHub::new();
     // The blackboard read seam, bundled with the executor by the assembly. Unlike
     // the document hub, the per-run blackboard fan-out is REUSED from the executor
@@ -547,6 +553,7 @@ pub async fn run_with_executor_on_and_health(
         lifecycle,
         publisher,
         promotion,
+        memory,
         blackboards,
         blackboard_reader,
         blackboard_writer,
@@ -2194,6 +2201,207 @@ async fn handle_request(
                         client_id,
                     };
                     let reply = match gateway.rollback(rollback).await {
+                        Ok(()) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandAccepted {
+                                command_id: command.command_id,
+                                sequence: None,
+                                created_run: None,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Outcome 17: the curated-memory store lives outside the session
+                // ledger, so — like the promotion commands — these are
+                // intercepted here and applied through the assembly's
+                // `MemoryGateway` seam. Reads are open to any handshaken client;
+                // the two destructive verbs are `Controller`-only. The scope
+                // gate lives INSIDE the seam, where the memory is fetched, and
+                // refuses "not visible" identically to "not there".
+                CommandBody::InspectMemory { id, repository } => {
+                    let Some(gateway) =
+                        memory_seam(state, conn, writer, &request, false, "inspect").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match gateway
+                        .inspect(crate::memory::InspectMemoryRequest {
+                            id: *id,
+                            repository: repository.clone(),
+                        })
+                        .await
+                    {
+                        Ok(memory) => Envelope::reply_to(
+                            &request,
+                            Payload::Memory {
+                                command_id: command.command_id,
+                                memory,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::CorrectMemory {
+                    id,
+                    repository,
+                    statement,
+                    structured_value,
+                    confidence,
+                } => {
+                    let Some(gateway) =
+                        memory_seam(state, conn, writer, &request, true, "correct").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match gateway
+                        .correct(crate::memory::CorrectMemoryRequest {
+                            id: *id,
+                            repository: repository.clone(),
+                            statement: statement.clone(),
+                            structured_value: structured_value.clone(),
+                            confidence: *confidence,
+                        })
+                        .await
+                    {
+                        Ok(memory) => Envelope::reply_to(
+                            &request,
+                            Payload::Memory {
+                                command_id: command.command_id,
+                                memory,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::ForgetMemory { id, repository } => {
+                    let Some(gateway) =
+                        memory_seam(state, conn, writer, &request, true, "forget").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match gateway
+                        .forget(crate::memory::ForgetMemoryRequest {
+                            id: Some(*id),
+                            repository: repository.clone(),
+                            tier: codypendent_protocol::MemoryScopeTier::Unknown,
+                        })
+                        .await
+                    {
+                        Ok(forgotten) => Envelope::reply_to(
+                            &request,
+                            Payload::MemoryForgotten {
+                                command_id: command.command_id,
+                                forgotten,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::ForgetMemoryScope { repository, tier } => {
+                    let Some(gateway) =
+                        memory_seam(state, conn, writer, &request, true, "forget").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match gateway
+                        .forget(crate::memory::ForgetMemoryRequest {
+                            id: None,
+                            repository: repository.clone(),
+                            tier: *tier,
+                        })
+                        .await
+                    {
+                        Ok(forgotten) => Envelope::reply_to(
+                            &request,
+                            Payload::MemoryForgotten {
+                                command_id: command.command_id,
+                                forgotten,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::OpenMemoryEvidence {
+                    id,
+                    repository,
+                    evidence_index,
+                } => {
+                    let Some(gateway) =
+                        memory_seam(state, conn, writer, &request, false, "inspect").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match gateway
+                        .open_evidence(crate::memory::OpenMemoryEvidenceRequest {
+                            id: *id,
+                            repository: repository.clone(),
+                            evidence_index: *evidence_index,
+                        })
+                        .await
+                    {
+                        Ok(evidence) => Envelope::reply_to(
+                            &request,
+                            Payload::MemoryEvidence {
+                                command_id: command.command_id,
+                                evidence,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // The regression evidence a promotion gate consumes must arrive
+                // over THIS socket, from an authenticated Controller, so the
+                // daemon writes `eval_suite_reports` itself. Before this command
+                // existed the CLI opened the daemon's own SQLite file and
+                // INSERTed the row directly — which made migration 0017's "the
+                // regression verdict is derived from a persisted SuiteReport" a
+                // statement about the caller's own claim, not about anything the
+                // daemon observed.
+                CommandBody::SubmitEvalEvidence {
+                    candidate_id,
+                    suite,
+                    routing_policy,
+                    report_json,
+                } => {
+                    if conn.role != ClientRole::Controller {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "only a Controller may submit promotion eval evidence".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(gateway) = state.promotion.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let submit = SubmitEvalEvidenceRequest {
+                        candidate_id: candidate_id.clone(),
+                        suite: suite.clone(),
+                        routing_policy: routing_policy.clone(),
+                        report_json: report_json.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match gateway.submit_eval_evidence(submit).await {
                         Ok(()) => Envelope::reply_to(
                             &request,
                             Payload::CommandAccepted {
@@ -3857,22 +4065,6 @@ async fn principal_may_use_session(
         .is_some_and(|owner| principal.owns(owner)))
 }
 
-/// The session a durable workflow run belongs to, via the session run it drives.
-/// `None` for an unknown run, an unbound one, or a synthetic repository board —
-/// all three are "no owning session", which the callers turn into a refusal.
-async fn workflow_run_session(
-    state: &ServerState,
-    workflow_run_id: &str,
-) -> anyhow::Result<Option<SessionId>> {
-    let owner: Option<(String,)> = sqlx::query_as(
-        "SELECT r.session_id FROM workflow_runs w JOIN runs r ON r.id = w.run_id WHERE w.id = ?",
-    )
-    .bind(workflow_run_id)
-    .fetch_optional(&state.pool)
-    .await?;
-    Ok(owner.and_then(|(id,)| SessionId::from_str(&id).ok()))
-}
-
 /// Whether `principal` may read a workflow run's observability snapshot or its
 /// blackboard, live or by id.
 ///
@@ -3910,7 +4102,7 @@ async fn principal_may_read_workflow(
 }
 
 /// Who owns a workflow run, distinguishing "no such run" from "a real run that
-/// was never bound to a session" — a distinction [`workflow_run_session`]
+/// was never bound to a session" — a distinction the earlier inner-join lookup
 /// collapsed into `None`, which is what made every unbound run unreadable.
 enum WorkflowOwner {
     /// The run is bound to a session run; that session's owner governs.
@@ -5058,6 +5250,11 @@ fn event_run_id(event: &SessionEvent) -> Option<codypendent_protocol::RunId> {
         | RunStateChanged { run_id, .. }
         | ModelStreamDelta { run_id, .. }
         | ToolProposed { run_id, .. }
+        // A policy denial belongs to the run that proposed the action. Omitting
+        // it made `RunTrace` — "the detailed trace of one run" — the ONE
+        // subscription that never showed a denial, so a client watching a
+        // single run saw the safe actions and none of the refused ones.
+        | ToolDenied { run_id, .. }
         | ToolStarted { run_id, .. }
         | ToolCompleted { run_id, .. }
         | PatchProposed { run_id, .. }
@@ -5065,6 +5262,7 @@ fn event_run_id(event: &SessionEvent) -> Option<codypendent_protocol::RunId> {
         | SteeringApplied { run_id }
         | BudgetWarning { run_id, .. }
         | RunCompleted { run_id, .. }
+        | RunUsage { run_id, .. }
         | LearningsCaptured { run_id, .. } => Some(*run_id),
         _ => None,
     }
@@ -5108,6 +5306,50 @@ async fn workflow_control_seam<'a>(
         return Ok(None);
     };
     Ok(Some(lifecycle))
+}
+
+/// The shared gate for a memory command (outcome 17): the assembly's
+/// [`MemoryGateway`](crate::memory::MemoryGateway) must be wired, and a
+/// *mutating* verb additionally requires the `Controller` role — an Observer may
+/// read what the fabric remembers, never rewrite or erase it. On either failure
+/// this frames the rejection onto `writer` and returns `None`.
+///
+/// The scope check is deliberately NOT here: it belongs where the memory is
+/// fetched, inside the seam, so "you may not see this" and "this does not
+/// exist" collapse to one answer instead of two.
+async fn memory_seam<'a>(
+    state: &'a Arc<ServerState>,
+    conn: &ConnState,
+    writer: &SharedWriter,
+    request: &Envelope,
+    mutating: bool,
+    verb: &str,
+) -> anyhow::Result<Option<&'a Arc<dyn crate::memory::MemoryGateway>>> {
+    if mutating && conn.role != ClientRole::Controller {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "protocol.role-denied",
+                format!("only a Controller may {verb} a memory"),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    }
+    let Some(memory) = state.memory.as_ref() else {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "memory.transport-unavailable",
+                "the memory store is not enabled on this daemon".to_string(),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    };
+    Ok(Some(memory))
 }
 
 /// Lower a wire [`BlackboardScope`] to the daemon's [`BoardTarget`], or `None`
@@ -5448,7 +5690,8 @@ mod tests {
     }
     use chrono::Utc;
     use codypendent_protocol::{
-        AgentMode, ClientId, CommandBody, CommandId, Payload, RunId, SessionId,
+        AgentMode, ClientId, CommandBody, CommandId, Payload, RunId, SessionEvent, SessionId,
+        Subscription,
     };
 
     fn invocation(
@@ -5466,6 +5709,55 @@ mod tests {
             interaction_token: None,
             interaction_event_type: None,
         }
+    }
+
+    fn run_event(body: codypendent_protocol::EventBody) -> SessionEvent {
+        SessionEvent {
+            sequence: 1,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: codypendent_protocol::Actor::System,
+            body,
+        }
+    }
+
+    /// `Subscription::RunTrace` is "the detailed trace of one run" — a policy
+    /// denial and a measured-usage report are both part of that trace, and both
+    /// were dropped because [`super::event_run_id`] did not match them.
+    #[test]
+    fn run_trace_carries_denials_and_usage_for_its_own_run() {
+        use codypendent_protocol::EventBody;
+        let run_id = RunId::new();
+        let other = RunId::new();
+        let trace = vec![Subscription::RunTrace { run_id }];
+
+        let denied = |run| {
+            run_event(EventBody::ToolDenied {
+                run_id: run,
+                action: codypendent_protocol::ProposedAction::ExecuteCommand {
+                    program: "rm".into(),
+                    args: vec!["-rf".into(), "/".into()],
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+                reasons: vec!["program is not allow-listed".into()],
+            })
+        };
+        let usage = |run| {
+            run_event(EventBody::RunUsage {
+                run_id: run,
+                prompt_tokens: Some(1002),
+                completion_tokens: Some(60),
+                cost_micros: None,
+            })
+        };
+
+        assert!(super::subscription_matches(&trace, &denied(run_id)));
+        assert!(super::subscription_matches(&trace, &usage(run_id)));
+        // …and the filter is still a filter: another run's denial stays out.
+        assert!(!super::subscription_matches(&trace, &denied(other)));
+        assert!(!super::subscription_matches(&trace, &usage(other)));
     }
 
     #[test]

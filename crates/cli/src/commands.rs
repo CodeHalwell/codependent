@@ -12,9 +12,10 @@ use codypendent_daemon::policy::{ApprovalAction, MergedPolicy, PolicyEngine};
 use codypendent_integrations::mcp::{load_mcp_config, McpConfig};
 use codypendent_knowledge::{
     anchor_repository_id, db as knowledge_db, install_package, is_retrievable_status,
-    plan_publication, publications, register_builtins, retrieve, user_skills_root, DocumentStore,
-    HashingEmbedder, Publication, PublishTarget as KnowledgePublishTarget, Registry,
-    RetrievalConfig, RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
+    local_user_scope, plan_publication, publications, register_builtins, retrieve,
+    user_skills_root, DocumentStore, HashingEmbedder, Publication,
+    PublishTarget as KnowledgePublishTarget, Registry, RetrievalConfig, RetrievalIndexes,
+    RetrievalQuery, RiskClass, Scope,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
@@ -677,6 +678,88 @@ pub async fn skill_add(paths: &RuntimePaths, dir: &std::path::Path) -> anyhow::R
     Ok(())
 }
 
+/// `codypendent skill new <ID> --name … --description … --procedure <FILE>`
+/// (outcome 4): author a skill package from the command line and register it
+/// through the SAME validate-and-install pipeline [`skill_add`] runs — a thin
+/// dispatch over [`crate::skill_writer`], which owns the manifest rendering
+/// and its round-trip tests.
+///
+/// It always lands as `draft`: [`SkillDraft`](crate::skill_writer::SkillDraft)
+/// has no constructor that starts active, and retrieval hard-filters
+/// everything but Active. So a newly authored skill is installed and
+/// inspectable but never disclosed to a run until a human promotes it — the
+/// review gate outcome 4 asks for, enforced by construction rather than by
+/// remembering to check.
+pub async fn skill_new(
+    paths: &RuntimePaths,
+    id: &str,
+    name: &str,
+    description: &str,
+    scope: &str,
+    procedure: &std::path::Path,
+    directory: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let body = std::fs::read_to_string(procedure)
+        .with_context(|| format!("reading the procedure body {}", procedure.display()))?;
+
+    // Derived exactly as `skill_add` derives it: a `repository`-scoped skill
+    // registered under any other identity is invisible to every run.
+    let anchor = anchor_repository_id(&std::env::current_dir()?);
+    let scope = match scope {
+        "user" => local_user_scope(),
+        "repository" => Scope::Repository(anchor),
+        other => anyhow::bail!("unknown scope {other:?}: expected \"user\" or \"repository\""),
+    };
+    let draft = crate::skill_writer::SkillDraft::new(id, name, scope, description, body);
+
+    // Staging is throwaway — `author_and_install` copies the validated package
+    // under `<data_dir>/skills/`, and that copy is what the registry points at.
+    // Never a path built from `id`: only `install_package` vets it for
+    // traversal, and that happens after the authoring write.
+    let staging;
+    let source_dir = match directory {
+        Some(dir) => dir,
+        None => {
+            staging = tempfile::tempdir()
+                .with_context(|| "creating a staging directory for the drafted package")?;
+            staging.path()
+        }
+    };
+
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = knowledge_db::open(&database_path)
+        .await
+        .with_context(|| format!("opening {}", database_path.display()))?;
+    let skills_root = user_skills_root(&paths.data_dir);
+    let (item, installed) =
+        crate::skill_writer::author_and_install(&pool, source_dir, &skills_root, anchor, &draft)
+            .await
+            .with_context(|| format!("authoring the skill package {id}"))?;
+
+    println!(
+        "authored skill {} {} ({}) -> {}",
+        item.name,
+        item.version.0,
+        item.scope.tier(),
+        installed.display()
+    );
+    if !is_retrievable_status(item.status) {
+        // The version bump is not optional advice: a same-version status flip
+        // re-registers as `Modified`, not `Active`, because the registry
+        // detects the changed hash (see `skill_writer`'s module doc).
+        println!(
+            "status is {:?}: registered, but retrieval will not disclose it until it is \
+             promoted — in {}/skill.toml set `status = \"active\"`, bump `version`, then \
+             re-run `codypendent skill add {}`",
+            item.status,
+            installed.display(),
+            installed.display()
+        );
+    }
+    Ok(())
+}
+
 /// `codypendent open <session> --in <ide>` (STEP 3.7). Print how the IDE should
 /// attach to the session, then best-effort launch the editor with the session in
 /// its environment. The IDE joins as a *contributor* to the SAME session — the
@@ -945,13 +1028,25 @@ pub async fn docs_publish(
     }
 
     let existing = publications(&pool, document_id).await?.len();
-    match wait_for_new_publication(&pool, document_id, existing).await {
-        Some(publication) => println!(
+    match wait_for_publish_outcome(&pool, document_id, approval_id, existing).await {
+        PublishOutcome::Published(publication) => println!(
             "Published \"{}\" ({document_id}) -> commit {}",
             doc.title,
             publication.git_commit.as_deref().unwrap_or("(none)")
         ),
-        None => println!(
+        // A terminal job state is a verdict, not a delay: telling the user to
+        // re-run would loop them forever on a publish that already resolved.
+        // Non-zero exit so a script can tell these from a success.
+        PublishOutcome::Failed => anyhow::bail!(
+            "Publish failed; nothing was written. The daemon recorded approval {approval_id} \
+             as failed — see {} for the reason.",
+            paths.log_dir.join("daemon.log").display()
+        ),
+        PublishOutcome::Cancelled => anyhow::bail!(
+            "Publish was cancelled before it ran; nothing was written. Approval {approval_id} \
+             was rejected or expired before the daemon executed it."
+        ),
+        PublishOutcome::StillRunning => println!(
             "Publish approved; the daemon is still executing it in the background. \
              Check the daemon log, or re-run `codypendent docs publish` shortly to see \
              the recorded commit."
@@ -1110,23 +1205,71 @@ fn slugify(title: &str) -> String {
     }
 }
 
-/// Poll the publication history for a fresh row beyond `existing_count`
-/// (the daemon's execution is fire-and-forget once the approval resolves),
-/// or give up after a generous bound and let the caller report "still
-/// running" rather than hang indefinitely.
-async fn wait_for_new_publication(
+/// What became of an approved publish, as read back from the daemon's own
+/// database by [`wait_for_publish_outcome`].
+enum PublishOutcome {
+    /// The daemon recorded a publication row.
+    Published(Box<Publication>),
+    /// `document_publish_jobs.state = 'failed'` — the execution ran and lost.
+    Failed,
+    /// `document_publish_jobs.state = 'cancelled'` — the approval was rejected
+    /// or expired before execution, so nothing ever ran.
+    Cancelled,
+    /// The bound elapsed with the job still pending or executing.
+    StillRunning,
+}
+
+/// The recorded state of the publish job this invocation parked, or `None`
+/// while the row is not yet readable. Keyed by `approval_id` — the table's
+/// primary key, and the exact job this CLI invocation caused, so a concurrent
+/// publish of the same document cannot be mistaken for ours.
+async fn publish_job_state(
+    pool: &sqlx::SqlitePool,
+    approval_id: codypendent_protocol::ApprovalId,
+) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT state FROM document_publish_jobs WHERE approval_id = ?")
+        .bind(approval_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Poll for the outcome of an approved publish: a fresh publication row beyond
+/// `existing_count`, or a terminal state for this approval's job. The daemon's
+/// execution is fire-and-forget once the approval resolves, so a failure is
+/// recorded ONLY in `document_publish_jobs` — watching publications alone left
+/// a failed publish reporting "still executing, re-run shortly" forever
+/// (2026-08-13 review F8). Gives up after a generous bound rather than hang.
+async fn wait_for_publish_outcome(
     pool: &sqlx::SqlitePool,
     document_id: DocumentId,
+    approval_id: codypendent_protocol::ApprovalId,
     existing_count: usize,
-) -> Option<Publication> {
+) -> PublishOutcome {
     for _ in 0..100 {
-        let published = publications(pool, document_id).await.ok()?;
+        // Publications first: the daemon records the row *before* it marks the
+        // job `completed`, so a success is never reported as anything else.
+        let Ok(published) = publications(pool, document_id).await else {
+            // A read error is not a verdict — never claim a failure the
+            // database did not state.
+            return PublishOutcome::StillRunning;
+        };
         if published.len() > existing_count {
-            return published.into_iter().next();
+            if let Some(publication) = published.into_iter().next() {
+                return PublishOutcome::Published(Box::new(publication));
+            }
+        }
+        match publish_job_state(pool, approval_id).await.as_deref() {
+            Some("failed") => return PublishOutcome::Failed,
+            Some("cancelled") => return PublishOutcome::Cancelled,
+            // `pending`/`executing`/`completed` (whose publication row is
+            // written first, so it was already caught above) — keep waiting.
+            _ => {}
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    None
+    PublishOutcome::StillRunning
 }
 
 /// `codypendent workflow validate <FILE> [--agents <DIR>]` (Phase 5 STEP 5.1):
@@ -1577,9 +1720,9 @@ fn run_phase_label(phase: WorkflowRunPhase) -> &'static str {
     }
 }
 
-/// Render a node's measured cost JSON (`wall_time_secs`, `tool_calls`) as a human
-/// string, or `None` when empty. Only measured dimensions — never a fabricated
-/// token/USD figure (T8).
+/// Render a node's measured cost JSON (`wall_time_secs`, `tool_calls`,
+/// `tokens`, `cost_micros`) as a human string, or `None` when empty. Only
+/// measured dimensions — never a fabricated token/USD figure (T8).
 fn render_cost(cost: &serde_json::Value) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(secs) = cost.get("wall_time_secs").and_then(|v| v.as_u64()) {
@@ -1592,6 +1735,15 @@ fn render_cost(cost: &serde_json::Value) -> Option<String> {
             "tool calls"
         };
         parts.push(format!("{calls} {unit}"));
+    }
+    // Measured-only, exactly like the producer (`NodeCost::to_json` omits an
+    // unmeasured dimension): an absent key prints nothing rather than a zero
+    // that would read as "this node was free".
+    if let Some(tokens) = cost.get("tokens").and_then(|v| v.as_u64()) {
+        parts.push(format!("{tokens} tokens"));
+    }
+    if let Some(micros) = cost.get("cost_micros").and_then(|v| v.as_u64()) {
+        parts.push(format!("${:.4}", micros as f64 / 1_000_000.0));
     }
     if parts.is_empty() {
         None
@@ -2782,6 +2934,30 @@ steps:
             value["nodes"][1]["action"]["name"],
             "github.update-pull-request"
         );
+    }
+
+    /// Outcome 15: a worker's spend must be *visible*. `NodeCost` measures
+    /// tokens and `cost_micros` and stores them in `workflow_nodes.cost_json`;
+    /// `workflow watch` used to read only wall-time and tool calls, dropping
+    /// both at the last inch.
+    #[test]
+    fn render_cost_shows_measured_tokens_and_money() {
+        let rendered = render_cost(&serde_json::json!({
+            "wall_time_secs": 3, "tool_calls": 1, "tokens": 1200, "cost_micros": 2500
+        }))
+        .expect("a measured node renders");
+        assert!(rendered.contains("1200 tokens"), "{rendered}");
+        assert!(rendered.contains("$0.0025"), "{rendered}");
+    }
+
+    #[test]
+    fn render_cost_never_fabricates_an_unmeasured_dimension() {
+        // Both keys absent from `cost_json` — the default install, where
+        // routing (the only price source) is off. Neither may print a zero.
+        let bare = render_cost(&serde_json::json!({"wall_time_secs": 3, "tool_calls": 1}))
+            .expect("wall time still renders");
+        assert!(!bare.contains("tokens") && !bare.contains('$'), "{bare}");
+        assert_eq!(render_cost(&serde_json::json!({})), None);
     }
 }
 
@@ -4131,5 +4307,140 @@ mod daemon_restart_tests {
             "got: {message}"
         );
         assert!(message.contains("did not become ready"), "got: {message}");
+    }
+}
+
+#[cfg(test)]
+mod docs_publish_outcome_tests {
+    use super::*;
+    use codypendent_protocol::ApprovalId;
+
+    /// A migrated database holding the foreign-key chain a publish job needs
+    /// (`sessions` -> `runs`, plus `documents`), and the ids to address it by.
+    async fn seeded_pool(
+        dir: &std::path::Path,
+    ) -> (sqlx::SqlitePool, DocumentId, codypendent_protocol::RunId) {
+        let pool = knowledge_db::open(&dir.join("codypendent.db"))
+            .await
+            .expect("migrated database");
+        let session_id = SessionId::new();
+        let run_id = codypendent_protocol::RunId::new();
+        let document_id = DocumentId::new();
+        let now = "2026-08-13T00:00:00Z";
+
+        sqlx::query(
+            "INSERT INTO sessions (id, workspace_id, title, state, created_at, updated_at, \
+             revision) VALUES (?, NULL, 'test', 'open', ?, ?, 0)",
+        )
+        .bind(session_id.to_string())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, \
+             budget_json) VALUES (?, ?, 'publish', 'running', 'Build', 'default', '{}')",
+        )
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO documents (id, title, scope_json, scope_tier, scope_key, status, \
+             metadata_json, crdt_snapshot, links_json, citations_json, revision, created_at, \
+             updated_at) VALUES (?, 'Doc', ?, 'system', NULL, 'draft', '{}', ?, '[]', '[]', 1, \
+             ?, ?)",
+        )
+        .bind(document_id.to_string())
+        .bind(serde_json::to_string(&Scope::System).unwrap())
+        .bind(Vec::<u8>::new())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        (pool, document_id, run_id)
+    }
+
+    async fn park_job(
+        pool: &sqlx::SqlitePool,
+        approval_id: ApprovalId,
+        run_id: codypendent_protocol::RunId,
+        document_id: DocumentId,
+        state: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO document_publish_jobs (approval_id, run_id, document_id, plan_json, \
+             state, created_at, updated_at) VALUES (?, ?, ?, '{}', ?, ?, ?)",
+        )
+        .bind(approval_id.to_string())
+        .bind(run_id.to_string())
+        .bind(document_id.to_string())
+        .bind(state)
+        .bind("2026-08-13T00:00:00Z")
+        .bind("2026-08-13T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// 2026-08-13 review F8: a publish whose job already says `failed` must
+    /// report a failure. Before this, only `document_publications` was polled,
+    /// so the CLI printed "still executing … re-run shortly" forever.
+    #[tokio::test]
+    async fn a_failed_publish_job_is_reported_as_failed_not_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, document_id, run_id) = seeded_pool(dir.path()).await;
+        let approval_id = ApprovalId::new();
+        park_job(&pool, approval_id, run_id, document_id, "failed").await;
+
+        let outcome = wait_for_publish_outcome(&pool, document_id, approval_id, 0).await;
+        assert!(
+            matches!(outcome, PublishOutcome::Failed),
+            "a job recorded as failed must not be reported as still running"
+        );
+    }
+
+    /// A rejected/expired approval never executes: distinct from a failure,
+    /// and equally not something re-running the command would resolve.
+    #[tokio::test]
+    async fn a_cancelled_publish_job_is_reported_as_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, document_id, run_id) = seeded_pool(dir.path()).await;
+        let approval_id = ApprovalId::new();
+        park_job(&pool, approval_id, run_id, document_id, "cancelled").await;
+
+        assert!(matches!(
+            wait_for_publish_outcome(&pool, document_id, approval_id, 0).await,
+            PublishOutcome::Cancelled
+        ));
+    }
+
+    /// A concurrent publish of the SAME document must not be read as ours —
+    /// the probe is keyed by the approval this invocation parked. (Testing the
+    /// probe rather than the loop: an "ours is still pending" assertion would
+    /// have to sit through the whole poll bound to prove a negative.)
+    #[tokio::test]
+    async fn the_job_probe_is_keyed_by_approval_not_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, document_id, run_id) = seeded_pool(dir.path()).await;
+        let theirs = ApprovalId::new();
+        let ours = ApprovalId::new();
+        park_job(&pool, theirs, run_id, document_id, "failed").await;
+        park_job(&pool, ours, run_id, document_id, "pending").await;
+
+        assert_eq!(
+            publish_job_state(&pool, ours).await.as_deref(),
+            Some("pending")
+        );
+        assert_eq!(
+            publish_job_state(&pool, theirs).await.as_deref(),
+            Some("failed")
+        );
+        // A job row that has not appeared yet is not a verdict either.
+        assert_eq!(publish_job_state(&pool, ApprovalId::new()).await, None);
     }
 }

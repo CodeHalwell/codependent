@@ -1029,7 +1029,16 @@ impl AgentLoopNodeExecutor {
             None
         };
 
-        guard.release().await;
+        // A captured patch is proof the node's edits are already a durable,
+        // content-addressed artifact, so the tree may go instead of being
+        // retained forever along with its `codypendent/run-*` branch (F15.5).
+        // With nothing captured, the ordinary protective release applies — an
+        // implementer whose diff we could not take keeps its worktree.
+        if proposed_patch.is_some() {
+            guard.release_captured().await;
+        } else {
+            guard.release().await;
+        }
 
         match outcome {
             Ok(RunOutcome {
@@ -1249,6 +1258,11 @@ impl AgentLoopNodeExecutor {
             run_journal(&self.pool, &self.approvals),
             artifact_sink(&self.pool, artifact_store(&self.paths)),
         );
+        // Outcome 11: a workflow agent node's result feeds the routing table
+        // too — otherwise only plain chat runs ever teach the router anything.
+        runtime = runtime.with_routing_outcomes(Arc::new(
+            crate::routing_outcomes::PoolRoutingOutcomes::new(self.pool.clone()),
+        ));
         if let Some(github) = &self.github {
             runtime = runtime.with_github(github.clone());
         }
@@ -1900,7 +1914,15 @@ impl AgentLoopNodeExecutor {
         }
 
         let consolidated = self.capture_proposed_patch(&worktree, run_id).await;
-        guard.release().await;
+        // Same rule as the agent-node path: the consolidated diff is a durable
+        // artifact before the tree goes, so retaining the tree (and its branch)
+        // would only keep a second copy of bytes that are already reachable. A
+        // capture that produced nothing keeps the protective release.
+        if consolidated.is_some() {
+            guard.release_captured().await;
+        } else {
+            guard.release().await;
+        }
 
         let Some(consolidated) = consolidated else {
             return Err(format!(
@@ -5882,34 +5904,19 @@ steps:
         assert_eq!(rows.len(), 3, "one worktree each: {rows:?}");
         assert!(rows.iter().all(|(_, _, state)| state == "released"));
 
-        // Branch lifecycle. The consolidator's worktree is CLEAN when it is
-        // released (its applied patches are captured as an artifact, not
-        // committed), so its branch is reclaimed — before this change every one
-        // of these three refs survived forever, one per node per run.
+        // Branch lifecycle — the last mile of F15.5, now closed. Every node here
+        // leaves a DIRTY worktree (a worker's edits are uncommitted by design,
+        // and the consolidator's applied patches are captured as an artifact
+        // rather than committed), so the protective release used to retain all
+        // three trees, and a retained tree keeps its branch checked out: three
+        // `codypendent/run-*` refs per run, forever, growing with every fan-out.
         //
-        // The two workers' trees are DIRTY (an implementer's edits are
-        // uncommitted by design), so the manager's "protect unmerged work"
-        // contract retains both tree and branch and exports the diff as a patch
-        // artifact. That retention is deliberate, not a leak — but it does mean
-        // a fan-out still accumulates one retained tree per writing worker
-        // until the daemon's `release_run_worktree` can pass `force` once a
-        // node's diff is provably captured (see
-        // `.impl/proposals/daemon-from-agent-delegation.md`).
-        //
-        // Every node here leaves a DIRTY worktree — a worker's edits are
-        // uncommitted by design, and the consolidator's applied patches are
-        // captured as an artifact rather than committed — so the manager's
-        // "protect unmerged work" contract retains each tree, and a retained
-        // tree has its branch checked out. Those three refs are therefore
-        // retained, not leaked: each one's diff is also an exported patch
-        // artifact. The reclaim path is exercised where it applies (a CLEAN
-        // release) in `worktrees.rs`'s own tests.
-        //
-        // Closing this last mile needs `release_run_worktree` to pass `force`
-        // once a node's diff is provably captured, which lives in a file I do
-        // not own — see `.impl/proposals/daemon-from-agent-delegation.md`. This
-        // assertion pins the CURRENT truth so that proposal landing is visible
-        // as a test change rather than a silent behaviour drift.
+        // Each of those trees is now released with `force` — but ONLY because
+        // its diff is provably a durable artifact first (`proposed_patch` /
+        // `consolidated` is `Some`). The manager still exports its own
+        // `base_commit -> working tree` patch before removing anything and still
+        // refuses to remove when that export is empty, so this discards a second
+        // copy, never the only one.
         let after = branch_list(&repo);
         let retained: Vec<_> = after
             .iter()
@@ -5917,8 +5924,8 @@ steps:
             .collect();
         assert_eq!(
             retained.len(),
-            3,
-            "one retained branch per dirty worktree. before={branches_before:?} after={after:?}"
+            0,
+            "a captured worktree's branch is reclaimed. before={branches_before:?} after={after:?}"
         );
     }
 

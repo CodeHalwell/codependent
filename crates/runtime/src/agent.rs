@@ -74,6 +74,11 @@ use codypendent_knowledge::{
     RiskClass, Scope,
 };
 use codypendent_protocol::ide::{DirtyBufferDigest, SourceProvenance};
+// Outcome 11: the loop classifies a finished run's objective with the SAME rules
+// the router selects a model with, so the outcome it writes back lands on the
+// class routing consulted. `codypendent-routing` is a protocol-only leaf crate
+// (its own Cargo.toml comment), so this adds no cycle.
+use codypendent_routing::{classify, TaskClass, TaskSignals};
 // THE untrusted-content chokepoint for MCP tool results (PR B): every byte a
 // server returns passes through `sanitize_untrusted` before it can enter the
 // model's observation stream — never raw.
@@ -824,6 +829,18 @@ pub trait ModelDriver: Send + Sync {
     fn context_window(&self) -> Option<u64> {
         None
     }
+
+    /// The endpoint (base URL) this driver's model is served from, if known.
+    ///
+    /// This is the second half of the `(model_id, endpoint)` key every stored
+    /// model profile lives under — `codypendent models bench <id>` persists a
+    /// profile keyed on the model's `base_url` — so it is what a routing-outcome
+    /// writeback must report. Defaults to `None` so a scripted or test driver
+    /// never fabricates one; a run under such a driver records no outcome rather
+    /// than folding a result into the wrong profile row.
+    fn endpoint(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A driver backed by a fixed queue of pre-set steps — the deterministic engine
@@ -843,6 +860,10 @@ pub struct ScriptedDriver {
     /// scripts a known window so a test can exercise the plain loop's
     /// `BudgetWarning{Tokens}` emission (context-window protection, T3).
     context_window: Option<u64>,
+    /// The endpoint [`ModelDriver::endpoint`] reports. `None` (the default via
+    /// [`Self::new`]) keeps the honest "no endpoint" answer a scripted driver
+    /// should give — a run under it records no routing outcome.
+    endpoint: Option<String>,
 }
 
 impl ScriptedDriver {
@@ -854,7 +875,15 @@ impl ScriptedDriver {
             model_id: ModelId("scripted".to_string()),
             usage: None,
             context_window: None,
+            endpoint: None,
         }
+    }
+
+    /// Script the endpoint the driver reports, so a test can exercise the
+    /// routing-outcome writeback (outcome 11) without a live provider.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = Some(endpoint.into());
+        self
     }
 
     /// Set the reported model id (defaults to `scripted`).
@@ -890,6 +919,10 @@ impl ModelDriver for ScriptedDriver {
 
     fn context_window(&self) -> Option<u64> {
         self.context_window
+    }
+
+    fn endpoint(&self) -> Option<String> {
+        self.endpoint.clone()
     }
 
     async fn next_step(
@@ -1248,6 +1281,42 @@ pub fn mode_overlay(mode: AgentMode) -> ModeOverlay {
     }
 }
 
+/// The lowercase mode token the rule classifier reads. Must agree with the
+/// daemon's `routing::mode_str`, which is what the ROUTER classified this run's
+/// objective with when it picked the model — a different token here would file
+/// the outcome under a class the routing decision never considered. An
+/// unknown/future mode maps to the empty string, which the classifier reads as
+/// "no mode signal".
+fn mode_signal(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Build => "build",
+        AgentMode::Explore => "explore",
+        AgentMode::Ask => "ask",
+        AgentMode::Plan => "plan",
+        AgentMode::Review => "review",
+        _ => "",
+    }
+}
+
+/// Classify a run's objective the way the router classified it at selection
+/// time (outcome 11).
+///
+/// The node kind is `"agent"` because that is what BOTH of the daemon's routing
+/// call sites pass — `executor.rs`'s plain-run path and `workflow_exec.rs`'s
+/// agent-node path — and the CI-diagnosis rule keys off it. `input_tokens`
+/// reproduces the daemon's `routing::estimate_input_tokens` formula rather than
+/// the run's measured token count: the two must be the same number for the class
+/// to be the same, and today's rules do not read it at all — copying the formula
+/// keeps that true if a future rule starts to.
+fn classify_run(run: &RunContext) -> codypendent_routing::Classification {
+    classify(&TaskSignals::from_objective(
+        mode_signal(run.mode),
+        "agent",
+        ((run.objective.len() as u64) / 4).max(256),
+        &run.objective,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // The RunJournal: pool-erased persistence, mirroring the ArtifactSink boundary
 // ---------------------------------------------------------------------------
@@ -1347,6 +1416,54 @@ impl RunJournal {
 }
 
 // ---------------------------------------------------------------------------
+// The routing-outcome writeback (outcome 11)
+// ---------------------------------------------------------------------------
+
+/// One run's terminal result, keyed the way the model-profile store keys a
+/// profile: `(model, endpoint)` plus the task class the run belonged to.
+#[derive(Debug, Clone)]
+pub struct RoutingOutcome<'a> {
+    /// The model that served the run.
+    pub model: &'a ModelId,
+    /// The endpoint it was served from — [`ModelDriver::endpoint`], which is the
+    /// same `base_url` a benched profile is stored under.
+    pub endpoint: &'a str,
+    /// The class the run's objective classified as, decided here (not by the
+    /// implementation) so the recorded class comes from the same rules the
+    /// router selects with.
+    pub task_class: TaskClass,
+    /// Whether the run reached a successful terminal state. Only the two
+    /// unambiguous dispositions are reported; see
+    /// [`FrameworkAgentRuntime::with_routing_outcomes`].
+    pub success: bool,
+    /// The run the observation came from — the store deduplicates on it, so a
+    /// replayed or retried terminal event cannot inflate a model's success rate.
+    pub run_id: RunId,
+}
+
+/// Pool-erased writeback for a finished run's per-task-class result.
+///
+/// The routing table `performance.task_class_success` is what makes the
+/// nine-class classifier actually change which model is picked; it was
+/// permanently empty because the only non-test constructor of a `ModelProfile`
+/// (the bench harness) always wrote an empty map and nothing ever folded a real
+/// run into it. The writer exists —
+/// `codypendent_daemon::model_profiles::ModelProfileStore::record_outcome` — but
+/// it takes a `SqlitePool`, which this crate cannot name (ADR-009, see the
+/// module docs). So the loop reports through this trait exactly as it reaches
+/// the ledger through [`RunJournal`], and the daemon assembly implements it over
+/// the pool.
+///
+/// An implementation must treat this as advisory telemetry: it is called after
+/// the run's terminal event is already published, and an `Err` is logged and
+/// dropped, never surfaced to the run.
+#[async_trait]
+pub trait RoutingOutcomeSink: Send + Sync {
+    /// Record one terminal outcome. `Err` is a legible reason for the log.
+    async fn record(&self, outcome: RoutingOutcome<'_>) -> Result<(), String>;
+}
+
+// ---------------------------------------------------------------------------
 // Trace metadata (Chapter 13 groundwork)
 // ---------------------------------------------------------------------------
 
@@ -1443,6 +1560,10 @@ pub struct FrameworkAgentRuntime {
     task_board: Option<Arc<dyn TaskBoardChannel>>,
     /// Persisted multi-model councils, available to ordinary chat runs.
     councils: Option<Arc<dyn CouncilService>>,
+    /// Where a finished run's per-task-class result is reported (outcome 11), if
+    /// wired. `None` leaves the loop's behavior exactly as it was — no
+    /// classification, no writeback.
+    routing_outcomes: Option<Arc<dyn RoutingOutcomeSink>>,
 }
 
 /// How a run terminated, before it is folded into a [`RunDisposition`].
@@ -1487,7 +1608,21 @@ impl FrameworkAgentRuntime {
             workflow_control: None,
             task_board: None,
             councils: None,
+            routing_outcomes: None,
         }
+    }
+
+    /// Inject the sink a finished run's per-task-class result is reported to
+    /// (outcome 11). Without it the loop records nothing, exactly as before.
+    ///
+    /// Only `Completed` and `Failed` runs are reported. A `Cancelled` run is
+    /// deliberately skipped: a human stopping a run says nothing about whether
+    /// the model was doing well, and counting it either way would bias the
+    /// routing table the classifier reads.
+    #[must_use]
+    pub fn with_routing_outcomes(mut self, sink: Arc<dyn RoutingOutcomeSink>) -> Self {
+        self.routing_outcomes = Some(sink);
+        self
     }
 
     /// Inject the GitHub client the `github.*` tools call. Without it those tools
@@ -2788,7 +2923,57 @@ impl FrameworkAgentRuntime {
         )
         .await?;
 
+        // Outcome 11: fold this run into the model's per-task-class success
+        // table. AFTER the terminal event, and best-effort: this is telemetry,
+        // so it must never delay a run's completion nor fail an already-terminal
+        // run.
+        self.record_routing_outcome(&run, driver, &disposition)
+            .await;
+
         Ok(RunOutcome { disposition, usage })
+    }
+
+    /// Report a finished run's result to the routing-outcome sink, if one is
+    /// wired and the run produced an unambiguous signal.
+    ///
+    /// Three conditions each skip the write rather than guess:
+    /// no sink; a driver with no known endpoint (a scripted/test driver — see
+    /// [`ModelDriver::endpoint`]); and a `Cancelled` disposition, which says
+    /// nothing about model quality in either direction.
+    async fn record_routing_outcome(
+        &self,
+        run: &RunContext,
+        driver: &dyn ModelDriver,
+        disposition: &RunDisposition,
+    ) {
+        let Some(sink) = self.routing_outcomes.as_ref() else {
+            return;
+        };
+        let success = match disposition {
+            RunDisposition::Completed { .. } => true,
+            RunDisposition::Failed { .. } => false,
+            _ => return,
+        };
+        let Some(endpoint) = driver.endpoint() else {
+            return;
+        };
+        let model = driver.model_id();
+        let outcome = RoutingOutcome {
+            model: &model,
+            endpoint: &endpoint,
+            task_class: classify_run(run).class,
+            success,
+            run_id: run.run_id,
+        };
+        if let Err(reason) = sink.record(outcome).await {
+            tracing::warn!(
+                run_id = %run.run_id,
+                model = %model,
+                endpoint = %endpoint,
+                reason,
+                "could not record the run's routing outcome"
+            );
+        }
     }
 
     // -- event helpers -----------------------------------------------------
@@ -5865,6 +6050,11 @@ pub struct FrameworkModelDriver {
     /// (the default via [`Self::new`]) means "unknown": [`Self::context_window`]
     /// honestly returns `None`, never a fabricated default.
     context_tokens: Option<u64>,
+    /// The endpoint (base URL) this model is served from, sourced from
+    /// `ModelConfig.base_url` by [`Self::from_registry`]. `None` (the default
+    /// via [`Self::new`]) means "unknown", which suppresses the routing-outcome
+    /// writeback rather than guessing a key — see [`ModelDriver::endpoint`].
+    endpoint: Option<String>,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -5881,6 +6071,7 @@ impl FrameworkModelDriver {
             client,
             model_id,
             context_tokens: None,
+            endpoint: None,
         }
     }
 
@@ -5889,7 +6080,22 @@ impl FrameworkModelDriver {
     /// [`Self::context_window`] can answer honestly (`Some` when configured,
     /// `None` when unset).
     pub async fn from_registry(models: &ModelRegistry, model_id: ModelId) -> anyhow::Result<Self> {
-        let context_tokens = models.get(&model_id).and_then(|cfg| cfg.context_tokens);
+        // Through [`ModelRegistry::context_tokens_for`], not
+        // `ModelConfig::context_tokens` directly: `context_tokens` crosses a
+        // trust boundary (a provider's own `/models` response can win over the
+        // curated catalog and is persisted to `models.toml` verbatim), and this
+        // value is load-bearing downstream — it is forwarded as Ollama's
+        // `num_ctx` request hint and is the denominator of the TUI's
+        // context-usage percentage. `context_tokens_for` clamps to the TIGHTER
+        // of the absolute plausibility ceiling and the specific catalog row's
+        // own documented window, so an overstated reading for a curated model
+        // is caught even when it sits under the absolute cap.
+        let context_tokens = models.context_tokens_for(&model_id);
+        // The endpoint the profile store keys on alongside the model id:
+        // `codypendent models bench <id>` persists under `ModelConfig::base_url`
+        // (`crates/cli/src/commands.rs`), so a routing-outcome writeback must
+        // report the same string or it lands under a key no profile row has.
+        let endpoint = models.get(&model_id).map(|cfg| cfg.base_url.clone());
         let client = models
             .client_for(&model_id)
             .await
@@ -5898,6 +6104,7 @@ impl FrameworkModelDriver {
             client,
             model_id,
             context_tokens,
+            endpoint,
         })
     }
 }
@@ -6638,6 +6845,10 @@ impl ModelDriver for FrameworkModelDriver {
 
     fn context_window(&self) -> Option<u64> {
         self.context_tokens
+    }
+
+    fn endpoint(&self) -> Option<String> {
+        self.endpoint.clone()
     }
 
     async fn next_step(
@@ -7535,6 +7746,60 @@ mod tests {
             driver.context_window(),
             None,
             "an unset context_tokens must stay honestly None, never a fabricated default"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn framework_driver_context_window_is_clamped_to_the_catalog_rows_own_ceiling() {
+        // `context_tokens` crosses a trust boundary: a provider's own `/models`
+        // response can beat the curated catalog and is persisted to
+        // `models.toml` verbatim. From here it is forwarded as Ollama's
+        // `num_ctx` request hint and used as the context-usage denominator, so
+        // `from_registry` must read it through `ModelRegistry::context_tokens_for`
+        // — which applies the catalog row's OWN documented ceiling — not off
+        // `ModelConfig::context_tokens` directly. This reading (1.9M against a
+        // curated 1M row) sits under the absolute plausibility clamp, so only
+        // the catalog-aware path catches it.
+        let provider_toml = r#"
+[[provider]]
+id = "anthropic"
+name = "Anthropic (Claude)"
+protocol = "anthropic"
+base_url = "https://api.anthropic.com"
+[[provider.auth]]
+kind = "api_key"
+env = ["ANTHROPIC_API_KEY_UNSET_AGENT_TEST"]
+header = "x-api-key"
+prefix = ""
+
+[[model]]
+id = "claude-opus-5"
+provider_id = "anthropic"
+context_tokens = 1000000
+"#;
+        let file: codypendent_providers::ProvidersFile =
+            toml::from_str(provider_toml).expect("provider toml");
+        let catalog = codypendent_providers::Catalog::from_parts(file.providers, file.models);
+        let id = ModelId("anthropic/claude-opus-5".to_string());
+        let registry = ModelRegistry::new([crate::models::ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            model: "claude-opus-5".to_string(),
+            api_key_env: String::new(),
+            context_tokens: Some(1_900_000),
+            provider_id: Some("anthropic".to_string()),
+        }])
+        .with_catalog(catalog);
+
+        let driver = FrameworkModelDriver::from_registry(&registry, id)
+            .await
+            .expect("driver builds from a registered model");
+        assert_eq!(
+            driver.context_window(),
+            Some(1_000_000),
+            "an overstated provider reading must not reach num_ctx or the context-usage denominator"
         );
     }
 
@@ -10686,6 +10951,258 @@ mod tests {
             }
         }
         out
+    }
+
+    // -----------------------------------------------------------------------
+    // Outcome 11: the routing-outcome writeback.
+    //
+    // `ModelProfileStore::record_outcome` is the writer that fills
+    // `performance.task_class_success` — the per-task-class table the nine-class
+    // classifier routes on, which stayed permanently empty because nothing ever
+    // called it. These tests pin the loop's half of that: which runs report,
+    // which deliberately do not, and that the class reported is the one the
+    // router would have classified the same objective as.
+    // -----------------------------------------------------------------------
+
+    /// One observation a [`RecordingOutcomeSink`] captured — the borrowed
+    /// [`RoutingOutcome`] in owned form, so a test can read it back after the
+    /// run that produced it has returned.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedOutcome {
+        model: ModelId,
+        endpoint: String,
+        task_class: TaskClass,
+        success: bool,
+        run_id: RunId,
+    }
+
+    /// A [`RoutingOutcomeSink`] that records what it was handed.
+    #[derive(Default)]
+    struct RecordingOutcomeSink {
+        recorded: Mutex<Vec<RecordedOutcome>>,
+    }
+
+    #[async_trait]
+    impl RoutingOutcomeSink for RecordingOutcomeSink {
+        async fn record(&self, outcome: RoutingOutcome<'_>) -> Result<(), String> {
+            self.recorded
+                .lock()
+                .expect("recording sink mutex poisoned")
+                .push(RecordedOutcome {
+                    model: outcome.model.clone(),
+                    endpoint: outcome.endpoint.to_string(),
+                    task_class: outcome.task_class,
+                    success: outcome.success,
+                    run_id: outcome.run_id,
+                });
+            Ok(())
+        }
+    }
+
+    /// A driver whose request always fails, so the loop reaches
+    /// `Terminal::Failed` — the disposition the writeback must report as
+    /// `success: false` rather than skip.
+    struct FailingDriver;
+
+    #[async_trait]
+    impl ModelDriver for FailingDriver {
+        fn model_id(&self) -> ModelId {
+            ModelId("qwen-local".to_string())
+        }
+
+        fn endpoint(&self) -> Option<String> {
+            Some("http://localhost:11434/v1".to_string())
+        }
+
+        async fn next_step(
+            &self,
+            _transcript: &[TurnItem],
+            _tools: &[ToolDefinition],
+            _sink: &mut dyn DeltaSink,
+        ) -> anyhow::Result<StepOutcome> {
+            Err(anyhow::anyhow!("endpoint refused the connection"))
+        }
+    }
+
+    /// A runtime with a routing-outcome sink attached, plus the sink handle.
+    fn test_runtime_recording_outcomes(
+    ) -> (FrameworkAgentRuntime, Arc<RecordingOutcomeSink>, SessionId) {
+        let (runtime, _events, session_id) = test_runtime();
+        let sink = Arc::new(RecordingOutcomeSink::default());
+        let runtime = runtime.with_routing_outcomes(sink.clone());
+        (runtime, sink, session_id)
+    }
+
+    fn scripted_finishing_driver() -> ScriptedDriver {
+        ScriptedDriver::new(vec![ModelStep::Finish {
+            summary: "done".to_string(),
+        }])
+        .with_model(ModelId("qwen-local".to_string()))
+        .with_endpoint("http://localhost:11434/v1")
+    }
+
+    #[tokio::test]
+    async fn a_completed_run_reports_its_task_class_to_the_routing_outcome_sink() {
+        let (runtime, sink, session_id) = test_runtime_recording_outcomes();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run_id = RunId::new();
+        let ctx = RunContext::new(
+            session_id,
+            run_id,
+            "fix the failing test in the parser",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(
+                &scripted_finishing_driver(),
+                ctx,
+                CancellationToken::never(),
+            )
+            .await
+            .expect("scripted run completes");
+
+        let recorded = sink.recorded.lock().expect("mutex").clone();
+        assert_eq!(
+            recorded,
+            vec![RecordedOutcome {
+                model: ModelId("qwen-local".to_string()),
+                // The endpoint, not the model id alone: `record_outcome` keys on
+                // BOTH, and a profile is stored under the model's `base_url`.
+                endpoint: "http://localhost:11434/v1".to_string(),
+                // The class the router's own rules give this objective — a
+                // failing test that is not the CI system itself.
+                task_class: TaskClass::FailingTestDiagnosis,
+                success: true,
+                run_id,
+            }],
+            "a completed run must fold exactly one success into its model's \
+             per-task-class table"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_reports_a_failure_rather_than_reporting_nothing() {
+        // The table is only useful if it records both sides. A writeback that
+        // only ever appended successes would drive every rate to 1.0.
+        let (runtime, sink, session_id) = test_runtime_recording_outcomes();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "refactor the extractor",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&FailingDriver, ctx, CancellationToken::never())
+            .await
+            .expect("a driver error is a failed run, not a returned error");
+
+        let recorded = sink.recorded.lock().expect("mutex").clone();
+        assert_eq!(recorded.len(), 1, "a failed run reports exactly once");
+        assert_eq!(recorded[0].task_class, TaskClass::SafeRefactor);
+        assert!(
+            !recorded[0].success,
+            "a failed run must report success = false"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_reports_nothing_and_an_endpointless_driver_reports_nothing() {
+        // Two deliberate silences, pinned together because both are "skip rather
+        // than guess": a human stopping a run is not evidence about the model,
+        // and a driver with no endpoint has no `(model, endpoint)` key to fold
+        // into — writing under a guessed key would corrupt another profile's row.
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        let (runtime, sink, session_id) = test_runtime_recording_outcomes();
+        let (handle, token) = cancellation();
+        handle.cancel();
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "fix the failing test in the parser",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&scripted_finishing_driver(), ctx, token)
+            .await
+            .expect("a cancelled run completes cleanly");
+        assert!(
+            sink.recorded.lock().expect("mutex").is_empty(),
+            "a cancelled run is not a model-quality signal in either direction"
+        );
+
+        let (runtime, sink, session_id) = test_runtime_recording_outcomes();
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "fix the failing test in the parser",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            // `ScriptedDriver::new` reports no endpoint — the honest default.
+            .execute_run(
+                &ScriptedDriver::new(vec![ModelStep::Finish {
+                    summary: "done".to_string(),
+                }]),
+                ctx,
+                CancellationToken::never(),
+            )
+            .await
+            .expect("scripted run completes");
+        assert!(
+            sink.recorded.lock().expect("mutex").is_empty(),
+            "a driver with no endpoint must not fabricate one"
+        );
+    }
+
+    #[test]
+    fn the_recorded_class_matches_the_class_the_router_selected_on() {
+        // The writeback is worthless if it files an outcome under a different
+        // class than the router consulted when it picked the model. The daemon
+        // routes with `classify(TaskSignals::from_objective(mode_str(mode),
+        // "agent", estimate_input_tokens(objective), objective))`
+        // (`crates/codypendentd/src/routing.rs::build_task_node`); this pins that
+        // `classify_run` reproduces every input of that call.
+        let repo = std::path::Path::new("/nonexistent");
+        for (mode, objective, expected) in [
+            (
+                AgentMode::Build,
+                "fix the failing test in the parser",
+                TaskClass::FailingTestDiagnosis,
+            ),
+            (
+                AgentMode::Explore,
+                "explain the architecture of the daemon",
+                TaskClass::ArchitectureExplanation,
+            ),
+            (
+                AgentMode::Build,
+                "add a regression test for the gate",
+                TaskClass::RegressionTestAddition,
+            ),
+            (AgentMode::Build, "fix the bug", TaskClass::SmallBugFix),
+            (AgentMode::Build, "do the thing", TaskClass::General),
+        ] {
+            let ctx = RunContext::new(SessionId::new(), RunId::new(), objective, mode, repo, repo);
+            let ours = classify_run(&ctx);
+            let routers = classify(&TaskSignals::from_objective(
+                mode_signal(mode),
+                "agent",
+                ((objective.len() as u64) / 4).max(256),
+                objective,
+            ));
+            assert_eq!(ours, routers, "classification drifted for `{objective}`");
+            assert_eq!(ours.class, expected, "unexpected class for `{objective}`");
+        }
     }
 
     #[tokio::test]

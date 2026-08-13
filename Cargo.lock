@@ -717,6 +717,7 @@ version = "0.4.6"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "codypendent-council",
  "codypendent-daemon",

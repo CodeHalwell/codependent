@@ -113,7 +113,8 @@ provider = "ollama"
 model = "nomic-embed-text"
 
 [retrieval]
-top_k = 12
+mcp_top_k = 12
+builtin_top_k = 0
 
 [transcription]
 base_url = "http://localhost:9000/v1"
@@ -145,7 +146,12 @@ setting = true
         ] {
             assert!(root.contains_key(table), "[{table}] must survive the write");
         }
-        assert_eq!(root["retrieval"]["top_k"].as_integer(), Some(12));
+        // The real `RetrievalSettings` keys, by name: both are `#[serde(default)]`,
+        // so a second writer that round-tripped the struct would silently reset
+        // `builtin_top_k = 0` (retrieval gating deliberately OFF) back to the
+        // default and quietly change what tools the model is shown.
+        assert_eq!(root["retrieval"]["mcp_top_k"].as_integer(), Some(12));
+        assert_eq!(root["retrieval"]["builtin_top_k"].as_integer(), Some(0));
         assert_eq!(root["speech"]["voice"].as_str(), Some("alloy"));
         assert_eq!(
             root["model"].as_array().map(Vec::len),

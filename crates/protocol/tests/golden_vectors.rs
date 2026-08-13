@@ -73,13 +73,13 @@ use codypendent_protocol::{
     DaemonStatus, DataClassification, Diagnostic, DiagnosticSeverity, DiffRequest,
     DirtyBufferDigest, DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync,
     EditorSelection, EventBody, GitHubRefKind, GitHubReference, IdeContextUpdate, IdeRequest,
-    ImageArtifact, ImageRegion, InputBlock, InputEnvelope, InputSource, Location, ModelObservation,
-    OffDevicePolicy, Payload, Position, PromotionAction, ProposedAction, ProtocolError,
-    PublishTarget, Range, ResumeToken, Risk, RiskLevel, RunDisposition, RunState, ScopeLevel,
-    ServerHello, SessionEvent, SessionProjection, SourceProvenance, Subscription, SuggestionInput,
-    SymbolRef, TextEdit, ToolOutcome, Transcript, TranscriptionMode, UserAction, WorkflowEvent,
-    WorkflowNodeState, WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceEdit,
-    PROTOCOL_V1,
+    ImageArtifact, ImageRegion, InputBlock, InputEnvelope, InputSource, Location, MemoryEvidence,
+    MemoryScope, MemoryScopeTier, MemoryView, ModelObservation, OffDevicePolicy, Payload, Position,
+    PromotionAction, ProposedAction, ProtocolError, PublishTarget, Range, ResumeToken, Risk,
+    RiskLevel, RunDisposition, RunState, ScopeLevel, ServerHello, SessionEvent, SessionProjection,
+    SourceProvenance, Subscription, SuggestionInput, SymbolRef, TextEdit, ToolOutcome, Transcript,
+    TranscriptionMode, UserAction, WorkflowEvent, WorkflowNodeState, WorkflowNodeView,
+    WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceEdit, PROTOCOL_V1,
 };
 use codypendent_protocol::{Actor, ApprovalId, ArtifactId, ChangeSetId, ClientId, CommandId};
 use codypendent_protocol::{
@@ -2123,6 +2123,167 @@ fn voice_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------
+// usage.json: the measured-usage event (outcome 20). Its own FILE, like the
+// voice/kanban additions above, so `events.json`'s committed bytes stay
+// byte-identical — the additive-only rule this directory has followed since
+// the voice vectors.
+// ---------------------------------------------------------------------------
+
+fn usage_vectors() -> Vec<Vector> {
+    vec![vec_of(
+        // `cost_micros` is deliberately absent: the vector pins the
+        // measured-only contract (an unpriced model reports tokens and no
+        // money) as bytes, not just as a doc comment.
+        "EventBody_RunUsage",
+        event_with(EventBody::RunUsage {
+            run_id: run_id(),
+            prompt_tokens: Some(1002),
+            completion_tokens: Some(60),
+            cost_micros: None,
+        }),
+    )]
+}
+
+// ---------------------------------------------------------------------------
+// memory.json: the client-facing memory triad (outcome 17) — commands, replies,
+// and the projections they carry.
+// ---------------------------------------------------------------------------
+
+fn memory_id() -> codypendent_protocol::MemoryId {
+    "e0000000-0000-0000-0000-000000000001".parse().unwrap()
+}
+
+fn memory_view() -> MemoryView {
+    MemoryView {
+        id: memory_id(),
+        scope: MemoryScope {
+            tier: "repository".to_string(),
+            key: Some("f0000000-0000-0000-0000-000000000001".to_string()),
+        },
+        class: "semantic".to_string(),
+        statement: "the parser is generated from grammar.pest".to_string(),
+        structured_value: Some(json!({ "generator": "pest" })),
+        confidence: 0.82,
+        observed_at: sentinel_time(),
+        sensitivity: DataClassification::Internal,
+        supersedes: vec![memory_id()],
+        evidence: vec!["session 20000000-0000-0000-0000-000000000001 events 1..3".to_string()],
+    }
+}
+
+fn memory_vectors() -> Vec<Vector> {
+    vec![
+        vec_of("MemoryView", memory_view()),
+        vec_of(
+            "MemoryScope_keyless",
+            MemoryScope {
+                tier: "system".to_string(),
+                key: None,
+            },
+        ),
+        vec_of("MemoryScopeTier_System", MemoryScopeTier::System),
+        vec_of("MemoryScopeTier_User", MemoryScopeTier::User),
+        vec_of("MemoryScopeTier_Repository", MemoryScopeTier::Repository),
+        vec_of(
+            "MemoryEvidence_Events",
+            MemoryEvidence::Events {
+                events: vec![event_with(EventBody::NoteAppended {
+                    text: "the parser is generated".to_string(),
+                    run_id: Some(run_id()),
+                })],
+            },
+        ),
+        vec_of(
+            "MemoryEvidence_Artifact",
+            MemoryEvidence::Artifact {
+                media_type: "text/plain".to_string(),
+                bytes_base64: "dGhlIHJlYWwgZXZpZGVuY2U=".to_string(),
+            },
+        ),
+        vec_of(
+            "CommandBody_InspectMemory",
+            CommandBody::InspectMemory {
+                id: memory_id(),
+                repository: "/home/user/project".to_string(),
+            },
+        ),
+        vec_of(
+            "CommandBody_CorrectMemory",
+            CommandBody::CorrectMemory {
+                id: memory_id(),
+                repository: "/home/user/project".to_string(),
+                statement: "the parser is hand-written".to_string(),
+                structured_value: None,
+                confidence: 0.9,
+            },
+        ),
+        vec_of(
+            "CommandBody_ForgetMemory",
+            CommandBody::ForgetMemory {
+                id: memory_id(),
+                repository: "/home/user/project".to_string(),
+            },
+        ),
+        vec_of(
+            "CommandBody_ForgetMemoryScope",
+            CommandBody::ForgetMemoryScope {
+                repository: "/home/user/project".to_string(),
+                tier: MemoryScopeTier::Repository,
+            },
+        ),
+        vec_of(
+            "CommandBody_OpenMemoryEvidence",
+            CommandBody::OpenMemoryEvidence {
+                id: memory_id(),
+                repository: "/home/user/project".to_string(),
+                evidence_index: 0,
+            },
+        ),
+        vec_of(
+            "Payload_Memory",
+            Payload::Memory {
+                command_id: command_id(),
+                memory: memory_view(),
+            },
+        ),
+        vec_of(
+            "Payload_MemoryForgotten",
+            Payload::MemoryForgotten {
+                command_id: command_id(),
+                forgotten: vec![memory_id()],
+            },
+        ),
+        vec_of(
+            "Payload_MemoryEvidence",
+            Payload::MemoryEvidence {
+                command_id: command_id(),
+                evidence: MemoryEvidence::Artifact {
+                    media_type: "text/plain".to_string(),
+                    bytes_base64: "dGhlIHJlYWwgZXZpZGVuY2U=".to_string(),
+                },
+            },
+        ),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// promotion_evidence.json: the socket command that replaced a client writing
+// the daemon's `eval_suite_reports` table itself.
+// ---------------------------------------------------------------------------
+
+fn promotion_evidence_vectors() -> Vec<Vector> {
+    vec![vec_of(
+        "CommandBody_SubmitEvalEvidence",
+        CommandBody::SubmitEvalEvidence {
+            candidate_id: "cand-abc123".to_string(),
+            suite: "core".to_string(),
+            routing_policy: "daemon-default".to_string(),
+            report_json: "{\"results\":[]}".to_string(),
+        },
+    )]
+}
+
+// ---------------------------------------------------------------------------
 // The single source of truth both the regenerator and the checks iterate.
 // ---------------------------------------------------------------------------
 
@@ -2152,6 +2313,15 @@ fn all_files() -> Vec<(&'static str, Vec<Vector>)> {
         ("board.json", board_vectors()),
         ("workflow_graph.json", workflow_graph_vectors()),
         ("history.json", history_vectors()),
+        // Same additive-only discipline for this wave: the measured-usage event
+        // (outcome 20), the memory triad (outcome 17), and the promotion
+        // evidence command each get their own file, so `events.json` and
+        // `command.json` stay byte-identical and the extension's drift guard —
+        // which reads those two files by name — is unaffected until its
+        // maintainers choose to model these.
+        ("usage.json", usage_vectors()),
+        ("memory.json", memory_vectors()),
+        ("promotion_evidence.json", promotion_evidence_vectors()),
     ]
 }
 

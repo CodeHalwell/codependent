@@ -16,7 +16,7 @@ use crate::remote_ui::RemoteKey;
 use crate::state::{
     AddModelRow, BlackboardItemCard, CouncilProgressPhase, CouncilRunSummary, DocBlockView,
     DocSuggestionView, KanbanCard, KeyStatus, ModelListOrigin, Pane, UnslothQuantCard,
-    UnslothRepoCard,
+    UnslothRepoCard, VoiceKeyRow,
 };
 
 /// One live workflow-node projection carried from the socket-owning harness to
@@ -546,11 +546,14 @@ pub enum Action {
     /// other projections (it reads `auth.json` + `models.toml` — the tui crate
     /// does no I/O) and re-fired after every key write.
     /// `models` is one `(model_id, status)` per configured model; `tavily` is
-    /// the `web.search` row's status. Statuses carry no key material — an env
-    /// status holds the variable NAME, never its value.
+    /// the `web.search` row's status; `voice` is one row per CONFIGURED
+    /// `[transcription]`/`[speech]` table (empty when neither is). Statuses
+    /// carry no key material — an env status holds the variable NAME, never its
+    /// value.
     ApiKeyStatusesLoaded {
         models: Vec<(String, KeyStatus)>,
         tavily: KeyStatus,
+        voice: Vec<VoiceKeyRow>,
     },
     /// Toggle the command palette (`/`): a searchable list of every command.
     OpenPalette,
@@ -630,6 +633,17 @@ pub enum KeyTarget {
     Model(String),
     /// The Tavily `web.search` key.
     Tavily,
+    /// The `[transcription]` (speech-to-text) endpoint's key. A voice profile
+    /// is not a `[[model]]` entry — it has no [`ModelId`] and so can never
+    /// appear as a `Model` row — which is why it needs its own target rather
+    /// than reusing one. The harness maps it onto the `auth.json` entry the
+    /// runtime's `audio_api_key` reads for that table.
+    ///
+    /// [`ModelId`]: codypendent_protocol::ModelId
+    Transcription,
+    /// The `[speech]` (text-to-speech) endpoint's key. See
+    /// [`KeyTarget::Transcription`].
+    Speech,
 }
 
 /// A disk-backed advanced-view projection the CLI can refresh without a daemon

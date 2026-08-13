@@ -30,10 +30,10 @@ use crate::state::{
     filter_onboard_providers, filter_providers, filter_themes, filter_unsloth_quants,
     filter_unsloth_repos, key_row_target, AddModelRow, AppState, CouncilBuilderState,
     CouncilBuilderStep, CouncilMemberDraft, DocBlockView, DocEdit, DocFocus, DocLeaseState,
-    DocSuggestionView, KeyStatus, ModelListOrigin, ModelReadiness, OnboardFlow,
-    OnboardProviderClass, OnboardStep, Overlay, Pane, PatchSummary, PendingApproval,
+    DocPublishTargetKind, DocSuggestionView, KeyStatus, ModelListOrigin, ModelReadiness,
+    OnboardFlow, OnboardProviderClass, OnboardStep, Overlay, Pane, PatchSummary, PendingApproval,
     PendingRunStart, RunActivity, RunStartDraftTarget, RunView, ToolCard, ToolStatus,
-    TranscriptEntry, UnslothQuantCard, UnslothRepoCard, EDGE_PAGE_SIZE,
+    TranscriptEntry, UnslothQuantCard, UnslothRepoCard, DOC_PUBLISH_TARGETS, EDGE_PAGE_SIZE,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -81,7 +81,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
             | Overlay::DocNew { .. }
             | Overlay::DocInsert { .. }
             | Overlay::DocDeleteConfirm { .. }
+            | Overlay::DocPublishTarget { .. }
             | Overlay::DocPublishPath { .. }
+            | Overlay::DocPublishBranch { .. }
+            | Overlay::DocPublishTitle { .. }
     );
     match action {
         Action::DaemonEvent(event) => {
@@ -859,7 +862,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 Overlay::DocEdit { .. }
                 | Overlay::DocNew { .. }
                 | Overlay::DocInsert { .. }
-                | Overlay::DocPublishPath { .. } => Overlay::Docs,
+                | Overlay::DocPublishTarget { .. }
+                | Overlay::DocPublishPath { .. }
+                | Overlay::DocPublishBranch { .. }
+                | Overlay::DocPublishTitle { .. } => Overlay::Docs,
                 _ => Overlay::None,
             };
         }
@@ -950,9 +956,14 @@ pub fn reduce(state: &mut AppState, action: Action) {
         } => on_model_key_verified(state, &model_id, ok, &reason),
 
         // --- `/keys` (D1): the harness's key-status projection ---
-        Action::ApiKeyStatusesLoaded { models, tavily } => {
+        Action::ApiKeyStatusesLoaded {
+            models,
+            tavily,
+            voice,
+        } => {
             state.key_status = models;
             state.tavily_key_status = tavily;
+            state.voice_key_rows = voice;
         }
 
         // --- Local models: Unsloth catalog browse/pull ---
@@ -985,7 +996,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
             | Overlay::DocNew { .. }
             | Overlay::DocInsert { .. }
             | Overlay::DocDeleteConfirm { .. }
+            | Overlay::DocPublishTarget { .. }
             | Overlay::DocPublishPath { .. }
+            | Overlay::DocPublishBranch { .. }
+            | Overlay::DocPublishTitle { .. }
     );
     if docs_surface_was_open
         && (!remains_in_docs_flow || state.should_detach || state.session_closed)
@@ -2308,8 +2322,15 @@ fn nav(state: &mut AppState, delta: i32) {
             ref query,
             ref mut selected,
         } => {
-            let indices = filter_key_rows(&state.models, query);
+            let indices = filter_key_rows(&state.models, &state.voice_key_rows, query);
             step(selected, indices.len(), delta);
+            return;
+        }
+        // A fixed, unfiltered three-row list — the cursor is all there is to move.
+        Overlay::DocPublishTarget {
+            ref mut selected, ..
+        } => {
+            step(selected, DOC_PUBLISH_TARGETS.len(), delta);
             return;
         }
         Overlay::CouncilBuilder(ref mut builder) => {
@@ -2448,7 +2469,10 @@ fn nav_to_edge(state: &mut AppState, last: bool) {
             *selected = edge(filter_themes(&state.themes, query).len());
         }
         Overlay::ApiKeys { query, selected } => {
-            *selected = edge(filter_key_rows(&state.models, query).len());
+            *selected = edge(filter_key_rows(&state.models, &state.voice_key_rows, query).len());
+        }
+        Overlay::DocPublishTarget { selected, .. } => {
+            *selected = edge(DOC_PUBLISH_TARGETS.len());
         }
         Overlay::AddModelPick {
             models,
@@ -3462,33 +3486,69 @@ fn begin_doc_delete(state: &mut AppState) {
     }
 }
 
+/// A lowercase, dash-separated slug of `title`, for seeding a publish path or
+/// branch name. Never empty: an all-punctuation title falls back to `document`.
+fn publish_slug(title: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for c in title.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+            last_dash = false;
+        } else if !last_dash && !slug.is_empty() {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        slug.push_str("document");
+    }
+    slug
+}
+
+/// Begin publishing the focused document (`P`). Step 1 is the TARGET, not the
+/// path: the daemon accepts a repository-file write, a docs-branch commit, or a
+/// documentation PR, and which one it is changes both the fields needed and the
+/// risk the approval card will state (outcome 18 F10).
 fn begin_doc_publish(state: &mut AppState) {
     if !matches!(state.overlay, Overlay::Docs) {
         return;
     }
     if let Some(doc) = state.focused_doc() {
-        let mut slug = String::new();
-        let mut last_dash = false;
-        for c in doc.title.chars().flat_map(char::to_lowercase) {
-            if c.is_ascii_alphanumeric() {
-                slug.push(c);
-                last_dash = false;
-            } else if !last_dash && !slug.is_empty() {
-                slug.push('-');
-                last_dash = true;
-            }
-        }
-        while slug.ends_with('-') {
-            slug.pop();
-        }
-        if slug.is_empty() {
-            slug.push_str("document");
-        }
-        state.overlay = Overlay::DocPublishPath {
+        state.overlay = Overlay::DocPublishTarget {
             document_id: doc.document_id,
-            buffer: format!("docs/{slug}.md"),
+            selected: 0,
         };
     }
+}
+
+/// Advance from the target picker to the path prompt, seeding the path from the
+/// document's title exactly as the single-target flow used to.
+fn choose_doc_publish_target(state: &mut AppState) {
+    let Overlay::DocPublishTarget {
+        document_id,
+        selected,
+    } = &state.overlay
+    else {
+        return;
+    };
+    let Some(&target) = DOC_PUBLISH_TARGETS.get(*selected) else {
+        return;
+    };
+    let document_id = *document_id;
+    let slug = state
+        .docs
+        .iter()
+        .find(|doc| doc.document_id == document_id)
+        .map_or_else(|| "document".to_owned(), |doc| publish_slug(&doc.title));
+    state.overlay = Overlay::DocPublishPath {
+        document_id,
+        target,
+        buffer: format!("docs/{slug}.md"),
+    };
 }
 
 /// Acquire `block_id`'s edit lease and queue `mutation` to fire once the daemon
@@ -3821,7 +3881,9 @@ fn edit_prompt(state: &mut AppState, edit: &Edit) {
         Overlay::DocInsert { buffer, .. } => append(buffer, edit),
         Overlay::DocEdit { buffer, .. } => append(buffer, edit),
         Overlay::LearningEdit { buffer, .. } => append(buffer, edit),
-        Overlay::DocPublishPath { buffer, .. } => append(buffer, edit),
+        Overlay::DocPublishPath { buffer, .. }
+        | Overlay::DocPublishBranch { buffer, .. }
+        | Overlay::DocPublishTitle { buffer, .. } => append(buffer, edit),
         Overlay::AddModelId { buffer, .. } => append(buffer, edit),
         // The key buffer is a redacting newtype; edit its inner String.
         Overlay::AddModelKey { buffer, .. } => append(&mut buffer.0, edit),
@@ -3999,16 +4061,24 @@ fn begin_remove_selected(state: &mut AppState) {
     let Overlay::ApiKeys { query, selected } = &state.overlay else {
         return;
     };
-    let Some(&idx) = filter_key_rows(&state.models, query).get(*selected) else {
+    let Some(&idx) = filter_key_rows(&state.models, &state.voice_key_rows, query).get(*selected)
+    else {
         return;
     };
-    let target = key_row_target(&state.models, idx);
+    let target = key_row_target(&state.models, &state.voice_key_rows, idx);
     let stored = match &target {
         KeyTarget::Model(id) => state
             .key_status
             .iter()
             .any(|(model_id, status)| model_id == id && matches!(status, KeyStatus::Stored)),
         KeyTarget::Tavily => matches!(state.tavily_key_status, KeyStatus::Stored),
+        // A voice row carries its own status (it is not in `key_status`, which
+        // is keyed by model id) — match on the target, not the row index, so
+        // the filtered selection can never point at the wrong row's status.
+        voice => state
+            .voice_key_rows
+            .iter()
+            .any(|row| &row.target == voice && matches!(row.status, KeyStatus::Stored)),
     };
     if stored {
         state.overlay = Overlay::ApiKeyRemoveConfirm { target };
@@ -4295,7 +4365,12 @@ fn input_cancel(state: &mut AppState) {
         | Overlay::DocNew { .. }
         | Overlay::DocInsert { .. }
         | Overlay::DocDeleteConfirm { .. } => state.overlay = Overlay::Docs,
-        Overlay::DocPublishPath { .. } => state.overlay = Overlay::Docs,
+        // Every publish step abandons back to the browser: nothing is sent
+        // until the last one, so there is no partial publish to unwind.
+        Overlay::DocPublishTarget { .. }
+        | Overlay::DocPublishPath { .. }
+        | Overlay::DocPublishBranch { .. }
+        | Overlay::DocPublishTitle { .. } => state.overlay = Overlay::Docs,
         Overlay::EdgeSearch(_) => state.overlay = Overlay::Edges,
         Overlay::WorkflowInputs { .. } => state.overlay = Overlay::Workflow,
         Overlay::KanbanNew { .. } => state.overlay = Overlay::Kanban,
@@ -4336,6 +4411,10 @@ fn set_overlay_selected(state: &mut AppState, n: usize) {
             ref mut selected, ..
         }
         | Overlay::UnslothQuants {
+            ref mut selected, ..
+        }
+        // A fixed three-row list, so the clicked index IS the selection.
+        | Overlay::DocPublishTarget {
             ref mut selected, ..
         } => {
             *selected = n;
@@ -4465,6 +4544,7 @@ fn activate_row(state: &mut AppState, n: usize) {
         | Overlay::ModePicker { .. }
         | Overlay::ThemePicker { .. }
         | Overlay::ApiKeys { .. }
+        | Overlay::DocPublishTarget { .. }
         | Overlay::AddModelPick { .. }
         | Overlay::CouncilBuilder(_)
         | Overlay::UnslothRepos { .. }
@@ -4804,14 +4884,29 @@ fn submit_prompt(state: &mut AppState) {
                 start_doc_edit(state, document_id, None, mutation);
             }
         }
+        // Publish step 1: the chosen target decides which prompts follow.
+        // `mem::take` already cleared the overlay, so put it back for
+        // `choose_doc_publish_target` to read the focused row from.
+        Overlay::DocPublishTarget {
+            document_id,
+            selected,
+        } => {
+            state.overlay = Overlay::DocPublishTarget {
+                document_id,
+                selected,
+            };
+            choose_doc_publish_target(state);
+        }
         Overlay::DocPublishPath {
             document_id,
+            target,
             buffer,
         } => {
             let path = buffer.trim().to_owned();
             if !valid_publish_path(&path) {
                 state.overlay = Overlay::DocPublishPath {
                     document_id,
+                    target,
                     buffer,
                 };
                 state.notice = Some((
@@ -4819,10 +4914,104 @@ fn submit_prompt(state: &mut AppState) {
                         .to_owned(),
                     state.tick + 30,
                 ));
+            } else if target.needs_branch() {
+                // The branch defaults to one derived from the path, so the
+                // common case is Enter-Enter rather than inventing a name.
+                let slug = publish_slug(path.trim_end_matches(".md"));
+                state.overlay = Overlay::DocPublishBranch {
+                    document_id,
+                    target,
+                    path,
+                    buffer: format!("docs/{slug}"),
+                };
             } else {
                 state.outbox.push(Intent::PublishDocument {
                     document_id,
                     target: codypendent_protocol::PublishTarget::RepositoryFile { path },
+                });
+                state.overlay = Overlay::Docs;
+                state.notice = Some((
+                    "preparing publish plan for approval…".to_owned(),
+                    state.tick + 40,
+                ));
+            }
+        }
+        // Publish step 3: the branch. Validated with the same conservative
+        // shape rule the path uses — a branch name reaches `git` on the daemon
+        // side, so shell/refspec metacharacters and traversal never leave here.
+        Overlay::DocPublishBranch {
+            document_id,
+            target,
+            path,
+            buffer,
+        } => {
+            let branch = buffer.trim().to_owned();
+            if !valid_publish_branch(&branch) {
+                state.overlay = Overlay::DocPublishBranch {
+                    document_id,
+                    target,
+                    path,
+                    buffer,
+                };
+                state.notice = Some((
+                    "enter a branch name of letters, digits, `.`, `_`, `-` and `/` \
+                     (no leading dash, no `..`)"
+                        .to_owned(),
+                    state.tick + 30,
+                ));
+            } else if matches!(target, DocPublishTargetKind::DocumentationPr) {
+                state.overlay = Overlay::DocPublishTitle {
+                    document_id,
+                    path,
+                    branch,
+                    // A PR needs a human title; seed it from the document so an
+                    // empty submit is never the fast path.
+                    buffer: state
+                        .docs
+                        .iter()
+                        .find(|doc| doc.document_id == document_id)
+                        .map_or_else(String::new, |doc| format!("docs: {}", doc.title)),
+                };
+            } else {
+                state.outbox.push(Intent::PublishDocument {
+                    document_id,
+                    target: codypendent_protocol::PublishTarget::DocsBranchCommit { branch, path },
+                });
+                state.overlay = Overlay::Docs;
+                state.notice = Some((
+                    "preparing publish plan for approval…".to_owned(),
+                    state.tick + 40,
+                ));
+            }
+        }
+        // Publish step 4: the PR title. Only its emptiness is checked — it is
+        // prose destined for a PR body, not a path or a ref.
+        Overlay::DocPublishTitle {
+            document_id,
+            path,
+            branch,
+            buffer,
+        } => {
+            let title = buffer.trim().to_owned();
+            if title.is_empty() {
+                state.overlay = Overlay::DocPublishTitle {
+                    document_id,
+                    path,
+                    branch,
+                    buffer,
+                };
+                state.notice = Some((
+                    "enter a title for the pull request".to_owned(),
+                    state.tick + 30,
+                ));
+            } else {
+                state.outbox.push(Intent::PublishDocument {
+                    document_id,
+                    target: codypendent_protocol::PublishTarget::DocumentationPr {
+                        branch,
+                        path,
+                        title,
+                    },
                 });
                 state.overlay = Overlay::Docs;
                 state.notice = Some((
@@ -5145,9 +5334,11 @@ fn submit_prompt(state: &mut AppState) {
         // pickers use): a query matching nothing opens nothing. `mem::take`
         // already closed the picker; the prompt replaces it.
         Overlay::ApiKeys { query, selected } => {
-            if let Some(&idx) = filter_key_rows(&state.models, &query).get(selected) {
+            if let Some(&idx) =
+                filter_key_rows(&state.models, &state.voice_key_rows, &query).get(selected)
+            {
                 state.overlay = Overlay::ApiKeySet {
-                    target: key_row_target(&state.models, idx),
+                    target: key_row_target(&state.models, &state.voice_key_rows, idx),
                     buffer: SecretKey(String::new()),
                 };
             }
@@ -5433,6 +5624,26 @@ fn submit_prompt(state: &mut AppState) {
     }
 }
 
+/// Whether `branch` is a safe git branch name to hand the daemon's publish
+/// engine (outcome 18 F10). Deliberately a small allowlist rather than a
+/// re-implementation of `git check-ref-format`: this value ends up in a
+/// `git` invocation and a PR head ref on the daemon side, so anything outside
+/// letters, digits, `.`, `_`, `-` and `/` is refused here rather than relied on
+/// to be rejected there. `..` is excluded for the same reason a publish path
+/// excludes `ParentDir`, and a leading `-` cannot be read as a flag.
+fn valid_publish_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.starts_with('-')
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && !branch.ends_with(".lock")
+        && !branch.contains("..")
+        && !branch.contains("//")
+        && branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
 fn valid_publish_path(path: &str) -> bool {
     use std::path::Component;
 
@@ -5579,7 +5790,8 @@ fn begin_verify_key(state: &mut AppState) {
     let Overlay::ApiKeys { query, selected } = &state.overlay else {
         return;
     };
-    let Some(&idx) = filter_key_rows(&state.models, query).get(*selected) else {
+    let Some(&idx) = filter_key_rows(&state.models, &state.voice_key_rows, query).get(*selected)
+    else {
         return;
     };
     let Some(card) = state.models.get(idx) else {
@@ -6142,7 +6354,10 @@ fn refresh_open_projection(state: &mut AppState) {
         | Overlay::DocNew { .. }
         | Overlay::DocInsert { .. }
         | Overlay::DocDeleteConfirm { .. }
-        | Overlay::DocPublishPath { .. } => Some(ProjectionKind::Docs),
+        | Overlay::DocPublishTarget { .. }
+        | Overlay::DocPublishPath { .. }
+        | Overlay::DocPublishBranch { .. }
+        | Overlay::DocPublishTitle { .. } => Some(ProjectionKind::Docs),
         Overlay::Workflow | Overlay::WorkflowInputs { .. } => Some(ProjectionKind::Workflow),
         _ => None,
     };
@@ -6286,6 +6501,7 @@ pub(crate) fn capability_label(action: &ProposedAction) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::VoiceKeyRow;
     use chrono::Utc;
     use codypendent_protocol::{
         AgentMode, ApprovalId, ArtifactId, ArtifactRef, ChangeSetId, DataClassification, ModelId,
@@ -8626,10 +8842,20 @@ mod tests {
         let _ = s.drain_outbox(); // projection refresh + live watch
 
         reduce(&mut s, Action::PublishDoc);
+        // Step 1 is the target picker, defaulting to the narrowest target.
+        assert_eq!(
+            s.overlay,
+            Overlay::DocPublishTarget {
+                document_id,
+                selected: 0,
+            }
+        );
+        reduce(&mut s, Action::InputSubmit);
         assert_eq!(
             s.overlay,
             Overlay::DocPublishPath {
                 document_id,
+                target: DocPublishTargetKind::RepositoryFile,
                 buffer: "docs/payments-retry-guide.md".to_owned(),
             }
         );
@@ -8647,6 +8873,164 @@ mod tests {
         );
     }
 
+    /// Outcome 18 F10: the daemon has always accepted three publish targets and
+    /// rates each one's risk on its own approval card, but the Studio could
+    /// construct only `RepositoryFile` — the other two were unreachable from
+    /// the shipped UI. This drives the longest path (a documentation PR) end to
+    /// end through the reducer.
+    #[test]
+    fn docs_publish_can_reach_a_documentation_pull_request() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("Payments & Retry Guide")];
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::OpenDocs);
+        let _ = s.drain_outbox();
+
+        reduce(&mut s, Action::PublishDoc);
+        // Move to the third row: the documentation PR.
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::InputSubmit);
+        assert!(matches!(
+            s.overlay,
+            Overlay::DocPublishPath {
+                target: DocPublishTargetKind::DocumentationPr,
+                ..
+            }
+        ));
+        reduce(&mut s, Action::InputSubmit);
+        // The branch step exists only for the two git-branch targets, and it
+        // defaults to a name derived from the path.
+        assert_eq!(
+            s.overlay,
+            Overlay::DocPublishBranch {
+                document_id,
+                target: DocPublishTargetKind::DocumentationPr,
+                path: "docs/payments-retry-guide.md".to_owned(),
+                buffer: "docs/docs-payments-retry-guide".to_owned(),
+            }
+        );
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.overlay,
+            Overlay::DocPublishTitle {
+                document_id,
+                path: "docs/payments-retry-guide.md".to_owned(),
+                branch: "docs/docs-payments-retry-guide".to_owned(),
+                buffer: "docs: Payments & Retry Guide".to_owned(),
+            }
+        );
+        assert!(s.outbox.is_empty(), "nothing is sent until the last step");
+        reduce(&mut s, Action::InputSubmit);
+
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::PublishDocument {
+                document_id,
+                target: codypendent_protocol::PublishTarget::DocumentationPr {
+                    branch: "docs/docs-payments-retry-guide".to_owned(),
+                    path: "docs/payments-retry-guide.md".to_owned(),
+                    title: "docs: Payments & Retry Guide".to_owned(),
+                },
+            }]
+        );
+    }
+
+    /// The picker is mouse-reachable too: a click must select the clicked row
+    /// and advance, not the row the keyboard cursor happened to be on.
+    #[test]
+    fn docs_publish_target_row_click_selects_and_advances() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("Release Notes")];
+        reduce(&mut s, Action::OpenDocs);
+        let _ = s.drain_outbox();
+        reduce(&mut s, Action::PublishDoc);
+        reduce(&mut s, Action::ActivateRow(2));
+        assert!(matches!(
+            s.overlay,
+            Overlay::DocPublishPath {
+                target: DocPublishTargetKind::DocumentationPr,
+                ..
+            }
+        ));
+    }
+
+    /// The docs-branch target stops one step earlier — it needs no PR title.
+    #[test]
+    fn docs_publish_docs_branch_commit_stops_at_the_branch() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("Release Notes")];
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::OpenDocs);
+        let _ = s.drain_outbox();
+
+        reduce(&mut s, Action::PublishDoc);
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::InputSubmit); // target -> path
+        reduce(&mut s, Action::InputSubmit); // path -> branch
+        reduce(&mut s, Action::InputSubmit); // branch -> send
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::PublishDocument {
+                document_id,
+                target: codypendent_protocol::PublishTarget::DocsBranchCommit {
+                    branch: "docs/docs-release-notes".to_owned(),
+                    path: "docs/release-notes.md".to_owned(),
+                },
+            }]
+        );
+    }
+
+    /// A branch name reaches `git` on the daemon side, so the shapes that could
+    /// be read as a flag, a refspec, or traversal never leave the prompt.
+    #[test]
+    fn docs_publish_rejects_unsafe_branch_names() {
+        let mut s = AppState::new();
+        let document_id = codypendent_protocol::DocumentId::new();
+        for invalid in [
+            "",
+            "-force",
+            "/leading",
+            "trailing/",
+            "docs/../main",
+            "docs//main",
+            "docs/branch.lock",
+            "docs/branch;rm -rf /",
+            "docs/branch\u{7f}",
+        ] {
+            s.overlay = Overlay::DocPublishBranch {
+                document_id,
+                target: DocPublishTargetKind::DocsBranchCommit,
+                path: "docs/report.md".to_owned(),
+                buffer: invalid.to_owned(),
+            };
+            reduce(&mut s, Action::InputSubmit);
+            assert!(
+                matches!(s.overlay, Overlay::DocPublishBranch { .. }),
+                "{invalid:?} must remain in the prompt"
+            );
+            assert!(s.outbox.is_empty(), "{invalid:?} must send nothing");
+        }
+        assert!(valid_publish_branch("docs/payments-retry_guide.v2"));
+    }
+
+    /// A PR with no title is refused rather than sent with an empty one.
+    #[test]
+    fn docs_publish_rejects_a_blank_pull_request_title() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::DocPublishTitle {
+            document_id: codypendent_protocol::DocumentId::new(),
+            path: "docs/report.md".to_owned(),
+            branch: "docs/report".to_owned(),
+            buffer: "   ".to_owned(),
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert!(matches!(s.overlay, Overlay::DocPublishTitle { .. }));
+        assert!(s.outbox.is_empty());
+    }
+
     #[test]
     fn docs_publish_rejects_absolute_and_parent_traversal_paths() {
         let mut s = AppState::new();
@@ -8654,6 +9038,7 @@ mod tests {
         for invalid in ["/tmp/report.md", "../report.md"] {
             s.overlay = Overlay::DocPublishPath {
                 document_id,
+                target: DocPublishTargetKind::RepositoryFile,
                 buffer: invalid.to_owned(),
             };
             reduce(&mut s, Action::InputSubmit);
@@ -11964,8 +12349,10 @@ mod tests {
     // -- `/keys` (D1): API key management ------------------------------------
 
     /// Seed two models + statuses and open the `/keys` overlay through the
-    /// palette, mirroring `open_mode_picker`.
-    fn open_api_keys(s: &mut AppState) {
+    /// palette, mirroring `open_mode_picker`. `voice_rows` seeds the
+    /// `[transcription]`/`[speech]` rows the harness contributes for whichever
+    /// voice table `models.toml` configures — empty for the common case.
+    fn open_api_keys_with_voice(s: &mut AppState, voice_rows: Vec<VoiceKeyRow>) {
         s.models = vec![
             crate::state::ModelCard {
                 id: ModelId("groq/llama".to_owned()),
@@ -11995,6 +12382,7 @@ mod tests {
                     ),
                 ],
                 tavily: KeyStatus::Missing,
+                voice: voice_rows,
             },
         );
         reduce(s, Action::OpenPalette);
@@ -12002,6 +12390,21 @@ mod tests {
             reduce(s, Action::InputChar(c));
         }
         reduce(s, Action::InputSubmit);
+    }
+
+    /// The common case: no voice table configured, so no voice rows.
+    fn open_api_keys(s: &mut AppState) {
+        open_api_keys_with_voice(s, Vec::new());
+    }
+
+    /// A `[transcription]` row exactly as the harness projects one.
+    fn transcription_row(status: KeyStatus) -> VoiceKeyRow {
+        VoiceKeyRow {
+            target: KeyTarget::Transcription,
+            label: "Voice input (speech-to-text)".to_owned(),
+            detail: "whisper-large-v3-turbo · https://api.groq.com/openai/v1".to_owned(),
+            status,
+        }
     }
 
     #[test]
@@ -12018,7 +12421,7 @@ mod tests {
         assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
         // Two model rows + the final Tavily row, in list order.
         assert_eq!(
-            crate::state::filter_key_rows(&s.models, ""),
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, ""),
             vec![0, 1, 2],
             "the rows are built from state (models, then Tavily)"
         );
@@ -12039,14 +12442,20 @@ mod tests {
             }
             other => panic!("expected the /keys overlay, got {other:?}"),
         }
-        assert_eq!(crate::state::filter_key_rows(&s.models, "gpt"), vec![1]);
+        assert_eq!(
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, "gpt"),
+            vec![1]
+        );
         // The provider substring filters too (both models share it here).
         assert_eq!(
-            crate::state::filter_key_rows(&s.models, "openai-compatible"),
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, "openai-compatible"),
             vec![0, 1]
         );
         // The Tavily row matches its own label.
-        assert_eq!(crate::state::filter_key_rows(&s.models, "tavily"), vec![2]);
+        assert_eq!(
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, "tavily"),
+            vec![2]
+        );
     }
 
     #[test]
@@ -12078,6 +12487,117 @@ mod tests {
             }
             other => panic!("expected the set prompt, got {other:?}"),
         }
+    }
+
+    /// The finding this closes (audio review F3): a `[transcription]`/`[speech]`
+    /// table deserializes into its own `AudioModelConfig`, never a `ModelCard`,
+    /// so before the voice rows existed `/keys` could name the STT/TTS
+    /// credential from no index at all — while the user guide said it could.
+    #[test]
+    fn api_keys_enter_on_the_voice_row_targets_the_transcription_table() {
+        let mut s = AppState::new();
+        open_api_keys_with_voice(&mut s, vec![transcription_row(KeyStatus::Missing)]);
+        // Two model rows, Tavily, then the one configured voice row.
+        assert_eq!(
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, ""),
+            vec![0, 1, 2, 3]
+        );
+        for _ in 0..3 {
+            reduce(&mut s, Action::SelectNext);
+        }
+        reduce(&mut s, Action::InputSubmit);
+        match &s.overlay {
+            Overlay::ApiKeySet { target, .. } => assert_eq!(*target, KeyTarget::Transcription),
+            other => panic!("expected the set prompt, got {other:?}"),
+        }
+    }
+
+    /// The voice row is reachable by its own label/detail, not only by scrolling
+    /// past every model — and filtering must not shift which target a row index
+    /// resolves to.
+    #[test]
+    fn api_keys_filter_matches_a_voice_row_and_keeps_its_target() {
+        let mut s = AppState::new();
+        open_api_keys_with_voice(
+            &mut s,
+            vec![
+                transcription_row(KeyStatus::Missing),
+                VoiceKeyRow {
+                    target: KeyTarget::Speech,
+                    label: "Voice output (text-to-speech)".to_owned(),
+                    detail: "tts-1 · https://api.openai.com/v1".to_owned(),
+                    status: KeyStatus::Stored,
+                },
+            ],
+        );
+        assert_eq!(
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, "speech"),
+            vec![3, 4],
+            "both voice labels carry the word `speech`"
+        );
+        assert_eq!(
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, "text-to-speech"),
+            vec![4]
+        );
+        assert_eq!(
+            key_row_target(&s.models, &s.voice_key_rows, 4),
+            KeyTarget::Speech
+        );
+    }
+
+    /// `Delete` opens the remove confirm only for a row that HAS a stored key.
+    /// A voice row's status lives on the row itself, not in `key_status` (which
+    /// is keyed by model id), so this is the arm that could silently read the
+    /// wrong row's status.
+    #[test]
+    fn api_keys_delete_on_a_voice_row_confirms_only_when_a_key_is_stored() {
+        let mut s = AppState::new();
+        open_api_keys_with_voice(&mut s, vec![transcription_row(KeyStatus::Missing)]);
+        for _ in 0..3 {
+            reduce(&mut s, Action::SelectNext);
+        }
+        reduce(&mut s, Action::RemoveSelected);
+        assert!(
+            matches!(s.overlay, Overlay::ApiKeys { .. }),
+            "nothing is stored for this row, so there is nothing to remove"
+        );
+
+        let mut s = AppState::new();
+        open_api_keys_with_voice(&mut s, vec![transcription_row(KeyStatus::Stored)]);
+        for _ in 0..3 {
+            reduce(&mut s, Action::SelectNext);
+        }
+        reduce(&mut s, Action::RemoveSelected);
+        assert_eq!(
+            s.overlay,
+            Overlay::ApiKeyRemoveConfirm {
+                target: KeyTarget::Transcription
+            }
+        );
+    }
+
+    /// End of the client-side round trip: the intent the harness turns into an
+    /// `auth.json` write names the voice table, so the key lands where the
+    /// runtime's `audio_api_key` looks for it.
+    #[test]
+    fn api_key_set_submit_on_a_voice_row_emits_a_transcription_intent() {
+        let mut s = AppState::new();
+        open_api_keys_with_voice(&mut s, vec![transcription_row(KeyStatus::Missing)]);
+        for _ in 0..3 {
+            reduce(&mut s, Action::SelectNext);
+        }
+        reduce(&mut s, Action::InputSubmit);
+        for c in "sk-stt".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::SetApiKey {
+                target: KeyTarget::Transcription,
+                key: SecretKey("sk-stt".to_owned()),
+            }]
+        );
     }
 
     #[test]

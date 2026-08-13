@@ -198,6 +198,28 @@ pub enum Payload {
         command_id: CommandId,
         artifact: crate::artifact::ArtifactRef,
     },
+    /// An `InspectMemory` / `CorrectMemory` reply: the memory as it stands
+    /// *now*. For a correction that is the NEW record (the correction
+    /// supersedes rather than overwrites), so a client re-renders from the
+    /// reply instead of guessing what the store did.
+    Memory {
+        command_id: CommandId,
+        memory: crate::memory::MemoryView,
+    },
+    /// A `ForgetMemory` / `ForgetMemoryScope` reply: a content-free audit of
+    /// what was removed. Ids only — the statements are gone, and echoing them
+    /// back would defeat the point of forgetting them.
+    MemoryForgotten {
+        command_id: CommandId,
+        forgotten: Vec<crate::ids::MemoryId>,
+    },
+    /// An `OpenMemoryEvidence` reply: the actual content behind one of a
+    /// memory's provenance refs (Chapter 06's "every retrieved memory opens its
+    /// source").
+    MemoryEvidence {
+        command_id: CommandId,
+        evidence: crate::memory::MemoryEvidence,
+    },
     /// A `ReadBlackboard` command's reply (Phase 5 STEP 5.3): the matching typed
     /// artifacts on the workflow run's board. A distinct reply from
     /// `CommandAccepted` because the client needs the items back, not just an

@@ -3189,6 +3189,16 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                     "Tavily API key for web.search (stored locally in auth.json, mode 0600)"
                         .to_owned()
                 }
+                KeyTarget::Transcription => {
+                    "API key for voice input / speech-to-text (stored locally in auth.json, \
+                     mode 0600)"
+                        .to_owned()
+                }
+                KeyTarget::Speech => {
+                    "API key for voice output / text-to-speech (stored locally in auth.json, \
+                     mode 0600)"
+                        .to_owned()
+                }
             };
             render_masked_prompt(frame, area, state, theme, &title, &buffer.0);
         }
@@ -3201,6 +3211,18 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 KeyTarget::Tavily => (
                     "Remove the saved Tavily key?".to_owned(),
                     "web.search stops using it immediately (env fallback may remain).",
+                ),
+                // Unlike the two above, a voice client snapshots its key when
+                // it is built at startup, so the removal is not felt until the
+                // process that owns it restarts.
+                KeyTarget::Transcription => (
+                    "Remove the saved voice-input key?".to_owned(),
+                    "Speech-to-text falls back to its api_key_env (if any) after a daemon \
+                     restart.",
+                ),
+                KeyTarget::Speech => (
+                    "Remove the saved voice-output key?".to_owned(),
+                    "Text-to-speech falls back to its api_key_env (if any) after a TUI restart.",
                 ),
             };
             render_confirm_box(frame, area, state, theme, &what, effect);
@@ -3244,14 +3266,45 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 "The block and its text are removed from the document.",
             );
         }
-        Overlay::DocPublishPath { buffer, .. } => {
+        Overlay::DocPublishTarget { selected, .. } => {
+            render_docs(frame, area, state, theme);
+            render_doc_publish_target(frame, area, state, theme, *selected);
+        }
+        // The prompt names the chosen target, so the operator can see which of
+        // the three flows they are in without backing out to check.
+        Overlay::DocPublishPath { target, buffer, .. } => {
             render_docs(frame, area, state, theme);
             render_prompt(
                 frame,
                 area,
                 state,
                 theme,
-                "Publish to repository Markdown path (approval required)",
+                &format!(
+                    "{}: repository Markdown path (approval required)",
+                    target.label()
+                ),
+                buffer,
+            );
+        }
+        Overlay::DocPublishBranch { target, buffer, .. } => {
+            render_docs(frame, area, state, theme);
+            render_prompt(
+                frame,
+                area,
+                state,
+                theme,
+                &format!("{}: branch name (approval required)", target.label()),
+                buffer,
+            );
+        }
+        Overlay::DocPublishTitle { buffer, .. } => {
+            render_docs(frame, area, state, theme);
+            render_prompt(
+                frame,
+                area,
+                state,
+                theme,
+                "Documentation pull request: title (approval required)",
                 buffer,
             );
         }
@@ -4954,6 +5007,86 @@ fn render_theme_picker(
     );
 }
 
+/// Publish step 1 (outcome 18 F10): which of the three publish targets the
+/// focused document is heading for. A fixed three-row list — no filter line,
+/// because there is nothing to filter — where each row states what the operator
+/// is actually authorizing, in the approval card's own terms. Colors are Theme
+/// tokens only (RULE 7).
+fn render_doc_publish_target(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+) {
+    let rect = centered_modal(area, 72, 14);
+    let inner = modal_surface(
+        frame,
+        rect,
+        "Publish document  ·  choose a target".to_owned(),
+        state,
+        theme,
+    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let list_block = modal_panel("Target".to_owned(), theme);
+    let list_area = list_block.inner(rows[0]);
+    frame.render_widget(list_block, rows[0]);
+
+    let items: Vec<ListItem> = crate::state::DOC_PUBLISH_TARGETS
+        .iter()
+        .enumerate()
+        .map(|(row, target)| {
+            let is_selected = row == selected;
+            let head = Line::from(vec![
+                Span::styled(
+                    if is_selected { "▎ " } else { "  " },
+                    theme.selection_aware_text_style(is_selected, theme.focus.active),
+                ),
+                Span::styled(
+                    truncate_display_width(
+                        target.label(),
+                        usize::from(list_area.width.saturating_sub(2)),
+                    ),
+                    theme.selection_aware_text_style(is_selected, theme.text.primary),
+                ),
+            ]);
+            let detail = Line::styled(
+                format!("      {}", target.detail()),
+                theme.selection_aware_text_style(is_selected, theme.text.muted),
+            );
+            let item = ListItem::new(vec![head, detail]);
+            if is_selected {
+                item.style(theme.selection_style())
+            } else {
+                item
+            }
+        })
+        .collect();
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
+        list_area,
+    );
+    for row in 0..crate::state::DOC_PUBLISH_TARGETS.len() {
+        let Some(hit) = visible_row_hit(list_area, row, 2) else {
+            break;
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
+    }
+
+    let hint = Line::styled(
+        "↑/↓ select · Enter continue · Esc cancel",
+        Style::default().fg(theme.text.muted),
+    )
+    .alignment(Alignment::Center);
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().bg(theme.surface.overlay)),
+        rows[1],
+    );
+}
+
 /// The `/keys` overlay (D1): the same filter-line + list shape as
 /// [`render_mode_picker`], over one row per configured model plus a final
 /// `Tavily (web.search)` row. Each row shows a status GLYPH (● saved in
@@ -4970,8 +5103,12 @@ fn render_api_keys(
     query: &str,
     selected: usize,
 ) {
-    let matches = filter_key_rows(&state.models, query);
-    let total = state.models.len().saturating_add(1);
+    let matches = filter_key_rows(&state.models, &state.voice_key_rows, query);
+    let total = state
+        .models
+        .len()
+        .saturating_add(1)
+        .saturating_add(state.voice_key_rows.len());
     let rect = centered_modal(area, 84, 24);
     let inner = modal_surface(
         frame,
@@ -5012,7 +5149,9 @@ fn render_api_keys(
     }
     for (row, &idx) in matches.iter().enumerate().skip(first) {
         // The row's label, provider/sub-line prefix, and status: indices into
-        // `state.models` are model rows; `models.len()` is the Tavily row.
+        // `state.models` are model rows; `models.len()` is the Tavily row;
+        // anything past it is a configured voice endpoint, which carries its
+        // own label/detail/status rather than living in `key_status`.
         let (label, provider, status) = match state.models.get(idx) {
             Some(card) => {
                 let status = state
@@ -5023,11 +5162,17 @@ fn render_api_keys(
                     .unwrap_or(&KeyStatus::Missing);
                 (card.id.0.clone(), card.provider.clone(), status.clone())
             }
-            None => (
-                "Tavily (web.search)".to_owned(),
-                "web search".to_owned(),
-                state.tavily_key_status.clone(),
-            ),
+            None => match idx
+                .checked_sub(state.models.len() + 1)
+                .and_then(|offset| state.voice_key_rows.get(offset))
+            {
+                Some(row) => (row.label.clone(), row.detail.clone(), row.status.clone()),
+                None => (
+                    "Tavily (web.search)".to_owned(),
+                    "web search".to_owned(),
+                    state.tavily_key_status.clone(),
+                ),
+            },
         };
         let (glyph, glyph_color, detail) = key_status_render(&status, theme);
         let is_selected = row == selected;
@@ -13427,6 +13572,78 @@ mod tests {
         assert!(
             !text.contains("tvly-"),
             "no Tavily key material either:\n{text}"
+        );
+    }
+
+    /// Outcome 18 F10: the publish flow now starts with a visible choice of all
+    /// three targets, each stating what it authorizes — a PR is a git PUSH, and
+    /// the operator sees that before typing anything.
+    #[test]
+    fn doc_publish_target_picker_lists_all_three_targets_with_what_they_authorize() {
+        let mut state = api_keys_state();
+        state.overlay = Overlay::DocPublishTarget {
+            document_id: codypendent_protocol::DocumentId::new(),
+            selected: 0,
+        };
+        let text = render_to_string(&state, 110, 34);
+        assert!(text.contains("choose a target"), "title missing:\n{text}");
+        for label in [
+            "Repository file",
+            "Docs-branch commit",
+            "Documentation pull request",
+        ] {
+            assert!(text.contains(label), "{label} missing:\n{text}");
+        }
+        assert!(
+            text.contains("rated High"),
+            "the PR row states the risk the approval card will state:\n{text}"
+        );
+    }
+
+    /// Audio review F3: a configured voice endpoint must actually be VISIBLE in
+    /// `/keys` — the row is what makes the credential nameable at all, and the
+    /// detail line has to identify the endpoint without carrying its key.
+    #[test]
+    fn api_keys_overlay_lists_a_row_for_each_configured_voice_endpoint() {
+        let mut state = api_keys_state();
+        state.voice_key_rows = vec![
+            crate::state::VoiceKeyRow {
+                target: crate::action::KeyTarget::Transcription,
+                label: "Voice input (speech-to-text)".to_owned(),
+                detail: "whisper-large-v3-turbo · api.groq.com".to_owned(),
+                status: crate::state::KeyStatus::Stored,
+            },
+            crate::state::VoiceKeyRow {
+                target: crate::action::KeyTarget::Speech,
+                label: "Voice output (text-to-speech)".to_owned(),
+                detail: "tts-1 · api.openai.com".to_owned(),
+                status: crate::state::KeyStatus::Env("OPENAI_API_KEY".to_owned()),
+            },
+        ];
+        state.overlay = Overlay::ApiKeys {
+            query: String::new(),
+            selected: 0,
+        };
+        let text = render_to_string(&state, 120, 40);
+        assert!(
+            text.contains("● Voice input (speech-to-text)"),
+            "a stored voice key renders ● on its own row:\n{text}"
+        );
+        assert!(
+            text.contains("◐ Voice output (text-to-speech)"),
+            "an env-declared voice key renders ◐:\n{text}"
+        );
+        assert!(
+            text.contains("whisper-large-v3-turbo · api.groq.com · key saved"),
+            "the detail line names the endpoint AND fits beside the status:\n{text}"
+        );
+        assert!(
+            text.contains("5 of 5 entries"),
+            "the count covers the voice rows too:\n{text}"
+        );
+        assert!(
+            !text.contains("sk-live-test-key"),
+            "key material must never render:\n{text}"
         );
     }
 

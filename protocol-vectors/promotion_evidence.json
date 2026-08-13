@@ -1,0 +1,9 @@
+{
+  "CommandBody_SubmitEvalEvidence": {
+    "candidate_id": "cand-abc123",
+    "report_json": "{\"results\":[]}",
+    "routing_policy": "daemon-default",
+    "suite": "core",
+    "type": "SubmitEvalEvidence"
+  }
+}

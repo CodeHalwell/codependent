@@ -48,6 +48,9 @@ thiserror = { workspace = true }
 rustix = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Encodes an opened memory-evidence artifact for the wire, the same way
+# `PutArtifact` carries bytes: JSON framing has no byte-string scalar.
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

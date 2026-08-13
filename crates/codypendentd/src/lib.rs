@@ -35,6 +35,9 @@ mod promotion;
 mod publish;
 mod retrieval;
 mod routing;
+// Outcome 11: the writeback that fills a model profile's per-task-class
+// success table — the map the router actually reads.
+mod routing_outcomes;
 /// The code-graph warm-up scan, the live filesystem watcher that keeps the graph
 /// current during a session, and the `graph.*` query seam. Public for the same
 /// reason as [`blackboard`]: the crate's own integration tests drive the REAL

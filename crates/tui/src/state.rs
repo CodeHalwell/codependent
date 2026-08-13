@@ -380,9 +380,37 @@ pub enum Overlay {
     /// Confirm deleting the focused block. Destructive and un-undoable from the
     /// TUI, so it never fires straight off a keypress.
     DocDeleteConfirm { block_id: String, label: String },
-    /// Repository-relative Markdown path for publishing the focused document.
+    /// Step 1 of publishing the focused document: which of the three publish
+    /// targets it is heading for (outcome 18 F10). `selected` indexes
+    /// [`DOC_PUBLISH_TARGETS`]. The daemon has always supported all three and
+    /// rates each one's risk on its own approval card; the Studio could
+    /// previously express only [`DocPublishTargetKind::RepositoryFile`], so the
+    /// other two were unreachable from the shipped UI.
+    DocPublishTarget {
+        document_id: DocumentId,
+        selected: usize,
+    },
+    /// Step 2, for every target: the repository-relative Markdown path the
+    /// rendered document is written to.
     DocPublishPath {
         document_id: DocumentId,
+        target: DocPublishTargetKind,
+        buffer: String,
+    },
+    /// Step 3, for the two git-branch targets: the branch the commit lands on.
+    /// `path` is the already-validated step-2 answer, carried forward.
+    DocPublishBranch {
+        document_id: DocumentId,
+        target: DocPublishTargetKind,
+        path: String,
+        buffer: String,
+    },
+    /// Step 4, for [`DocPublishTargetKind::DocumentationPr`] only: the pull
+    /// request's title.
+    DocPublishTitle {
+        document_id: DocumentId,
+        path: String,
+        branch: String,
         buffer: String,
     },
     /// The model picker (MP1): a fuzzy-filterable list of the models
@@ -497,8 +525,9 @@ pub enum Overlay {
         refreshing: bool,
     },
     /// The `/keys` overlay (D1): a fuzzy-filterable list of every configured
-    /// model (see [`AppState::models`]) plus a final `Tavily (web.search)` row,
-    /// each with its key status (see [`AppState::key_status`] /
+    /// model (see [`AppState::models`]), a `Tavily (web.search)` row, and a row
+    /// per configured voice endpoint (see [`AppState::voice_key_rows`]), each
+    /// with its key status (see [`AppState::key_status`] /
     /// [`AppState::tavily_key_status`]). `query` filters by id/provider
     /// substring; `selected` indexes the filtered results (reset to 0 whenever
     /// the query changes) — the same shape as [`Overlay::ModePicker`]. `Enter`
@@ -1698,14 +1727,98 @@ pub enum KeyStatus {
     Missing,
 }
 
-/// The indices into the `/keys` row list whose model id or provider
+/// Which [`codypendent_protocol::PublishTarget`] a Docs Studio publish is
+/// heading for. Mirrors that enum's three real variants — never its `Unknown`
+/// catch-all, which exists only so an older client can decode a newer wire.
+/// The TUI collects the extra field each target needs and the reducer builds
+/// the protocol value; the daemon then frames the risk and capabilities of
+/// whichever one it receives (a documentation PR is rated `High` and declares
+/// `GitPush`, so widening the picker does not widen what lands unapproved).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocPublishTargetKind {
+    /// Write the rendered Markdown into the working tree and commit it.
+    RepositoryFile,
+    /// Commit it to a dedicated docs branch, leaving the primary checkout alone.
+    DocsBranchCommit,
+    /// Open (or update) a documentation pull request.
+    DocumentationPr,
+}
+
+impl DocPublishTargetKind {
+    /// The picker row's label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RepositoryFile => "Repository file",
+            Self::DocsBranchCommit => "Docs-branch commit",
+            Self::DocumentationPr => "Documentation pull request",
+        }
+    }
+
+    /// The picker row's sub-line: what the operator is actually authorizing.
+    /// Phrased from the approval card's own framing so the two agree.
+    #[must_use]
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::RepositoryFile => "writes the file in the working tree and commits it",
+            Self::DocsBranchCommit => "commits to a dedicated docs branch, worktree-safe",
+            Self::DocumentationPr => "commits, pushes, and opens a PR — approval is rated High",
+        }
+    }
+
+    /// Whether this target needs a branch name (publish step 3).
+    #[must_use]
+    pub fn needs_branch(self) -> bool {
+        matches!(self, Self::DocsBranchCommit | Self::DocumentationPr)
+    }
+}
+
+/// The publish targets the picker offers, in list order. Ordered least- to
+/// most-privileged, so the default selection is the narrowest one.
+pub const DOC_PUBLISH_TARGETS: [DocPublishTargetKind; 3] = [
+    DocPublishTargetKind::RepositoryFile,
+    DocPublishTargetKind::DocsBranchCommit,
+    DocPublishTargetKind::DocumentationPr,
+];
+
+/// One non-model `/keys` row for a voice endpoint: the `[transcription]`
+/// (speech-to-text) or `[speech]` (text-to-speech) table in `models.toml`.
+///
+/// These are not [`ModelCard`]s and can never become ones: a voice profile
+/// deserializes into its own `AudioModelConfig`, has no `ModelId`, and so never
+/// reaches [`AppState::models`]. Without a row of its own there was no way to
+/// name either credential from the shipped UI at all, even though the runtime
+/// has always resolved it from `auth.json` first.
+///
+/// The harness seeds one row per table it finds CONFIGURED — an absent table
+/// has no endpoint and therefore no credential to hold, so it gets no row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceKeyRow {
+    /// Which table this row keys — always [`KeyTarget::Transcription`] or
+    /// [`KeyTarget::Speech`].
+    pub target: KeyTarget,
+    /// The row's label, e.g. `"Voice input (speech-to-text)"`.
+    pub label: String,
+    /// The sub-line: the configured endpoint, e.g. `"whisper-large-v3-turbo ·
+    /// api.groq.com"`. Never any key material.
+    pub detail: String,
+    /// Whether a key is stored, named by an `api_key_env`, or missing.
+    pub status: KeyStatus,
+}
+
+/// The indices into the `/keys` row list whose label/id/provider
 /// case-insensitively contains `query` — the overlay's substring filter, in
-/// list order. The row list is `models` followed by one final Tavily
-/// `web.search` row at index `models.len()`; the Tavily row matches the
-/// `"tavily (web.search)"` label. An empty query matches every row. Mirrors
-/// [`filter_models`], extended by the one non-model row.
+/// list order. The row list is `models`, then one Tavily `web.search` row at
+/// index `models.len()`, then one row per configured voice table; the Tavily
+/// row matches the `"tavily (web.search)"` label and a voice row matches its
+/// own label/detail. An empty query matches every row. Mirrors
+/// [`filter_models`], extended by the non-model rows.
 #[must_use]
-pub(crate) fn filter_key_rows(models: &[ModelCard], query: &str) -> Vec<usize> {
+pub(crate) fn filter_key_rows(
+    models: &[ModelCard],
+    voice: &[VoiceKeyRow],
+    query: &str,
+) -> Vec<usize> {
     let needle = query.trim().to_lowercase();
     let mut indices: Vec<usize> = models
         .iter()
@@ -1720,17 +1833,32 @@ pub(crate) fn filter_key_rows(models: &[ModelCard], query: &str) -> Vec<usize> {
     if needle.is_empty() || "tavily (web.search)".contains(&needle) {
         indices.push(models.len());
     }
+    indices.extend(
+        voice
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                needle.is_empty()
+                    || row.label.to_lowercase().contains(&needle)
+                    || row.detail.to_lowercase().contains(&needle)
+            })
+            .map(|(offset, _)| models.len() + 1 + offset),
+    );
     indices
 }
 
 /// The [`KeyTarget`] a `/keys` row index addresses: indices into `models` are
-/// that model's id; `models.len()` is the final Tavily `web.search` row (see
-/// [`filter_key_rows`]).
+/// that model's id; `models.len()` is the Tavily `web.search` row; anything
+/// past it indexes `voice` (see [`filter_key_rows`]). An index past every row
+/// falls back to the Tavily row, which is always present.
 #[must_use]
-pub(crate) fn key_row_target(models: &[ModelCard], idx: usize) -> KeyTarget {
+pub(crate) fn key_row_target(models: &[ModelCard], voice: &[VoiceKeyRow], idx: usize) -> KeyTarget {
     match models.get(idx) {
         Some(card) => KeyTarget::Model(card.id.0.clone()),
-        None => KeyTarget::Tavily,
+        None => match idx.checked_sub(models.len() + 1).and_then(|o| voice.get(o)) {
+            Some(row) => row.target.clone(),
+            None => KeyTarget::Tavily,
+        },
     }
 }
 
@@ -2243,6 +2371,11 @@ pub struct AppState {
     /// The Tavily `web.search` row's key status (D1), folded from the same
     /// [`Action::ApiKeyStatusesLoaded`] as [`AppState::key_status`].
     pub tavily_key_status: KeyStatus,
+    /// The `/keys` rows for the configured voice endpoints (D1), folded from
+    /// the same [`Action::ApiKeyStatusesLoaded`]. Empty when `models.toml`
+    /// declares neither `[transcription]` nor `[speech]`, which is the common
+    /// case — voice is opt-in.
+    pub voice_key_rows: Vec<VoiceKeyRow>,
     /// Persistent, de-duplicated setup/runtime diagnostics. Boot loader failures
     /// land here instead of competing for the single transient notice slot.
     pub issues: Vec<String>,
@@ -2429,6 +2562,7 @@ impl AppState {
             selected_provider: 0,
             key_status: Vec::new(),
             tavily_key_status: KeyStatus::Missing,
+            voice_key_rows: Vec::new(),
             issues: Vec::new(),
             selected_issue: 0,
             focus: Pane::Sessions,
@@ -2504,6 +2638,8 @@ impl AppState {
             | Overlay::DocNew { .. }
             | Overlay::DocInsert { .. }
             | Overlay::DocPublishPath { .. }
+            | Overlay::DocPublishBranch { .. }
+            | Overlay::DocPublishTitle { .. }
             | Overlay::LearningEdit { .. }
             | Overlay::AddModelId { .. }
             | Overlay::AddModelKey { .. }
@@ -2537,6 +2673,10 @@ impl AppState {
             | Overlay::ModePicker { .. }
             | Overlay::ThemePicker { .. }
             | Overlay::ApiKeys { .. }
+            // A fixed three-row list, arrow-navigable with `Enter` to choose —
+            // the `/keys` shape. It carries no query (there is nothing to
+            // filter), so printable keys are simply inert here.
+            | Overlay::DocPublishTarget { .. }
             | Overlay::AddModelPick { .. } => InputMode::Palette,
             // The Skills / Memory / Docs / Edges / Workflow / Help browsers are
             // navigable with the arrow/command key table, so they stay in `Normal`

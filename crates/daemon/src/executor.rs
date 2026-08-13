@@ -242,6 +242,16 @@ pub trait RunExecutor: Send + Sync {
         None
     }
 
+    /// The assembly-provided [`MemoryGateway`](crate::memory::MemoryGateway)
+    /// backing the client-facing inspect/correct/forget commands (outcome 17).
+    /// Bundled with the executor for the same reason as the promotion gateway:
+    /// it names `codypendent-knowledge` and the pool, which only the assembly
+    /// can. The default `None` leaves every memory command unwired — the
+    /// executor-less server rejects them `memory.transport-unavailable`.
+    fn memory_gateway(&self) -> Option<std::sync::Arc<dyn crate::memory::MemoryGateway>> {
+        None
+    }
+
     /// The assembly-provided [`BlackboardReader`](crate::blackboard::BlackboardReader)
     /// that projects a workflow run's board for an accepted `ReadBlackboard` command
     /// (Phase 5 STEP 5.3). Bundled with the executor like the workflow seams — it
