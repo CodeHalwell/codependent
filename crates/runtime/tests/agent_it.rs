@@ -1036,6 +1036,11 @@ fn sample_pull_request(number: u64) -> model::PullRequest {
         html_url: format!("https://github.com/octocat/hello-world/pull/{number}"),
         head: None,
         base: None,
+        // A never-merged open PR: the fixture's `state` is "open", so the merge
+        // fields must agree with it rather than defaulting arbitrarily.
+        merged: false,
+        merged_at: None,
+        merge_commit_sha: None,
     }
 }
 

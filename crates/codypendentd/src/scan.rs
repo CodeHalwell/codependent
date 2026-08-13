@@ -571,6 +571,7 @@ async fn apply_batch(
     if relative.is_empty() {
         return;
     }
+    tracing::warn!(?relative, "PROBE batch paths");
     // `.gitignore` is asked once per batch, not once per file.
     let ignore_root = root.to_path_buf();
     let probe = relative.clone();
