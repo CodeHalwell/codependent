@@ -120,11 +120,24 @@ fi
 # standing escape hatch — `compare_baseline.py --update-baseline` outside
 # this bootstrap path always requires the explicit flag.
 if [ ! -s "$BASELINE" ] || [ "$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))))" "$BASELINE" 2>/dev/null || echo 0)" = "0" ]; then
-  echo "eval-gate: no baseline recorded yet at $BASELINE — establishing one from this run (bootstrap, not a comparison)" >&2
-  python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" \
-    --baseline "$BASELINE" --update-baseline \
-    --note "bootstrap: first eval-regression run to establish a baseline"
-  exit 0
+  if [ "${EVAL_GATE_ALLOW_BOOTSTRAP:-0}" = "1" ]; then
+    echo "eval-gate: no baseline at $BASELINE — establishing one (explicit bootstrap; NOT a comparison)" >&2
+    python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" \
+      --baseline "$BASELINE" --update-baseline \
+      --note "bootstrap: established a baseline on request"
+    exit 0
+  fi
+  # An empty baseline used to bootstrap itself and exit 0. In CI that write
+  # lands in a disposable checkout and is gone before the next run, so the gate
+  # silently re-bootstrapped on every run and could never fail — a complete
+  # score collapse would have passed. Refuse instead, and say exactly how to
+  # produce the missing artifact.
+  echo "eval-gate: no baseline recorded at $BASELINE." >&2
+  echo "eval-gate: this gate compares against a COMMITTED baseline; without one it" >&2
+  echo "eval-gate: would pass unconditionally, so it fails instead." >&2
+  echo "eval-gate: to establish one, run locally and commit the result:" >&2
+  echo "eval-gate:   EVAL_GATE_ALLOW_BOOTSTRAP=1 evals/ci/run_gate.sh" >&2
+  exit 1
 fi
 
 exec python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" --baseline "$BASELINE"
