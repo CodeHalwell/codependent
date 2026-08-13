@@ -71,6 +71,36 @@ impl ModelProfileStore {
         endpoint: &str,
         profile: &ModelProfile,
     ) -> Result<(), ModelProfileStoreError> {
+        // Re-fold the learned per-task-class rates before writing.
+        //
+        // `bench_to_store` builds a profile with an EMPTY `task_class_success`,
+        // and this upsert replaces `profile_json` wholesale — so re-benchmarking
+        // a model silently erased every rate learned from real runs, and routing
+        // fell back to overall reliability until each class happened to be
+        // observed again. The durable evidence was never lost (the
+        // `model_task_outcomes` rows survive); only the snapshot derived from it
+        // was. Recomputing here means the snapshot cannot drift from the rows it
+        // is a projection of, whatever the caller happened to pass in.
+        let mut profile = profile.clone();
+        let learned: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT task_class, COALESCE(SUM(success), 0), COUNT(*) \
+             FROM model_task_outcomes WHERE model_id = ? AND endpoint = ? \
+             GROUP BY task_class",
+        )
+        .bind(profile.id.0.as_str())
+        .bind(endpoint)
+        .fetch_all(pool)
+        .await?;
+        for (task_class, successes, total) in learned {
+            if total > 0 {
+                profile
+                    .performance
+                    .task_class_success
+                    .insert(task_class, successes as f64 / total as f64);
+            }
+        }
+        let profile = &profile;
+
         let json = serde_json::to_string(profile)?;
         let now = Utc::now().to_rfc3339();
         sqlx::query(
@@ -556,6 +586,65 @@ mod tests {
     /// class starts as the overall `reliability` (no history), then diverges
     /// once real run outcomes are recorded — proving `task_class_success` is
     /// no longer permanently the empty map every non-test path used to write.
+    /// A re-benchmark must not erase what real runs taught the router.
+    ///
+    /// `bench_to_store` builds a profile whose `task_class_success` is empty and
+    /// `upsert` replaces `profile_json` wholesale, so `models bench` on an
+    /// already-measured model wiped every learned rate — routing fell back to
+    /// overall reliability even though the `model_task_outcomes` rows were still
+    /// sitting there. Outcome 11 is "route from measured outcomes"; re-measuring
+    /// one dimension must not discard another.
+    #[tokio::test]
+    async fn re_benchmarking_preserves_rates_learned_from_real_runs() {
+        use codypendent_routing::TaskClass;
+
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let store = ModelProfileStore::new();
+        let endpoint = "http://localhost:11434/v1";
+        let model = ModelId("qwen-local".into());
+
+        store
+            .upsert(&pool, endpoint, &rich_local_profile("qwen-local"))
+            .await
+            .unwrap();
+        for (run, ok) in [("run-1", true), ("run-2", true), ("run-3", false)] {
+            store
+                .record_outcome(&pool, &model, endpoint, TaskClass::SafeRefactor, ok, run)
+                .await
+                .unwrap();
+        }
+        let learned = store
+            .get(&pool, &model, endpoint)
+            .await
+            .unwrap()
+            .unwrap()
+            .performance
+            .predicted_success(TaskClass::SafeRefactor);
+        assert!(
+            (learned - (2.0 / 3.0)).abs() < 1e-9,
+            "precondition: 2/3 learned"
+        );
+
+        // Exactly what `models bench` does on a second run: a freshly measured
+        // profile carrying no task-class history at all.
+        let mut rebenched = rich_local_profile("qwen-local");
+        rebenched.performance.task_class_success.clear();
+        store.upsert(&pool, endpoint, &rebenched).await.unwrap();
+
+        let after = store
+            .get(&pool, &model, endpoint)
+            .await
+            .unwrap()
+            .unwrap()
+            .performance
+            .predicted_success(TaskClass::SafeRefactor);
+        assert!(
+            (after - (2.0 / 3.0)).abs() < 1e-9,
+            "a re-benchmark must re-fold the durable outcome rows, got {after}"
+        );
+    }
+
     #[tokio::test]
     async fn record_outcome_folds_real_run_results_into_task_class_success() {
         use codypendent_routing::TaskClass;
