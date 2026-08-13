@@ -189,12 +189,15 @@ confirmed to **fail against the previous behaviour** before being kept.
 | Repository identity re-derived from the CWD at five sites, emptying documents, memories, learnings and graph edges from any subdirectory (`cli/src/tui.rs`, `commands.rs`) | (c) | `docs list` from `repo/src` now returns the document instead of "No documents yet." |
 | The daemon chmodded borrowed socket directories, including a shared `/tmp` (`protocol/src/discovery.rs`) | (c) | 0700 now applies only to directories we created or own |
 | Three spellings of one checkout minted three separate task boards (`codypendentd/src/blackboard.rs`) | (c) | without the fix the card is invisible through the plain spelling — 0 of 1 |
+| `models add` destroyed `[embedding]`, `[retrieval]`, `[transcription]` and `[speech]` on every invocation (§1) | (c) | all four writers now delegate to one `crates/cli/src/models_file.rs`; re-ran the original reproduction against the built binary — all four tables survive |
+| The Help overlay drew ~a third of its bindings off the bottom with no scroll, and collided key labels with descriptions (`tui/src/render.rs`) | (c) | `help_scroll` + the existing max-scroll geometry cache; both tests confirmed failing against the old behaviour |
 
-The `models add` config-clobber (§1) is **not** in this list. Fixing it at
-`commands.rs:2894` alone would reproduce the exact per-site-patching reflex this
-review identifies as the root cause; it needs the single shared writer named in
-[`2026-08-13-shared-surface.md`](2026-08-13-shared-surface.md), which is a `cli-owner`
-change.
+The `models add` fix was deliberately **not** applied at `commands.rs:2894`
+alone. Patching the one broken site would have left four copies of one
+invariant and a fifth writer free to reintroduce it — the exact per-site
+reflex §1 identifies as the root cause. The invariant now lives in one module
+that all four paths call, and a table a later version adds is carried through
+untouched.
 
 ---
 
