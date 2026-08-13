@@ -5110,22 +5110,39 @@ fn render_confirm_box(
     title: &str,
     detail: &str,
 ) {
-    let rect = centered_rect_min(60, 20, 48, 7, area);
+    // Size from the wrapped body rather than a fixed percentage. Long trust
+    // prompts must never push the decision labels below the card: hiding the
+    // affirmative/negative controls would make the consent boundary both
+    // confusing and inaccessible. The extra row per non-empty logical line is
+    // a conservative allowance for ratatui's word wrapping (which may break
+    // before the raw display-cell boundary).
+    let provisional = centered_rect_min(60, 20, 48, 7, area);
+    let inner_width = provisional.width.saturating_sub(2).max(1);
+    let detail_rows = detail.lines().fold(0u16, |rows, line| {
+        rows.saturating_add(cell_wrap_rows(std::iter::once(line), inner_width))
+            .saturating_add(u16::from(!line.is_empty()))
+    });
+    let required_height = detail_rows
+        .saturating_add(4) // title + decisions + two border rows
+        .max(7);
+    let rect = centered_rect_min(60, 20, 48, required_height, area);
     shield_modal(state, rect);
     frame.render_widget(Clear, rect);
-    let lines = vec![
-        Line::styled(
-            title.to_owned(),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(detail.to_owned(), Style::default().fg(theme.text.secondary)),
-        Line::from(vec![
-            Span::styled("[y] yes   ", Style::default().fg(theme.status.warning)),
-            Span::styled("[n] no", Style::default().fg(theme.status.success)),
-        ]),
-    ];
+    let mut lines = vec![Line::styled(
+        title.to_owned(),
+        Style::default()
+            .fg(theme.text.heading)
+            .add_modifier(Modifier::BOLD),
+    )];
+    lines.extend(
+        detail
+            .lines()
+            .map(|line| Line::styled(line.to_owned(), Style::default().fg(theme.text.secondary))),
+    );
+    lines.push(Line::from(vec![
+        Span::styled("[y] yes   ", Style::default().fg(theme.status.warning)),
+        Span::styled("[n] no", Style::default().fg(theme.status.success)),
+    ]));
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Confirm ")
