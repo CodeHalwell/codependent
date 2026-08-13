@@ -507,7 +507,23 @@ impl SkillRunner {
                 // merely inside the package: the manifest names where behaviour
                 // lives, and a caller must not be able to run some other file
                 // the package happens to ship.
-                if !relpath.starts_with(declared.trim_end_matches('/')) {
+                // Compared by PATH COMPONENT, not string prefix: with
+                // `scripts = "scripts/"`, a bare `starts_with` also admitted
+                // `scripts-evil/run`, which resolves inside the package and so
+                // survived every later check — defeating the boundary this is.
+                let declared_components: Vec<&str> = declared
+                    .trim_end_matches('/')
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .collect();
+                let candidate_components: Vec<&str> =
+                    relpath.split('/').filter(|part| !part.is_empty()).collect();
+                let under_declared = candidate_components.len() > declared_components.len()
+                    && candidate_components
+                        .iter()
+                        .zip(&declared_components)
+                        .all(|(candidate, declared)| candidate == declared);
+                if !under_declared {
                     return Err(SkillExecError::ScriptEscapesPackage {
                         path: relpath.clone(),
                     });
@@ -574,6 +590,43 @@ impl SkillRunner {
 
 #[cfg(test)]
 mod tests {
+
+    /// `scripts = "scripts/"` declares a DIRECTORY. Compared as a string
+    /// prefix, `scripts-evil/run` also matched — it resolves inside the package,
+    /// so nothing downstream caught it, and the manifest's entrypoint boundary
+    /// meant nothing. The comparison is by path component for that reason.
+    #[test]
+    fn a_sibling_directory_does_not_satisfy_the_scripts_entrypoint() {
+        fn under(declared: &str, candidate: &str) -> bool {
+            let declared_components: Vec<&str> = declared
+                .trim_end_matches('/')
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .collect();
+            let candidate_components: Vec<&str> = candidate
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .collect();
+            candidate_components.len() > declared_components.len()
+                && candidate_components
+                    .iter()
+                    .zip(&declared_components)
+                    .all(|(candidate, declared)| candidate == declared)
+        }
+
+        assert!(under("scripts/", "scripts/run.sh"), "the declared case");
+        assert!(under("scripts", "scripts/nested/run.sh"), "nested is fine");
+
+        assert!(
+            !under("scripts/", "scripts-evil/run.sh"),
+            "a sibling directory sharing a name prefix must NOT satisfy it"
+        );
+        assert!(
+            !under("scripts/", "scripts"),
+            "the directory itself is not a script"
+        );
+        assert!(!under("scripts/", "other/run.sh"), "an unrelated directory");
+    }
     use super::*;
     use codypendent_sandbox::RefusingSandbox;
 

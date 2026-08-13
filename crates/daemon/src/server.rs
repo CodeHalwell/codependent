@@ -1406,6 +1406,9 @@ async fn handle_request(
                 // a ledger command — upsert it directly and acknowledge, mirroring
                 // the AttachSession interception above (Phase 3 STEP 3.4).
                 CommandBody::UpdateIdeContext { session_id, update } => {
+                    if reject_unowned_session(state, conn, writer, &request, *session_id).await? {
+                        return Ok(false);
+                    }
                     // Read-only clients must not overwrite the IDE-context
                     // projection the run read-path uses for provenance labeling.
                     if conn.role == ClientRole::Observer {
@@ -1564,6 +1567,9 @@ async fn handle_request(
                     document_id,
                     mutation,
                 } => {
+                    if reject_unowned_document(state, conn, writer, &request, *document_id).await? {
+                        return Ok(false);
+                    }
                     // Role gate (the seam additionally enforces the document's
                     // collaboration mode and edit leases; this is the coarse role
                     // gate the daemon owns). An Observer may not mutate at all.
@@ -1645,6 +1651,11 @@ async fn handle_request(
                 // A lease is a precursor to writing, so — as with a non-resolving
                 // `MutateDocument` — an Observer may not take one.
                 CommandBody::AcquireDocumentLease { lease, ttl_seconds } => {
+                    if reject_unowned_document(state, conn, writer, &request, lease.document_id)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
                     if conn.role == ClientRole::Observer {
                         let reply = Envelope::reply_to(
                             &request,
@@ -1914,6 +1925,11 @@ async fn handle_request(
                 // synchronous state change and drives the run onward in the
                 // background, so the reply is a fast accept/reject (Phase 5 STEP 5.2).
                 CommandBody::PauseWorkflow { workflow_run_id } => {
+                    if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
                     if let Some(lifecycle) =
                         workflow_control_seam(state, conn, writer, &request, "pause").await?
                     {
@@ -1940,6 +1956,11 @@ async fn handle_request(
                     }
                 }
                 CommandBody::ResumeWorkflow { workflow_run_id } => {
+                    if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
                     if let Some(lifecycle) =
                         workflow_control_seam(state, conn, writer, &request, "resume").await?
                     {
@@ -1969,6 +1990,11 @@ async fn handle_request(
                     workflow_run_id,
                     node_id,
                 } => {
+                    if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
                     if let Some(lifecycle) =
                         workflow_control_seam(state, conn, writer, &request, "retry").await?
                     {
@@ -2001,6 +2027,11 @@ async fn handle_request(
                 // change (run → Cancelled, pending nodes → Skipped) and interrupts any
                 // in-flight node agent run, so the reply is a fast accept/reject.
                 CommandBody::CancelWorkflow { workflow_run_id } => {
+                    if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
                     if let Some(lifecycle) =
                         workflow_control_seam(state, conn, writer, &request, "cancel").await?
                     {
@@ -2039,6 +2070,18 @@ async fn handle_request(
                     version,
                     requires_permission_review,
                 } => {
+                    if conn.principal.uid() != state.daemon_uid {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     if conn.role == ClientRole::Observer {
                         let reply = Envelope::reply_to(
                             &request,
@@ -2090,6 +2133,18 @@ async fn handle_request(
                     candidate_id,
                     action,
                 } => {
+                    if conn.principal.uid() != state.daemon_uid {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     if conn.role != ClientRole::Controller {
                         let reply = Envelope::reply_to(
                             &request,
@@ -2145,6 +2200,18 @@ async fn handle_request(
                 // let alone succeed; `Candidate::approve` then refuses a
                 // non-human actor a second, structural time regardless.
                 CommandBody::ApprovePromotion { candidate_id } => {
+                    if conn.principal.uid() != state.daemon_uid {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     if conn.role != ClientRole::Controller {
                         let reply = Envelope::reply_to(
                             &request,
@@ -2202,6 +2269,18 @@ async fn handle_request(
                 // the system-attributed auto-rollback a canary regression
                 // produces on its own (`AdvancePromotion { ObserveCanary }`).
                 CommandBody::RollbackPromotion { candidate_id } => {
+                    if conn.principal.uid() != state.daemon_uid {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     if conn.role != ClientRole::Controller {
                         let reply = Envelope::reply_to(
                             &request,
@@ -2538,6 +2617,15 @@ async fn handle_request(
                 // an agent writes through its own `blackboard.*` / `task.*` tools
                 // (which carry server-built agent attribution) rather than here.
                 CommandBody::PostBlackboardItem { scope, item } => {
+                    if let codypendent_protocol::BlackboardScope::WorkflowRun { workflow_run_id } =
+                        scope
+                    {
+                        if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                            .await?
+                        {
+                            return Ok(false);
+                        }
+                    }
                     let Some(target) = board_target(scope) else {
                         let reply = Envelope::reply_to(
                             &request,
@@ -2576,6 +2664,15 @@ async fn handle_request(
                     ordinal,
                     payload,
                 } => {
+                    if let codypendent_protocol::BlackboardScope::WorkflowRun { workflow_run_id } =
+                        scope
+                    {
+                        if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                            .await?
+                        {
+                            return Ok(false);
+                        }
+                    }
                     let Some(target) = board_target(scope) else {
                         let reply = Envelope::reply_to(
                             &request,
@@ -4119,6 +4216,75 @@ async fn principal_may_use_session(
     Ok(session_owner_uid(state, session_id)
         .await?
         .is_some_and(|owner| principal.owns(owner)))
+}
+
+/// Refuse a connection-level command that names a resource this principal does
+/// not own, with the resource's own not-found error so a refusal is
+/// indistinguishable from a miss.
+///
+/// The connection-level branches are intercepted BEFORE the command ledger and
+/// therefore never reach [`authorize_command`], which is where by-id ownership
+/// is enforced for everything else. The first pass of the multi-uid work gated
+/// the read and subscribe paths and left every write and lifecycle path on this
+/// side of that fence — so a peer that knew an id could mutate what it could not
+/// read. These helpers exist so the check is one call at each site rather than a
+/// pattern each site is trusted to remember.
+async fn reject_unowned_workflow(
+    state: &ServerState,
+    conn: &ConnState,
+    writer: &SharedWriter,
+    request: &Envelope,
+    workflow_run_id: &str,
+) -> anyhow::Result<bool> {
+    if principal_may_read_workflow(state, conn.principal, workflow_run_id).await? {
+        return Ok(false);
+    }
+    let reply = Envelope::reply_to(
+        request,
+        Payload::CommandRejected(workflow_run_not_found(workflow_run_id)),
+    );
+    send(writer, &reply).await?;
+    Ok(true)
+}
+
+async fn reject_unowned_document(
+    state: &ServerState,
+    conn: &ConnState,
+    writer: &SharedWriter,
+    request: &Envelope,
+    document_id: codypendent_protocol::DocumentId,
+) -> anyhow::Result<bool> {
+    if principal_may_read_document(state, conn.principal, document_id).await? {
+        return Ok(false);
+    }
+    let reply = Envelope::reply_to(
+        request,
+        Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "document.not-found",
+            format!("no document {document_id}"),
+            false,
+        )),
+    );
+    send(writer, &reply).await?;
+    Ok(true)
+}
+
+async fn reject_unowned_session(
+    state: &ServerState,
+    conn: &ConnState,
+    writer: &SharedWriter,
+    request: &Envelope,
+    session_id: SessionId,
+) -> anyhow::Result<bool> {
+    if principal_may_use_session(state, conn.principal, session_id).await? {
+        return Ok(false);
+    }
+    let reply = Envelope::reply_to(
+        request,
+        Payload::CommandRejected(session_not_found(session_id)),
+    );
+    send(writer, &reply).await?;
+    Ok(true)
 }
 
 /// Whether `principal` may read a workflow run's observability snapshot or its
