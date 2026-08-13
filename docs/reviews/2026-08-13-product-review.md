@@ -245,14 +245,27 @@ evidence rather than the orchestrator's own:
   success is inferred rather than observed.
 - **Audio.** No audio device exists in this container. STT was proven by the
   reviewer against a mock HTTP endpoint; capture and playback were not run.
-- **The full workspace test suite under the orchestrator's changes** was
-  started, but this container's disk could not hold every debug test binary
-  (peak `target/` 27 GB against ~19 GB free at session start). `cargo fmt
-  --all -- --check`, `cargo check --workspace --all-targets --all-features`
-  and `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-  are all clean, and the suites for every crate touched — `codypendent-eval`,
-  `codypendent-cli`, `codypendent-protocol`, `codypendent-codypendentd`,
-  `codypendent-tui` (554 tests) — pass. **CI is the arbiter for the rest.**
+- **One pre-existing test failure, not caused by this branch.**
+  `remote_ui_plugins::tests::trust_removal_preserves_affected_ids_when_record_repair_fails`
+  (`crates/daemon/src/remote_ui_plugins.rs:2449`) fails in this container. The
+  test chmods a `records/` directory to `0o500` and asserts the resulting
+  repair failure is recorded; it observes none. It was confirmed to fail
+  **identically at the pinned commit `535a2f5`**, built in a clean worktree
+  with none of this branch's changes — and `remote_ui_plugins.rs` is untouched
+  here and never consults `RuntimePaths`, so the `discovery.rs` change cannot
+  reach it. Environment-specific (this container's filesystem and/or uid 0),
+  not a regression. Left alone rather than "fixed" blind.
+
+- **Gate status under this branch's changes.** `cargo fmt --all -- --check`,
+  `cargo check --workspace --all-targets --all-features` and `cargo clippy
+  --workspace --all-targets --all-features -- -D warnings` are all clean.
+  `cargo test --workspace --all-features --no-fail-fast`: **2,025 passed, 1
+  failed** across 75 suites, the one failure being the pre-existing case above.
+  Reaching that number took three attempts — the first died on `No space left
+  on device` while linking (three failures, every one disk, zero code errors),
+  and a debug test binary here is 400-600 MB against a `target/` that peaks
+  near 27 GB, so the suite only fits with debug info off. **CI is the arbiter**,
+  per the convention this review was run under.
 
 Environment note, because it shaped the evidence: the container has 4 CPUs and
 filled its 252 GB filesystem to 100% twice under eleven concurrent reviewers
