@@ -2404,6 +2404,28 @@ async fn handle_request(
                     routing_policy,
                     report_json,
                 } => {
+                    // The promotion store is daemon-wide, exactly like the
+                    // memory store, so it belongs to the uid the daemon runs as
+                    // and there is no per-row owner to compare against. `role`
+                    // is REQUESTED by the client, so it authenticates nothing:
+                    // without this a peer able to reach the socket could submit
+                    // a syntactically valid, all-passing SuiteReport for any
+                    // known candidate and the role-only promotion controls would
+                    // then consume that fabricated evidence. The refusal reuses
+                    // the transport-unavailable error so a foreign principal
+                    // cannot distinguish "not allowed" from "not enabled here".
+                    if conn.principal.uid() != state.daemon_uid {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     if conn.role != ClientRole::Controller {
                         let reply = Envelope::reply_to(
                             &request,
