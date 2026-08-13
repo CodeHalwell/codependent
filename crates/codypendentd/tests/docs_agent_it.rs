@@ -203,6 +203,24 @@ async fn a_scripted_agent_drafts_a_doc_edit_that_a_human_then_accepts() {
     for tool in ["docs.create", "docs.read", "docs.edit", "docs.suggest"] {
         assert!(offered.iter().any(|n| n == tool), "{tool} not offered");
     }
+    // ...and are ADVERTISED, not merely offered. Asserting only on the offered
+    // set (which is all this test used to do) missed the whole defect: the four
+    // tools were dispatchable and driven successfully by the `ScriptedDriver`
+    // below, while `static_tool_definitions()` had no entry for any of them — so
+    // the intersection in `advertised_tool_definitions` dropped all four and a
+    // REAL model was never shown a document tool. A scripted driver cannot catch
+    // that, because it calls tools by name without reading the catalog.
+    let advertised: Vec<String> = runtime
+        .advertised_tool_definitions(&ctx)
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect();
+    for tool in ["docs.create", "docs.read", "docs.edit", "docs.suggest"] {
+        assert!(
+            advertised.iter().any(|n| n == tool),
+            "{tool} is dispatchable but never shown to the model: {advertised:?}"
+        );
+    }
 
     // The script: read the document (to learn its block ids, as a real agent
     // would), then rewrite the intro block.

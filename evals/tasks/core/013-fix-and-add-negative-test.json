@@ -1,0 +1,15 @@
+{
+  "id": "fix-and-add-negative-test",
+  "repository_revision": "8e7644ddbbe0dd04052b47f0e2bfefd45b535ee6",
+  "prompt": "Fix the off-by-one bug in `add_one` in src/math.rs AND add a new test function named exactly `add_one_handles_negative_numbers` to the `tests` module that asserts `add_one(-5) == -4`. Do both in one change and confirm with the test suite.",
+  "policy": "coding-balanced",
+  "expected": [
+    { "assert": "tests-pass" },
+    { "assert": "file-changed", "path": "src/math.rs" },
+    { "assert": "symbol-exists", "symbol": "add_one_handles_negative_numbers" },
+    { "assert": "patch-scope-limit", "max_files": 1 }
+  ],
+  "maximum_cost_usd": 0.5,
+  "maximum_duration_ms": 120000,
+  "task_class": "small-bug-fix"
+}

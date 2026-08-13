@@ -152,13 +152,27 @@ impl BenchOutcome {
     ///
     /// The performance seed is honest and minimal — reliability is the measured
     /// coding-eval score (the best single objective signal the bench produces),
-    /// median latency is the measured time-to-first-token plus one generation, and
-    /// `cost_per_1k_tokens_usd` is `0` (this is the *local*-bench harness; a hosted
-    /// endpoint's real token price is not something the harness measures — the CLI
-    /// warns when it benches a non-local endpoint). Observed per-task-class success
-    /// accrues later from eval + trace data; this is the bench-time baseline.
+    /// median latency is the measured time-to-first-token plus one generation.
+    /// Observed per-task-class success accrues later from real run outcomes
+    /// (`crates/daemon/src/model_profiles.rs::ModelProfileStore::record_outcome`);
+    /// this is the bench-time baseline.
+    ///
+    /// `cost_per_1k_tokens_usd` is the caller-supplied `known_price_per_1k_usd`
+    /// when given, else `0.0` — this harness measures timing and scripted-probe
+    /// accuracy, never a hosted endpoint's real token price (the CLI warns when
+    /// it benches a non-local endpoint). `0.0` is not a neutral default,
+    /// though: `crates/routing/src/router.rs`'s eligibility filter reads it as
+    /// "the benchmark harness's unmeasured sentinel" and drops any non-local
+    /// model that carries it, so an operator-supplied price (from the built-in
+    /// provider catalog, or hand-set) is what makes a hosted model routable at
+    /// all — see `codypendent models bench`'s catalog lookup and the
+    /// `--price-per-1m-usd` override in `crates/cli/src/commands.rs`.
     #[must_use]
-    pub fn into_profile(self, location: ModelLocation) -> ModelProfile {
+    pub fn into_profile(
+        self,
+        location: ModelLocation,
+        known_price_per_1k_usd: Option<f64>,
+    ) -> ModelProfile {
         let latency_ms_p50 = self.local_bench.time_to_first_token_ms
             + generation_ms(self.local_bench.tokens_per_second);
         ModelProfile {
@@ -167,7 +181,7 @@ impl BenchOutcome {
             capabilities: self.capabilities,
             performance: ModelPerformance {
                 reliability: self.local_bench.coding_eval_score,
-                cost_per_1k_tokens_usd: 0.0,
+                cost_per_1k_tokens_usd: known_price_per_1k_usd.unwrap_or(0.0),
                 latency_ms_p50,
                 task_class_success: Default::default(),
                 failure_patterns: Vec::new(),
@@ -176,6 +190,20 @@ impl BenchOutcome {
             bench: Some(self.local_bench),
         }
     }
+}
+
+/// Blend a catalog row's separate input/output per-1M prices into the single
+/// per-1K rate [`ModelPerformance::cost_per_1k_tokens_usd`] expects
+/// (`crates/routing/src/profile.rs::expected_cost_usd` applies one rate to a
+/// total token count, not separate input/output counts — the router does not
+/// track the input/output split, so a single blended figure is the most this
+/// seam can carry). A simple average, not an agentic-workload-weighted one:
+/// this number drives comparative routing (which model is cheaper), not
+/// billing, so a defensible approximation is enough — an operator who wants
+/// exact economics still has the catalog's own separate fields to read.
+#[must_use]
+pub fn blended_price_per_1k_usd(cost_per_1m_input_usd: f64, cost_per_1m_output_usd: f64) -> f64 {
+    (cost_per_1m_input_usd + cost_per_1m_output_usd) / 2.0 / 1000.0
 }
 
 /// Classify an endpoint `base_url` as [`ModelLocation::Local`] or `Hosted` for
@@ -536,14 +564,49 @@ mod tests {
     async fn into_profile_uses_the_supplied_location_never_a_default() {
         let outcome = run_bench(&mock(), BenchOptions::default()).await.unwrap();
         // Local when told local...
-        let local = outcome.clone().into_profile(ModelLocation::Local);
+        let local = outcome.clone().into_profile(ModelLocation::Local, None);
         assert!(local.is_local());
         assert_eq!(local.performance.cost_per_1k_tokens_usd, 0.0);
         assert!((local.performance.reliability - 0.6).abs() < 1e-9);
         assert_eq!(local.bench.as_ref().unwrap().tokens_per_second, 50.0);
         // ...and Hosted when told hosted — no hardcoded `Local` to leak past the filter.
-        let hosted = outcome.into_profile(ModelLocation::Hosted);
+        let hosted = outcome.clone().into_profile(ModelLocation::Hosted, None);
         assert!(!hosted.is_local());
+        assert_eq!(
+            hosted.performance.cost_per_1k_tokens_usd, 0.0,
+            "no known price still means unmeasured (the router's ineligibility \
+             sentinel) — see hosted_price_makes_a_benched_model_eligible below \
+             for the case that changes this"
+        );
+    }
+
+    /// F11.4 (`2026-08-13-verticals/sandbox-eval-routing.md`): "the only way
+    /// [to route to a hosted model] is to hand-edit `model_profiles.profile_json`
+    /// in SQLite." `into_profile`'s `known_price_per_1k_usd` is the seam that
+    /// makes a hosted model routable through ordinary channels instead —
+    /// pinned here directly (`codypendent models bench`'s catalog lookup and
+    /// `--price-per-1m-usd` override, `crates/cli/src/commands.rs`, both feed
+    /// through this same parameter and are exercised in that crate's tests).
+    /// `crates/routing/src/router.rs`'s
+    /// `a_supplied_price_makes_a_hosted_model_eligible` test pins the router's
+    /// own side of this: that a nonzero `cost_per_1k_tokens_usd` on a
+    /// `ModelLocation::Hosted` profile — exactly what this constructs — clears
+    /// `Router::is_eligible`'s "unmeasured hosted model" hard filter.
+    #[tokio::test]
+    async fn hosted_price_flows_from_bench_into_the_persisted_profile() {
+        let outcome = run_bench(&mock(), BenchOptions::default()).await.unwrap();
+        let hosted = outcome.into_profile(ModelLocation::Hosted, Some(0.0025));
+        assert_eq!(
+            hosted.performance.cost_per_1k_tokens_usd, 0.0025,
+            "a caller-supplied known price must ride into the persisted profile \
+             verbatim, not be discarded back to the 0.0 unmeasured sentinel"
+        );
+    }
+
+    #[test]
+    fn blended_price_averages_the_catalogs_separate_input_and_output_rates() {
+        // $2/1M in, $10/1M out -> blended $6/1M -> $0.006/1K.
+        assert!((blended_price_per_1k_usd(2.0, 10.0) - 0.006).abs() < 1e-12);
     }
 
     #[test]

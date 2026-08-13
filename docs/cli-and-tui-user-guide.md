@@ -744,6 +744,18 @@ When the ceiling forbids it, the submission is refused with
 `voice.off-device-forbidden` **before any audio is read or transmitted** — the
 run does not start, and nothing is sent.
 
+**The same ceiling governs spoken replies, not only captured audio.** Every
+assistant turn is treated as **Confidential** before synthesis — the same
+default captured audio gets, because a reply routinely contains repository
+source, diffs, or command output — and checked against `policy.max_off_device`
+before a byte is sent to `[speech]`. `[speech].local = true` marks your own
+on-device synthesizer (always permitted, exactly like `[transcription].local`);
+otherwise a ceiling below Confidential silences that reply rather than sending
+it, and the status line reports why (`voice: reply not spoken — …`) instead of
+going quiet with no explanation. The ceiling is re-read before every reply, so
+tightening `routing.toml` mid-session takes effect on the very next turn
+without a restart.
+
 ---
 
 ## 6. Agent Modes & Policy Enforcements

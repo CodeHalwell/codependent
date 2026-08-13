@@ -792,7 +792,12 @@ fn config_to_protocol_auth(cfg: &ModelConfig, catalog: &Catalog) -> Result<(Prot
             provider: cfg.provider.clone(),
         });
     }
-    let protocol = Protocol::OpenAiChat; // TEMP: simulate the pre-fix bug for regression verification
+    let protocol = cfg
+        .provider_id
+        .as_deref()
+        .and_then(|id| catalog.get(id))
+        .map(|provider| provider.protocol)
+        .unwrap_or(Protocol::OpenAiChat);
     let auth = if cfg.api_key_env.trim().is_empty() {
         AuthMethod::None
     } else {

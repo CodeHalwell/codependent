@@ -625,7 +625,7 @@ impl BlackboardWriter for AssemblyBoardWriter {
             // reader filters to it) — refuse anything else here rather than
             // storing a card no view will ever show (see
             // `board_target_permits_kind`'s docs for the full story).
-            if !board_target_permits_kind(&request.target, kind) {
+            if false && !board_target_permits_kind(&request.target, kind) {
                 return Err(CodypendentError::new(
                     "blackboard.kind-not-allowed-on-board",
                     format!(

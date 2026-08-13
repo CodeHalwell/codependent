@@ -115,6 +115,9 @@ pub struct WorkspaceLease {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub released_at: Option<DateTime<Utc>>,
+    /// When this lease's per-run branch was reclaimed, or `None` when it has not
+    /// been (so a startup sweep knows which branches are still outstanding).
+    pub branch_deleted_at: Option<DateTime<Utc>>,
 }
 
 /// What [`WorktreeManager::release`] did with a lease.
@@ -149,6 +152,10 @@ pub struct ReconcileReport {
     /// manual cleanup. Never auto-deleted, and never auto-inserted (their owner
     /// run is unknown, and `owner_run_id` is a non-null foreign key).
     pub adopted_orphans: Vec<PathBuf>,
+    /// Per-run branches reclaimed from earlier releases that removed a worktree
+    /// but left its branch behind (every release before the reclaim landed).
+    /// Only branches provably contained in `HEAD` are deleted.
+    pub reclaimed_branches: Vec<String>,
 }
 
 /// A structured worktree-management error. Every variant is machine-branchable;
@@ -336,6 +343,7 @@ impl WorktreeManager {
             created_at: now,
             expires_at: now + Duration::hours(LEASE_TTL_HOURS),
             released_at: None,
+            branch_deleted_at: None,
         };
 
         if let Err(e) = insert_lease(pool, &lease).await {
@@ -603,6 +611,39 @@ impl WorktreeManager {
             }
         }
 
+        // Reclaim branches left behind by earlier releases. A release before
+        // this feature removed the worktree and left `codypendent/run-<short>`
+        // in the user's repository forever, so an existing install carries one
+        // ref per writing run it has ever done (the review found four after two
+        // small workflow runs). A row qualifies only when ALL of these hold, so
+        // nothing that could still be someone's work is touched:
+        //
+        //   * the lease is `released` (not active, not orphaned — an orphaned
+        //     row means reality disagreed with the record, which a human reads);
+        //   * `branch_deleted_at` is NULL (we have not already reclaimed it);
+        //   * the worktree directory is GONE (a retained tree is retained
+        //     precisely because it holds unmerged work, and its branch is
+        //     checked out there anyway);
+        //   * `git merge-base --is-ancestor <branch> HEAD` — the same proof
+        //     `allocate` and `release` require before deleting a branch.
+        //
+        // This is the ONE thing startup reconciliation deletes, and it deletes
+        // only refs it can prove HEAD already contains.
+        for lease in &leases {
+            if lease.state != LeaseState::Released
+                || lease.branch_deleted_at.is_some()
+                || lease.worktree_path.exists()
+            {
+                continue;
+            }
+            if self
+                .reclaim_branch(pool, &lease.repository_path, &lease.branch, lease.id)
+                .await
+            {
+                report.reclaimed_branches.push(lease.branch.clone());
+            }
+        }
+
         Ok(report)
     }
 
@@ -818,10 +859,11 @@ type LeaseRow = (
     String,
     String,
     Option<String>,
+    Option<String>,
 );
 
 const LEASE_COLUMNS: &str = "id, repository_path, worktree_path, branch, base_commit, \
-     owner_run_id, mode, state, created_at, expires_at, released_at";
+     owner_run_id, mode, state, created_at, expires_at, released_at, branch_deleted_at";
 
 async fn active_lease_exists(pool: &SqlitePool, worktree: &Path) -> Result<bool, WorktreeError> {
     let row: Option<(String,)> = sqlx::query_as(
@@ -835,7 +877,7 @@ async fn active_lease_exists(pool: &SqlitePool, worktree: &Path) -> Result<bool,
 
 async fn insert_lease(pool: &SqlitePool, lease: &WorkspaceLease) -> Result<(), WorktreeError> {
     sqlx::query(&format!(
-        "INSERT INTO workspace_leases ({LEASE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO workspace_leases ({LEASE_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ))
     .bind(lease.id.to_string())
     .bind(lease.repository_path.to_string_lossy().as_ref())
@@ -848,6 +890,7 @@ async fn insert_lease(pool: &SqlitePool, lease: &WorkspaceLease) -> Result<(), W
     .bind(lease.created_at.to_rfc3339())
     .bind(lease.expires_at.to_rfc3339())
     .bind(lease.released_at.map(|t| t.to_rfc3339()))
+    .bind(lease.branch_deleted_at.map(|t| t.to_rfc3339()))
     .execute(pool)
     .await?;
     Ok(())
@@ -904,6 +947,7 @@ fn lease_from_row(row: LeaseRow) -> Result<WorkspaceLease, WorktreeError> {
         created_at,
         expires_at,
         released_at,
+        branch_deleted_at,
     ) = row;
     Ok(WorkspaceLease {
         id: Uuid::from_str(&id).map_err(|e| WorktreeError::Corrupt(format!("id: {e}")))?,
@@ -919,6 +963,9 @@ fn lease_from_row(row: LeaseRow) -> Result<WorkspaceLease, WorktreeError> {
         expires_at: parse_ts(&expires_at, "expires_at")?,
         released_at: released_at
             .map(|t| parse_ts(&t, "released_at"))
+            .transpose()?,
+        branch_deleted_at: branch_deleted_at
+            .map(|t| parse_ts(&t, "branch_deleted_at"))
             .transpose()?,
     })
 }
@@ -1218,6 +1265,67 @@ mod tests {
     /// The other half of the contract: a branch that holds commits `HEAD` does
     /// not is NEVER deleted. The worktree is retained too, so the user can still
     /// reach the work directly.
+    /// Branches an OLDER build left behind — released lease, worktree gone, ref
+    /// still there — are swept on startup. This is the only thing reconciliation
+    /// deletes, and only when `HEAD` provably contains the branch.
+    #[tokio::test]
+    async fn startup_reconciliation_sweeps_branches_left_by_earlier_releases() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let repo = init_repo(dir.path());
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+        let before = branches(&repo);
+
+        let mgr = WorktreeManager::new();
+        let run_id = seed_run(&pool).await;
+        let lease = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+        mgr.release(&pool, &store, lease.id, false).await.unwrap();
+
+        // Recreate exactly the state an install upgraded from the leaking build
+        // is in: the branch survives and the lease was never stamped.
+        git(&repo, &["branch", &lease.branch]);
+        sqlx::query("UPDATE workspace_leases SET branch_deleted_at = NULL WHERE id = ?")
+            .bind(lease.id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(branches(&repo).contains(&lease.branch));
+
+        let report = mgr.reconcile_on_startup(&pool).await.unwrap();
+        assert_eq!(report.reclaimed_branches, vec![lease.branch.clone()]);
+        assert_eq!(branches(&repo), before);
+    }
+
+    /// …but a swept branch must still be provably merged. One that is not is
+    /// reported nowhere and deleted never.
+    #[tokio::test]
+    async fn the_startup_sweep_never_deletes_an_unmerged_branch() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let repo = init_repo(dir.path());
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+
+        let mgr = WorktreeManager::new();
+        let run_id = seed_run(&pool).await;
+        let lease = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+        // Commit on the run branch INSIDE its worktree, then remove the tree
+        // behind the manager's back so only the branch (with real work) is left.
+        let wt = &lease.worktree_path;
+        std::fs::write(wt.join("worker.txt"), "worker output\n").unwrap();
+        git(wt, &["add", "."]);
+        git(wt, &["commit", "-q", "-m", "worker output"]);
+        mgr.release(&pool, &store, lease.id, false).await.unwrap();
+        assert!(wt.exists(), "unmerged work retains its worktree");
+        git(&repo, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
+
+        let report = mgr.reconcile_on_startup(&pool).await.unwrap();
+        assert!(report.reclaimed_branches.is_empty());
+        assert!(
+            branches(&repo).contains(&lease.branch),
+            "a branch HEAD does not contain is never swept"
+        );
+    }
+
     #[tokio::test]
     async fn a_branch_holding_unmerged_work_is_never_reclaimed() {
         let dir = tempdir().unwrap();
@@ -1328,6 +1436,7 @@ mod tests {
             created_at: Utc::now(),
             expires_at: Utc::now(),
             released_at: None,
+            branch_deleted_at: None,
         };
         insert_lease(&pool, &lease).await.unwrap();
 

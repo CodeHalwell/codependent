@@ -484,6 +484,64 @@ pub async fn run_case_with_trace(
     Ok((result, trace))
 }
 
+/// Run every case in `cases` as a [`codypendent_eval::RegressionSuite`] guard
+/// batch, returning the real [`codypendent_eval::RegressionReport`] —
+/// [`codypendent_eval::RegressionSuite`]'s own `evaluate`, not an ad hoc
+/// re-implementation of its "a case with no observation counts as
+/// regressed" rule. Before this, nothing in the workspace ever built a
+/// `RegressionSuite` from a real run; every prior use was a hand-built
+/// `BTreeMap` in a unit test (see the task report). Mirrors [`run_suite`]
+/// case for case (fresh daemon-ensure, one checkout per case, one connection
+/// per case) but keeps every case's raw [`RunObservation`] — never
+/// discarding it into a bare pass/fail — because that is exactly what
+/// [`codypendent_eval::RegressionSuite::evaluate`] needs to tell "failed"
+/// apart from "never observed".
+///
+/// Intended for `evals/regressions/` (see that directory's own `README.md`):
+/// guard cases for historical failures that must never silently come back.
+/// No named CLI flag drives this yet — see `.impl/proposals/
+/// agent-models-from-agent-evals.md` for the follow-up wiring a `codypendent
+/// eval run --suite evals/regressions --regression` flag would need in
+/// `commands.rs` (not owned by this crate module).
+pub async fn run_regression_suite(
+    paths: &codypendent_protocol::discovery::RuntimePaths,
+    cases: &[EvalCase],
+    fixture_root: &Path,
+) -> anyhow::Result<codypendent_eval::RegressionReport> {
+    ensure_daemon(paths).await?;
+    let mut suite = codypendent_eval::RegressionSuite::new();
+    for case in cases {
+        suite.add(case.clone());
+    }
+    let mut observations = std::collections::BTreeMap::new();
+    for case in cases {
+        eprintln!("eval: running regression guard {}", case.id);
+        let (_scratch, checkout) = checkout_fixture(fixture_root, &case.repository_revision)
+            .await
+            .with_context(|| {
+                format!("preparing the fixture checkout for guard case {}", case.id)
+            })?;
+        let mut conn = Connection::connect(&paths.socket_path).await?;
+        let (mut obs, run_id) = run_case_over_connection(&mut conn, case, &checkout, None).await?;
+        inspect_repository(&checkout, run_id, case, &mut obs).await?;
+        observations.insert(case.id.clone(), obs);
+    }
+    let report = suite.evaluate(&observations);
+    if report.regressed() {
+        eprintln!(
+            "eval: regression suite FAILED — {} guard case(s) regressed: {}",
+            report.regressed_ids().len(),
+            report.regressed_ids().join(", ")
+        );
+    } else {
+        eprintln!(
+            "eval: regression suite held — {} guard case(s), none regressed",
+            cases.len()
+        );
+    }
+    Ok(report)
+}
+
 /// The connected core of one case's headless run: handshake, create a session,
 /// attach as `Controller`, start the run, and stream events until it reaches a
 /// terminal state — building a [`RunObservation`] from the stream as it goes.

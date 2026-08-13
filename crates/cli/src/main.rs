@@ -710,7 +710,25 @@ enum ModelsCommand {
         /// The `models.toml` model id to benchmark (its `base_url` is the
         /// endpoint the profile + probe are keyed under).
         id: String,
+        /// Set (or override) this model's blended per-1M-token price for
+        /// routing's cost/utility scoring, e.g. `3.5` for an average of $3.5
+        /// per million tokens. Without it, a HOSTED model's price is looked
+        /// up from the built-in provider catalog when the entry names a
+        /// known `provider_id` (the same catalog `models add` reads); when
+        /// neither is available the model is benched with an unpriced
+        /// profile and stays ineligible for routing (Chapter 09's hard
+        /// filter — a hosted model can never be silently treated as free).
+        /// A LOCAL model needs no price to route (routing costs it at $0
+        /// genuinely, not as the harness's "unmeasured" sentinel), so this
+        /// flag is normally only needed for a hosted endpoint the catalog
+        /// does not curate.
+        #[arg(long, value_name = "USD_PER_1M")]
+        price_per_1m_usd: Option<f64>,
     },
+    /// List the built-in + user-extended provider catalog: id, display name,
+    /// wire protocol, and whether it curates any prefilled models — the
+    /// input `models add <provider> <model-id>` expects.
+    ListProviders,
     /// Pull a GGUF model from the Unsloth catalog on Hugging Face and register
     /// it against the `ollama` provider. Resolves `<hf-repo>[:<quant>]`
     /// (defaulting a bare repo name to the `unsloth/` org and, with no
@@ -1118,7 +1136,11 @@ async fn main() -> anyhow::Result<()> {
                 id,
             } => commands::models_add(&paths, &provider, &model, key_env.as_deref(), id.as_deref()),
             ModelsCommand::Check { id } => commands::models_check(&paths, &id).await,
-            ModelsCommand::Bench { id } => commands::models_bench(&paths, &id).await,
+            ModelsCommand::Bench {
+                id,
+                price_per_1m_usd,
+            } => commands::models_bench(&paths, &id, price_per_1m_usd).await,
+            ModelsCommand::ListProviders => commands::models_list_providers(&paths),
             ModelsCommand::Pull { spec } => {
                 let hf = codypendent_integrations::unsloth::HfHubClient::hub()?;
                 codypendent_cli::models_pull::run(

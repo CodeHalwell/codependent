@@ -72,7 +72,7 @@ impl SkillDraft {
     pub fn new(id: impl Into<String>, name: impl Into<String>, scope: Scope,
                description: impl Into<String>, procedure: impl Into<String>) -> Self;
     // builder-style `.with_*` setters for the optional fields
-    pub fn promote_to_active(&mut self, next_version: &str);
+    pub fn promote_to_active(&mut self, next_version: impl Into<String>);
 }
 
 /// Render + validate (via `codypendent_knowledge::manifest::load_package`,

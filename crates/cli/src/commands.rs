@@ -2973,7 +2973,11 @@ pub async fn models_check(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> 
 /// `model_profiles` table the live daemon only *reads* (and only when routing is
 /// enabled, default OFF). SQLite WAL + the shared `busy_timeout` make the
 /// concurrent open safe.
-pub async fn models_bench(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
+pub async fn models_bench(
+    paths: &RuntimePaths,
+    id: &str,
+    price_per_1m_usd: Option<f64>,
+) -> anyhow::Result<()> {
     use codypendent_runtime::agent::FrameworkModelDriver;
     use codypendent_runtime::bench::{BenchOptions, DriverBenchTarget};
     use codypendent_runtime::models::{load_models, ModelRegistry};
@@ -3008,10 +3012,11 @@ pub async fn models_bench(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> 
     // The persisted profile's location is derived from the endpoint (fail-closed
     // to hosted). `models bench` is a LOCAL-model harness; warn loudly when it is
     // pointed at a non-local endpoint rather than silently mislabelling it.
-    if matches!(
+    let hosted = matches!(
         codypendent_runtime::bench::endpoint_location(&endpoint),
         codypendent_routing::ModelLocation::Hosted
-    ) {
+    );
+    if hosted {
         eprintln!(
             "models bench: WARNING — `{endpoint}` is not a local endpoint; the profile will be \
              stored as HOSTED (so the routing hard filter still applies) and its token price is \
@@ -3019,23 +3024,61 @@ pub async fn models_bench(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> 
         );
     }
 
+    // A HOSTED model needs a real per-token price to ever clear the router's
+    // "unmeasured hosted model" hard filter (outcome 11, F11.4) — this harness
+    // measures timing, never a real endpoint's price. A LOCAL model needs
+    // neither — its price is genuinely $0, not the harness's sentinel.
+    let known_price_per_1k_usd = if !hosted {
+        None
+    } else {
+        let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+            &paths.data_dir.join("providers.toml"),
+        )
+        .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+        let price = resolve_hosted_price(&config, &catalog, price_per_1m_usd);
+        if price.is_none() {
+            eprintln!(
+                "models bench: WARNING — no catalog price found for `{id}` (provider_id={:?}, \
+                 model={:?}); the profile will be stored UNPRICED and stay ineligible for \
+                 routing until one is set — re-run with `--price-per-1m-usd <blended $/1M>`.",
+                config.provider_id, config.model
+            );
+        }
+        price
+    };
+
     eprintln!("models bench: measuring `{id}` at {endpoint} (this drives the model)...");
     let profile = {
         let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
             .await
             .context("opening the database to persist the model profile")?;
-        bench_to_store(&pool, &endpoint, &target, BenchOptions::default()).await?
+        bench_to_store(
+            &pool,
+            &endpoint,
+            &target,
+            BenchOptions::default(),
+            known_price_per_1k_usd,
+        )
+        .await?
     };
 
     let bench = profile
         .bench
         .as_ref()
         .expect("a benched profile carries a LocalBench");
+    let price_line = if hosted {
+        match known_price_per_1k_usd {
+            Some(p) => format!("\n  price: ${:.4}/1K tokens (blended, routable)", p),
+            None => "\n  price: none (unpriced — ineligible for routing)".to_string(),
+        }
+    } else {
+        String::new()
+    };
     println!(
         "measured `{id}` (persisted to model_profiles @ {endpoint}):\n  \
          tokens/sec: {:.1}\n  time-to-first-token: {:.0} ms\n  warm-up: {:.0} ms\n  \
          memory: {} MB\n  context limit: {}\n  structured-output reliability: {:.2}\n  \
-         tool-call accuracy: {:.2}\n  coding-eval score: {:.2}",
+         tool-call accuracy: {:.2}\n  coding-eval score: {:.2}{price_line}",
         bench.tokens_per_second,
         bench.time_to_first_token_ms,
         bench.warmup_ms,
@@ -3048,15 +3091,44 @@ pub async fn models_bench(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// The per-1K-token price a benched HOSTED model should be persisted with, so
+/// it can clear the router's "unmeasured hosted model" hard filter (outcome
+/// 11, F11.4 — `2026-08-13-verticals/sandbox-eval-routing.md`): (1) an
+/// explicit `--price-per-1m-usd` override always wins; (2) otherwise the
+/// built-in provider catalog's own price for this exact `provider_id` +
+/// provider-side `model`, when known (both `cost_per_1m_input_usd` and
+/// `cost_per_1m_output_usd` present — a partial catalog row is treated as
+/// unpriced rather than blending a real number against a missing one); (3)
+/// `None` — an operator who wants this model routable must supply a price
+/// through one of the first two, never a fabricated one.
+fn resolve_hosted_price(
+    config: &codypendent_runtime::models::ModelConfig,
+    catalog: &codypendent_providers::Catalog,
+    override_per_1m_usd: Option<f64>,
+) -> Option<f64> {
+    if let Some(price) = override_per_1m_usd {
+        return Some(price / 1000.0);
+    }
+    let provider_id = config.provider_id.as_deref()?;
+    let row = catalog.model(provider_id, &config.model)?;
+    let (input, output) = (row.cost_per_1m_input_usd?, row.cost_per_1m_output_usd?);
+    Some(codypendent_runtime::bench::blended_price_per_1k_usd(
+        input, output,
+    ))
+}
+
 /// Run the bench against `target` and persist the measured profile to the store,
 /// returning the persisted profile. The persistence core, split from
 /// [`models_bench`] so a test drives it with a scripted target and a temp DB
-/// (no model, no network).
+/// (no model, no network). `known_price_per_1k_usd` rides straight into
+/// [`BenchOutcome::into_profile`] — see that method's doc comment for why a
+/// hosted model needs one to be routable at all.
 async fn bench_to_store(
     pool: &sqlx::SqlitePool,
     endpoint: &str,
     target: &dyn codypendent_runtime::bench::BenchTarget,
     options: codypendent_runtime::bench::BenchOptions,
+    known_price_per_1k_usd: Option<f64>,
 ) -> anyhow::Result<codypendent_routing::ModelProfile> {
     let outcome = codypendent_runtime::bench::run_bench(target, options)
         .await
@@ -3065,12 +3137,45 @@ async fn bench_to_store(
     // endpoint stored as `Local` would short-circuit the routing hard filter
     // (`endpoint_location` fails closed to `Hosted`).
     let location = codypendent_runtime::bench::endpoint_location(endpoint);
-    let profile = outcome.into_profile(location);
+    let profile = outcome.into_profile(location, known_price_per_1k_usd);
     codypendent_daemon::model_profiles::ModelProfileStore::new()
         .upsert(pool, endpoint, &profile)
         .await
         .context("persisting the measured model profile")?;
     Ok(profile)
+}
+
+/// `codypendent models list-providers`: the built-in + user-extended catalog's
+/// providers, one per line — id, wire protocol, and how many models it
+/// curates (F8: the `models add --help` text has always pointed here; this is
+/// what makes that true). Local providers (Ollama, LM Studio, vLLM) are
+/// marked so a user scanning the list can tell which ones need no API key.
+pub fn models_list_providers(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+        &paths.data_dir.join("providers.toml"),
+    )
+    .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+    for provider in catalog.providers() {
+        let curated = catalog
+            .models()
+            .filter(|m| m.provider_id == provider.id)
+            .count();
+        let protocol = match provider.protocol {
+            codypendent_providers::Protocol::OpenAiChat => "openai-chat",
+            codypendent_providers::Protocol::Anthropic => "anthropic",
+            codypendent_providers::Protocol::GeminiNative => "gemini-native",
+            codypendent_providers::Protocol::Acp => "acp",
+            _ => "unknown",
+        };
+        println!(
+            "{:20} {:14} {} model(s) curated{}",
+            provider.id,
+            protocol,
+            curated,
+            if provider.local { "  (local)" } else { "" }
+        );
+    }
+    Ok(())
 }
 
 /// The conservative declared capabilities a benched local model is described
@@ -3212,9 +3317,15 @@ mod models_bench_tests {
             .unwrap();
         let endpoint = "http://localhost:11434/v1";
 
-        let profile = bench_to_store(&pool, endpoint, &ScriptedTarget, BenchOptions::default())
-            .await
-            .unwrap();
+        let profile = bench_to_store(
+            &pool,
+            endpoint,
+            &ScriptedTarget,
+            BenchOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(profile.is_local());
         assert_eq!(profile.id, ModelId("qwen-local".into()));
 
@@ -3243,12 +3354,69 @@ mod models_bench_tests {
             "https://api.openai.com/v1",
             &ScriptedTarget,
             BenchOptions::default(),
+            None,
         )
         .await
         .unwrap();
         assert!(
             !profile.is_local(),
             "a non-local base_url is stored as hosted, so the classification filter still applies"
+        );
+        assert_eq!(
+            profile.performance.cost_per_1k_tokens_usd, 0.0,
+            "with no catalog/override price, a hosted profile stays unpriced \
+             (never a fabricated price) — and therefore ineligible for routing"
+        );
+    }
+
+    fn model_config(model: &str, provider_id: Option<&str>) -> codypendent_runtime::models::ModelConfig {
+        codypendent_runtime::models::ModelConfig {
+            id: ModelId(format!("test/{model}")),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.example.test/v1".to_string(),
+            model: model.to_string(),
+            api_key_env: String::new(),
+            provider_id: provider_id.map(str::to_owned),
+            context_tokens: None,
+        }
+    }
+
+    #[test]
+    fn resolve_hosted_price_prefers_the_explicit_override() {
+        let catalog = codypendent_providers::Catalog::builtin();
+        let config = model_config("claude-opus-5", Some("anthropic"));
+        // $10/1M override -> $0.01/1K, regardless of what the catalog says.
+        assert_eq!(
+            resolve_hosted_price(&config, &catalog, Some(10.0)),
+            Some(0.01)
+        );
+    }
+
+    #[test]
+    fn resolve_hosted_price_falls_back_to_the_catalogs_blended_price() {
+        let catalog = codypendent_providers::Catalog::builtin();
+        // The curated anthropic/claude-opus-5 row: $5/1M in, $25/1M out ->
+        // blended $15/1M -> $0.015/1K.
+        let config = model_config("claude-opus-5", Some("anthropic"));
+        assert_eq!(
+            resolve_hosted_price(&config, &catalog, None),
+            Some(0.015)
+        );
+    }
+
+    #[test]
+    fn resolve_hosted_price_is_none_when_neither_source_has_one() {
+        let catalog = codypendent_providers::Catalog::builtin();
+        // No provider_id at all.
+        assert_eq!(resolve_hosted_price(&model_config("mystery", None), &catalog, None), None);
+        // A provider_id the catalog does not curate this model under.
+        assert_eq!(
+            resolve_hosted_price(
+                &model_config("not-a-real-model-xyz", Some("anthropic")),
+                &catalog,
+                None
+            ),
+            None
         );
     }
 }

@@ -1094,9 +1094,29 @@ async fn observer_start_run_is_role_denied() {
     let mut stream = connect(&paths).await;
     handshake(&mut stream, client_id).await;
 
-    // Bind Observer, then attempt StartRun. Role is checked before session
-    // existence, so an Observer is denied regardless of the target session.
-    let session_id = SessionId::new();
+    // Bind Observer, then attempt StartRun against a session this connection
+    // actually owns. Ownership is now the OUTER gate (outcome 19): a command
+    // naming a session the connection's principal does not own — or one that
+    // does not exist — is refused `session-not-found` before the role is even
+    // consulted, so a probe cannot use `role-denied` to confirm an id. Role is
+    // what remains once you have proved the resource is yours, and it still
+    // denies an Observer here.
+    let create = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::CreateSession {
+                    workspace: WorkspaceId::new(),
+                    title: "observed".to_string(),
+                    repository: None,
+                },
+                "obs-create",
+            )),
+        ),
+    )
+    .await;
+    let session_id = create.session_id.expect("CreateSession returns its session");
     bind_role(&mut stream, client_id, ClientRole::Observer, "obs-att").await;
 
     let reply = send_recv(
@@ -1118,6 +1138,30 @@ async fn observer_start_run_is_role_denied() {
     .await;
     match reply.payload {
         Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.role-denied"),
+        other => panic!("expected CommandRejected, got {other:?}"),
+    }
+
+    // The other half of the new ordering: an id this principal does not own is
+    // refused as missing, never as `role-denied`.
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::StartRun {
+                    session_id: SessionId::new(),
+                    objective: "diagnose".to_string(),
+                    mode: AgentMode::Build,
+                    repository: None,
+                    model: None,
+                },
+                "start-unowned",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.session-not-found"),
         other => panic!("expected CommandRejected, got {other:?}"),
     }
 

@@ -2508,12 +2508,6 @@ async fn event_loop<P: Presentation>(
                     description: description.clone(),
                     chair: chair.clone(),
                     rounds: *rounds,
-                    // TEMPORARY probe-only patch (agent-evals): unblocks a
-                    // local build to verify crates/cli/src/eval.rs alone;
-                    // reverted via `git checkout` before this task's diff is
-                    // reported. Not this crate's fix to make permanently —
-                    // council/service.rs (agent-delegation) added `quorum`.
-                    quorum: None,
                     // The host-owned wizard has no evidence-mode step yet; a
                     // council created this way keeps rubric 6's "default
                     // behavior unchanged" and can still be flipped on later by
