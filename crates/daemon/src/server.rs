@@ -5370,6 +5370,30 @@ async fn memory_seam<'a>(
     mutating: bool,
     verb: &str,
 ) -> anyhow::Result<Option<&'a Arc<dyn crate::memory::MemoryGateway>>> {
+    // The memory store is daemon-wide: its scopes are System, the local user,
+    // and a repository — there is no per-row owner to resolve, so unlike a
+    // session or a workflow run there is nothing here to compare a principal
+    // AGAINST. The store therefore belongs to the uid the daemon runs as, and
+    // only that principal may touch it.
+    //
+    // The role check below is NOT a substitute: `ClientRole` is requested by
+    // the client, so without this a peer that can reach the socket could ask
+    // for `Controller` and issue `ForgetMemoryScope { tier: User | System }`,
+    // erasing every memory in a shared scope without knowing a single id. The
+    // socket directory's 0700 mode normally keeps other users out; this is the
+    // check that does not depend on that being true.
+    if conn.principal.uid() != state.daemon_uid {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "memory.transport-unavailable",
+                "the memory store is not enabled on this daemon".to_string(),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    }
     if mutating && conn.role != ClientRole::Controller {
         let reply = Envelope::reply_to(
             request,

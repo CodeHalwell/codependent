@@ -323,6 +323,21 @@ impl MemoryGateway for MemoryStoreGateway {
                 "statement": request.statement,
                 "confidence": request.confidence,
             });
+            // Validate BEFORE minting the receipt. `correct` re-checks
+            // authoritatively below — this pre-check exists only so a rejected
+            // request (absent, already superseded, or out of scope) does not
+            // leave an orphan artifact row and blob behind. Without it every
+            // invalid CorrectMemory grew storage permanently, and a caller
+            // could grow it without bound by repeating one.
+            let visible = MemoryStore::new()
+                .get(&host.pool, request.id)
+                .await
+                .map_err(memory_error_to_protocol)?
+                .is_some_and(|record| in_scope(&record, &scopes));
+            if !visible {
+                return Err(memory_error_to_protocol(MemoryError::NotFound(request.id)));
+            }
+
             let stored = host
                 .artifacts
                 .put(
@@ -475,6 +490,61 @@ mod tests {
             Curation::Accepted(record) => record.id,
             other => panic!("expected the seed memory to be accepted, got {other:?}"),
         }
+    }
+
+    /// A rejected correction used to mint its receipt artifact BEFORE the
+    /// target was validated, so every invalid `CorrectMemory` left an orphan
+    /// metadata row (and, for a unique statement, an orphan blob) behind. A
+    /// caller could grow the artifact store without bound by repeating one.
+    #[tokio::test]
+    async fn a_rejected_correction_persists_no_receipt_artifact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = db::open_database(&tmp.path().join("codypendent.db"))
+            .await
+            .expect("open db");
+        let gateway = MemoryStoreGateway::new(
+            pool.clone(),
+            ArtifactStore::new(tmp.path().join("artifacts")),
+        );
+
+        let artifacts_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artifacts")
+            .fetch_one(&pool)
+            .await
+            .expect("count artifacts");
+
+        // Out of scope for the repository this request names, so `correct`
+        // refuses it — the same refusal an absent id gets.
+        let hidden = seed_memory(
+            &pool,
+            Scope::Repository(RepositoryId::new()),
+            "another checkout's secret",
+        )
+        .await;
+
+        for id in [hidden, MemoryId::new()] {
+            let refused = gateway
+                .correct(CorrectMemoryRequest {
+                    id,
+                    repository: tmp.path().to_string_lossy().into_owned(),
+                    statement: "a correction that must not be recorded".to_string(),
+                    structured_value: None,
+                    confidence: 0.9,
+                })
+                .await;
+            assert!(
+                refused.is_err(),
+                "a hidden or absent memory must be refused"
+            );
+        }
+
+        let artifacts_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artifacts")
+            .fetch_one(&pool)
+            .await
+            .expect("count artifacts");
+        assert_eq!(
+            artifacts_before, artifacts_after,
+            "a refused correction must leave no receipt behind"
+        );
     }
 
     #[tokio::test]
