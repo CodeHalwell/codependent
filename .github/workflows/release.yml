@@ -195,20 +195,55 @@ jobs:
           path: ${{ steps.package.outputs.artifact }}
           if-no-files-found: error
 
-      # A tag push (`v1.2.3`) publishes a normal release on that tag. All three
-      # matrix jobs target the one release; action-gh-release creates it once and
-      # each job attaches its own tarball.
+  publish:
+    name: publish release
+    needs: build
+    if: >-
+      startsWith(github.ref, 'refs/tags/') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Collect every platform archive before touching the release. Publishing
+      # from the matrix jobs races concurrent release-policy/asset updates and
+      # can leave a partially populated release even though every build passed.
+      - name: Download platform archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: codypendent-*
+          path: dist
+          merge-multiple: true
+
+      - name: Resolve the workspace version
+        id: version
+        shell: bash
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the complete release set
+        shell: bash
+        run: |
+          expected=(
+            codypendent-x86_64-unknown-linux-gnu.tar.gz
+            codypendent-x86_64-apple-darwin.tar.gz
+            codypendent-aarch64-apple-darwin.tar.gz
+          )
+          for archive in "${expected[@]}"; do
+            test -s "dist/$archive"
+          done
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')" = "3"
+
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           body_path: docs/releases/v${{ steps.version.outputs.version }}.md
-          files: ${{ steps.package.outputs.artifact }}
+          files: dist/*.tar.gz
 
-      # Every push to main cuts a fresh, per-commit prerelease. The tag
-      # `v<version>-build.<run_number>` is identical across the three matrix jobs
-      # of a run (so they share one release) and distinct for every commit (so
-      # each commit publishes its own release). The workflow run creates the tag.
+      # Every push to main cuts one fresh, per-commit prerelease after every
+      # platform artifact has passed the same quality gates.
       - name: Publish rolling release (main)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
@@ -218,4 +253,4 @@ jobs:
           target_commitish: ${{ github.sha }}
           prerelease: true
           body_path: docs/releases/v${{ steps.version.outputs.version }}.md
-          files: ${{ steps.package.outputs.artifact }}
+          files: dist/*.tar.gz
