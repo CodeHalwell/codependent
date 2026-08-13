@@ -529,6 +529,23 @@ pub async fn run_with_executor_on_and_health(
             "adopted pre-0031 sessions for the local user"
         );
     }
+    // The same one-shot adoption for pre-0033 workflow runs. Without it every
+    // such row has neither a bound session nor an owner uid, and
+    // `principal_may_read_workflow` fails them closed — which would make a
+    // pre-upgrade user's existing workflow runs abruptly unreadable.
+    let adopted_workflows =
+        sqlx::query("UPDATE workflow_runs SET owner_uid = ? WHERE owner_uid IS NULL")
+            .bind(i64::from(daemon_uid))
+            .execute(&pool)
+            .await?
+            .rows_affected();
+    if adopted_workflows > 0 {
+        info!(
+            workflow_runs = adopted_workflows,
+            uid = daemon_uid,
+            "adopted pre-0033 workflow runs for the local user"
+        );
+    }
 
     let state = Arc::new(ServerState {
         pool,
@@ -1861,13 +1878,30 @@ async fn handle_request(
                         client_id: conn.client_id_or(request.client_id),
                     };
                     let reply = match starter.start(start).await {
-                        Ok(workflow_run_id) => Envelope::reply_to(
-                            &request,
-                            Payload::WorkflowRunStarted {
-                                command_id: command.command_id,
-                                workflow_run_id,
-                            },
-                        ),
+                        Ok(workflow_run_id) => {
+                            // Stamp the creating principal (0033). The store
+                            // inserts `run_id = NULL`, so this column is the
+                            // ONLY ownership a workflow run has until (and
+                            // unless) it is bound to a session run.
+                            if let Err(error) = sqlx::query(
+                                "UPDATE workflow_runs SET owner_uid = ? WHERE id = ? \
+                                 AND owner_uid IS NULL",
+                            )
+                            .bind(i64::from(conn.principal.uid()))
+                            .bind(&workflow_run_id)
+                            .execute(&state.pool)
+                            .await
+                            {
+                                warn!(%workflow_run_id, %error, "could not stamp workflow-run owner");
+                            }
+                            Envelope::reply_to(
+                                &request,
+                                Payload::WorkflowRunStarted {
+                                    command_id: command.command_id,
+                                    workflow_run_id,
+                                },
+                            )
+                        }
                         Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
                     };
                     send(writer, &reply).await?;
@@ -4074,16 +4108,20 @@ async fn principal_may_use_session(
 /// is by definition the local user.
 ///
 /// An **unbound workflow run** — one whose `workflow_runs.run_id` is NULL — is
-/// allowed for the same reason. That column is nullable on purpose (migration
-/// 0010: "the session run this workflow drives, *when bound*… so workflow
-/// storage is self-contained"), so a run that was never bound to a session has
-/// no owner recorded anywhere. Denying it protects nobody and makes the run
-/// permanently unreadable by every principal including the one that created it;
-/// the transport's peer-credential check is the boundary that applies.
+/// governed by its own `owner_uid` (migration 0033). That case is the norm, not
+/// an edge: `WorkflowStore::create_run_idempotent` inserts `run_id = NULL`
+/// unconditionally, so *every* client-created workflow run is unbound. An
+/// earlier version of this gate allowed unbound runs outright on the reasoning
+/// that they had no owner to protect — true of the schema as it stood, and
+/// wrong the moment you notice which runs are unbound: it made every workflow
+/// run in the product readable by any principal that could guess its id.
 ///
-/// A run that IS bound must resolve to a session this principal owns. Note the
-/// asymmetry is safe in the direction that matters: binding a run can only ever
-/// narrow who may read it.
+/// A run that IS bound to a session run is governed by that session's owner.
+/// Binding can only ever narrow who may read a run, never widen it.
+///
+/// A row with neither (created before 0033) is adopted for the daemon's own uid
+/// once at boot, exactly as pre-0031 sessions are, so this path sees it as
+/// owned rather than having to infer the same thing on every request.
 async fn principal_may_read_workflow(
     state: &ServerState,
     principal: PeerPrincipal,
@@ -4092,11 +4130,11 @@ async fn principal_may_read_workflow(
     if is_repository_board_id(workflow_run_id) {
         return Ok(true);
     }
-    match workflow_run_owner(state, workflow_run_id).await? {
+    match workflow_run_owner(&state.pool, workflow_run_id).await? {
         WorkflowOwner::Session(session_id) => {
             principal_may_use_session(state, principal, session_id).await
         }
-        WorkflowOwner::Unbound => Ok(true),
+        WorkflowOwner::Uid(owner_uid) => Ok(principal.uid() == owner_uid),
         WorkflowOwner::Missing => Ok(false),
     }
 }
@@ -4107,31 +4145,38 @@ async fn principal_may_read_workflow(
 enum WorkflowOwner {
     /// The run is bound to a session run; that session's owner governs.
     Session(SessionId),
-    /// The run exists but has no session bound (see the note above).
-    Unbound,
-    /// No such workflow run.
+    /// The run has no session bound, but carries the uid of the principal that
+    /// created it (migration 0033). This is the common case.
+    Uid(u32),
+    /// No such workflow run — or one with neither owner, which cannot survive
+    /// boot adoption and so is treated as absent rather than as public.
     Missing,
 }
 
 async fn workflow_run_owner(
-    state: &ServerState,
+    pool: &SqlitePool,
     workflow_run_id: &str,
 ) -> anyhow::Result<WorkflowOwner> {
     // LEFT JOIN, so an unbound run still yields a row (with a NULL session).
-    let row: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT r.session_id FROM workflow_runs w \
+    let row: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT r.session_id, w.owner_uid FROM workflow_runs w \
          LEFT JOIN runs r ON r.id = w.run_id WHERE w.id = ?",
     )
     .bind(workflow_run_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(pool)
     .await?;
     Ok(match row {
         None => WorkflowOwner::Missing,
-        Some((None,)) => WorkflowOwner::Unbound,
-        Some((Some(id),)) => match SessionId::from_str(&id) {
-            Ok(session_id) => WorkflowOwner::Session(session_id),
-            Err(_) => WorkflowOwner::Unbound,
+        // A bound session governs; it is the narrower of the two.
+        Some((Some(id), _)) if SessionId::from_str(&id).is_ok() => {
+            WorkflowOwner::Session(SessionId::from_str(&id).expect("checked above"))
+        }
+        Some((_, Some(uid))) => match u32::try_from(uid) {
+            Ok(uid) => WorkflowOwner::Uid(uid),
+            Err(_) => WorkflowOwner::Missing,
         },
+        // Neither: a pre-0033 row that boot adoption did not reach. Fail closed.
+        Some(_) => WorkflowOwner::Missing,
     })
 }
 
@@ -5666,6 +5711,73 @@ mod tests {
         persist_ui_plugin_command_result, remote_ui_artifact_range, remote_ui_command, resume,
         IntegrationHealth, REMOTE_UI_ACTIONS,
     };
+
+    /// `WorkflowStore::create_run_idempotent` inserts `run_id = NULL`
+    /// unconditionally, so EVERY client-created workflow run is unbound. An
+    /// earlier version of this gate read "unbound" as "no owner to protect" and
+    /// allowed those outright — which made every workflow run in the product
+    /// readable by any principal that could guess its id. Migration 0033 gives
+    /// the run its own owner; these pin the three cases apart.
+    ///
+    /// Driven at `workflow_run_owner` rather than over the socket on purpose:
+    /// the first version of this test sent `ReadWorkflowRun` to a test daemon
+    /// that has no workflow transport, so it was refused with
+    /// `workflow.transport-unavailable` before the gate was ever consulted and
+    /// passed against the bug it was written to catch.
+    #[tokio::test]
+    async fn an_unbound_workflow_run_is_owned_by_its_creator_not_by_everyone() {
+        use super::{workflow_run_owner, WorkflowOwner};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open_database(&dir.path().join("test.db"))
+            .await
+            .expect("migrated pool");
+        let now = Utc::now().to_rfc3339();
+
+        let insert = |id: &'static str, owner: Option<i64>| {
+            let pool = pool.clone();
+            let now = now.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO workflow_runs \
+                     (id, workflow_id, workflow_version, graph_signature, run_id, inputs_json, \
+                      state, created_at, updated_at, owner_uid) \
+                     VALUES (?, 'demo', 1, 'sig', NULL, '{}', 'pending', ?, ?, ?)",
+                )
+                .bind(id)
+                .bind(&now)
+                .bind(&now)
+                .bind(owner)
+                .execute(&pool)
+                .await
+                .expect("seed workflow run");
+            }
+        };
+        insert("wf-owned", Some(4242)).await;
+        insert("wf-legacy", None).await;
+
+        assert!(
+            matches!(
+                workflow_run_owner(&pool, "wf-owned").await.expect("query"),
+                WorkflowOwner::Uid(4242)
+            ),
+            "an unbound run must be governed by the uid that created it"
+        );
+        assert!(
+            matches!(
+                workflow_run_owner(&pool, "wf-legacy").await.expect("query"),
+                WorkflowOwner::Missing
+            ),
+            "a pre-0033 row boot adoption never reached must fail closed, not open"
+        );
+        assert!(
+            matches!(
+                workflow_run_owner(&pool, "wf-absent").await.expect("query"),
+                WorkflowOwner::Missing
+            ),
+            "an absent run is Missing — the same answer a foreign one produces"
+        );
+    }
 
     #[test]
     fn integration_health_is_sanitized_and_deduplicated() {
