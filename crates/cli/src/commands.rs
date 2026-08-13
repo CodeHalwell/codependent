@@ -3044,7 +3044,7 @@ pub fn models_add(
     id: Option<&str>,
 ) -> anyhow::Result<()> {
     use codypendent_providers::Catalog;
-    use codypendent_runtime::models::{load_models, ModelConfig};
+    use codypendent_runtime::models::ModelConfig;
 
     let data_dir = &paths.data_dir;
     std::fs::create_dir_all(data_dir)
@@ -3070,14 +3070,7 @@ pub fn models_add(
     }
 
     let models_path = data_dir.join("models.toml");
-    let mut configs = if models_path.exists() {
-        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?
-    } else {
-        Vec::new()
-    };
-    let replaced = configs.iter().any(|c| c.id.0 == display_id);
-    configs.retain(|c| c.id.0 != display_id);
-    configs.push(ModelConfig {
+    let config = ModelConfig {
         id: codypendent_protocol::ModelId(display_id.clone()),
         provider: "openai-compatible".to_string(),
         base_url,
@@ -3087,9 +3080,13 @@ pub fn models_add(
         context_tokens: catalog
             .model(provider_id, model)
             .and_then(|row| row.context_tokens),
-    });
-
-    crate::models_file::write_model_entries(&models_path, &configs)?;
+    };
+    let replaced = crate::models_file::update_model_entries(&models_path, |configs| {
+        let replaced = configs.iter().any(|c| c.id.0 == display_id);
+        configs.retain(|c| c.id.0 != display_id);
+        configs.push(config);
+        Ok(replaced)
+    })?;
     println!(
         "{} model {display_id} ({})",
         if replaced { "updated" } else { "added" },

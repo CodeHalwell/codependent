@@ -1,7 +1,7 @@
 # Codypendent CLI & TUI User Guide
 
 > **Product:** Codypendent — The local-first agentic developer environment
-> **Version:** 0.4.6
+> **Version:** 0.5.1
 > **Documentation Target:** CLI reference, Ratatui TUI shortcuts, environment setup, and workflow operations.
 
 ---
@@ -44,20 +44,17 @@ codypendent update --check
 
 # Install the newest published release, or pin an exact tag.
 codypendent update
-codypendent update v0.4.6
+codypendent update v0.5.1
 ```
 
 Updating never kills an active run. An idle daemon restarts immediately; a busy
 daemon keeps serving its current build until the runs finish or the next
 launch. Database migrations are embedded in the binary and apply on open. They
-preserve existing sessions and configuration; migration files are **meant** to
-be immutable once released — `sqlx` checksums every applied migration and
-refuses to boot if one changed underneath it — but that promise has already
-been broken once in practice: `migrations/0017_promotion_evidence.sql` gained
-five columns in a commit after v0.1.1 shipped it (`git log -- migrations/
-0017_promotion_evidence.sql`), so an install that upgrades from v0.1.1 hits a
-daemon that refuses to start. If you maintain this project, treat that as a
-standing bug, not a documentation nit.
+preserve existing sessions and configuration. Released migration files are
+immutable: `sqlx` checksums every applied migration and refuses to boot if one
+changes underneath an installation. Schema changes therefore always ship as a
+new numbered migration; the v0.1.1 promotion migration has been verified
+byte-for-byte against the published tag.
 
 ---
 

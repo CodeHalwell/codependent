@@ -533,6 +533,7 @@ async fn watch_loop(
         } else {
             false
         };
+        let deferred_rebuild = wants_rebuild && !rebuilt;
         if !rebuilt {
             // Within the rescan cooldown, or the rebuild failed. Fold what this
             // batch DOES name rather than discarding it — bounded per-file work
@@ -553,6 +554,35 @@ async fn watch_loop(
         // by any recursive watch yet — the root's own non-recursive watch is what
         // reported it. One `read_dir` of the root per batch closes that gap.
         watched = arm_source_subtrees(&mut watcher, &root, &mut watched);
+
+        // A dropped notify event names no path, so folding the paths that did
+        // arrive cannot repair the graph. Previously a cooldown-deferred rebuild
+        // forgot `lost` here and waited for an unrelated future filesystem event;
+        // if the tree then stayed quiet the graph remained stale forever. Wait
+        // outside the repository lock and perform the promised authoritative
+        // rebuild even when no further event arrives. Events accumulated during
+        // the wait remain in the bounded channel and are folded afterwards.
+        if deferred_rebuild {
+            let remaining = WATCH_FULL_RESCAN_COOLDOWN.saturating_sub(last_full_rescan.elapsed());
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining).await;
+            }
+            let guard = lock_repository(repository).await;
+            match scan_repository(&pool, repository, &root).await {
+                Ok(()) => {
+                    last_full_rescan = Instant::now();
+                    info!(%repository, "code-graph watcher: completed deferred rebuild");
+                }
+                Err(error) => {
+                    // Preserve the need for a rebuild. The next queued event (or
+                    // producer overflow) will retry instead of treating the
+                    // missing paths as repaired.
+                    dropped.fetch_add(lost.max(1), Ordering::Relaxed);
+                    warn!(%repository, %error, "code-graph deferred rebuild failed");
+                }
+            }
+            drop(guard);
+        }
 
         if closed {
             break;

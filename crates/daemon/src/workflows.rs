@@ -43,6 +43,10 @@ pub struct StartWorkflowRequest {
     /// restart. `None` (an older client that sends none) leaves the node executor
     /// to fall back to the daemon's startup repository root.
     pub repository: Option<String>,
+    /// The server-derived operating-system principal that owns the run. This is
+    /// never accepted from the wire: the daemon stamps it before crossing this
+    /// seam so ownership is committed atomically with the durable run.
+    pub owner_uid: u32,
     /// The identity of the starting client, for attribution.
     pub client_id: ClientId,
 }

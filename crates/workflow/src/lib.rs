@@ -83,5 +83,6 @@ pub use source::{
 };
 pub use store::{
     blocked_node_ids, ready_node_ids, Checkpoint, NodeState, ResumePlan, WorkflowNodeRecord,
-    WorkflowRunRecord, WorkflowRunSnapshot, WorkflowRunState, WorkflowStore, WorkflowStoreError,
+    WorkflowRunAttribution, WorkflowRunRecord, WorkflowRunSnapshot, WorkflowRunState,
+    WorkflowStore, WorkflowStoreError,
 };

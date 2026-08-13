@@ -4162,7 +4162,7 @@ fn write_add_model(
 ) -> anyhow::Result<()> {
     use codypendent_providers::Catalog;
     use codypendent_runtime::auth::AuthStore;
-    use codypendent_runtime::models::{load_models, ModelConfig};
+    use codypendent_runtime::models::ModelConfig;
 
     if display_id.trim().is_empty() {
         bail!("model id must not be blank");
@@ -4242,17 +4242,8 @@ fn write_add_model(
             .and_then(|row| row.context_tokens)
     });
 
-    // Read the existing models.toml (absent ⇒ start empty) through the real
-    // loader, drop any entry sharing the new display id (update-in-place), then
-    // append the new one — every other existing entry survives untouched.
     let models_path = data_dir.join("models.toml");
-    let mut configs = if models_path.exists() {
-        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?
-    } else {
-        Vec::new()
-    };
-    configs.retain(|c| c.id.0 != display_id);
-    configs.push(ModelConfig {
+    let config = ModelConfig {
         id: ModelId(display_id.to_string()),
         provider: runtime_provider,
         base_url,
@@ -4262,9 +4253,12 @@ fn write_add_model(
         // ACP agent's provider id names a registry agent, not a provider.
         provider_id: catalog_provider.then(|| provider_id.to_string()),
         context_tokens,
-    });
-
-    crate::models_file::write_model_entries(&models_path, &configs)?;
+    };
+    crate::models_file::update_model_entries(&models_path, |configs| {
+        configs.retain(|c| c.id.0 != display_id);
+        configs.push(config);
+        Ok(())
+    })?;
 
     // Store the key (hosted providers only) in auth.json at 0600 — loaded
     // above, BEFORE models.toml was written, so a corrupt pre-existing
