@@ -99,20 +99,24 @@ use crate::tools::{
     new_pull_request, parse_artifact_read, parse_blackboard_post, parse_blackboard_query,
     parse_council_create, parse_council_result, parse_council_run, parse_create_check_run,
     parse_create_draft_pull_request, parse_docs_create, parse_docs_edit, parse_docs_read,
-    parse_docs_suggest, parse_edit_file as parse_edit_file_args, parse_get_pull_request,
+    graph_proposed_action, parse_docs_suggest, parse_edit_file as parse_edit_file_args,
+    parse_get_pull_request,
     parse_list_check_runs, parse_memory_remember, parse_skills_search, parse_task_create,
     parse_task_list, parse_task_move, parse_task_update, parse_update_pull_request,
-    parse_web_search, parse_workflow_create, parse_workflow_query, parse_workflow_run,
+    parse_symbol_question, parse_tests_covering, parse_web_search, parse_workflow_create,
+    parse_workflow_query, parse_workflow_run,
     parse_write_file as parse_write_file_args, render_check_runs, render_pull_request,
     render_registry_search, render_search_outcome, task_read_action, task_write_action, tool_label,
-    workflow_create_action, workflow_run_action, ApplyPatch, ApplyPatchInput, ArtifactRead,
+    summarize_graph_question, workflow_create_action, workflow_run_action, ApplyPatch,
+    ApplyPatchInput, ArtifactRead,
     ArtifactReadInput, ArtifactReader, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
     BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CouncilCreateInput,
     CouncilCreateTool, CouncilResultInput, CouncilResultTool, CouncilRunInput, CouncilRunTool,
     CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
     CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool, DocsEditInput, DocsEditTool,
     DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool, EditFile, EditFileInput,
-    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns,
+    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput,
+    GraphBlastRadius, GraphCallersOf, GraphTestsCovering, ListCheckRuns,
     ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput,
     RegistrySearch, RegistrySearchRequest, RepositoryTest, Search, SearchInput, Shell,
     SkillsSearch, SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool,
@@ -1408,6 +1412,10 @@ pub struct FrameworkAgentRuntime {
     /// gate outright (advertise every offered built-in — the behavior before
     /// this existed). Set from `models.toml`'s `[retrieval] builtin_top_k`.
     builtin_top_k: usize,
+    /// The code graph the `graph.*` tools query (outcome 5), if wired. Like
+    /// `registry`, a process-wide read seam over the daemon's own derived
+    /// projection; `None` leaves the three tools unoffered.
+    code_graph: Option<Arc<dyn codypendent_knowledge::CodeGraphQueries>>,
     /// The registry the `skills.search` tool queries (rubric 9), if wired.
     /// Process-wide (one knowledge pool), like `github`/`mcp`, so it lives on
     /// the runtime rather than the run context. `None` leaves the tool unoffered
@@ -1473,6 +1481,7 @@ impl FrameworkAgentRuntime {
             blackboard: None,
             mcp_top_k: crate::models::DEFAULT_MCP_TOP_K,
             builtin_top_k: crate::models::DEFAULT_BUILTIN_TOP_K,
+            code_graph: None,
             registry: None,
             docs: None,
             artifacts: None,
@@ -1548,6 +1557,20 @@ impl FrameworkAgentRuntime {
     #[must_use]
     pub fn with_registry_search(mut self, registry: Arc<dyn RegistrySearch>) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Inject the code-graph seam the `graph.*` tools query (outcome 5). Without
+    /// it the tools are never offered and a run behaves exactly as before. The
+    /// daemon binds it over the same pool and the same `repository_id_for` the
+    /// startup scan wrote the graph under — deriving that identity any other way
+    /// is how a caller ends up querying an id nothing was ever stored beneath.
+    #[must_use]
+    pub fn with_code_graph(
+        mut self,
+        code_graph: Arc<dyn codypendent_knowledge::CodeGraphQueries>,
+    ) -> Self {
+        self.code_graph = Some(code_graph);
         self
     }
 
@@ -1721,6 +1744,20 @@ impl FrameworkAgentRuntime {
         // filter below leaves it in every mode).
         if self.registry.is_some() {
             names.push(SkillsSearch::NAME.to_string());
+        }
+        // Outcome 5: offered whenever the graph seam is wired — a read of the
+        // daemon's own derived projection, so like `skills.search` the
+        // configured gate alone decides and no mode overlay removes it.
+        if self.code_graph.is_some() {
+            names.extend(
+                [
+                    GraphCallersOf::NAME,
+                    GraphBlastRadius::NAME,
+                    GraphTestsCovering::NAME,
+                ]
+                .iter()
+                .map(|name| (*name).to_string()),
+            );
         }
         if self.offers_blackboard(run) {
             names.extend(
@@ -3465,6 +3502,44 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::SkillsSearch(input),
                 })
             }
+            // Outcome 5: the three code-graph reads. Match-guarded on a wired
+            // seam (the blackboard idiom), so a call with no graph falls through
+            // to the unknown-tool refusal the offering already promised. The
+            // depth a model asks for is carried, never rejected: the store
+            // clamps it, so an absurd number answers narrowly instead of failing.
+            GraphCallersOf::NAME if self.code_graph.is_some() => {
+                let (symbol, _) = parse_symbol_question(args, GraphCallersOf::NAME)?;
+                let question = codypendent_knowledge::GraphQuestion::CallersOf { symbol };
+                Ok(Prepared {
+                    action: graph_proposed_action(
+                        &run.repository,
+                        summarize_graph_question(&question),
+                    ),
+                    tool: PreparedTool::CodeGraph(question),
+                })
+            }
+            GraphBlastRadius::NAME if self.code_graph.is_some() => {
+                let (symbol, depth) = parse_symbol_question(args, GraphBlastRadius::NAME)?;
+                let question = codypendent_knowledge::GraphQuestion::BlastRadius { symbol, depth };
+                Ok(Prepared {
+                    action: graph_proposed_action(
+                        &run.repository,
+                        summarize_graph_question(&question),
+                    ),
+                    tool: PreparedTool::CodeGraph(question),
+                })
+            }
+            GraphTestsCovering::NAME if self.code_graph.is_some() => {
+                let (path, depth) = parse_tests_covering(args)?;
+                let question = codypendent_knowledge::GraphQuestion::TestsCovering { path, depth };
+                Ok(Prepared {
+                    action: graph_proposed_action(
+                        &run.repository,
+                        summarize_graph_question(&question),
+                    ),
+                    tool: PreparedTool::CodeGraph(question),
+                })
+            }
             // `artifact.read`: gated on a wired reader exactly as
             // `offered_tool_names` gates the offer (the blackboard match-guard
             // idiom) — a call with no reader falls through to the unknown-tool
@@ -4820,6 +4895,9 @@ enum PreparedTool {
     /// A `skills.search` call (rubric 9): the parsed query plus the optional
     /// skill name whose procedure to open.
     SkillsSearch(SkillsSearchInput),
+    /// A `graph.*` call (outcome 5): the typed question, already bounded by its
+    /// parser and clamped again by the store.
+    CodeGraph(codypendent_knowledge::GraphQuestion),
     DocsCreate(DocsCreateInput),
     DocsRead(DocsReadInput),
     DocsEdit(DocsEditInput),

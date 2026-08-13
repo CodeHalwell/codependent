@@ -248,8 +248,24 @@ pub fn plan_publication(doc: &KnowledgeDocument, target: PublishTarget) -> Publi
     }
 }
 
+/// A minimal, GitHub-API-agnostic handle to an opened pull request — just
+/// enough to persist and later poll. This crate depends only on
+/// `codypendent-protocol` (see the crate root docs), so it cannot name
+/// `codypendent-integrations::github::model::PullRequest` directly; the
+/// daemon assembly (`codypendentd::publish`) converts between the two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestHandle {
+    pub number: u64,
+    pub url: String,
+}
+
 /// A recorded publication: which document revision was published, to where, at
-/// which commit, and the hash of the rendered Markdown.
+/// which commit, and the hash of the rendered Markdown. For a
+/// `DocumentationPr` target, also the opened PR's number/URL and — once
+/// polled back via [`record_pull_request_merge`] — whether/when it merged
+/// (2026-08-13 review F9: until now, the PR `create_draft_pull_request`
+/// returned was discarded outright — `.await?; Ok(())` — so nothing was ever
+/// persisted to poll, and no schema column existed to poll into).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Publication {
     pub id: String,
@@ -258,22 +274,35 @@ pub struct Publication {
     pub target: String,
     pub git_commit: Option<String>,
     pub rendered_hash: String,
+    /// The opened PR's number, for a `DocumentationPr` target; `None` for the
+    /// other two targets, which never open a PR.
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+    /// Whether GitHub has reported this PR merged, as of the last poll.
+    pub pr_merged: bool,
+    pub pr_merged_at: Option<String>,
+    pub pr_merge_commit_sha: Option<String>,
 }
 
 /// Record a completed publication (`plan` executed, producing `git_commit`),
-/// storing the `(document revision ↔ git commit)` pairing staleness compares.
+/// storing the `(document revision ↔ git commit)` pairing staleness compares,
+/// and — for a `DocumentationPr` target — the opened PR's handle so its merge
+/// status can later be polled and reflected back (see
+/// [`record_pull_request_merge`]).
 pub async fn record_publication(
     pool: &SqlitePool,
     document_id: DocumentId,
     plan: &PublishPlan,
     git_commit: Option<&str>,
+    pull_request: Option<&PullRequestHandle>,
 ) -> Result<Publication, DocStoreError> {
     let id = Uuid::now_v7().to_string();
     let target = plan.git_action.clone();
     sqlx::query(
         "INSERT INTO document_publications \
-         (id, document_id, revision, target, git_commit, rendered_hash, published_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         (id, document_id, revision, target, git_commit, rendered_hash, published_at, \
+          pr_number, pr_url, pr_merged, pr_merged_at, pr_merge_commit_sha) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)",
     )
     .bind(&id)
     .bind(document_id.to_string())
@@ -282,6 +311,8 @@ pub async fn record_publication(
     .bind(git_commit)
     .bind(&plan.rendered_hash)
     .bind(Utc::now().to_rfc3339())
+    .bind(pull_request.map(|pr| pr.number as i64))
+    .bind(pull_request.map(|pr| pr.url.clone()))
     .execute(pool)
     .await?;
     Ok(Publication {
@@ -291,6 +322,11 @@ pub async fn record_publication(
         target,
         git_commit: git_commit.map(str::to_string),
         rendered_hash: plan.rendered_hash.clone(),
+        pr_number: pull_request.map(|pr| pr.number),
+        pr_url: pull_request.map(|pr| pr.url.clone()),
+        pr_merged: false,
+        pr_merged_at: None,
+        pr_merge_commit_sha: None,
     })
 }
 
@@ -300,23 +336,92 @@ pub async fn publications(
     document_id: DocumentId,
 ) -> Result<Vec<Publication>, DocStoreError> {
     let rows = sqlx::query(
-        "SELECT id, revision, target, git_commit, rendered_hash FROM document_publications \
+        "SELECT id, revision, target, git_commit, rendered_hash, pr_number, pr_url, pr_merged, \
+         pr_merged_at, pr_merge_commit_sha FROM document_publications \
          WHERE document_id = ? ORDER BY published_at DESC, id DESC",
     )
     .bind(document_id.to_string())
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .iter()
-        .map(|row| Publication {
-            id: row.get("id"),
-            document_id,
-            revision: row.get::<i64, _>("revision") as u64,
-            target: row.get("target"),
-            git_commit: row.get("git_commit"),
-            rendered_hash: row.get("rendered_hash"),
+    rows.iter()
+        .map(|row| decode_publication(row, document_id))
+        .collect()
+}
+
+/// Every publication row that opened a pull request whose merge status has
+/// not yet been observed as merged — the poll list a merge-status sync walks
+/// (2026-08-13 review F9). Spans every document, newest first.
+pub async fn pending_pull_request_publications(
+    pool: &SqlitePool,
+) -> Result<Vec<Publication>, DocStoreError> {
+    let rows = sqlx::query(
+        "SELECT id, document_id, revision, target, git_commit, rendered_hash, pr_number, pr_url, \
+         pr_merged, pr_merged_at, pr_merge_commit_sha FROM document_publications \
+         WHERE pr_number IS NOT NULL AND pr_merged = 0 \
+         ORDER BY published_at DESC, id DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            let document_id: DocumentId = row
+                .get::<String, _>("document_id")
+                .parse()
+                .map_err(|e: uuid::Error| DocStoreError::Corrupt(e.to_string()))?;
+            decode_publication(row, document_id)
         })
-        .collect())
+        .collect()
+}
+
+/// Reflect a polled GitHub merge status back onto every publication row that
+/// opened `pr_number` for `document_id` — the read-back half of F9 that
+/// `open_documentation_pr` alone could never provide (opening a PR and it
+/// later merging are separated by however long review takes). Idempotent:
+/// re-polling an already-merged PR is a harmless no-op update. Returns how
+/// many rows were updated (0 for a PR number never recorded against this
+/// document).
+pub async fn record_pull_request_merge(
+    pool: &SqlitePool,
+    document_id: DocumentId,
+    pr_number: u64,
+    merged: bool,
+    merged_at: Option<&str>,
+    merge_commit_sha: Option<&str>,
+) -> Result<u64, DocStoreError> {
+    let result = sqlx::query(
+        "UPDATE document_publications SET pr_merged = ?, pr_merged_at = ?, pr_merge_commit_sha = ? \
+         WHERE document_id = ? AND pr_number = ?",
+    )
+    .bind(merged)
+    .bind(merged_at)
+    .bind(merge_commit_sha)
+    .bind(document_id.to_string())
+    .bind(pr_number as i64)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Decode one `document_publications` row (the column set [`publications`]
+/// and [`pending_pull_request_publications`] both select) into a
+/// [`Publication`], anchored to the caller-supplied `document_id`.
+fn decode_publication(
+    row: &sqlx::sqlite::SqliteRow,
+    document_id: DocumentId,
+) -> Result<Publication, DocStoreError> {
+    Ok(Publication {
+        id: row.get("id"),
+        document_id,
+        revision: row.get::<i64, _>("revision") as u64,
+        target: row.get("target"),
+        git_commit: row.get("git_commit"),
+        rendered_hash: row.get("rendered_hash"),
+        pr_number: row.get::<Option<i64>, _>("pr_number").map(|n| n as u64),
+        pr_url: row.get("pr_url"),
+        pr_merged: row.get("pr_merged"),
+        pr_merged_at: row.get("pr_merged_at"),
+        pr_merge_commit_sha: row.get("pr_merge_commit_sha"),
+    })
 }
 
 #[cfg(test)]

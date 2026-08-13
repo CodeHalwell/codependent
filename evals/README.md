@@ -94,12 +94,24 @@ multi-fixture-revision suite (see below) removes this constraint.
    allow-listed shell command in this codebase's default policy requires
    approval (`crates/daemon/src/policy/mod.rs`), so this is a narrow,
    documented gap, not a silent one.
-2. **From the checked-out working tree, after the run completes** —
+2. **From the run's own isolated worktree, after the run completes** —
    `changed_files` (tracked + untracked diff against the pinned revision),
    `existing_symbols` (a literal `git grep`, checked only when a case
-   actually asserts `symbol-exists`), and `tests_passed` (a real `cargo test`
-   in the checkout, checked only when a case asserts `tests-pass`). These
-   facts live in the repository, not on the wire.
+   actually asserts `symbol-exists`), and `tests_passed` (a real `cargo test`,
+   checked only when a case asserts `tests-pass`). These facts live in the
+   repository, not on the wire. **Not `repository` itself** — STEP 1.8
+   isolates every writing run onto its own `git worktree` (a sibling
+   directory, `codypendent-worktrees/<repo>/run-<short-id>`), and
+   `WorktreeManager::release` never merges that back into the checkout that
+   spawned it (it exports the diff as a patch artifact and, whenever the
+   worktree holds real changes, *retains the directory* instead of deleting
+   it). Diffing `repository` alone would report `file-changed` as false for
+   every case that actually worked — a false negative baked into the harness,
+   found and fixed in this task (see `crate::eval::run_worktree_root`'s own
+   doc in `crates/cli/src/eval.rs` for the full trust chain, and
+   `run_worktree_root_matches_the_daemons_own_layout`, which cross-checks the
+   reconstructed path against a real `WorktreeManager::allocate` call rather
+   than a hand-verified formula).
 
 `correct_citations` has **no signal yet** — no event carries a claim/source
 pair — so it is always empty and a `citation-correct` assertion would always
