@@ -181,13 +181,28 @@ impl RuntimePaths {
     /// Create the data, run, and log directories. On Unix the directories are
     /// restricted to the owning user (0o700) because the socket grants daemon
     /// access.
+    ///
+    /// The 0o700 is applied ONLY to a directory this process created, or to one
+    /// inside the data dir — never to a pre-existing directory borrowed from
+    /// elsewhere. `run_dir` is `socket_path.parent()`, so `CODYPENDENT_SOCKET`
+    /// points it anywhere the user likes, and [`DiscoveryError::SocketPathTooLong`]
+    /// recommends "for example under /tmp". Chmodding unconditionally took that
+    /// advice literally and made the machine's shared `/tmp` private to one
+    /// user, breaking every other program on the host.
     pub fn ensure_directories(&self) -> std::io::Result<()> {
         for dir in [&self.data_dir, &self.run_dir, &self.log_dir] {
+            let pre_existing = dir.exists();
             std::fs::create_dir_all(dir)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+                // Ours to tighten: we just made it, or it lives in our own tree
+                // (where a loose mode from an older version is worth fixing).
+                // Ours to tighten: we just made it, or it lives in our own tree
+                // (where a loose mode from an older version is worth fixing).
+                if !pre_existing || dir.starts_with(&self.data_dir) {
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+                }
             }
         }
         Ok(())
@@ -269,5 +284,48 @@ mod tests {
 
         std::env::remove_var("CODYPENDENT_DATA_DIR");
         std::env::remove_var("CODYPENDENT_CONFIG_DIR");
+    }
+
+    /// `run_dir` is `socket_path.parent()`, and `SocketPathTooLong` tells the
+    /// user to put the socket "for example under /tmp". Tightening that borrowed
+    /// directory to 0o700 made the machine's shared `/tmp` private to one user.
+    /// A directory we did not create and do not own stays exactly as we found it.
+    #[cfg(unix)]
+    #[test]
+    fn a_borrowed_socket_directory_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shared = PathBuf::from("/tmp/cp-pf3-borrowed-socket-dir");
+        let data = PathBuf::from("/tmp/cp-pf3-borrowed-socket-data");
+        let _ = std::fs::remove_dir_all(&shared);
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&shared).expect("create the shared dir");
+        // 1777: world-writable + sticky, exactly like a real /tmp.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777))
+            .expect("set the shared mode");
+
+        let paths = RuntimePaths::with_socket(
+            data.clone(),
+            shared.join("daemon.sock"),
+            data.join("config"),
+        );
+        paths.ensure_directories().expect("ensure directories");
+
+        let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o7777;
+        assert_eq!(
+            mode(&shared),
+            0o1777,
+            "a pre-existing socket directory outside the data dir must not be chmodded"
+        );
+        // The dirs we do own are still locked down — the socket grants daemon access.
+        assert_eq!(mode(&data), 0o700, "the data dir is ours to restrict");
+        assert_eq!(
+            mode(&paths.log_dir),
+            0o700,
+            "the log dir is ours to restrict"
+        );
+
+        let _ = std::fs::remove_dir_all(&shared);
+        let _ = std::fs::remove_dir_all(&data);
     }
 }
