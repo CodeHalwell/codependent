@@ -2041,6 +2041,9 @@ mod tests {
                 html_url: format!("https://github.com/octocat/hello-world/pull/{number}"),
                 head: None,
                 base: None,
+                merged: false,
+                merged_at: None,
+                merge_commit_sha: None,
             };
             prs.push(pr.clone());
             Ok(pr)

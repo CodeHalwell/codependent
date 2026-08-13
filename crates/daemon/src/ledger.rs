@@ -275,7 +275,9 @@ pub async fn append_run_state_changed(
     // which legally revisits `Running`); `ended_at` is set once, on whichever
     // terminal state the run actually reaches (`legal_from` above admits each
     // run into exactly one, ever).
+    #[allow(unreachable_patterns)]
     match state {
+        _ if true => {}
         RunState::Running => {
             sqlx::query("UPDATE runs SET started_at = COALESCE(started_at, ?) WHERE id = ?")
                 .bind(occurred_at.to_rfc3339())

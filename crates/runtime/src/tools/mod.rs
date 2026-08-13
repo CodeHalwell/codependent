@@ -38,6 +38,7 @@ mod docs;
 mod edit_file;
 mod git;
 mod github;
+mod graph;
 mod label;
 mod memory;
 mod read_file;
@@ -78,6 +79,10 @@ pub use docs::{
 pub use edit_file::{parse_edit_file, EditFile, EditFileInput, EditFileOutcome, FileEdit};
 pub use git::{
     ApplyPatch, ApplyPatchInput, ApplyPatchOutcome, GitDiff, GitDiffInput, GitDiffOutcome,
+};
+pub use graph::{
+    graph_proposed_action, parse_symbol_question, parse_tests_covering,
+    summarize_graph_question, GraphBlastRadius, GraphCallersOf, GraphTestsCovering,
 };
 pub use github::{
     new_pull_request, parse_create_check_run, parse_create_draft_pull_request,

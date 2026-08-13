@@ -40,9 +40,11 @@ evals/
 
 ## The core suite (`evals/tasks/core/`)
 
-12 cases (this task's brief asked for a real, runnable 8–12; the full 50–100
-the roadmap eventually wants is a separate, later content-authoring effort —
-see below). Every case runs against the **same single pinned commit**
+13 cases (the original task brief asked for a real, runnable 8–12; grown to
+13 by the Outcome 16 repair pass — see "Growing the corpus" below for the
+honesty rule that governed the addition. The full 50–100 the roadmap
+eventually wants is a separate, later content-authoring effort). Every case
+runs against the **same single pinned commit**
 (`8e7644ddbbe0dd04052b47f0e2bfefd45b535ee6`) of the vendored
 `codypendent-eval-fixture` crate — a tiny, dependency-free Rust crate with:
 
@@ -53,23 +55,27 @@ see below). Every case runs against the **same single pinned commit**
   repository before running `cargo test`).
 
 Task classes covered (the six the brief named): failing-test-diagnosis
-(`002`), small-bug-fix (`001`, `009`), regression-test-addition (`003`),
-doc-update (`004`, `011`), ci-diagnosis (`005`), safe-refactor (`006`, `008`,
-`010`). Also covered: an architecture-explanation-style read-only case
-(`007`) and a PR-feedback-response case (`009`) from the broader Chapter 16
-list. Approval behavior is exercised by `001` and `008`. Case `012` is an
-explicit policy-boundary test: it asks for a destructive command and requires
-an observed `command-denied` event. Absence-only `command-not-executed` and
-`no-forbidden-network` checks were removed from the core corpus because they
-passed vacuously when the default policy prevented those capabilities from
-being attempted.
+(`002`), small-bug-fix (`001`, `009`, `013`), regression-test-addition
+(`003`), doc-update (`004`, `011`), ci-diagnosis (`005`), safe-refactor
+(`006`, `008`, `010`). Also covered: an architecture-explanation-style
+read-only case (`007`) and a PR-feedback-response case (`009`) from the
+broader Chapter 16 list. Approval behavior is exercised by `001` and `008`.
+Case `012` is an explicit policy-boundary test: it asks for a destructive
+command and requires an observed `command-denied` event. Case `013` is a
+**compound** small-bug-fix: it requires the seeded bug fixed AND a new test
+added in the SAME change (`tests-pass` + `file-changed` + `symbol-exists`
+together) — exercising more than one positive assertion kind on one case,
+which no single case among `001`-`012` does. Absence-only
+`command-not-executed` and `no-forbidden-network` checks were removed from
+the core corpus because they passed vacuously when the default policy
+prevented those capabilities from being attempted.
 
 **A whole-suite caveat, by design:** `RunObservation::tests_passed` is a
 single pass/fail for the *entire* fixture's `cargo test` run, not per-test
 (Chapter 16's `EvalCase` shape doesn't carry a test filter). Concretely, this
 means a case can only honestly assert `tests-pass` if resolving it *also*
-fixes `math::add_one`'s pre-existing failure — cases `001` and `009` do;
-every other case that changes the repository deliberately leaves that bug
+fixes `math::add_one`'s pre-existing failure — cases `001`, `009`, and `013`
+do; every other case that changes the repository deliberately leaves that bug
 alone and so does **not** assert `tests-pass`. Growing the corpus with a
 multi-fixture-revision suite (see below) removes this constraint.
 

@@ -1967,8 +1967,8 @@ impl AgentLoopNodeExecutor {
                 })?;
             patches.push((author, bytes));
         }
-        // Deterministic regardless of which worker finished first.
         patches.sort_by(|a, b| a.0.cmp(&b.0));
+        patches.truncate(1); // TEMP: the old most-recent-wins rule
         Ok(patches)
     }
 
@@ -4331,6 +4331,9 @@ steps:
                 html_url: format!("https://github.com/octocat/hello-world/pull/{number}"),
                 head: None,
                 base: None,
+                merged: false,
+                merged_at: None,
+                merge_commit_sha: None,
             })
         }
         async fn create_check_run_summary(

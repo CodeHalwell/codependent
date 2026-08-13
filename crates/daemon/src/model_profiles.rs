@@ -18,7 +18,7 @@
 
 use chrono::Utc;
 use codypendent_protocol::ids::ModelId;
-use codypendent_routing::{ModelCapabilities, ModelProfile};
+use codypendent_routing::{ModelCapabilities, ModelProfile, TaskClass};
 use sqlx::{Row, SqlitePool};
 
 /// An error from the model-profile store.
@@ -191,6 +191,111 @@ impl ModelProfileStore {
         .await?
         .rows_affected();
         Ok(affected)
+    }
+
+    /// Record one REAL run's outcome for `(model, endpoint, task_class)` and
+    /// immediately fold the recomputed aggregate into
+    /// `performance.task_class_success` — outcome 11's missing writer
+    /// (migration 0025, `crates/routing/src/profile.rs::ModelPerformance`'s
+    /// per-task-class map had exactly one non-test constructor in the
+    /// workspace before this, `BenchOutcome::into_profile`, and it always
+    /// wrote an empty one). The recompute is exact — a fresh `AVG` over every
+    /// `model_task_outcomes` row for this key, not an incrementally-updated
+    /// running average — so repeated calls cannot accumulate floating-point
+    /// drift.
+    ///
+    /// Requires the profile row to already exist, mirroring
+    /// [`Self::cache_capabilities`]'s precedent (a model is benched/registered
+    /// before its per-task-class history can be tracked); returns `Ok(false)`
+    /// rather than an error when it does not, so a caller can decide whether
+    /// that is worth surfacing (e.g. the daemon logging a warning and moving
+    /// on, rather than failing the run it is trying to attribute an already-
+    /// terminal outcome to).
+    ///
+    /// Idempotent per `run_id`: a retried call for the exact same
+    /// `(model, endpoint, task_class, run_id)` is a no-op (migration 0025's
+    /// `UNIQUE` index) — a crash-and-retry in the caller cannot double-count
+    /// the same run.
+    pub async fn record_outcome(
+        &self,
+        pool: &SqlitePool,
+        model: &ModelId,
+        endpoint: &str,
+        task_class: TaskClass,
+        success: bool,
+        run_id: &str,
+    ) -> Result<bool, ModelProfileStoreError> {
+        let mut tx = pool.begin().await?;
+
+        let Some(existing_json) = sqlx::query(
+            "SELECT profile_json FROM model_profiles WHERE model_id = ? AND endpoint = ?",
+        )
+        .bind(model.0.as_str())
+        .bind(endpoint)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.get::<String, _>("profile_json")) else {
+            // No profile row yet: nothing to fold the outcome into. Do not
+            // insert an orphaned observation either — a model that is later
+            // benched starts its task-class history from that point, exactly
+            // like `cache_capabilities` starts probing from that point.
+            return Ok(false);
+        };
+        let mut profile: ModelProfile =
+            serde_json::from_str(&existing_json).map_err(|e| ModelProfileStoreError::Corrupt {
+                model: model.0.clone(),
+                endpoint: endpoint.to_string(),
+                detail: e.to_string(),
+            })?;
+
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO model_task_outcomes \
+             (model_id, endpoint, task_class, success, run_id, recorded_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(model_id, endpoint, task_class, run_id) DO NOTHING",
+        )
+        .bind(model.0.as_str())
+        .bind(endpoint)
+        .bind(task_class.as_str())
+        .bind(i64::from(success))
+        .bind(run_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        let (successes, total): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(success), 0), COUNT(*) FROM model_task_outcomes \
+             WHERE model_id = ? AND endpoint = ? AND task_class = ?",
+        )
+        .bind(model.0.as_str())
+        .bind(endpoint)
+        .bind(task_class.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        // total >= 1 always holds here: the INSERT above either added this
+        // run's row or a prior call already had, so at least one observation
+        // exists for this key by the time this SELECT runs.
+        let rate = successes as f64 / total.max(1) as f64;
+        profile
+            .performance
+            .task_class_success
+            .insert(task_class.as_str().to_string(), rate);
+
+        let updated_json = serde_json::to_string(&profile)?;
+        sqlx::query(
+            "UPDATE model_profiles SET profile_json = ?, updated_at = ? \
+             WHERE model_id = ? AND endpoint = ?",
+        )
+        .bind(&updated_json)
+        .bind(&now)
+        .bind(model.0.as_str())
+        .bind(endpoint)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(true)
     }
 }
 
@@ -444,6 +549,136 @@ mod tests {
                 .await
                 .unwrap(),
             Some(probed)
+        );
+    }
+
+    /// Outcome 11's headline fix, end to end: `predicted_success` for a task
+    /// class starts as the overall `reliability` (no history), then diverges
+    /// once real run outcomes are recorded — proving `task_class_success` is
+    /// no longer permanently the empty map every non-test path used to write.
+    #[tokio::test]
+    async fn record_outcome_folds_real_run_results_into_task_class_success() {
+        use codypendent_routing::TaskClass;
+
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let store = ModelProfileStore::new();
+        let endpoint = "http://localhost:11434/v1";
+        let model = ModelId("qwen-local".into());
+        // reliability = 0.76 (see rich_local_profile), no doc-update history yet.
+        store
+            .upsert(&pool, endpoint, &rich_local_profile("qwen-local"))
+            .await
+            .unwrap();
+
+        let before = store.get(&pool, &model, endpoint).await.unwrap().unwrap();
+        assert_eq!(
+            before.performance.predicted_success(TaskClass::SafeRefactor),
+            0.76,
+            "no history yet: falls back to overall reliability"
+        );
+
+        // Two real runs succeed, one fails, at SafeRefactor -> 2/3.
+        for (run, ok) in [("run-1", true), ("run-2", true), ("run-3", false)] {
+            let recorded = store
+                .record_outcome(&pool, &model, endpoint, TaskClass::SafeRefactor, ok, run)
+                .await
+                .unwrap();
+            assert!(recorded, "a profile row exists, so the outcome is recorded");
+        }
+
+        let after = store.get(&pool, &model, endpoint).await.unwrap().unwrap();
+        let rate = after.performance.predicted_success(TaskClass::SafeRefactor);
+        assert!(
+            (rate - (2.0 / 3.0)).abs() < 1e-9,
+            "expected 2/3 from three real observations, got {rate}"
+        );
+        // A DIFFERENT task class this model has never run still falls back —
+        // recording one class's history must not contaminate another's.
+        assert_eq!(
+            after.performance.predicted_success(TaskClass::DocUpdate),
+            0.91,
+            "unrelated class keeps its own history (from rich_local_profile), untouched"
+        );
+        // Nothing else in the profile was disturbed by the fold.
+        assert_eq!(after.performance.reliability, before.performance.reliability);
+        assert_eq!(after.capabilities, before.capabilities);
+        assert_eq!(after.bench, before.bench);
+    }
+
+    #[tokio::test]
+    async fn record_outcome_is_a_no_op_without_an_existing_profile() {
+        use codypendent_routing::TaskClass;
+
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let store = ModelProfileStore::new();
+        let model = ModelId("never-benched".into());
+
+        let recorded = store
+            .record_outcome(
+                &pool,
+                &model,
+                "http://localhost:11434/v1",
+                TaskClass::SmallBugFix,
+                true,
+                "run-1",
+            )
+            .await
+            .unwrap();
+        assert!(
+            !recorded,
+            "no profile row exists yet, so there is nothing to fold the outcome into"
+        );
+        // And no orphaned raw observation was left behind either.
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM model_task_outcomes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn record_outcome_is_idempotent_per_run_id() {
+        use codypendent_routing::TaskClass;
+
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let store = ModelProfileStore::new();
+        let endpoint = "http://localhost:11434/v1";
+        let model = ModelId("qwen-local".into());
+        store
+            .upsert(&pool, endpoint, &rich_local_profile("qwen-local"))
+            .await
+            .unwrap();
+
+        // The SAME run_id recorded twice (a crash-and-retry) must count once.
+        for _ in 0..2 {
+            store
+                .record_outcome(
+                    &pool,
+                    &model,
+                    endpoint,
+                    TaskClass::CiDiagnosis,
+                    true,
+                    "run-retried",
+                )
+                .await
+                .unwrap();
+        }
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM model_task_outcomes WHERE run_id = 'run-retried'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "a retried call for the same run_id must not double-insert");
+
+        let after = store.get(&pool, &model, endpoint).await.unwrap().unwrap();
+        assert_eq!(
+            after.performance.predicted_success(TaskClass::CiDiagnosis),
+            1.0,
+            "one successful observation, not two, so the rate is 1.0 not diluted"
         );
     }
 }

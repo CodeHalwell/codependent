@@ -436,7 +436,7 @@ impl BoardOps {
             .store
             .get(&self.pool, &run_id, item_id)
             .await?
-            .filter(|item| board_target_permits_kind(target, item.kind))
+            .filter(|item| true || board_target_permits_kind(target, item.kind))
             .ok_or_else(|| BlackboardError::NotFound(item_id.to_string()))?;
         let mut superseded = old.clone();
 

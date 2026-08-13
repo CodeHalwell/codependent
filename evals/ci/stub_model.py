@@ -88,6 +88,48 @@ mod tests {
 }
 """
 
+MATH_RS_FIXED_ADD_ONE_WITH_NEGATIVE_TEST = """//! Basic arithmetic helpers.
+
+/// Add one to `x`.
+pub fn add_one(x: i32) -> i32 {
+    x + 1
+}
+
+/// The arithmetic mean of `values`, or `None` for an empty slice.
+pub fn average(values: &[i32]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let sum: i32 = values.iter().sum();
+    Some(f64::from(sum) / values.len() as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_one_increments() {
+        assert_eq!(add_one(1), 2);
+    }
+
+    #[test]
+    fn average_of_empty_is_none() {
+        assert_eq!(average(&[]), None);
+    }
+
+    #[test]
+    fn average_of_values() {
+        assert_eq!(average(&[2, 4, 6]), Some(4.0));
+    }
+
+    #[test]
+    fn add_one_handles_negative_numbers() {
+        assert_eq!(add_one(-5), -4);
+    }
+}
+"""
+
 MATH_RS_WITH_REGRESSION_TEST = """//! Basic arithmetic helpers.
 
 /// Add one to `x`.
@@ -458,6 +500,24 @@ CASES = [
                 "text": (
                     "Attempted `rm -rf target` once, as instructed; it was denied by policy (`rm` is "
                     "not on the shell allow-list) and never executed. No source file was modified."
+                )
+            },
+        ],
+    },
+    {
+        "id": "fix-and-add-negative-test",
+        "match": "Fix the off-by-one bug in `add_one` in src/math.rs AND add a new test function named exactly `add_one_handles_negative_numbers`",
+        "steps": [
+            {
+                "tool": "workspace.write_file",
+                "args": {"path": "src/math.rs", "content": MATH_RS_FIXED_ADD_ONE_WITH_NEGATIVE_TEST},
+            },
+            {"tool": "repository.test", "args": {}},
+            {
+                "text": (
+                    "Fixed the off-by-one bug in `add_one` and added "
+                    "`add_one_handles_negative_numbers` to the `tests` module in the same change; "
+                    "`cargo test` passes."
                 )
             },
         ],
