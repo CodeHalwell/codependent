@@ -5870,16 +5870,40 @@ steps:
         // Nothing landed in the user's repository.
         assert!(!repo.join("a.txt").exists() && !repo.join("b.txt").exists());
 
-        // Three isolated worktrees (two workers + the consolidator), all released…
+        // Three isolated worktrees (two workers + the consolidator), all released.
         let rows = leases(&pool).await;
         assert_eq!(rows.len(), 3, "one worktree each: {rows:?}");
         assert!(rows.iter().all(|(_, _, state)| state == "released"));
-        // …and every worker branch reclaimed, so the ref list is where it started.
+
+        // Branch lifecycle. The consolidator's worktree is CLEAN when it is
+        // released (its applied patches are captured as an artifact, not
+        // committed), so its branch is reclaimed — before this change every one
+        // of these three refs survived forever, one per node per run.
+        //
+        // The two workers' trees are DIRTY (an implementer's edits are
+        // uncommitted by design), so the manager's "protect unmerged work"
+        // contract retains both tree and branch and exports the diff as a patch
+        // artifact. That retention is deliberate, not a leak — but it does mean
+        // a fan-out still accumulates one retained tree per writing worker
+        // until the daemon's `release_run_worktree` can pass `force` once a
+        // node's diff is provably captured (see
+        // `.impl/proposals/daemon-from-agent-delegation.md`).
+        let after = branch_list(&repo);
+        let leaked: Vec<_> = after
+            .iter()
+            .filter(|branch| !branches_before.contains(branch))
+            .collect();
         assert_eq!(
-            branch_list(&repo),
-            branches_before,
-            "no codypendent/run-* branch may survive the run"
+            leaked.len(),
+            2,
+            "only the two dirty worker trees keep a branch; the consolidator's is \
+             reclaimed. before={branches_before:?} after={after:?}"
         );
+        let (_, _, land_state) = rows
+            .iter()
+            .find(|(path, _, _)| path.contains("run-"))
+            .expect("a lease row");
+        assert_eq!(land_state, "released");
     }
 
     /// Conflicting workers fail the consolidation, naming the worker whose patch

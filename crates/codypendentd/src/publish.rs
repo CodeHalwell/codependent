@@ -526,15 +526,23 @@ async fn execute_plan(
             title,
         } => {
             let github = github.ok_or(PublishExecError::NoGitHubClient)?;
+            // Both preconditions are checked BEFORE any write (2026-08-13
+            // review F7): `resolve_github_repo` used to run only AFTER the
+            // docs branch was committed and pushed to the user's remote —
+            // reproduced live: with a non-GitHub `origin`, a `docs/pr2` branch
+            // landed on the real remote, no publication row was ever written,
+            // and the job silently ended up `failed`. Resolving the owner/repo
+            // first makes that failure a clean no-op — nothing touched, exactly
+            // like the `NoGitHubClient` case already was.
+            let repo = crate::executor::resolve_github_repo(repository_root)
+                .await
+                .ok_or(PublishExecError::NoGitHubRemote)?;
             let sha = commit_on_docs_branch(repository_root, branch, path, &plan.rendered).await?;
             run_git(
                 repository_root,
                 &["push", "origin", &format!("{branch}:{branch}")],
             )
             .await?;
-            let repo = crate::executor::resolve_github_repo(repository_root)
-                .await
-                .ok_or(PublishExecError::NoGitHubRemote)?;
             let base = current_branch(repository_root)
                 .await
                 .unwrap_or_else(|| FALLBACK_BASE_BRANCH.to_string());

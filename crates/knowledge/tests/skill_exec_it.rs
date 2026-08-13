@@ -16,8 +16,9 @@ use codypendent_knowledge::{
     SkillResourceLimits, SkillRunOutcome, SkillRunner,
 };
 use codypendent_protocol::RepositoryId;
-use codypendent_sandbox::gate::{DenyAllGate, GateDenied, GateGrant, GateSeal, HostRequest,
-    RunPolicyGate};
+use codypendent_sandbox::gate::{
+    DenyAllGate, GateDenied, GateGrant, GateSeal, HostRequest, RunPolicyGate,
+};
 use codypendent_sandbox::RefusingSandbox;
 
 /// The `$REPOSITORY`/`$WORKTREE` values placement substitution resolves against.
@@ -316,7 +317,12 @@ impl RunPolicyGate for AllowAllGate {
     }
 }
 
-fn wasm_fixture() -> (tempfile::TempDir, tempfile::TempDir, RegistryItem, PlaceholderContext) {
+fn wasm_fixture() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    RegistryItem,
+    PlaceholderContext,
+) {
     let repo = tempfile::tempdir().unwrap();
     let repo_root = std::fs::canonicalize(repo.path()).unwrap();
     let data = repo_root.join("data.txt");
@@ -332,7 +338,10 @@ fn wasm_fixture() -> (tempfile::TempDir, tempfile::TempDir, RegistryItem, Placeh
 #[test]
 fn a_wasm_skill_is_refused_without_a_run_policy_behind_it() {
     let (_repo, _pkg, item, ctx) = wasm_fixture();
-    assert!(item.executable, "a module entrypoint is executable behaviour");
+    assert!(
+        item.executable,
+        "a module entrypoint is executable behaviour"
+    );
 
     // The default posture. The manifest declares the read; the run policy does
     // not exist for this caller, so nothing privileged happens.
