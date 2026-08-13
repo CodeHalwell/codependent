@@ -338,6 +338,7 @@ mod tests {
             assertion_results: Vec::new(),
             within_cost: true,
             within_duration: true,
+            run_completed: true,
         }])
     }
 
@@ -533,6 +534,7 @@ mod tests {
             }],
             within_cost: true,
             within_duration: true,
+            run_completed: true,
         }]);
         bind_report(&pool, &candidate_id, "failed-report", &report).await;
         let rejected = gateway

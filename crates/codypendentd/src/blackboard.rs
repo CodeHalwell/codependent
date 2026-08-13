@@ -30,6 +30,7 @@ use codypendent_daemon::blackboard::{
     BoardTarget, PostBlackboardRequest, ReadBlackboardRequest, UpdateBlackboardRequest,
 };
 use codypendent_protocol::{board_scope_id, BlackboardItemView, CodypendentError};
+
 use codypendent_runtime::blackboard::{
     BlackboardChannel, BlackboardChannelError, BlackboardPost, TaskBoardChannel, TaskCardChange,
     TaskCardDraft,
@@ -39,6 +40,26 @@ use codypendent_workflow::{
     NewBlackboardItem, WorkflowStore, DEFAULT_TASK_STATUS,
 };
 use sqlx::SqlitePool;
+
+/// The board id for a repository, from a path spelling supplied by a caller.
+///
+/// [`board_scope_id`] is pure string formatting and documents its contract as
+/// "callers pass the canonicalized repository root" — but it lives in the
+/// protocol crate, which does no I/O, so nothing enforced it. Clients send
+/// whatever path they were started with, and `.../repo`, `.../repo/.` and
+/// `.../repo/` each minted a SEPARATE board: a card written through one
+/// spelling was invisible, permanently and silently, from any other. The daemon
+/// is where the filesystem is, so the daemon canonicalizes.
+///
+/// A path that cannot be canonicalized (it does not exist on this host) keeps
+/// its literal spelling rather than failing the request — unchanged behaviour
+/// for that case, which is a separate question from this one.
+fn repository_board_id(repository: &str) -> String {
+    let canonical = std::fs::canonicalize(repository)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| repository.to_string());
+    board_scope_id(&canonical)
+}
 
 /// Project a stored workflow artifact into its wire/runtime view, carrying the run
 /// id with it so a live delivery routes without the enclosing frame.
@@ -200,7 +221,7 @@ impl BlackboardReader for WorkflowBlackboardReader {
             // has no rows, and an empty board is the truthful answer (the store's
             // FK only matters for writes).
             let workflow_run_id = match board_repository.as_deref() {
-                Some(repository) => board_scope_id(repository),
+                Some(repository) => repository_board_id(repository),
                 None => workflow_run_id,
             };
 
@@ -274,7 +295,7 @@ impl BoardOps {
         match target {
             BoardTarget::WorkflowRun(run) => Ok((run.clone(), None)),
             BoardTarget::Repository(repository) => {
-                let board_id = board_scope_id(repository);
+                let board_id = repository_board_id(repository);
                 WorkflowStore::new()
                     .ensure_board_run(&self.pool, &board_id, repository)
                     .await
@@ -405,7 +426,7 @@ impl BoardOps {
     ) -> Result<Vec<BlackboardItemView>, BlackboardError> {
         let run_id = match target {
             BoardTarget::WorkflowRun(run) => run.clone(),
-            BoardTarget::Repository(repository) => board_scope_id(repository),
+            BoardTarget::Repository(repository) => repository_board_id(repository),
         };
         let items = self.store.query(&self.pool, &run_id, kind, false).await?;
         Ok(items
@@ -800,6 +821,66 @@ mod tests {
         let live = channel.query(run, None, false).await.unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].id, second.id);
+    }
+
+    /// A repository board is keyed by path, and the path arrives from the
+    /// client. `.../repo`, `.../repo/.` and `.../repo/` are the same checkout
+    /// and must be the same board — before the daemon canonicalized, each
+    /// spelling minted its own, so a card written by an agent launched with one
+    /// was permanently invisible to a TUI launched with another.
+    #[tokio::test]
+    async fn one_checkout_is_one_board_however_the_path_is_spelled() {
+        let (dir, pool) = temp_pool().await;
+        let hub = BlackboardHub::new();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create the checkout");
+
+        let plain = repo.to_string_lossy().into_owned();
+        let dotted = repo.join(".").to_string_lossy().into_owned();
+        let trailing = format!("{plain}/");
+
+        let writer = AssemblyBoardWriter::new(pool.clone(), hub.clone());
+        writer
+            .post(PostBlackboardRequest {
+                target: BoardTarget::Repository(dotted.clone()),
+                item: codypendent_protocol::BlackboardItemDraft {
+                    kind: "task".to_string(),
+                    payload: serde_json::json!({ "title": "written through repo/." }),
+                    confidence: None,
+                    evidence: Vec::new(),
+                    status: None,
+                    assignee: None,
+                    ordinal: None,
+                },
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("post through the dotted spelling");
+
+        let reader = WorkflowBlackboardReader::new(pool.clone());
+        for spelling in [&plain, &dotted, &trailing] {
+            let items = reader
+                .read(ReadBlackboardRequest {
+                    workflow_run_id: String::new(),
+                    board_repository: Some(spelling.clone()),
+                    kind: None,
+                    include_superseded: false,
+                    client_id: ClientId::new(),
+                })
+                .await
+                .expect("read the board");
+            assert_eq!(
+                items.len(),
+                1,
+                "the card must be visible through the spelling `{spelling}`"
+            );
+        }
+
+        let boards: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(boards, 1, "three spellings must not mint three boards");
     }
 
     #[tokio::test]
