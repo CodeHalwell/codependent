@@ -2893,18 +2893,7 @@ pub fn models_add(
             .and_then(|row| row.context_tokens),
     });
 
-    #[derive(serde::Serialize)]
-    struct ModelsToml {
-        #[serde(rename = "model")]
-        model: Vec<ModelConfig>,
-    }
-    let rendered = toml::to_string_pretty(&ModelsToml { model: configs })
-        .context("serializing models.toml")?;
-    let tmp = data_dir.join("models.toml.tmp");
-    std::fs::write(&tmp, rendered.as_bytes())
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &models_path)
-        .with_context(|| format!("replacing {}", models_path.display()))?;
+    crate::models_file::write_model_entries(&models_path, &configs)?;
     println!(
         "{} model {display_id} ({})",
         if replaced { "updated" } else { "added" },

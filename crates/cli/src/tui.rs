@@ -4251,37 +4251,7 @@ fn write_add_model(
         context_tokens,
     });
 
-    // Replace only the `[[model]]` array. Voice, transcription, embedding,
-    // retrieval and future top-level settings share this file and must survive
-    // adding a model from the TUI.
-    #[derive(serde::Serialize)]
-    struct ModelsToml {
-        #[serde(rename = "model")]
-        model: Vec<ModelConfig>,
-    }
-    let mut root = if models_path.exists() {
-        let raw = std::fs::read_to_string(&models_path)
-            .with_context(|| format!("reading {}", models_path.display()))?;
-        raw.parse::<toml::Value>()
-            .with_context(|| format!("parsing {}", models_path.display()))?
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    let replacement =
-        toml::Value::try_from(ModelsToml { model: configs }).context("serializing models.toml")?;
-    let model = replacement
-        .get("model")
-        .cloned()
-        .unwrap_or_else(|| toml::Value::Array(Vec::new()));
-    root.as_table_mut()
-        .ok_or_else(|| anyhow!("models.toml must contain a TOML table"))?
-        .insert("model".to_owned(), model);
-    let rendered = toml::to_string_pretty(&root).context("serializing models.toml")?;
-    let models_tmp = data_dir.join("models.toml.tmp");
-    std::fs::write(&models_tmp, rendered.as_bytes())
-        .with_context(|| format!("writing {}", models_tmp.display()))?;
-    std::fs::rename(&models_tmp, &models_path)
-        .with_context(|| format!("replacing {}", models_path.display()))?;
+    crate::models_file::write_model_entries(&models_path, &configs)?;
 
     // Store the key (hosted providers only) in auth.json at 0600 — loaded
     // above, BEFORE models.toml was written, so a corrupt pre-existing
