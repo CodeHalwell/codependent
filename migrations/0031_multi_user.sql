@@ -1,0 +1,17 @@
+-- Outcome 19: a session records the principal that created it.
+--
+-- Until now the daemon had no principal at all: `client_id` and `ClientRole`
+-- were plaintext assertions in the client's own envelope, so any process that
+-- could open the socket could read any session and resolve any approval. The
+-- principal is now derived from the transport (`SO_PEERCRED` on the Unix
+-- socket), which the kernel fills in at connect(2) and a client cannot forge.
+--
+-- `owner_uid` is that peer uid, recorded when the session is created. Every
+-- by-id read, every subscription, and `ResolveApproval` re-derive permission
+-- from THIS column — never from anything in the request.
+--
+-- Nullable because rows created before this migration have no recorded owner.
+-- They are not treated as public: the daemon serves one local user, so a
+-- NULL owner is resolved to the uid the daemon process itself runs as, which
+-- is necessarily the uid that created them.
+ALTER TABLE sessions ADD COLUMN owner_uid INTEGER;

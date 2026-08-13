@@ -26,8 +26,9 @@
 
 use async_trait::async_trait;
 use codypendent_daemon::blackboard::{
-    BlackboardHub, BlackboardReadFuture, BlackboardReader, BlackboardWriteFuture, BlackboardWriter,
-    BoardTarget, PostBlackboardRequest, ReadBlackboardRequest, UpdateBlackboardRequest,
+    BlackboardHistoryRequest, BlackboardHub, BlackboardReadFuture, BlackboardReader,
+    BlackboardWriteFuture, BlackboardWriter, BoardTarget, PostBlackboardRequest,
+    ReadBlackboardRequest, UpdateBlackboardRequest,
 };
 use codypendent_protocol::{board_scope_id, BlackboardItemView, CodypendentError};
 
@@ -40,6 +41,35 @@ use codypendent_workflow::{
     NewBlackboardItem, WorkflowStore, DEFAULT_TASK_STATUS,
 };
 use sqlx::SqlitePool;
+
+/// Whether `target`'s board ever SHOWS an item of `kind` on its live list.
+///
+/// A repository task board's two readers — `AssemblyTaskBoardChannel::list`
+/// below (the `task.list` tool) and the TUI's kanban load
+/// (`ReadBlackboard { board_repository: Some(_), kind: Some("task") }`) — both
+/// filter to `BlackboardKind::Task`, unconditionally. Before this predicate
+/// existed, [`BoardOps::post_card`] accepted ANY kind at repository scope: a
+/// posted `open_question` stored, stamped a real `status`/`ordinal`, replied
+/// success — and then was invisible everywhere, forever, while its `ordinal`
+/// still occupied a column position ahead of the next real card
+/// (`BlackboardStore::next_ordinal` has no kind filter). Refusing the write up
+/// front is simpler than teaching every reader to show a kind the board's own
+/// concept (a *task* board) does not mean, and it is the only fix that also
+/// closes [`BoardOps::update_card`]'s door: an id the list never shows must
+/// not be reachable by a caller who already knows (or guesses) it either
+/// (brief rule 2) — see the `.filter(...)` there, which reuses this SAME
+/// predicate so the two paths cannot drift apart again.
+///
+/// A durable `WorkflowRun`'s board has no such filter (an agent's
+/// `blackboard.query` — and a human's `PostBlackboardQuestion` intent, which
+/// posts an `open_question` at workflow-run scope — show every kind), so this
+/// is `true` unconditionally there.
+fn board_target_permits_kind(target: &BoardTarget, kind: BlackboardKind) -> bool {
+    match target {
+        BoardTarget::Repository(_) => kind == BlackboardKind::Task,
+        BoardTarget::WorkflowRun(_) => true,
+    }
+}
 
 /// The board id for a repository, from a path spelling supplied by a caller.
 ///
@@ -255,6 +285,41 @@ impl BlackboardReader for WorkflowBlackboardReader {
                 .collect())
         })
     }
+
+    fn history(&self, request: BlackboardHistoryRequest) -> BlackboardReadFuture<'_> {
+        let pool = self.pool.clone();
+        let store = self.store;
+        Box::pin(async move {
+            let BlackboardHistoryRequest {
+                workflow_run_id,
+                board_repository,
+                item_id,
+                client_id: _,
+            } = request;
+
+            // Same board-resolution rule as `read`: a repository-board request
+            // re-points at the synthetic run, unchanged otherwise.
+            let workflow_run_id = match board_repository.as_deref() {
+                Some(repository) => repository_board_id(repository),
+                None => workflow_run_id,
+            };
+
+            let chain = store
+                .history(&pool, &workflow_run_id, &item_id)
+                .await
+                .map_err(|error| {
+                    CodypendentError::new(
+                        "workflow.blackboard-read-failed",
+                        format!("could not read the item's history: {error}"),
+                        true,
+                    )
+                })?;
+            Ok(chain
+                .into_iter()
+                .map(|item| item_to_view(&workflow_run_id, item))
+                .collect())
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -361,10 +426,17 @@ impl BoardOps {
         change: CardChange,
     ) -> Result<BlackboardItemView, BlackboardError> {
         let (run_id, _) = self.resolve_for_write(target).await?;
+        // The SAME gate `list_cards` applies, at the fetch (brief rule 2): a
+        // repository board's `get` must refuse an id whose kind the board's
+        // own list would never show, indistinguishably from an id that does
+        // not exist at all — `NotFound` either way, no enumeration oracle. A
+        // legacy row (written before `post_card` started refusing this at
+        // write time) is exactly what this guards, not only a hypothetical.
         let old = self
             .store
             .get(&self.pool, &run_id, item_id)
             .await?
+            .filter(|item| board_target_permits_kind(target, item.kind))
             .ok_or_else(|| BlackboardError::NotFound(item_id.to_string()))?;
         let mut superseded = old.clone();
 
@@ -549,6 +621,21 @@ impl BlackboardWriter for AssemblyBoardWriter {
                     false,
                 )
             })?;
+            // A repository task board only ever DISPLAYS `task` cards (every
+            // reader filters to it) — refuse anything else here rather than
+            // storing a card no view will ever show (see
+            // `board_target_permits_kind`'s docs for the full story).
+            if !board_target_permits_kind(&request.target, kind) {
+                return Err(CodypendentError::new(
+                    "blackboard.kind-not-allowed-on-board",
+                    format!(
+                        "`{}` cards are never shown on a repository task board (only `task` \
+                         is); post it at workflow-run scope instead",
+                        kind.as_str()
+                    ),
+                    false,
+                ));
+            }
             ops.post_card(
                 &request.target,
                 NewCard {
@@ -1139,5 +1226,214 @@ mod tests {
             .expect("human moves the agent's card");
         assert_eq!(moved.status.as_deref(), Some("done"));
         assert_eq!(moved.assignee.as_deref(), Some("dana"));
+    }
+
+    // -----------------------------------------------------------------------
+    // F3/F4: a repository board only ever shows `task` — a client cannot
+    // plant a hidden kind by posting one, and cannot reach one by id either.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn posting_a_non_task_kind_at_repository_scope_is_refused() {
+        let (_dir, pool) = temp_pool().await;
+        let writer = AssemblyBoardWriter::new(pool.clone(), BlackboardHub::new());
+        let repository = "/home/user/project";
+
+        let err = writer
+            .post(PostBlackboardRequest {
+                target: BoardTarget::Repository(repository.to_string()),
+                item: codypendent_protocol::BlackboardItemDraft {
+                    kind: "open_question".to_string(),
+                    payload: json!({ "question": "is this on the board?" }),
+                    confidence: None,
+                    evidence: Vec::new(),
+                    status: None,
+                    assignee: None,
+                    ordinal: None,
+                },
+                client_id: ClientId::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "blackboard.kind-not-allowed-on-board");
+
+        // Refused before any write — no synthetic board run, no orphaned row.
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflow_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+        let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blackboard_items")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(items, 0);
+    }
+
+    /// Simulates a row written before `post_card` started refusing non-`task`
+    /// kinds at repository scope (a legacy row, or any future bug that lets one
+    /// through some other seam) — the by-id path must refuse it exactly as it
+    /// would refuse an id that never existed, not merely omit it from the list.
+    #[tokio::test]
+    async fn a_hidden_non_task_item_cannot_be_reached_or_rewritten_by_id() {
+        let (_dir, pool) = temp_pool().await;
+        let hub = BlackboardHub::new();
+        let repository = "/home/user/project";
+        let board_id = board_scope_id(repository);
+        WorkflowStore::new()
+            .ensure_board_run(&pool, &board_id, repository)
+            .await
+            .expect("seed the synthetic board run");
+        let store = BlackboardStore::new();
+        let hidden = store
+            .post(
+                &pool,
+                &board_id,
+                NewBlackboardItem {
+                    kind: BlackboardKind::OpenQuestion,
+                    payload: json!({ "question": "is this on the board?" }),
+                    author: json!({ "role": "agent" }),
+                    confidence: None,
+                    evidence: Vec::new(),
+                    board: BoardFields {
+                        board_scope: Some(repository.to_string()),
+                        status: Some("todo".to_string()),
+                        assignee: None,
+                        ordinal: Some(0),
+                    },
+                },
+            )
+            .await
+            .expect("plant a pre-fix-shaped row directly through the store");
+
+        // The list (what `task.list` / the TUI kanban both show) never surfaces it.
+        let agent = AssemblyTaskBoardChannel::new(pool.clone(), hub.clone());
+        let listed = agent.list(repository).await.expect("list");
+        assert!(
+            listed.is_empty(),
+            "a non-task item must not appear on the board"
+        );
+
+        // Neither can a Controller reach it by id — refused exactly as a
+        // nonexistent id would be, not with a different (enumeration-leaking)
+        // error.
+        let writer = AssemblyBoardWriter::new(pool.clone(), hub);
+        let by_hidden_id = writer
+            .update(UpdateBlackboardRequest {
+                target: BoardTarget::Repository(repository.to_string()),
+                item_id: hidden.id.clone(),
+                status: Some("done".to_string()),
+                assignee: None,
+                ordinal: None,
+                payload: Some(
+                    json!({ "question": "REWRITTEN by a client that could not see this item" }),
+                ),
+                client_id: ClientId::new(),
+            })
+            .await
+            .unwrap_err();
+        let by_bogus_id = writer
+            .update(UpdateBlackboardRequest {
+                target: BoardTarget::Repository(repository.to_string()),
+                item_id: "not-a-real-id".to_string(),
+                status: Some("done".to_string()),
+                assignee: None,
+                ordinal: None,
+                payload: None,
+                client_id: ClientId::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(by_hidden_id.code, "blackboard.item-not-found");
+        assert_eq!(
+            by_hidden_id.code, by_bogus_id.code,
+            "a kind the list hides must fail identically to an id that does not exist"
+        );
+        // Same phrasing for both — each message only ever echoes back the id
+        // the CALLER supplied (never a different id it might have compared
+        // against), so a caller learns nothing beyond what it already knew.
+        assert!(by_hidden_id
+            .message
+            .starts_with("no such blackboard item: "));
+        assert!(by_bogus_id.message.starts_with("no such blackboard item: "));
+
+        // And the store row itself is untouched — the rejected update never
+        // reached `supersede`.
+        let untouched = store
+            .get(&pool, &board_id, &hidden.id)
+            .await
+            .unwrap()
+            .expect("the original row is still there, unsuperseded");
+        assert_eq!(untouched.payload["question"], "is this on the board?");
+        assert!(untouched.superseded_by.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // F5: `BlackboardStore::history` gets a real caller.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn history_returns_the_full_lineage_oldest_first() {
+        let (_dir, pool) = temp_pool().await;
+        let hub = BlackboardHub::new();
+        let repository = "/home/user/project";
+        let writer = AssemblyBoardWriter::new(pool.clone(), hub.clone());
+        let reader = WorkflowBlackboardReader::new(pool.clone());
+
+        let created = writer
+            .post(PostBlackboardRequest {
+                target: BoardTarget::Repository(repository.to_string()),
+                item: card("wire the DAG viewer", Some("todo")),
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("post");
+        let moved = writer
+            .update(UpdateBlackboardRequest {
+                target: BoardTarget::Repository(repository.to_string()),
+                item_id: created.id.clone(),
+                status: Some("doing".to_string()),
+                assignee: None,
+                ordinal: None,
+                payload: None,
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("move");
+
+        // Asking with EITHER revision's id resolves the same full chain.
+        for anchor in [&created.id, &moved.id] {
+            let history = reader
+                .history(BlackboardHistoryRequest {
+                    workflow_run_id: String::new(),
+                    board_repository: Some(repository.to_string()),
+                    item_id: anchor.clone(),
+                    client_id: ClientId::new(),
+                })
+                .await
+                .expect("history reads");
+            assert_eq!(history.len(), 2, "one create + one move = two revisions");
+            assert_eq!(history[0].id, created.id);
+            assert_eq!(history[0].revision, 1);
+            assert_eq!(history[0].status.as_deref(), Some("todo"));
+            assert_eq!(history[0].superseded_by.as_deref(), Some(moved.id.as_str()));
+            assert_eq!(history[1].id, moved.id);
+            assert_eq!(history[1].revision, 2);
+            assert_eq!(history[1].status.as_deref(), Some("doing"));
+            assert!(history[1].superseded_by.is_none());
+        }
+
+        // An id the board has never seen resolves to an empty chain, not an
+        // error — mirrors `BlackboardStore::history`'s own contract.
+        let unknown = reader
+            .history(BlackboardHistoryRequest {
+                workflow_run_id: String::new(),
+                board_repository: Some(repository.to_string()),
+                item_id: "not-a-real-id".to_string(),
+                client_id: ClientId::new(),
+            })
+            .await
+            .expect("history reads");
+        assert!(unknown.is_empty());
     }
 }

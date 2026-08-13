@@ -93,6 +93,17 @@ enum TopCommand {
         /// Repository the run operates in. Defaults to the current directory.
         #[arg(long)]
         repo: Option<PathBuf>,
+        /// Pin the run to this configured model id (as it appears in
+        /// `codypendent models list`), e.g. `openai/gpt-5.4` or `acp/cursor`.
+        /// Without it, model selection falls to routing (if enabled) or the
+        /// resolver's first reachable candidate in `models.toml` FILE ORDER —
+        /// with several models configured, which one that is is not obvious
+        /// from the command line alone. A pin overrides quality/routing
+        /// choice, never the security ceiling: a pinned hosted model for
+        /// classified data is still refused (fail-closed), same as the TUI's
+        /// `/model` picker.
+        #[arg(long)]
+        model: Option<String>,
         /// Stream every session event to stdout as JSONL until the run
         /// terminates. Currently required — interactive attach lands with
         /// the TUI (STEP 1.12).
@@ -1014,13 +1025,15 @@ async fn main() -> anyhow::Result<()> {
             objective,
             mode,
             repo,
+            model,
             jsonl,
         } => {
             let repo = match repo {
                 Some(repo) => repo,
                 None => std::env::current_dir()?,
             };
-            let exit_code = commands::run(&paths, objective, mode.into(), repo, jsonl).await?;
+            let exit_code =
+                commands::run(&paths, objective, mode.into(), repo, model, jsonl).await?;
             std::process::exit(exit_code);
         }
         TopCommand::Attach {

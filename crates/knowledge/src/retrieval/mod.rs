@@ -12,7 +12,7 @@
 //!                    drop risk above the query's ceiling   (security is a FILTER)
 //!   → rerank: dense + lexical + exact + dependency + trust_bonus − risk_penalty
 //!   → dependency closure: a selected skill pulls its required tools by name
-//!   → context budget: 6–12 tool cards + 1–3 skill cards
+//!   → context budget: 6–12 tool cards + 1–3 skill cards + 0–2 command cards
 //! ```
 //!
 //! Only compact cards cross into context (progressive disclosure); the full JSON
@@ -107,6 +107,11 @@ pub struct RetrievalResult {
     pub tools: Vec<ToolCard>,
     /// Disclosed skill cards (1–3).
     pub skills: Vec<ToolCard>,
+    /// Disclosed command cards (0–2) — the slash commands (`/fix-ci`,
+    /// `/update-docs`) whose registry rows the funnel used to score and then
+    /// discard. A command is not model-callable; disclosing it tells the run
+    /// that a whole prepared workflow already exists for this task.
+    pub commands: Vec<ToolCard>,
     /// The auditable record of how this selection was produced.
     pub trace: RetrievalTrace,
 }
@@ -313,6 +318,17 @@ pub fn retrieve(
         .filter(|s| s.item.kind == RegistryItemKind::Skill)
         .map(|s| s.item)
         .collect();
+    // Commands were the third kind all along: they pass the hard filters, enter
+    // the candidate union, and occupy rerank-pool slots — and used to be dropped
+    // here, unpartitioned, so `/fix-ci` could never reach a run however exactly
+    // the query matched its intents. Budgeted separately (see
+    // `disclose_commands_max`) so surfacing one never costs a tool card.
+    let disclosed_commands: Vec<&RegistryItem> = ranked
+        .iter()
+        .filter(|s| s.item.kind == RegistryItemKind::Command)
+        .map(|s| s.item)
+        .take(config.disclose_commands_max)
+        .collect();
 
     // ---- Disclose skills (1–3), bounded by availability ---------------------
     let skill_take = bounded(
@@ -389,13 +405,19 @@ pub fn retrieve(
         .iter()
         .map(|item| ToolCard::of(item))
         .collect();
+    let commands: Vec<ToolCard> = disclosed_commands
+        .iter()
+        .map(|item| ToolCard::of(item))
+        .collect();
 
     let mut selected_ids = disclosed_tool_ids;
     selected_ids.extend(disclosed_skills.iter().map(|item| item.id));
+    selected_ids.extend(disclosed_commands.iter().map(|item| item.id));
 
     Ok(RetrievalResult {
         tools,
         skills,
+        commands,
         trace: RetrievalTrace {
             config_version: config.version,
             candidate_ids,
@@ -582,4 +604,88 @@ fn risk_signal(risk: RiskClass) -> f32 {
 /// up to `max`, but never fewer than `min` when that many are available.
 fn bounded(available: usize, min: usize, max: usize) -> usize {
     available.min(max).max(min.min(available))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builtin::{builtin_commands, builtin_tools};
+
+    /// The regression for the silently-discarded third kind: `Command` items pass
+    /// the hard filters, enter the candidate union, and get scored — and used to
+    /// be dropped before disclosure, so the built-in written for exactly this
+    /// sentence could never be surfaced. Asserted with the PRODUCTION registry,
+    /// not a fixture, because the bug was that production commands vanished.
+    #[test]
+    fn a_matching_command_is_disclosed_not_discarded() {
+        let items: Vec<RegistryItem> = builtin_tools()
+            .into_iter()
+            .chain(builtin_commands())
+            .collect();
+        let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new()).expect("indexes");
+        let query = RetrievalQuery::new(
+            "the ci is red, fix the failing github check",
+            vec![Scope::System],
+            RiskClass::High,
+        );
+        let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default()).expect("ok");
+
+        // The old behaviour, pinned: the command was ALWAYS in the candidate
+        // union — retrieved, filtered, scored, and then dropped unpartitioned.
+        // If this half ever stops holding, the disclosure assertion below is
+        // passing for the wrong reason.
+        let fix_ci_id = items
+            .iter()
+            .find(|item| item.kind == RegistryItemKind::Command && item.name == "fix-ci")
+            .map(|item| item.id)
+            .expect("`fix-ci` is a built-in command");
+        assert!(
+            result.trace.candidate_ids.contains(&fix_ci_id),
+            "`/fix-ci` was always a candidate; the bug was dropping it before disclosure"
+        );
+
+        let disclosed: Vec<&str> = result
+            .commands
+            .iter()
+            .map(|card| card.name.as_str())
+            .collect();
+        assert!(
+            disclosed.contains(&"fix-ci"),
+            "`/fix-ci` must reach disclosure for its own intent text: {disclosed:?}"
+        );
+        // The command budget is separate from the tool budget, so surfacing one
+        // never costs a tool card.
+        assert!(
+            result.tools.len() >= RetrievalConfig::default().disclose_tools_min,
+            "commands must not eat into the tool budget: {} tools",
+            result.tools.len()
+        );
+        // Every disclosed id is in the trace, so the audit trail still explains
+        // the whole selection.
+        for card in &result.commands {
+            assert!(
+                result.trace.selected_ids.contains(&card.id),
+                "a disclosed command must appear in the trace"
+            );
+        }
+    }
+
+    /// `disclose_commands_max: 0` keeps the pre-change behavior exactly, so an
+    /// operator (or the runtime's built-in gate, which projects no commands) can
+    /// opt out without touching anything else.
+    #[test]
+    fn a_zero_command_budget_discloses_none() {
+        let items: Vec<RegistryItem> = builtin_tools()
+            .into_iter()
+            .chain(builtin_commands())
+            .collect();
+        let indexes = RetrievalIndexes::build(&items, HashingEmbedder::new()).expect("indexes");
+        let query = RetrievalQuery::new("the ci is red", vec![Scope::System], RiskClass::High);
+        let config = RetrievalConfig {
+            disclose_commands_max: 0,
+            ..RetrievalConfig::default()
+        };
+        let result = retrieve(&items, &indexes, &query, &config).expect("ok");
+        assert!(result.commands.is_empty());
+    }
 }

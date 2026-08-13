@@ -34,12 +34,25 @@ optional_tools = [
 filesystem_read = ["$REPOSITORY"]
 filesystem_write = ["$WORKTREE"]
 commands = ["cargo", "git"]
-network = ["api.github.com:443"]
+# `network` is deliberately absent. A `host:port` grant needs an outbound broker
+# that does not exist, and every sandbox backend refuses a non-empty network
+# allowlist outright (`validate_enforceable_profile`). Declaring it made this
+# package installable but structurally unrunnable — the skill's GitHub reads go
+# through the `github.*` tools, which carry their own network authorization.
 secrets = []
 
+# Enforced, not advisory: `maximum_duration_seconds` is the wall clock the
+# sandbox kills the process group at, `maximum_cpu_seconds` the CPU rlimit (and
+# the WASM fuel budget), `maximum_memory_mb` the address-space rlimit (and the
+# WASM linear-memory cap). A value of zero, or one above the hard ceiling, is
+# refused at load. `maximum_cost_usd` is still carried rather than enforced —
+# a script spends no model tokens.
 [limits]
 maximum_iterations = 20
 maximum_duration_seconds = 1800
+maximum_cpu_seconds = 600
+maximum_memory_mb = 512
+maximum_output_mb = 16
 maximum_cost_usd = 3.00
 
 [entrypoints]

@@ -321,6 +321,49 @@ pub async fn upsert_file_graph(
     })
 }
 
+/// Retire every symbol a **deleted** file defined, in one transaction.
+///
+/// [`upsert_file_graph`] retires the symbols a file no longer defines, but it
+/// only ever runs on a file that still exists — nothing reparses a path that was
+/// removed, so its nodes would linger until the next full [`clear_repository`]
+/// rebuild. The incremental watcher calls this instead when a watched path
+/// disappears (deleted, or renamed away), which is what makes a live per-file
+/// pipeline self-sufficient without a repository-wide wipe.
+///
+/// Edges are removed in both directions first — the file's own outgoing edges,
+/// and any edge from another file pointing INTO a symbol that is about to
+/// vanish (foreign keys are ON, so a still-referenced node cannot be deleted;
+/// an edge into a deleted symbol is stale regardless). Returns how many nodes
+/// were retired, so a caller can report a no-op honestly.
+pub async fn remove_file_graph(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    path: &str,
+) -> Result<u64, CodeGraphError> {
+    let repo = repository.to_string();
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM code_edges WHERE from_node IN \
+         (SELECT id FROM code_nodes WHERE repository = ? AND source_path = ?) \
+         OR to_node IN \
+         (SELECT id FROM code_nodes WHERE repository = ? AND source_path = ?)",
+    )
+    .bind(&repo)
+    .bind(path)
+    .bind(&repo)
+    .bind(path)
+    .execute(&mut *tx)
+    .await?;
+    let removed = sqlx::query("DELETE FROM code_nodes WHERE repository = ? AND source_path = ?")
+        .bind(&repo)
+        .bind(path)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(removed)
+}
+
 /// Parse a file graph without mutating persistence. Full-repository rebuilders
 /// use this preflight so one malformed file cannot trigger a destructive clear
 /// followed by a partial rebuild.
@@ -613,8 +656,13 @@ pub async fn blast_radius(
 }
 
 /// The tests covering a path: `Test` nodes that reach any symbol defined in
-/// `path` through up to `depth` layers of `Calls`/`References` edges
-/// (`graph.tests_covering`).
+/// `path` through up to `depth` layers of `Calls`/`References` edges, PLUS the
+/// tests defined in `path` itself (`graph.tests_covering`).
+///
+/// The same-file half matters more than the traversal in Rust: a `#[cfg(test)]
+/// mod tests` lives in the file it exercises, so its tests are seeds of the walk
+/// and [`reverse_reachable`] deliberately excludes seeds — asking "what tests
+/// cover `engine.rs`" would answer "none" for the overwhelmingly common layout.
 pub async fn tests_covering(
     pool: &SqlitePool,
     repository: RepositoryId,
@@ -631,10 +679,21 @@ pub async fn tests_covering(
     .into_iter()
     .map(|(id,)| CodeNodeId::from_str(&id))
     .collect::<Result<_, _>>()?;
+    covering_tests(pool, repository, &seeds, depth).await
+}
+
+/// The `Test` nodes among `seeds` and everything that reverse-reaches them.
+async fn covering_tests(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    seeds: &[CodeNodeId],
+    depth: usize,
+) -> Result<Vec<CodeNode>, CodeGraphError> {
     if seeds.is_empty() {
         return Ok(Vec::new());
     }
-    let reached = reverse_reachable(pool, repository, &seeds, depth).await?;
+    let mut reached = reverse_reachable(pool, repository, seeds, depth).await?;
+    reached.extend_from_slice(seeds);
     Ok(nodes_by_ids(pool, repository, &reached)
         .await?
         .into_iter()
@@ -672,7 +731,7 @@ async fn reverse_reachable(
     for _ in 0..depth {
         let mut next = Vec::new();
         for id in &frontier {
-            for caller in direct_caller_ids(pool, *id).await? {
+            for caller in direct_caller_ids(pool, repository, *id).await? {
                 if visited.insert(caller) {
                     next.push(caller);
                 }
@@ -683,23 +742,32 @@ async fn reverse_reachable(
         }
         frontier = next;
     }
-    let _ = repository;
     Ok(visited
         .into_iter()
         .filter(|id| !seeds.contains(id))
         .collect())
 }
 
-/// The ids with a `Calls`/`References` edge directly into `node`.
+/// The ids with a `Calls`/`References` edge directly into `node`, **scoped to
+/// `repository`**.
+///
+/// The scope is applied during the walk, not after it: a semantic (LSP) edge can
+/// cross checkouts served by one daemon, and filtering only at the final
+/// `nodes_by_ids` — as this did before — let the BFS spend its depth budget on
+/// nodes in another repository and then drop them silently, so a `blast_radius`
+/// could come back short with no indication why (2026-08-13 review, F10).
 async fn direct_caller_ids(
     pool: &SqlitePool,
+    repository: RepositoryId,
     node: CodeNodeId,
 ) -> Result<Vec<CodeNodeId>, CodeGraphError> {
     let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT from_node FROM code_edges WHERE to_node = ? \
-         AND relation IN ('calls', 'references')",
+        "SELECT e.from_node FROM code_edges e JOIN code_nodes n ON e.from_node = n.id \
+         WHERE e.to_node = ? AND n.repository = ? \
+         AND e.relation IN ('calls', 'references')",
     )
     .bind(node.to_string())
+    .bind(repository.to_string())
     .fetch_all(pool)
     .await?;
     rows.into_iter()
@@ -730,6 +798,413 @@ async fn nodes_by_ids(
     }
     let rows = query.fetch_all(pool).await?;
     rows.into_iter().map(|r| r.into_node(repository)).collect()
+}
+
+// --------------------------------------------------------------------------
+// The named query surface (`graph.callers_of` / `blast_radius` /
+// `tests_covering`) — what a tool, the TUI, or a CLI subcommand asks
+// --------------------------------------------------------------------------
+
+/// How many nodes one [`GraphAnswer`] discloses. A blast radius over a hub
+/// symbol can reach hundreds of nodes; an answer that spends the whole context
+/// window is worse than a truncated one that says it was truncated, so the
+/// answer carries `total` alongside the disclosed slice.
+pub const GRAPH_ANSWER_LIMIT: usize = 40;
+
+/// Ceiling on traversal depth. Each layer is a BFS round-trip per frontier node,
+/// so an unbounded depth on a large graph is a database stampede; five layers is
+/// far past the useful answer for "what breaks if I change this".
+pub const GRAPH_MAX_DEPTH: usize = 5;
+
+/// How many alternative symbols an ambiguous or missed lookup names back, so a
+/// caller that guessed the wrong name gets a next step instead of "not found".
+pub const GRAPH_CANDIDATE_LIMIT: usize = 10;
+
+/// A question the code graph can answer about a repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphQuestion {
+    /// Who calls this symbol directly (`graph.callers_of`).
+    CallersOf { symbol: String },
+    /// Everything that transitively reaches this symbol (`graph.blast_radius`).
+    BlastRadius { symbol: String, depth: usize },
+    /// Which tests reach any symbol defined in this file (`graph.tests_covering`).
+    TestsCovering { path: String, depth: usize },
+}
+
+/// One disclosed symbol in a [`GraphAnswer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphHit {
+    pub qualified_name: String,
+    pub kind: CodeNodeKind,
+    pub source_path: String,
+    /// The revision this node was last folded at. A `…+workdir` suffix means it
+    /// came from an uncommitted working-tree edit picked up by the watcher.
+    pub revision: String,
+}
+
+/// The answer to one [`GraphQuestion`]: what was asked, what it resolved to, and
+/// the (bounded) symbols found — plus the candidates to try when nothing matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphAnswer {
+    /// A one-line rendering of the question, so the answer stands alone.
+    pub question: String,
+    /// The symbols/files the question actually resolved to. Empty means the
+    /// lookup found nothing — see `candidates`.
+    pub targets: Vec<String>,
+    /// Near-miss symbol names, offered when `targets` is empty or the match was
+    /// ambiguous.
+    pub candidates: Vec<String>,
+    /// The disclosed slice of the result, at most [`GRAPH_ANSWER_LIMIT`].
+    pub hits: Vec<GraphHit>,
+    /// How many results existed before truncation.
+    pub total: usize,
+}
+
+impl GraphAnswer {
+    /// True when `hits` is a truncated view of `total`.
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.total > self.hits.len()
+    }
+
+    /// Render the answer as the compact text block a tool result or a CLI/TUI
+    /// pane shows. Deliberately plain: every line is `kind qualified_name —
+    /// path`, so a model can quote a symbol straight back into a follow-up query
+    /// and a human can paste a path into an editor.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&self.question);
+        out.push('\n');
+        if !self.targets.is_empty() {
+            out.push_str(&format!("resolved to: {}\n", self.targets.join(", ")));
+        }
+        if self.hits.is_empty() {
+            out.push_str("no results\n");
+            if !self.candidates.is_empty() {
+                out.push_str(&format!("did you mean: {}\n", self.candidates.join(", ")));
+            }
+            return out;
+        }
+        out.push_str(&format!(
+            "{} result{}{}\n",
+            self.total,
+            if self.total == 1 { "" } else { "s" },
+            if self.truncated() {
+                format!(" (showing the first {})", self.hits.len())
+            } else {
+                String::new()
+            }
+        ));
+        for hit in &self.hits {
+            out.push_str(&format!(
+                "  {} {} — {} @{}\n",
+                kind_label(hit.kind),
+                hit.qualified_name,
+                hit.source_path,
+                hit.revision
+            ));
+        }
+        out
+    }
+}
+
+/// The lower-case scalar name of a node kind, as the query surface prints it.
+fn kind_label(kind: CodeNodeKind) -> String {
+    let raw = scalar(&kind);
+    if raw.is_empty() {
+        format!("{kind:?}").to_lowercase()
+    } else {
+        raw
+    }
+}
+
+/// The seam a tool/CLI calls to ask the code graph a question. Lives here rather
+/// than in the runtime so the query layer, its bounds, and its rendering are one
+/// unit: the caller supplies a repository ROOT (what a run knows) and the
+/// implementation resolves the repository identity and the pool it owns.
+#[async_trait::async_trait]
+pub trait CodeGraphQueries: Send + Sync {
+    /// Answer `question` about the checkout at `repository_root`. Errors are
+    /// human strings — the caller renders them into a tool failure.
+    async fn ask(
+        &self,
+        repository_root: &Path,
+        question: GraphQuestion,
+    ) -> Result<GraphAnswer, String>;
+}
+
+/// Every node whose `qualified_name` matches `name`, best match first.
+///
+/// Three tiers, tried in order and never mixed: an exact `qualified_name`, then
+/// a last-segment match (`Engine::tick` for `tick`), then a substring. A model
+/// or a user names a symbol the way it appears in the source, not by the
+/// `source_path|package::name#Kind@hash` composite the graph keys on, so this is
+/// the translation layer every query goes through.
+pub async fn find_symbols(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    name: &str,
+    limit: usize,
+) -> Result<Vec<CodeNode>, CodeGraphError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(Vec::new());
+    }
+    // `_` and `%` are LIKE wildcards and `_` is pervasive in Rust identifiers, so
+    // escape both (plus the escape character itself) before interpolating.
+    let escaped = name
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let tiers = [
+        ("qualified_name = ?".to_string(), name.to_string()),
+        (
+            "qualified_name LIKE ? ESCAPE '\\'".to_string(),
+            format!("%::{escaped}"),
+        ),
+        (
+            "qualified_name LIKE ? ESCAPE '\\'".to_string(),
+            format!("%{escaped}%"),
+        ),
+    ];
+    for (predicate, pattern) in tiers {
+        let sql = format!(
+            "SELECT id, language, package, source_path, qualified_name, kind, signature_hash, \
+                    revision \
+             FROM code_nodes WHERE repository = ? AND {predicate} \
+             ORDER BY created_at ASC, id ASC LIMIT ?"
+        );
+        let rows: Vec<NodeRow> = sqlx::query_as(&sql)
+            .bind(repository.to_string())
+            .bind(&pattern)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await?;
+        if !rows.is_empty() {
+            return rows
+                .into_iter()
+                .map(|row| row.into_node(repository))
+                .collect();
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// Answer a [`GraphQuestion`] against `repository`'s graph.
+///
+/// Depth is clamped to [`GRAPH_MAX_DEPTH`] and results to [`GRAPH_ANSWER_LIMIT`]
+/// rather than rejected, so a caller that asks for `depth: 99` gets a bounded
+/// answer instead of an error it has to learn to avoid.
+pub async fn answer(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    question: &GraphQuestion,
+) -> Result<GraphAnswer, CodeGraphError> {
+    match question {
+        GraphQuestion::CallersOf { symbol } => {
+            let (targets, seeds, candidates) = resolve_seeds(pool, repository, symbol).await?;
+            let mut reached = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for seed in &seeds {
+                for caller in direct_caller_ids(pool, repository, *seed).await? {
+                    if !seeds.contains(&caller) && seen.insert(caller) {
+                        reached.push(caller);
+                    }
+                }
+            }
+            let nodes = nodes_by_ids(pool, repository, &reached).await?;
+            Ok(assemble(
+                format!("callers of `{symbol}`"),
+                targets,
+                candidates,
+                nodes,
+            ))
+        }
+        GraphQuestion::BlastRadius { symbol, depth } => {
+            let depth = (*depth).clamp(1, GRAPH_MAX_DEPTH);
+            let (targets, seeds, candidates) = resolve_seeds(pool, repository, symbol).await?;
+            let reached = reverse_reachable(pool, repository, &seeds, depth).await?;
+            let nodes = nodes_by_ids(pool, repository, &reached).await?;
+            Ok(assemble(
+                format!("blast radius of `{symbol}` (depth {depth})"),
+                targets,
+                candidates,
+                nodes,
+            ))
+        }
+        GraphQuestion::TestsCovering { path, depth } => {
+            let depth = (*depth).clamp(1, GRAPH_MAX_DEPTH);
+            let (targets, seeds) = resolve_path_seeds(pool, repository, path).await?;
+            let candidates = if seeds.is_empty() {
+                nearby_paths(pool, repository, path).await?
+            } else {
+                Vec::new()
+            };
+            let nodes = covering_tests(pool, repository, &seeds, depth).await?;
+            Ok(assemble(
+                format!("tests covering `{path}` (depth {depth})"),
+                targets,
+                candidates,
+                nodes,
+            ))
+        }
+    }
+}
+
+/// Resolve a symbol name to its matching node ids, plus the names they resolved
+/// to and (when nothing matched) the near-miss candidates to suggest.
+async fn resolve_seeds(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    symbol: &str,
+) -> Result<(Vec<String>, Vec<CodeNodeId>, Vec<String>), CodeGraphError> {
+    let matched = find_symbols(pool, repository, symbol, GRAPH_CANDIDATE_LIMIT).await?;
+    if matched.is_empty() {
+        return Ok((
+            Vec::new(),
+            Vec::new(),
+            nearby_symbols(pool, repository, symbol).await?,
+        ));
+    }
+    let targets = matched
+        .iter()
+        .map(|n| format!("{} ({})", n.key.qualified_name, n.key.source_path))
+        .collect();
+    let seeds = matched.iter().map(|n| n.id).collect();
+    Ok((targets, seeds, Vec::new()))
+}
+
+/// Resolve a file path to the ids of every symbol defined in it. Accepts a
+/// repo-relative path, or a suffix of one (`policy.rs` finds
+/// `crates/routing/src/policy.rs`) — a user or model rarely types the full path.
+async fn resolve_path_seeds(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    path: &str,
+) -> Result<(Vec<String>, Vec<CodeNodeId>), CodeGraphError> {
+    let path = path.trim().trim_start_matches("./");
+    if path.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let escaped = path
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    for (predicate, pattern) in [
+        ("source_path = ?".to_string(), path.to_string()),
+        (
+            "source_path LIKE ? ESCAPE '\\'".to_string(),
+            format!("%{escaped}"),
+        ),
+    ] {
+        let sql =
+            format!("SELECT id, source_path FROM code_nodes WHERE repository = ? AND {predicate}");
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(&sql)
+            .bind(repository.to_string())
+            .bind(&pattern)
+            .fetch_all(pool)
+            .await?;
+        if !rows.is_empty() {
+            let mut paths: Vec<String> = rows
+                .iter()
+                .filter_map(|(_, p)| p.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            paths.truncate(GRAPH_CANDIDATE_LIMIT);
+            let ids = rows
+                .iter()
+                .map(|(id, _)| CodeNodeId::from_str(id))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok((paths, ids));
+        }
+    }
+    Ok((Vec::new(), Vec::new()))
+}
+
+/// Symbol names sharing a prefix with a failed lookup — the "did you mean".
+async fn nearby_symbols(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    symbol: &str,
+) -> Result<Vec<String>, CodeGraphError> {
+    let head: String = symbol.trim().chars().take(3).collect();
+    if head.is_empty() {
+        return Ok(Vec::new());
+    }
+    let escaped = head
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT qualified_name FROM code_nodes \
+         WHERE repository = ? AND qualified_name LIKE ? ESCAPE '\\' \
+         ORDER BY qualified_name ASC LIMIT ?",
+    )
+    .bind(repository.to_string())
+    .bind(format!("%{escaped}%"))
+    .bind(GRAPH_CANDIDATE_LIMIT as i64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(name,)| name).collect())
+}
+
+/// Indexed paths sharing a component with a failed path lookup.
+async fn nearby_paths(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    path: &str,
+) -> Result<Vec<String>, CodeGraphError> {
+    let stem = Path::new(path.trim())
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if stem.is_empty() {
+        return Ok(Vec::new());
+    }
+    let escaped = stem
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT source_path FROM code_nodes \
+         WHERE repository = ? AND source_path LIKE ? ESCAPE '\\' \
+         ORDER BY source_path ASC LIMIT ?",
+    )
+    .bind(repository.to_string())
+    .bind(format!("%{escaped}%"))
+    .bind(GRAPH_CANDIDATE_LIMIT as i64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(path,)| path).collect())
+}
+
+/// Project resolved nodes into a bounded [`GraphAnswer`].
+fn assemble(
+    question: String,
+    targets: Vec<String>,
+    candidates: Vec<String>,
+    nodes: Vec<CodeNode>,
+) -> GraphAnswer {
+    let total = nodes.len();
+    let hits = nodes
+        .into_iter()
+        .take(GRAPH_ANSWER_LIMIT)
+        .map(|node| GraphHit {
+            qualified_name: node.key.qualified_name,
+            kind: node.key.kind,
+            source_path: node.key.source_path,
+            revision: node.revision.0,
+        })
+        .collect();
+    GraphAnswer {
+        question,
+        targets,
+        candidates,
+        hits,
+        total,
+    }
 }
 
 // --------------------------------------------------------------------------

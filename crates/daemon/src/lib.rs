@@ -22,6 +22,9 @@ pub mod documents;
 pub mod executor;
 pub mod model_profiles;
 pub mod policy;
+// Outcome 19: the connection principal, derived from the socket's peer
+// credentials rather than asserted by the client.
+pub mod principal;
 pub mod projections;
 pub mod promotion;
 pub mod recovery;

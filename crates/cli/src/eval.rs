@@ -367,6 +367,15 @@ fn routed_model_for_case(routed: Option<&[(String, ModelId)]>, case_id: &str) ->
 /// not given. Each case's routed model, if any, is pinned into its own
 /// `StartRun.model` (see [`routed_model_for_case`]), so the model this run
 /// executes on is always the model the report attributes to it.
+///
+/// **Also grades and clusters every case's [`codypendent_eval::Trace`]**
+/// (STEP 7.4's `codypendent_eval::grade`/`cluster` — previously a
+/// well-tested library with no production producer or consumer; see the
+/// task report). This is additive to [`SuiteReport`] itself (which
+/// `crate::commands::eval_run` — not owned by this module — reads and
+/// writes unchanged) and reported ONLY over stderr, the same channel the
+/// per-case `PASS`/`FAIL` lines already use, so no caller's parsing of the
+/// returned [`SuiteReport`] or the written report file changes shape.
 pub async fn run_suite(
     paths: &codypendent_protocol::discovery::RuntimePaths,
     cases: &[EvalCase],
@@ -375,6 +384,7 @@ pub async fn run_suite(
 ) -> anyhow::Result<SuiteReport> {
     ensure_daemon(paths).await?;
     let mut results = Vec::with_capacity(cases.len());
+    let mut grades = Vec::with_capacity(cases.len());
     for case in cases {
         eprintln!("eval: running {}", case.id);
         let (_scratch, checkout) = checkout_fixture(fixture_root, &case.repository_revision)
@@ -383,34 +393,95 @@ pub async fn run_suite(
 
         let mut conn = Connection::connect(&paths.socket_path).await?;
         let routed_model = routed_model_for_case(routed, &case.id);
-        let result = run_case(&mut conn, case, &checkout, routed_model).await?;
+        let (result, trace) = run_case_with_trace(&mut conn, case, &checkout, routed_model).await?;
         eprintln!(
             "eval: {} {}",
             case.id,
             if result.passed() { "PASS" } else { "FAIL" }
         );
+        grades.push(codypendent_eval::grade(&trace));
         results.push(result);
     }
+    report_failure_clusters(&grades);
     Ok(SuiteReport::new(results))
 }
 
-/// Run one case to a [`CaseResult`]: drive it headlessly over `conn` (already
-/// connected; this handshakes it), then fill in the repository-derived facts
-/// from `checkout`, then score. Split out from [`run_suite`]'s loop so a test
-/// can drive exactly this pipeline — wire observation AND repository
-/// inspection — against a hand-rolled mock daemon and a real (but tiny,
-/// throwaway) git checkout, without a live daemon or model. `routed_model`
-/// (when `Some`) is the model this case is pinned to (see [`run_suite`]);
-/// `None` sends `StartRun { model: None }`, unchanged.
+/// Print a deterministic, most-frequent-first summary of this run's failure
+/// clusters to stderr — [`codypendent_eval::cluster_failures`]'s one
+/// production call site. Silent when nothing has a negative signal (an
+/// all-passing suite prints nothing extra beyond the existing PASS lines).
+fn report_failure_clusters(grades: &[codypendent_eval::TraceGrade]) {
+    let failing: Vec<codypendent_eval::TraceGrade> = grades
+        .iter()
+        .filter(|g| g.has_negative_signal())
+        .cloned()
+        .collect();
+    if failing.is_empty() {
+        return;
+    }
+    let clusters = codypendent_eval::cluster_failures(&failing);
+    let clusters = codypendent_eval::rank_by_frequency(clusters);
+    eprintln!(
+        "eval: {} failing trace(s) across {} failure cluster(s):",
+        failing.len(),
+        clusters.len()
+    );
+    for cluster in &clusters {
+        eprintln!(
+            "eval:   [{}x] {} / {} (tool: {}) — {}",
+            cluster.count(),
+            cluster.key.task_class,
+            cluster.key.failing_signal.as_str(),
+            cluster.key.tool.as_deref().unwrap_or("none"),
+            cluster.exemplars.join(", ")
+        );
+    }
+}
+
+/// Run one case to a [`CaseResult`](codypendent_eval::CaseResult), discarding
+/// the [`codypendent_eval::Trace`] built alongside it. Kept as the stable,
+/// minimal-surface entry point `crates/cli/tests/eval_it.rs` and any
+/// external caller drives directly against a hand-rolled mock daemon;
+/// [`run_suite`] uses [`run_case_with_trace`] so it can grade and cluster
+/// the suite's failures.
 pub async fn run_case(
     conn: &mut Connection,
     case: &EvalCase,
     checkout: &Path,
     routed_model: Option<ModelId>,
 ) -> anyhow::Result<codypendent_eval::CaseResult> {
-    let mut obs = run_case_over_connection(conn, case, checkout, routed_model).await?;
-    inspect_repository(checkout, case, &mut obs).await?;
-    Ok(case.score(&obs))
+    let (result, _trace) = run_case_with_trace(conn, case, checkout, routed_model).await?;
+    Ok(result)
+}
+
+/// Like [`run_case`], but also returns the [`codypendent_eval::Trace`] built
+/// from the same observation — the STEP 7.4 wiring `codypendent_eval::grade`/
+/// `cluster` previously had no production producer for. Built here, where
+/// the full [`RunObservation`] is still in scope, rather than re-derived
+/// later from a bare [`codypendent_eval::CaseResult`]: several `Trace`
+/// fields (`tool`, `command_failures`) need facts (`executed_commands`,
+/// per-assertion detail against `obs` directly) a bare
+/// [`codypendent_eval::CaseResult`] — assertion pass/fail only — has
+/// already discarded.
+/// Drive it headlessly over `conn` (already connected; this handshakes it),
+/// then fill in the repository-derived facts from `checkout`, then score.
+/// Split out from [`run_suite`]'s loop so a test can drive exactly this
+/// pipeline — wire observation AND repository inspection — against a
+/// hand-rolled mock daemon and a real (but tiny, throwaway) git checkout,
+/// without a live daemon or model. `routed_model` (when `Some`) is the model
+/// this case is pinned to (see [`run_suite`]); `None` sends
+/// `StartRun { model: None }`, unchanged.
+pub async fn run_case_with_trace(
+    conn: &mut Connection,
+    case: &EvalCase,
+    checkout: &Path,
+    routed_model: Option<ModelId>,
+) -> anyhow::Result<(codypendent_eval::CaseResult, codypendent_eval::Trace)> {
+    let (mut obs, run_id) = run_case_over_connection(conn, case, checkout, routed_model).await?;
+    inspect_repository(checkout, run_id, case, &mut obs).await?;
+    let result = case.score(&obs);
+    let trace = codypendent_eval::Trace::from_case(case, &result, &obs);
+    Ok((result, trace))
 }
 
 /// The connected core of one case's headless run: handshake, create a session,
@@ -420,12 +491,19 @@ pub async fn run_case(
 /// against a hand-rolled mock daemon instead of a live one. `routed_model`
 /// (when `Some`) is pinned onto the `StartRun` this sends (see [`run_suite`]);
 /// `None` sends `StartRun { model: None }`, unchanged.
+///
+/// Also returns the [`RunId`] the daemon assigned (`None` only if the
+/// connection closed before any `RunStarted`/`CommandAccepted` ever named
+/// one — an early-failure shape [`inspect_repository`] already handles by
+/// falling back to `repository`), so [`run_case`] can locate the run's own
+/// isolated worktree (see [`run_worktree_root`]) rather than only ever
+/// inspecting `repository` itself.
 pub async fn run_case_over_connection(
     conn: &mut Connection,
     case: &EvalCase,
     repository: &Path,
     routed_model: Option<ModelId>,
-) -> anyhow::Result<RunObservation> {
+) -> anyhow::Result<(RunObservation, Option<RunId>)> {
     conn.handshake("codypendent-eval", env!("CARGO_PKG_VERSION"), None)
         .await?;
 
@@ -535,7 +613,7 @@ pub async fn run_case_over_connection(
         }
     }
     builder.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    Ok(builder.finish())
+    Ok((builder.finish(), run_id))
 }
 
 /// Whether `body` is the terminal event of the run it belongs to (mirrors
@@ -695,12 +773,26 @@ impl ObservationBuilder {
 /// tracked and untracked), and — only when the case actually asserts on them
 /// (skipped otherwise to avoid a needless `cargo test`/`git grep`) —
 /// `existing_symbols` and `tests_passed`.
+///
+/// **Inspects the run's own worktree, not blindly `repository`.** A writing
+/// run never mutates `repository` itself — see [`run_worktree_root`] for why
+/// — so when `run_id` resolves to a worktree that still exists on disk, every
+/// fact below is read from THAT directory instead. A case that changed
+/// nothing (or whose run never got a `run_id`) still correctly inspects
+/// `repository`, because [`run_worktree_root`] returns `None` in exactly
+/// that situation (see its own doc for why that fallback is safe, not just
+/// convenient).
 async fn inspect_repository(
     repository: &Path,
+    run_id: Option<RunId>,
     case: &EvalCase,
     obs: &mut RunObservation,
 ) -> anyhow::Result<()> {
-    obs.changed_files = git_changed_files(repository, &case.repository_revision).await?;
+    let root: PathBuf = run_id
+        .and_then(|id| run_worktree_root(repository, id))
+        .unwrap_or_else(|| repository.to_path_buf());
+
+    obs.changed_files = git_changed_files(&root, &case.repository_revision).await?;
     obs.patch_files_changed = obs.changed_files.len();
 
     if case
@@ -710,7 +802,7 @@ async fn inspect_repository(
     {
         for assertion in &case.expected {
             if let Assertion::SymbolExists { symbol } = assertion {
-                if git_grep_has_match(repository, symbol).await? {
+                if git_grep_has_match(&root, symbol).await? {
                     obs.existing_symbols.push(symbol.clone());
                 }
             }
@@ -722,10 +814,66 @@ async fn inspect_repository(
         .iter()
         .any(|a| matches!(a, Assertion::TestsPass))
     {
-        obs.tests_passed = Some(run_fixture_tests(repository).await?);
+        obs.tests_passed = Some(run_fixture_tests(&root).await?);
     }
 
     Ok(())
+}
+
+/// Mirrors `codypendent_daemon::worktrees::short_run_id` exactly — 12 lower-hex
+/// characters, the tail of the run id's simple (no-hyphen) form. That function
+/// is private to the daemon crate and the wire protocol carries no message
+/// exposing it, so a client that wants to find its OWN run's isolated
+/// worktree (see [`run_worktree_root`]) has no way to ask for the path — it
+/// must reconstruct it. Cross-checked against a REAL
+/// `codypendent_daemon::worktrees::WorktreeManager::allocate` call by
+/// `run_worktree_root_matches_the_daemons_own_layout`, so a future change to
+/// either side's formula fails a test here rather than silently going stale.
+fn short_run_id(run_id: RunId) -> String {
+    let simple = run_id.0.as_simple().to_string();
+    simple[simple.len() - 12..].to_string()
+}
+
+/// The isolated worktree directory a writing run used, if one still exists on
+/// disk — `<repository>/../codypendent-worktrees/<repository-name>/run-<short>`,
+/// `codypendent_daemon::worktrees::WorktreeManager`'s own on-disk layout under
+/// its default (`--worktree-root` unset) configuration, which every eval run
+/// uses (see [`short_run_id`] for why this is reconstructed rather than
+/// asked for).
+///
+/// **Why `repository` itself is the wrong place to look.** STEP 1.8 isolates
+/// every writing run onto a dedicated `git worktree` — a sibling directory on
+/// its own branch — specifically so a run can never mutate the checkout that
+/// spawned it out from under a concurrent reader. `WorktreeManager::release`
+/// (called unconditionally once a run ends, success or not) does not merge
+/// that branch back into `repository`: it exports the diff as a patch
+/// artifact and, whenever the worktree holds unmerged commits or a dirty
+/// tree, *retains the directory* rather than deleting it — the "protect
+/// unmerged work" exit criterion documented on `WorktreeManager::release`
+/// itself. So a case whose run genuinely wrote `src/math.rs` leaves that
+/// change sitting in this directory, while `repository`'s own working tree
+/// is — correctly, by the runtime's own design — never touched. Diffing
+/// `repository` alone (this function's caller's behavior before this fix)
+/// therefore reports `file-changed` assertions as failed for every case that
+/// actually worked, which is worse than a merely-vacuous pass: it is a
+/// false NEGATIVE baked into the harness itself, not the model under test.
+///
+/// Returns `None` — meaning the caller should inspect `repository` — when
+/// nothing is here to find: a read-only run allocates no worktree at all
+/// (`WorktreeManager::allocate` is only ever called by the first write
+/// attempt), and a run that allocated one but changed nothing has it removed
+/// by the same release path (nothing to protect). In both cases `repository`
+/// already reflects reality, so falling back to it is not a lesser signal —
+/// it is the SAME signal a worktree would have given.
+fn run_worktree_root(repository: &Path, run_id: RunId) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(repository).ok()?;
+    let parent = canonical.parent()?;
+    let repo_name = canonical.file_name()?;
+    let candidate = parent
+        .join("codypendent-worktrees")
+        .join(repo_name)
+        .join(format!("run-{}", short_run_id(run_id)));
+    candidate.is_dir().then_some(candidate)
 }
 
 /// Every path that differs from `base_revision` in `repository`'s working
@@ -1087,5 +1235,92 @@ mod policy_routing_tests {
             "the model pinned into this case's StartRun must equal the model \
              recorded in the report"
         );
+    }
+}
+
+#[cfg(test)]
+mod worktree_inspection_tests {
+    use super::*;
+    use codypendent_daemon::worktrees::WorktreeManager;
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args([
+                "-c",
+                "user.name=eval-worktree-test",
+                "-c",
+                "user.email=eval-worktree-test@example.com",
+            ])
+            .args(args)
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {args:?} failed: {status}");
+    }
+
+    fn init_repo(root: &Path) {
+        std::fs::write(root.join("README.md"), "seed\n").unwrap();
+        git(root, &["init", "--quiet"]);
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "--quiet", "-m", "seed"]);
+    }
+
+    /// A real cross-check against `codypendent_daemon::worktrees::WorktreeManager`
+    /// itself — not just a hand-verified formula — so a future change to the
+    /// daemon's own layout (`short_run_id`'s derivation, or the
+    /// sibling-directory convention `run_worktree_root` assumes) fails HERE
+    /// instead of `codypendent eval run` silently going back to scoring every
+    /// writing case's `file-changed`/`tests-pass`/`symbol-exists` assertion
+    /// false forever (see `run_worktree_root`'s own doc for the full story:
+    /// this is the fix for a false negative baked into the harness itself,
+    /// found and verified against a real daemon binary — see the task
+    /// report).
+    #[tokio::test]
+    async fn run_worktree_root_matches_the_daemons_own_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let pool = open_database(&dir.path().join("codypendent.db"))
+            .await
+            .expect("open a freshly migrated database");
+        let run_id = RunId::new();
+        let lease = WorktreeManager::new()
+            .allocate(&pool, &repo, run_id)
+            .await
+            .expect("allocate a real worktree exactly as the daemon would for a writing run");
+
+        let found = run_worktree_root(&repo, run_id)
+            .expect("the freshly allocated worktree exists on disk");
+        assert_eq!(
+            std::fs::canonicalize(&found).unwrap(),
+            std::fs::canonicalize(&lease.worktree_path).unwrap(),
+            "run_worktree_root must resolve to the SAME directory WorktreeManager::allocate just created"
+        );
+    }
+
+    /// `None` — meaning "inspect `repository` itself" — is the correct answer
+    /// for a run that never allocated a worktree at all (no writing tool was
+    /// ever called; `WorktreeManager::allocate` is only reached by the first
+    /// write attempt), not merely "an absent directory".
+    #[test]
+    fn run_worktree_root_is_none_when_nothing_was_ever_allocated() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // No `codypendent-worktrees/` sibling exists at all — this is what an
+        // eval case whose run touched nothing (or that never got a `run_id`)
+        // looks like on disk.
+        assert_eq!(run_worktree_root(&repo, RunId::new()), None);
+    }
+
+    #[test]
+    fn short_run_id_is_the_last_twelve_hex_characters_of_the_simple_form() {
+        let run_id = RunId::new();
+        let simple = run_id.0.as_simple().to_string();
+        assert_eq!(short_run_id(run_id), simple[simple.len() - 12..]);
+        assert_eq!(short_run_id(run_id).len(), 12);
     }
 }

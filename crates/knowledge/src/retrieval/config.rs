@@ -74,6 +74,15 @@ pub struct RetrievalConfig {
     pub disclose_skills_min: usize,
     /// Maximum skill cards to disclose.
     pub disclose_skills_max: usize,
+    /// Maximum **command** cards to disclose (`0` discloses none).
+    ///
+    /// Deliberately much smaller than the tool budget: a command is a whole
+    /// workflow behind one slash word, so one or two of them is a suggestion
+    /// ("there is a `/fix-ci` for this") rather than a catalog. Before this
+    /// existed, [`Command`](crate::types::RegistryItemKind::Command) items were
+    /// scored and then dropped on the floor — `/fix-ci` entered the candidate
+    /// union for "the ci is red" on every query and could never be disclosed.
+    pub disclose_commands_max: usize,
     /// The rerank weights.
     pub weights: RerankWeights,
 }
@@ -91,6 +100,7 @@ impl Default for RetrievalConfig {
             disclose_tools_max: 12,
             disclose_skills_min: 1,
             disclose_skills_max: 3,
+            disclose_commands_max: 2,
             weights: RerankWeights::default(),
         }
     }

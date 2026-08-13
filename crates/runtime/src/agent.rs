@@ -1120,9 +1120,24 @@ pub struct RunContext {
     /// `None` — the default, and the value for every run whose bridge offers at
     /// most `mcp_top_k` tools — means "advertise every MCP tool the bridge
     /// offers", exactly today's behavior. `Some(names)` is the top-k subset a
-    /// large MCP surface was narrowed to. Only the `mcp.*` family is ever gated:
-    /// the core built-in tools are always advertised in full.
+    /// large MCP surface was narrowed to.
     pub mcp_advertised: Option<Vec<String>>,
+    /// This run's retrieval-narrowed BUILT-IN advertisement (rubric 9), computed
+    /// ONCE per run by [`FrameworkAgentRuntime::select_builtin_tools`] and read
+    /// by [`advertised_tool_definitions`](FrameworkAgentRuntime::advertised_tool_definitions)
+    /// on every step.
+    ///
+    /// `None` means "advertise every offered built-in", the behavior before the
+    /// funnel fed this decision. `Some(names)` is
+    /// [`ALWAYS_ADVERTISED_TOOLS`] ∪ the funnel's top-k for this run's objective.
+    ///
+    /// It narrows only what the model is SHOWN. It is deliberately NOT consulted
+    /// by [`offered_tool_names`](FrameworkAgentRuntime::offered_tool_names), so a
+    /// tool the model learned about earlier — from a prior turn's transcript,
+    /// from `skills.search`, or from a continuation's carried context — still
+    /// dispatches. Narrowing advertisement can cost the model an idea; narrowing
+    /// dispatch would strand it mid-task.
+    pub tools_advertised: Option<Vec<String>>,
 }
 
 impl RunContext {
@@ -1149,6 +1164,7 @@ impl RunContext {
             steering: None,
             prior: Vec::new(),
             mcp_advertised: None,
+            tools_advertised: None,
         }
     }
 
@@ -1387,6 +1403,11 @@ pub struct FrameworkAgentRuntime {
     /// gate outright — every offered MCP tool is advertised, today's behavior.
     /// Set from `models.toml`'s `[retrieval] mcp_top_k`.
     mcp_top_k: usize,
+    /// Retrieval gating for the BUILT-IN tool family (rubric 9): how many tools
+    /// the funnel picks on top of [`ALWAYS_ADVERTISED_TOOLS`]. `0` disables the
+    /// gate outright (advertise every offered built-in — the behavior before
+    /// this existed). Set from `models.toml`'s `[retrieval] builtin_top_k`.
+    builtin_top_k: usize,
     /// The registry the `skills.search` tool queries (rubric 9), if wired.
     /// Process-wide (one knowledge pool), like `github`/`mcp`, so it lives on
     /// the runtime rather than the run context. `None` leaves the tool unoffered
@@ -1451,6 +1472,7 @@ impl FrameworkAgentRuntime {
             search: None,
             blackboard: None,
             mcp_top_k: crate::models::DEFAULT_MCP_TOP_K,
+            builtin_top_k: crate::models::DEFAULT_BUILTIN_TOP_K,
             registry: None,
             docs: None,
             artifacts: None,
@@ -1504,6 +1526,18 @@ impl FrameworkAgentRuntime {
     #[must_use]
     pub fn with_mcp_top_k(mut self, mcp_top_k: usize) -> Self {
         self.mcp_top_k = mcp_top_k;
+        self
+    }
+
+    /// Set the BUILT-IN retrieval-gating budget (rubric 9) from `models.toml`'s
+    /// `[retrieval] builtin_top_k`: how many tools the funnel selects on top of
+    /// the [`ALWAYS_ADVERTISED_TOOLS`] floor. `0` disables the gate — every
+    /// offered built-in is advertised, exactly as before this existed — which is
+    /// the escape hatch if an operator ever finds the narrowing wrong for their
+    /// workload.
+    #[must_use]
+    pub fn with_builtin_top_k(mut self, builtin_top_k: usize) -> Self {
+        self.builtin_top_k = builtin_top_k;
         self
     }
 
@@ -1815,21 +1849,38 @@ impl FrameworkAgentRuntime {
     /// client): the static catalog filtered to exactly
     /// [`offered_tool_names`](Self::offered_tool_names) (the FIX 1 projection —
     /// a name absent there is fail-safe omitted even if the catalog and the
-    /// offered set ever drift), PLUS one definition per tool the MCP bridge
-    /// currently offers, carrying the server-supplied description and
-    /// `inputSchema` VERBATIM. MCP definitions are declaration-only
+    /// offered set ever drift), then narrowed by this run's retrieval selection
+    /// ([`RunContext::tools_advertised`], rubric 9), PLUS one definition per tool
+    /// the MCP bridge currently offers, carrying the server-supplied description
+    /// and `inputSchema` VERBATIM. MCP definitions are declaration-only
     /// (`executor: None`, `ApprovalMode::NeverRequire`) — the loop executes
     /// them, and the daemon's policy engine (not the framework) gates them.
     /// The MCP half projects through the SAME offered set (PR C2: a mode whose
-    /// overlay forbids commands drops `mcp.*` from both sides, keeping
-    /// advertised ≡ offered in every mode).
+    /// overlay forbids commands drops `mcp.*` from both sides).
+    ///
+    /// **Advertised ⊆ offered, and no longer ≡ offered.** Advertisement is what
+    /// the model is shown; the offered set is what `prepare` will dispatch. The
+    /// funnel narrows only the former, because a wrong ranking must cost the
+    /// model an idea and never the ability to finish (see
+    /// [`RunContext::tools_advertised`]). The relationship in the other
+    /// direction is still exact: a name absent from `offered` is never
+    /// advertised, in any mode.
     #[must_use]
     pub fn advertised_tool_definitions(&self, run: &RunContext) -> Vec<ToolDefinition> {
         use agent_framework_core::tools::{ApprovalMode, ToolKind};
         let offered = self.offered_tool_names(run);
+        let advertise = |name: &String| {
+            offered.contains(name)
+                && match &run.tools_advertised {
+                    // `mcp.*` has its own gate (`mcp_advertised`, already applied
+                    // inside `offered_tool_names`), so it is never re-filtered here.
+                    Some(selected) => name.starts_with("mcp.") || selected.contains(name),
+                    None => true,
+                }
+        };
         let mut definitions: Vec<ToolDefinition> = static_tool_definitions()
             .into_iter()
-            .filter(|def| offered.contains(&def.name))
+            .filter(|def| advertise(&def.name))
             .collect();
         if let Some(bridge) = &self.mcp {
             definitions.extend(
@@ -1851,13 +1902,126 @@ impl FrameworkAgentRuntime {
         definitions
     }
 
+    /// Choose which BUILT-IN tools this run advertises (rubric 9 — vector top-k
+    /// tool selection instead of injecting every description), or `None` to
+    /// advertise them all.
+    ///
+    /// This is the half of rubric 9 that used to be missing. The doc comment on
+    /// [`select_mcp_tools`](Self::select_mcp_tools) below used to claim the
+    /// built-in set "stays static and fully advertised — ALWAYS", and it did: two
+    /// runs with unrelated objectives produced byte-identical 21-definition tool
+    /// arrays, so on a default install (no MCP servers) retrieval gated exactly
+    /// zero tools. The funnel's ranked output reached the model only as prose in
+    /// a context card, next to the full schemas of everything.
+    ///
+    /// Now the same funnel (`codypendent_knowledge::retrieve`) ranks the run's
+    /// OFFERED built-ins — each projected into an in-memory registry item
+    /// carrying the schema catalog's description plus, when the knowledge crate
+    /// registers the same name, its curated intents and keywords — and the
+    /// advertisement is the floor plus the top `builtin_top_k`.
+    ///
+    /// # The floor
+    ///
+    /// [`ALWAYS_ADVERTISED_TOOLS`] is unioned in unconditionally (intersected
+    /// with what the run is offered, so a mode overlay's denials still win). The
+    /// outcome asks for "top-k selection instead of injecting all descriptions",
+    /// not "let retrieval decide whether the agent can read a file": the ranker
+    /// is a fuzzy lexical signal over one sentence of objective, and a query that
+    /// happens not to mention writing must not leave a Build run unable to write.
+    /// The floor is the set whose absence is unrecoverable; everything else the
+    /// model can get back by ranking, by naming it (dispatch is never narrowed),
+    /// or by asking `skills.search` — which is itself in the floor for exactly
+    /// that reason.
+    ///
+    /// Returns `None` (advertise everything, unchanged behavior) when: the gate
+    /// is disabled (`builtin_top_k == 0`), the run offers so few built-ins that
+    /// floor + k already covers them, or the funnel itself fails. Retrieval is an
+    /// aid, never a gate on running — a degraded funnel widens the
+    /// advertisement, never narrows it wrongly.
+    ///
+    /// Computed once per run (see [`execute_run`](Self::execute_run)), like the
+    /// MCP gate and for the same reason: the query is the objective plus the
+    /// latest user turn, and neither changes between steps.
+    #[must_use]
+    pub fn select_builtin_tools(&self, run: &RunContext) -> Option<Vec<String>> {
+        if self.builtin_top_k == 0 {
+            return None;
+        }
+        // `mcp.*` is excluded here and left to `select_mcp_tools`: the two
+        // families have different budgets and different failure modes, and
+        // ranking them in one pool would let a large MCP surface crowd out the
+        // built-ins (or vice versa).
+        let candidates: Vec<String> = self
+            .offered_tool_names(run)
+            .into_iter()
+            .filter(|name| !name.starts_with("mcp."))
+            .collect();
+        let floor: Vec<String> = ALWAYS_ADVERTISED_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .filter(|name| candidates.contains(name))
+            .collect();
+        if candidates.len() <= floor.len() + self.builtin_top_k {
+            return None;
+        }
+
+        let items = builtin_registry_items(&candidates);
+        let indexes = match RetrievalIndexes::build(&items, HashingEmbedder::new()) {
+            Ok(indexes) => indexes,
+            Err(error) => {
+                warn_builtin_gate_degraded(&error.to_string());
+                return None;
+            }
+        };
+        // Every projected item is System-scoped, Active, executable, FirstParty
+        // and uniformly `Low` risk (see `builtin_registry_items`), and the ceiling
+        // is `High` — so the funnel's hard filters admit the whole family and this
+        // is a pure relevance ranking. Nothing here is a security decision: the
+        // mode overlay in `offered_tool_names`, `prepare`, and the policy engine
+        // remain the only things that decide what a run may DO.
+        let query = RetrievalQuery::new(
+            retrieval_query_text(run),
+            vec![Scope::System],
+            RiskClass::High,
+        );
+        let config = RetrievalConfig {
+            disclose_tools_min: self.builtin_top_k,
+            disclose_tools_max: self.builtin_top_k,
+            // The projection has no skills or commands, so ask for none.
+            disclose_skills_min: 0,
+            disclose_skills_max: 0,
+            disclose_commands_max: 0,
+            ..RetrievalConfig::default()
+        };
+        match retrieve(&items, &indexes, &query, &config) {
+            Ok(result) => {
+                let mut selected = floor;
+                for card in result.tools {
+                    if !selected.contains(&card.name) {
+                        selected.push(card.name);
+                    }
+                }
+                tracing::info!(
+                    run_id = %run.run_id,
+                    offered = candidates.len(),
+                    advertised = selected.len(),
+                    "retrieval narrowed this run's built-in tool advertisement"
+                );
+                Some(selected)
+            }
+            Err(error) => {
+                warn_builtin_gate_degraded(&error.to_string());
+                None
+            }
+        }
+    }
+
     /// Choose which `mcp.*` tools this run advertises (rubric 9 — retrieval-gated
     /// tool advertisement), or `None` to advertise them all.
     ///
-    /// The built-in tool set is small, fixed, and always relevant, so it stays
-    /// static and fully advertised — ALWAYS. The MCP family is the opposite: it
-    /// grows without bound with the operator's server list, and every tool in it
-    /// used to be injected on every step. Above the `mcp_top_k` threshold this
+    /// The MCP family grows without bound with the operator's server list, and
+    /// every tool in it used to be injected on every step. Above the `mcp_top_k`
+    /// threshold this
     /// runs the SAME retrieval funnel the knowledge fabric uses for context
     /// assembly (`codypendent_knowledge::retrieve`) over the bridge's tools — each
     /// projected into an in-memory registry item carrying the server-supplied
@@ -1963,6 +2127,13 @@ impl FrameworkAgentRuntime {
         // `None` result means "advertise every offered MCP tool", the behavior
         // before this existed.
         run.mcp_advertised = self.select_mcp_tools(&run);
+        // Rubric 9, the other half: narrow the BUILT-IN advertisement to the
+        // floor plus the top-k most relevant to this objective, ONCE, here — for
+        // the same reason as the MCP gate above, and read by
+        // `advertised_tool_definitions` on every step. `None` means "advertise
+        // every offered built-in", the behavior before this existed. Dispatch is
+        // untouched: `offered_tool_names` never consults this.
+        run.tools_advertised = self.select_builtin_tools(&run);
         let model_id = driver.model_id();
         let run_actor = Actor::Agent {
             agent_id: AgentId::new(),
@@ -3797,7 +3968,22 @@ impl FrameworkAgentRuntime {
                         open: input.open.as_deref(),
                         // Server-derived, never model-supplied: a search sees
                         // exactly this run's repository scope.
-                        repository: &run.repository,
+                        //
+                        // The run's repository IDENTITY, not its policy read root
+                        // (`run.repository`). In the default Build mode those
+                        // differ: the read root is a dedicated LINKED WORKTREE, and
+                        // `git rev-parse --show-toplevel` inside one returns the
+                        // worktree — so deriving the scope from it produced a
+                        // `RepositoryId` no repository-scoped skill is registered
+                        // under, and every build-mode search reported the run's own
+                        // installed skills as "not among the skills this search
+                        // disclosed" while the context manifest was advertising
+                        // their cards. The board and GitHub wiring already key off
+                        // this identity; only the registry search was missed.
+                        repository: run
+                            .board_repository
+                            .as_deref()
+                            .map_or(run.repository.as_path(), Path::new),
                     };
                     match registry.search(request).await {
                         Ok(outcome) => (
@@ -4800,6 +4986,111 @@ fn mcp_unavailable(tool: &str) -> (String, Option<ArtifactRef>, ToolOutcome) {
 /// pure relevance comparison among peers and the funnel's hard filters admit all
 /// of them. This projection is NOT a security decision: an MCP call is
 /// dispositioned by the daemon's policy engine at dispatch, exactly as before.
+/// The built-in tools advertised on EVERY step, whatever retrieval ranks — the
+/// floor under [`select_builtin_tools`](FrameworkAgentRuntime::select_builtin_tools).
+///
+/// **Why a floor at all.** The funnel's default embedder is a character-trigram
+/// hash, not a semantic model, and the query is one sentence of objective. It
+/// ranks well enough to choose *which specialist tools to mention*; it is nowhere
+/// near reliable enough to decide whether a Build run is allowed to see the write
+/// tools. "Refactor the parser" does not lexically resemble "write a file", and a
+/// run that cannot write is not a narrowed run — it is a broken one. So the
+/// motor skills are unconditional and only the specialists compete for the top-k.
+///
+/// **Why these seven.** They are the tools whose absence is unrecoverable:
+/// reading, searching, creating, editing, and patching files, running a command,
+/// and — the escape hatch — asking the registry what else exists. Everything an
+/// agent does that changes the world routes through one of them.
+///
+/// **Why not more.** `git.diff`, `repository.test`, `web.search`,
+/// `memory.remember`, and the `task.*`/`workflow.*`/`council.*`/`docs.*` families
+/// are deliberately OUT. Each is either reachable another way (`git.diff` and
+/// `repository.test` are `shell.run` with a nicer shape) or is a specialist whose
+/// whole point is to appear when the objective calls for it. Putting them in the
+/// floor would rebuild inject-everything one sympathetic exception at a time.
+///
+/// The floor is intersected with the run's offered set before use, so a mode
+/// overlay that denies writes or commands still removes them — a floor can never
+/// widen what a mode permits.
+const ALWAYS_ADVERTISED_TOOLS: &[&str] = &[
+    Shell::NAME,
+    ReadFile::NAME,
+    Search::NAME,
+    WriteFile::NAME,
+    EditFile::NAME,
+    ApplyPatch::NAME,
+    SkillsSearch::NAME,
+];
+
+/// Project this run's offered built-in tool names into in-memory registry items
+/// the funnel can rank.
+///
+/// The description is the SCHEMA CATALOG's — the exact prose the model would be
+/// shown — so the ranker reads what the advertisement would say. Intents and
+/// keywords come from `codypendent_knowledge::builtin_tools()` when it registers
+/// the same name, which is the whole value of keeping the two catalogs in sync:
+/// "the ci is red" matches `/fix-ci`'s curated intents, never its description.
+/// A name the knowledge crate does not register still ranks, on its description
+/// and its dotted name alone.
+///
+/// Risk and trust are deliberately UNIFORM (`Low`, `FirstParty`). The rerank
+/// applies a risk penalty and a trust bonus; letting real values through would
+/// quietly bias advertisement by danger, and this projection must be pure
+/// relevance — the run's actual security decisions happen in the policy engine.
+fn builtin_registry_items(names: &[String]) -> Vec<RegistryItem> {
+    use codypendent_knowledge::{
+        builtin_tools, Provenance as KnowledgeProvenance, RegistryItemKind, RegistryStatus,
+        TrustMetadata, TrustTier, Version,
+    };
+    let catalog = static_tool_definitions();
+    let registered = builtin_tools();
+    let now = chrono::Utc::now();
+    names
+        .iter()
+        .filter_map(|name| {
+            // A name with no schema can never be advertised, so ranking it would
+            // only waste a top-k slot on a tool the model will never be shown.
+            let definition = catalog.iter().find(|def| &def.name == name)?;
+            let known = registered.iter().find(|item| &item.name == name);
+            // The dotted name's own segments ("docs", "create") are what a user
+            // types when they mean a family, so they seed the exact-overlap arm
+            // alongside any curated keywords.
+            let mut keywords: Vec<String> = name.split('.').map(str::to_string).collect();
+            if let Some(item) = known {
+                keywords.extend(item.keywords.iter().cloned());
+            }
+            Some(RegistryItem {
+                id: codypendent_protocol::RegistryItemId::new(),
+                kind: RegistryItemKind::Tool,
+                name: name.clone(),
+                version: Version("1.0.0".to_string()),
+                scope: Scope::System,
+                description: definition.description.clone(),
+                intents: known.map(|item| item.intents.clone()).unwrap_or_default(),
+                keywords,
+                examples: Vec::new(),
+                input_schema: None,
+                output_schema: None,
+                dependencies: Vec::new(),
+                permissions: Vec::new(),
+                risk: RiskClass::Low,
+                provenance: KnowledgeProvenance::BuiltIn,
+                trust: TrustMetadata {
+                    publisher: "codypendent".to_string(),
+                    signature_required: false,
+                    signature: None,
+                    tier: TrustTier::FirstParty,
+                },
+                status: RegistryStatus::Active,
+                content_hash: String::new(),
+                executable: true,
+                created_at: now,
+                updated_at: now,
+            })
+        })
+        .collect()
+}
+
 fn mcp_registry_item(info: &McpToolInfo) -> RegistryItem {
     use codypendent_knowledge::{
         Provenance as KnowledgeProvenance, RegistryItemKind, RegistryStatus, TrustMetadata,
@@ -4869,6 +5160,16 @@ fn warn_mcp_gate_degraded(reason: &str) {
     tracing::warn!(
         %reason,
         "mcp retrieval gate unavailable; advertising every offered mcp tool"
+    );
+}
+
+/// Log a degraded built-in gate: the funnel failed, so this run advertises every
+/// offered built-in — the pre-gate behavior. Warned rather than propagated for
+/// the same reason as the MCP gate: retrieval is an aid, never a gate on running.
+fn warn_builtin_gate_degraded(reason: &str) {
+    tracing::warn!(
+        %reason,
+        "built-in retrieval gate unavailable; advertising every offered built-in tool"
     );
 }
 
@@ -5585,6 +5886,20 @@ fn workflow_draft_schema() -> Value {
     })
 }
 
+/// The full catalog of built-in tool schemas.
+///
+/// This is the CATALOG, not the advertisement: every name here must also appear
+/// in [`offered_tool_names`](FrameworkAgentRuntime::offered_tool_names) for the
+/// run before it can reach the model, and
+/// [`advertised_tool_definitions`](FrameworkAgentRuntime::advertised_tool_definitions)
+/// narrows it further through the retrieval funnel. A tool missing here is
+/// therefore invisible to the model even when it is offered AND dispatchable —
+/// which is exactly what happened to the four `docs.*` tools: added to the
+/// offered set and to `prepare`, never to this vec, so the doc-writer could not
+/// be invoked by any agent. Adding a dispatchable tool means touching three
+/// places (offer, dispatch, and this catalog), and
+/// `advertised_definitions_cover_every_offered_tool` fails the build if the
+/// first and the third ever disagree again.
 pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
     use agent_framework_core::tools::{ApprovalMode, ToolDefinition, ToolKind};
     let decl = |name: &str, description: &str, parameters: Value| ToolDefinition {
@@ -6029,6 +6344,88 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                     "result_id": {"type": "string"},
                     "name": {"type": "string"}
                 }
+            }),
+        ),
+        // The doc-writer (rubric #4). These four were dispatchable and offered
+        // from the day they shipped but had no entry here, so the intersection in
+        // `advertised_tool_definitions` dropped every one of them and no agent
+        // could ever call one. The descriptions say "not a Markdown file in the
+        // worktree" because the failure mode without them is not an error — it is
+        // the model quietly reaching for `workspace.write_file` instead.
+        decl(
+            DocsCreateTool::NAME,
+            "Draft a new document in the knowledge fabric (Docs Studio) — the durable, \
+                 block-structured, reviewable place documentation lives. Use this, not \
+                 `workspace.write_file`, when asked to write something up. Returns the new \
+                 document's id.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "scope": {
+                        "type": "string",
+                        "description": "Visibility: `repository` (default) or `system`."
+                    },
+                    "markdown": {
+                        "type": "string",
+                        "description": "The document body as Markdown; omit for an empty draft."
+                    }
+                },
+                "required": ["title"]
+            }),
+        ),
+        decl(
+            DocsReadTool::NAME,
+            "Read a document as Markdown, or — with no arguments — list the documents this \
+                 repository can see. Read before editing: `docs.edit` and `docs.suggest` need a \
+                 block id, and block ids come from here.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "document_id": {
+                        "type": "string",
+                        "description": "The document to read; omit to list the visible documents."
+                    }
+                }
+            }),
+        ),
+        decl(
+            DocsEditTool::NAME,
+            "Replace one block's text in a document. Whether this lands as a direct edit or as \
+                 a reviewable suggestion is decided by the document's collaboration mode, not by \
+                 you — an organization-scoped document turns this into a suggestion.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string"},
+                    "block_id": {"type": "string"},
+                    "text": {
+                        "type": "string",
+                        "description": "The block's new text (may be empty to clear it)."
+                    }
+                },
+                "required": ["document_id", "block_id", "text"]
+            }),
+        ),
+        decl(
+            DocsSuggestTool::NAME,
+            "Propose a replacement for a character range inside a block, for a human to accept \
+                 or reject. Prefer this over `docs.edit` when the document is someone else's or \
+                 the change is a judgement call. Omitting the range inserts at the block start.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string"},
+                    "block_id": {"type": "string"},
+                    "range_start": {"type": "integer", "minimum": 0},
+                    "range_end": {"type": "integer", "minimum": 0},
+                    "replacement": {"type": "string"},
+                    "rationale": {
+                        "type": "string",
+                        "description": "Why the change is proposed; shown to the reviewer."
+                    }
+                },
+                "required": ["document_id", "block_id", "replacement"]
             }),
         ),
     ]
@@ -7341,6 +7738,332 @@ mod tests {
         assert!(
             names.contains(&Shell::NAME) && names.contains(&ReadFile::NAME),
             "the unconditional baseline tools are still advertised: {names:?}"
+        );
+    }
+
+    // -- Rubric 9 / #4: retrieval-gated built-in advertisement ---------------
+
+    /// A do-nothing document channel: enough to flip the `self.docs.is_some()`
+    /// gate. What the tools DO is covered by `codypendentd`'s docs integration
+    /// test; what is covered here is whether the model is ever shown them.
+    struct StubDocsChannel;
+
+    #[async_trait]
+    impl DocsChannel for StubDocsChannel {
+        async fn create(
+            &self,
+            _author: &DocsAuthor,
+            _request: DocsCreate,
+            _repository: &str,
+        ) -> Result<String, DocsChannelError> {
+            Ok("doc-1".to_string())
+        }
+        async fn read(
+            &self,
+            _document_id: Option<&str>,
+            _repository: &str,
+        ) -> Result<String, DocsChannelError> {
+            Ok(String::new())
+        }
+        async fn edit(
+            &self,
+            _author: &DocsAuthor,
+            _repository: &str,
+            _request: DocsEdit,
+        ) -> Result<DocsWriteEffect, DocsChannelError> {
+            Ok(DocsWriteEffect::Applied { revision: 1 })
+        }
+        async fn suggest(
+            &self,
+            _author: &DocsAuthor,
+            _repository: &str,
+            _request: DocsSuggest,
+        ) -> Result<DocsWriteEffect, DocsChannelError> {
+            Ok(DocsWriteEffect::Suggested {
+                suggestion_id: "s-1".to_string(),
+            })
+        }
+    }
+
+    /// The advertisement half of rubric #4, which the shipped proof test skipped.
+    ///
+    /// `docs_agent_it.rs` asserted on `offered_tool_names` and then drove the
+    /// calls with a `ScriptedDriver`, so it verified dispatch and never noticed
+    /// that `static_tool_definitions()` had no `docs.*` entry — the intersection
+    /// in `advertised_tool_definitions` dropped all four, and no real model could
+    /// call a tool it was never shown. This is the `task.*` pattern
+    /// (`the_task_tools_are_advertised_to_a_plain_chat_run`) applied to `docs.*`.
+    #[test]
+    fn the_docs_tools_are_advertised_when_a_document_channel_is_wired() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        // Without a channel: neither offered nor advertised.
+        let bare = solo_run(session_id, repo.path());
+        assert!(
+            !runtime
+                .advertised_tool_definitions(&bare)
+                .iter()
+                .any(|def| def.name.starts_with("docs.")),
+            "no channel → no docs.* advertisement"
+        );
+
+        let wired = runtime.with_docs(Arc::new(StubDocsChannel));
+        // The objective names documentation, so the funnel ranks `docs.*` up —
+        // and the FLOOR is present regardless.
+        let mut run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "document the charge path and write it up as a knowledge doc",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        run.tools_advertised = wired.select_builtin_tools(&run);
+
+        let advertised: Vec<String> = wired
+            .advertised_tool_definitions(&run)
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        for tool in [
+            DocsCreateTool::NAME,
+            DocsReadTool::NAME,
+            DocsEditTool::NAME,
+            DocsSuggestTool::NAME,
+        ] {
+            assert!(
+                advertised.iter().any(|name| name == tool),
+                "{tool} must be advertised for a documentation objective: {advertised:?}"
+            );
+        }
+    }
+
+    /// The structural guard that makes F4.1's class of bug a build failure: every
+    /// name a run can be OFFERED must have a schema in the catalog. A tool added
+    /// to `offered_tool_names` and to `prepare` but not to
+    /// `static_tool_definitions()` is dispatchable-but-invisible — exactly what
+    /// happened to `docs.*` — and silently so, because the intersection just
+    /// drops it. Run with the gate off, so this asserts about the CATALOG rather
+    /// than about what retrieval happened to rank.
+    #[test]
+    fn every_offered_tool_has_a_schema_in_the_catalog() {
+        let (runtime, _events, session_id) = test_runtime();
+        // Wire every configured gate that has an in-crate stub, so the offered
+        // set is as wide as this test can make it.
+        let runtime = runtime
+            .with_docs(Arc::new(StubDocsChannel))
+            .with_search(Arc::new(StubSearchApi {
+                result: Ok(stub_outcome("x")),
+            }))
+            .with_task_board(Arc::new(RecordingTaskBoard::default()))
+            .with_builtin_top_k(0);
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "anything",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        )
+        .with_board_repository("/repo");
+
+        let catalog: Vec<String> = static_tool_definitions()
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        let missing: Vec<String> = runtime
+            .offered_tool_names(&run)
+            .into_iter()
+            .filter(|name| !name.starts_with("mcp.") && !catalog.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "offered but absent from static_tool_definitions(), so the model can never \
+             see them: {missing:?}"
+        );
+    }
+
+    /// Rubric 9's headline claim, as a unit: the advertisement a run gets now
+    /// DEPENDS on what the run is doing. Before this, two unrelated objectives
+    /// produced byte-identical tool arrays.
+    #[test]
+    fn retrieval_narrows_the_builtin_advertisement_per_objective() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_docs(Arc::new(StubDocsChannel))
+            .with_task_board(Arc::new(RecordingTaskBoard::default()));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let advertise = |objective: &str| -> Vec<String> {
+            let mut run = RunContext::new(
+                session_id,
+                RunId::new(),
+                objective,
+                AgentMode::Build,
+                repo.path(),
+                repo.path(),
+            )
+            .with_board_repository("/repo");
+            run.tools_advertised = runtime.select_builtin_tools(&run);
+            let mut names: Vec<String> = runtime
+                .advertised_tool_definitions(&run)
+                .into_iter()
+                .map(|def| def.name)
+                .collect();
+            names.sort();
+            names
+        };
+
+        let offered_count = {
+            let run = RunContext::new(
+                session_id,
+                RunId::new(),
+                "x",
+                AgentMode::Build,
+                repo.path(),
+                repo.path(),
+            )
+            .with_board_repository("/repo");
+            runtime.offered_tool_names(&run).len()
+        };
+
+        let docs = advertise("document the charge path and write it up as a knowledge doc");
+        let backlog = advertise("break this feature into kanban backlog cards for the board");
+
+        assert_ne!(
+            docs, backlog,
+            "two unrelated objectives must not get the same tool array"
+        );
+        assert!(
+            docs.len() < offered_count && backlog.len() < offered_count,
+            "the advertisement must be narrower than the offered set \
+             (docs {}, backlog {}, offered {offered_count})",
+            docs.len(),
+            backlog.len()
+        );
+        assert!(
+            docs.iter().any(|name| name.starts_with("docs.")),
+            "a documentation objective selects the docs tools: {docs:?}"
+        );
+        assert!(
+            backlog.iter().any(|name| name.starts_with("task.")),
+            "a backlog objective selects the board tools: {backlog:?}"
+        );
+        // The floor holds in BOTH, whatever the ranking did.
+        for names in [&docs, &backlog] {
+            for floor in ALWAYS_ADVERTISED_TOOLS {
+                // `skills.search` needs a wired registry seam, which this runtime
+                // has not got, so it is not offered here and cannot be floored in.
+                if *floor == SkillsSearch::NAME {
+                    continue;
+                }
+                assert!(
+                    names.iter().any(|name| name == floor),
+                    "{floor} is in the floor and must always be advertised: {names:?}"
+                );
+            }
+        }
+    }
+
+    /// The safety property the floor exists to back up: narrowing the
+    /// advertisement never narrows DISPATCH. A tool retrieval declined to show
+    /// still prepares, so a model that learned the name from an earlier turn (or
+    /// from `skills.search`) is never stranded mid-task.
+    #[tokio::test]
+    async fn a_narrowed_advertisement_still_dispatches_every_offered_tool() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_task_board(Arc::new(RecordingTaskBoard::default()))
+            .with_docs(Arc::new(StubDocsChannel));
+        let repo = tempfile::tempdir().expect("tempdir");
+        // `repository.test` detects its command from the worktree's build
+        // manifest, so give it one — otherwise a `prepare` failure here would be
+        // an absent Cargo.toml, not the dispatch gate this test is about.
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo.toml");
+        let mut run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "read the parser and explain how tokens are produced",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        )
+        .with_board_repository("/repo");
+        run.tools_advertised = runtime.select_builtin_tools(&run);
+
+        let advertised: Vec<String> = runtime
+            .advertised_tool_definitions(&run)
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        let dropped: Vec<String> = runtime
+            .offered_tool_names(&run)
+            .into_iter()
+            .filter(|name| !advertised.contains(name))
+            .collect();
+        assert!(
+            !dropped.is_empty(),
+            "this objective is expected to narrow something"
+        );
+        for name in &dropped {
+            assert!(
+                runtime
+                    .prepare(name, &tool_probe_args(name), &run)
+                    .await
+                    .is_ok(),
+                "`{name}` was dropped from the advertisement but must still dispatch"
+            );
+        }
+    }
+
+    /// Minimal valid arguments for the tools this test file may need to prepare.
+    fn tool_probe_args(name: &str) -> Value {
+        match name {
+            "shell.run" | "repository.test" => json!({"program": "true"}),
+            "workspace.read_file" => json!({"path": "a.txt"}),
+            "workspace.search" => json!({"pattern": "x"}),
+            "workspace.write_file" => json!({"path": "a.txt", "content": "x"}),
+            "workspace.edit_file" => json!({"path": "a.txt", "old": "x", "new": "y"}),
+            "git.apply_patch" => json!({"patch": "diff"}),
+            "memory.remember" => json!({"statement": "a fact"}),
+            "task.create" => json!({"title": "t"}),
+            "task.update" | "task.move" => json!({"item_id": "1", "status": "doing"}),
+            "docs.create" => json!({"title": "t"}),
+            "docs.edit" => json!({"document_id": "d", "block_id": "b", "text": "x"}),
+            "docs.suggest" => json!({"document_id": "d", "block_id": "b", "replacement": "x"}),
+            _ => json!({}),
+        }
+    }
+
+    /// `builtin_top_k = 0` restores full injection exactly — the operator escape
+    /// hatch, and the property that makes this change reversible in production
+    /// without a rebuild.
+    #[test]
+    fn a_zero_builtin_budget_disables_the_gate() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_docs(Arc::new(StubDocsChannel))
+            .with_builtin_top_k(0);
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut run = solo_run(session_id, repo.path());
+        run.tools_advertised = runtime.select_builtin_tools(&run);
+        assert!(run.tools_advertised.is_none(), "the gate is disabled");
+
+        let advertised: Vec<String> = runtime
+            .advertised_tool_definitions(&run)
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        let offered = runtime.offered_tool_names(&run);
+        assert_eq!(
+            advertised.len(),
+            offered.len(),
+            "with the gate off, advertised ≡ offered: {advertised:?} vs {offered:?}"
         );
     }
 

@@ -223,6 +223,30 @@ pub trait BlackboardWriter: Send + Sync {
 pub type BlackboardReadFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<BlackboardItemView>, CodypendentError>> + Send + 'a>>;
 
+/// A request for one board item's full revision lineage
+/// (`codypendent_workflow::BlackboardStore::history`): every superseded
+/// ancestor and the live head, oldest first. Mirrors [`ReadBlackboardRequest`]'s
+/// two ways to name a board (a durable run, or a repository's synthetic board)
+/// but names one item within it rather than the whole board.
+///
+/// Not wired to a wire command yet (see [`BlackboardReader::history`]'s docs) —
+/// this is the daemon-side seam a `ReadBlackboardHistory` command (or an
+/// `item_id` added to `ReadBlackboard`) would call once one exists.
+#[derive(Debug, Clone)]
+pub struct BlackboardHistoryRequest {
+    /// The durable workflow-run id whose item to trace. Ignored when
+    /// [`board_repository`](Self::board_repository) is set.
+    pub workflow_run_id: String,
+    /// Trace an item on a **repository task board** rather than a workflow
+    /// run's board, exactly as [`ReadBlackboardRequest::board_repository`].
+    pub board_repository: Option<String>,
+    /// The item whose lineage to walk (any revision's id resolves the whole
+    /// chain, not only the live head's).
+    pub item_id: String,
+    /// The identity of the reading client (for attribution / audit).
+    pub client_id: ClientId,
+}
+
 /// The daemon's seam for *reading* a durable run's blackboard from an accepted
 /// `ReadBlackboard` command.
 ///
@@ -238,6 +262,22 @@ pub trait BlackboardReader: Send + Sync {
     /// as a `CommandRejected`; an unknown run yields an empty board (its own board
     /// is simply empty), never an error.
     fn read(&self, request: ReadBlackboardRequest) -> BlackboardReadFuture<'_>;
+
+    /// Project one item's full supersession lineage, oldest revision first —
+    /// the read half of `codypendent_workflow::BlackboardStore::history`, which
+    /// every board move (a column drag, a `task.move`) already feeds and which
+    /// had no caller anywhere in the product before this method existed. A
+    /// board move is a supersession, so the audit trail ("who moved this, and
+    /// when, and what did it say before") already lives durably in the store —
+    /// this is the seam that lets a client actually ask for it.
+    ///
+    /// Returns the SAME [`BlackboardReadFuture`] shape as
+    /// [`read`](Self::read): reuses [`BlackboardItemView`] for each revision
+    /// rather than inventing a parallel type, since a history entry IS a
+    /// stored item, just not the live one. An id absent from the named board
+    /// yields an empty vector (mirrors `BlackboardStore::history`'s own
+    /// "empty ⇒ not found" contract), never an error.
+    fn history(&self, request: BlackboardHistoryRequest) -> BlackboardReadFuture<'_>;
 }
 
 #[cfg(test)]

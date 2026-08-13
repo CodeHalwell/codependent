@@ -25,11 +25,22 @@ mod docs_job;
 pub mod documents;
 mod executor;
 mod learning_capture;
+/// Daemon-side handlers for memory inspect/edit/delete and opening a
+/// provenance card's source (2026-08-13 review F3/F4). Public so a future
+/// protocol command handler (elsewhere) can call these directly, and so this
+/// crate's own tests exercise the SAME functions rather than reproducing
+/// their scope-visibility check.
+pub mod memory_ops;
 mod promotion;
 mod publish;
 mod retrieval;
 mod routing;
-mod scan;
+/// The code-graph warm-up scan, the live filesystem watcher that keeps the graph
+/// current during a session, and the `graph.*` query seam. Public for the same
+/// reason as [`blackboard`]: the crate's own integration tests drive the REAL
+/// watcher and the REAL scan (`tests/codegraph_live_it.rs`) rather than
+/// reimplementing their debounce and ignore policy, which would then drift.
+pub mod scan;
 mod session_history;
 // Voice v1 (rubric 8): the speech-to-text seam, implemented over the runtime's
 // OpenAI-compatible `/audio/transcriptions` client.

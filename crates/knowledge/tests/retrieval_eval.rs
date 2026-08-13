@@ -69,11 +69,11 @@ async fn seed() -> (tempfile::TempDir, Vec<RegistryItem>, RepositoryId) {
     }
 
     let items = registry.list(&pool).await.unwrap();
-    // 21 production built-ins (tools and commands), the repository-scoped
+    // 29 production built-ins (27 tools and 2 commands), the repository-scoped
     // rust.fix-ci skill, and 20 synthetic decoys. Keeping this count explicit
     // ensures every newly advertised tool is evaluated against the retrieval
     // budget and forbidden-item filter instead of silently bypassing the gate.
-    assert_eq!(items.len(), 42, "unexpected seeded item count");
+    assert_eq!(items.len(), 50, "unexpected seeded item count");
     (tmp, items, repo)
 }
 

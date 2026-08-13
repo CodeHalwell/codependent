@@ -2287,6 +2287,20 @@ pub struct AppState {
     /// `Esc` — every gesture that means "I am driving the composer/view
     /// again". Client-only view state; never on the wire.
     pub transcript_browse: bool,
+    /// Which run the transcript fold cursor is *in*. The conversation stacks
+    /// EVERY run (`render_conversation` walks `runs` whole) and each follow-up
+    /// message opens a new one, so the cursor has to be able to sit in a run
+    /// that is not [`AppState::selected_run`] — otherwise every tool card and
+    /// patch diff older than the current turn is drawn on screen and cannot be
+    /// expanded by keyboard or by mouse. Paired with the focused run's
+    /// `transcript_selected` to name one entry. Client-only view state.
+    pub transcript_focus_run: usize,
+    /// Whether the open command palette was reached from first-run setup, so
+    /// `Esc` returns to the setup gate instead of dropping an operator with no
+    /// runnable model into an inert chat. First-run setup is a modal gate over
+    /// an empty session; without this the only way back would be to guess that
+    /// Enter on an empty composer reopens it. Client-only view state.
+    pub palette_from_onboard: bool,
     /// Every theme the `/theme` picker offers: the seven built-in variants,
     /// plus any data-only packs the CLI loaded from `<data-dir>/themes/` at
     /// boot (the TUI crate does no I/O, so a pack arrives already parsed).
@@ -2424,6 +2438,8 @@ impl AppState {
             history_cursor: None,
             composer_stash: None,
             transcript_browse: false,
+            transcript_focus_run: 0,
+            palette_from_onboard: false,
             themes: builtin_theme_choices(),
             theme_selected: None,
             layout: LayoutMode::Chat,
@@ -2577,6 +2593,24 @@ impl AppState {
     #[must_use]
     pub fn selected_run(&self) -> Option<&RunView> {
         self.runs.get(self.selected_run)
+    }
+
+    /// The run the transcript fold cursor sits in, clamped into range.
+    ///
+    /// Distinct from [`AppState::selected_run`] on purpose: the composer submits
+    /// against the selected run, while `Alt-↑`/`Alt-↓` and transcript clicks walk
+    /// the *whole* stacked conversation. A stale index (runs dropped since the
+    /// cursor was set) resolves to the last run rather than vanishing.
+    #[must_use]
+    pub fn fold_focus_run(&self) -> usize {
+        self.transcript_focus_run
+            .min(self.runs.len().saturating_sub(1))
+    }
+
+    /// The run the fold cursor is in, if the session has any run at all.
+    #[must_use]
+    pub fn fold_focus(&self) -> Option<&RunView> {
+        self.runs.get(self.fold_focus_run())
     }
 
     /// Whether the selected run is still live — i.e. a composer message should

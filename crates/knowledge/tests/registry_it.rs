@@ -76,9 +76,13 @@ fn package_parse_round_trip() {
     // (2026-08-11 review — the draft status left the only real skill dead).
     assert_eq!(item.status, RegistryStatus::Active);
 
-    // [permissions] flattens to 1 read + 1 write + 2 commands + 1 network = 5.
-    assert_eq!(item.permissions.len(), 5);
-    // Writes/commands/network → Medium; no secrets → not High.
+    // [permissions] flattens to 1 read + 1 write + 2 commands = 4. The `network`
+    // grant it used to declare is gone: no sandbox backend admits a non-empty
+    // network allowlist (there is no outbound broker), so declaring one made this
+    // package installable and structurally unrunnable. `load_package` now refuses
+    // it outright rather than deferring the failure to the first run.
+    assert_eq!(item.permissions.len(), 4);
+    // Writes/commands → Medium; no secrets → not High.
     assert_eq!(item.risk, RiskClass::Medium);
 
     // required_tools (3) + optional_tools (3).

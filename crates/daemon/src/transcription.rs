@@ -26,10 +26,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use codypendent_protocol::input::{
-    transcription_allowed, AudioArtifact, InputBlock, InputEnvelope, OffDevicePolicy, Transcript,
-    TranscriptionMode,
+    transcription_allowed, AudioArtifact, GitHubRefKind, GitHubReference, ImageArtifact,
+    InputBlock, InputEnvelope, OffDevicePolicy, SymbolRef, Transcript, TranscriptionMode,
 };
-use codypendent_protocol::{ArtifactRef, CodypendentError, ModelId};
+use codypendent_protocol::{ArtifactRef, CodypendentError, EditorSelection, ModelId};
 use sqlx::SqlitePool;
 
 use crate::artifacts::ArtifactStore;
@@ -258,34 +258,157 @@ async fn read_artifact(
 }
 
 /// The text a resolved envelope contributes as the run's objective: every
-/// transcript and text block, in order. Used when the submitted `text` is empty
-/// (the push-to-talk shape — the client has no text to send until the daemon
-/// has transcribed).
+/// block's text, in order. Used when the submitted `text` is empty (the
+/// push-to-talk shape — the client has no text to send until the daemon has
+/// transcribed audio).
+///
+/// **Every named [`InputBlock`] variant contributes something** (2026-08-13
+/// review, F4). A build that understood only `Text`/`Audio` and silently
+/// dropped `Image`/`File`/`EditorSelection`/`CodeSymbol`/`GitHubReference` was
+/// proven live to reject an image-only or editor-selection-only submission as
+/// `voice.empty-transcript` — "the submitted input produced no text to run" —
+/// when the true story was "this build understood two of seven block kinds and
+/// discarded the rest without saying so."
+///
+/// This function takes no store/filesystem access (it only reads what already
+/// rides on the wire), so it can describe what was attached, never fabricate
+/// its content: [`describe_image`]/[`describe_file`]/[`describe_selection`]
+/// name the attachment and say plainly that the content is not included,
+/// rather than pretending to have read bytes this function was never given.
+/// [`describe_symbol`]/[`describe_github_reference`] are pure, self-contained
+/// citations (every field the description needs already rides in the block),
+/// so they render in full. Only [`InputBlock::Unknown`] — a block kind THIS
+/// BUILD DOES NOT KNOW, `#[serde(other)]`'s forward-compatibility fallback —
+/// contributes nothing, because there is, by construction, nothing left to
+/// name; that is the one case where silence is honest rather than a dropped
+/// block this build understood perfectly well.
 #[must_use]
 pub fn envelope_text(envelope: &InputEnvelope) -> String {
-    let mut parts: Vec<&str> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     for block in &envelope.blocks {
         match block {
-            InputBlock::Text { text } if !text.trim().is_empty() => parts.push(text),
+            InputBlock::Text { text } if !text.trim().is_empty() => parts.push(text.clone()),
+            InputBlock::Text { .. } => {}
             InputBlock::Audio(audio) => {
                 if let Some(transcript) = &audio.transcript {
                     if !transcript.text.trim().is_empty() {
-                        parts.push(&transcript.text);
+                        parts.push(transcript.text.clone());
                     }
                 }
             }
+            InputBlock::Image(image) => parts.push(describe_image(image)),
+            InputBlock::File(file) => parts.push(describe_file(file)),
+            InputBlock::EditorSelection(selection) => parts.push(describe_selection(selection)),
+            InputBlock::CodeSymbol(symbol) => parts.push(describe_symbol(symbol)),
+            InputBlock::GitHubReference(reference) => {
+                parts.push(describe_github_reference(reference));
+            }
+            // A block kind a newer peer defined that this build does not know
+            // (`#[serde(other)]`). Nothing here to name — see the doc comment.
+            InputBlock::Unknown => {}
+            // `InputBlock` is `#[non_exhaustive]`: this arm is the Rust-level
+            // twin of `Unknown` above (a variant added to the wire type after
+            // THIS build was compiled, which cannot reach `Unknown` — that is
+            // a serde decode fallback, not a language feature). Never a place
+            // to add a NAMED variant's handling; add a real arm above instead.
             _ => {}
         }
     }
     parts.join("\n")
 }
 
+/// A human-legible reference for an attached image (never its pixels: this
+/// function does no I/O). Any model `observations` already riding inline on
+/// the block ARE genuine text — a model looked at the image and wrote them
+/// down before this envelope was built — so those are appended; the raw
+/// bytes and any OCR text are artifacts this function is never handed.
+fn describe_image(image: &ImageArtifact) -> String {
+    let mut line = format!("[attached image: {}", image.original.media_type);
+    if let (Some(width), Some(height)) = (image.width, image.height) {
+        line.push_str(&format!(", {width}x{height}"));
+    }
+    line.push_str(
+        " — this build has no image-reading pipeline, so its contents are not visible here]",
+    );
+    let observed = image
+        .observations
+        .iter()
+        .map(|observation| observation.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if observed.is_empty() {
+        line
+    } else {
+        format!("{line}\n{observed}")
+    }
+}
+
+/// A human-legible reference for an attached file. The bytes are addressed by
+/// `ArtifactRef.id` in the content-addressed store; reading them needs the
+/// store and pool this function is not given (they live at the daemon's I/O
+/// boundary — see [`transcribe_envelope`]), so this names what was attached
+/// instead of pretending to inline it.
+fn describe_file(file: &ArtifactRef) -> String {
+    format!(
+        "[attached file: {}, {} bytes — contents not included]",
+        file.media_type, file.byte_length
+    )
+}
+
+/// A human-legible reference for an IDE editor selection. `path`/`range` are
+/// everything the block carries — the selected text itself is not on the wire
+/// (an [`EditorSelection`] is a citation, not a copy) — so this cannot quote
+/// it. Positions are 0-based exactly as the wire type defines them.
+fn describe_selection(selection: &EditorSelection) -> String {
+    format!(
+        "[editor selection: {} lines {}-{} (0-based) — contents not included]",
+        selection.path, selection.range.start.line, selection.range.end.line
+    )
+}
+
+/// A code-symbol reference. Every field is already inline on the block, so
+/// this renders in full rather than pointing elsewhere.
+fn describe_symbol(symbol: &SymbolRef) -> String {
+    let kind = symbol.kind.as_deref().unwrap_or("symbol");
+    match symbol.line {
+        Some(line) => format!(
+            "[code {kind}: {} -> {} (line {line})]",
+            symbol.path, symbol.symbol
+        ),
+        None => format!("[code {kind}: {} -> {}]", symbol.path, symbol.symbol),
+    }
+}
+
+/// A GitHub entity reference. Every field is already inline on the block, so
+/// this renders in full rather than pointing elsewhere.
+fn describe_github_reference(reference: &GitHubReference) -> String {
+    let kind = match reference.kind {
+        GitHubRefKind::PullRequest => "pull request",
+        GitHubRefKind::Issue => "issue",
+        GitHubRefKind::Commit => "commit",
+        GitHubRefKind::Comment => "comment",
+        GitHubRefKind::Unknown => "reference",
+        // `#[non_exhaustive]`, same reasoning as `envelope_text`'s trailing arm.
+        _ => "reference",
+    };
+    match reference.number {
+        Some(number) => format!(
+            "[GitHub {kind}: {}/{}#{number}]",
+            reference.owner, reference.repo
+        ),
+        None => format!("[GitHub {kind}: {}/{}]", reference.owner, reference.repo),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use codypendent_protocol::input::{InputSource, ScopeLevel, DEFAULT_MEDIA_CLASSIFICATION};
-    use codypendent_protocol::{ArtifactId, DataClassification};
+    use codypendent_protocol::input::{
+        InputSource, ModelObservation, ScopeLevel, DEFAULT_MEDIA_CLASSIFICATION,
+    };
+    use codypendent_protocol::{ArtifactId, DataClassification, Position, Range};
 
     /// A transcriber that returns canned text — no audio hardware and no
     /// network are available in this environment, so every test here drives
@@ -561,5 +684,162 @@ mod tests {
             attachments: Vec::new(),
         };
         assert_eq!(envelope_text(&envelope), "context:\nthe spoken part");
+    }
+
+    /// Wrap a single block in an otherwise-empty envelope with empty `text` —
+    /// exactly the shape `resolve_voice_input` builds `objective` from
+    /// (`crates/daemon/src/server.rs`), and exactly the shape the review's
+    /// live repro used to prove F4.
+    fn solo_envelope(block: InputBlock) -> InputEnvelope {
+        InputEnvelope {
+            source: InputSource::Tui,
+            blocks: vec![block],
+            scope: ScopeLevel::Session,
+            attachments: Vec::new(),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // F4: every named block kind must contribute something, or the
+    // `voice.empty-transcript` rejection lies about what was submitted.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn an_image_only_envelope_is_no_longer_silently_empty() {
+        // Proven live by the review: an image-only, empty-text envelope was
+        // rejected `voice.empty-transcript` ("the submitted input produced no
+        // text to run") even though an image WAS submitted.
+        let image = ImageArtifact {
+            original: audio_ref(DEFAULT_MEDIA_CLASSIFICATION),
+            extracted_text: None,
+            observations: Vec::new(),
+            regions: Vec::new(),
+            width: Some(1280),
+            height: Some(720),
+        };
+        let text = envelope_text(&solo_envelope(InputBlock::Image(image)));
+        assert!(
+            !text.trim().is_empty(),
+            "an attached image must produce SOME text"
+        );
+        assert!(text.contains("1280x720"), "{text}");
+        assert!(
+            text.contains("no image-reading pipeline"),
+            "the description must not overclaim OCR/vision that does not exist: {text}"
+        );
+    }
+
+    #[test]
+    fn an_image_with_model_observations_includes_them_verbatim() {
+        // Observations are genuine inline text (a model already looked and
+        // wrote them down) — unlike pixels, this function CAN honestly include
+        // them, and future producers of this field must not be silently
+        // dropped alongside the pixels that really cannot be read here.
+        let image = ImageArtifact {
+            original: audio_ref(DEFAULT_MEDIA_CLASSIFICATION),
+            extracted_text: None,
+            observations: vec![ModelObservation {
+                text: "A terminal showing a failing test.".to_string(),
+                model: None,
+            }],
+            regions: Vec::new(),
+            width: None,
+            height: None,
+        };
+        let text = envelope_text(&solo_envelope(InputBlock::Image(image)));
+        assert!(
+            text.contains("A terminal showing a failing test."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_editor_selection_only_envelope_is_no_longer_silently_empty() {
+        // Proven live by the review, same failure mode as the image case.
+        let selection = EditorSelection {
+            path: "crates/workflow/src/drive.rs".to_string(),
+            range: Range {
+                start: Position {
+                    line: 12,
+                    character: 0,
+                },
+                end: Position {
+                    line: 34,
+                    character: 5,
+                },
+            },
+        };
+        let text = envelope_text(&solo_envelope(InputBlock::EditorSelection(selection)));
+        assert!(
+            !text.trim().is_empty(),
+            "an editor selection must produce SOME text"
+        );
+        assert!(text.contains("crates/workflow/src/drive.rs"), "{text}");
+        assert!(text.contains("12"), "{text}");
+        assert!(text.contains("34"), "{text}");
+        assert!(
+            text.contains("not included"),
+            "must not claim to quote text this block never carried: {text}"
+        );
+    }
+
+    #[test]
+    fn a_file_only_envelope_is_no_longer_silently_empty() {
+        let file = ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "text/plain".to_string(),
+            byte_length: 1_234,
+            sha256: "b".repeat(64),
+            sensitivity: DEFAULT_MEDIA_CLASSIFICATION,
+        };
+        let text = envelope_text(&solo_envelope(InputBlock::File(file)));
+        assert!(text.contains("text/plain"), "{text}");
+        assert!(text.contains("1234"), "{text}");
+    }
+
+    #[test]
+    fn a_code_symbol_only_envelope_renders_the_full_reference() {
+        let symbol = SymbolRef {
+            path: "crates/workflow/src/drive.rs".to_string(),
+            symbol: "WorkflowDriver::advance".to_string(),
+            kind: Some("function".to_string()),
+            line: Some(42),
+        };
+        let text = envelope_text(&solo_envelope(InputBlock::CodeSymbol(symbol)));
+        assert!(text.contains("crates/workflow/src/drive.rs"), "{text}");
+        assert!(text.contains("WorkflowDriver::advance"), "{text}");
+        assert!(text.contains("function"), "{text}");
+        assert!(text.contains("42"), "{text}");
+    }
+
+    #[test]
+    fn a_github_reference_only_envelope_renders_the_full_reference() {
+        let reference = GitHubReference {
+            owner: "CodeHalwell".to_string(),
+            repo: "codypendent".to_string(),
+            kind: GitHubRefKind::PullRequest,
+            number: Some(14),
+            url: None,
+        };
+        let text = envelope_text(&solo_envelope(InputBlock::GitHubReference(reference)));
+        assert_eq!(text, "[GitHub pull request: CodeHalwell/codypendent#14]");
+    }
+
+    #[test]
+    fn an_unknown_block_kind_is_the_one_legitimate_silence() {
+        // Forward compatibility only: THIS build genuinely knows nothing about
+        // it, unlike the five kinds above which it understands perfectly well.
+        assert_eq!(envelope_text(&solo_envelope(InputBlock::Unknown)), "");
+    }
+
+    #[test]
+    fn a_genuinely_contentless_envelope_still_reports_empty() {
+        // Unrelated to F4: whitespace-only text must still be excluded, so the
+        // `voice.empty-transcript` rejection stays honest for an envelope that
+        // truly carries nothing runnable.
+        let envelope = solo_envelope(InputBlock::Text {
+            text: "   \n  ".to_string(),
+        });
+        assert_eq!(envelope_text(&envelope), "");
     }
 }

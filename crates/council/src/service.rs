@@ -52,6 +52,11 @@ const TRUNCATION_MARKER: &str = "\n[…truncated]\n\n";
 const MEMBER_TIMEOUT: Duration = Duration::from_secs(600);
 /// Upper bound on a chronicle blob this CLI will read back for measured usage.
 const MAX_CHRONICLE_BYTES: u64 = 4 * 1024 * 1024;
+/// How long a member run that has already gone terminal is given to deliver the
+/// `RunCompleted` carrying its reason. The ledger appends `RunStateChanged`
+/// first, so this is the window between two adjacent appends — generous at a
+/// second, and it bounds a daemon that never sends the disposition at all.
+const TERMINAL_REASON_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +74,16 @@ pub struct CouncilDefinition {
     pub chair: String,
     #[serde(default = "default_rounds")]
     pub rounds: u8,
+    /// The number of members that must complete a round for the council to
+    /// proceed. `None` is the default rule: a simple majority, `members/2 + 1`
+    /// (see [`required_quorum`]).
+    ///
+    /// This used to be the literal `2`, which made the smallest legal council
+    /// all-or-nothing while an eight-member council synthesized from two
+    /// completions — six missing voices, no signal. Additive and optional, so
+    /// existing `councils.toml` files parse and behave sensibly without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quorum: Option<usize>,
     /// Evidence mode: members run `Explore` (policy-enforced read-only tools)
     /// instead of tool-forbidden `Ask`, and are asked to ground claims in
     /// `file:line` citations the chair then weighs. Additive and default-off,
@@ -407,6 +422,27 @@ fn validate_member(member: &CouncilMember) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How many members must complete a round for the council to proceed.
+///
+/// The definition's explicit `quorum` when it names one (clamped into
+/// `2..=members`, so a hand-edited `councils.toml` can neither ask for a
+/// one-member "council" nor for more members than exist), else a simple
+/// majority: `members / 2 + 1`.
+///
+/// This replaces a hard-coded literal `2`, under which the smallest legal
+/// council (2 members) was all-or-nothing while an eight-member council
+/// synthesized happily from two completions — six voices missing and nothing
+/// said about it. A majority makes the guarantee scale with the council's size,
+/// which is the only reading of "quorum" that means anything.
+#[must_use]
+pub fn required_quorum(definition: &CouncilDefinition) -> usize {
+    let members = definition.members.len();
+    let default = members / 2 + 1;
+    definition
+        .quorum
+        .map_or(default, |q| q.clamp(2, members.max(2)))
+}
+
 /// Whether the chair also sits as a member — legal (a member may chair the
 /// synthesis) but worth a warning, since the chair then weighs its own report.
 #[must_use]
@@ -468,6 +504,10 @@ pub fn create_definition(
         description: description.unwrap_or_default().trim().to_owned(),
         chair: chair.trim().to_owned(),
         rounds,
+        // No CLI flag names a quorum yet; the default majority rule applies
+        // (see `required_quorum`). A user who wants a different one edits
+        // `councils.toml`, which validates the value on the next run.
+        quorum: None,
         evidence,
         members,
     };
@@ -746,13 +786,13 @@ where
         warnings.push(message);
     }
 
-    let seed = ReportSeed {
+    let mut seed = ReportSeed {
         result_id,
         definition: &definition,
         objective: &objective,
         evidence,
         started_at: &started_at,
-        warnings: &warnings,
+        warnings,
         repository: &repository_label,
         origin_session_id,
     };
@@ -786,15 +826,38 @@ where
             members: successes.clone(),
             failures: failures.clone(),
         });
-        if successes.len() < 2 {
+        let quorum = required_quorum(&definition);
+        if successes.len() < quorum {
             let error = format!(
-                "council round {round} failed quorum ({} of {} completed): {}",
+                "council round {round} failed quorum ({} of {} completed, {quorum} required): {}",
                 successes.len(),
                 definition.members.len(),
                 failures.join("; ")
             );
             let report = build_report(&seed, "quorum-failed", &rounds_report, None, Some(&error));
             return Err(persisted_failure(paths, &report, error));
+        }
+        // Quorum met but voices missing: say so. Synthesizing from a subset is
+        // legal and often right, but the user must never learn it only by
+        // counting the participant roster.
+        if successes.len() < definition.members.len() {
+            let message = format!(
+                "council round {round} synthesized from {} of {} members ({} required); \
+                 the missing member(s) failed: {}",
+                successes.len(),
+                definition.members.len(),
+                quorum,
+                failures.join("; ")
+            );
+            progress_event(
+                &progress,
+                result_id,
+                &definition.name,
+                CouncilEvent::Warning {
+                    message: message.clone(),
+                },
+            );
+            seed.warnings.push(message);
         }
         latest = successes;
     }
@@ -829,6 +892,7 @@ where
 
     let report = build_report(&seed, "completed", &rounds_report, Some(&chair), None);
     let costs = report.costs.clone();
+    let warnings = seed.warnings.clone();
     let handle = persist_report(paths, &report)?;
     Ok(CouncilRunOutcome {
         outcome: CouncilOutcome {
@@ -1057,11 +1121,35 @@ async fn collect_run(
     run_id: RunId,
 ) -> anyhow::Result<(String, ArtifactRef)> {
     let mut response = String::new();
+    // A terminal `RunStateChanged` seen while still waiting for `RunCompleted`.
+    // The ledger appends the state change FIRST, so bailing on it — which this
+    // used to do — always beat the arm that renders the real reason: a member
+    // pointed at a dead endpoint reported `run 019ff886-… entered terminal state
+    // Failed` while the ledger held "pinned model `deadmodel` is not available:
+    // connection check to `http://127.0.0.1:9/v1` failed: …", and that UUID was
+    // what landed in the durable report. Remember the state instead and keep
+    // reading for the disposition that explains it.
+    let mut terminal: Option<RunState> = None;
     loop {
-        let envelope = conn
-            .next_envelope()
-            .await?
-            .ok_or_else(|| anyhow!("daemon closed before run {run_id} completed"))?;
+        // Once the run is terminal, `RunCompleted` is already queued behind it —
+        // wait a short grace rather than the caller's full member timeout, so a
+        // daemon that never sends one still fails fast.
+        let next = conn.next_envelope();
+        let envelope = match terminal {
+            Some(state) => match tokio::time::timeout(TERMINAL_REASON_GRACE, next).await {
+                Ok(envelope) => envelope?,
+                Err(_) => bail!("run {run_id} entered terminal state {state:?}"),
+            },
+            None => next.await?,
+        };
+        let Some(envelope) = envelope else {
+            // The daemon closed. Report the terminal state if we saw one — it is
+            // still more than "closed before completing".
+            match terminal {
+                Some(state) => bail!("run {run_id} entered terminal state {state:?}"),
+                None => bail!("daemon closed before run {run_id} completed"),
+            }
+        };
         let Payload::Event(event) = envelope.payload else {
             continue;
         };
@@ -1075,14 +1163,16 @@ async fn collect_run(
                 chronicle,
             } if own == run_id => match disposition {
                 RunDisposition::Completed { .. } => return Ok((response, chronicle)),
+                // The daemon's own diagnostic reason, which is what the user
+                // needs and what the durable report should record.
+                RunDisposition::Failed { reason } => bail!("{reason}"),
                 other => bail!("run {run_id} did not complete successfully: {other:?}"),
             },
-            EventBody::RunStateChanged { run_id: own, state } if own == run_id => match state {
-                RunState::Failed | RunState::Cancelled => {
-                    bail!("run {run_id} entered terminal state {state:?}")
+            EventBody::RunStateChanged { run_id: own, state } if own == run_id => {
+                if matches!(state, RunState::Failed | RunState::Cancelled) {
+                    terminal = Some(state);
                 }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
@@ -1264,6 +1354,15 @@ fn validate_definition(paths: &RuntimePaths, definition: &CouncilDefinition) -> 
     if !(1..=MAX_ROUNDS).contains(&definition.rounds) {
         bail!("council rounds must be 1..={MAX_ROUNDS}");
     }
+    if let Some(quorum) = definition.quorum {
+        if !(2..=definition.members.len()).contains(&quorum) {
+            bail!(
+                "council quorum must be 2..={} (the council has {} members)",
+                definition.members.len(),
+                definition.members.len()
+            );
+        }
+    }
     if definition.chair.is_empty()
         || definition.chair.len() > 128
         || contains_unsafe_control(&definition.chair)
@@ -1430,7 +1529,10 @@ struct ReportSeed<'a> {
     objective: &'a str,
     evidence: bool,
     started_at: &'a str,
-    warnings: &'a [String],
+    /// Hygiene warnings accumulated as the run proceeds (an owned Vec, not a
+    /// borrow, so a warning raised mid-run — a round that met quorum with a
+    /// member missing — can still be appended before the report is built).
+    warnings: Vec<String>,
     repository: &'a str,
     origin_session_id: Option<SessionId>,
 }
@@ -1454,7 +1556,7 @@ fn build_report(
         origin_session_id: seed.origin_session_id,
         evidence: seed.evidence,
         definition: seed.definition.clone(),
-        warnings: seed.warnings.to_vec(),
+        warnings: seed.warnings.clone(),
         costs: aggregate_costs(rounds, chair),
         rounds: rounds.to_vec(),
         chair: chair.cloned(),
@@ -1919,6 +2021,7 @@ model = "gpt-4"
                 description: "Created interactively".to_owned(),
                 chair: "chair".to_owned(),
                 rounds: 3,
+                quorum: None,
                 evidence: false,
                 members: vec![
                     CouncilMember {
@@ -1945,6 +2048,51 @@ model = "gpt-4"
     /// re-parsed members through `MODEL=ROLE` syntax and split such ids at the
     /// first `=` (mangling the model AND the role); direct field validation
     /// must accept it.
+    fn council_of(members: usize, quorum: Option<usize>) -> CouncilDefinition {
+        CouncilDefinition {
+            name: "q".to_owned(),
+            description: String::new(),
+            chair: "chair".to_owned(),
+            rounds: 1,
+            quorum,
+            evidence: false,
+            members: (0..members)
+                .map(|i| CouncilMember {
+                    model: format!("m{i}"),
+                    role: format!("r{i}"),
+                })
+                .collect(),
+        }
+    }
+
+    /// The regression for the hard-coded literal `2`: it made an 8-member
+    /// council proceed on 2 completions (6 voices missing, no signal) while a
+    /// 2-member council was all-or-nothing.
+    #[test]
+    fn quorum_defaults_to_a_majority_of_the_members() {
+        assert_eq!(required_quorum(&council_of(2, None)), 2);
+        assert_eq!(required_quorum(&council_of(3, None)), 2);
+        assert_eq!(required_quorum(&council_of(4, None)), 3);
+        assert_eq!(required_quorum(&council_of(8, None)), 5);
+    }
+
+    #[test]
+    fn an_explicit_quorum_is_honoured_and_clamped_to_something_meaningful() {
+        assert_eq!(required_quorum(&council_of(8, Some(3))), 3);
+        // A hand-edited councils.toml cannot ask for a one-member "council"…
+        assert_eq!(required_quorum(&council_of(8, Some(1))), 2);
+        // …nor for more members than the council has.
+        assert_eq!(required_quorum(&council_of(4, Some(9))), 4);
+    }
+
+    #[test]
+    fn validation_rejects_an_out_of_range_quorum() {
+        let (_directory, paths) = paths();
+        let error = validate_definition(&paths, &council_of(3, Some(9)))
+            .expect_err("a quorum larger than the council must be rejected");
+        assert!(error.to_string().contains("quorum"), "{error}");
+    }
+
     #[test]
     fn validation_accepts_model_ids_containing_equals() {
         let (_directory, paths) = paths();
@@ -1953,6 +2101,7 @@ model = "gpt-4"
             description: String::new(),
             chair: "chair".to_owned(),
             rounds: 1,
+            quorum: None,
             evidence: false,
             members: vec![
                 CouncilMember {
@@ -1977,6 +2126,7 @@ model = "gpt-4"
             description: String::new(),
             chair: "chair".to_string(),
             rounds: 1,
+            quorum: None,
             evidence: false,
             members: vec![
                 parse_member("claude=one").expect("one"),
@@ -1998,6 +2148,7 @@ model = "gpt-4"
             description: String::new(),
             chair: "claude".to_string(),
             rounds: 1,
+            quorum: None,
             evidence: false,
             members: vec![
                 parse_member("claude=one").expect("one"),
@@ -2017,6 +2168,7 @@ model = "gpt-4"
             description: String::new(),
             chair: "chair".to_string(),
             rounds: 2,
+            quorum: None,
             evidence: false,
             members: vec![
                 parse_member("claude=security").expect("one"),
@@ -2064,6 +2216,7 @@ model = "gpt-4"
             description: String::new(),
             chair: "chair".to_string(),
             rounds: 1,
+            quorum: None,
             evidence: true,
             members: vec![
                 parse_member("claude=security").expect("one"),
@@ -2207,6 +2360,7 @@ model = "gpt-4"
             description: String::new(),
             chair: "chair".to_owned(),
             rounds: 2,
+            quorum: None,
             evidence: false,
             members: vec![
                 parse_member("claude=architect").expect("member"),
@@ -2219,7 +2373,7 @@ model = "gpt-4"
             objective: "Decide the storage engine",
             evidence: false,
             started_at: "2026-08-11T00:00:00Z",
-            warnings: &[],
+            warnings: Vec::new(),
             repository: "/tmp/example-repository",
             origin_session_id: Some(SessionId::new()),
         };
@@ -2286,6 +2440,7 @@ model = "gpt-4"
             description: "Independent architecture review".to_owned(),
             chair: "chair".to_owned(),
             rounds: 1,
+            quorum: None,
             evidence: true,
             members: vec![
                 parse_member("claude=architect").expect("member"),
@@ -2300,7 +2455,7 @@ model = "gpt-4"
             objective: "Review the durable result contract",
             evidence: true,
             started_at: "2026-08-12T10:00:00Z",
-            warnings: &["one member reported an uncertainty".to_owned()],
+            warnings: vec!["one member reported an uncertainty".to_owned()],
             repository: "/workspace/codypendent",
             origin_session_id: Some(origin_session_id),
         };
@@ -2362,6 +2517,7 @@ model = "gpt-4"
             description: String::new(),
             chair: "chair".to_owned(),
             rounds: 1,
+            quorum: None,
             evidence: false,
             members: vec![
                 parse_member("claude=architect").expect("member"),
@@ -2374,7 +2530,7 @@ model = "gpt-4"
             objective: "Test failure retrieval",
             evidence: false,
             started_at: "2026-08-12T11:00:00Z",
-            warnings: &[],
+            warnings: Vec::new(),
             repository: "/workspace/codypendent",
             origin_session_id: None,
         };

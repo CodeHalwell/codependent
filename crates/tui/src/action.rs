@@ -192,6 +192,17 @@ pub enum Action {
     /// selected run. Folds to the same effect the keyboard's selection + `Enter`
     /// produces. Client-only (no `Intent`, no wire).
     ActivateRow(usize),
+    /// Toggle one transcript fold by its full address (mouse click on a card,
+    /// diff, or note head). Carries the owning run because the conversation
+    /// stacks every run and a click can land on a card from any earlier turn —
+    /// [`Action::ActivateRow`] can only ever name an entry of the *selected*
+    /// run, which left every older card inert. Equivalent to walking the fold
+    /// cursor there with `Alt-↑`/`Alt-↓` and pressing `Alt-Enter` (RULE 3).
+    /// Client-only (no `Intent`, no wire).
+    ActivateFold {
+        run: usize,
+        entry: usize,
+    },
     /// Select run N in the runs pane (mouse click). Client-only.
     SelectRun(usize),
     /// Focus document N in the Docs tree (mouse click). Client-only.

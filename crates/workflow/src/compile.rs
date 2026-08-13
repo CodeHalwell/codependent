@@ -30,6 +30,34 @@ use crate::model::{
 };
 use crate::registry::WorkflowRegistry;
 
+/// The tools that can be a graph node, in the daemon's dispatch order.
+///
+/// This is a **closed set**, not the runtime's full tool list: a workflow tool
+/// node is not an agent tool call, it is a step the workflow executor runs
+/// directly, and only these have an executor
+/// (`codypendentd::workflow_exec::run_tool_node`). Keeping the set here — in the
+/// daemon-free compiler — is what lets `workflow validate` answer "can this run?"
+/// offline, without a daemon or a live registry.
+///
+/// **Adding a tool node means adding it in both places**: an arm in the
+/// executor's dispatch AND a name here. A name here with no executor would
+/// re-open exactly the hole this closes (a green tick for a step that dies at
+/// runtime), so the daemon asserts the two agree.
+pub const EXECUTABLE_TOOL_NODES: &[&str] = &[
+    "repository.test",
+    "github.update_pull_request",
+    "patch.consolidate",
+];
+
+/// Whether `tool` can be a graph node, comparing through the shared namespace
+/// normalization (T6) so a manifest may write `github.update-pull-request` for
+/// the runtime's `github.update_pull_request`.
+#[must_use]
+pub fn is_executable_tool_node(tool: &str) -> bool {
+    let normalized = normalize_tool_name(tool.trim());
+    EXECUTABLE_TOOL_NODES.contains(&normalized.as_str())
+}
+
 /// A failure to compile a workflow definition. Each variant names the offending
 /// step (or the whole-workflow property) so a caller can report it precisely.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -100,6 +128,17 @@ pub enum CompileError {
     /// A step names a tool the registry does not know (STEP 5.1 cross-check).
     #[error("step {step} references unknown tool {tool}")]
     UnknownTool { step: String, tool: String },
+    /// A tool step names a tool that has no workflow tool-node executor, so the
+    /// step could never run however well-formed the rest of the manifest is.
+    #[error(
+        "workflow.tool-not-executable: step {step} uses tool {tool}, which has no workflow \
+         tool-node executor (executable as a step: {executable})"
+    )]
+    ToolNotExecutable {
+        step: String,
+        tool: String,
+        executable: String,
+    },
     /// An agent step names a skill the registry does not know (STEP 5.1
     /// cross-check).
     #[error("step {step} references unknown skill {skill}")]
@@ -160,6 +199,26 @@ impl CompiledWorkflow {
             .iter()
             .filter(|node| matches!(node.action, NodeAction::Agent { .. }))
             .count()
+    }
+
+    /// How many nodes of this workflow's ready frontier may run at once: the
+    /// manifest's `budget.maximum_agents`, or `1` when it declares none.
+    ///
+    /// This is the field's **enforcement point** (outcome 15). It was previously
+    /// validated here and read nowhere, so `maximum_agents: 1` and
+    /// `maximum_agents: 8` produced byte-identical, strictly sequential
+    /// behaviour. [`crate::WorkflowDriver`] now sizes each wave by it, so the cap
+    /// is the one thing bounding how wide a delegating workflow fans out.
+    ///
+    /// A manifest with no `maximum_agents` is legal only when it has no agent
+    /// steps (see `validate_budget`), and runs one node at a time — the
+    /// pre-concurrency behaviour, unchanged. `0` cannot reach here: the compiler
+    /// rejects it.
+    #[must_use]
+    pub fn max_concurrency(&self) -> usize {
+        self.budget
+            .maximum_agents
+            .map_or(1, |agents| agents.max(1) as usize)
     }
 
     /// Cross-check every node's references against `registry` (STEP 5.1): a tool
@@ -405,6 +464,23 @@ pub fn compile(definition: &WorkflowDefinition) -> Result<CompiledWorkflow, Comp
         }
         if step.skill.is_some() && step.agent.is_none() {
             return Err(CompileError::SkillWithoutAgent(step.id.clone()));
+        }
+        // A tool step must name a tool that can actually be a graph node. The set
+        // is closed and static ([`EXECUTABLE_TOOL_NODES`]), so this belongs here
+        // rather than behind a live registry: checking it at compile time means
+        // EVERY path gets it — `workflow validate`, `StartWorkflow`, the conductor's
+        // recompile, and the agent-facing `workflow.create` all call a `compile*`
+        // function. Before this, `workflow validate` printed a green tick for
+        // `tool: totally.made_up_tool` and the run then died at execution with
+        // `workflow.tool-not-executable`.
+        if let Some(tool) = &step.tool {
+            if !is_executable_tool_node(tool) {
+                return Err(CompileError::ToolNotExecutable {
+                    step: step.id.clone(),
+                    tool: tool.clone(),
+                    executable: EXECUTABLE_TOOL_NODES.join(", "),
+                });
+            }
         }
         // Declared outputs are blackboard artifact kinds — validate them here
         // so a typo (`test-result` for `test_result`) fails at compile time
@@ -866,13 +942,63 @@ mod tests {
         assert_eq!(order, ["a", "b"]);
     }
 
+    /// The regression for "`workflow validate` green-lights unrunnable
+    /// workflows": a tool with no workflow tool-node executor used to compile
+    /// cleanly and only fail at execution with `workflow.tool-not-executable`.
+    #[test]
+    fn a_tool_step_with_no_workflow_executor_is_rejected_at_compile_time() {
+        let mut step = tool_step("ghost", &[]);
+        step.tool = Some("totally.made_up_tool".to_owned());
+        let error = compile(&definition(vec![step])).unwrap_err();
+        assert!(
+            matches!(&error, CompileError::ToolNotExecutable { step, tool, .. }
+                if step == "ghost" && tool == "totally.made_up_tool"),
+            "unexpected error: {error}"
+        );
+        // The message names what IS executable, so the author can fix it.
+        assert!(error.to_string().contains("repository.test"), "{error}");
+    }
+
+    /// A real runtime tool that is not a graph node is rejected just the same —
+    /// the set is "has a tool-node executor", not "is a known tool".
+    #[test]
+    fn a_registered_tool_without_a_node_executor_is_still_rejected() {
+        let mut step = tool_step("land", &[]);
+        step.tool = Some("git.apply_patch".to_owned());
+        assert!(matches!(
+            compile(&definition(vec![step])).unwrap_err(),
+            CompileError::ToolNotExecutable { .. }
+        ));
+    }
+
+    /// The manifest spelling (`-`) and the runtime spelling (`_`) are the same
+    /// tool, exactly as `validate_references` already treats them.
+    #[test]
+    fn the_hyphenated_manifest_spelling_of_a_tool_node_is_accepted() {
+        let mut step = tool_step("publish", &[]);
+        step.tool = Some("github.update-pull-request".to_owned());
+        assert!(compile(&definition(vec![step])).is_ok());
+        assert!(is_executable_tool_node("github.update-pull-request"));
+        assert!(!is_executable_tool_node("totally.made_up_tool"));
+    }
+
+    /// `maximum_agents` finally has a consumer: the driver's wave width.
+    #[test]
+    fn max_concurrency_reads_maximum_agents() {
+        let mut def = definition(vec![tool_step("a", &[])]);
+        def.budget.maximum_agents = None;
+        assert_eq!(compile(&def).unwrap().max_concurrency(), 1, "absent ⇒ 1");
+        def.budget.maximum_agents = Some(5);
+        assert_eq!(compile(&def).unwrap().max_concurrency(), 5);
+    }
+
     #[test]
     fn signature_reflects_action_config_not_just_shape() {
         // Same graph shape (one tool node, no edges), different tool name → the
         // signature must change, so `resume` cannot accept a swapped tool.
         let base = compile(&definition(vec![tool_step("a", &[])])).unwrap();
         let mut swapped_step = tool_step("a", &[]);
-        swapped_step.tool = Some("workspace.apply_patch".to_owned());
+        swapped_step.tool = Some("github.update_pull_request".to_owned());
         let swapped = compile(&definition(vec![swapped_step])).unwrap();
         assert_ne!(base.signature(), swapped.signature());
 

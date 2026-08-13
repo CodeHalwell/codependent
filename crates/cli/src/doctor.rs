@@ -127,6 +127,7 @@ pub async fn run(paths: &RuntimePaths, json: bool, deep: bool) -> anyhow::Result
     check_daemon(&mut report, paths).await;
     check_paths(&mut report, paths);
     check_models_and_providers(&mut report, paths, deep).await;
+    check_voice(&mut report, paths);
 
     if json {
         println!("{}", report.render_json());
@@ -366,6 +367,144 @@ async fn check_models_and_providers(report: &mut Report, paths: &RuntimePaths, d
     }
 }
 
+/// Voice readiness (outcome 8 / voice v1 rubric 8, 2026-08-13 review F6):
+/// whether push-to-talk input and spoken replies are configured and
+/// reachable. Before this, `doctor` had ZERO voice checks despite three of
+/// this feature's own failure modes — a destroyed `[transcription]`/`[speech]`
+/// table, a key that resolves nowhere, a missing recorder/player — having no
+/// other diagnostic anywhere in the product; a user whose voice stopped
+/// working had no supported way to find out why short of reading
+/// `models.toml` by hand.
+fn check_voice(report: &mut Report, paths: &RuntimePaths) {
+    let models_path = paths.data_dir.join("models.toml");
+    let audio = match codypendent_runtime::models::load_audio_models(&models_path) {
+        Ok(audio) => audio,
+        Err(error) => {
+            report.fail(
+                "voice",
+                format!(
+                    "could not parse the voice tables in {}: {error:#}",
+                    models_path.display()
+                ),
+                "fix the [transcription]/[speech] syntax in models.toml — a typo silently \
+                 disables voice rather than failing loudly anywhere else",
+            );
+            return;
+        }
+    };
+    if audio.transcription.is_none() && audio.speech.is_none() {
+        report.ok(
+            "voice",
+            "not configured (no [transcription]/[speech] table) — push-to-talk input and \
+             spoken replies are both off",
+        );
+        return;
+    }
+
+    let auth = codypendent_runtime::auth::AuthStore::load(&paths.data_dir).unwrap_or_default();
+    if let Some(stt) = &audio.transcription {
+        check_voice_endpoint(
+            report,
+            "voice input (STT)",
+            stt,
+            &auth,
+            "transcription",
+            "the DAEMON's environment (not the shell `doctor` runs in) must export it before \
+             the daemon starts",
+        );
+    }
+    if let Some(tts) = &audio.speech {
+        check_voice_endpoint(
+            report,
+            "voice output (TTS)",
+            tts,
+            &auth,
+            "speech",
+            "the TUI's environment (not the shell `doctor` runs in) must export it before the \
+             TUI starts",
+        );
+    }
+
+    // Recorder/player readiness reuses the SAME selection logic the TUI itself
+    // runs at startup (`crate::voice`), so `doctor` can never disagree with
+    // what pressing the push-to-talk key will actually do.
+    let voice_config = crate::voice::load_voice_config(&models_path);
+    if audio.transcription.is_some() {
+        let path_var = std::env::var("PATH").ok();
+        match crate::voice::select_recorder(&voice_config, path_var.as_deref()) {
+            Some(recorder) => report.ok(
+                "voice recorder",
+                format!("{:?} ready for push-to-talk", recorder.source),
+            ),
+            None => report.warn(
+                "voice recorder",
+                "no recorder found on $PATH and no voice.record_command set",
+                "install sox (`rec`), alsa-utils (`arecord`), or ffmpeg, or set \
+                 voice.record_command in models.toml",
+            ),
+        }
+    }
+    if audio.speech.is_some() {
+        if voice_config.play_command.is_empty() {
+            report.warn(
+                "voice playback",
+                "[speech] is configured but voice.play_command is not set",
+                "set voice.play_command in models.toml (e.g. [\"mpv\", \"--no-terminal\", \"-\"]) \
+                 to hear replies",
+            );
+        } else {
+            report.ok(
+                "voice playback",
+                format!("play_command: {}", voice_config.play_command.join(" ")),
+            );
+        }
+    }
+}
+
+/// One `[transcription]`/`[speech]` endpoint's key-resolution readiness.
+fn check_voice_endpoint(
+    report: &mut Report,
+    label: &str,
+    config: &codypendent_runtime::models::AudioModelConfig,
+    auth: &codypendent_runtime::auth::AuthStore,
+    table: &str,
+    env_hint: &str,
+) {
+    let keyless = config.api_key_env.trim().is_empty();
+    let has_stored_key = auth.get(table).filter(|key| !key.is_empty()).is_some();
+    let env_set = !keyless && std::env::var(&config.api_key_env).is_ok();
+    let locality = if config.local {
+        "local".to_string()
+    } else {
+        "remote — governed by routing.toml's policy.max_off_device".to_string()
+    };
+
+    if keyless || has_stored_key || env_set {
+        report.ok(
+            label,
+            format!("{} · model {} · {locality}", config.base_url, config.model),
+        );
+    } else {
+        // `/keys` cannot save a [transcription]/[speech] credential today (the
+        // 2026-08-13 review's F3): `auth.json`'s "transcription"/"speech" rows
+        // are unreachable from any UI the product ships, so an env var is the
+        // only path that currently works — and it must be set in the RIGHT
+        // process, which `doctor`'s own environment does not prove.
+        report.warn(
+            label,
+            format!(
+                "{} · model {} — {} is not set in doctor's own environment",
+                config.base_url, config.model, config.api_key_env
+            ),
+            &format!(
+                "export {} before starting — {env_hint}; `/keys` cannot save this credential yet, \
+                 so an environment variable is the only supported path",
+                config.api_key_env
+            ),
+        );
+    }
+}
+
 /// Whether a base URL points at the loopback interface (a local model server).
 fn is_local_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
@@ -428,5 +567,194 @@ mod tests {
         assert!(is_local_url("http://localhost:11434/v1"));
         assert!(is_local_url("http://127.0.0.1:1234"));
         assert!(!is_local_url("https://api.openai.com/v1"));
+    }
+
+    // -----------------------------------------------------------------
+    // F6: `doctor` must have voice checks (it had none at all before this).
+    // -----------------------------------------------------------------
+
+    fn paths_for(dir: &std::path::Path) -> RuntimePaths {
+        let paths = RuntimePaths::from_data_dir(dir.to_path_buf());
+        paths.ensure_directories().expect("directories");
+        paths
+    }
+
+    #[test]
+    fn unconfigured_voice_is_a_single_ok_check_not_silence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_for(dir.path());
+        let mut report = Report::default();
+        check_voice(&mut report, &paths);
+
+        let voice: Vec<&Check> = report.items.iter().filter(|c| c.name == "voice").collect();
+        assert_eq!(voice.len(), 1);
+        assert_eq!(voice[0].status, Status::Ok);
+        assert!(
+            report.items.iter().all(|c| c.name != "voice recorder"),
+            "no [transcription] means a missing recorder is moot, not worth a row"
+        );
+    }
+
+    #[test]
+    fn a_malformed_voice_table_fails_loudly_instead_of_disabling_silently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_for(dir.path());
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            "[transcription]\nbase_url =",
+        )
+        .expect("write");
+        let mut report = Report::default();
+        check_voice(&mut report, &paths);
+
+        let voice = report
+            .items
+            .iter()
+            .find(|c| c.name == "voice")
+            .expect("a voice row");
+        assert_eq!(voice.status, Status::Fail);
+    }
+
+    #[test]
+    fn a_keyless_endpoint_is_ok_with_no_credential_anywhere() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_for(dir.path());
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            "[transcription]\nbase_url = \"http://127.0.0.1:8080/v1\"\n\
+             model = \"whisper-cpp\"\nlocal = true\n",
+        )
+        .expect("write");
+        let mut report = Report::default();
+        check_voice(&mut report, &paths);
+
+        let row = report
+            .items
+            .iter()
+            .find(|c| c.name == "voice input (STT)")
+            .expect("an STT row");
+        assert_eq!(row.status, Status::Ok, "{row:?}");
+    }
+
+    #[test]
+    fn a_stored_auth_key_satisfies_the_check_without_touching_the_environment() {
+        // Exercises the SAME resolution path `AudioTranscriber`/`AudioSynthesizer`
+        // use (`auth.get(table)`), deterministically — no process-env mutation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_for(dir.path());
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            "[speech]\nbase_url = \"https://api.example.invalid/v1\"\n\
+             model = \"tts-1\"\napi_key_env = \"CODYPENDENT_TEST_DOCTOR_TTS_KEY\"\n",
+        )
+        .expect("write");
+        let mut auth = codypendent_runtime::auth::AuthStore::default();
+        auth.set("speech", "sk-stored-in-auth-json");
+        auth.save(&paths.data_dir).expect("save auth.json");
+
+        let mut report = Report::default();
+        check_voice(&mut report, &paths);
+        let row = report
+            .items
+            .iter()
+            .find(|c| c.name == "voice output (TTS)")
+            .expect("a TTS row");
+        assert_eq!(row.status, Status::Ok, "{row:?}");
+    }
+
+    #[test]
+    fn an_unresolvable_key_warns_and_names_the_env_var_and_the_keys_limitation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_for(dir.path());
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            "[transcription]\nbase_url = \"https://api.groq.com/openai/v1\"\n\
+             model = \"whisper-large-v3-turbo\"\n\
+             api_key_env = \"CODYPENDENT_TEST_DOCTOR_UNSET_XYZ_12345\"\n",
+        )
+        .expect("write");
+        let mut report = Report::default();
+        check_voice(&mut report, &paths);
+
+        let row = report
+            .items
+            .iter()
+            .find(|c| c.name == "voice input (STT)")
+            .expect("an STT row");
+        assert_eq!(row.status, Status::Warn, "{row:?}");
+        assert!(row
+            .message
+            .contains("CODYPENDENT_TEST_DOCTOR_UNSET_XYZ_12345"));
+        let hint = row.hint.as_deref().unwrap_or_default();
+        assert!(hint.contains("/keys"), "{hint}");
+        assert!(
+            hint.contains("daemon"),
+            "STT names the DAEMON's environment: {hint}"
+        );
+    }
+
+    #[test]
+    fn a_speech_endpoint_names_the_tui_process_not_the_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_for(dir.path());
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            "[speech]\nbase_url = \"https://api.openai.com/v1\"\nmodel = \"tts-1\"\n\
+             api_key_env = \"CODYPENDENT_TEST_DOCTOR_UNSET_XYZ_12345\"\n",
+        )
+        .expect("write");
+        let mut report = Report::default();
+        check_voice(&mut report, &paths);
+
+        let row = report
+            .items
+            .iter()
+            .find(|c| c.name == "voice output (TTS)")
+            .expect("a TTS row");
+        assert_eq!(row.status, Status::Warn, "{row:?}");
+        let hint = row.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("TUI"),
+            "TTS names the TUI's environment: {hint}"
+        );
+    }
+
+    #[test]
+    fn transcription_configured_always_yields_a_recorder_row() {
+        // The concrete verdict (ok/warn) depends on the ambient $PATH, which
+        // this test must not assume anything about — only that the row EXISTS
+        // whenever [transcription] is configured, so a user always gets an
+        // answer instead of nothing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_for(dir.path());
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            "[transcription]\nbase_url = \"http://127.0.0.1:8080/v1\"\nmodel = \"whisper-cpp\"\n\
+             local = true\n",
+        )
+        .expect("write");
+        let mut report = Report::default();
+        check_voice(&mut report, &paths);
+        assert!(report.items.iter().any(|c| c.name == "voice recorder"));
+    }
+
+    #[test]
+    fn speech_configured_without_a_play_command_warns_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_for(dir.path());
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            "[speech]\nbase_url = \"http://127.0.0.1:8080/v1\"\nmodel = \"tts\"\nlocal = true\n",
+        )
+        .expect("write");
+        let mut report = Report::default();
+        check_voice(&mut report, &paths);
+        let row = report
+            .items
+            .iter()
+            .find(|c| c.name == "voice playback")
+            .expect("a playback row");
+        assert_eq!(row.status, Status::Warn, "{row:?}");
+        assert!(row.message.contains("play_command"));
     }
 }

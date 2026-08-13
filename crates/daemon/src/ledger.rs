@@ -107,6 +107,25 @@ pub async fn session_exists(pool: &SqlitePool, session_id: SessionId) -> anyhow:
     Ok(row.is_some())
 }
 
+/// The principal that created `session_id` (migration 0031), or `None` when the
+/// daemon has never seen that session.
+///
+/// The inner `Option` is the recorded `owner_uid`: `None` there means a row
+/// written before 0031, which the caller resolves to the daemon's own uid — a
+/// pre-0031 row can only have been created by the single local user the daemon
+/// served at the time. Existence and ownership come from ONE query so an
+/// ownership check cannot be told apart from an existence check by timing.
+pub async fn session_owner_uid(
+    pool: &SqlitePool,
+    session_id: SessionId,
+) -> anyhow::Result<Option<Option<u32>>> {
+    let row: Option<(Option<i64>,)> = sqlx::query_as("SELECT owner_uid FROM sessions WHERE id = ?")
+        .bind(session_id.to_string())
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(owner,)| owner.and_then(|uid| u32::try_from(uid).ok())))
+}
+
 /// Decode raw event rows into [`SessionEvent`]s.
 fn rows_to_events(rows: Vec<EventRow>) -> anyhow::Result<Vec<SessionEvent>> {
     let mut events = Vec::with_capacity(rows.len());
@@ -245,6 +264,35 @@ pub async fn append_run_state_changed(
             "refused stale runtime transition for {run_id}: {current:?} -> {state:?}"
         ));
     }
+    // Outcome 20: `started_at`/`ended_at` (migration 0002) were declared columns
+    // nobody wrote — every completed run read back `None` for both, so no
+    // reader could compute latency. This transition is the ONE place every
+    // run's state change already passes through under `BEGIN IMMEDIATE`, so it
+    // is also the one place that can stamp both timestamps without a second,
+    // unsynchronized write path drifting from the transition it describes.
+    // `started_at` is set only the FIRST time a run reaches `Running`
+    // (`COALESCE` preserves the original moment across a pause/resume cycle,
+    // which legally revisits `Running`); `ended_at` is set once, on whichever
+    // terminal state the run actually reaches (`legal_from` above admits each
+    // run into exactly one, ever).
+    match state {
+        RunState::Running => {
+            sqlx::query("UPDATE runs SET started_at = COALESCE(started_at, ?) WHERE id = ?")
+                .bind(occurred_at.to_rfc3339())
+                .bind(run_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        RunState::Completed | RunState::Failed | RunState::Cancelled => {
+            sqlx::query("UPDATE runs SET ended_at = ? WHERE id = ?")
+                .bind(occurred_at.to_rfc3339())
+                .bind(run_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        _ => {}
+    }
+
     let body = EventBody::RunStateChanged { run_id, state };
     let (sequence,): (i64,) = sqlx::query_as(
         "INSERT INTO events \
@@ -268,6 +316,52 @@ pub async fn append_run_state_changed(
         actor: actor.clone(),
         body,
     })
+}
+
+/// Persist a completed run's MEASURED usage (outcome 20; migration 0032's
+/// `prompt_tokens` / `completion_tokens` / `cost_micros` columns on `runs`).
+///
+/// Takes primitive `Option<u64>`s rather than `codypendent_runtime::ModelUsage`
+/// itself: this crate does not (and must not) depend on `codypendent-runtime`
+/// — the same layering rule this module's sibling `blackboard.rs` documents for
+/// `codypendent-workflow` — so the assembly (which CAN name that type) unpacks
+/// it before calling this.
+///
+/// `None` means "not measured" and is written as SQL `NULL`, never a
+/// fabricated zero a reader could mistake for a genuinely free/silent run:
+/// `RunOutcome.usage` is `None` for a wholly unmeasured run (writes three
+/// `NULL`s here); `Some(usage)` commonly has real `prompt_tokens` /
+/// `completion_tokens` with `cost_micros` still `None` (a live driver measures
+/// tokens but the price is applied downstream, if at all — see `ModelUsage`'s
+/// own "tokens and cost are decoupled" doc comment).
+///
+/// Idempotent (last write wins) and best-effort by *contract*, not by
+/// swallowing errors here: this runs after the run's terminal `RunCompleted`
+/// has already been journaled, so the caller must treat a failure as
+/// non-fatal to the run itself (log and move on) rather than let a ledger
+/// write turn an otherwise-successful run into one the user sees fail.
+pub async fn record_run_usage(
+    pool: &SqlitePool,
+    run_id: RunId,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    cost_micros: Option<u64>,
+) -> anyhow::Result<()> {
+    // A token/cost figure this large is unreachable in practice; saturate
+    // rather than let a `u64 as i64` wrap negative, which would otherwise turn
+    // a pathological input into a silently wrong (and misleadingly "measured")
+    // negative value instead of a merely very large one.
+    let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    sqlx::query(
+        "UPDATE runs SET prompt_tokens = ?, completion_tokens = ?, cost_micros = ? WHERE id = ?",
+    )
+    .bind(prompt_tokens.map(to_i64))
+    .bind(completion_tokens.map(to_i64))
+    .bind(cost_micros.map(to_i64))
+    .bind(run_id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// The next sequence number for a session (1-based).
@@ -359,6 +453,46 @@ mod tests {
         .expect("insert run");
     }
 
+    /// Insert a session and a `Queued` run under FRESH, caller-visible ids (the
+    /// outcome-20 tests below drive the run through several legal transitions
+    /// and then read its row back, so — unlike [`seed_run`] — they need the ids
+    /// in hand).
+    async fn seed_queued_run(pool: &SqlitePool) -> (SessionId, RunId) {
+        let session_id = SessionId::new();
+        let run_id = RunId::new();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO sessions (id, title, state, created_at, updated_at, revision) \
+             VALUES (?, ?, 'open', ?, ?, 0)",
+        )
+        .bind(session_id.to_string())
+        .bind("ledger-timing-test")
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("insert session");
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, budget_json) \
+             VALUES (?, ?, 'diagnose', 'Queued', 'Build', 'hosted-default', '{}')",
+        )
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .execute(pool)
+        .await
+        .expect("insert run");
+        (session_id, run_id)
+    }
+
+    /// `(started_at, ended_at)` off the `runs` row, both possibly `NULL`.
+    async fn run_timing(pool: &SqlitePool, run_id: RunId) -> (Option<String>, Option<String>) {
+        sqlx::query_as("SELECT started_at, ended_at FROM runs WHERE id = ?")
+            .bind(run_id.to_string())
+            .fetch_one(pool)
+            .await
+            .expect("run row")
+    }
+
     #[tokio::test]
     async fn active_run_count_is_zero_with_no_runs() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -406,5 +540,154 @@ mod tests {
                 "state {state} must count as active"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Outcome 20: `runs.started_at` / `ended_at` actually get written.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_run_transition_stamps_started_at_once_and_ended_at_on_completion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = test_pool(tmp.path()).await;
+        let (session_id, run_id) = seed_queued_run(&pool).await;
+
+        let (started, ended) = run_timing(&pool, run_id).await;
+        assert_eq!(started, None, "a Queued run has not started yet");
+        assert_eq!(ended, None);
+
+        append_run_state_changed(
+            &pool,
+            session_id,
+            &Actor::System,
+            run_id,
+            RunState::Preparing,
+            Utc::now(),
+        )
+        .await
+        .expect("-> Preparing");
+        let (started, ended) = run_timing(&pool, run_id).await;
+        assert_eq!(started, None, "Preparing is not Running yet");
+        assert_eq!(ended, None);
+
+        let first_running_at = Utc::now();
+        append_run_state_changed(
+            &pool,
+            session_id,
+            &Actor::System,
+            run_id,
+            RunState::Running,
+            first_running_at,
+        )
+        .await
+        .expect("-> Running");
+        let (started, ended) = run_timing(&pool, run_id).await;
+        assert_eq!(
+            started.as_deref(),
+            Some(first_running_at.to_rfc3339().as_str())
+        );
+        assert_eq!(ended, None, "a Running run has not ended");
+
+        // A pause/resume cycle legally revisits Running — `started_at` must
+        // keep the FIRST moment, not the resume moment.
+        append_run_state_changed(
+            &pool,
+            session_id,
+            &Actor::System,
+            run_id,
+            RunState::Paused,
+            Utc::now(),
+        )
+        .await
+        .expect("-> Paused");
+        append_run_state_changed(
+            &pool,
+            session_id,
+            &Actor::System,
+            run_id,
+            RunState::Running,
+            Utc::now(),
+        )
+        .await
+        .expect("-> Running again (resume)");
+        let (started_after_resume, ended) = run_timing(&pool, run_id).await;
+        assert_eq!(
+            started_after_resume.as_deref(),
+            Some(first_running_at.to_rfc3339().as_str()),
+            "started_at must survive a pause/resume cycle unchanged"
+        );
+        assert_eq!(ended, None);
+
+        let completed_at = Utc::now();
+        append_run_state_changed(
+            &pool,
+            session_id,
+            &Actor::System,
+            run_id,
+            RunState::Completed,
+            completed_at,
+        )
+        .await
+        .expect("-> Completed");
+        let (started, ended) = run_timing(&pool, run_id).await;
+        assert_eq!(
+            started.as_deref(),
+            Some(first_running_at.to_rfc3339().as_str()),
+            "started_at is still the original Running moment"
+        );
+        assert_eq!(ended.as_deref(), Some(completed_at.to_rfc3339().as_str()));
+    }
+
+    #[tokio::test]
+    async fn record_run_usage_writes_measured_fields_and_leaves_unmeasured_ones_null() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool = test_pool(tmp.path()).await;
+        let (_session_id, run_id) = seed_queued_run(&pool).await;
+
+        type UsageRow = (Option<i64>, Option<i64>, Option<i64>);
+        let read_usage = |pool: SqlitePool, run_id: RunId| async move {
+            sqlx::query_as::<_, UsageRow>(
+                "SELECT prompt_tokens, completion_tokens, cost_micros FROM runs WHERE id = ?",
+            )
+            .bind(run_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("run row")
+        };
+
+        // A wholly unmeasured run writes three NULLs, not fabricated zeros.
+        record_run_usage(&pool, run_id, None, None, None)
+            .await
+            .expect("record unmeasured");
+        assert_eq!(read_usage(pool.clone(), run_id).await, (None, None, None));
+
+        // Tokens measured, cost not (the common case: a live driver has no
+        // per-token price) — cost_micros stays NULL while tokens are real.
+        record_run_usage(&pool, run_id, Some(1050), Some(1052), None)
+            .await
+            .expect("record tokens-only");
+        assert_eq!(
+            read_usage(pool.clone(), run_id).await,
+            (Some(1050), Some(1052), None)
+        );
+
+        // A genuinely measured zero cost (e.g. a free local model) is `Some(0)`,
+        // distinct from `None` — both round-trip exactly.
+        record_run_usage(&pool, run_id, Some(200), Some(50), Some(0))
+            .await
+            .expect("record measured zero cost");
+        assert_eq!(
+            read_usage(pool.clone(), run_id).await,
+            (Some(200), Some(50), Some(0))
+        );
+
+        // Fully measured and priced.
+        record_run_usage(&pool, run_id, Some(4000), Some(212), Some(15_000))
+            .await
+            .expect("record fully measured");
+        assert_eq!(
+            read_usage(pool, run_id).await,
+            (Some(4000), Some(212), Some(15_000))
+        );
     }
 }

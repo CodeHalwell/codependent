@@ -19,8 +19,8 @@ use codypendent_knowledge::{
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     AgentMode, ApprovalDecision, ApprovalScope, ClientRole, CommandBody, CommandId, DaemonStatus,
-    DocumentId, Payload, PromotionAction, SessionId, Subscription, WorkflowEvent, WorkflowNodeView,
-    WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceId,
+    DocumentId, ModelId, Payload, PromotionAction, SessionId, Subscription, WorkflowEvent,
+    WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceId,
 };
 
 use crate::client;
@@ -367,6 +367,7 @@ pub async fn run(
     objective: String,
     mode: AgentMode,
     repo: PathBuf,
+    model: Option<String>,
     jsonl: bool,
 ) -> anyhow::Result<i32> {
     if !jsonl {
@@ -384,6 +385,20 @@ pub async fn run(
     if !repo.is_dir() {
         anyhow::bail!("--repo {}: not a directory", repo.display());
     }
+    // Caught here, before the daemon is even contacted, so a typo'd `--model`
+    // fails fast with the same list a user would check by hand — not a
+    // StartRun round trip followed by an opaque daemon-side resolution error.
+    if let Some(id) = &model {
+        let configured =
+            codypendent_runtime::models::load_models(&paths.data_dir.join("models.toml"))
+                .unwrap_or_default();
+        if !configured.iter().any(|c| c.id.0 == *id) {
+            anyhow::bail!(
+                "--model `{id}` is not configured; see `codypendent models list` for the \
+                 configured ids"
+            );
+        }
+    }
 
     // The daemon-start banner ("daemon already running" / "daemon started
     // (pid N)") is Phase 0 human output; --jsonl's contract is that stdout
@@ -394,7 +409,9 @@ pub async fn run(
     let mut conn = Connection::connect(&paths.socket_path).await?;
     let mut stdout = std::io::stdout();
     let repository = repo.to_string_lossy().into_owned();
-    let exit = run_over_connection(&mut conn, objective, mode, &repository, &mut stdout).await?;
+    let model = model.map(ModelId);
+    let exit =
+        run_over_connection(&mut conn, objective, mode, &repository, model, &mut stdout).await?;
     Ok(exit.exit_code())
 }
 
@@ -408,6 +425,7 @@ pub async fn run_over_connection<W: Write>(
     objective: String,
     mode: AgentMode,
     repository: &str,
+    model: Option<ModelId>,
     out: &mut W,
 ) -> anyhow::Result<RunExit> {
     let hello = conn
@@ -478,8 +496,10 @@ pub async fn run_over_connection<W: Write>(
             // shared daemon does not store its memories under its own directory
             // (issue #6 item 1).
             repository: Some(repository.to_owned()),
-            // The headless `run` path pins no model; the daemon resolves/routes.
-            model: None,
+            // `--model` pins the run exactly like the TUI's `/model` picker
+            // (STEP MP2); `None` keeps the prior behavior — routing (if
+            // enabled) or the resolver's first reachable candidate.
+            model,
         })
         .await?;
     if let Payload::CommandRejected(error) = &start_reply.payload {

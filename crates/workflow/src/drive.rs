@@ -28,9 +28,18 @@
 //! A node failure blocks only its *dependents* — independent siblings still run,
 //! maximising progress — and leaves the run [`Failed`](WorkflowRunState::Failed);
 //! the blocked work is resumable via [`WorkflowStore::retry_from_node`] on the
-//! failed node. Concurrent execution of the frontier (into isolated worktrees) is
-//! a later refinement; this driver runs the frontier sequentially in topological
-//! order, which is enough to prove the durable lifecycle.
+//! failed node.
+//!
+//! **The frontier is executed concurrently** (STEP 5.2 / outcome 15), bounded by
+//! the manifest's `budget.maximum_agents` — see
+//! [`CompiledWorkflow::max_concurrency`]. Independent ready nodes therefore run at
+//! the same time rather than one after another, which is the whole point of
+//! delegating to workers: each writing node already mints its own run id and binds
+//! its own isolated worktree (and so its own branch), so concurrent writers never
+//! share a tree. The cap is the *only* thing bounding fan-out breadth, so it is
+//! enforced here rather than merely validated at compile time. A manifest without
+//! `maximum_agents` (legal only when it has no agent steps) runs one node at a
+//! time, exactly as before.
 //!
 //! **Cooperative pause/cancel.** The driver re-reads the run's persisted state at
 //! each scheduling boundary, so a [`pause`](crate::WorkflowConductor::pause) or
@@ -43,6 +52,7 @@
 //! [`WorkflowConductor`](crate::WorkflowConductor).
 
 use async_trait::async_trait;
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
@@ -404,6 +414,10 @@ impl WorkflowDriver {
         // The snapshot taken here also feeds the pure `ready_node_ids` frontier, so
         // this is one read per round, not two (the signature was already guarded
         // above and the graph cannot change under a single drive).
+        //
+        // The wave's width. Read once: the graph — and so its budget — cannot
+        // change under a single drive (the signature guard above).
+        let concurrency = compiled.max_concurrency();
         loop {
             let snapshot = self
                 .store
@@ -420,15 +434,42 @@ impl WorkflowDriver {
             if ready.is_empty() {
                 break;
             }
-            for node_id in ready {
-                let node = compiled
-                    .node(&node_id)
-                    .expect("a ready node is part of the compiled graph");
-                self.run_node(pool, workflow_run_id, node, executor, observer)
-                    .await?;
-                // A blocked node pauses the run. Stop this already-computed wave
-                // immediately so siblings do not continue spending against an
-                // exhausted envelope.
+
+            // Run the wave concurrently, never more than `concurrency` at once,
+            // refilling a free slot as soon as a node lands. `FuturesUnordered`
+            // (not `JoinSet`) because every node future borrows the compiled
+            // graph, the executor, and the observer — spawning would force a
+            // `'static` bound on the whole `NodeExecutor`/`NodeObserver` API for
+            // no gain: node work is I/O-bound (model calls, `git`, SQLite), so it
+            // yields at every await and genuinely overlaps.
+            let mut queue = ready.into_iter();
+            let mut inflight = FuturesUnordered::new();
+            // Set when the wave must stop LAUNCHING but must still drain: a store
+            // error, or the run leaving `Running` (a blocked node paused it, or a
+            // concurrent pause/cancel landed). Cancelling in-flight nodes instead
+            // would abandon live agent runs and their worktree leases mid-flight.
+            let mut stop_launching = false;
+            let mut first_error = None;
+            let mut halted = false;
+            loop {
+                while !stop_launching && inflight.len() < concurrency {
+                    let Some(node_id) = queue.next() else { break };
+                    let node = compiled
+                        .node(&node_id)
+                        .expect("a ready node is part of the compiled graph");
+                    inflight.push(self.run_node(pool, workflow_run_id, node, executor, observer));
+                }
+                let Some(result) = inflight.next().await else {
+                    break;
+                };
+                if let Err(error) = result {
+                    stop_launching = true;
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+                // A blocked node pauses the run. Stop launching the rest of this
+                // already-computed wave so siblings do not continue spending
+                // against an exhausted envelope — the in-flight ones drain first.
                 let state = self
                     .store
                     .snapshot(pool, workflow_run_id)
@@ -437,8 +478,22 @@ impl WorkflowDriver {
                     .run
                     .state;
                 if state != WorkflowRunState::Running {
-                    return Ok(state);
+                    stop_launching = true;
+                    halted = true;
                 }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            if halted {
+                // Re-read rather than reporting the state that halted the wave:
+                // the nodes that drained after it may have moved the run again.
+                let current = self
+                    .store
+                    .snapshot(pool, workflow_run_id)
+                    .await?
+                    .ok_or_else(|| WorkflowStoreError::NotFound(workflow_run_id.to_owned()))?;
+                return Ok(current.run.state);
             }
         }
 
@@ -855,6 +910,158 @@ steps:
     depends_on: [b, c]
     tool: repository.test
 ";
+
+    /// Records how many nodes are executing AT THE SAME TIME. Each execution
+    /// holds its slot across an `await`, so a sequential driver can only ever
+    /// reach a peak of 1 — which is exactly what this asserts against.
+    #[derive(Default)]
+    struct ConcurrencyProbe {
+        inflight: Mutex<usize>,
+        peak: Mutex<usize>,
+    }
+
+    impl ConcurrencyProbe {
+        fn peak(&self) -> usize {
+            *self.peak.lock().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl NodeExecutor for ConcurrencyProbe {
+        async fn execute(&self, _ctx: NodeContext<'_>) -> NodeOutcome {
+            {
+                let mut inflight = self.inflight.lock().unwrap();
+                *inflight += 1;
+                let mut peak = self.peak.lock().unwrap();
+                *peak = (*peak).max(*inflight);
+            }
+            // Yield long enough that a truly concurrent driver overlaps and a
+            // sequential one cannot.
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            *self.inflight.lock().unwrap() -= 1;
+            NodeOutcome::completed()
+        }
+    }
+
+    /// Three independent steps that all become ready at once, with the wave width
+    /// left to the caller's `maximum_agents`.
+    fn fan_out(maximum_agents: Option<u32>) -> String {
+        let budget = maximum_agents.map_or_else(String::new, |agents| {
+            format!("budget:\n  maximum_agents: {agents}\n")
+        });
+        format!(
+            "\
+schema_version: 1
+id: fanout
+version: 1
+{budget}steps:
+  - id: w1
+    tool: repository.test
+  - id: w2
+    tool: repository.test
+  - id: w3
+    tool: repository.test
+  - id: w4
+    tool: repository.test
+"
+        )
+    }
+
+    async fn drive_fan_out(maximum_agents: Option<u32>) -> (usize, WorkflowRunState) {
+        let (_tmp, pool) = temp_pool().await;
+        let compiled = compile_yaml(&fan_out(maximum_agents)).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+        let probe = ConcurrencyProbe::default();
+        let state = WorkflowDriver::new()
+            .run(&pool, &run_id, &compiled, &probe)
+            .await
+            .unwrap();
+        (probe.peak(), state)
+    }
+
+    /// The regression for the single largest outcome-15 gap: the frontier used to
+    /// be a `for` loop with one `.await` per node, so four independent workers ran
+    /// strictly one after another and the peak was always 1.
+    #[tokio::test]
+    async fn the_ready_frontier_runs_concurrently() {
+        let (peak, state) = drive_fan_out(Some(4)).await;
+        assert_eq!(state, WorkflowRunState::Completed);
+        assert_eq!(peak, 4, "four independent nodes should overlap");
+    }
+
+    /// …and `maximum_agents` is the thing that bounds it — previously validated at
+    /// compile time and read by nothing.
+    #[tokio::test]
+    async fn maximum_agents_bounds_the_frontier() {
+        let (peak, state) = drive_fan_out(Some(2)).await;
+        assert_eq!(state, WorkflowRunState::Completed);
+        assert_eq!(peak, 2, "the wave must never exceed maximum_agents");
+    }
+
+    /// A manifest that declares no cap (legal only without agent steps) keeps the
+    /// pre-concurrency behaviour: one node at a time.
+    #[tokio::test]
+    async fn no_maximum_agents_runs_one_node_at_a_time() {
+        let (peak, state) = drive_fan_out(None).await;
+        assert_eq!(state, WorkflowRunState::Completed);
+        assert_eq!(peak, 1);
+    }
+
+    /// A concurrent wave must still honour "a failure blocks only its dependents":
+    /// the siblings that were already in flight land normally.
+    #[tokio::test]
+    async fn a_failure_inside_a_concurrent_wave_does_not_abort_its_siblings() {
+        let (_tmp, pool) = temp_pool().await;
+        let compiled = compile_yaml(&fan_out(Some(4))).unwrap();
+        let store = WorkflowStore::new();
+        let run_id = store
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+        let executor = ScriptedExecutor::default().with("w2", vec![NodeOutcome::failed("boom")]);
+        let state = WorkflowDriver::new()
+            .run(&pool, &run_id, &compiled, &executor)
+            .await
+            .unwrap();
+        assert_eq!(state, WorkflowRunState::Failed);
+        let snap = store.snapshot(&pool, &run_id).await.unwrap().unwrap();
+        let node = |id: &str| snap.nodes.iter().find(|n| n.node_id == id).unwrap().state;
+        assert_eq!(node("w1"), NodeState::Completed);
+        assert_eq!(node("w2"), NodeState::Failed);
+        assert_eq!(node("w3"), NodeState::Completed);
+        assert_eq!(node("w4"), NodeState::Completed);
+    }
+
+    /// A budget block pauses the run, and the wave stops LAUNCHING while draining
+    /// what is already in flight — the cooperative contract the sequential driver
+    /// had, preserved under concurrency.
+    #[tokio::test]
+    async fn a_blocked_node_pauses_the_run_and_stops_the_wave() {
+        let (_tmp, pool) = temp_pool().await;
+        // Width 1 so the block is observed before the remaining nodes launch.
+        let compiled = compile_yaml(&fan_out(Some(1))).unwrap();
+        let store = WorkflowStore::new();
+        let run_id = store
+            .create_run(&pool, &compiled, None, &json!({}), None)
+            .await
+            .unwrap();
+        let executor = ScriptedExecutor::default().with(
+            "w1",
+            vec![NodeOutcome::blocked("workflow.budget-exceeded", None)],
+        );
+        let state = WorkflowDriver::new()
+            .run(&pool, &run_id, &compiled, &executor)
+            .await
+            .unwrap();
+        assert_eq!(state, WorkflowRunState::Paused);
+        assert!(
+            !executor.ran("w2"),
+            "the wave must stop launching after a block"
+        );
+    }
 
     async fn temp_pool() -> (tempfile::TempDir, SqlitePool) {
         let tmp = tempfile::tempdir().unwrap();

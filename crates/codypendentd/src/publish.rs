@@ -1850,6 +1850,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn documentation_pr_target_with_a_non_github_remote_fails_before_touching_git() {
+        // Regression (2026-08-13 review F7), reproduced live: `resolve_github_repo`
+        // used to be checked AFTER `commit_on_docs_branch` + `git push`, so a
+        // non-GitHub `origin` let a branch land on the real remote before the
+        // job failed with no publication row recording it. A GitHub CLIENT is
+        // configured here (so `NoGitHubClient` cannot be what trips this) but
+        // `origin` is a plain local bare repo — not github.com-resolvable — so
+        // only `NoGitHubRemote` can explain the failure, and it must fire
+        // BEFORE any commit or push.
+        let dir = tempfile::tempdir().unwrap();
+        let pool = temp_pool(dir.path()).await;
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let bare = dir.path().join("origin.git");
+        git(
+            dir.path(),
+            &["init", "--bare", "-q", bare.to_str().unwrap()],
+        );
+        git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        let artifacts = ArtifactStore::new(dir.path().join("artifacts"));
+        let document_id = DocumentId::new();
+        let github = FakeGitHub::default();
+
+        let plan = PublishPlan {
+            target: KnowledgeTarget::DocumentationPr {
+                branch: "docs/pr2".to_string(),
+                path: "docs/pr2.md".to_string(),
+                title: "Publish: PR2".to_string(),
+            },
+            changed_files: vec!["docs/pr2.md".to_string()],
+            git_action: "open documentation PR".to_string(),
+            rendered: "# PR2\n".to_string(),
+            rendered_hash: "deadbeef".to_string(),
+            revision: 1,
+        };
+
+        let error = execute_plan(&repo, &pool, &artifacts, Some(&github), &plan, document_id)
+            .await
+            .expect_err("a non-GitHub origin must fail");
+        assert!(
+            matches!(error, PublishExecError::NoGitHubRemote),
+            "expected NoGitHubRemote, got {error:?}"
+        );
+
+        // Nothing was touched — the exact bug: a branch used to be created
+        // AND pushed to `origin` before this check ran.
+        let branches = git_output(&repo, &["branch", "--list"]);
+        assert!(
+            !branches.contains("docs/pr2"),
+            "no branch must be created: {branches}"
+        );
+        let worktrees = git_output(&repo, &["worktree", "list"]);
+        assert_eq!(
+            worktrees.lines().count(),
+            1,
+            "no worktree must be created: {worktrees}"
+        );
+        let remote_branches = git_output(&bare, &["branch", "--list"]);
+        assert!(
+            !remote_branches.contains("docs/pr2"),
+            "nothing must be pushed to the remote: {remote_branches}"
+        );
+        assert_eq!(github.prs.lock().unwrap().len(), 0, "no PR must be opened");
+    }
+
+    #[tokio::test]
     async fn docs_branch_push_reaches_a_real_remote() {
         // Proves the exact invocation `execute_plan`'s PR target relies on
         // (`git push origin <branch>:<branch>`) actually lands the commit on a

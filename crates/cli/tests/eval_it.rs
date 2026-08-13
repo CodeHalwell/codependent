@@ -524,7 +524,11 @@ async fn approved_execute_command_is_recorded_and_a_rejected_one_is_not() {
     });
 
     let mut conn = Connection::connect(&socket.path).await.unwrap();
-    let obs = tokio::time::timeout(
+    // `run_case_over_connection` also returns the daemon-assigned `RunId` (so
+    // `run_case` can find that run's own isolated worktree — see
+    // `codypendent_cli::eval::run_worktree_root`); this test only cares about
+    // the wire-observable half.
+    let (obs, _run_id) = tokio::time::timeout(
         Duration::from_secs(10),
         codypendent_cli::eval::run_case_over_connection(
             &mut conn,

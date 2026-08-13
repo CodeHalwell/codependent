@@ -481,6 +481,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::FocusPane(pane) => state.focus = pane,
         Action::ActivateRow(n) => activate_row(state, n),
+        Action::ActivateFold { run, entry } => activate_fold(state, run, entry),
         Action::SelectRun(n) => {
             let mut idx = n;
             clamp(&mut idx, state.runs.len());
@@ -789,13 +790,20 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::OpenPalette => {
-            state.overlay = match state.overlay {
-                Overlay::Edges => Overlay::EdgeSearch(state.edge_query.clone()),
-                Overlay::Palette { .. } => Overlay::None,
-                _ => Overlay::Palette {
-                    query: String::new(),
-                    selected: 0,
-                },
+            // Toggling the palette shut has the same return address as `Esc`.
+            // Not an early `return`: the post-match Docs-lease release below
+            // must run for every action.
+            if matches!(state.overlay, Overlay::Palette { .. }) && state.palette_from_onboard {
+                open_onboard(state);
+            } else {
+                state.overlay = match state.overlay {
+                    Overlay::Edges => Overlay::EdgeSearch(state.edge_query.clone()),
+                    Overlay::Palette { .. } => Overlay::None,
+                    _ => Overlay::Palette {
+                        query: String::new(),
+                        selected: 0,
+                    },
+                }
             }
         }
         Action::BeginAddModel => begin_add_model(state),
@@ -2612,49 +2620,77 @@ fn request_edge_page(state: &mut AppState, page: usize) {
     });
 }
 
-/// `Alt-↑`/`Alt-↓`: walk the selected run's *foldable* entries — tool cards,
-/// patch diffs, the backstage fold, long notes, failed-run errors — and mark
-/// the transcript as being browsed, so the renderer highlights the landing
-/// entry, keeps it in the viewport, and `Alt-Enter` expands it. Stepping only
-/// over foldable entries means every stop has something to open (the mouse's
-/// click targets are exactly this set — see `TranscriptEntry::is_foldable`).
-/// A no-op when the selected run has no foldable entry at all.
+/// Every foldable transcript entry in the whole session, as `(run, entry)`
+/// addresses in the order the conversation stacks them.
+///
+/// The walk deliberately spans runs: `render_conversation` draws EVERY run in
+/// one continuous timeline and each follow-up message opens a new run, so a
+/// cursor confined to `selected_run` left every tool card and patch diff from
+/// an earlier turn visible-but-inert. The mouse's click targets are exactly
+/// this set (`fold_hit_entry` shares `TranscriptEntry::is_foldable`), so
+/// keyboard and mouse reach the same cards (RULE 3).
+fn session_folds(state: &AppState) -> Vec<(usize, usize)> {
+    state
+        .runs
+        .iter()
+        .enumerate()
+        .flat_map(|(run_idx, run)| {
+            run.transcript
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.is_foldable())
+                .map(move |(idx, _)| (run_idx, idx))
+        })
+        .collect()
+}
+
+/// Point the fold cursor at one `(run, entry)` address.
+fn set_fold_cursor(state: &mut AppState, (run_idx, entry): (usize, usize)) {
+    state.transcript_focus_run = run_idx;
+    if let Some(run) = state.runs.get_mut(run_idx) {
+        run.transcript_selected = entry;
+    }
+}
+
+/// The cursor's current address, or `None` when the session has no run.
+fn fold_cursor(state: &AppState) -> Option<(usize, usize)> {
+    let run_idx = state.fold_focus_run();
+    state
+        .runs
+        .get(run_idx)
+        .map(|run| (run_idx, run.transcript_selected))
+}
+
+/// `Alt-↑`/`Alt-↓`: walk the session's *foldable* entries — tool cards, patch
+/// diffs, the backstage fold, long notes, failed-run errors — across every run,
+/// and mark the transcript as being browsed, so the renderer highlights the
+/// landing entry, keeps it in the viewport, and `Alt-Enter` expands it.
+/// Stepping only over foldable entries means every stop has something to open.
+/// A no-op when the session has no foldable entry at all.
 fn browse_fold(state: &mut AppState, delta: i32) {
     if !matches!(state.overlay, Overlay::None) {
         return;
     }
-    let browsing = state.transcript_browse;
-    let Some(run) = state.selected_run_mut() else {
-        return;
-    };
-    let folds: Vec<usize> = run
-        .transcript
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.is_foldable())
-        .map(|(idx, _)| idx)
-        .collect();
+    let folds = session_folds(state);
     let Some(&last) = folds.last() else {
         return;
     };
-    // The first Alt-↑/Alt-↓ enters browse mode at the newest fold (the one the
-    // tail of the conversation is showing); later presses walk from there.
-    if !browsing {
-        run.transcript_selected = last;
+    // The first Alt-↑/Alt-↓ enters browse mode at the newest fold in the whole
+    // conversation (the one the tail is showing); later presses walk from there.
+    if !state.transcript_browse {
         state.transcript_browse = true;
+        set_fold_cursor(state, last);
         return;
     }
-    let current = run.transcript_selected;
-    let position = folds
-        .iter()
-        .position(|&idx| idx == current)
+    let position = fold_cursor(state)
+        .and_then(|current| folds.iter().position(|&fold| fold == current))
         .unwrap_or(folds.len() - 1);
     let next = if delta < 0 {
         position.saturating_sub(1)
     } else {
         (position + 1).min(folds.len() - 1)
     };
-    run.transcript_selected = folds[next];
+    set_fold_cursor(state, folds[next]);
 }
 
 /// Leave transcript-browse mode: the selection stops being highlighted and
@@ -2662,6 +2698,9 @@ fn browse_fold(state: &mut AppState, delta: i32) {
 /// that means "I am driving the composer or the viewport again".
 fn end_browse(state: &mut AppState) {
     state.transcript_browse = false;
+    // Idle, the fold cursor belongs to the run the composer talks to; the next
+    // `Alt-↑` re-enters at the session's newest fold anyway.
+    state.transcript_focus_run = state.selected_run;
 }
 
 fn expand_selected(state: &mut AppState) {
@@ -2696,7 +2735,7 @@ fn expand_selected(state: &mut AppState) {
     if state.layout == crate::state::LayoutMode::Workspace && state.focus != Pane::Transcript {
         return;
     }
-    let idx = state.selected_run;
+    let idx = state.fold_focus_run();
     if let Some(run) = state.runs.get_mut(idx) {
         if let Some(entry) = run.transcript.get_mut(run.transcript_selected) {
             match entry {
@@ -2712,7 +2751,7 @@ fn expand_selected(state: &mut AppState) {
 }
 
 fn focused_transcript_entry(state: &AppState) -> Option<(&RunView, &TranscriptEntry)> {
-    let run = state.selected_run()?;
+    let run = state.fold_focus()?;
     run.transcript
         .get(run.transcript_selected)
         .map(|entry| (run, entry))
@@ -2796,7 +2835,7 @@ fn copy_focused_card(state: &mut AppState) {
 }
 
 fn failed_run_context(state: &AppState) -> Option<(String, AgentMode, Option<ModelId>, usize)> {
-    let run = state.selected_run()?;
+    let run = state.fold_focus()?;
     let entry = run.transcript.get(run.transcript_selected)?;
     matches!(
         entry,
@@ -2810,7 +2849,7 @@ fn failed_run_context(state: &AppState) -> Option<(String, AgentMode, Option<Mod
             run.objective.clone(),
             run.mode,
             run.model.clone(),
-            state.selected_run,
+            state.fold_focus_run(),
         )
     })
 }
@@ -3901,6 +3940,26 @@ fn input_char(state: &mut AppState, c: char) {
         };
         return;
     }
+    // First-run setup is `InputMode::Palette` but has no query buffer, so every
+    // printable key — including the `/` its own splash advertises — used to fall
+    // through `edit_prompt`'s `_ => {}` and vanish. The palette is the product's
+    // advertised front door; it must work on the very first screen, and `Esc`
+    // brings the gate back (see `input_cancel`).
+    if c == '/'
+        && matches!(
+            state.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { .. }
+            }
+        )
+    {
+        state.palette_from_onboard = true;
+        state.overlay = Overlay::Palette {
+            query: String::new(),
+            selected: 0,
+        };
+        return;
+    }
     edit_prompt(state, &Edit::Insert(c.to_string()));
     detach_history_on_edit(state);
 }
@@ -4010,6 +4069,7 @@ fn history_next(state: &mut AppState) {
 
 fn open_onboard(state: &mut AppState) {
     state.onboard_flow = None;
+    state.palette_from_onboard = false;
     state.overlay = Overlay::Onboard {
         step: OnboardStep::Triage { selected: 0 },
     };
@@ -4191,6 +4251,12 @@ fn input_cancel(state: &mut AppState) {
     // "stop browsing".
     if state.transcript_browse && matches!(state.overlay, Overlay::None) {
         end_browse(state);
+        return;
+    }
+    // The palette opened over first-run setup returns to it; closing to an inert
+    // chat would strand an operator who still has no runnable model.
+    if matches!(state.overlay, Overlay::Palette { .. }) && state.palette_from_onboard {
+        open_onboard(state);
         return;
     }
     match state.overlay {
@@ -4407,21 +4473,37 @@ fn activate_row(state: &mut AppState, n: usize) {
             submit_prompt(state);
         }
         Overlay::None => {
-            state.focus = Pane::Transcript;
-            let idx = state.selected_run;
-            if let Some(run) = state.runs.get_mut(idx) {
-                if n < run.transcript.len() {
-                    run.transcript_selected = n;
-                    // A clicked fold becomes the browsed one, so the keyboard
-                    // can carry on from where the mouse left off (and the row
-                    // the click landed on is visibly selected).
-                    state.transcript_browse = true;
-                }
-            }
-            expand_selected(state);
+            let run_idx = state.selected_run;
+            activate_fold(state, run_idx, n);
         }
         _ => {}
     }
+}
+
+/// Toggle the transcript fold at `(run, entry)` — the mouse's path to a tool
+/// card, patch diff, or long note anywhere in the stacked conversation, not
+/// only in the run the composer happens to be pointed at.
+fn activate_fold(state: &mut AppState, run_idx: usize, entry: usize) {
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    state.focus = Pane::Transcript;
+    // A click whose address no longer exists (the projection moved under the
+    // frame it was drawn from) must not fall through and toggle whatever the
+    // cursor happened to be on.
+    if state
+        .runs
+        .get(run_idx)
+        .is_none_or(|run| entry >= run.transcript.len())
+    {
+        return;
+    }
+    set_fold_cursor(state, (run_idx, entry));
+    // A clicked fold becomes the browsed one, so the keyboard can carry on
+    // from where the mouse left off (and the row the click landed on is
+    // visibly selected).
+    state.transcript_browse = true;
+    expand_selected(state);
 }
 
 fn submit_prompt(state: &mut AppState) {
@@ -4752,6 +4834,9 @@ fn submit_prompt(state: &mut AppState) {
         // `mem::take` already closed the palette (left `None`); run the
         // highlighted command, which may open its own overlay.
         Overlay::Palette { query, selected } => {
+            // The chosen command owns the flow from here, so `Esc` belongs to
+            // whatever it opened rather than to the setup gate behind it.
+            state.palette_from_onboard = false;
             if let Some(selector) = parse_council_result_query(&query) {
                 state.overlay = Overlay::CouncilResults;
                 state.outbox.push(Intent::LoadCouncilResults { selector });
@@ -11216,6 +11301,68 @@ mod tests {
         assert_eq!(s.drain_outbox(), vec![Intent::SetOnboardSkipped]);
     }
 
+    /// First-run setup is `InputMode::Palette` with no query buffer, so every
+    /// printable key fell through `edit_prompt`'s `_ => {}` and was swallowed —
+    /// typing `/model` ate six keystrokes and then `Enter` activated whatever
+    /// triage row happened to be highlighted. The splash advertises `/`, and it
+    /// is the only front door to the rest of the product.
+    #[test]
+    fn slash_opens_the_command_palette_from_first_run_setup() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenOnboard);
+
+        reduce(&mut s, Action::InputChar('/'));
+        assert!(
+            matches!(s.overlay, Overlay::Palette { .. }),
+            "`/` opens the palette instead of vanishing: {:?}",
+            s.overlay
+        );
+
+        // The query then filters normally rather than steering the triage list.
+        for c in "model".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        let Overlay::Palette { query, .. } = &s.overlay else {
+            unreachable!("still the palette")
+        };
+        assert_eq!(query, "model", "the keystrokes reached the filter");
+
+        reduce(&mut s, Action::InputSubmit);
+        assert!(
+            matches!(s.overlay, Overlay::ModelPicker { .. }),
+            "the highlighted command ran: {:?}",
+            s.overlay
+        );
+    }
+
+    #[test]
+    fn escaping_that_palette_returns_to_first_run_setup() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenOnboard);
+        reduce(&mut s, Action::InputChar('/'));
+
+        reduce(&mut s, Action::InputCancel);
+        assert!(
+            matches!(
+                s.overlay,
+                Overlay::Onboard {
+                    step: OnboardStep::Triage { .. }
+                }
+            ),
+            "Esc must not strand a zero-model operator in an inert chat: {:?}",
+            s.overlay
+        );
+        assert!(!s.palette_from_onboard, "the return address is consumed");
+
+        // A palette opened the ordinary way still closes to the base view.
+        reduce(&mut s, Action::InputCancel); // triage → skip confirm
+        reduce(&mut s, Action::InputSubmit); // skip setup
+        reduce(&mut s, Action::InputChar('/'));
+        assert!(matches!(s.overlay, Overlay::Palette { .. }));
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.overlay, Overlay::None);
+    }
+
     #[test]
     fn onboard_provider_classes_are_mutually_exclusive_and_cannot_roam() {
         let mut hosted = provider_card("groq", "Groq", "openai-chat", "api-key: GROQ", false);
@@ -13463,6 +13610,114 @@ mod tests {
             s.runs[0].transcript_selected, 3,
             "saturates at the newest fold"
         );
+    }
+
+    /// A follow-up message: the daemon seeds a continuation run, whose
+    /// `RunStarted` moves `selected_run` onto it. Everything turn 1 produced is
+    /// still drawn — the conversation stacks every run — so it must stay live.
+    fn add_a_second_turn(s: &mut AppState) {
+        let run_id = RunId::new();
+        reduce(
+            s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "and now the tests".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "workspace.read_file".to_owned(),
+                args_digest: "def".to_owned(),
+                label: Some("README.md".to_owned()),
+            }),
+        );
+    }
+
+    #[test]
+    fn alt_arrows_walk_folds_across_runs_not_just_the_selected_one() {
+        let mut s = run_with_two_folds();
+        add_a_second_turn(&mut s);
+        assert_eq!(s.selected_run, 1, "the follow-up run is selected");
+        assert_eq!(s.runs.len(), 2);
+
+        // Entry point is the newest fold in the whole conversation.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!((s.fold_focus_run(), s.runs[1].transcript_selected), (1, 1));
+
+        // Alt-↑ crosses the run boundary into turn 1's patch — before this it
+        // saturated inside run 1 and every earlier card was unreachable.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!(s.fold_focus_run(), 0, "the walk crossed into the older run");
+        assert_eq!(s.runs[0].transcript_selected, 3);
+        reduce(&mut s, Action::InputNewline);
+        assert!(
+            patch_expanded(&s),
+            "Alt-Enter expands a diff from an earlier turn"
+        );
+        assert!(
+            s.composer.is_empty(),
+            "…instead of inserting a newline in the composer"
+        );
+
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!((s.fold_focus_run(), s.runs[0].transcript_selected), (0, 1));
+        reduce(&mut s, Action::InputNewline);
+        assert!(tool_expanded(&s), "and expands its tool card");
+
+        // Alt-↓ walks forward over the same boundary.
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert_eq!((s.fold_focus_run(), s.runs[0].transcript_selected), (0, 3));
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert_eq!(s.fold_focus_run(), 1, "and back into the newest run");
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert_eq!(
+            s.fold_focus_run(),
+            1,
+            "saturating at the session's newest fold"
+        );
+
+        // The composer still submits against the selected run: browsing an old
+        // card must not silently re-target the next message.
+        assert_eq!(s.selected_run, 1);
+    }
+
+    #[test]
+    fn clicking_a_fold_in_an_earlier_run_expands_that_run_s_card() {
+        let mut s = run_with_two_folds();
+        add_a_second_turn(&mut s);
+
+        reduce(&mut s, Action::ActivateFold { run: 0, entry: 1 });
+        assert!(tool_expanded(&s), "the click toggled turn 1's tool card");
+        assert!(
+            s.transcript_browse,
+            "the clicked fold becomes the browsed one"
+        );
+        assert_eq!((s.fold_focus_run(), s.runs[0].transcript_selected), (0, 1));
+        assert_eq!(s.selected_run, 1, "clicking a card does not switch runs");
+
+        // Alt-Y copies the card the mouse just focused, not the selected run's.
+        reduce(&mut s, Action::CopyFocusedCard);
+        let copied = s
+            .drain_outbox()
+            .into_iter()
+            .find_map(|intent| match intent {
+                Intent::CopyText { text } => Some(text),
+                _ => None,
+            })
+            .expect("the focused card was copied");
+        assert!(copied.contains("shell.run"), "{copied}");
+    }
+
+    #[test]
+    fn an_out_of_range_fold_click_is_inert() {
+        let mut s = run_with_two_folds();
+        reduce(&mut s, Action::ActivateFold { run: 9, entry: 0 });
+        assert!(!s.transcript_browse);
+        assert!(!tool_expanded(&s));
+        assert!(!patch_expanded(&s));
     }
 
     #[test]

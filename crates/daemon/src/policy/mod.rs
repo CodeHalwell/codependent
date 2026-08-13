@@ -332,7 +332,11 @@ impl PolicyEngine {
             | ProposedAction::WorkflowQuery { .. }
             | ProposedAction::TaskWrite { .. }
             | ProposedAction::TaskRead { .. }
-            | ProposedAction::CouncilResultRead { .. } => self.eval_blackboard(),
+            | ProposedAction::CouncilResultRead { .. }
+            // Outcome 5: a code-graph query reads only the derived projection of
+            // this repository that the daemon itself parsed — the same "internal
+            // state, no external effect" reasoning as the reads above.
+            | ProposedAction::CodeGraphQuery { .. } => self.eval_blackboard(),
             // Council creation changes durable configuration, and running one
             // fans out model requests with potentially material cost. Both are
             // deliberately fresh approvals; the ProposedAction is the preview.

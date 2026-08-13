@@ -28,12 +28,38 @@
 //! fail-closed refusal elsewhere) that *consumes* a [`SandboxProfile`](profile::SandboxProfile)
 //! and actually confines a process — and the [`trust_store`], the data-only
 //! trusted-publisher key store that gives [`verify_artifact`](verify::verify_artifact)
-//! real keys to verify against. What it still defers (named, not faked): the
-//! `wasmtime` WASM component runtime and the brokered-secrets daemon.
+//! real keys to verify against.
+//!
+//! STEP 6.3 adds the WASM half and the seam that keeps it honest:
+//!
+//! * [`wasm`] — a `wasmi` guest runtime with **enforced** ceilings (fuel,
+//!   linear memory, a wall clock that actually terminates, output, host I/O)
+//!   and no ambient capabilities at all: WASI is not linked, and a module that
+//!   imports it is refused by name.
+//! * [`gate`] — the [`RunPolicyGate`](gate::RunPolicyGate) seam. A package's
+//!   own manifest is a **ceiling**, never a grant: every privileged act a guest
+//!   attempts is lowered into a [`HostRequest`](gate::HostRequest) that must
+//!   also be authorized by the daemon's deny-first **run** policy. This crate
+//!   cannot depend on `codypendent-daemon` (the daemon depends on *it*), so the
+//!   dependency is inverted rather than a second capability model being minted
+//!   here. See `.impl/threat-models/12-executable-skills.md` §0.
+//!
+//! * [`hook`] — the hook engine's decision core: a `hook.toml` parser with the
+//!   same `deny_unknown_fields` discipline as `plugin.toml`, the verdict lattice
+//!   in which `Deny` is absorbing, and the [`Unapproved`](hook::Unapproved) type
+//!   wall that makes "a hook cannot escalate privilege" a compile-time property
+//!   — a rewritten tool call has no accessor and can only be unwrapped by
+//!   re-entering the policy engine. See `.impl/threat-models/13-hooks.md`.
+//!
+//! What it still defers (named, not faked): the brokered-secrets daemon, the
+//! network broker that `network_allowlist` waits on, and the runtime dispatch
+//! site that emits hook events (owned by another crate; see the hook module docs).
 //!
 //! [`docs/specs/plugin.toml`]: ../../docs/specs/plugin.toml
 
 pub mod executor;
+pub mod gate;
+pub mod hook;
 pub mod lifecycle;
 pub mod manifest;
 pub mod permission;
@@ -41,11 +67,21 @@ pub mod profile;
 pub mod sanitize;
 pub mod trust_store;
 pub mod verify;
+pub mod wasm;
 
 pub use executor::{
     bwrap_argv, enforcing_executor, seatbelt_profile, CapabilityReport, RefusingSandbox,
     SandboxBackend, SandboxCommand, SandboxError, SandboxExecutor, SandboxOutcome,
     SandboxProcessSpec,
+};
+pub use gate::{
+    CapabilityBroker, DenyAllGate, GateDenied, GateGrant, GateSeal, HostRequest, RunPolicyGate,
+};
+pub use hook::{
+    combine, parse_hook, validate_event_set, Authorized, FailurePolicy, HookDenied, HookError,
+    HookEvent, HookKind, HookNetwork, HookOutcome, HookOutput, HookPolicy, HookRuntime, HookSpec,
+    HookVerdict, PolicyReentry, ReentryContext, ToolCall, Unapproved, MAX_HOOKS_PER_EVENT,
+    SUPPORTED_HOOK_SCHEMA_VERSION,
 };
 pub use lifecycle::{
     InstalledPlugin, LifecycleError, LifecycleState, PendingUpdateApproval, TrustTier,
@@ -67,3 +103,4 @@ pub use trust_store::{TrustStoreError, TrustedPublishers};
 pub use verify::{
     checksum_of, signing_digest, verify_artifact, UnsignedPolicy, Verified, VerifyError,
 };
+pub use wasm::{WasmError, WasmHost, WasmLimits, WasmOutcome};

@@ -63,8 +63,9 @@ pub use budget::{
     NodeCost,
 };
 pub use compile::{
-    compile, compile_with_registry, compile_yaml, compile_yaml_with_registry, CompileError,
-    CompiledNode, CompiledWorkflow, NodeAction, WorkflowError,
+    compile, compile_with_registry, compile_yaml, compile_yaml_with_registry,
+    is_executable_tool_node, CompileError, CompiledNode, CompiledWorkflow, NodeAction,
+    WorkflowError, EXECUTABLE_TOOL_NODES,
 };
 pub use conductor::{ConductorError, RecoveryReport, WorkflowConductor};
 pub use drive::{

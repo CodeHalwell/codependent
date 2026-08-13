@@ -60,7 +60,7 @@ use codypendent_protocol::{
 };
 use codypendent_runtime::agent::{
     cancellation, mode_overlay, ApprovalRequest, CancellationHandle, CancellationToken,
-    FrameworkAgentRuntime, FrameworkModelDriver, RunContext, RunJournal, TurnItem,
+    FrameworkAgentRuntime, FrameworkModelDriver, RunContext, RunJournal, RunOutcome, TurnItem,
 };
 use codypendent_runtime::models::{
     load_models, resolve_model, ModelPolicy, ModelRegistry, RetrievalSettings,
@@ -143,6 +143,14 @@ pub struct RuntimeExecutor {
     /// matches the folded revision re-scans; a run at the same revision reuses
     /// the graph exactly as before. `Arc<Mutex<…>>` so every clone shares one map.
     scanned: Arc<Mutex<HashMap<RepositoryId, GitRevision>>>,
+    /// The live code-graph watcher for each repository this daemon has folded
+    /// (outcome 14). Armed once, right after a repository's first successful
+    /// scan, and kept for the daemon's life: a watcher is one `notify` thread
+    /// plus one debouncing task, so a per-repository entry is cheap, while
+    /// re-arming per run would leak a thread per run. `Arc<Mutex<…>>` so every
+    /// clone of this executor shares ONE registry — otherwise the clone the
+    /// server holds and the clone `spawn_run` holds would each arm their own.
+    watchers: Arc<Mutex<HashMap<RepositoryId, scan::RepositoryWatcher>>>,
     /// Live per-run cancellation handles, keyed by `RunId`. `spawn_run` registers
     /// a run's handle before its loop starts and removes it once the loop is
     /// terminal; [`cancel_run`](RunExecutor::cancel_run) fires the matching handle
@@ -305,6 +313,7 @@ impl RuntimeExecutor {
             subscriptions,
             approvals,
             scanned: Arc::new(Mutex::new(scanned)),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             pending_cancellations: Arc::new(Mutex::new(HashSet::new())),
             pending_pauses: Arc::new(Mutex::new(HashSet::new())),
@@ -501,8 +510,20 @@ impl RuntimeExecutor {
     /// A checkout with no resolvable `HEAD` reports the same `"workdir"`
     /// placeholder every time, so it scans exactly once, as before.
     ///
-    /// The lock is released before the (async) scan — a `std` mutex is never held
-    /// across an await.
+    /// The `std` mutex over the revision map is never held across an await; the
+    /// mutual exclusion that matters is [`scan::lock_repository`], an async lock
+    /// held across the whole scan.
+    ///
+    /// **Two callers fire this for one `codypendent run`** — the server's
+    /// `CreateSession` hook (via [`Self::ensure_repository_scanned`]) and
+    /// `spawn_run`. Before the async lock, both read the revision map, both saw
+    /// "not folded", and both ran `clear_repository` + a full rebuild against the
+    /// same database: reproducibly `database is locked`, after which the losing
+    /// scan never recorded its revision (so the repository re-scanned on every
+    /// later run), and a run could read the repository map between the winner's
+    /// clear and its rebuild — a torn graph in the model's opening note
+    /// (2026-08-13 review, F6). The guard is re-checked *under* the lock, so the
+    /// second caller finds the fold already recorded and does no work.
     async fn ensure_scanned(&self, repository: RepositoryId, root: &Path) {
         let revision = scan::head_revision(root);
         let folded_current = {
@@ -512,12 +533,32 @@ impl RuntimeExecutor {
         if folded_current {
             return;
         }
+        let guard = scan::lock_repository(repository).await;
+        // Re-check: another caller may have folded this exact revision while
+        // this one waited for the lock. This is the check that makes the pair of
+        // triggers idempotent — the cheap pre-check above only avoids the wait.
+        let already_folded = {
+            let seen = self.scanned.lock().expect("scanned map lock");
+            seen.get(&repository) == Some(&revision)
+        };
+        if already_folded {
+            return;
+        }
         match scan::scan_repository(&self.pool, repository, root).await {
             Ok(()) => {
                 self.scanned
                     .lock()
                     .expect("scanned map lock")
                     .insert(repository, revision);
+                // Outcome 14: arm the live watcher the moment a repository has a
+                // valid graph, so an edit made DURING the session — the agent's
+                // own `edit_file` included — is folded incrementally and is
+                // visible to the next tool call, with no commit and no restart.
+                self.ensure_watching(repository, root);
+                // Released before the docs sweep below: that sweep reads the
+                // graph but never writes it, and holding the graph's writer lock
+                // across it would stall the watcher for the sweep's duration.
+                drop(guard);
                 // The graph just changed, which is exactly when documentation
                 // can have gone stale — so run the `/update-docs` sweep against
                 // it (STEP 4.6, previously tested but never wired). It only
@@ -542,6 +583,30 @@ impl RuntimeExecutor {
             Err(error) => {
                 warn!(%repository, %error, "code-graph scan failed; a later run will retry");
             }
+        }
+    }
+
+    /// Arm this repository's live code-graph watcher, once (outcome 14).
+    ///
+    /// Idempotent by construction: the registry entry IS the "already watching"
+    /// flag, so the second run against a repository re-uses the first run's
+    /// watcher. A watcher that cannot be armed (an unsupported platform, an
+    /// inotify limit) is logged and skipped — the daemon keeps working exactly
+    /// as it did before, with a graph that only moves on `HEAD`.
+    fn ensure_watching(&self, repository: RepositoryId, root: &Path) {
+        let mut watchers = self.watchers.lock().expect("code-graph watcher registry");
+        if watchers.contains_key(&repository) {
+            return;
+        }
+        match scan::arm_watcher(self.pool.clone(), repository, root) {
+            Ok(watcher) => {
+                watchers.insert(repository, watcher);
+            }
+            Err(error) => warn!(
+                %repository,
+                %error,
+                "could not arm the code-graph watcher; the graph will refresh only on a revision change"
+            ),
         }
     }
 
@@ -795,6 +860,7 @@ impl RuntimeExecutor {
         // `emit_context` just used.
         runtime = runtime
             .with_mcp_top_k(self.retrieval.mcp_top_k)
+            .with_builtin_top_k(self.retrieval.builtin_top_k)
             .with_registry_search(Arc::new(PoolRegistrySearch::new(
                 self.pool.clone(),
                 self.embedder.clone(),
@@ -898,11 +964,39 @@ impl RuntimeExecutor {
         // Drive the loop, then release the worktree — the guard releases it even if
         // the loop unwinds (the manager preserves any unmerged work as a patch
         // before teardown; a read-only run bound no worktree, so release is a no-op).
-        let result = runtime
-            .execute_run(&driver, ctx, token)
+        let outcome = runtime.execute_run(&driver, ctx, token).await;
+        // Outcome 20: persist the run's MEASURED usage where a `SELECT` can find
+        // it (migration 0032's `runs.prompt_tokens` / `completion_tokens` /
+        // `cost_micros`). This used to be `.execute_run(...).await.map(|_| ())`
+        // — the ONLY consumer of `RunOutcome.usage` anywhere was the workflow
+        // NODE path (`workflow_exec.rs`'s `node_cost_micros`), so an ordinary
+        // `codypendent run` measured its tokens honestly (the chronicle proves
+        // it) and then threw the number away right here. Best-effort and after
+        // the run's own terminal state is already journaled: a ledger write
+        // failure must never turn an otherwise-successful run into one the user
+        // sees fail.
+        if let Ok(RunOutcome { usage, .. }) = &outcome {
+            let (prompt_tokens, completion_tokens, cost_micros) = match usage {
+                Some(usage) => (
+                    Some(usage.prompt_tokens),
+                    Some(usage.completion_tokens),
+                    usage.cost_micros,
+                ),
+                None => (None, None, None),
+            };
+            if let Err(error) = ledger::record_run_usage(
+                &self.pool,
+                launch.run_id,
+                prompt_tokens,
+                completion_tokens,
+                cost_micros,
+            )
             .await
-            .map(|_| ())
-            .map_err(|e| format!("run failed: {e}"));
+            {
+                warn!(run_id = %launch.run_id, %error, "could not record the run's measured usage");
+            }
+        }
+        let result = outcome.map(|_| ()).map_err(|e| format!("run failed: {e}"));
         guard.release().await;
         result
     }
@@ -1801,12 +1895,33 @@ impl RuntimeExecutor {
         let store = MemoryStore::new();
         for candidate in candidates {
             match store.curate(&self.pool, candidate).await {
-                Ok(Curation::Accepted(record)) | Ok(Curation::Superseded { record, .. }) => {
+                Ok(Curation::Accepted(record)) => {
                     if let Err(error) = self
                         .emit_note(
                             session_id,
                             run_id,
                             format!("remembered: {}", record.statement),
+                        )
+                        .await
+                    {
+                        warn!(%session_id, %run_id, %error, "could not emit curated-memory note");
+                    }
+                }
+                // A detected contradiction resolves by supersession — never a
+                // silent overwrite — but the note used to say exactly the same
+                // generic "remembered:" an ordinary accepted fact gets, so the
+                // user was never told a contradiction was found at all
+                // (2026-08-13 review F5: "explicit contradiction resolution").
+                // Say so directly, distinct from a plain new memory.
+                Ok(Curation::Superseded { record, .. }) => {
+                    if let Err(error) = self
+                        .emit_note(
+                            session_id,
+                            run_id,
+                            format!(
+                                "remembered (replacing an earlier, contradicting note): {}",
+                                record.statement
+                            ),
                         )
                         .await
                     {

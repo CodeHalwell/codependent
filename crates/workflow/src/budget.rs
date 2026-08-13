@@ -57,6 +57,17 @@ pub struct NodeCost {
     /// usage. Accumulated across a run's model requests only when measured, so an
     /// unmeasured node never contributes a real `0` toward a cost ceiling.
     pub cost_micros: Option<u64>,
+    /// Measured tokens the node's model requests consumed, or `None` when the
+    /// node reported no usage.
+    ///
+    /// Recorded, never *charged*: there is no `maximum_tokens` on the manifest
+    /// budget or an agent slice, so this is a reporting dimension — the one
+    /// number a delegating user can always see, because it needs no price list
+    /// and no benchmarked model (unlike [`Self::cost_micros`], which is `None`
+    /// on a default install because routing — the only price source — is
+    /// default-off). Outcome 15 asks that every worker's cost land on the board;
+    /// with cost unmeasurable out of the box, tokens is what actually lands.
+    pub tokens: Option<u64>,
 }
 
 impl NodeCost {
@@ -78,6 +89,9 @@ impl NodeCost {
         if let Some(cost_micros) = self.cost_micros {
             object.insert("cost_micros".to_string(), json!(cost_micros));
         }
+        if let Some(tokens) = self.tokens {
+            object.insert("tokens".to_string(), json!(tokens));
+        }
         Value::Object(object)
     }
 
@@ -93,6 +107,7 @@ impl NodeCost {
             wall_time_secs: field("wall_time_secs"),
             tool_calls: field("tool_calls"),
             cost_micros: value.get("cost_micros").and_then(Value::as_u64),
+            tokens: value.get("tokens").and_then(Value::as_u64),
         }
     }
 
@@ -107,6 +122,7 @@ impl NodeCost {
             wall_time_secs: self.wall_time_secs.saturating_add(other.wall_time_secs),
             tool_calls: self.tool_calls.saturating_add(other.tool_calls),
             cost_micros: add_measured_cost(self.cost_micros, other.cost_micros),
+            tokens: add_measured_cost(self.tokens, other.tokens),
         }
     }
 }
@@ -432,6 +448,7 @@ mod tests {
             wall_time_secs: wall,
             tool_calls: tools,
             cost_micros: None,
+            tokens: None,
         }
     }
 
@@ -441,7 +458,36 @@ mod tests {
             wall_time_secs: 0,
             tool_calls: 0,
             cost_micros: Some(micros),
+            tokens: None,
         }
+    }
+
+    /// The tokens dimension is measured-only and additive, exactly like cost —
+    /// and it is the dimension that actually lands on a default install, where
+    /// `cost_micros` is always `None` (routing, the only price source, is off).
+    #[test]
+    fn tokens_are_measured_only_and_sum_across_nodes() {
+        let unmeasured = nc(1, 1);
+        assert_eq!(unmeasured.tokens, None);
+        assert_eq!(unmeasured.to_json().get("tokens"), None);
+
+        let a = NodeCost {
+            tokens: Some(300),
+            ..nc(1, 1)
+        };
+        let b = NodeCost {
+            tokens: Some(180),
+            ..nc(2, 4)
+        };
+        assert_eq!(a.saturating_add(&b).tokens, Some(480));
+        // An unmeasured sibling never dilutes a measured total to a fabricated 0.
+        assert_eq!(a.saturating_add(&unmeasured).tokens, Some(300));
+        assert_eq!(NodeCost::from_json(&a.to_json()), a);
+        // A record written before this dimension existed reads as "not measured".
+        assert_eq!(
+            NodeCost::from_json(&json!({"wall_time_secs": 4, "tool_calls": 2})).tokens,
+            None
+        );
     }
 
     #[test]
@@ -460,6 +506,7 @@ mod tests {
             wall_time_secs: 12,
             tool_calls: 3,
             cost_micros: Some(4_500),
+            tokens: None,
         };
         let json = measured.to_json();
         assert_eq!(json.as_object().unwrap().len(), 3);
@@ -468,6 +515,7 @@ mod tests {
             wall_time_secs: 0,
             tool_calls: 0,
             cost_micros: Some(0),
+            tokens: None,
         };
         assert_eq!(NodeCost::from_json(&zero_cost.to_json()), zero_cost);
 

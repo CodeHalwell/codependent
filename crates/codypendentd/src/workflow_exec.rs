@@ -60,7 +60,7 @@
 //! node ([`NodeState::Blocked`]) and pauses the run for a human decision — an
 //! overrun is never silent.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -85,15 +85,15 @@ use codypendent_integrations::mcp::McpBridge;
 use codypendent_integrations::search::SearchApi;
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    Actor, AgentMode, ApprovalDecision, ArtifactRef, EventBody, ProposedAction, Risk, RiskLevel,
-    RunDisposition, RunId, RunState, SessionId, ToolOutcome,
+    Actor, AgentMode, ApprovalDecision, ArtifactRef, EventBody, ModelId, ProposedAction, Risk,
+    RiskLevel, RunDisposition, RunId, RunState, SessionId, ToolOutcome,
 };
 use codypendent_runtime::agent::{
     cancellation, mode_overlay, CancellationHandle, CancellationToken, FrameworkAgentRuntime,
     FrameworkModelDriver, ModelDriver, ModelUsage, RunContext, RunOutcome, WorkflowContext,
 };
 use codypendent_runtime::blackboard::{BlackboardChannel, BlackboardPost};
-use codypendent_runtime::models::{resolve_model, ModelRegistry};
+use codypendent_runtime::models::{resolve_model, ModelPolicy, ModelRegistry};
 use codypendent_runtime::tools::{
     ApplyPatch, ApplyPatchInput, ArtifactSink, GitDiff, GitDiffInput, RepositoryTest,
     RepositoryTestOutcome,
@@ -121,6 +121,8 @@ use crate::workflows::{DriveLockRegistry, WorkflowConductorHost};
 /// `codypendent_runtime::tools::UpdatePullRequestTool::NAME`). Named here so the
 /// tool-node executor's per-tool binding matrix reads against a constant.
 const GITHUB_UPDATE_PR: &str = "github.update_pull_request";
+/// The merge-back step: consolidate every worker's `proposed_patch` into one.
+const PATCH_CONSOLIDATE: &str = "patch.consolidate";
 
 /// The model policy recorded on an agent-node run row when no profile (and no
 /// step `model_policy`) resolves one — the same default the daemon's `StartRun`
@@ -232,6 +234,81 @@ fn node_cost_micros(price_per_1k_usd: Option<f64>, usage: Option<ModelUsage>) ->
     Some(price_to_micros(price, total_tokens))
 }
 
+/// The `[policy]` table of `models.toml`: named, ordered model-id lists a
+/// workflow step selects by name with `agent.model_policy`.
+///
+/// ```toml
+/// [policy]
+/// economical-coding = ["local-qwen"]
+/// coding = ["gpt-5-codex", "local-qwen"]
+/// ```
+///
+/// Parsed with its own narrow struct and **only ever read**: `models.toml` has
+/// exactly one writer (`crates/cli/src/models_file.rs`) and this must never
+/// become a second. An absent file, an absent table, or a parse failure all
+/// yield no named policies — the node then falls back to the daemon-wide order,
+/// never to an error (a step's policy name must not be able to break a run that
+/// worked before).
+#[derive(Debug, Default, serde::Deserialize)]
+struct NamedPolicyTable {
+    #[serde(default)]
+    policy: BTreeMap<String, Vec<String>>,
+}
+
+fn load_named_policies(paths: &RuntimePaths) -> BTreeMap<String, Vec<String>> {
+    std::fs::read_to_string(paths.data_dir.join("models.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<NamedPolicyTable>(&text).ok())
+        .map(|table| table.policy)
+        .unwrap_or_default()
+}
+
+/// The [`ModelPolicy`] a step's `model_policy` name selects, or `None` to keep
+/// the daemon-wide candidate order.
+///
+/// In order: the daemon default name resolves to `None` (unchanged behaviour); a
+/// `[policy]` entry becomes that ordered candidate list; a name that IS a
+/// configured model profile pins exactly that model (so a manifest can say
+/// "this worker runs on the cheap local model" with no extra config); anything
+/// else is `None`.
+///
+/// Every branch resolves against names already in `models.toml`, so a manifest
+/// — which is data, and on the `workflow.create` path is authored by an agent —
+/// can only ever select among endpoints the user configured. It can never name
+/// a URL, a key, or a model the user did not add.
+fn node_model_policy(
+    registry: &ModelRegistry,
+    named: &BTreeMap<String, Vec<String>>,
+    requested: &str,
+) -> Option<ModelPolicy> {
+    if requested == DEFAULT_MODEL_POLICY {
+        return None;
+    }
+    if let Some(ids) = named.get(requested) {
+        let candidates: Vec<ModelId> = ids
+            .iter()
+            .map(|id| ModelId(id.clone()))
+            .filter(|id| registry.get(id).is_some())
+            .collect();
+        if !candidates.is_empty() {
+            return Some(ModelPolicy::new().with_default_candidates(candidates));
+        }
+    }
+    let pinned = ModelId(requested.to_owned());
+    registry
+        .get(&pinned)
+        .map(|_| ModelPolicy::new().with_default_candidates(vec![pinned]))
+}
+
+/// The node's MEASURED total tokens, or `None` when the run reported no usage.
+///
+/// Unlike [`node_cost_micros`] this needs no price list and no benchmarked
+/// model, so it is the one spend dimension that lands on a default install.
+/// Prompt + completion, saturating.
+fn node_tokens(usage: Option<ModelUsage>) -> Option<u64> {
+    usage.map(|u| u.prompt_tokens.saturating_add(u.completion_tokens))
+}
+
 /// `price_per_1k_usd × total_tokens`, in micro-USD (the unit measured cost is
 /// charged in — mirrors the workflow budget's `usd_to_micros`). A non-finite or
 /// negative price (a nonsensical profile) prices `0`; the float→int cast
@@ -303,13 +380,28 @@ impl NodeModelDriverFactory for ConfiguredModelDriverFactory {
         session_id: SessionId,
         run_id: RunId,
     ) -> Result<NodeDriver, String> {
-        // The node's resolved policy name (T8) is recorded on the run row by
-        // the caller (`create_agent_run`) for provenance only: there is no
-        // per-node-policy registry yet, so model SELECTION below routes under
-        // the ONE daemon-configured routing policy (a documented follow-up —
-        // see the module docs and `RoutingCoordinator`'s).
-        let _requested_policy = model_policy;
         let (registry, policy) = load_model_registry(&self.paths)?;
+        // The node's own `model_policy` (T8), honoured rather than discarded.
+        // Before this, every agent node of a workflow resolved the SAME model:
+        // the daemon-wide candidate list, in `models.toml` file order. The
+        // shipped `repair-github-check` manifest assigns three distinct policies
+        // (`economical-coding` to the investigator, `coding` to the implementer,
+        // …) and all three landed on one model, so the whole point of
+        // delegation — cheap workers, an expensive synthesizer — was
+        // inexpressible.
+        //
+        // Resolution is against `models.toml` ONLY, so a manifest can never
+        // reach an endpoint the user has not configured: a `[policy]` entry, else
+        // a model profile of that exact name, else the daemon-wide order with a
+        // warning. See [`node_model_policy`].
+        let node_policy =
+            node_model_policy(&registry, &load_named_policies(&self.paths), model_policy);
+        if node_policy.is_none() && model_policy != DEFAULT_MODEL_POLICY {
+            warn!(
+                policy = %model_policy,
+                "the step's model_policy names neither a `[policy]` entry nor a model profile in models.toml;                  this node resolves under the daemon-wide candidate order"
+            );
+        }
         // Phase-7 routing seam (STEP 7.2/7.3), DEFAULT OFF — mirrors
         // `RuntimeExecutor::execute`'s use of the seam EXACTLY: routing OFF
         // returns `Ok(None)` and the model resolves the Phase-1 way (every
@@ -350,8 +442,12 @@ impl NodeModelDriverFactory for ConfiguredModelDriverFactory {
                 }
                 (selection.model().clone(), selection.price_per_1k_usd)
             }
+            // Routing OFF (or Phase-1 resolve): the node's own policy selects.
+            // Routing ON deliberately wins over it — the classification
+            // hard-filter is a fail-closed safety property, and a manifest must
+            // not be able to route around it by naming a model.
             None => (
-                resolve_model(&registry, &policy, mode)
+                resolve_model(&registry, node_policy.as_ref().unwrap_or(&policy), mode)
                     .await
                     .map_err(|e| format!("no model configured: {e}"))?
                     .id,
@@ -951,6 +1047,13 @@ impl AgentLoopNodeExecutor {
                     wall_time_secs,
                     tool_calls: self.count_tool_calls(session_id).await,
                     cost_micros: node_cost_micros(price_per_1k_usd, usage),
+                    // The tokens the run MEASURED, lifted onto the node ledger.
+                    // They were already in hand here and were thrown away, which
+                    // left the ledger a board reads with no spend dimension at
+                    // all on a default install: `cost_micros` needs a price, and
+                    // the only price source (routing) is default-off. Tokens
+                    // need nothing but the provider's own usage report.
+                    tokens: node_tokens(usage),
                 };
 
                 // Charge the measured cost against the nested budgets. Exceeding
@@ -1411,6 +1514,11 @@ impl AgentLoopNodeExecutor {
                 self.run_github_update_pr_node(ctx, session_id, run_id, &args)
                     .await
             }
+            PATCH_CONSOLIDATE => self.run_patch_consolidate_node(ctx, run_id).await,
+            // Unreachable through any compile path: `compile` rejects a tool with
+            // no executor, and the two lists are kept in step by
+            // `every_executable_tool_node_has_a_dispatch_arm`. Kept as a
+            // belt-and-braces failure rather than a panic.
             other => Err(format!(
                 "workflow.tool-not-executable: tool `{other}` has no workflow tool-node executor"
             )),
@@ -1418,11 +1526,14 @@ impl AgentLoopNodeExecutor {
         let wall_time_secs = started.elapsed().as_secs();
 
         match result {
-            Ok(ToolNodeResult::Completed { test }) => {
+            Ok(ToolNodeResult::Completed { test, patch }) => {
                 // Map the tool result onto the node's declared blackboard outputs
                 // (e.g. `verify` → `test_result`), through the same store path an
                 // agent node's outputs take.
-                if let Err(missing) = self.post_tool_outputs(ctx, run_id, test.as_ref()).await {
+                if let Err(missing) = self
+                    .post_tool_outputs(ctx, run_id, test.as_ref(), patch.as_ref())
+                    .await
+                {
                     let reason = format!("tool node `{}` {missing}", ctx.node.id);
                     self.fail_run(run_id, session_id, &objective, &reason).await;
                     return NodeOutcome::failed(reason);
@@ -1435,6 +1546,7 @@ impl AgentLoopNodeExecutor {
                     wall_time_secs,
                     tool_calls: self.count_tool_calls(session_id).await,
                     cost_micros: None,
+                    tokens: None,
                 };
                 let warnings = match self.charge_node_budget(&limits, &others, &measured) {
                     Ok(warnings) => warnings,
@@ -1506,7 +1618,7 @@ impl AgentLoopNodeExecutor {
                 .map_err(|detail| format!("workflow.tool-binding-missing: {detail}"));
         }
         match resolved {
-            RepositoryTest::NAME => Ok(json!({})),
+            RepositoryTest::NAME | PATCH_CONSOLIDATE => Ok(json!({})),
             GITHUB_UPDATE_PR => {
                 let number = pr_number(inputs).ok_or_else(|| {
                     "workflow.tool-binding-missing: `github.update_pull_request` needs a \
@@ -1685,6 +1797,7 @@ impl AgentLoopNodeExecutor {
                 if outcome.success {
                     Ok(ToolNodeResult::Completed {
                         test: Some(outcome),
+                        patch: None,
                     })
                 } else {
                     // A failing test is a retryable node failure (T6 retry: the
@@ -1709,6 +1822,154 @@ impl AgentLoopNodeExecutor {
                 Err(reason)
             }
         }
+    }
+
+    /// Run a `patch.consolidate` tool node: the merge-back step.
+    ///
+    /// A fan-out of N workers leaves N `proposed_patch` items on the run's board
+    /// and, before this, nothing that combined them:
+    /// [`resolve_proposed_patch`](Self::resolve_proposed_patch) takes the
+    /// MOST-RECENT one, so three implementers running concurrently had exactly
+    /// one of their patches verified and the other two silently dropped. This
+    /// node applies **every** live worker patch, in a deterministic order, into
+    /// its own throwaway worktree, and posts the combined diff as one
+    /// `proposed_patch` — which, being the newest, is what the downstream
+    /// verifier and publisher then use.
+    ///
+    /// **Order is by author node id, not by arrival.** Arrival order is a
+    /// scheduling accident once the frontier runs concurrently; the node id is a
+    /// property of the manifest, so the same graph consolidates the same way
+    /// every time.
+    ///
+    /// **Conflicts fail; they are never resolved.** The first patch that does
+    /// not apply on top of its predecessors fails the node, naming the worker
+    /// whose patch conflicted. Auto-resolving two agents' overlapping edits
+    /// would be inventing a change neither of them proposed.
+    ///
+    /// **Nothing lands.** This writes only inside a fresh isolated worktree that
+    /// is released immediately afterwards, and never checks out, merges, rebases,
+    /// or pushes anything in the user's repository. The consolidated diff leaves
+    /// as a content-addressed artifact on the board, exactly like a worker's own.
+    async fn run_patch_consolidate_node(
+        &self,
+        ctx: &NodeContext<'_>,
+        run_id: RunId,
+    ) -> Result<ToolNodeResult, String> {
+        let patches = self.resolve_worker_patches(ctx.workflow_run_id).await?;
+        if patches.is_empty() {
+            return Err(
+                "workflow.nothing-to-consolidate: no live `proposed_patch` on the run's board —                  a `patch.consolidate` step must depend on at least one node that produces one"
+                    .to_string(),
+            );
+        }
+
+        let repository = self.node_repository(ctx.workflow_run_id).await;
+        let manager = WorktreeManager::new();
+        let binding = bind_run_worktree(&self.pool, &manager, run_id, true, &repository)
+            .await
+            .map_err(|reason| format!("could not bind a worktree: {reason}"))?;
+        let worktree = binding.worktree.clone();
+        let guard = WorktreeReleaseGuard::arm(
+            self.pool.clone(),
+            artifact_store(&self.paths),
+            manager,
+            binding,
+        );
+
+        let policy = PolicyEngine::with_defaults();
+        let eval_ctx =
+            EvalContext::new(&worktree, &worktree).with_mode(mode_overlay(AgentMode::Build));
+        let write_scope = policy.file_write_scope(&eval_ctx);
+        let command_scope = policy.command_scope();
+
+        let mut applied = Vec::new();
+        for (author, diff) in &patches {
+            let input = ApplyPatchInput {
+                cwd: worktree.clone(),
+                patch: String::from_utf8_lossy(diff).into_owned(),
+            };
+            if let Err(error) = ApplyPatch::execute(&input, &write_scope, &command_scope).await {
+                guard.release().await;
+                return Err(format!(
+                    "workflow.patch-conflict: `{author}`'s proposed patch does not apply on top of                      [{}]: {error}. Resolve it by narrowing the workers' file ownership or by                      ordering the steps; consolidation never merges conflicting edits itself.",
+                    applied.join(", ")
+                ));
+            }
+            applied.push(author.clone());
+        }
+
+        let consolidated = self.capture_proposed_patch(&worktree, run_id).await;
+        guard.release().await;
+
+        let Some(consolidated) = consolidated else {
+            return Err(format!(
+                "workflow.nothing-to-consolidate: applying {} worker patch(es) produced an empty                  diff",
+                patches.len()
+            ));
+        };
+        info!(
+            node = %ctx.node.id,
+            workers = patches.len(),
+            bytes = consolidated.byte_length,
+            "consolidated worker patches"
+        );
+        Ok(ToolNodeResult::Completed {
+            test: None,
+            patch: Some(consolidated),
+        })
+    }
+
+    /// Every live `proposed_patch` on the run's board as `(author, diff bytes)`,
+    /// ordered by author node id. An item whose diff artifact cannot be read is an
+    /// `Err` — a promised-but-absent worker patch must fail the consolidation, not
+    /// be silently dropped from it.
+    async fn resolve_worker_patches(
+        &self,
+        workflow_run_id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let items = BlackboardStore::new()
+            .query(
+                &self.pool,
+                workflow_run_id,
+                Some(BlackboardKind::ProposedPatch),
+                false,
+            )
+            .await
+            .map_err(|e| format!("could not read the board for proposed_patch items: {e}"))?;
+
+        let store = artifact_store(&self.paths);
+        let mut patches = Vec::with_capacity(items.len());
+        for item in items {
+            let author = item
+                .author
+                .get("node_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            let artifact: ArtifactRef = item
+                .payload
+                .get("artifact")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .ok_or_else(|| {
+                    format!(
+                        "workflow.patch-apply-failed: `{author}`'s proposed_patch carries no \
+                         resolvable diff artifact"
+                    )
+                })?;
+            let mut file = store.open(&self.pool, artifact.id).await.map_err(|e| {
+                format!("workflow.patch-apply-failed: could not open `{author}`'s patch: {e}")
+            })?;
+            let mut bytes = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes)
+                .await
+                .map_err(|e| {
+                    format!("workflow.patch-apply-failed: could not read `{author}`'s patch: {e}")
+                })?;
+            patches.push((author, bytes));
+        }
+        // Deterministic regardless of which worker finished first.
+        patches.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(patches)
     }
 
     /// Resolve the `proposed_patch` a `repository.test` node should apply (T6b): the
@@ -1863,7 +2124,10 @@ impl AgentLoopNodeExecutor {
                 )
                 .await;
                 info!(node = %ctx.node.id, pr = pr.number, "workflow tool node updated the pull request");
-                Ok(ToolNodeResult::Completed { test: None })
+                Ok(ToolNodeResult::Completed {
+                    test: None,
+                    patch: None,
+                })
             }
             Err(error) => {
                 let reason = format!("github.update_pull_request failed: {error}");
@@ -1998,6 +2262,7 @@ impl AgentLoopNodeExecutor {
         ctx: &NodeContext<'_>,
         run_id: RunId,
         test: Option<&RepositoryTestOutcome>,
+        patch: Option<&ArtifactRef>,
     ) -> Result<(), String> {
         let mut seen: Vec<&str> = Vec::new();
         for declared in &ctx.node.outputs {
@@ -2033,6 +2298,16 @@ impl AgentLoopNodeExecutor {
                         evidence,
                     )
                     .await?;
+                }
+                // The merge-back step's output: ONE consolidated diff standing
+                // for every worker's patch, so a downstream verifier stops
+                // silently testing whichever worker happened to finish last.
+                "proposed_patch" => {
+                    let patch = patch.ok_or_else(|| {
+                        "declared output `proposed_patch` but produced no consolidated diff"
+                            .to_string()
+                    })?;
+                    self.post_proposed_patch(ctx, run_id, "tool", patch).await?;
                 }
                 other => {
                     return Err(format!(
@@ -2437,9 +2712,13 @@ fn budget_consumption(
 
 /// The outcome of a tool node's execution, before it folds into a [`NodeOutcome`].
 enum ToolNodeResult {
-    /// The tool ran to completion; `test` carries a `repository.test` result when
-    /// the node was a `repository.test`, for declared-output posting.
-    Completed { test: Option<RepositoryTestOutcome> },
+    /// The tool ran to completion. `test` carries a `repository.test` result and
+    /// `patch` a `patch.consolidate` result, for declared-output posting; each is
+    /// `None` for the tool kinds that do not produce it.
+    Completed {
+        test: Option<RepositoryTestOutcome>,
+        patch: Option<ArtifactRef>,
+    },
     /// The node parked for approval and the approval was rejected.
     Rejected,
     /// The workflow was cancelled while the node was parked for approval (MF-1):
@@ -2490,6 +2769,80 @@ mod tests {
         compile_yaml, NodeState, WorkflowConductor, WorkflowRunState, REPAIR_GITHUB_CHECK_ID,
     };
     use serde_json::json;
+
+    /// The compiler rejects a tool step whose tool has no executor here, using a
+    /// closed list it owns. If the two ever drift, `workflow validate` goes back
+    /// to green-lighting a step that dies at runtime — the exact defect that list
+    /// was added to close. This is the guard against that drift.
+    #[test]
+    fn every_executable_tool_node_has_a_dispatch_arm() {
+        for tool in codypendent_workflow::EXECUTABLE_TOOL_NODES {
+            let resolved = normalize_tool_name(tool);
+            assert!(
+                matches!(
+                    resolved.as_str(),
+                    RepositoryTest::NAME | GITHUB_UPDATE_PR | PATCH_CONSOLIDATE
+                ),
+                "`{tool}` compiles as a graph node but `run_tool_node` has no arm for it"
+            );
+        }
+        // …and nothing dispatches that the compiler would reject.
+        for arm in [RepositoryTest::NAME, GITHUB_UPDATE_PR, PATCH_CONSOLIDATE] {
+            assert!(
+                codypendent_workflow::is_executable_tool_node(arm),
+                "`{arm}` dispatches but no manifest can name it"
+            );
+        }
+    }
+
+    /// A step's `model_policy` used to be assigned to `_requested_policy` and
+    /// dropped, so the shipped `repair-github-check` manifest's three distinct
+    /// policies all resolved to one model.
+    #[test]
+    fn a_step_model_policy_selects_a_configured_model() {
+        use codypendent_runtime::models::ModelConfig;
+        let config = |id: &str| ModelConfig {
+            id: ModelId(id.to_owned()),
+            provider: "openai-compatible".to_owned(),
+            base_url: "http://127.0.0.1:9/v1".to_owned(),
+            model: id.to_owned(),
+            api_key_env: String::new(),
+            provider_id: None,
+            context_tokens: None,
+        };
+        let registry = ModelRegistry::new(vec![config("expensive"), config("cheap")]);
+        let mut named = BTreeMap::new();
+        named.insert(
+            "economical-coding".to_owned(),
+            vec!["cheap".to_owned(), "expensive".to_owned()],
+        );
+
+        // A `[policy]` entry becomes that ordered candidate list.
+        let policy = node_model_policy(&registry, &named, "economical-coding")
+            .expect("a named policy resolves");
+        assert_eq!(
+            policy.candidates(AgentMode::Build),
+            &[ModelId("cheap".to_owned()), ModelId("expensive".to_owned())]
+        );
+
+        // A policy name that IS a model profile pins exactly that model, so a
+        // cheap-worker / expensive-synthesizer topology needs no extra config.
+        let pinned =
+            node_model_policy(&registry, &BTreeMap::new(), "cheap").expect("a profile name pins");
+        assert_eq!(
+            pinned.candidates(AgentMode::Build),
+            &[ModelId("cheap".to_owned())]
+        );
+
+        // The daemon default, and an unresolvable name, both keep the
+        // daemon-wide order — a policy name can never break a run that worked.
+        assert!(node_model_policy(&registry, &named, DEFAULT_MODEL_POLICY).is_none());
+        assert!(node_model_policy(&registry, &named, "no-such-policy").is_none());
+        // A named policy listing only unconfigured models does NOT silently pin
+        // nothing; it falls back rather than failing the node.
+        named.insert("ghosts".to_owned(), vec!["not-configured".to_owned()]);
+        assert!(node_model_policy(&registry, &named, "ghosts").is_none());
+    }
 
     /// A factory that hands back a scripted driver — no model, no network — so the
     /// agent-node path is exercised end to end in a test. `usage`, when set,
@@ -3309,18 +3662,14 @@ steps:
         drop(listener);
     }
 
-    #[tokio::test]
-    async fn a_tool_node_with_no_executor_binding_fails_legibly() {
-        // A tool node whose (normalized) tool has no workflow tool-node executor
-        // fails cleanly — `with:` lets its arguments bind, so the failure is the
-        // dispatch, not the binding.
-        let (tmp, pool, paths) = temp_env().await;
-        let factory = Arc::new(ScriptedDriverFactory {
-            steps: vec![],
-            usage: None,
-        });
-        let executor = executor_with(&pool, &paths, factory, tmp.path());
-
+    #[test]
+    fn a_tool_node_with_no_executor_is_refused_before_the_run_starts() {
+        // This used to compile cleanly — `workflow validate` printed a green tick
+        // — and only fail at execution with `workflow.tool-not-executable`, after
+        // the run had been created and its earlier steps had spent real money.
+        // Now the manifest cannot compile at all, so EVERY path that reaches a
+        // `compile*` function (validate, StartWorkflow, the conductor's
+        // recompile, the agent-facing `workflow.create`) refuses it up front.
         let manifest = "\
 schema_version: 1
 id: t
@@ -3331,43 +3680,12 @@ steps:
     with:
       x: 1
 ";
-        let compiled = compile_yaml(manifest).unwrap();
-        let run_id = WorkflowStore::new()
-            .create_run(&pool, &compiled, None, &json!({}), Some(manifest))
-            .await
-            .unwrap();
-
-        // Drive to a terminal state (the node fails, so the run fails).
-        let state = WorkflowConductor::new()
-            .drive(&pool, &run_id, &executor, &())
-            .await
-            .unwrap();
-        assert_eq!(state, WorkflowRunState::Failed);
-        let snapshot = WorkflowStore::new()
-            .snapshot(&pool, &run_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(snapshot.nodes[0].state, NodeState::Failed);
-
-        // The returned outcome names the failure legibly.
-        let node = compiled.node("run").unwrap();
-        let outcome = executor
-            .execute(NodeContext {
-                workflow_run_id: &run_id,
-                node,
-                attempt: 1,
-            })
-            .await;
-        match outcome {
-            NodeOutcome::Failed { error } => {
-                assert!(
-                    error.contains("tool-not-executable"),
-                    "legible reason: {error}"
-                );
-            }
-            other => panic!("expected a failure, got {other:?}"),
-        }
+        let error = compile_yaml(manifest).expect_err("an unrunnable tool step must not compile");
+        let message = error.to_string();
+        assert!(message.contains("tool-not-executable"), "{message}");
+        assert!(message.contains("some.unknown-tool"), "{message}");
+        // The message names what a step CAN use.
+        assert!(message.contains(RepositoryTest::NAME), "{message}");
     }
 
     #[tokio::test]
@@ -5395,6 +5713,236 @@ steps:
             distinct.len(),
             2,
             "verify's worktree is not patch's worktree"
+        );
+    }
+
+    /// The repository's branch list — the "worker branches leak forever" evidence
+    /// the review collected with `git branch` before and after a run.
+    fn branch_list(repo: &Path) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["branch", "--format=%(refname:short)"])
+            .output()
+            .expect("spawn git");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    /// Two workers, each adding its own new file, consolidated into ONE patch by a
+    /// `patch.consolidate` node. `model_policy` is the only per-node signal the
+    /// factory receives, so the manifest gives each worker a distinct one.
+    struct FanOutDriverFactory;
+
+    #[async_trait]
+    impl NodeModelDriverFactory for FanOutDriverFactory {
+        async fn build(
+            &self,
+            _mode: AgentMode,
+            model_policy: &str,
+            _objective: &str,
+            _session_id: SessionId,
+            _run_id: RunId,
+        ) -> Result<NodeDriver, String> {
+            let file = if model_policy == "worker-a" {
+                "a.txt"
+            } else {
+                "b.txt"
+            };
+            Ok(NodeDriver {
+                driver: Box::new(ScriptedDriver::new(vec![
+                    apply_patch_step(&new_file_patch(file, FIX_SENTINEL)),
+                    ModelStep::Finish {
+                        summary: format!("wrote {file}"),
+                    },
+                ])),
+                price_per_1k_usd: None,
+            })
+        }
+    }
+
+    const FAN_OUT_MANIFEST: &str = "\
+schema_version: 1
+id: fanout-consolidate
+version: 1
+orchestration_reason: parallelism
+budget:
+  maximum_agents: 2
+steps:
+  - id: w1
+    agent:
+      role: implementer
+      model_policy: worker-a
+    workspace:
+      mode: isolated-worktree
+    outputs: [proposed_patch]
+  - id: w2
+    agent:
+      role: implementer
+      model_policy: worker-b
+    workspace:
+      mode: isolated-worktree
+    outputs: [proposed_patch]
+  - id: land
+    depends_on: [w1, w2]
+    tool: patch.consolidate
+    outputs: [proposed_patch]
+";
+
+    /// The merge-back regression. Before this, a fan-out of N workers left N
+    /// `proposed_patch` items and nothing that combined them: the downstream
+    /// resolver takes the MOST RECENT one, so two of three implementers' work was
+    /// silently dropped. `patch.consolidate` applies every worker's patch into its
+    /// own throwaway worktree and posts the combined diff.
+    ///
+    /// Doubles as the worktree-lifecycle proof: `git branch` before and after a
+    /// three-worktree run, which used to grow by one `codypendent/run-*` ref per
+    /// node and never shrink.
+    #[tokio::test]
+    async fn patch_consolidate_combines_every_workers_patch_into_one() {
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        let branches_before = branch_list(&repo);
+        let broker = ApprovalBroker::new();
+        let executor = tool_executor(
+            &pool,
+            &paths,
+            &repo,
+            None,
+            ScriptedRepositoryTestRunner::new(vec![]),
+            broker.clone(),
+            Arc::new(FanOutDriverFactory),
+        );
+
+        let compiled = compile_yaml(FAN_OUT_MANIFEST).unwrap();
+        assert_eq!(
+            compiled.max_concurrency(),
+            2,
+            "the workers run concurrently"
+        );
+        let run_id = WorkflowStore::new()
+            .create_run_idempotent(
+                &pool,
+                &compiled,
+                "cmd-fanout",
+                &json!({}),
+                Some(FAN_OUT_MANIFEST),
+                Some(repo.to_string_lossy().as_ref()),
+            )
+            .await
+            .unwrap();
+
+        let approver = spawn_auto_approver(pool.clone(), broker.clone());
+        let state = WorkflowConductor::new()
+            .drive(&pool, &run_id, &executor, &())
+            .await
+            .unwrap();
+        approver.abort();
+        assert_eq!(state, WorkflowRunState::Completed);
+
+        // The newest live proposed_patch is the consolidated one, and it carries
+        // BOTH workers' files — the whole point.
+        let items = BlackboardStore::new()
+            .query(&pool, &run_id, Some(BlackboardKind::ProposedPatch), false)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 3, "two worker patches plus the consolidation");
+        assert_eq!(
+            items[0].author.get("node_id").and_then(Value::as_str),
+            Some("land")
+        );
+        let artifact: ArtifactRef =
+            serde_json::from_value(items[0].payload.get("artifact").unwrap().clone()).unwrap();
+        let mut file = artifact_store(&paths)
+            .open(&pool, artifact.id)
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes)
+            .await
+            .unwrap();
+        let diff = String::from_utf8_lossy(&bytes);
+        assert!(diff.contains("a.txt"), "w1's file is in the merge: {diff}");
+        assert!(diff.contains("b.txt"), "w2's file is in the merge: {diff}");
+
+        // Nothing landed in the user's repository.
+        assert!(!repo.join("a.txt").exists() && !repo.join("b.txt").exists());
+
+        // Three isolated worktrees (two workers + the consolidator), all released…
+        let rows = leases(&pool).await;
+        assert_eq!(rows.len(), 3, "one worktree each: {rows:?}");
+        assert!(rows.iter().all(|(_, _, state)| state == "released"));
+        // …and every worker branch reclaimed, so the ref list is where it started.
+        assert_eq!(
+            branch_list(&repo),
+            branches_before,
+            "no codypendent/run-* branch may survive the run"
+        );
+    }
+
+    /// Conflicting workers fail the consolidation, naming the worker whose patch
+    /// did not apply. Auto-resolving two agents' overlapping edits would be
+    /// inventing a change neither of them proposed.
+    #[tokio::test]
+    async fn patch_consolidate_fails_legibly_on_a_conflict() {
+        let (tmp, pool, paths) = temp_env().await;
+        let repo = init_git_repo(tmp.path(), "repo");
+        let broker = ApprovalBroker::new();
+        // Both workers add the SAME new file, so the second patch cannot apply.
+        let executor = tool_executor(
+            &pool,
+            &paths,
+            &repo,
+            None,
+            ScriptedRepositoryTestRunner::new(vec![]),
+            broker.clone(),
+            factory(vec![
+                apply_patch_step(&new_file_patch("same.txt", FIX_SENTINEL)),
+                ModelStep::Finish {
+                    summary: "wrote same.txt".to_string(),
+                },
+            ]),
+        );
+
+        let compiled = compile_yaml(FAN_OUT_MANIFEST).unwrap();
+        let run_id = WorkflowStore::new()
+            .create_run_idempotent(
+                &pool,
+                &compiled,
+                "cmd-conflict",
+                &json!({}),
+                Some(FAN_OUT_MANIFEST),
+                Some(repo.to_string_lossy().as_ref()),
+            )
+            .await
+            .unwrap();
+
+        let approver = spawn_auto_approver(pool.clone(), broker.clone());
+        let state = WorkflowConductor::new()
+            .drive(&pool, &run_id, &executor, &())
+            .await
+            .unwrap();
+        approver.abort();
+        assert_eq!(state, WorkflowRunState::Failed);
+
+        let snapshot = WorkflowStore::new()
+            .snapshot(&pool, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let land = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "land")
+            .unwrap();
+        assert_eq!(land.state, NodeState::Failed);
+        let error = land.error.clone().unwrap_or_default();
+        assert!(error.contains("workflow.patch-conflict"), "{error}");
+        assert!(
+            error.contains("w1") || error.contains("w2"),
+            "the reason names the conflicting worker: {error}"
         );
     }
 

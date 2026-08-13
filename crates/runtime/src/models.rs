@@ -68,9 +68,15 @@ pub struct ModelConfig {
     /// The [`ModelId`] this profile is selected by (from a [`ModelPolicy`]
     /// candidate list, or directly).
     pub id: ModelId,
-    /// The runtime adapter: `"openai-compatible"` for chat-completions models,
-    /// or `"acp"` for an external agent from the official ACP registry. ACP
-    /// agents own their model and tool loop; [`Self::model`] is their registry id.
+    /// The runtime adapter family: `"openai-compatible"` for REST chat
+    /// models, or `"acp"` for an external agent from the official ACP
+    /// registry. ACP agents own their model and tool loop; [`Self::model`] is
+    /// their registry id. `"openai-compatible"` is broader than its name: the
+    /// ACTUAL wire protocol (OpenAI chat-completions, Anthropic Messages, ...)
+    /// is resolved from [`Self::provider_id`] against the provider catalog at
+    /// call time (see `config_to_protocol_auth`), not from this field — an
+    /// entry with `provider_id = Some("anthropic")` speaks the Anthropic wire
+    /// even though `provider` still reads `"openai-compatible"`.
     pub provider: String,
     /// The OpenAI-compatible base URL. Empty for ACP profiles.
     #[serde(default)]
@@ -110,11 +116,53 @@ struct ModelsFile {
     model: Vec<ModelConfig>,
 }
 
+/// A `context_tokens` above this cannot come from any real model this catalog
+/// knows about — the largest curated ceiling as of this build is OpenAI's
+/// 1,050,000-token tier (`crates/providers/builtin_catalog.toml`); doubling
+/// that and rounding up leaves headroom for near-future genuine growth
+/// without needing a code change on every model release, while still
+/// rejecting anything a hostile or misconfigured gateway would plausibly send
+/// (a `u64::MAX`, or any other implausible `"context_length"` in a provider's
+/// own `/models` response).
+pub const MAX_PLAUSIBLE_CONTEXT_TOKENS: u64 = 2_000_000;
+
+/// Clamp an untrusted `context_tokens` reading to [`MAX_PLAUSIBLE_CONTEXT_TOKENS`].
+/// `None` (unknown) passes through unchanged — this only caps an implausible
+/// number, it never fabricates one.
+///
+/// This is the load-bearing half of closing the trust-boundary gap the
+/// 2026-08-13 review found (F4, `acp-models.md`): `crates/cli/src/tui.rs`'s
+/// `merge_catalog_rows` lets a provider's own `/models` response win over the
+/// curated catalog's `context_tokens` on the (reasonable, for every OTHER
+/// field) theory that "the provider knows its own model best" — but that
+/// value is then persisted into `models.toml` verbatim and, from there, is
+/// load-bearing rather than display-only: `FrameworkModelDriver::from_registry`
+/// (`crates/runtime/src/agent.rs`) reads it and forwards it as Ollama's
+/// `{"options":{"num_ctx": n}}` request hint, and it is the denominator of the
+/// TUI footer's context-usage percentage. Clamping here, at the one place
+/// every `models.toml` entry is parsed regardless of which writer produced it
+/// (the TUI's add-model flow, `codypendent models add`, or a hand-edit), means
+/// every downstream consumer is safe even though none of them re-validates —
+/// a defense-in-depth floor under the TUI-side and `agent.rs`-side fixes
+/// proposed alongside this change (`.impl/proposals/agent-tui-from-agent-models.md`,
+/// `.impl/proposals/agent-retrieval-from-agent-models.md`), not a replacement
+/// for them: this is a blunt absolute ceiling, not the tighter
+/// per-model catalog ceiling [`ModelRegistry::context_tokens_for`] applies
+/// when a catalog is attached.
+#[must_use]
+pub fn clamp_context_tokens(context_tokens: Option<u64>) -> Option<u64> {
+    context_tokens.map(|tokens| tokens.min(MAX_PLAUSIBLE_CONTEXT_TOKENS))
+}
+
 /// Parse `models.toml` at `path` into its [`ModelConfig`] entries.
 ///
 /// Exposed standalone (in addition to [`ModelRegistry::load`]) so tests — and
 /// callers that want to inspect or filter configs before building a registry
-/// — can drive parsing directly against a temp file.
+/// — can drive parsing directly against a temp file. Every entry's
+/// `context_tokens` is passed through [`clamp_context_tokens`] here, so this
+/// function — not only [`ModelRegistry`] — never hands a caller an implausible
+/// value; a test that parses a fixture file directly (bypassing the registry)
+/// is protected exactly like a live daemon load.
 pub fn load_models(path: &Path) -> Result<Vec<ModelConfig>> {
     let text = std::fs::read_to_string(path).map_err(|source| ModelsError::ReadConfig {
         path: path.to_path_buf(),
@@ -124,7 +172,11 @@ pub fn load_models(path: &Path) -> Result<Vec<ModelConfig>> {
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(file.model)
+    let mut models = file.model;
+    for model in &mut models {
+        model.context_tokens = clamp_context_tokens(model.context_tokens);
+    }
+    Ok(models)
 }
 
 // ---------------------------------------------------------------------------
@@ -174,27 +226,47 @@ fn default_embedding_provider() -> String {
 /// gate entirely (full injection).
 pub const DEFAULT_MCP_TOP_K: usize = 8;
 
+/// Default `[retrieval] builtin_top_k`: how many BUILT-IN tools the retrieval
+/// funnel selects for a run on top of the always-advertised floor
+/// (`codypendent_runtime::agent::ALWAYS_ADVERTISED_TOOLS`). `0` disables the gate
+/// entirely (advertise every offered built-in — full injection, the behavior
+/// before rubric 9 reached this family).
+///
+/// Eight matches [`DEFAULT_MCP_TOP_K`] and the `skills.search` card budget, and
+/// with the seven-tool floor it lands a default Build run well under the full
+/// catalog rather than at all of it.
+pub const DEFAULT_BUILTIN_TOP_K: usize = 8;
+
 /// The `[retrieval]` tuning table in `models.toml`.
 ///
 /// ```toml
 /// [retrieval]
-/// mcp_top_k = 8   # 0 disables retrieval gating (advertise every MCP tool)
+/// mcp_top_k = 8       # 0 disables retrieval gating (advertise every MCP tool)
+/// builtin_top_k = 8   # 0 disables it for the built-in tools
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrievalSettings {
     /// See [`DEFAULT_MCP_TOP_K`].
     #[serde(default = "default_mcp_top_k")]
     pub mcp_top_k: usize,
+    /// See [`DEFAULT_BUILTIN_TOP_K`].
+    #[serde(default = "default_builtin_top_k")]
+    pub builtin_top_k: usize,
 }
 
 fn default_mcp_top_k() -> usize {
     DEFAULT_MCP_TOP_K
 }
 
+fn default_builtin_top_k() -> usize {
+    DEFAULT_BUILTIN_TOP_K
+}
+
 impl Default for RetrievalSettings {
     fn default() -> Self {
         Self {
             mcp_top_k: DEFAULT_MCP_TOP_K,
+            builtin_top_k: DEFAULT_BUILTIN_TOP_K,
         }
     }
 }
@@ -273,9 +345,14 @@ pub enum ModelsError {
     )]
     UnsupportedProvider { model: ModelId, provider: String },
 
-    /// A model's provider maps to a wire protocol this build does not yet wire
-    /// (Anthropic/Gemini native are follow-ups; only OpenAI-compatible is wired).
-    #[error("model `{model}` uses protocol `{protocol}` which is not yet wired (only OpenAI-compatible is)")]
+    /// A model's provider maps to a wire protocol this build does not wire a
+    /// client for. OpenAI-chat and (when the `provider-anthropic` feature is
+    /// compiled in — on by default) Anthropic are wired; Gemini native and
+    /// anything else are follow-ups. Also returned for a wired protocol when
+    /// the enabling feature was compiled out (`--no-default-features`), so a
+    /// passing [`ModelRegistry::check_model`] never promises more than
+    /// [`ModelRegistry::client_for`] can deliver.
+    #[error("model `{model}` uses protocol `{protocol}` which is not wired in this build")]
     ProtocolNotWired { model: ModelId, protocol: String },
 
     /// A model's `api_key_env` names an environment variable that is not
@@ -680,11 +757,23 @@ fn endpoint_auth_for(cfg: &ModelConfig, catalog: &Catalog) -> EndpointAuth {
 }
 
 /// Map a persisted [`ModelConfig`] onto the provider abstraction. Chat profiles
-/// become `(OpenAiChat, ApiKey|None)`; ACP profiles are marked so the assembly
+/// become `(protocol, ApiKey|None)`; ACP profiles are marked so the assembly
 /// executor can route them to the full-agent runtime instead of a chat client.
-/// This remains the backward-compatible bridge for existing `models.toml` files;
-/// the `ApiKey` arm carries the catalog-resolved header/prefix (bearer when the
-/// entry names no provider) so Azure-shaped providers stop being flattened.
+///
+/// `provider == "openai-compatible"` on [`ModelConfig`] is a broad "REST chat
+/// family" adapter marker, not a promise that the wire is literally OpenAI's:
+/// the catalog is the authority on the actual wire [`Protocol`]. When the
+/// entry names a known [`ModelConfig::provider_id`], that provider's declared
+/// `protocol` wins (e.g. `anthropic` resolves to [`Protocol::Anthropic`], not
+/// OpenAI chat-completions) — this is what lets `codypendent models add
+/// anthropic claude-opus-5` build a client that actually speaks the Anthropic
+/// Messages API instead of POSTing an OpenAI-shaped body to it. An absent or
+/// unknown `provider_id` keeps today's [`Protocol::OpenAiChat`] default, so
+/// every pre-existing `models.toml` entry (and every entry from a provider
+/// this catalog doesn't curate) resolves exactly as before. The `ApiKey` arm
+/// carries the catalog-resolved header/prefix (bearer when the entry names no
+/// provider) so Azure- and Anthropic-shaped providers stop being flattened to
+/// `Authorization: Bearer`.
 #[cfg(feature = "provider-openai")]
 fn config_to_protocol_auth(cfg: &ModelConfig, catalog: &Catalog) -> Result<(Protocol, AuthMethod)> {
     if cfg.provider == "acp" {
@@ -703,6 +792,7 @@ fn config_to_protocol_auth(cfg: &ModelConfig, catalog: &Catalog) -> Result<(Prot
             provider: cfg.provider.clone(),
         });
     }
+    let protocol = Protocol::OpenAiChat; // TEMP: simulate the pre-fix bug for regression verification
     let auth = if cfg.api_key_env.trim().is_empty() {
         AuthMethod::None
     } else {
@@ -713,7 +803,7 @@ fn config_to_protocol_auth(cfg: &ModelConfig, catalog: &Catalog) -> Result<(Prot
             prefix: endpoint.prefix,
         }
     };
-    Ok((Protocol::OpenAiChat, auth))
+    Ok((protocol, auth))
 }
 
 #[cfg(feature = "provider-openai")]
@@ -722,6 +812,34 @@ impl ModelRegistry {
     /// the process-wide built-ins.
     fn catalog(&self) -> &Catalog {
         self.catalog.as_ref().unwrap_or_else(|| builtin_catalog())
+    }
+
+    /// `id`'s `context_tokens`, clamped against the tighter of two ceilings:
+    /// [`MAX_PLAUSIBLE_CONTEXT_TOKENS`] (always, via [`clamp_context_tokens`])
+    /// and — when `id` names a catalog-known `provider_id` + provider-side
+    /// `model` — that exact row's own curated `context_tokens`, when the
+    /// catalog documents one. The second is strictly tighter: a curated
+    /// Anthropic row tops out at 1,000,000, so a live `/models` response that
+    /// claimed 1,900,000 for that same model would pass the blunt absolute
+    /// ceiling but should not pass THIS one. Callers that forward
+    /// `context_tokens` somewhere consequential (the Ollama `num_ctx` request
+    /// hint, a context-usage percentage) should prefer this over reading
+    /// [`ModelConfig::context_tokens`] directly — see F4 in
+    /// `2026-08-13-verticals/acp-models.md` and [`clamp_context_tokens`]'s
+    /// doc comment for the full trust-boundary account.
+    #[must_use]
+    pub fn context_tokens_for(&self, id: &ModelId) -> Option<u64> {
+        let cfg = self.get(id)?;
+        let configured = clamp_context_tokens(cfg.context_tokens)?;
+        let catalog_ceiling = cfg
+            .provider_id
+            .as_deref()
+            .and_then(|provider_id| self.catalog().model(provider_id, &cfg.model))
+            .and_then(|row| row.context_tokens);
+        Some(match catalog_ceiling {
+            Some(ceiling) => configured.min(ceiling),
+            None => configured,
+        })
     }
 
     /// Resolve the key exactly as the live client does. Keeping this in one
@@ -828,12 +946,27 @@ impl ModelRegistry {
             return Ok(());
         }
         let (protocol, _) = config_to_protocol_auth(cfg, self.catalog())?;
-        if !matches!(protocol, Protocol::OpenAiChat) {
-            return Err(ModelsError::ProtocolNotWired {
-                model: id.clone(),
-                protocol: format!("{protocol:?}"),
-            });
-        }
+        // The reachability probe's path differs by wire protocol: OpenAI-chat
+        // providers list models at `{base_url}/models` (`base_url` already
+        // carries the `/v1` the provider documents, e.g.
+        // `https://api.openai.com/v1`); Anthropic's Messages API base_url is
+        // bare (`https://api.anthropic.com`) and lists models at the
+        // spec-fixed `/v1/models` — both return the same `{"data":
+        // [{"id": ...}, ...]}` shape, so the matching logic below is shared.
+        // Anything else this build cannot wire a client for should not claim
+        // to be checkable either — a passing `check` must mean the run that
+        // follows can actually build a client.
+        let models_suffix = match protocol {
+            Protocol::OpenAiChat => "/models",
+            #[cfg(feature = "provider-anthropic")]
+            Protocol::Anthropic => "/v1/models",
+            _ => {
+                return Err(ModelsError::ProtocolNotWired {
+                    model: id.clone(),
+                    protocol: format!("{protocol:?}"),
+                });
+            }
+        };
         if cfg.base_url.trim().is_empty() {
             return Err(ModelsError::InvalidBaseUrl {
                 base_url: cfg.base_url.clone(),
@@ -842,7 +975,7 @@ impl ModelRegistry {
         }
 
         let key = self.api_key_for(cfg).await?;
-        let endpoint = format!("{}/models", cfg.base_url.trim_end_matches('/'));
+        let endpoint = format!("{}{models_suffix}", cfg.base_url.trim_end_matches('/'));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
             .build()
@@ -926,9 +1059,12 @@ impl ModelRegistry {
     /// required-but-unset variable produces [`ModelsError::MissingApiKeyEnv`]
     /// naming the variable.
     ///
-    /// Today only [`Protocol::OpenAiChat`] is wired: a legacy `models.toml`
-    /// entry (`provider = "openai-compatible"`) maps onto it via
-    /// [`config_to_protocol_auth`] and builds the exact same
+    /// [`Protocol::OpenAiChat`] and (when this build carries
+    /// `provider-anthropic`, on by default) [`Protocol::Anthropic`] are
+    /// wired. A legacy `models.toml` entry (`provider = "openai-compatible"`)
+    /// maps onto one or the other via [`config_to_protocol_auth`], which
+    /// consults the catalog: no `provider_id`, or one this build doesn't
+    /// recognize, keeps the OpenAiChat default and builds the exact same
     /// `OpenAIChatCompletionClient::new(api_key, model).with_base_url(base_url)`
     /// as before — the one code path that serves both the hosted OpenAI
     /// endpoint and any OpenAI-compatible local/self-hosted endpoint (e.g.
@@ -936,8 +1072,13 @@ impl ModelRegistry {
     /// [`ModelConfig::provider_id`] whose catalog auth is not the bearer
     /// default (or that declares extra headers) builds the wire-identical
     /// [`HeaderAuthChatClient`] instead, so Azure OpenAI / GitHub Models
-    /// authenticate with the headers the provider actually expects. Any
-    /// other protocol (Anthropic/Gemini native are follow-ups) returns
+    /// authenticate with the headers the provider actually expects.
+    /// `provider_id = "anthropic"` (or any catalog provider declaring
+    /// `protocol = "anthropic"`) builds an `agent_framework_anthropic::
+    /// AnthropicClient` directly — it speaks the real Messages API wire
+    /// (`x-api-key` + `anthropic-version`, its own request/response and SSE
+    /// shapes) rather than being flattened through the OpenAI-chat path.
+    /// Gemini native and any other undeclared protocol still return
     /// [`ModelsError::ProtocolNotWired`].
     pub async fn client_for(
         &self,
@@ -980,6 +1121,20 @@ impl ModelRegistry {
                         })?;
                     Ok(Arc::new(client))
                 }
+            }
+            // Same key-resolution precedence as the OpenAiChat arm above;
+            // `AnthropicClient` sends `x-api-key`/`anthropic-version` itself; it
+            // is not routed through `HeaderAuthChatClient` because it is not an
+            // OpenAI-chat-completions body over different headers — the request
+            // and response shapes themselves differ (Messages API), so the
+            // framework's purpose-built client owns the whole wire.
+            #[cfg(feature = "provider-anthropic")]
+            Protocol::Anthropic => {
+                let api_key = self.api_key_for(cfg).await?;
+                let client =
+                    agent_framework_anthropic::AnthropicClient::new(api_key, cfg.model.clone())
+                        .with_base_url(cfg.base_url.clone());
+                Ok(Arc::new(client))
             }
             Protocol::Acp => Err(ModelsError::ProtocolNotWired {
                 model: id.clone(),
@@ -2048,6 +2203,111 @@ api_key_env = "OPENAI_API_KEY"
         );
     }
 
+    /// F4 (`2026-08-13-verticals/acp-models.md`): `crates/cli/src/tui.rs`'s
+    /// `merge_catalog_rows` lets a provider's own `/models` response win over
+    /// the curated catalog's `context_tokens` with no upper-bound check
+    /// (`context_tokens.filter(|tokens| *tokens > 0)` is the only validation),
+    /// and that value is persisted into `models.toml` verbatim, then forwarded
+    /// as Ollama's `num_ctx` request hint and used as the TUI footer's
+    /// context-usage denominator — "a misconfigured or hostile OpenAI-compatible
+    /// gateway that reports `"context_length": 18446744073709551615` gets that
+    /// number sent back as `num_ctx`". (The literal `u64::MAX` cannot itself
+    /// ride through a `models.toml` round trip — TOML integers are signed
+    /// 64-bit, so a provider's `serde_json` `u64::MAX` fails to serialize as a
+    /// TOML integer at write time, before this clamp is even reached; this
+    /// test uses a value that DOES survive the round trip — still absurd for
+    /// any real model, still well under `i64::MAX` — to pin the clamp for
+    /// every value that actually reaches parsing.) `load_models` is the one
+    /// place every `models.toml` entry is parsed regardless of which writer
+    /// produced it; this pins that an implausible reading never survives it.
+    #[test]
+    fn load_models_clamps_an_implausible_context_tokens_reading() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp file");
+        write!(
+            file,
+            r#"
+[[model]]
+id = "hostile-gateway"
+provider = "openai-compatible"
+base_url = "https://gateway.example/v1"
+model = "some-model"
+api_key_env = ""
+context_tokens = 999999999999999
+"#
+        )
+        .expect("write temp file");
+
+        let configs = load_models(file.path()).expect("parse models.toml");
+        assert_eq!(
+            configs[0].context_tokens,
+            Some(MAX_PLAUSIBLE_CONTEXT_TOKENS),
+            "an implausible reading must be clamped, not passed through to num_ctx verbatim"
+        );
+    }
+
+    #[test]
+    fn clamp_context_tokens_passes_none_and_plausible_values_through_unchanged() {
+        assert_eq!(clamp_context_tokens(None), None);
+        assert_eq!(clamp_context_tokens(Some(200_000)), Some(200_000));
+        assert_eq!(
+            clamp_context_tokens(Some(MAX_PLAUSIBLE_CONTEXT_TOKENS)),
+            Some(MAX_PLAUSIBLE_CONTEXT_TOKENS),
+            "the ceiling itself is not clamped down further"
+        );
+    }
+
+    /// [`ModelRegistry::context_tokens_for`] applies the TIGHTER of the two
+    /// ceilings: an implausible-but-under-the-absolute-max reading (below
+    /// [`MAX_PLAUSIBLE_CONTEXT_TOKENS`], so [`clamp_context_tokens`] alone
+    /// would not catch it) must still be capped to the specific catalog row's
+    /// own documented `context_tokens` when the config names a known
+    /// `provider_id` + provider-side `model`.
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn context_tokens_for_clamps_to_the_specific_catalog_rows_ceiling() {
+        let provider_toml = r#"
+[[provider]]
+id = "anthropic"
+name = "Anthropic (Claude)"
+protocol = "anthropic"
+base_url = "https://api.anthropic.com"
+[[provider.auth]]
+kind = "api_key"
+env = ["ANTHROPIC_API_KEY_UNSET_TEST_3"]
+header = "x-api-key"
+prefix = ""
+
+[[model]]
+id = "claude-opus-5"
+provider_id = "anthropic"
+context_tokens = 1000000
+"#;
+        let file: codypendent_providers::ProvidersFile =
+            toml::from_str(provider_toml).expect("provider toml");
+        let catalog = Catalog::from_parts(file.providers, file.models);
+
+        let id = model_id("anthropic/claude-opus-5");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            model: "claude-opus-5".to_string(),
+            api_key_env: String::new(),
+            // A live /models response that overstated the real 1,000,000
+            // ceiling but stayed under the absolute MAX_PLAUSIBLE_CONTEXT_TOKENS
+            // sanity clamp — the case only the catalog-aware clamp catches.
+            context_tokens: Some(1_900_000),
+            provider_id: Some("anthropic".to_string()),
+        }])
+        .with_catalog(catalog);
+
+        assert_eq!(
+            registry.context_tokens_for(&id),
+            Some(1_000_000),
+            "must clamp to the catalog row's own documented ceiling, tighter than the absolute max"
+        );
+    }
+
     // -- missing-env-var --------------------------------------------------
 
     #[cfg(feature = "provider-openai")]
@@ -2801,6 +3061,152 @@ prefix = ""
         assert!(
             !head.contains("authorization:"),
             "no bearer header for an api-key provider:\n{request}"
+        );
+    }
+
+    /// F3 (`2026-08-13-verticals/acp-models.md`): `codypendent models add
+    /// anthropic claude-opus-5` writes `provider = "openai-compatible"` (every
+    /// `models add` entry does — see `crates/cli/src/commands.rs::models_add`)
+    /// with `provider_id = Some("anthropic")`. Before this fix,
+    /// `config_to_protocol_auth` ignored `provider_id` entirely and hard-coded
+    /// `Protocol::OpenAiChat`, so this exact config would have POSTed an
+    /// OpenAI-shaped chat-completions body to `/chat/completions` with a
+    /// bearer header — wrong on every axis for Anthropic's real Messages API.
+    /// This test builds a client from that exact on-disk shape and asserts on
+    /// the real wire: the real Messages route, `x-api-key` (never bearer), and
+    /// the catalog's `anthropic-version` extra header.
+    #[cfg(all(feature = "provider-openai", feature = "provider-anthropic"))]
+    #[tokio::test]
+    async fn client_for_speaks_the_anthropic_wire_for_a_models_add_style_config() {
+        use crate::auth::AuthStore;
+        use agent_framework_core::client::ChatClient;
+        use agent_framework_core::types::{ChatOptions, Message};
+
+        let provider_toml = r#"
+[[provider]]
+id = "anthropic"
+name = "Anthropic (Claude)"
+protocol = "anthropic"
+base_url = "https://unused.example"
+extra_headers = { "anthropic-version" = "2023-06-01" }
+[[provider.auth]]
+kind = "api_key"
+env = ["ANTHROPIC_API_KEY_UNSET_TEST"]
+header = "x-api-key"
+prefix = ""
+"#;
+        let file: codypendent_providers::ProvidersFile =
+            toml::from_str(provider_toml).expect("provider toml");
+        let catalog = Catalog::from_providers(file.providers);
+
+        let body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5",
+            "content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn",
+            "usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let (url, server) = capture_server(body).await;
+        // `capture_server` returns a `/v1`-suffixed base_url for the OpenAI-chat
+        // tests above; Anthropic's own base_url is bare (`https://api.anthropic.com`,
+        // no `/v1` — the client appends `/v1/messages` itself), so strip it here.
+        let base_url = url.trim_end_matches("/v1").to_string();
+
+        // Exactly the shape `models_add` (`crates/cli/src/commands.rs`) writes:
+        // `provider = "openai-compatible"`, `provider_id = Some("anthropic")`.
+        let id = model_id("anthropic/claude-opus-5");
+        let mut auth = AuthStore::default();
+        auth.set(id.0.as_str(), "sk-ant-secret");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url,
+            model: "claude-opus-5".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: Some("anthropic".to_string()),
+        }])
+        .with_auth(auth)
+        .with_catalog(catalog);
+
+        let client = registry.client_for(&id).await.expect("client builds");
+        let response = client
+            .get_response(vec![Message::user("ping")], ChatOptions::default())
+            .await
+            .expect("the mock answers");
+        assert_eq!(response.text(), "hi");
+
+        let request = server.await.unwrap();
+        let head = request.to_lowercase();
+        assert!(
+            head.starts_with("post /v1/messages"),
+            "the Anthropic Messages route, not /chat/completions:\n{request}"
+        );
+        assert!(
+            head.contains("x-api-key: sk-ant-secret"),
+            "the key rides x-api-key, never Authorization:\n{request}"
+        );
+        assert!(
+            head.contains("anthropic-version: 2023-06-01"),
+            "the catalog's anthropic-version header is sent:\n{request}"
+        );
+        assert!(
+            !head.contains("authorization:"),
+            "no bearer header may be sent to an Anthropic endpoint:\n{request}"
+        );
+    }
+
+    /// Same F3 fix, the reachability-probe half: `check_model` must ask
+    /// Anthropic's real `GET /v1/models` (spec-fixed path; verified against
+    /// `platform.claude.com/docs/en/api/models/list`), not the OpenAI-chat
+    /// `{base_url}/models` this build used to send unconditionally — which
+    /// resolved to `https://api.anthropic.com/models`, a route that does not
+    /// exist, so `codypendent models check` on a freshly `models add`ed
+    /// Anthropic entry always failed even with a valid key.
+    #[cfg(all(feature = "provider-openai", feature = "provider-anthropic"))]
+    #[tokio::test]
+    async fn check_model_asks_v1_models_for_the_anthropic_protocol() {
+        use crate::auth::AuthStore;
+
+        let provider_toml = r#"
+[[provider]]
+id = "anthropic"
+name = "Anthropic (Claude)"
+protocol = "anthropic"
+base_url = "https://unused.example"
+extra_headers = { "anthropic-version" = "2023-06-01" }
+[[provider.auth]]
+kind = "api_key"
+env = ["ANTHROPIC_API_KEY_UNSET_TEST_2"]
+header = "x-api-key"
+prefix = ""
+"#;
+        let file: codypendent_providers::ProvidersFile =
+            toml::from_str(provider_toml).expect("provider toml");
+        let catalog = Catalog::from_providers(file.providers);
+
+        let (url, server) = capture_server(r#"{"data":[{"id":"claude-opus-5"}]}"#).await;
+        let base_url = url.trim_end_matches("/v1").to_string();
+
+        let id = model_id("anthropic/claude-opus-5");
+        let mut auth = AuthStore::default();
+        auth.set(id.0.as_str(), "sk-ant-secret");
+        let registry = ModelRegistry::new([ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url,
+            model: "claude-opus-5".to_string(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            provider_id: Some("anthropic".to_string()),
+        }])
+        .with_auth(auth)
+        .with_catalog(catalog);
+
+        registry
+            .check_model(&id)
+            .await
+            .expect("the endpoint lists the model at /v1/models");
+        let request = server.await.unwrap();
+        assert!(
+            request.to_lowercase().starts_with("get /v1/models"),
+            "must probe the spec-fixed Anthropic Models API path:\n{request}"
         );
     }
 

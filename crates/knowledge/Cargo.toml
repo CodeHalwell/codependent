@@ -42,6 +42,9 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Assembles the WebAssembly text fixture the end-to-end skill-module test runs.
+# Test-only: the shipped binary never parses WebAssembly text.
+wat = "1"
 
 [lints]
 workspace = true

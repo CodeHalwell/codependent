@@ -127,6 +127,10 @@ pub struct ReleaseOutcome {
     pub preserved: bool,
     /// `true` when the worktree directory was removed from disk.
     pub worktree_removed: bool,
+    /// `true` when the run's `codypendent/run-<short>` branch was reclaimed.
+    /// `false` when it was retained because it holds commits `HEAD` does not —
+    /// the branch is never deleted with unmerged work on it.
+    pub branch_deleted: bool,
     /// The exported patch artifact, present whenever unmerged commits or dirty
     /// files were detected (the safety net for "protect unmerged work").
     pub patch: Option<ArtifactRef>,
@@ -418,6 +422,9 @@ impl WorktreeManager {
                 lease_id,
                 preserved: true,
                 worktree_removed: false,
+                // The tree — and so the branch — is retained precisely because
+                // it holds work.
+                branch_deleted: false,
                 patch: Some(patch),
                 unmerged_commits,
                 dirty,
@@ -438,6 +445,7 @@ impl WorktreeManager {
                     lease_id,
                     preserved: true,
                     worktree_removed: false,
+                    branch_deleted: false,
                     patch: None,
                     unmerged_commits,
                     dirty,
@@ -462,15 +470,83 @@ impl WorktreeManager {
             removed = true;
         }
 
+        // Reclaim the per-run branch. Removing the worktree used to leave
+        // `codypendent/run-<short>` behind forever: the only branch deletion is
+        // `allocate`'s reclaim, which keys on a worktree path derived from a fresh
+        // run id and so never matches again. Every writing run leaked one ref, and
+        // a fan-out leaked one per worker.
+        //
+        // Gated on the SAME test `allocate` uses — every commit on the branch is
+        // reachable from HEAD — so a branch that holds work is never deleted, only
+        // reported. The forced path is allowed through because it has already
+        // exported a verified non-empty patch artifact, so nothing is lost.
+        let branch_deleted = if removed && (!has_work || force) {
+            self.reclaim_branch(pool, repo, &lease.branch, lease_id)
+                .await
+        } else {
+            false
+        };
+
         mark_released(pool, lease_id).await?;
         Ok(ReleaseOutcome {
             lease_id,
             preserved: false,
             worktree_removed: removed,
+            branch_deleted,
             patch,
             unmerged_commits,
             dirty,
         })
+    }
+
+    /// Delete `branch` when — and only when — every commit on it is reachable
+    /// from the repository's `HEAD`, stamping `branch_deleted_at` on the lease so
+    /// the deletion is a durable fact rather than an inference.
+    ///
+    /// Best-effort by design: a branch that cannot be proven merged is left
+    /// alone, and a `git` failure is logged rather than propagated — a lease must
+    /// still be released even if its branch cannot be reclaimed, or the ref leak
+    /// would be traded for a lease leak.
+    async fn reclaim_branch(
+        &self,
+        pool: &SqlitePool,
+        repo: &Path,
+        branch: &str,
+        lease_id: Uuid,
+    ) -> bool {
+        let branch_ref = format!("refs/heads/{branch}");
+        if run_git(repo, &["rev-parse", "--verify", &branch_ref])
+            .await
+            .is_err()
+        {
+            return false; // already gone
+        }
+        if run_git(repo, &["merge-base", "--is-ancestor", branch, "HEAD"])
+            .await
+            .is_err()
+        {
+            tracing::info!(
+                %branch,
+                "worker branch holds commits HEAD does not contain; retained (its work is in the exported patch artifact)"
+            );
+            return false;
+        }
+        if let Err(error) = run_git(repo, &["branch", "-D", branch]).await {
+            tracing::warn!(%branch, %error, "could not delete the worker branch");
+            return false;
+        }
+        if let Err(error) =
+            sqlx::query("UPDATE workspace_leases SET branch_deleted_at = ? WHERE id = ?")
+                .bind(Utc::now().to_rfc3339())
+                .bind(lease_id.to_string())
+                .execute(pool)
+                .await
+        {
+            // The branch is already gone; a missing stamp only costs the audit
+            // trail, so it must not fail the release.
+            tracing::warn!(%branch, %error, "deleted the worker branch but could not record it");
+        }
+        true
     }
 
     /// Reconcile lease rows against reality on daemon startup. Active leases whose
@@ -1077,6 +1153,93 @@ mod tests {
         assert!(outcome.patch.is_none());
         assert_eq!(lease_state(&pool, lease.id).await, LeaseState::Released);
         assert!(!wt.exists(), "clean worktree directory must be removed");
+    }
+
+    /// A repository's `git branch` list after a clean release. The leak this
+    /// guards was verified in the review: four orphan `codypendent/run-*`
+    /// branches after two small workflow runs, growing by one ref per writing
+    /// run (and one per worker on a fan-out) forever.
+    fn branches(repo: &Path) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["branch", "--format=%(refname:short)"])
+            .output()
+            .expect("spawn git");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_clean_release_reclaims_the_worker_branch() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let repo = init_repo(dir.path());
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+        let before = branches(&repo);
+
+        // Two workers, as a fan-out would allocate them.
+        let mgr = WorktreeManager::new();
+        let mut leases = Vec::new();
+        for _ in 0..2 {
+            let run_id = seed_run(&pool).await;
+            leases.push(mgr.allocate(&pool, &repo, run_id).await.unwrap());
+        }
+        assert_eq!(
+            branches(&repo).len(),
+            before.len() + 2,
+            "each worker takes a branch"
+        );
+
+        for lease in &leases {
+            let outcome = mgr.release(&pool, &store, lease.id, false).await.unwrap();
+            assert!(outcome.branch_deleted, "a clean worker branch is reclaimed");
+        }
+
+        assert_eq!(
+            branches(&repo),
+            before,
+            "no codypendent/run-* branch may survive a clean release"
+        );
+        // The reclamation is recorded, not merely inferred.
+        for lease in &leases {
+            let (stamp,): (Option<String>,) =
+                sqlx::query_as("SELECT branch_deleted_at FROM workspace_leases WHERE id = ?")
+                    .bind(lease.id.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(stamp.is_some());
+        }
+    }
+
+    /// The other half of the contract: a branch that holds commits `HEAD` does
+    /// not is NEVER deleted. The worktree is retained too, so the user can still
+    /// reach the work directly.
+    #[tokio::test]
+    async fn a_branch_holding_unmerged_work_is_never_reclaimed() {
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let repo = init_repo(dir.path());
+        let run_id = seed_run(&pool).await;
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+
+        let mgr = WorktreeManager::new();
+        let lease = mgr.allocate(&pool, &repo, run_id).await.unwrap();
+        let wt = &lease.worktree_path;
+        std::fs::write(wt.join("feature.txt"), "worker output\n").unwrap();
+        git(wt, &["add", "."]);
+        git(wt, &["commit", "-q", "-m", "worker output"]);
+
+        let outcome = mgr.release(&pool, &store, lease.id, false).await.unwrap();
+        assert!(outcome.preserved);
+        assert!(!outcome.branch_deleted);
+        assert!(
+            branches(&repo).contains(&lease.branch),
+            "unmerged work must keep its branch"
+        );
     }
 
     #[tokio::test]

@@ -101,6 +101,66 @@ pub fn builtin_tools() -> Vec<RegistryItem> {
                 CapabilityRequest::Command("git".into()),
             ],
         ),
+        // The structured write tools. They were advertised to the model from the
+        // day they shipped but never registered, so the funnel that is supposed
+        // to SELECT tools could not rank, card, or disclose the two tools an
+        // agent writes files with — the sharpest instance of the two-universes
+        // split. Registered here so ranking sees the same catalog dispatch does.
+        tool(
+            "workspace.write_file",
+            "Create or overwrite a file in the worktree with exact contents, as structured \
+             arguments rather than a diff. Parent directories are created; the write is \
+             confined to the granted write scope.",
+            &[
+                "write a file",
+                "create a new file",
+                "overwrite a file",
+                "save this content to a file",
+            ],
+            &["file", "write", "create", "overwrite", "save", "new"],
+            vec![CapabilityRequest::FilesystemWrite(WORKTREE_ROOT.into())],
+        ),
+        tool(
+            "workspace.edit_file",
+            "Replace an exact, unique snippet of an existing file with new text — a targeted \
+             edit that refuses ambiguous or missing context instead of guessing.",
+            &[
+                "edit a file",
+                "change a line in a file",
+                "replace text in a file",
+                "make a targeted edit",
+            ],
+            &["file", "edit", "replace", "modify", "snippet", "change"],
+            vec![CapabilityRequest::FilesystemWrite(WORKTREE_ROOT.into())],
+        ),
+        // The agent's window back onto this very registry. Registering it makes
+        // the escape hatch itself discoverable — a narrowed advertisement can
+        // always be widened by asking what else exists.
+        tool(
+            "skills.search",
+            "Search the registry for the tools and skills that fit a task and read a returned \
+             skill's procedure. Use it when the offered tools do not obviously cover the work.",
+            &[
+                "what tools are available",
+                "find a skill for this task",
+                "search the registry",
+                "is there a skill for this",
+            ],
+            &["skill", "search", "registry", "discover", "catalog", "tool"],
+            Vec::new(),
+        ),
+        tool(
+            "web.search",
+            "Search the public web and return ranked results with titles, URLs, and snippets. \
+             Reaches the network through the configured search provider.",
+            &[
+                "search the web",
+                "look this up online",
+                "find documentation on the internet",
+            ],
+            &["web", "search", "internet", "online", "lookup", "browse"],
+            vec![CapabilityRequest::Network("*".into())],
+        ),
         // The Phase-5 workflow verification tool (T6): a workflow **tool node**
         // runs the repository's own test command in its worktree through the same
         // sandboxed process-spawn path as `shell.run`, returning a structured
@@ -273,6 +333,100 @@ pub fn builtin_tools() -> Vec<RegistryItem> {
                 "note a learning for future runs",
             ],
             &["memory", "remember", "fact", "decision", "learning"],
+            Vec::new(),
+        ),
+        // The doc-writer tools (rubric #4). Like `blackboard.*` they target only
+        // the knowledge fabric's document store — never the filesystem, a
+        // command, or the network — so they request no capability (risk `Safe`);
+        // the real gate on an agent's document write is the document's
+        // collaboration mode. Registered so a "write this up" objective can
+        // actually SELECT them: without a registry row the funnel had nothing to
+        // rank, and the runtime never advertised them either.
+        tool(
+            "docs.create",
+            "Draft a new knowledge-fabric document (title, scope, Markdown body) in Docs \
+             Studio — the durable, block-structured place documentation lives, not a Markdown \
+             file in the worktree.",
+            &[
+                "write this up as a document",
+                "document this subsystem",
+                "draft a design doc",
+                "create a knowledge document",
+                "write documentation for this",
+            ],
+            &[
+                "docs",
+                "document",
+                "documentation",
+                "write-up",
+                "draft",
+                "knowledge",
+                "create",
+            ],
+            Vec::new(),
+        ),
+        tool(
+            "docs.read",
+            "Read a knowledge-fabric document as Markdown, or list the documents this run's \
+             repository can see. Read before editing: block ids come from here.",
+            &[
+                "read the documentation",
+                "list the knowledge documents",
+                "open a document",
+                "what docs exist for this",
+            ],
+            &[
+                "docs",
+                "document",
+                "documentation",
+                "read",
+                "list",
+                "open",
+                "knowledge",
+            ],
+            Vec::new(),
+        ),
+        tool(
+            "docs.edit",
+            "Replace one block's text in a knowledge-fabric document. Whether the change lands \
+             directly or as a reviewable suggestion is decided by the document's collaboration \
+             mode, not by the caller.",
+            &[
+                "edit the documentation",
+                "update a document",
+                "fix a paragraph in the docs",
+                "revise the knowledge document",
+            ],
+            &[
+                "docs",
+                "document",
+                "documentation",
+                "edit",
+                "update",
+                "revise",
+                "block",
+            ],
+            Vec::new(),
+        ),
+        tool(
+            "docs.suggest",
+            "Propose a range replacement inside a document block for a human to accept or \
+             reject, with an optional rationale — the reviewable path when the document should \
+             not be edited directly.",
+            &[
+                "suggest a documentation change",
+                "propose an edit to the docs for review",
+                "flag stale documentation",
+            ],
+            &[
+                "docs",
+                "document",
+                "documentation",
+                "suggest",
+                "propose",
+                "review",
+                "stale",
+            ],
             Vec::new(),
         ),
     ]

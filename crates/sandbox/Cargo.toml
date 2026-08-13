@@ -25,8 +25,24 @@ ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 # One-shot approval receipts bind a human decision to one pending update.
 uuid = { workspace = true }
+# The WASM guest runtime (STEP 6.3). `wasmi` rather than `wasmtime`: a skill
+# module runs for milliseconds, so an interpreter is fast enough, and it avoids
+# putting a JIT — which compiles attacker-supplied bytecode to native code, with
+# W^X pages, signal-based traps and an unwinder — inside the trust boundary.
+# `default-features = false` drops the `wat` text parser AND the SIMD proposal
+# from the build entirely, so neither is reachable from guest bytes at all.
+# Fuel metering and the resource limiter are core, not features.
+# See `.impl/threat-models/12-executable-skills.md` §4 for the full rationale,
+# including the measured dependency-count comparison against wasmtime.
+wasmi = { version = "0.51", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# Assembles the WebAssembly *text* fixtures the WASM host tests are written in.
+# Deliberately a separate dev-dependency rather than wasmi's own `wat` feature:
+# that feature makes `Module::new` accept text, so enabling it would leave the
+# tests exercising a parser the shipped binary does not have. Assembling to
+# binary here keeps the test and production paths identical.
+wat = "1"
 # Temp dirs for the trusted-publisher store and enforcement integration tests.
 tempfile = { workspace = true }
 
