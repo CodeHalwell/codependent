@@ -2508,6 +2508,10 @@ async fn event_loop<P: Presentation>(
                     description: description.clone(),
                     chair: chair.clone(),
                     rounds: *rounds,
+                    // The wizard has no quorum step, so take the default rule
+                    // (a simple majority of members) rather than pinning a
+                    // number the user was never shown.
+                    quorum: None,
                     // The host-owned wizard has no evidence-mode step yet; a
                     // council created this way keeps rubric 6's "default
                     // behavior unchanged" and can still be flipped on later by
