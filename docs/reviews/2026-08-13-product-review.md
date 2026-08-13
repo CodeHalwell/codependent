@@ -3,7 +3,7 @@
 Reviewed at `535a2f5` (v0.4.5, branch `main`) against twenty target outcomes:
 the ten from the [2026-08-11 review](2026-08-11-product-review.md), which were
 to be **verified rather than re-designed**, plus ten new ones each building on a
-named shipped outcome. Ten parallel reviewers each read every file in one
+named shipped outcome. Eleven parallel reviewers each read every file in one
 vertical and, unlike the previous pass, **ran the product** — live daemons,
 stub model servers, real pty sessions, hand-written ACP agents, SQLite dumps.
 Full vertical reports are in [`2026-08-13-verticals/`](2026-08-13-verticals/).
@@ -24,9 +24,9 @@ This document is the synthesis.
   rigor as the algorithms themselves."*
 - **2026-08-11** (`df62ef4`): *"The platform is genuinely excellent; the product
   is systematically one wire short of it."*
-- **2026-08-13** (`535a2f5`, this review): ten reviewers, working independently
-  and told nothing about either prior review, each independently named the same
-  shape. Verbatim, from four of them:
+- **2026-08-13** (`535a2f5`, this review): eleven reviewers, working
+  independently and told nothing about either prior review, each independently
+  named the same shape. Verbatim, from five of them:
 
   > *"the engine is built, tested and documented; the final wire is attached to
   > the wrong terminal."* (acp-models)
@@ -39,6 +39,9 @@ This document is the synthesis.
 
   > *"Every number and every identity crosses a seam as an opaque reference, and
   > the reference is where the trail ends."* (daemon-core)
+
+  > *"Projected for everything, wired for the selection only … the last hop from
+  > 'the data is on screen' to 'the user can act on all of it'."* (tui-shell)
 
 Between the second review and this one, eleven implementation agents were run
 against its findings. Per
@@ -112,18 +115,17 @@ Green tests were never evidence here. That is why this review ran the product.
 ## 2. Scorecard
 
 Verdicts are as measured by the vertical reviewers at `535a2f5`, **before** the
-repairs in §4. Outcome 1/7 has no verdict: that reviewer had not reported when
-this document was written (see §5).
+repairs in §4.
 
 | # | Outcome | State | Verdict |
 |--:|---|:--:|---|
-| 1 | Polished TUI | — | not reported (§5) |
+| 1 | Polished TUI | PARTIAL | all 50 overlays reachable, shell/pickers/splash genuinely well made; Help drops ~8 of 29 bindings with no scroll; browsers hard-cut their own empty-state copy mid-word; first-run gate swallows `/` so the palette is dead exactly when a new user needs it |
 | 2 | ACP + auto model discovery | PARTIAL | discovery works on a real wire — 3 models found, profiles written, live prompt turn completed; **serve mode failed every prompt** |
 | 3 | Model selection + prefilled lists | PARTIAL | 42-provider/387-model catalog real and wired to TUI + `models add`; Anthropic unreachable in TUI and mis-wired in CLI; no `--model` on `run`; every "1M" context value overstated |
 | 4 | Skill-writer + doc-writer | BROKEN | `docs.*` implemented, dispatchable, and never advertised to the model; no skill-writer of any kind |
-| 5 | DAG viewer (user + agent) | BROKEN | flat paginated edge table, not a DAG; empty from any subdirectory; no `graph.*` tool exists |
+| 5 | DAG viewer (user + agent) | BROKEN | `dag.rs` draws *workflow* manifests live and correctly, and is the only caller of `lay_out`; the *code-context* graph — 28,198 nodes / 94,466 edges — renders as 945 alphabetical pages with a LIKE filter, no layout, no traversal; empty from any subdirectory; no `graph.*` tool exists |
 | 6 | AI council | PARTIAL | genuinely convenes — concurrent members, distinct models, fair-share dossier, chair synthesis; cost undercounts ~2×; member failure reason discarded |
-| 7 | Rich chat stream | — | not reported (§5) |
+| 7 | Rich chat stream | PARTIAL | markdown, tool cards, folds and virtualization are real and good; **from the second message onward every card from an earlier turn is permanently un-expandable** |
 | 8 | TTS + STT | PARTIAL | STT proven end to end against a configured endpoint; **zero audio crates in the workspace** — nothing is "built-in"; TTS has no privacy gate |
 | 9 | Vector top-k selection | PARTIAL | funnel runs and its cards reach the model, but **additively** — all 21 built-in tools are injected every step, byte-identical across unrelated objectives |
 | 10 | Blackboard + kanban + NL backlog | PARTIAL | both real and distinct; board worked end to end in a pty; board identity keyed on an uncanonicalized caller path |
@@ -136,7 +138,7 @@ this document was written (see §5).
 | 17 | Compounding memory | PARTIAL | genuinely persists across sessions with real provenance; no delete, no edit, no protocol command; the store that *has* decay/promotion/contradiction has no reader |
 | 18 | Docs round-trip | PARTIAL | publish really commits and records; PR path pushes before checking it can open a PR; **merge readback absent down to the schema** |
 | 19 | Real multi-user | ABSENT | **and the trust boundary is open** — see §3 |
-| 20 | The ledger made visible | BROKEN | every event type *does* have a consumer; the **numbers** are not in events at all |
+| 20 | The ledger made visible | BROKEN | every event type *does* have a consumer; the **numbers** are not in events at all. Confirmed from both ends: `protocol/src/events.rs` carries no usage variant, the agent loop never emits `BudgetWarning{Cost}`, and the TUI's `format_cost` therefore renders `—` in header, footer and run detail after eight real runs |
 
 ---
 
@@ -206,9 +208,6 @@ listed in §4.
 
 Specifically not done:
 
-- **Outcome 1 and 7 have no verdict.** The TUI reviewer had not reported. Every
-  statement about the TUI in this document comes from other verticals touching
-  it in passing, and outcomes 1 and 7 should be treated as unassessed.
 - **No new outcome (11–20) was built.** The brief forbids building on an
   unverified base; verification consumed the run, and §3 is a hard blocker for
   four of the ten.
@@ -218,7 +217,7 @@ Specifically not done:
   expected.
 
 Environment note, because it shaped the evidence: the container has 4 CPUs and
-filled its 252 GB filesystem to 100% twice under ten concurrent reviewers
+filled its 252 GB filesystem to 100% twice under eleven concurrent reviewers
 (`target/` peaked at 27 GB). Two reviewers abandoned probe builds mid-pass and
 substituted weaker evidence, which they labelled as such. Their reports say
 where.

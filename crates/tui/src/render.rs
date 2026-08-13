@@ -7230,10 +7230,18 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             .add_modifier(Modifier::BOLD),
     ));
     lines.push(Line::raw(""));
+    // Pad to the widest binding actually in the table. A fixed 12 silently
+    // stopped padding for every longer key, so those rows ran their label
+    // straight into their description ("Delete / Ctrl-Dremove a model").
+    let key_width = crate::input::KEY_BINDINGS
+        .iter()
+        .map(|b| b.keys.chars().count())
+        .max()
+        .unwrap_or(12);
     for binding in crate::input::KEY_BINDINGS {
         let mut spans = vec![
             Span::styled(
-                format!("  {:<12}", binding.keys),
+                format!("  {:<key_width$}  ", binding.keys),
                 Style::default()
                     .fg(theme.status.info)
                     .add_modifier(Modifier::BOLD),
@@ -7266,10 +7274,26 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .bg(theme.surface.overlay)
                 .fg(theme.text.primary),
         );
+    // Wrapped height at this width, so paging stops at the last real row.
+    let inner_width = usize::from(rect.width.saturating_sub(2)).max(1);
+    let inner_height = rect.height.saturating_sub(2);
+    let wrapped: usize = lines
+        .iter()
+        .map(|line| {
+            let width = line.width().max(1);
+            width.div_ceil(inner_width)
+        })
+        .sum();
+    let max_scroll =
+        u16::try_from(wrapped.saturating_sub(usize::from(inner_height))).unwrap_or(u16::MAX);
+    state.help_max_scroll.set(max_scroll);
+    let offset = state.help_scroll.min(max_scroll);
+
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((offset, 0)),
         rect,
     );
 }
@@ -9671,6 +9695,72 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|f| render(f, state, theme)).expect("draw");
         terminal.backend().buffer().clone()
+    }
+
+    /// The Help overlay lists every binding in `KEY_BINDINGS`, which is taller
+    /// than the modal on an ordinary terminal. Without a scroll offset the tail
+    /// was simply not drawn — the Council and Board keys, the last rows of the
+    /// table, could not be reached by any input. `PgDn` scrolls the modal now
+    /// instead of scrolling the transcript behind it.
+    #[test]
+    fn the_help_overlay_can_reach_its_last_binding() {
+        let last = crate::input::KEY_BINDINGS
+            .last()
+            .expect("the binding table is not empty");
+        // The key column, not the description: it sits at the start of its line
+        // and so is never split by wrapping.
+        let needle = last.keys;
+
+        let mut state = AppState::new();
+        state.overlay = crate::state::Overlay::Help;
+        let unscrolled = render_to_string(&state, 100, 24);
+        assert!(
+            !unscrolled.contains(needle),
+            "precondition: the last binding should be below the fold at 100x24"
+        );
+
+        // Page down until it appears, exactly as a user would.
+        let mut found = false;
+        for _ in 0..12 {
+            crate::reduce::reduce(&mut state, crate::action::Action::ScrollPageDown);
+            if render_to_string(&state, 100, 24).contains(needle) {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "the last binding `{}` must be reachable by paging the Help overlay",
+            last.keys
+        );
+    }
+
+    /// A key label longer than the old fixed 12-column pad ran straight into
+    /// its description ("K · ← / → (Board)open the task board · …"). Checks
+    /// every binding actually on screen, not one chosen row — the table is
+    /// taller than the modal, so a fixed pick can silently test nothing.
+    #[test]
+    fn help_key_labels_never_touch_their_descriptions() {
+        let mut state = AppState::new();
+        state.overlay = crate::state::Overlay::Help;
+        let text = render_to_string(&state, 120, 60);
+
+        let mut checked = 0;
+        for binding in crate::input::KEY_BINDINGS {
+            let glued = format!("{}{}", binding.keys, binding.description);
+            if text.contains(binding.keys) {
+                checked += 1;
+            }
+            assert!(
+                !text.contains(&glued),
+                "`{}` runs into its description",
+                binding.keys
+            );
+        }
+        assert!(
+            checked > 5,
+            "precondition: the assertion must have seen real rendered rows, saw {checked}"
+        );
     }
 
     #[test]

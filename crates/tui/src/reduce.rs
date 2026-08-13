@@ -809,7 +809,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::Help => {
             state.overlay = match state.overlay {
                 Overlay::Help => Overlay::None,
-                _ => Overlay::Help,
+                _ => {
+                    // Always open at the top, however the last visit was left.
+                    state.help_scroll = 0;
+                    Overlay::Help
+                }
             }
         }
         Action::Detach => state.should_detach = true,
@@ -2489,6 +2493,17 @@ const PAGE: u16 = 10;
 const WHEEL_LINES: u16 = 3;
 
 fn scroll_lines(state: &mut AppState, up: bool) {
+    if matches!(state.overlay, Overlay::Help) {
+        state.help_scroll = if up {
+            state.help_scroll.saturating_sub(WHEEL_LINES)
+        } else {
+            state
+                .help_scroll
+                .saturating_add(WHEEL_LINES)
+                .min(state.help_max_scroll.get())
+        };
+        return;
+    }
     if matches!(state.overlay, Overlay::CouncilResults) {
         state.council_result_scroll = if up {
             state.council_result_scroll.saturating_sub(WHEEL_LINES)
@@ -2501,6 +2516,17 @@ fn scroll_lines(state: &mut AppState, up: bool) {
 }
 
 fn scroll_page(state: &mut AppState, up: bool) {
+    if matches!(state.overlay, Overlay::Help) {
+        state.help_scroll = if up {
+            state.help_scroll.saturating_sub(PAGE)
+        } else {
+            state
+                .help_scroll
+                .saturating_add(PAGE)
+                .min(state.help_max_scroll.get())
+        };
+        return;
+    }
     if matches!(state.overlay, Overlay::CouncilResults) {
         state.council_result_scroll = if up {
             state.council_result_scroll.saturating_sub(PAGE)
@@ -5913,7 +5939,10 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
                 state.focus = Pane::Transcript;
             }
         }
-        PaletteCommand::Help => state.overlay = Overlay::Help,
+        PaletteCommand::Help => {
+            state.help_scroll = 0;
+            state.overlay = Overlay::Help;
+        }
         PaletteCommand::Detach => state.should_detach = true,
         PaletteCommand::NewConversation => {
             release_doc_lease(state);

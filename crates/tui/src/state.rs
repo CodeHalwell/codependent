@@ -2170,6 +2170,15 @@ pub struct AppState {
     pub selected_council_result: usize,
     /// Detail-rail viewport; the full synthesis remains in memory verbatim.
     pub council_result_scroll: u16,
+    /// Help-overlay viewport. The overlay lists every binding in
+    /// [`crate::input::KEY_BINDINGS`], which is taller than the modal on a
+    /// normal terminal — without this the tail was simply not drawn, so the
+    /// keys a user most needs to discover were the ones they could not see.
+    pub help_scroll: u16,
+    /// Render->input geometry cache for the Help overlay (mirrors
+    /// [`Self::transcript_max_scroll`]): the largest offset that still leaves
+    /// the modal full, so paging cannot run off the end into blank space.
+    pub help_max_scroll: Cell<u16>,
     /// Whether the detail rail includes all member reports/rounds.
     pub council_result_expanded: bool,
     /// The repository task board (rubric 10): every live `task` card on the
@@ -2381,6 +2390,8 @@ impl AppState {
             council_results: Vec::new(),
             selected_council_result: 0,
             council_result_scroll: 0,
+            help_scroll: 0,
+            help_max_scroll: Cell::new(0),
             council_result_expanded: false,
             kanban: Vec::new(),
             selected_card: 0,
