@@ -203,9 +203,9 @@ untouched.
 
 ## 5. Scope actually completed, and what remains
 
-This review completed **Phase 1** (parallel vertical review, ten of eleven
+This review completed **Phase 1** (parallel vertical review, all eleven
 verticals reporting) and a first tranche of **Phase 2** repairs. It did **not**
-complete Phase 2 for the seventeen remaining outcomes, Phase 3 (adversarial
+complete Phase 2 for the outcomes not listed in §4, Phase 3 (adversarial
 integration pass over the seams), or Phase 4 verification of anything not
 listed in §4.
 
@@ -215,9 +215,44 @@ Specifically not done:
   unverified base; verification consumed the run, and §3 is a hard blocker for
   four of the ten.
 - **No adversarial integration pass.** The shared-surface ownership map was
-  written before any code changed, and the changes above touch five files
-  across four crates, but nobody has diffed the seams against what each vertical
+  written before any code changed, and the changes above touch nine files
+  across five crates, but nobody has diffed the seams against what each vertical
   expected.
+
+### What was not exercised
+
+Everything in §4 was run against the built product. Nothing else in this
+document was, and the following are reported on the strength of a reviewer's
+evidence rather than the orchestrator's own:
+
+- **Every defect NOT in §4.** The scorecard verdicts come from the vertical
+  reports. Where a reviewer says they measured something, they measured it;
+  where they say they reasoned from the source, they say so in their report.
+  None of those findings was independently re-run here.
+- **The repairs' effect on a live model.** No repair in §4 was exercised
+  against a real provider — there are no credentials in this environment.
+  `models add` was verified against the filesystem, the ACP fix against the
+  reply-type contract and the compiler, the repository-identity fix against a
+  real daemon and a real checkout, the board fix against a real SQLite database,
+  the Help fix against a rendered `TestBackend` buffer. None of them against a
+  model that costs money.
+- **The ACP fix end to end through Zed.** The defect was confirmed by reading
+  both sides of the contract (`handle_attach` only ever replies `Catchup`;
+  `require_accepted` only ever accepts `CommandAccepted`) and by the reviewer's
+  captured wire trace of the failure. The repair compiles and matches the
+  contract every other client uses. **A prompt has not been driven through the
+  fixed path from a real ACP client.** That is the one repair here whose
+  success is inferred rather than observed.
+- **Audio.** No audio device exists in this container. STT was proven by the
+  reviewer against a mock HTTP endpoint; capture and playback were not run.
+- **The full workspace test suite under the orchestrator's changes** was
+  started, but this container's disk could not hold every debug test binary
+  (peak `target/` 27 GB against ~19 GB free at session start). `cargo fmt
+  --all -- --check`, `cargo check --workspace --all-targets --all-features`
+  and `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  are all clean, and the suites for every crate touched — `codypendent-eval`,
+  `codypendent-cli`, `codypendent-protocol`, `codypendent-codypendentd`,
+  `codypendent-tui` (554 tests) — pass. **CI is the arbiter for the rest.**
 
 Environment note, because it shaped the evidence: the container has 4 CPUs and
 filled its 252 GB filesystem to 100% twice under eleven concurrent reviewers
