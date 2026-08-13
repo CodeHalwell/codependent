@@ -58,8 +58,21 @@ pub fn write_model_entries(path: &Path, configs: &[ModelConfig]) -> anyhow::Resu
         .parent()
         .ok_or_else(|| anyhow!("{}: has no parent directory", path.display()))?;
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    // Pid-unique so two concurrent writers never share a temp file.
-    let temp = parent.join(format!(".models-{}.tmp", std::process::id()));
+    // Unique per WRITE, not per process. The previous name was pid-only and its
+    // comment claimed that stopped concurrent writers sharing a temp file — it
+    // did not: two writes inside one process (the TUI's background model pull
+    // alongside an edit) collided on the same path, so one could rename the
+    // other's half-written render into place. A counter plus the pid is unique
+    // for both cases.
+    //
+    // This makes the temp file safe. It does NOT make the read-modify-write
+    // safe: two callers that each loaded `configs` before the other's rename
+    // still lose one of the two edits. Closing that needs a lock held across
+    // load→edit→write, which is a larger change than this comment; the honest
+    // position is that this is last-writer-wins and known to be.
+    static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ticket = WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = parent.join(format!(".models-{}-{ticket}.tmp", std::process::id()));
     std::fs::write(&temp, rendered.as_bytes())
         .with_context(|| format!("writing {}", temp.display()))?;
     #[cfg(unix)]

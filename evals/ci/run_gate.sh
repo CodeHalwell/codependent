@@ -107,8 +107,13 @@ BASELINE="$REPO_ROOT/evals/baselines/core.json"
 
 if [ "${1:-}" = "--update-baseline" ]; then
   shift
-  exec python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" \
+  # NOT `exec`: exec replaces this shell, so the EXIT trap never runs and the
+  # stub server and scratch data dir outlive the script. Observed for real —
+  # an orphaned stub kept the default port bound and the NEXT gate run died
+  # with "Address already in use".
+  python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" \
     --baseline "$BASELINE" --update-baseline --note "$*"
+  exit $?
 fi
 
 # Bootstrap, don't fabricate: this gate ships with NO pre-computed baseline
@@ -140,4 +145,6 @@ if [ ! -s "$BASELINE" ] || [ "$(python3 -c "import json,sys; print(len(json.load
   exit 1
 fi
 
-exec python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" --baseline "$BASELINE"
+# Again, not `exec` — the cleanup trap has to run (see above).
+python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" --baseline "$BASELINE"
+exit $?
