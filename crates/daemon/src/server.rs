@@ -1897,7 +1897,16 @@ async fn handle_request(
                             // inserts `run_id = NULL`, so this column is the
                             // ONLY ownership a workflow run has until (and
                             // unless) it is bound to a session run.
-                            if let Err(error) = sqlx::query(
+                            //
+                            // A failure here is NOT survivable, so it is not
+                            // merely logged: the row would keep both `run_id`
+                            // and `owner_uid` null, every later read, pause,
+                            // cancel and blackboard request would resolve it as
+                            // missing while its execution carried on in the
+                            // background, and boot adoption has already run so
+                            // nothing repairs it short of a restart. Reporting
+                            // the failure is the honest outcome.
+                            match sqlx::query(
                                 "UPDATE workflow_runs SET owner_uid = ? WHERE id = ? \
                                  AND owner_uid IS NULL",
                             )
@@ -1906,15 +1915,34 @@ async fn handle_request(
                             .execute(&state.pool)
                             .await
                             {
-                                warn!(%workflow_run_id, %error, "could not stamp workflow-run owner");
+                                Ok(_) => Envelope::reply_to(
+                                    &request,
+                                    Payload::WorkflowRunStarted {
+                                        command_id: command.command_id,
+                                        workflow_run_id,
+                                    },
+                                ),
+                                Err(error) => {
+                                    warn!(
+                                        %workflow_run_id, %error,
+                                        "could not stamp the workflow-run owner; \
+                                         reporting the start as failed"
+                                    );
+                                    Envelope::reply_to(
+                                        &request,
+                                        Payload::CommandRejected(
+                                            codypendent_protocol::CodypendentError::new(
+                                                "workflow.owner-unrecorded",
+                                                "the workflow run started but its owner could not \
+                                                 be recorded; it is not reachable and must be \
+                                                 cancelled"
+                                                    .to_string(),
+                                                true,
+                                            ),
+                                        ),
+                                    )
+                                }
                             }
-                            Envelope::reply_to(
-                                &request,
-                                Payload::WorkflowRunStarted {
-                                    command_id: command.command_id,
-                                    workflow_run_id,
-                                },
-                            )
                         }
                         Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
                     };
@@ -2629,11 +2657,12 @@ async fn handle_request(
                 // an agent writes through its own `blackboard.*` / `task.*` tools
                 // (which carry server-built agent attribution) rather than here.
                 CommandBody::PostBlackboardItem { scope, item } => {
-                    if let codypendent_protocol::BlackboardScope::WorkflowRun { workflow_run_id } =
-                        scope
-                    {
-                        if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
-                            .await?
+                    // Every scope, not only WorkflowRun: a repository board is
+                    // now owner-checked too (see principal_may_read_workflow),
+                    // and scoping this to workflow runs was what left the board
+                    // writable by any peer that could name the checkout.
+                    if let Some(gated_id) = board_scope_gate_id(scope) {
+                        if reject_unowned_workflow(state, conn, writer, &request, &gated_id).await?
                         {
                             return Ok(false);
                         }
@@ -2676,11 +2705,12 @@ async fn handle_request(
                     ordinal,
                     payload,
                 } => {
-                    if let codypendent_protocol::BlackboardScope::WorkflowRun { workflow_run_id } =
-                        scope
-                    {
-                        if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
-                            .await?
+                    // Every scope, not only WorkflowRun: a repository board is
+                    // now owner-checked too (see principal_may_read_workflow),
+                    // and scoping this to workflow runs was what left the board
+                    // writable by any peer that could name the checkout.
+                    if let Some(gated_id) = board_scope_gate_id(scope) {
+                        if reject_unowned_workflow(state, conn, writer, &request, &gated_id).await?
                         {
                             return Ok(false);
                         }
@@ -4328,7 +4358,18 @@ async fn principal_may_read_workflow(
     workflow_run_id: &str,
 ) -> anyhow::Result<bool> {
     if is_repository_board_id(workflow_run_id) {
-        return Ok(true);
+        // A repository task board is a synthetic run with no owning session and
+        // no owner_uid — its id is `board:<canonical repo>`, which any peer that
+        // knows the checkout path can construct. I previously returned true here
+        // and wrote "deliberately shared" in the comment, which was an assumption
+        // about who can reach the socket rather than anything derived: a peer
+        // could read and, via the repository-scoped board writes, corrupt another
+        // user's kanban.
+        //
+        // It is daemon-wide state with no per-row owner, exactly like the memory
+        // and promotion stores, so it takes the same answer they do: it belongs
+        // to the uid the daemon runs as.
+        return Ok(principal.uid() == state.daemon_uid);
     }
     match workflow_run_owner(&state.pool, workflow_run_id).await? {
         WorkflowOwner::Session(session_id) => {
@@ -4378,6 +4419,20 @@ async fn workflow_run_owner(
         // Neither: a pre-0033 row that boot adoption did not reach. Fail closed.
         Some(_) => WorkflowOwner::Missing,
     })
+}
+
+/// The id a board scope is authorized against, or `None` for a scope this
+/// daemon does not understand (rejected separately by `board_target`).
+fn board_scope_gate_id(scope: &codypendent_protocol::BlackboardScope) -> Option<String> {
+    match scope {
+        codypendent_protocol::BlackboardScope::WorkflowRun { workflow_run_id } => {
+            Some(workflow_run_id.clone())
+        }
+        codypendent_protocol::BlackboardScope::RepositoryBoard { repository } => {
+            Some(codypendent_protocol::board_scope_id(repository))
+        }
+        _ => None,
+    }
 }
 
 /// Whether `workflow_run_id` names a repository task board rather than a real
