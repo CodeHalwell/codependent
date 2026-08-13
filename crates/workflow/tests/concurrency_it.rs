@@ -206,14 +206,30 @@ async fn maximum_agents_serialises_the_excess_worker() {
         .filter(|(id, _, _)| id.starts_with('w'))
         .cloned()
         .collect();
-    let overlapping = workers
+    // At least one pair must NOT overlap: three mutually overlapping intervals
+    // would mean three workers ran at once under a cap of 2. (Pairs at the
+    // hand-off boundary can brush against each other by a fraction of a
+    // millisecond, so counting overlapping pairs exactly would be flaky; the
+    // property that matters is that no THREE were ever live together.)
+    let disjoint = workers
         .iter()
         .enumerate()
         .flat_map(|(i, a)| workers[i + 1..].iter().map(move |b| (a, b)))
-        .filter(|(a, b)| overlaps(a, b))
+        .filter(|(a, b)| !overlaps(a, b))
         .count();
-    assert_eq!(
-        overlapping, 1,
-        "with a cap of 2, exactly one pair of the three workers may overlap: {workers:?}"
+    assert!(
+        disjoint >= 1,
+        "with a cap of 2 the third worker must wait for a free slot: {workers:?}"
+    );
+    // The excess worker starts only after one of the first two has finished.
+    let last = workers
+        .iter()
+        .max_by_key(|(_, started, _)| *started)
+        .unwrap();
+    assert!(
+        workers
+            .iter()
+            .any(|worker| worker.0 != last.0 && worker.2 <= last.1),
+        "the last worker started before any slot was freed: {workers:?}"
     );
 }

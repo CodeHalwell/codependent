@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use codypendent_knowledge::{codegraph, GitRevision};
 use codypendent_protocol::RepositoryId;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, OwnedMutexGuard};
 use tracing::{debug, info, warn};
@@ -377,9 +378,8 @@ pub fn arm_watcher(
     // non-zero count into a full rescan.
     let dropped = Arc::new(AtomicUsize::new(0));
     let dropped_by_notify = Arc::clone(&dropped);
-    let mut watcher = codegraph::watcher(move |event| {
-        let Ok(event) = event else { return };
-        for path in event.paths {
+    let mut watcher = codegraph::watcher(move |paths: Vec<PathBuf>| {
+        for path in paths {
             if is_candidate_path(&filter_root, &path) && tx.try_send(path).is_err() {
                 dropped_by_notify.fetch_add(1, Ordering::Relaxed);
             }
@@ -479,6 +479,10 @@ async fn watch_loop(
     mut watched: HashSet<PathBuf>,
 ) {
     let mut last_full_rescan = Instant::now() - WATCH_FULL_RESCAN_COOLDOWN;
+    // The bytes last folded for each path, so a repeated event for an unchanged
+    // file costs a hash instead of a parse and a transaction. Belt and braces
+    // over the event-kind filter: any future event storm degrades to a read.
+    let mut folded: HashMap<String, [u8; 32]> = HashMap::new();
     while let Some(first) = rx.recv().await {
         let mut pending: HashSet<PathBuf> = HashSet::new();
         pending.insert(first);
@@ -541,7 +545,7 @@ async fn watch_loop(
                     "code-graph watcher: rebuild deferred by the cooldown; folding this batch incrementally"
                 );
             }
-            apply_batch(&pool, repository, &root, pending).await;
+            apply_batch(&pool, repository, &root, pending, &mut folded).await;
         }
         drop(guard);
 
@@ -562,6 +566,7 @@ async fn apply_batch(
     repository: RepositoryId,
     root: &Path,
     pending: HashSet<PathBuf>,
+    folded: &mut HashMap<String, [u8; 32]>,
 ) {
     let mut relative: Vec<String> = pending
         .iter()
@@ -571,7 +576,6 @@ async fn apply_batch(
     if relative.is_empty() {
         return;
     }
-    tracing::warn!(?relative, "PROBE batch paths");
     // `.gitignore` is asked once per batch, not once per file.
     let ignore_root = root.to_path_buf();
     let probe = relative.clone();
@@ -593,16 +597,29 @@ async fn apply_batch(
         let absolute = root.join(&path);
         match std::fs::read_to_string(&absolute) {
             Ok(source) => {
+                let digest: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+                if folded.get(&path) == Some(&digest) {
+                    continue;
+                }
                 match codegraph::upsert_file_graph(pool, repository, &revision, &path, &source)
                     .await
                 {
-                    Ok(_) => reparsed += 1,
+                    Ok(_) => {
+                        // Bounded: a repository past the scan cap would otherwise
+                        // grow this map without limit over the daemon's life.
+                        if folded.len() >= SCAN_FILE_CAP {
+                            folded.clear();
+                        }
+                        folded.insert(path.clone(), digest);
+                        reparsed += 1;
+                    }
                     Err(error) => warn!(%repository, path, %error, "code-graph reparse failed"),
                 }
             }
             // Gone (deleted or renamed away): retire what it defined, which a
             // reparse can never do because nothing reparses a missing file.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                folded.remove(&path);
                 match codegraph::remove_file_graph(pool, repository, &path).await {
                     Ok(removed) if removed > 0 => retired += 1,
                     Ok(_) => {}

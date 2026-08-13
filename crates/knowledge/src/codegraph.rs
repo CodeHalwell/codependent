@@ -1241,20 +1241,56 @@ impl GraphWatcher {
     }
 }
 
-/// Build a watcher that forwards raw notify events to `handler`, watching
-/// nothing until [`GraphWatcher::watch_subtree`] is called.
+/// True for an event kind that can change what the PARSER sees in a file.
 ///
-/// Intentionally minimal: it does not itself reparse — a caller debounces the
-/// events, applies the ignore/generated-file policy, and calls
+/// `notify`'s inotify mask includes `IN_OPEN`, so merely **reading** a watched
+/// file produces an event. A caller that reparses on every event therefore
+/// re-triggers itself the instant it opens the file it was just told about — an
+/// endless reparse loop running at the debounce frequency forever, which is
+/// exactly what the daemon did before this filter (observed 2026-08-13: one
+/// uncommitted edit produced a batch every 420 ms indefinitely). Metadata-only
+/// changes (`chmod`, an atime bump under a non-`relatime` mount) are dropped for
+/// the same reason: they cannot change a symbol.
+fn is_content_change(kind: &notify::EventKind) -> bool {
+    use notify::event::ModifyKind;
+    use notify::EventKind;
+    match kind {
+        EventKind::Create(_) | EventKind::Remove(_) => true,
+        EventKind::Modify(ModifyKind::Metadata(_)) => false,
+        EventKind::Modify(_) => true,
+        EventKind::Access(_) => false,
+        // `Any`/`Other` come from backends that do not classify (the polling
+        // fallback). Treat them as changes: a spurious reparse is cheap, a
+        // silently dropped edit is the bug this whole pipeline exists to fix.
+        EventKind::Any | EventKind::Other => true,
+    }
+}
+
+/// Build a watcher that forwards the paths of **content-changing** filesystem
+/// events to `handler`, watching nothing until [`GraphWatcher::watch_subtree`]
+/// is called.
+///
+/// The handler receives plain paths, not `notify` types: kind classification
+/// (see [`is_content_change`]) and error suppression belong here, next to the
+/// dependency, and keeping them here is what lets the daemon drive a watcher
+/// without naming `notify` at all.
+///
+/// Intentionally minimal beyond that: it does not itself reparse — a caller
+/// debounces the paths, applies the ignore/generated-file policy, and calls
 /// [`upsert_file_graph`] per changed file to produce a [`GraphDelta`]. The
 /// daemon's `scan::arm_watcher` is that caller.
-pub fn watcher<F>(handler: F) -> Result<GraphWatcher, CodeGraphError>
+pub fn watcher<F>(mut handler: F) -> Result<GraphWatcher, CodeGraphError>
 where
-    F: FnMut(notify::Result<notify::Event>) + Send + 'static,
+    F: FnMut(Vec<std::path::PathBuf>) + Send + 'static,
 {
-    Ok(GraphWatcher {
-        inner: notify::recommended_watcher(handler)?,
-    })
+    let inner = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let Ok(event) = event else { return };
+        if !is_content_change(&event.kind) {
+            return;
+        }
+        handler(event.paths);
+    })?;
+    Ok(GraphWatcher { inner })
 }
 
 /// Arm a recursive filesystem watcher over `root` — [`watcher`] plus a single
@@ -1262,7 +1298,7 @@ where
 /// tree; the daemon deliberately does not (see [`GraphWatcher`]).
 pub fn watch<F>(root: &Path, handler: F) -> Result<GraphWatcher, CodeGraphError>
 where
-    F: FnMut(notify::Result<notify::Event>) + Send + 'static,
+    F: FnMut(Vec<std::path::PathBuf>) + Send + 'static,
 {
     let mut watcher = watcher(handler)?;
     watcher.watch_subtree(root, true)?;

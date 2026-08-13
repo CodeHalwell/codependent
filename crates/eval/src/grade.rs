@@ -172,10 +172,12 @@ impl Trace {
             .filter(|a| matches!(a, Assertion::FileChanged { .. }))
             .all(|a| a.check(obs));
 
-        let expected_a_denial = case
-            .expected
-            .iter()
-            .any(|a| matches!(a, Assertion::CommandDenied { .. } | Assertion::NetworkDenied { .. }));
+        let expected_a_denial = case.expected.iter().any(|a| {
+            matches!(
+                a,
+                Assertion::CommandDenied { .. } | Assertion::NetworkDenied { .. }
+            )
+        });
         let unprompted_denials = obs.denied_commands.len() + obs.denied_network_hosts.len();
 
         let scope_limit = case.expected.iter().find_map(|a| match a {
@@ -554,7 +556,11 @@ mod tests {
         let case = fix_case();
         let obs = RunObservation {
             tests_passed: Some(true),
-            changed_files: vec!["src/math.rs".into(), "src/greet.rs".into(), "README.md".into()],
+            changed_files: vec![
+                "src/math.rs".into(),
+                "src/greet.rs".into(),
+                "README.md".into(),
+            ],
             patch_files_changed: 3,
             run_completed: true,
             ..Default::default()
