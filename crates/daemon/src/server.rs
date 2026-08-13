@@ -1651,11 +1651,6 @@ async fn handle_request(
                 // A lease is a precursor to writing, so — as with a non-resolving
                 // `MutateDocument` — an Observer may not take one.
                 CommandBody::AcquireDocumentLease { lease, ttl_seconds } => {
-                    if reject_unowned_document(state, conn, writer, &request, lease.document_id)
-                        .await?
-                    {
-                        return Ok(false);
-                    }
                     if conn.role == ClientRole::Observer {
                         let reply = Envelope::reply_to(
                             &request,
@@ -1680,6 +1675,14 @@ async fn handle_request(
                         send(writer, &reply).await?;
                         return Ok(false);
                     };
+                    // Ownership AFTER role + transport, so those refusals keep
+                    // their existing meaning; this is the gate a Controller peer
+                    // that knows a document id has to pass.
+                    if reject_unowned_document(state, conn, writer, &request, lease.document_id)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
                     let acquire = DocumentLeaseRequest {
                         document_id: lease.document_id,
                         block_id: lease.block_id.clone(),
@@ -1925,14 +1928,17 @@ async fn handle_request(
                 // synchronous state change and drives the run onward in the
                 // background, so the reply is a fast accept/reject (Phase 5 STEP 5.2).
                 CommandBody::PauseWorkflow { workflow_run_id } => {
-                    if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
-                        .await?
-                    {
-                        return Ok(false);
-                    }
                     if let Some(lifecycle) =
                         workflow_control_seam(state, conn, writer, &request, "pause").await?
                     {
+                        // Ownership AFTER role/transport: a role refusal describes the
+                        // connection, not the resource, so it leaks nothing and must keep
+                        // its existing contract. This gate is what stops a Controller peer.
+                        if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                            .await?
+                        {
+                            return Ok(false);
+                        }
                         let reply = match lifecycle
                             .pause(PauseWorkflowRequest {
                                 workflow_run_id: workflow_run_id.clone(),
@@ -1956,14 +1962,17 @@ async fn handle_request(
                     }
                 }
                 CommandBody::ResumeWorkflow { workflow_run_id } => {
-                    if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
-                        .await?
-                    {
-                        return Ok(false);
-                    }
                     if let Some(lifecycle) =
                         workflow_control_seam(state, conn, writer, &request, "resume").await?
                     {
+                        // Ownership AFTER role/transport: a role refusal describes the
+                        // connection, not the resource, so it leaks nothing and must keep
+                        // its existing contract. This gate is what stops a Controller peer.
+                        if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                            .await?
+                        {
+                            return Ok(false);
+                        }
                         let reply = match lifecycle
                             .resume(ResumeWorkflowRequest {
                                 workflow_run_id: workflow_run_id.clone(),
@@ -1990,14 +1999,14 @@ async fn handle_request(
                     workflow_run_id,
                     node_id,
                 } => {
-                    if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
-                        .await?
-                    {
-                        return Ok(false);
-                    }
                     if let Some(lifecycle) =
                         workflow_control_seam(state, conn, writer, &request, "retry").await?
                     {
+                        if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                            .await?
+                        {
+                            return Ok(false);
+                        }
                         let reply = match lifecycle
                             .retry_node(RetryWorkflowNodeRequest {
                                 workflow_run_id: workflow_run_id.clone(),
@@ -2027,14 +2036,17 @@ async fn handle_request(
                 // change (run → Cancelled, pending nodes → Skipped) and interrupts any
                 // in-flight node agent run, so the reply is a fast accept/reject.
                 CommandBody::CancelWorkflow { workflow_run_id } => {
-                    if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
-                        .await?
-                    {
-                        return Ok(false);
-                    }
                     if let Some(lifecycle) =
                         workflow_control_seam(state, conn, writer, &request, "cancel").await?
                     {
+                        // Ownership AFTER role/transport: a role refusal describes the
+                        // connection, not the resource, so it leaks nothing and must keep
+                        // its existing contract. This gate is what stops a Controller peer.
+                        if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                            .await?
+                        {
+                            return Ok(false);
+                        }
                         let reply = match lifecycle
                             .cancel(CancelWorkflowRequest {
                                 workflow_run_id: workflow_run_id.clone(),

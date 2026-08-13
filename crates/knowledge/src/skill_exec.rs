@@ -435,6 +435,42 @@ pub struct SkillRunner {
     gate: Arc<dyn RunPolicyGate>,
 }
 
+/// Whether `relpath` names a script BENEATH the manifest's declared `scripts`
+/// entrypoint.
+///
+/// Compared component-wise, and refusing `.`/`..` outright. Two escapes lived
+/// here, one behind the other:
+///
+/// * a string prefix (`starts_with`) also admitted `scripts-evil/run`, a
+///   sibling directory that merely shares a name prefix;
+/// * comparing components alone still admitted `scripts/../other/run.sh`, whose
+///   FIRST component is `scripts` — `resolve_within` then canonicalizes that to
+///   `other/run.sh` and only checks it stayed inside the package.
+///
+/// Both resolve inside the package, so nothing downstream catches either. The
+/// manifest says where a package's behaviour lives; this is the check that
+/// makes that mean something.
+fn script_is_under_entrypoint(declared: &str, relpath: &str) -> bool {
+    let declared_components: Vec<&str> = declared
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let candidate_components: Vec<&str> =
+        relpath.split('/').filter(|part| !part.is_empty()).collect();
+    if candidate_components
+        .iter()
+        .any(|part| *part == "." || *part == "..")
+    {
+        return false;
+    }
+    candidate_components.len() > declared_components.len()
+        && candidate_components
+            .iter()
+            .zip(&declared_components)
+            .all(|(candidate, declared)| candidate == declared)
+}
+
 impl SkillRunner {
     /// Build a runner over an explicit executor — the seam tests and alternative
     /// hosts use.
@@ -503,27 +539,7 @@ impl SkillRunner {
                         reason: "the package declares no `scripts` entrypoint".into(),
                     }
                 })?;
-                // A script must live under the declared scripts entrypoint, not
-                // merely inside the package: the manifest names where behaviour
-                // lives, and a caller must not be able to run some other file
-                // the package happens to ship.
-                // Compared by PATH COMPONENT, not string prefix: with
-                // `scripts = "scripts/"`, a bare `starts_with` also admitted
-                // `scripts-evil/run`, which resolves inside the package and so
-                // survived every later check — defeating the boundary this is.
-                let declared_components: Vec<&str> = declared
-                    .trim_end_matches('/')
-                    .split('/')
-                    .filter(|part| !part.is_empty())
-                    .collect();
-                let candidate_components: Vec<&str> =
-                    relpath.split('/').filter(|part| !part.is_empty()).collect();
-                let under_declared = candidate_components.len() > declared_components.len()
-                    && candidate_components
-                        .iter()
-                        .zip(&declared_components)
-                        .all(|(candidate, declared)| candidate == declared);
-                if !under_declared {
+                if !script_is_under_entrypoint(declared, relpath) {
                     return Err(SkillExecError::ScriptEscapesPackage {
                         path: relpath.clone(),
                     });
@@ -597,22 +613,7 @@ mod tests {
     /// meant nothing. The comparison is by path component for that reason.
     #[test]
     fn a_sibling_directory_does_not_satisfy_the_scripts_entrypoint() {
-        fn under(declared: &str, candidate: &str) -> bool {
-            let declared_components: Vec<&str> = declared
-                .trim_end_matches('/')
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .collect();
-            let candidate_components: Vec<&str> = candidate
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .collect();
-            candidate_components.len() > declared_components.len()
-                && candidate_components
-                    .iter()
-                    .zip(&declared_components)
-                    .all(|(candidate, declared)| candidate == declared)
-        }
+        let under = super::script_is_under_entrypoint;
 
         assert!(under("scripts/", "scripts/run.sh"), "the declared case");
         assert!(under("scripts", "scripts/nested/run.sh"), "nested is fine");
@@ -626,6 +627,15 @@ mod tests {
             "the directory itself is not a script"
         );
         assert!(!under("scripts/", "other/run.sh"), "an unrelated directory");
+
+        // Traversal: the first component IS `scripts`, and `resolve_within`
+        // would then canonicalize this to `other/run.sh` — still inside the
+        // package, but outside the declared entrypoint.
+        assert!(
+            !under("scripts/", "scripts/../other/run.sh"),
+            "`..` must not be treated as an ordinary component"
+        );
+        assert!(!under("scripts/", "scripts/./run.sh"), "`.` is refused too");
     }
     use super::*;
     use codypendent_sandbox::RefusingSandbox;
