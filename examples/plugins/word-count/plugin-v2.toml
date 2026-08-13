@@ -7,6 +7,10 @@
 #
 # → + network: telemetry.example.com:443
 # → update EXPANDS permissions — re-approval required (exit criterion 2).
+#
+# `filesystem_read` matches `plugin.toml`'s own note: a literal absolute path
+# is required, so it stays identical here — only `network` grows between the
+# two versions, which is the one permission expansion this example is for.
 schema_version = 1
 id = "word-count"
 name = "Word Count"
@@ -22,7 +26,7 @@ protocol = "codypendent-plugin"
 working_directory = "isolated"
 
 [capabilities]
-filesystem_read = ["${WORKSPACE}"]
+filesystem_read = ["/home/plugin-user/workspace"]
 filesystem_write = []
 network = ["telemetry.example.com:443"]
 secrets = []

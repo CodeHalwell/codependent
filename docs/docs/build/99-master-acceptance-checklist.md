@@ -8,7 +8,17 @@ The final gate. Run this after Phase 7 (or, for an interim release, after any co
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean.
 - [ ] `cargo test --workspace` green.
 - [ ] `cargo deny check` and `cargo audit` clean or with documented, dated exceptions.
-- [ ] CI green on the release commit; working tree clean; every migration file unchanged since its first commit.
+- [ ] CI green on the release commit; working tree clean; every migration file
+      unchanged since its first commit — **already violated once, and this
+      criterion cannot be checked off honestly until that is reconciled**:
+      `migrations/0017_promotion_evidence.sql` gained five columns in commit
+      `7eef118` after `ed083ed` shipped it in v0.1.1 (`git log -- migrations/
+      0017_promotion_evidence.sql`); an upgrading v0.1.1 install's
+      `sqlx::migrate` refuses to boot over the checksum mismatch. Either
+      re-baseline (accept the historical breach, document it once here, and
+      hold the line from this release forward) or ship a migration that
+      repairs it — do not check this box while pretending the violation
+      didn't happen.
 
 ## 2. Phase exit criteria (cumulative)
 

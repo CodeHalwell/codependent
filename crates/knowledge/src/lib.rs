@@ -110,8 +110,9 @@ pub use docs::model::{
     LinkTarget, MutationKind, ResolvedSymbol,
 };
 pub use docs::render::{
-    plan_publication, publications, record_publication, render_document, Publication, PublishPlan,
-    PublishTarget,
+    pending_pull_request_publications, plan_publication, publications, record_publication,
+    record_pull_request_merge, render_document, Publication, PublishPlan, PublishTarget,
+    PullRequestHandle,
 };
 pub use docs::replica::DocumentReplica;
 pub use docs::staleness::{

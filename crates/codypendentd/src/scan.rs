@@ -346,8 +346,12 @@ impl Drop for RepositoryWatcher {
 /// Bounded on every axis, because this runs for the daemon's whole life against
 /// a tree a build system is also writing to:
 ///
-/// * only `*.rs` files outside `target/`, `.git/`, and any dot-directory reach
-///   the channel at all (filtered in the notify callback, before the queue);
+/// * `target/`, `.git/`, any other dot-directory, and every `.gitignore`d
+///   top-level directory are never WATCHED at all — one `inotify` watch is
+///   taken per directory, so filtering their events afterwards would still
+///   register thousands of kernel watches for build output;
+/// * of what is watched, only `*.rs` files reach the channel (filtered in the
+///   notify callback, before the queue);
 /// * `.gitignore` is applied per batch, by asking Git (see [`ignored_paths`]);
 /// * events are debounced by [`WATCH_DEBOUNCE`] and capped at [`WATCH_MAX_WINDOW`];
 /// * a batch over [`WATCH_BATCH_CAP`] files (a branch switch) collapses to ONE
@@ -373,7 +377,7 @@ pub fn arm_watcher(
     // non-zero count into a full rescan.
     let dropped = Arc::new(AtomicUsize::new(0));
     let dropped_by_notify = Arc::clone(&dropped);
-    let watcher = codegraph::watch(&root, move |event| {
+    let mut watcher = codegraph::watcher(move |event| {
         let Ok(event) = event else { return };
         for path in event.paths {
             if is_candidate_path(&filter_root, &path) && tx.try_send(path).is_err() {
@@ -381,12 +385,12 @@ pub fn arm_watcher(
             }
         }
     })?;
+    let watched = arm_source_subtrees(&mut watcher, &root, &mut HashSet::new());
 
     let task = tokio::spawn(async move {
         // The watcher lives exactly as long as this task: aborting the task on
         // `RepositoryWatcher::drop` drops it here, which joins notify's thread.
-        let _watcher = watcher;
-        watch_loop(pool, repository, root, rx, dropped).await;
+        watch_loop(pool, repository, root, rx, dropped, watcher, watched).await;
     });
     info!(%repository, "code-graph watcher armed");
     Ok(RepositoryWatcher { repository, task })
@@ -414,13 +418,65 @@ fn is_candidate_path(root: &Path, path: &Path) -> bool {
     })
 }
 
+/// Watch `root` itself (non-recursively) plus every immediate child directory
+/// that could hold source, recursively — skipping `target/`, `.git/`, any other
+/// dot-directory, and anything `.gitignore` excludes.
+///
+/// One `inotify` watch is taken per directory, so a recursive watch on the root
+/// would register thousands for build output that can only ever produce events
+/// [`is_candidate_path`] discards. `already` carries the set arming has covered,
+/// so re-calling this only adds newly appeared directories. Returns the updated
+/// set. Best-effort per directory: one unwatchable path is logged and skipped,
+/// never fatal.
+fn arm_source_subtrees(
+    watcher: &mut codegraph::GraphWatcher,
+    root: &Path,
+    already: &mut HashSet<PathBuf>,
+) -> HashSet<PathBuf> {
+    // The root is watched non-recursively so a NEW top-level directory (a new
+    // crate) is noticed at all; the sweep below then arms it on the next batch.
+    if already.insert(root.to_path_buf()) {
+        if let Err(error) = watcher.watch_subtree(root, false) {
+            warn!(root = %root.display(), %error, "could not watch the repository root");
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return std::mem::take(already);
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "target" {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            candidates.push((name.into_owned(), entry.path()));
+        }
+    }
+    let relative: Vec<String> = candidates.iter().map(|(name, _)| name.clone()).collect();
+    let ignored = ignored_paths(root, &relative);
+    for (name, path) in candidates {
+        if ignored.contains(&name) || !already.insert(path.clone()) {
+            continue;
+        }
+        if let Err(error) = watcher.watch_subtree(&path, true) {
+            warn!(path = %path.display(), %error, "could not watch a source subtree");
+        }
+    }
+    std::mem::take(already)
+}
+
 /// Drain events, debounce them into batches, and fold each batch into the graph.
+#[allow(clippy::too_many_arguments)]
 async fn watch_loop(
     pool: SqlitePool,
     repository: RepositoryId,
     root: PathBuf,
     mut rx: mpsc::Receiver<PathBuf>,
     dropped: Arc<AtomicUsize>,
+    mut watcher: codegraph::GraphWatcher,
+    mut watched: HashSet<PathBuf>,
 ) {
     let mut last_full_rescan = Instant::now() - WATCH_FULL_RESCAN_COOLDOWN;
     while let Some(first) = rx.recv().await {
@@ -488,6 +544,11 @@ async fn watch_loop(
             apply_batch(&pool, repository, &root, pending).await;
         }
         drop(guard);
+
+        // A new top-level directory (a crate added mid-session) is not covered
+        // by any recursive watch yet — the root's own non-recursive watch is what
+        // reported it. One `read_dir` of the root per batch closes that gap.
+        watched = arm_source_subtrees(&mut watcher, &root, &mut watched);
 
         if closed {
             break;
@@ -670,6 +731,56 @@ mod tests {
             repository_id_for(b.path()),
             "different roots → different repository ids"
         );
+    }
+
+    #[test]
+    fn candidate_paths_are_judged_relative_to_the_checkout() {
+        // The checkout's own ancestors are none of the filter's business. Judging
+        // the ABSOLUTE path rejected every file in a repository living under a
+        // dot-directory — `/tmp/.tmpXk9/…`, `~/.local/share/…`, a checkout inside
+        // a dot-prefixed workspace — and the watcher then folded nothing at all.
+        let root = Path::new("/tmp/.tmpXk9/repo");
+        assert!(is_candidate_path(root, &root.join("src/lib.rs")));
+        assert!(is_candidate_path(root, &root.join("crates/a/src/mod.rs")));
+
+        // Inside the checkout the rules still bite.
+        assert!(!is_candidate_path(
+            root,
+            &root.join("target/debug/build.rs")
+        ));
+        assert!(!is_candidate_path(root, &root.join(".git/hooks/x.rs")));
+        assert!(!is_candidate_path(root, &root.join(".cargo/config.rs")));
+        assert!(!is_candidate_path(root, &root.join("src/lib.py")));
+        assert!(!is_candidate_path(root, &root.join("src/nested")));
+    }
+
+    #[test]
+    fn ignored_paths_asks_git_and_degrades_to_an_empty_set() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        std::fs::write(repo.path().join(".gitignore"), "generated/\n").unwrap();
+        std::fs::create_dir_all(repo.path().join("generated")).unwrap();
+        std::fs::write(repo.path().join("generated/a.rs"), "").unwrap();
+        std::fs::write(repo.path().join("kept.rs"), "").unwrap();
+
+        let probe = vec!["generated/a.rs".to_string(), "kept.rs".to_string()];
+        let ignored = ignored_paths(repo.path(), &probe);
+        assert!(ignored.contains("generated/a.rs"), "{ignored:?}");
+        assert!(!ignored.contains("kept.rs"), "{ignored:?}");
+
+        // Outside a checkout Git cannot answer; the filter must then exclude
+        // nothing rather than excluding everything.
+        let plain = tempfile::tempdir().unwrap();
+        assert!(ignored_paths(plain.path(), &probe).is_empty());
+        assert!(ignored_paths(repo.path(), &[]).is_empty());
+    }
+
+    #[test]
+    fn a_working_tree_fold_is_stamped_so_the_revision_says_uncommitted() {
+        let repo = tempfile::tempdir().unwrap();
+        // No commits yet: `head_revision` reports the `workdir` placeholder, which
+        // must not be doubled into `workdir+workdir`.
+        assert_eq!(working_tree_revision(repo.path()).0, "workdir");
     }
 
     #[test]

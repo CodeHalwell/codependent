@@ -573,7 +573,9 @@ mod tests {
 
         let before = store.get(&pool, &model, endpoint).await.unwrap().unwrap();
         assert_eq!(
-            before.performance.predicted_success(TaskClass::SafeRefactor),
+            before
+                .performance
+                .predicted_success(TaskClass::SafeRefactor),
             0.76,
             "no history yet: falls back to overall reliability"
         );
@@ -601,7 +603,10 @@ mod tests {
             "unrelated class keeps its own history (from rich_local_profile), untouched"
         );
         // Nothing else in the profile was disturbed by the fold.
-        assert_eq!(after.performance.reliability, before.performance.reliability);
+        assert_eq!(
+            after.performance.reliability,
+            before.performance.reliability
+        );
         assert_eq!(after.capabilities, before.capabilities);
         assert_eq!(after.bench, before.bench);
     }
@@ -666,13 +671,15 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let (count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM model_task_outcomes WHERE run_id = 'run-retried'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(count, 1, "a retried call for the same run_id must not double-insert");
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM model_task_outcomes WHERE run_id = 'run-retried'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 1,
+            "a retried call for the same run_id must not double-insert"
+        );
 
         let after = store.get(&pool, &model, endpoint).await.unwrap().unwrap();
         assert_eq!(

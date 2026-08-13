@@ -1211,19 +1211,61 @@ fn assemble(
 // Incremental pipeline — filesystem watcher (minimal)
 // --------------------------------------------------------------------------
 
-/// Arm a recursive filesystem watcher over `root`, forwarding raw notify events
-/// to `handler`. This is intentionally minimal: it does not itself reparse — a
-/// caller debounces the events, applies the ignore/generated-file policy, and
-/// calls [`upsert_file_graph`] per changed file to produce a [`GraphDelta`].
+/// A filesystem watcher whose watched subtrees the caller chooses one at a time.
 ///
-/// The returned watcher owns its own background thread and stops when dropped;
-/// tests never start one (no background threads in tests).
-pub fn watch<F>(root: &Path, handler: F) -> Result<notify::RecommendedWatcher, CodeGraphError>
+/// Wrapping `notify`'s watcher keeps the dependency inside this crate (the
+/// daemon drives it without naming `notify`), and — more importantly — lets the
+/// caller arm *selected* subtrees rather than one recursive watch over the
+/// repository root. That distinction is not cosmetic: `inotify` registers one
+/// kernel watch per directory, and a recursive watch on a Rust checkout root
+/// registers thousands for `target/` alone (5065 in this repository) that can
+/// only ever produce events the caller discards. Filtering events is not enough;
+/// the watches must not be taken in the first place.
+///
+/// The watcher owns its own background thread and stops when dropped.
+pub struct GraphWatcher {
+    inner: notify::RecommendedWatcher,
+}
+
+impl GraphWatcher {
+    /// Start watching `path`, recursively or not. Idempotent per path in
+    /// `notify`'s own semantics (re-watching replaces the previous mode).
+    pub fn watch_subtree(&mut self, path: &Path, recursive: bool) -> Result<(), CodeGraphError> {
+        let mode = if recursive {
+            notify::RecursiveMode::Recursive
+        } else {
+            notify::RecursiveMode::NonRecursive
+        };
+        notify::Watcher::watch(&mut self.inner, path, mode)?;
+        Ok(())
+    }
+}
+
+/// Build a watcher that forwards raw notify events to `handler`, watching
+/// nothing until [`GraphWatcher::watch_subtree`] is called.
+///
+/// Intentionally minimal: it does not itself reparse — a caller debounces the
+/// events, applies the ignore/generated-file policy, and calls
+/// [`upsert_file_graph`] per changed file to produce a [`GraphDelta`]. The
+/// daemon's `scan::arm_watcher` is that caller.
+pub fn watcher<F>(handler: F) -> Result<GraphWatcher, CodeGraphError>
 where
     F: FnMut(notify::Result<notify::Event>) + Send + 'static,
 {
-    let mut watcher = notify::recommended_watcher(handler)?;
-    notify::Watcher::watch(&mut watcher, root, notify::RecursiveMode::Recursive)?;
+    Ok(GraphWatcher {
+        inner: notify::recommended_watcher(handler)?,
+    })
+}
+
+/// Arm a recursive filesystem watcher over `root` — [`watcher`] plus a single
+/// recursive subtree. Convenience for a caller that genuinely wants the whole
+/// tree; the daemon deliberately does not (see [`GraphWatcher`]).
+pub fn watch<F>(root: &Path, handler: F) -> Result<GraphWatcher, CodeGraphError>
+where
+    F: FnMut(notify::Result<notify::Event>) + Send + 'static,
+{
+    let mut watcher = watcher(handler)?;
+    watcher.watch_subtree(root, true)?;
     Ok(watcher)
 }
 

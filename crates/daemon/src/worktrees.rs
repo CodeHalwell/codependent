@@ -1316,7 +1316,10 @@ mod tests {
         git(wt, &["commit", "-q", "-m", "worker output"]);
         mgr.release(&pool, &store, lease.id, false).await.unwrap();
         assert!(wt.exists(), "unmerged work retains its worktree");
-        git(&repo, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
+        git(
+            &repo,
+            &["worktree", "remove", "--force", &wt.to_string_lossy()],
+        );
 
         let report = mgr.reconcile_on_startup(&pool).await.unwrap();
         assert!(report.reclaimed_branches.is_empty());

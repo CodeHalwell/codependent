@@ -200,6 +200,14 @@ enum TopCommand {
         #[command(subcommand)]
         command: CouncilCommand,
     },
+    /// Configure live measured routing (Phase 7 STEP 7.2/7.3, outcome 11):
+    /// per-task-node model selection from benched profiles, instead of the
+    /// Phase-1 resolver's first-reachable-candidate-in-file-order. Reads and
+    /// writes `<data_dir>/routing.toml`. Default OFF.
+    Routing {
+        #[command(subcommand)]
+        command: RoutingCommand,
+    },
     /// Hand a session off to an IDE (STEP 3.7): print how to attach, and launch
     /// the editor if it is on `PATH`. The IDE attaches as a contributor to the
     /// same session — the run keeps going, it never restarts.
@@ -742,6 +750,26 @@ enum ModelsCommand {
         /// `Qwen3-32B-GGUF:UD-Q4_K_XL`, or `some-org/Some-Model-GGUF:Q8_0`.
         spec: String,
     },
+}
+
+#[derive(Subcommand)]
+enum RoutingCommand {
+    /// Show whether the routing seam is enabled and what `routing.toml`
+    /// currently declares (outcome 11).
+    Status,
+    /// Turn on live measured routing: task nodes are sent to
+    /// `codypendent-routing`'s `Router` over benched model profiles instead
+    /// of the Phase-1 resolver's first-reachable-candidate order.
+    Enable {
+        /// The most sensitive data this scope is asserted to handle
+        /// (`public`|`internal`|`confidential`|`secret`). Governs which
+        /// models may be selected for off-device (hosted) routing — omit to
+        /// keep the fail-closed default (`Unknown`, local-only).
+        #[arg(long)]
+        data_classification: Option<String>,
+    },
+    /// Turn off live measured routing (the Phase-1 resolver decides again).
+    Disable,
 }
 
 #[derive(Subcommand)]
@@ -1338,6 +1366,13 @@ async fn main() -> anyhow::Result<()> {
                 codypendent_cli::council::run(&paths, &name, objective, repository, json, evidence)
                     .await
             }
+        },
+        TopCommand::Routing { command } => match command {
+            RoutingCommand::Status => commands::routing_status(&paths),
+            RoutingCommand::Enable {
+                data_classification,
+            } => commands::routing_enable(&paths, data_classification.as_deref()),
+            RoutingCommand::Disable => commands::routing_disable(&paths),
         },
         TopCommand::Open {
             session_id,

@@ -1526,7 +1526,8 @@ impl AgentLoopNodeExecutor {
         let wall_time_secs = started.elapsed().as_secs();
 
         match result {
-            Ok(ToolNodeResult::Completed { test, patch }) => {
+            Ok(ToolNodeResult::Completed(success)) => {
+                let ToolNodeSuccess { test, patch } = *success;
                 // Map the tool result onto the node's declared blackboard outputs
                 // (e.g. `verify` → `test_result`), through the same store path an
                 // agent node's outputs take.
@@ -1795,10 +1796,10 @@ impl AgentLoopNodeExecutor {
                 )
                 .await;
                 if outcome.success {
-                    Ok(ToolNodeResult::Completed {
+                    Ok(ToolNodeResult::Completed(Box::new(ToolNodeSuccess {
                         test: Some(outcome),
                         patch: None,
-                    })
+                    })))
                 } else {
                     // A failing test is a retryable node failure (T6 retry: the
                     // canonical `verify` step declares attempts: 2).
@@ -1913,10 +1914,10 @@ impl AgentLoopNodeExecutor {
             bytes = consolidated.byte_length,
             "consolidated worker patches"
         );
-        Ok(ToolNodeResult::Completed {
+        Ok(ToolNodeResult::Completed(Box::new(ToolNodeSuccess {
             test: None,
             patch: Some(consolidated),
-        })
+        })))
     }
 
     /// Every live `proposed_patch` on the run's board as `(author, diff bytes)`,
@@ -1967,8 +1968,8 @@ impl AgentLoopNodeExecutor {
                 })?;
             patches.push((author, bytes));
         }
+        // Deterministic regardless of which worker finished first.
         patches.sort_by(|a, b| a.0.cmp(&b.0));
-        patches.truncate(1); // TEMP: the old most-recent-wins rule
         Ok(patches)
     }
 
@@ -2124,10 +2125,10 @@ impl AgentLoopNodeExecutor {
                 )
                 .await;
                 info!(node = %ctx.node.id, pr = pr.number, "workflow tool node updated the pull request");
-                Ok(ToolNodeResult::Completed {
+                Ok(ToolNodeResult::Completed(Box::new(ToolNodeSuccess {
                     test: None,
                     patch: None,
-                })
+                })))
             }
             Err(error) => {
                 let reason = format!("github.update_pull_request failed: {error}");
@@ -2714,11 +2715,9 @@ fn budget_consumption(
 enum ToolNodeResult {
     /// The tool ran to completion. `test` carries a `repository.test` result and
     /// `patch` a `patch.consolidate` result, for declared-output posting; each is
-    /// `None` for the tool kinds that do not produce it.
-    Completed {
-        test: Option<RepositoryTestOutcome>,
-        patch: Option<ArtifactRef>,
-    },
+    /// `None` for the tool kinds that do not produce it. Boxed because the
+    /// success payload dwarfs the two unit variants.
+    Completed(Box<ToolNodeSuccess>),
     /// The node parked for approval and the approval was rejected.
     Rejected,
     /// The workflow was cancelled while the node was parked for approval (MF-1):
@@ -2732,6 +2731,11 @@ enum ToolNodeResult {
 /// `CancelWorkflow` fired the run's cancellation token while the node was parked
 /// (or raced its grant), so the park returns WITHOUT the node proceeding to its
 /// (possibly durable) write.
+struct ToolNodeSuccess {
+    test: Option<RepositoryTestOutcome>,
+    patch: Option<ArtifactRef>,
+}
+
 enum ParkOutcome {
     Approved,
     Rejected,

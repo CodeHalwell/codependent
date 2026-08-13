@@ -3,7 +3,7 @@
 //! `docs publish` (Phase 4 STEP 4.4).
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -3178,6 +3178,192 @@ pub fn models_list_providers(paths: &RuntimePaths) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// `codypendent routing status | enable | disable` (outcome 11)
+// ---------------------------------------------------------------------------
+//
+// `crates/codypendentd/src/routing.rs`'s `RoutingConfig::load` reads
+// `<data_dir>/routing.toml`, but nothing in the shipped CLI ever wrote one —
+// the 2026-08-13 review (`2026-08-13-verticals/sandbox-eval-routing.md`,
+// 11.8) found the routing-decision explanation surface fully built and
+// reachable from real code, gated behind exactly this file, with "no CLI
+// command that writes routing.toml" as the one missing piece keeping it from
+// ever firing on a default install. These three commands are that piece.
+//
+// This is a SEPARATE writer from `RoutingConfig::load`'s reader by
+// necessity (`codypendentd`'s `routing` module is private to that crate, and
+// `crates/cli` cannot reach its `RoutingConfigFile` type — see this
+// function's own doc comments for why that boundary is intentional rather
+// than worked around), so it deliberately does the minimum a shared-file
+// writer must: read the file as a generic [`toml::Value`] (never a struct
+// that only models the keys this command knows about), touch only the
+// specific keys each subcommand is documented to set, and write everything
+// else in the table back untouched — an operator's hand-edited `[policy]`
+// table (there is no CLI surface for authoring one; RULE: don't build a
+// second, narrower one that silently drops it) survives `routing enable`/
+// `disable` exactly as they left it.
+
+/// `codypendent routing status`: whether the routing seam is enabled, and
+/// what `<data_dir>/routing.toml` currently declares. Prints the raw file
+/// state, not a re-validated one — `codypendentd`'s own fail-closed loader
+/// (which rejects a malformed policy) is the daemon-side authority; this is
+/// "here is what is on disk," useful precisely when those two might disagree.
+pub fn routing_status(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let path = paths.data_dir.join("routing.toml");
+    let Some(doc) = read_routing_toml(&path)? else {
+        println!(
+            "routing: disabled (no {} — the Phase-1 resolver picks a model)",
+            path.display()
+        );
+        return Ok(());
+    };
+    let enabled = doc
+        .get("enabled")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    println!(
+        "routing: {} ({})",
+        if enabled { "ENABLED" } else { "disabled" },
+        path.display()
+    );
+    match doc
+        .get("data_classification")
+        .and_then(|v| v.get("type"))
+        .and_then(toml::Value::as_str)
+    {
+        Some(kind) => println!("  data_classification ceiling: {kind}"),
+        None => println!(
+            "  data_classification ceiling: (undeclared — fails closed to Unknown, local-only)"
+        ),
+    }
+    println!(
+        "  policy: {}",
+        if doc.get("policy").is_some() {
+            "custom (see routing.toml [policy])"
+        } else {
+            "default (router/balanced/1)"
+        }
+    );
+    if enabled {
+        println!(
+            "  note: routing also requires at least one benched profile \
+             (`codypendent models bench <id>`) — with none, every run still \
+             fails closed rather than silently falling back."
+        );
+    }
+    Ok(())
+}
+
+/// `codypendent routing enable [--data-classification <level>]`: sets
+/// `enabled = true`, creating `routing.toml` if absent. `--data-classification`
+/// (`public`|`internal`|`confidential`|`secret`, case-insensitive) sets the
+/// operator-declared ceiling; without it the ceiling stays whatever the file
+/// already had, or the fail-closed `Unknown` default (local-only routing) on a
+/// fresh file — enabling routing is never, by itself, an act of permitting
+/// off-device data.
+pub fn routing_enable(
+    paths: &RuntimePaths,
+    data_classification: Option<&str>,
+) -> anyhow::Result<()> {
+    let path = paths.data_dir.join("routing.toml");
+    let mut doc = read_routing_toml(&path)?.unwrap_or_else(empty_table);
+    let has_classification = {
+        let table = doc.as_table_mut().ok_or_else(|| {
+            anyhow::anyhow!("{}: not a TOML table at the top level", path.display())
+        })?;
+        table.insert("enabled".to_string(), toml::Value::Boolean(true));
+        if let Some(level) = data_classification {
+            let variant = classification_variant_name(level).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--data-classification `{level}`: expected one of public, internal, \
+                     confidential, secret"
+                )
+            })?;
+            let mut classification = toml::map::Map::new();
+            classification.insert("type".to_string(), toml::Value::String(variant.to_string()));
+            table.insert(
+                "data_classification".to_string(),
+                toml::Value::Table(classification),
+            );
+        }
+        table.contains_key("data_classification")
+    };
+    write_routing_toml(&path, &doc)?;
+    println!("routing: enabled ({})", path.display());
+    if !has_classification {
+        println!(
+            "  data_classification ceiling is undeclared — fails closed to Unknown \
+             (local-only). Pass --data-classification to permit hosted models."
+        );
+    }
+    println!("  next: `codypendent models bench <id>` at least one model, then run normally.");
+    Ok(())
+}
+
+/// `codypendent routing disable`: sets `enabled = false`, preserving every
+/// other declared key (a `disable`/`enable` round trip must not discard a
+/// hand-set policy or classification ceiling). A no-op, not an error, when no
+/// `routing.toml` exists yet — routing is already off.
+pub fn routing_disable(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let path = paths.data_dir.join("routing.toml");
+    let Some(mut doc) = read_routing_toml(&path)? else {
+        println!("routing: already disabled (no {})", path.display());
+        return Ok(());
+    };
+    let table = doc
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("{}: not a TOML table at the top level", path.display()))?;
+    table.insert("enabled".to_string(), toml::Value::Boolean(false));
+    write_routing_toml(&path, &doc)?;
+    println!("routing: disabled ({})", path.display());
+    Ok(())
+}
+
+/// Map a case-insensitive CLI spelling to `DataClassification`'s exact
+/// `#[serde(tag = "type")]` variant name (`crates/protocol/src/artifact.rs`) —
+/// the derived (un-renamed) Serde encoding is the Rust variant name verbatim
+/// (`"Internal"`, not `"internal"`), so this is not optional sugar; the wrong
+/// case is a silent parse failure the NEXT time `routing.toml` is read.
+/// `Unknown` is deliberately not offered — it is the fail-closed default an
+/// operator reaches by declaring nothing, not something to opt into.
+fn classification_variant_name(level: &str) -> Option<&'static str> {
+    match level.to_ascii_lowercase().as_str() {
+        "public" => Some("Public"),
+        "internal" => Some("Internal"),
+        "confidential" => Some("Confidential"),
+        "secret" => Some("Secret"),
+        _ => None,
+    }
+}
+
+fn empty_table() -> toml::Value {
+    toml::Value::Table(toml::map::Map::new())
+}
+
+/// Read `path` as a generic TOML document. `Ok(None)` for an absent file
+/// (routing is simply off); a present-but-malformed file is a hard error here
+/// — surfacing the exact parse problem beats silently treating it as absent
+/// and clobbering whatever the operator meant to keep on a later `enable`/
+/// `disable`.
+fn read_routing_toml(path: &Path) -> anyhow::Result<Option<toml::Value>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let value: toml::Value =
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+            Ok(Some(value))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn write_routing_toml(path: &Path, doc: &toml::Value) -> anyhow::Result<()> {
+    let text =
+        toml::to_string_pretty(doc).with_context(|| format!("serializing {}", path.display()))?;
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 /// The conservative declared capabilities a benched local model is described
 /// with until a real endpoint capability-discovery probe exists (the model-
 /// driver seam surfaces none): streaming (OpenAI-compatible endpoints stream),
@@ -3369,7 +3555,10 @@ mod models_bench_tests {
         );
     }
 
-    fn model_config(model: &str, provider_id: Option<&str>) -> codypendent_runtime::models::ModelConfig {
+    fn model_config(
+        model: &str,
+        provider_id: Option<&str>,
+    ) -> codypendent_runtime::models::ModelConfig {
         codypendent_runtime::models::ModelConfig {
             id: ModelId(format!("test/{model}")),
             provider: "openai-compatible".to_string(),
@@ -3398,17 +3587,17 @@ mod models_bench_tests {
         // The curated anthropic/claude-opus-5 row: $5/1M in, $25/1M out ->
         // blended $15/1M -> $0.015/1K.
         let config = model_config("claude-opus-5", Some("anthropic"));
-        assert_eq!(
-            resolve_hosted_price(&config, &catalog, None),
-            Some(0.015)
-        );
+        assert_eq!(resolve_hosted_price(&config, &catalog, None), Some(0.015));
     }
 
     #[test]
     fn resolve_hosted_price_is_none_when_neither_source_has_one() {
         let catalog = codypendent_providers::Catalog::builtin();
         // No provider_id at all.
-        assert_eq!(resolve_hosted_price(&model_config("mystery", None), &catalog, None), None);
+        assert_eq!(
+            resolve_hosted_price(&model_config("mystery", None), &catalog, None),
+            None
+        );
         // A provider_id the catalog does not curate this model under.
         assert_eq!(
             resolve_hosted_price(
@@ -3417,6 +3606,172 @@ mod models_bench_tests {
                 None
             ),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod routing_command_tests {
+    use super::*;
+    use codypendent_protocol::discovery::RuntimePaths;
+
+    fn temp_paths() -> (tempfile::TempDir, RuntimePaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        (dir, paths)
+    }
+
+    #[test]
+    fn classification_variant_name_is_case_insensitive_and_matches_the_wire_spelling() {
+        // Must match `DataClassification`'s un-renamed Serde encoding exactly
+        // (`crates/protocol/src/artifact.rs`) — the Rust variant name, PascalCase.
+        assert_eq!(classification_variant_name("internal"), Some("Internal"));
+        assert_eq!(classification_variant_name("INTERNAL"), Some("Internal"));
+        assert_eq!(
+            classification_variant_name("Confidential"),
+            Some("Confidential")
+        );
+        assert_eq!(classification_variant_name("public"), Some("Public"));
+        assert_eq!(classification_variant_name("secret"), Some("Secret"));
+        // `Unknown` is the fail-closed default, deliberately not an accepted spelling.
+        assert_eq!(classification_variant_name("unknown"), None);
+        assert_eq!(classification_variant_name("nonsense"), None);
+    }
+
+    #[test]
+    fn routing_enable_creates_the_file_and_status_reflects_it() {
+        let (_dir, paths) = temp_paths();
+        let path = paths.data_dir.join("routing.toml");
+        assert!(!path.exists());
+
+        routing_enable(&paths, Some("internal")).unwrap();
+        assert!(path.exists());
+
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc.get("enabled").and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            doc.get("data_classification")
+                .and_then(|v| v.get("type"))
+                .and_then(toml::Value::as_str),
+            Some("Internal")
+        );
+
+        // `status` does not error and does not require re-parsing here — this
+        // just pins that it runs cleanly against what `enable` just wrote.
+        routing_status(&paths).unwrap();
+    }
+
+    #[test]
+    fn routing_enable_rejects_an_unknown_classification_and_writes_nothing() {
+        let (_dir, paths) = temp_paths();
+        let path = paths.data_dir.join("routing.toml");
+        let err = routing_enable(&paths, Some("nonsense")).unwrap_err();
+        assert!(err.to_string().contains("nonsense"));
+        assert!(
+            !path.exists(),
+            "a rejected classification must not leave a half-written routing.toml"
+        );
+    }
+
+    #[test]
+    fn routing_disable_preserves_everything_else_including_an_unmodeled_policy_table() {
+        let (_dir, paths) = temp_paths();
+        let path = paths.data_dir.join("routing.toml");
+        // A hand-authored file with a full [policy] table this command's
+        // struct-free toml::Value approach has never heard of — the "don't
+        // build a second, narrower writer" requirement this module's own doc
+        // comment states.
+        std::fs::write(
+            &path,
+            r#"
+enabled = true
+
+[data_classification]
+type = "Confidential"
+
+[policy]
+name = "coding"
+version = 3
+quality_threshold = 0.7
+max_off_device = { type = "Confidential" }
+
+[policy.lambdas]
+cost = 1.0
+latency = 0.05
+privacy = 0.5
+failure = 0.5
+"#,
+        )
+        .unwrap();
+
+        routing_disable(&paths).unwrap();
+
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc.get("enabled").and_then(toml::Value::as_bool),
+            Some(false),
+            "enabled must flip to false"
+        );
+        assert_eq!(
+            doc.get("data_classification")
+                .and_then(|v| v.get("type"))
+                .and_then(toml::Value::as_str),
+            Some("Confidential"),
+            "the classification ceiling survives a disable"
+        );
+        assert_eq!(
+            doc.get("policy")
+                .and_then(|p| p.get("name"))
+                .and_then(toml::Value::as_str),
+            Some("coding"),
+            "the hand-authored [policy] table survives untouched"
+        );
+        assert_eq!(
+            doc.get("policy")
+                .and_then(|p| p.get("lambdas"))
+                .and_then(|l| l.get("cost"))
+                .and_then(toml::Value::as_float),
+            Some(1.0),
+            "nested [policy.lambdas] survives too"
+        );
+    }
+
+    #[test]
+    fn routing_disable_without_a_file_is_a_clean_no_op() {
+        let (_dir, paths) = temp_paths();
+        // Must not error and must not create a file just to say "already off".
+        routing_disable(&paths).unwrap();
+        assert!(!paths.data_dir.join("routing.toml").exists());
+    }
+
+    #[test]
+    fn routing_status_without_a_file_reports_disabled_and_does_not_error() {
+        let (_dir, paths) = temp_paths();
+        routing_status(&paths).unwrap();
+    }
+
+    #[test]
+    fn enable_then_disable_round_trips_without_dropping_the_classification() {
+        let (_dir, paths) = temp_paths();
+        routing_enable(&paths, Some("secret")).unwrap();
+        routing_disable(&paths).unwrap();
+        let doc: toml::Value =
+            toml::from_str(&std::fs::read_to_string(paths.data_dir.join("routing.toml")).unwrap())
+                .unwrap();
+        assert_eq!(
+            doc.get("enabled").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            doc.get("data_classification")
+                .and_then(|v| v.get("type"))
+                .and_then(toml::Value::as_str),
+            Some("Secret"),
+            "disable must not erase a classification enable had set"
         );
     }
 }

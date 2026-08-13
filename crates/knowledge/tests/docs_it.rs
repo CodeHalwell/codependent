@@ -5,7 +5,8 @@
 use codypendent_knowledge::db;
 use codypendent_knowledge::docs::crdt::{DocCrdtError, DocumentCrdt};
 use codypendent_knowledge::docs::model::{
-    BlockContent, ChecklistItem, DocumentAuthor, DocumentBlock, DocumentMetadata, MutationKind,
+    BlockContent, ChecklistItem, DocumentAuthor, DocumentBlock, DocumentMetadata, DocumentStatus,
+    MutationKind,
 };
 use codypendent_knowledge::docs::store::{DocStoreError, DocumentStore, NewDocument};
 use codypendent_knowledge::Scope;
@@ -532,4 +533,101 @@ async fn set_links_guards_against_a_stale_revision() {
         err,
         DocStoreError::StaleRevision { expected: 1, .. }
     ));
+}
+
+/// Regression (2026-08-13 review F12): editing a `Published` document must
+/// demote it back to `Draft` — the published badge otherwise kept describing
+/// content that had since diverged from the commit it was published at.
+/// Verified against the old behaviour first: with `write_document_tx`
+/// persisting `doc.status.as_str()` unchanged (the pre-fix code), this
+/// assertion fails — the document stays `published` at revision 2.
+#[tokio::test]
+async fn editing_a_published_document_reverts_it_to_draft() {
+    let (_tmp, pool) = temp_pool().await;
+    let store = DocumentStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("dev".into()),
+    };
+
+    let mut doc = store
+        .create(
+            &pool,
+            NewDocument {
+                title: "Doc".into(),
+                scope: Scope::User(UserId("dev".into())),
+                metadata: DocumentMetadata::default(),
+                blocks: vec![DocumentBlock::with_id(
+                    "p",
+                    BlockContent::Paragraph { text: "hi".into() },
+                )],
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+
+    // Mirrors what a real publish does: flip status without bumping revision
+    // or touching content (`codypendentd::publish::execute_approved_plan`).
+    store
+        .set_status(&pool, doc.id, DocumentStatus::Published)
+        .await
+        .unwrap();
+    doc.status = DocumentStatus::Published;
+
+    doc.crdt.insert_text("p", 2, " there").unwrap();
+    let revision = store
+        .save(&pool, &mut doc, &human, MutationKind::EditText, Some("p"))
+        .await
+        .unwrap();
+    assert_eq!(revision, 2, "the edit itself must still succeed");
+
+    // The in-memory replica reflects the demotion immediately...
+    assert_eq!(
+        doc.status,
+        DocumentStatus::Draft,
+        "the in-memory document must reflect the demotion without a re-load"
+    );
+    // ...and so does a fresh read from the store.
+    let reloaded = store.load(&pool, doc.id).await.unwrap().unwrap();
+    assert_eq!(
+        reloaded.status,
+        DocumentStatus::Draft,
+        "a published document must revert to draft once its content changes"
+    );
+}
+
+/// A document that was never published stays `Draft` through an edit — the
+/// F12 fix only ever demotes `Published`, never invents a transition for
+/// documents that were already editable.
+#[tokio::test]
+async fn editing_a_draft_document_leaves_it_a_draft() {
+    let (_tmp, pool) = temp_pool().await;
+    let store = DocumentStore::new();
+    let human = DocumentAuthor::Human {
+        user: UserId("dev".into()),
+    };
+    let mut doc = store
+        .create(
+            &pool,
+            NewDocument {
+                title: "Doc".into(),
+                scope: Scope::User(UserId("dev".into())),
+                metadata: DocumentMetadata::default(),
+                blocks: vec![DocumentBlock::with_id(
+                    "p",
+                    BlockContent::Paragraph { text: "hi".into() },
+                )],
+            },
+            &human,
+        )
+        .await
+        .unwrap();
+    assert_eq!(doc.status, DocumentStatus::Draft);
+
+    doc.crdt.insert_text("p", 2, " there").unwrap();
+    store
+        .save(&pool, &mut doc, &human, MutationKind::EditText, Some("p"))
+        .await
+        .unwrap();
+    assert_eq!(doc.status, DocumentStatus::Draft);
 }

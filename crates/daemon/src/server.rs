@@ -2472,8 +2472,7 @@ async fn handle_request(
                     if let Err(denial) =
                         authorize_command(state, conn.principal, &command.body).await?
                     {
-                        let reply =
-                            Envelope::reply_to(&request, Payload::CommandRejected(denial));
+                        let reply = Envelope::reply_to(&request, Payload::CommandRejected(denial));
                         send(writer, &reply).await?;
                         return Ok(false);
                     }
@@ -3965,10 +3964,7 @@ async fn authorize_command(
             .bind(approval_id.to_string())
             .fetch_optional(&state.pool)
             .await?;
-            (
-                row.and_then(|(id,)| SessionId::from_str(&id).ok()),
-                denial,
-            )
+            (row.and_then(|(id,)| SessionId::from_str(&id).ok()), denial)
         }
     };
 
@@ -3989,7 +3985,10 @@ async fn authorize_command(
 /// both "missing" and "not yours" collapse to.
 enum CommandTarget {
     Session(SessionId, codypendent_protocol::CodypendentError),
-    Run(codypendent_protocol::RunId, codypendent_protocol::CodypendentError),
+    Run(
+        codypendent_protocol::RunId,
+        codypendent_protocol::CodypendentError,
+    ),
     Approval(
         codypendent_protocol::ApprovalId,
         codypendent_protocol::CodypendentError,
@@ -4018,7 +4017,9 @@ async fn principal_may_read_document(
         return Ok(false);
     };
     if scope_tier == "session" {
-        let Some(session_id) = scope_key.as_deref().and_then(|key| SessionId::from_str(key).ok())
+        let Some(session_id) = scope_key
+            .as_deref()
+            .and_then(|key| SessionId::from_str(key).ok())
         else {
             return Ok(false);
         };

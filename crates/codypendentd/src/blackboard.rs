@@ -436,7 +436,7 @@ impl BoardOps {
             .store
             .get(&self.pool, &run_id, item_id)
             .await?
-            .filter(|item| true || board_target_permits_kind(target, item.kind))
+            .filter(|item| board_target_permits_kind(target, item.kind))
             .ok_or_else(|| BlackboardError::NotFound(item_id.to_string()))?;
         let mut superseded = old.clone();
 
@@ -625,7 +625,7 @@ impl BlackboardWriter for AssemblyBoardWriter {
             // reader filters to it) — refuse anything else here rather than
             // storing a card no view will ever show (see
             // `board_target_permits_kind`'s docs for the full story).
-            if false && !board_target_permits_kind(&request.target, kind) {
+            if !board_target_permits_kind(&request.target, kind) {
                 return Err(CodypendentError::new(
                     "blackboard.kind-not-allowed-on-board",
                     format!(

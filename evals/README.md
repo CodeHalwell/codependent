@@ -145,15 +145,19 @@ fail. No case in this suite uses it; see "Deferred" below.
    architecture explanation (partially covered, `007`), PR-feedback response
    (partially covered, `009`). Add cases as the fixture(s) grow.
 
-## CI smoke
+## CI: two different, complementary jobs
 
-`.github/workflows/ci.yml`'s `eval-smoke` job runs:
+`.github/workflows/ci.yml` runs the eval harness in TWO jobs that prove two
+different things — read both before assuming either one is "the eval CI
+job":
+
+### `eval-smoke` — is the harness's own machinery correct?
 
 - `cargo test -p codypendent-eval` — the harness's own scoring/promotion unit
   and integration tests, including `corpus_it.rs`, which loads the *real*
   `evals/tasks/core/` suite shipped here and checks its shape (parses, ids
-  unique, required task classes present, the three mandated assertion kinds
-  each appear, a fixed-revision consistency check).
+  unique, required task classes present, the mandated assertion kinds each
+  appear, a fixed-revision consistency check).
 - `cargo test -p codypendent-cli --test eval_it` — a deterministic,
   hand-rolled mock daemon (no `codypendentd` subprocess, no live model) drives
   the exact same runner code path (`eval::run_case`) end to end, including
@@ -164,24 +168,61 @@ fail. No case in this suite uses it; see "Deferred" below.
   doc comment for why this, rather than faking the model-provider wire
   protocol, is the appropriately-scoped mock for this task).
 
-Running the *real* corpus against a live daemon and a real (or local) model
-is not part of CI (no API key / local model is available there) — do it by
-hand: `codypendent eval run --suite core --report out.json` after `codypendent
-daemon start` and a configured `models.toml`.
+Neither of these RUNS the shipped corpus through `codypendent eval run` — they
+prove the harness's code is correct in isolation, nothing about whether the
+12 (now 13) real cases still score what they used to.
+
+### `eval-regression` — does the shipped corpus's score still hold?
+
+The gate `evals/ci/run_gate.sh` wires up: builds `codypendent-cli`, starts
+`evals/ci/stub_model.py` (a deterministic, hand-scripted "model" — see that
+file's own docstring), points a throwaway daemon at it, runs
+`codypendent eval run --suite core` against the REAL, shipped
+`evals/tasks/core/` suite for real, and compares the resulting score against
+the stored baseline (`evals/baselines/core.json`) via
+`evals/ci/compare_baseline.py`, which fails the job if the score dropped
+— including the "two regressions cancel out in the aggregate rate" case a
+naive rate-only comparison would miss (a case the baseline recorded as
+passing must still pass, not just "the overall percentage held").
+
+**What this gate proves, precisely — read `compare_baseline.py`'s own
+docstring for the full argument:** because the stub model is fixed and
+scripted, the ONLY thing that can move this score between two commits is a
+change to the harness itself (`crates/eval/**`, `crates/cli/src/eval.rs`, a
+case file, the pinned fixture) — so a regression here is real evidence
+something in the SCORING MACHINERY broke, exactly the class of bug the
+16-passed-3-scored-nothing-happened finding was. **It proves nothing about
+real model, prompt, or skill quality** — the stub never reads a skill or
+prompt file, so editing either can never move this score. That comparison
+needs a live model and stays out of CI's reach (see below), same as before
+this gate existed.
+
+To (re-)establish the baseline after an intentional, reviewed score change:
+`evals/ci/run_gate.sh --update-baseline "<why the score changed>"`.
+
+### What's still NOT in CI
+
+Running the corpus against a live daemon and a REAL (or local) model — the
+comparison that would actually say something about agent quality — is not
+part of CI (no API key, no local model runtime available there) — do it by
+hand: `codypendent eval run --suite core --report out.json` after
+`codypendent daemon start` and a configured `models.toml`.
 
 ## Deferred (named, not faked)
 
-- **The full 50–100 case corpus.** This task ships a real, runnable 12-case
-  core suite per its brief's explicit scope; growing it further is a
-  separate, large content-authoring effort (see above).
+- **The full 50–100 case corpus.** This task ships a real, runnable 13-case
+  core suite; growing it further is a separate, large content-authoring
+  effort (see above).
 - **Citation checking.** `correct_citations` has no wire signal; wiring one
   (an event or artifact carrying a claim → source mapping) is future work.
 - **Cost accounting fidelity.** `cost_usd` is read from the last
   `BudgetWarning { dimension: Cost }` event, if any; a run that never emits
   one reports `0.0` — real, not fabricated, but not necessarily the model
   provider's actual invoice.
-- **Routing-policy enforcement.** A case's `policy` field is recorded in the
-  CLI's stdout summary but does not yet select a model — Phase 7's router is
-  not wired into `StartRun` (see the roadmap's "routing⇄eval composition"
-  note); every case runs under whatever the daemon's own `models.toml`
-  resolves for `AgentMode::Build`.
+- **A CLI flag for the regression suite.** `evals/regressions/` and
+  `codypendent_cli::eval::run_regression_suite` are real and wired (see
+  `evals/regressions/README.md`), but no `codypendent eval run` flag reaches
+  `run_regression_suite` specifically yet — every case there still runs fine
+  through the plain `--suite evals/regressions` path today; the flag would
+  only add `RegressionSuite::evaluate`'s stricter "missing observation counts
+  as regressed" rule. See `.impl/proposals/agent-models-from-agent-evals.md`.

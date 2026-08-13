@@ -1116,7 +1116,9 @@ async fn observer_start_run_is_role_denied() {
         ),
     )
     .await;
-    let session_id = create.session_id.expect("CreateSession returns its session");
+    let session_id = create
+        .session_id
+        .expect("CreateSession returns its session");
     bind_role(&mut stream, client_id, ClientRole::Observer, "obs-att").await;
 
     let reply = send_recv(

@@ -50,8 +50,14 @@ codypendent update v0.4.6
 Updating never kills an active run. An idle daemon restarts immediately; a busy
 daemon keeps serving its current build until the runs finish or the next
 launch. Database migrations are embedded in the binary and apply on open. They
-preserve existing sessions and configuration; migration files are immutable
-once released.
+preserve existing sessions and configuration; migration files are **meant** to
+be immutable once released — `sqlx` checksums every applied migration and
+refuses to boot if one changed underneath it — but that promise has already
+been broken once in practice: `migrations/0017_promotion_evidence.sql` gained
+five columns in a commit after v0.1.1 shipped it (`git log -- migrations/
+0017_promotion_evidence.sql`), so an install that upgrades from v0.1.1 hits a
+daemon that refuses to start. If you maintain this project, treat that as a
+standing bug, not a documentation nit.
 
 ---
 

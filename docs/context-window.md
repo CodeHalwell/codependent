@@ -6,8 +6,10 @@ default. Both are driven by one optional setting.
 
 ## Enable it: `context_tokens` in `models.toml`
 
-Add `context_tokens` to a `[[model]]` entry in
-`<config_dir>/codypendent/models.toml`:
+Add `context_tokens` to a `[[model]]` entry in `<data_dir>/models.toml`
+(the **data** directory, not `<config_dir>` — `models.toml` has one home;
+see `crates/cli/src/tui.rs`'s own `data_dir.join("models.toml")`, and
+`codypendent doctor`'s report line, which names the same path):
 
 ```toml
 [[model]]

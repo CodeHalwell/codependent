@@ -17,8 +17,10 @@ Unlike Phase 0, this chapter specifies **modules, schemas, behaviours, and tests
 ```toml
 codypendent-runtime = { path = "crates/runtime" }
 codypendent-tui = { path = "crates/tui" }
-agent-framework-openai = "0.1.1"
-agent-framework-anthropic = "0.1.1"
+# Match whatever `agent-framework-core` was pinned to in Phase 0 — the
+# umbrella crates are versioned together (0.2.0 as of 2026-08-13).
+agent-framework-openai = "0.2.0"
+agent-framework-anthropic = "0.2.0"
 ratatui = "0.29"
 crossterm = "0.28"
 sha2 = "0.10"

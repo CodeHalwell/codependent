@@ -244,10 +244,11 @@ impl DocumentStore {
         block_id: Option<&str>,
     ) -> Result<u64, DocStoreError> {
         let mut tx = pool.begin().await?;
-        let revision =
+        let (revision, status) =
             write_document_tx(&mut tx, doc, author, mutation, block_id, Utc::now()).await?;
         tx.commit().await?;
         doc.revision = revision;
+        doc.status = status;
         Ok(revision)
     }
 
@@ -459,12 +460,25 @@ pub struct DocumentSummary {
 
 /// Write `doc`'s current CRDT snapshot inside the caller's transaction, guarded
 /// on the document's loaded revision (optimistic concurrency), and record the
-/// authorship + `DocumentChanged` outbox row. Returns the new revision.
+/// authorship + `DocumentChanged` outbox row. Returns the new revision and the
+/// status actually persisted.
+///
+/// **A content edit demotes `Published` back to `Draft`** (2026-08-13 review
+/// F12): the `published` badge used to keep describing a document whose
+/// content had since diverged from the commit it was published at — nothing
+/// ever advanced `status` past the one `set_status(Published)` call a publish
+/// makes, so `write_document_tx` kept re-writing `doc.status.as_str()`
+/// unchanged forever after. A live document is either an accurate published
+/// snapshot or being edited; it cannot honestly claim both, so the moment
+/// content changes underneath a `Published` document it reverts to `Draft`
+/// until the next publish re-earns the badge. `InReview`/`Archived` are left
+/// alone — this is not this fix's concern, and reverting a human's explicit
+/// archive decision on an incidental edit would be its own surprise.
 ///
 /// Shared by [`DocumentStore::save`] and the suggestion-accept flow so the
 /// document write and a suggestion's resolution can commit atomically in one
-/// transaction. Does **not** mutate `doc.revision` — the caller does that only
-/// after the transaction commits.
+/// transaction. Does **not** mutate `doc.revision`/`doc.status` — the caller
+/// does that only after the transaction commits.
 ///
 /// **Does not write `links_json`.** Knowledge-graph links are machine-resolved
 /// against the code graph and owned exclusively by [`DocumentStore::set_links`]
@@ -478,12 +492,17 @@ pub(crate) async fn write_document_tx(
     mutation: MutationKind,
     block_id: Option<&str>,
     now: chrono::DateTime<Utc>,
-) -> Result<u64, DocStoreError> {
+) -> Result<(u64, DocumentStatus), DocStoreError> {
     let snapshot = doc.crdt.snapshot()?;
     let now_str = now.to_rfc3339();
     let revision = doc.revision + 1;
     let citations_json = serde_json::to_string(&doc.citations)?;
     let metadata_json = serde_json::to_string(&doc.metadata)?;
+    let status = if doc.status == DocumentStatus::Published {
+        DocumentStatus::Draft
+    } else {
+        doc.status
+    };
 
     let affected = sqlx::query(
         "UPDATE documents SET crdt_snapshot = ?, status = ?, metadata_json = ?, \
@@ -491,7 +510,7 @@ pub(crate) async fn write_document_tx(
          WHERE id = ? AND revision = ?",
     )
     .bind(&snapshot)
-    .bind(doc.status.as_str())
+    .bind(status.as_str())
     .bind(&metadata_json)
     .bind(&citations_json)
     .bind(revision as i64)
@@ -525,7 +544,7 @@ pub(crate) async fn write_document_tx(
         now,
     )
     .await?;
-    Ok(revision)
+    Ok((revision, status))
 }
 
 /// Insert one authorship row inside the caller's transaction.

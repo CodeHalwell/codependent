@@ -101,6 +101,46 @@ jobs:
       - name: Eval runner smoke (mock daemon, known-pass/known-fail)
         run: cargo test -p codypendent-cli --all-features --test eval_it
 
+  # THE regression gate `eval-smoke` (above) does not provide: `eval-smoke`
+  # proves the harness's OWN code is correct in isolation; it never actually
+  # runs `codypendent eval run` against the shipped `evals/tasks/core/`
+  # corpus, so a case file edited into vacuity, an assertion that silently
+  # stopped firing, or a scoring-logic regression — exactly the "harness
+  # scored 3/12 PASS on a run where the agent never executed" class of bug
+  # this outcome exists to fix — would pass `eval-smoke` cleanly. This job
+  # runs the REAL corpus for real, against a deterministic, hand-scripted
+  # stub model (`evals/ci/stub_model.py` — no API key, no live model, ever)
+  # and fails if the score against the stored baseline
+  # (`evals/baselines/core.json`) drops. Read `evals/ci/compare_baseline.py`'s
+  # own module doc for the precise, honest claim this gate makes and does
+  # NOT make: it is a real regression test of the harness's scoring machinery,
+  # and it proves nothing about real model/prompt/skill quality (the stub
+  # never reads either, so neither can move this score) — that comparison
+  # needs a live model and stays out of CI's reach, same as before this job
+  # existed. See `evals/README.md`'s "CI: two different, complementary jobs".
+  eval-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift \
+            /usr/local/lib/node_modules "${AGENT_TOOLSDIRECTORY:-}"
+          sudo docker image prune -af || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: eval-regression
+      - name: Build codypendent-cli
+        # A separate step (like `test`'s Build/Run split) so a compile
+        # failure and a scored regression are distinguishable from CI log
+        # timing alone.
+        run: cargo build -p codypendent-cli
+      - name: Eval corpus regression gate (deterministic stub model)
+        run: evals/ci/run_gate.sh
+
   # Supply-chain gate (every-release hygiene): advisories, licenses, bans, and
   # sources per `deny.toml`. A separate lightweight job — it needs no build, only
   # the lockfile and the RustSec advisory database the action fetches. Its dated

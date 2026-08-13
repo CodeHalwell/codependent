@@ -63,7 +63,8 @@ Verify before starting:
 
 ```bash
 git --version          # need ≥ 2.40 (worktree porcelain v2 features)
-rustc --version        # need ≥ 1.82 (agent-framework MSRV); stable channel
+rustc --version        # need ≥ 1.88 (see Cargo.toml's rust-version — driven by
+                        # agent-client-protocol 2.0.0, edition-2024); stable channel
 cargo --version
 rg --version           # ripgrep, used by the search tool in Phase 1
 sqlite3 --version      # optional, for inspecting the database while debugging
@@ -73,7 +74,7 @@ Install Rust via rustup if missing (`curl --proto '=https' --tlsv1.2 -sSf https:
 
 Key facts you must not rediscover the hard way:
 
-- **The framework dependency is real and pinned**: crate `agent-framework-core` version `0.1.1` on crates.io (repository: `https://github.com/CodeHalwell/agent-framework-rs`), MSRV Rust 1.82, umbrella crate `agent-framework` with per-provider features (`openai` is the default). Never enable the umbrella `full` feature (ADR-009).
+- **The framework dependency is real and pinned**: crate `agent-framework-core` version `0.2.0` on crates.io (repository: `https://github.com/CodeHalwell/agent-framework-rs`), MSRV Rust 1.88, umbrella crate `agent-framework` with per-provider features (`openai` is the default). Never enable the umbrella `full` feature (ADR-009). (Verify against the workspace `Cargo.toml` before trusting this line — the framework has moved a full minor version since an earlier draft of this guide, and did so again once already.)
 - **Unix socket paths are limited to ~104–108 bytes.** The daemon resolves its socket into `$XDG_RUNTIME_DIR` when available and validates length up front; tests must use short temp paths. Phase 0 handles this for you — do not "simplify" it away.
 - **SQLite runs in WAL mode** with migrations embedded from `migrations/` at the repo root; migrations are append-only — never edit a committed migration.
 

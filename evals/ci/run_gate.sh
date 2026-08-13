@@ -103,12 +103,28 @@ fi
 # is the actual gate.
 echo "eval-gate: codypendent eval run exited $RUN_EXIT (informational; the score comparison below is the gate)" >&2
 
+BASELINE="$REPO_ROOT/evals/baselines/core.json"
+
 if [ "${1:-}" = "--update-baseline" ]; then
   shift
   exec python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" \
-    --baseline "$REPO_ROOT/evals/baselines/core.json" \
-    --update-baseline --note "$*"
+    --baseline "$BASELINE" --update-baseline --note "$*"
 fi
 
-exec python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" \
-  --baseline "$REPO_ROOT/evals/baselines/core.json"
+# Bootstrap, don't fabricate: this gate ships with NO pre-computed baseline
+# number in `evals/baselines/core.json` (an honest empty history, not a
+# guessed score — see that file's own comment). The first time this job
+# ever runs against a real, working `codypendent` binary, it establishes the
+# baseline from that real run and passes; every run after that compares
+# against it for real. This is a one-time, self-documenting bootstrap, not a
+# standing escape hatch — `compare_baseline.py --update-baseline` outside
+# this bootstrap path always requires the explicit flag.
+if [ ! -s "$BASELINE" ] || [ "$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1]))))" "$BASELINE" 2>/dev/null || echo 0)" = "0" ]; then
+  echo "eval-gate: no baseline recorded yet at $BASELINE — establishing one from this run (bootstrap, not a comparison)" >&2
+  python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" \
+    --baseline "$BASELINE" --update-baseline \
+    --note "bootstrap: first eval-regression run to establish a baseline"
+  exit 0
+fi
+
+exec python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" --baseline "$BASELINE"

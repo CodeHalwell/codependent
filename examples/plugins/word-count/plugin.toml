@@ -1,11 +1,17 @@
 # An example Codypendent plugin manifest (Phase 6). A minimal WASM-component
 # plugin that counts words in a granted file — the "preferred runtime for new
 # Codypendent-native plugins" (Chapter 05). It requests exactly one capability
-# (read access to the workspace), so `codypendent plugin inspect` shows a small,
+# (read access to a workspace), so `codypendent plugin inspect` shows a small,
 # legible permission surface.
 #
 #   codypendent plugin inspect examples/plugins/word-count/plugin.toml
 #
+# `filesystem_read` below must be a literal, absolute, normalized path —
+# `crates/sandbox/src/manifest.rs`'s validator rejects anything else
+# (including a `${VAR}`-style placeholder token: there is no substitution
+# pass before validation, for any plugin manifest). The path shown is an
+# example shape only; substitute the real workspace path a packaged build of
+# this plugin should read from before shipping it.
 schema_version = 1
 id = "word-count"
 name = "Word Count"
@@ -21,7 +27,7 @@ protocol = "codypendent-plugin"
 working_directory = "isolated"
 
 [capabilities]
-filesystem_read = ["${WORKSPACE}"]
+filesystem_read = ["/home/plugin-user/workspace"]
 filesystem_write = []
 network = []
 secrets = []

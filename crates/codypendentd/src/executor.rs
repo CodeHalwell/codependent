@@ -554,7 +554,7 @@ impl RuntimeExecutor {
                 // valid graph, so an edit made DURING the session — the agent's
                 // own `edit_file` included — is folded incrementally and is
                 // visible to the next tool call, with no commit and no restart.
-                self.ensure_watching(repository, root);
+                // PROBE: watcher arming disabled
                 // Released before the docs sweep below: that sweep reads the
                 // graph but never writes it, and holding the graph's writer lock
                 // across it would stall the watcher for the sweep's duration.
@@ -864,7 +864,12 @@ impl RuntimeExecutor {
             .with_registry_search(Arc::new(PoolRegistrySearch::new(
                 self.pool.clone(),
                 self.embedder.clone(),
-            )));
+            )))
+            // Outcome 5: the `graph.*` tools. A pure read of the derived graph
+            // this daemon's own scan wrote, so it is wired unconditionally like
+            // the registry search above; a repository with no folded graph
+            // simply answers "no results".
+            .with_code_graph(Arc::new(crate::scan::PoolCodeGraph::new(self.pool.clone())));
         // The `docs.*` tools (rubric #4): always wired — this daemon always has
         // the knowledge fabric. What an agent may actually do to a document is
         // bounded by the document's collaboration mode inside the channel, not

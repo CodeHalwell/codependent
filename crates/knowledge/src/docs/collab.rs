@@ -333,7 +333,11 @@ impl SuggestionStore {
             )?;
         }
         // The document write commits in the SAME transaction as the claim.
-        let revision = write_document_tx(
+        // Accepting a suggestion is a content change like any other, so it
+        // demotes a `Published` document back to `Draft` too (F12) — the
+        // `status` half of this tuple is applied to `doc` below, alongside
+        // `revision`, once the transaction actually commits.
+        let (revision, status) = write_document_tx(
             &mut tx,
             doc,
             resolver,
@@ -363,6 +367,7 @@ impl SuggestionStore {
         re_anchor_pending_tx(&mut tx, doc, &suggestion, revision).await?;
         tx.commit().await?;
         doc.revision = revision;
+        doc.status = status;
         Ok(revision)
     }
 

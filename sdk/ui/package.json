@@ -64,7 +64,8 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run test && npm run build"
+    "check": "npm run typecheck && npm run test && npm run build",
+    "prepare": "npm run build"
   },
   "peerDependencies": {
     "react": ">=19.0.0 <19.1.0",

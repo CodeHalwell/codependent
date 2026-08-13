@@ -96,19 +96,17 @@ use crate::models::ModelRegistry;
 use crate::models::{classify_provider_message, FailureClass};
 use crate::tools::{
     council_create_action, council_result_action, council_run_action, docs_proposed_action,
-    new_pull_request, parse_artifact_read, parse_blackboard_post, parse_blackboard_query,
-    parse_council_create, parse_council_result, parse_council_run, parse_create_check_run,
-    parse_create_draft_pull_request, parse_docs_create, parse_docs_edit, parse_docs_read,
-    graph_proposed_action, parse_docs_suggest, parse_edit_file as parse_edit_file_args,
-    parse_get_pull_request,
-    parse_list_check_runs, parse_memory_remember, parse_skills_search, parse_task_create,
-    parse_task_list, parse_task_move, parse_task_update, parse_update_pull_request,
-    parse_symbol_question, parse_tests_covering, parse_web_search, parse_workflow_create,
-    parse_workflow_query, parse_workflow_run,
-    parse_write_file as parse_write_file_args, render_check_runs, render_pull_request,
-    render_registry_search, render_search_outcome, task_read_action, task_write_action, tool_label,
-    summarize_graph_question, workflow_create_action, workflow_run_action, ApplyPatch,
-    ApplyPatchInput, ArtifactRead,
+    graph_proposed_action, new_pull_request, parse_artifact_read, parse_blackboard_post,
+    parse_blackboard_query, parse_council_create, parse_council_result, parse_council_run,
+    parse_create_check_run, parse_create_draft_pull_request, parse_docs_create, parse_docs_edit,
+    parse_docs_read, parse_docs_suggest, parse_edit_file as parse_edit_file_args,
+    parse_get_pull_request, parse_list_check_runs, parse_memory_remember, parse_skills_search,
+    parse_symbol_question, parse_task_create, parse_task_list, parse_task_move, parse_task_update,
+    parse_tests_covering, parse_update_pull_request, parse_web_search, parse_workflow_create,
+    parse_workflow_query, parse_workflow_run, parse_write_file as parse_write_file_args,
+    render_check_runs, render_pull_request, render_registry_search, render_search_outcome,
+    summarize_graph_question, task_read_action, task_write_action, tool_label,
+    workflow_create_action, workflow_run_action, ApplyPatch, ApplyPatchInput, ArtifactRead,
     ArtifactReadInput, ArtifactReader, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
     BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CouncilCreateInput,
     CouncilCreateTool, CouncilResultInput, CouncilResultTool, CouncilRunInput, CouncilRunTool,
@@ -116,13 +114,13 @@ use crate::tools::{
     CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool, DocsEditInput, DocsEditTool,
     DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool, EditFile, EditFileInput,
     EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput,
-    GraphBlastRadius, GraphCallersOf, GraphTestsCovering, ListCheckRuns,
-    ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput,
-    RegistrySearch, RegistrySearchRequest, RepositoryTest, Search, SearchInput, Shell,
-    SkillsSearch, SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool,
-    TaskMoveTool, TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput, UpdatePullRequestTool,
-    WebSearch, WebSearchInput, WorkflowCreateInput, WorkflowCreateTool, WorkflowQueryInput,
-    WorkflowQueryTool, WorkflowRunInput, WorkflowRunTool, WriteFile, WriteFileInput,
+    GraphBlastRadius, GraphCallersOf, GraphTestsCovering, ListCheckRuns, ListCheckRunsInput,
+    MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput, RegistrySearch,
+    RegistrySearchRequest, RepositoryTest, Search, SearchInput, Shell, SkillsSearch,
+    SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool,
+    TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput, UpdatePullRequestTool, WebSearch,
+    WebSearchInput, WorkflowCreateInput, WorkflowCreateTool, WorkflowQueryInput, WorkflowQueryTool,
+    WorkflowRunInput, WorkflowRunTool, WriteFile, WriteFileInput,
 };
 use crate::workflow_control::{
     WorkflowControlChannel, WorkflowCreateRequest, WorkflowRunRequest, WorkflowRunTarget,
@@ -4076,6 +4074,29 @@ impl FrameworkAgentRuntime {
                     }
                 }
             },
+            // Outcome 5: first-party content — symbol names and repo-relative
+            // paths this daemon's own parser produced — and already bounded by
+            // the store's answer limit, so unlike the MCP/web/skill arms it needs
+            // no sanitize-and-cap pass before entering the observation stream.
+            PreparedTool::CodeGraph(question) => match self.code_graph.as_ref() {
+                None => (
+                    "the code graph is unavailable (no graph connection)".to_string(),
+                    None,
+                    ToolOutcome::Failed {
+                        message: "graph.unavailable".to_string(),
+                    },
+                ),
+                Some(graph) => match graph.ask(&run.repository, question).await {
+                    Ok(answer) => (answer.render(), None, ToolOutcome::Succeeded),
+                    Err(reason) => (
+                        format!("code-graph query failed: {reason}"),
+                        None,
+                        ToolOutcome::Failed {
+                            message: "graph.failed".to_string(),
+                        },
+                    ),
+                },
+            },
             PreparedTool::Mcp { server, tool, args } => match self.mcp.as_ref() {
                 None => mcp_unavailable(&format!("mcp.{server}.{tool}")),
                 Some(bridge) => match bridge.call_tool(&server, &tool, args).await {
@@ -6422,6 +6443,47 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                     "result_id": {"type": "string"},
                     "name": {"type": "string"}
                 }
+            }),
+        ),
+        // Outcome 5: the agent's window onto the code graph. Offered only when
+        // the daemon wired the graph seam; retrieval then decides whether a given
+        // objective is one these answer.
+        decl(
+            GraphCallersOf::NAME,
+            "List the symbols that call a function, method, or type in this repository. Name \
+                 the symbol as it appears in the source (`decide`, `Router::decide`); you do not \
+                 need a file path. Use this before changing a signature.",
+            json!({
+                "type": "object",
+                "properties": {"symbol": {"type": "string"}},
+                "required": ["symbol"]
+            }),
+        ),
+        decl(
+            GraphBlastRadius::NAME,
+            "List everything that transitively reaches a symbol — what could break if you \
+                 change it. `depth` is the number of call layers to walk (default 2, clamped to \
+                 the store's ceiling).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string"},
+                    "depth": {"type": "integer", "minimum": 1, "maximum": 5}
+                },
+                "required": ["symbol"]
+            }),
+        ),
+        decl(
+            GraphTestsCovering::NAME,
+            "List the tests that exercise a file: tests defined in it, plus tests elsewhere \
+                 that reach a symbol it defines. `path` may be a suffix (`router.rs`).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "depth": {"type": "integer", "minimum": 1, "maximum": 5}
+                },
+                "required": ["path"]
             }),
         ),
         // The doc-writer (rubric #4). These four were dispatchable and offered
