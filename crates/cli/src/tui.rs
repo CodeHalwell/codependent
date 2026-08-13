@@ -2763,7 +2763,7 @@ async fn event_loop<P: Presentation>(
                     continue;
                 };
                 let repository_id =
-                    codypendent_knowledge::stable_repository_id(Path::new(repository));
+                    codypendent_knowledge::anchor_repository_id(Path::new(repository));
                 let scopes = [
                     Scope::System,
                     Scope::Workspace(workspace_id),
@@ -2947,7 +2947,7 @@ async fn event_loop<P: Presentation>(
             if let Intent::SearchEdges { query, page } = &intent {
                 if let Some(pool) = docs_pool.as_ref() {
                     let repository_id =
-                        codypendent_knowledge::stable_repository_id(Path::new(repository));
+                        codypendent_knowledge::anchor_repository_id(Path::new(repository));
                     let mut warnings = Vec::new();
                     let (edges, total, page) =
                         load_edge_page(pool, repository_id, query, *page, &mut warnings).await;
@@ -5900,10 +5900,13 @@ async fn load_knowledge(
     };
 
     // Visible scopes: the System tier, this session's workspace, and THIS
-    // repository — where a run's harvested memories and documents live, derived
-    // from the same canonical path the daemon uses. The stores enforce
+    // repository — where a run's harvested memories and documents live. The
+    // identity must come from `anchor_repository_id`, which resolves the Git
+    // toplevel first, exactly as `codypendentd::scan::repository_id_for` does:
+    // hashing the opened directory instead made every one of these lists empty
+    // whenever the TUI was started from a subdirectory. The stores enforce
     // cross-scope isolation in SQL; an empty result is fine.
-    let repository = codypendent_knowledge::stable_repository_id(repo);
+    let repository = codypendent_knowledge::anchor_repository_id(repo);
     let scopes = vec![
         Scope::System,
         Scope::Workspace(workspace_id),
@@ -6765,7 +6768,7 @@ async fn load_journey(
             &LearningQuery {
                 scopes: vec![
                     LearningScope::User(UserId("local".to_owned())),
-                    LearningScope::Repository(codypendent_knowledge::stable_repository_id(
+                    LearningScope::Repository(codypendent_knowledge::anchor_repository_id(
                         repository,
                     )),
                 ],

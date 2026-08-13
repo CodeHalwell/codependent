@@ -133,6 +133,7 @@ mod tests {
     fn passing_obs() -> RunObservation {
         RunObservation {
             tests_passed: Some(true),
+            run_completed: true,
             ..Default::default()
         }
     }

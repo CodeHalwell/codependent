@@ -84,8 +84,8 @@ use codypendent_daemon::model_profiles::ModelProfileStore;
 use codypendent_eval::{Assertion, EvalCase, RunObservation, SuiteReport};
 use codypendent_protocol::{
     AgentMode, ApprovalDecision, ApprovalId, ApprovalScope, BudgetDimension, ClientRole,
-    CommandBody, DataClassification, EventBody, ModelId, Payload, ProposedAction, RunId, RunState,
-    Subscription, WorkspaceId,
+    CommandBody, DataClassification, EventBody, ModelId, Payload, ProposedAction, RunDisposition,
+    RunId, RunState, Subscription, WorkspaceId,
 };
 use codypendent_routing::{
     classify, ModelProfile, RequiredCapabilities, Router, RoutingPolicy, TaskNode, TaskSignals,
@@ -564,6 +564,8 @@ struct ObservationBuilder {
     denied_network_hosts: Vec<String>,
     cost_usd: f64,
     duration_ms: u64,
+    /// Whether the run reached `Completed` — see [`RunObservation::run_completed`].
+    run_completed: bool,
     /// A proposed action's approval is requested, then resolved, as two
     /// separate events correlated by `approval_id`; only a *resolved-approve*
     /// counts as executed/contacted, so the action is held here in between.
@@ -572,6 +574,23 @@ struct ObservationBuilder {
 
 impl ObservationBuilder {
     fn observe(&mut self, body: &EventBody) {
+        // Liveness, recorded from whichever terminal signal arrives: a run that
+        // failed before the agent acted (no model configured, provider
+        // unreachable) satisfies every absence-shaped assertion for free, so
+        // the scorer must be able to tell "asserted nothing changed, and
+        // nothing did" from "nothing ran". `is_terminal` treats all three
+        // dispositions alike because it only decides when to stop reading.
+        match body {
+            EventBody::RunCompleted {
+                disposition: RunDisposition::Completed { .. },
+                ..
+            }
+            | EventBody::RunStateChanged {
+                state: RunState::Completed,
+                ..
+            } => self.run_completed = true,
+            _ => {}
+        }
         match body {
             EventBody::ApprovalRequested {
                 approval_id,
@@ -665,6 +684,7 @@ impl ObservationBuilder {
             denied_network_hosts: self.denied_network_hosts,
             cost_usd: self.cost_usd,
             duration_ms: self.duration_ms,
+            run_completed: self.run_completed,
             ..Default::default()
         }
     }
@@ -991,6 +1011,7 @@ mod policy_routing_tests {
             assertion_results: vec![],
             within_cost: true,
             within_duration: true,
+            run_completed: true,
         };
         let report = SuiteReport::new(vec![case_result]);
         let routed = vec![("case-a".to_string(), ModelId("local-coder".to_string()))];
@@ -1051,6 +1072,7 @@ mod policy_routing_tests {
             assertion_results: vec![],
             within_cost: true,
             within_duration: true,
+            run_completed: true,
         };
         let report = SuiteReport::new(vec![case_result]);
         let json = report_json_with_routing(&report, Some(&routed)).unwrap();

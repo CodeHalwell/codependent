@@ -757,8 +757,10 @@ pub async fn docs_list(paths: &RuntimePaths) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("opening {}", database_path.display()))?;
 
-    let repository =
-        codypendent_knowledge::stable_repository_id(&std::env::current_dir()?.canonicalize()?);
+    // `anchor_repository_id`, not `stable_repository_id`: the daemon stores rows
+    // under the Git toplevel, so hashing the current directory listed nothing
+    // whenever this was run from a subdirectory of the checkout.
+    let repository = anchor_repository_id(&std::env::current_dir()?);
     let scopes = [Scope::Repository(repository), Scope::System];
     let summaries = DocumentStore::new().list(&pool, &scopes).await?;
     if summaries.is_empty() {
