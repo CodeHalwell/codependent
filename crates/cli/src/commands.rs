@@ -3437,7 +3437,7 @@ pub fn routing_status(paths: &RuntimePaths) -> anyhow::Result<()> {
 /// already had, or the fail-closed `Unknown` default (local-only routing) on a
 /// fresh file — enabling routing is never, by itself, an act of permitting
 /// off-device data.
-pub fn routing_enable(
+pub async fn routing_enable(
     paths: &RuntimePaths,
     data_classification: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -3465,7 +3465,7 @@ pub fn routing_enable(
         table.contains_key("data_classification")
     };
     write_routing_toml(&path, &doc)?;
-    println!("routing: enabled ({})", path.display());
+    report_routing_change(paths, "enabled", &path).await;
     if !has_classification {
         println!(
             "  data_classification ceiling is undeclared — fails closed to Unknown \
@@ -3476,11 +3476,37 @@ pub fn routing_enable(
     Ok(())
 }
 
+/// Whether a daemon is answering right now.
+///
+/// `routing.toml` is read ONCE, when `RuntimeExecutor` builds its
+/// `RoutingCoordinator`, and held in an `Arc` for the daemon's lifetime — there
+/// is no reload and no IPC notification. So a running daemon keeps routing
+/// exactly as it was until it restarts, and a bare "routing: disabled" would
+/// tell a user their data had stopped going off-device while it was still
+/// going off-device. That is the one thing this command must not do.
+async fn daemon_is_live(paths: &RuntimePaths) -> bool {
+    client::ping(&paths.socket_path).await
+}
+
+/// Print the truth about when a routing change takes effect.
+async fn report_routing_change(paths: &RuntimePaths, what: &str, path: &std::path::Path) {
+    if daemon_is_live(paths).await {
+        println!("routing: {what} in {}", path.display());
+        println!(
+            "  the running daemon still has the PREVIOUS routing policy loaded — it reads \
+             routing.toml once at startup."
+        );
+        println!("  run `codypendent daemon restart` to apply it.");
+    } else {
+        println!("routing: {what} ({})", path.display());
+    }
+}
+
 /// `codypendent routing disable`: sets `enabled = false`, preserving every
 /// other declared key (a `disable`/`enable` round trip must not discard a
 /// hand-set policy or classification ceiling). A no-op, not an error, when no
 /// `routing.toml` exists yet — routing is already off.
-pub fn routing_disable(paths: &RuntimePaths) -> anyhow::Result<()> {
+pub async fn routing_disable(paths: &RuntimePaths) -> anyhow::Result<()> {
     let path = paths.data_dir.join("routing.toml");
     let Some(mut doc) = read_routing_toml(&path)? else {
         println!("routing: already disabled (no {})", path.display());
@@ -3491,7 +3517,7 @@ pub fn routing_disable(paths: &RuntimePaths) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("{}: not a TOML table at the top level", path.display()))?;
     table.insert("enabled".to_string(), toml::Value::Boolean(false));
     write_routing_toml(&path, &doc)?;
-    println!("routing: disabled ({})", path.display());
+    report_routing_change(paths, "disabled", &path).await;
     Ok(())
 }
 
@@ -3815,13 +3841,13 @@ mod routing_command_tests {
         assert_eq!(classification_variant_name("nonsense"), None);
     }
 
-    #[test]
-    fn routing_enable_creates_the_file_and_status_reflects_it() {
+    #[tokio::test]
+    async fn routing_enable_creates_the_file_and_status_reflects_it() {
         let (_dir, paths) = temp_paths();
         let path = paths.data_dir.join("routing.toml");
         assert!(!path.exists());
 
-        routing_enable(&paths, Some("internal")).unwrap();
+        routing_enable(&paths, Some("internal")).await.unwrap();
         assert!(path.exists());
 
         let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -3841,11 +3867,11 @@ mod routing_command_tests {
         routing_status(&paths).unwrap();
     }
 
-    #[test]
-    fn routing_enable_rejects_an_unknown_classification_and_writes_nothing() {
+    #[tokio::test]
+    async fn routing_enable_rejects_an_unknown_classification_and_writes_nothing() {
         let (_dir, paths) = temp_paths();
         let path = paths.data_dir.join("routing.toml");
-        let err = routing_enable(&paths, Some("nonsense")).unwrap_err();
+        let err = routing_enable(&paths, Some("nonsense")).await.unwrap_err();
         assert!(err.to_string().contains("nonsense"));
         assert!(
             !path.exists(),
@@ -3853,8 +3879,8 @@ mod routing_command_tests {
         );
     }
 
-    #[test]
-    fn routing_disable_preserves_everything_else_including_an_unmodeled_policy_table() {
+    #[tokio::test]
+    async fn routing_disable_preserves_everything_else_including_an_unmodeled_policy_table() {
         let (_dir, paths) = temp_paths();
         let path = paths.data_dir.join("routing.toml");
         // A hand-authored file with a full [policy] table this command's
@@ -3884,7 +3910,7 @@ failure = 0.5
         )
         .unwrap();
 
-        routing_disable(&paths).unwrap();
+        routing_disable(&paths).await.unwrap();
 
         let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -3916,25 +3942,25 @@ failure = 0.5
         );
     }
 
-    #[test]
-    fn routing_disable_without_a_file_is_a_clean_no_op() {
+    #[tokio::test]
+    async fn routing_disable_without_a_file_is_a_clean_no_op() {
         let (_dir, paths) = temp_paths();
         // Must not error and must not create a file just to say "already off".
-        routing_disable(&paths).unwrap();
+        routing_disable(&paths).await.unwrap();
         assert!(!paths.data_dir.join("routing.toml").exists());
     }
 
-    #[test]
-    fn routing_status_without_a_file_reports_disabled_and_does_not_error() {
+    #[tokio::test]
+    async fn routing_status_without_a_file_reports_disabled_and_does_not_error() {
         let (_dir, paths) = temp_paths();
         routing_status(&paths).unwrap();
     }
 
-    #[test]
-    fn enable_then_disable_round_trips_without_dropping_the_classification() {
+    #[tokio::test]
+    async fn enable_then_disable_round_trips_without_dropping_the_classification() {
         let (_dir, paths) = temp_paths();
-        routing_enable(&paths, Some("secret")).unwrap();
-        routing_disable(&paths).unwrap();
+        routing_enable(&paths, Some("secret")).await.unwrap();
+        routing_disable(&paths).await.unwrap();
         let doc: toml::Value =
             toml::from_str(&std::fs::read_to_string(paths.data_dir.join("routing.toml")).unwrap())
                 .unwrap();

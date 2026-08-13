@@ -432,7 +432,30 @@ fn host_read_file(
 /// a hostile symlink to `/dev/zero` cannot exhaust host memory.
 fn read_capped(path: &PathBuf, cap: usize) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
+    // REGULAR FILES ONLY, and checked BEFORE the open — opening a read-only FIFO
+    // blocks in the kernel until a writer arrives, so a check on the opened
+    // handle never runs. (Verified: the first version of this guard stat'd the
+    // File and the test hung on `open`.)
+    //
+    // This matters because neither limit covers it. Fuel is not consumed while
+    // execution is inside a host function, and the wall deadline is only
+    // observed when the guest yields on `OutOfFuel` — so a host read that blocks
+    // is bounded by nothing at all. A FIFO with no writer, a character device,
+    // or a stalled network mount would hang the invocation forever.
+    //
+    // `metadata` follows symlinks, which is what we want: the broker authorized
+    // the resolved target, and a symlink pointing AT a FIFO is exactly the case
+    // being refused. A path that changes type between this check and the open is
+    // a residual race, bounded by the read cap below and by the broker having
+    // already authorized the path.
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
     let file = std::fs::File::open(path)?;
+
     let mut buffer = Vec::new();
     file.take(cap as u64).read_to_end(&mut buffer)?;
     Ok(buffer)
@@ -650,6 +673,48 @@ impl WasmHost {
 
 #[cfg(test)]
 mod tests {
+
+    /// A FIFO with no writer blocks `read` forever in the kernel. Fuel is not
+    /// consumed inside a host call and the wall deadline is only observed when
+    /// the guest yields on `OutOfFuel`, so nothing would ever terminate that
+    /// invocation. `read_capped` refuses anything that is not a regular file,
+    /// which is why this test can complete at all.
+    #[test]
+    #[cfg(unix)]
+    fn a_fifo_is_refused_rather_than_blocking_forever() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        assert!(
+            std::fs::metadata(&fifo)
+                .expect("stat fifo")
+                .file_type()
+                .is_fifo(),
+            "precondition: the fixture really is a FIFO"
+        );
+
+        // Opening a read-only FIFO does not block; reading it does. Without the
+        // regular-file check this call never returns.
+        let refused = super::read_capped(&fifo, 1024);
+        assert!(
+            refused.is_err(),
+            "a FIFO must be refused, not read — an unbounded host read is not \
+             covered by the fuel or wall-clock limits"
+        );
+
+        let ordinary = dir.path().join("input.txt");
+        std::fs::write(&ordinary, b"hello").expect("write");
+        assert_eq!(
+            super::read_capped(&ordinary, 1024).expect("regular file reads"),
+            b"hello"
+        );
+    }
     use super::*;
     use crate::gate::{DenyAllGate, GateDenied, GateGrant, GateSeal};
 

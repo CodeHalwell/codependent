@@ -1416,8 +1416,8 @@ async fn main() -> anyhow::Result<()> {
             RoutingCommand::Status => commands::routing_status(&paths),
             RoutingCommand::Enable {
                 data_classification,
-            } => commands::routing_enable(&paths, data_classification.as_deref()),
-            RoutingCommand::Disable => commands::routing_disable(&paths),
+            } => commands::routing_enable(&paths, data_classification.as_deref()).await,
+            RoutingCommand::Disable => commands::routing_disable(&paths).await,
         },
         TopCommand::Open {
             session_id,

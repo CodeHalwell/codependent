@@ -104,8 +104,8 @@ the release gate is the
 > `claude/roadmap-completion-w20`, PR #19): 19 tasks + the two–project-review defect
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
-> `-D warnings`, `cargo test --workspace` = **≈2765 tests as of 2026-08-13**
-<!-- doc-count:test sources="crates" expect=2765 label="workspace total" -->
+> `-D warnings`, `cargo test --workspace` = **≈2766 tests as of 2026-08-13**
+<!-- doc-count:test sources="crates" expect=2766 label="workspace total" -->
 > (a `#[test]`/`#[tokio::test]` count over every `crates/**/*.rs` file at HEAD —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with
@@ -451,7 +451,7 @@ live client-capture paths (voice/clipboard) are the remaining wiring.
       guarded state machine carrying each plugin's trust record; and neutralizes
       untrusted plugin/MCP output (origin label, size cap, control-sequence strip)
       before it enters context. 154 unit tests (measured 2026-08-13: `git show HEAD:crates/sandbox/src/*.rs` summed, `#[test]`/`#[tokio::test]`; plus 11 more in `crates/sandbox/tests/`). **Surfaced to users** via
-<!-- doc-count:test sources="crates/sandbox/src" expect=154 label="sandbox unit tests" -->
+<!-- doc-count:test sources="crates/sandbox/src" expect=155 label="sandbox unit tests" -->
       <!-- doc-count:test sources="crates/sandbox/tests" expect=11 label="sandbox integration tests" -->
       `codypendent plugin inspect <file>` (renders identity + the requested
       capability list + resource caps + trust posture — the "evaluate permissions"
