@@ -3139,6 +3139,14 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 "{model_id}\nprovider: {provider}\n\nOnly this user-configured models.toml entry and its model-specific saved key are removed. Comments, ordering, and the provider catalogue remain intact."
             ),
         ),
+        Overlay::ConfirmCommunityAcpInstall { .. } => render_confirm_box(
+            frame,
+            area,
+            state,
+            theme,
+            "Install the Antigravity community ACP bridge?",
+            "This bridge is not provided or endorsed by Google. Its maintainer warns that using third-party software with Antigravity OAuth may violate Google's Terms and risk account suspension.\n\nCodypendent will download pinned v1.0.0 from the project's GitHub release, verify its published SHA-256, and install it privately. Your credentials are not downloaded or stored by Codypendent.",
+        ),
         Overlay::ModelPicker { query, selected } => {
             render_model_picker(frame, area, state, theme, query, *selected);
         }
@@ -12814,6 +12822,27 @@ mod tests {
             !text.contains("stage"),
             "the dead 'stage' copy must be gone:\n{text}"
         );
+    }
+
+    #[test]
+    fn antigravity_consent_names_third_party_terms_and_verified_install() {
+        let mut state = running_build_state();
+        state.overlay = Overlay::ConfirmCommunityAcpInstall {
+            provider_id: "antigravity-acp".to_owned(),
+            query: "anti".to_owned(),
+            selected: 0,
+            onboard_class: None,
+        };
+
+        let text = render_to_string(&state, 120, 40);
+        assert!(
+            text.contains("not provided or endorsed by Google"),
+            "{text}"
+        );
+        assert!(text.contains("risk account suspension"), "{text}");
+        assert!(text.contains("pinned v1.0.0"), "{text}");
+        assert!(text.contains("SHA-256"), "{text}");
+        assert!(text.contains("[y] yes"), "{text}");
     }
 
     #[test]

@@ -344,6 +344,10 @@ enum AcpCommand {
         /// Permit a curated binary URL whose registry entry has no SHA-256.
         #[arg(long)]
         allow_unverified: bool,
+        /// Acknowledge that Antigravity's community ACP bridge is third-party
+        /// software whose OAuth use may violate Google's Terms.
+        #[arg(long)]
+        accept_community_risk: bool,
     },
     /// Install, handshake, and add an ACP agent to the model picker.
     Connect {
@@ -355,6 +359,9 @@ enum AcpCommand {
         refresh: bool,
         #[arg(long)]
         allow_unverified: bool,
+        /// Acknowledge Antigravity community-bridge account/Terms risk.
+        #[arg(long)]
+        accept_community_risk: bool,
         /// Repository used for the handshake smoke test.
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -373,6 +380,9 @@ enum AcpCommand {
         refresh: bool,
         #[arg(long)]
         allow_unverified: bool,
+        /// Acknowledge Antigravity community-bridge account/Terms risk.
+        #[arg(long)]
+        accept_community_risk: bool,
         /// Repository passed as the ACP session working directory.
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -1201,15 +1211,23 @@ async fn main() -> anyhow::Result<()> {
                 agent,
                 refresh,
                 allow_unverified,
+                accept_community_risk,
             }) => {
-                codypendent_cli::acp_clients::install(&paths, &agent, refresh, allow_unverified)
-                    .await
+                codypendent_cli::acp_clients::install(
+                    &paths,
+                    &agent,
+                    refresh,
+                    allow_unverified,
+                    accept_community_risk,
+                )
+                .await
             }
             Some(AcpCommand::Connect {
                 agent,
                 profile,
                 refresh,
                 allow_unverified,
+                accept_community_risk,
                 repo: connect_repo,
             }) => {
                 let repository = connect_repo.or(repo).unwrap_or(std::env::current_dir()?);
@@ -1219,6 +1237,7 @@ async fn main() -> anyhow::Result<()> {
                     profile.as_deref(),
                     refresh,
                     allow_unverified,
+                    accept_community_risk,
                     &repository,
                 )
                 .await
@@ -1228,6 +1247,7 @@ async fn main() -> anyhow::Result<()> {
                 prompt,
                 refresh,
                 allow_unverified,
+                accept_community_risk,
                 repo: probe_repo,
             }) => {
                 let repository = probe_repo.or(repo).unwrap_or(std::env::current_dir()?);
@@ -1237,6 +1257,7 @@ async fn main() -> anyhow::Result<()> {
                     &prompt,
                     refresh,
                     allow_unverified,
+                    accept_community_risk,
                     &repository,
                 )
                 .await
@@ -1430,6 +1451,26 @@ mod tests {
                 command: Some(AcpCommand::Probe { agent, .. }),
                 ..
             }) if agent == "kimi-code"
+        ));
+
+        let antigravity = Cli::try_parse_from([
+            "codypendent",
+            "acp",
+            "connect",
+            "antigravity",
+            "--accept-community-risk",
+        ])
+        .expect("Antigravity risk acknowledgement must parse");
+        assert!(matches!(
+            antigravity.command,
+            Some(TopCommand::Acp {
+                command: Some(AcpCommand::Connect {
+                    agent,
+                    accept_community_risk: true,
+                    ..
+                }),
+                ..
+            }) if agent == "antigravity"
         ));
 
         let legacy = Cli::try_parse_from(["codypendent", "acp", "--repo", "."])

@@ -605,6 +605,9 @@ fn append_overlay(lines: &mut Vec<String>, state: &AppState) {
             clean(model_id),
             clean(provider)
         )),
+        Overlay::ConfirmCommunityAcpInstall { .. } => {
+            lines.push("Confirmation: install the pinned Antigravity community ACP bridge v1.0.0? This bridge is not provided or endorsed by Google. Its maintainer warns that third-party Antigravity OAuth use may violate Google's Terms and risk account suspension. Codypendent verifies the published SHA-256 and does not store Antigravity credentials.".to_owned());
+        }
         Overlay::CouncilBrowser => {
             lines.push(format!(
                 "Agent councils: {} configured",
@@ -834,6 +837,7 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::CouncilRunObjective { .. } => "council objective",
         Overlay::ConfirmCouncilDelete { .. } => "remove council confirmation",
         Overlay::ConfirmModelRemove { .. } => "remove model confirmation",
+        Overlay::ConfirmCommunityAcpInstall { .. } => "Antigravity community bridge confirmation",
         Overlay::AddModelId { .. }
         | Overlay::AddModelKey { .. }
         | Overlay::AddModelProviderKey { .. }

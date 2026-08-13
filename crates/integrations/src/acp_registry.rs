@@ -1,4 +1,5 @@
-//! Official ACP agent-registry discovery and pinned launch/install support.
+//! Official ACP agent-registry discovery and pinned launch/install support,
+//! plus explicitly consented community adapters with immutable release hashes.
 //!
 //! The registry is data, never authority: Codypendent validates and caches a
 //! bounded copy, pins package versions exactly as published, and only installs
@@ -338,8 +339,15 @@ impl AcpRegistryStore {
     /// Resolve a cached agent to an executable launch. NPM/Python entries remain
     /// version-pinned commands; binary entries must have been explicitly installed.
     pub fn launch_spec(&self, coordinate: &str) -> Result<AcpLaunchSpec, AcpRegistryError> {
-        if let Some(spec) = resolve_local_acp_agent(coordinate)? {
-            return Ok(spec);
+        match resolve_local_acp_agent(coordinate) {
+            Ok(Some(spec)) => return Ok(spec),
+            Ok(None) => {}
+            // Antigravity has no vendor ACP server. Prefer an operator-installed
+            // bridge, but fall through to Codypendent's pinned community build
+            // when it is absent. Every other local adapter remains PATH-only.
+            Err(AcpRegistryError::ToolUnavailable { .. })
+                if split_agent_coordinate(coordinate).0 == "antigravity-acp" => {}
+            Err(error) => return Err(error),
         }
         let agent = self.resolve_agent(coordinate)?;
         self.launch_spec_for(&agent)
@@ -401,8 +409,12 @@ impl AcpRegistryStore {
         coordinate: &str,
         allow_unverified: bool,
     ) -> Result<AcpLaunchSpec, AcpRegistryError> {
-        if let Some(spec) = resolve_local_acp_agent(coordinate)? {
-            return Ok(spec);
+        match resolve_local_acp_agent(coordinate) {
+            Ok(Some(spec)) => return Ok(spec),
+            Ok(None) => {}
+            Err(AcpRegistryError::ToolUnavailable { .. })
+                if split_agent_coordinate(coordinate).0 == "antigravity-acp" => {}
+            Err(error) => return Err(error),
         }
         let agent = self.resolve_agent(coordinate)?;
         if agent.distribution.npx.is_some() || agent.distribution.uvx.is_some() {
@@ -518,6 +530,9 @@ impl AcpRegistryStore {
             }
             return Ok(agent);
         }
+        if let Some(agent) = community_acp_agent(&id) {
+            return Ok(agent);
+        }
         let registry = self.load_cached()?;
         registry
             .get(&id)
@@ -533,6 +548,68 @@ impl AcpRegistryStore {
             &bytes,
         )
     }
+}
+
+/// A narrowly audited community distribution that is intentionally kept out
+/// of the official ACP registry projection. Google ships the `agy` CLI but no
+/// native ACP server; this third-party bridge warns that using Antigravity OAuth
+/// through third-party software may violate Google's Terms and risk account
+/// suspension. Callers must show that warning and obtain explicit consent
+/// before invoking [`AcpRegistryStore::install`].
+#[must_use]
+pub fn community_acp_agent(id: &str) -> Option<AcpRegistryAgent> {
+    if canonical_agent_id(id) != "antigravity-acp" {
+        return None;
+    }
+    let mut binary = BTreeMap::new();
+    for (platform, asset, sha256) in [
+        (
+            "darwin-aarch64",
+            "agy-acp-darwin-arm64",
+            "7936bd5fd662e6514755a8e8b19aba88b2f01b94d082d93bbc238cb4bdc9c2e8",
+        ),
+        (
+            "darwin-x86_64",
+            "agy-acp-darwin-x64",
+            "4265454974b67142061539270fb6401229034098590762b2b0c30be68ff5ebdc",
+        ),
+        (
+            "linux-aarch64",
+            "agy-acp-linux-arm64",
+            "7eec158411e1939c6ad6298b52ee2691425b666a448ee12c07ccf59b55067652",
+        ),
+        (
+            "linux-x86_64",
+            "agy-acp-linux-x64",
+            "ed900c0ebb72ff505ec5c64296b534472927140514aacad607af645320e6a3d1",
+        ),
+    ] {
+        binary.insert(
+            platform.to_string(),
+            AcpBinaryDistribution {
+                archive: format!(
+                    "https://github.com/shubzkothekar/antigravity-acp/releases/download/v1.0.0/{asset}"
+                ),
+                cmd: format!("./{asset}"),
+                sha256: Some(sha256.to_string()),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+            },
+        );
+    }
+    Some(AcpRegistryAgent {
+        id: "antigravity-acp".to_string(),
+        name: "Google Antigravity (community ACP bridge)".to_string(),
+        version: "1.0.0".to_string(),
+        description: "Third-party Antigravity ACP bridge; not provided or endorsed by Google"
+            .to_string(),
+        repository: "https://github.com/shubzkothekar/antigravity-acp".to_string(),
+        distribution: AcpDistribution {
+            npx: None,
+            uvx: None,
+            binary,
+        },
+    })
 }
 
 /// Discover Kimi Code's native ACP server when its own installer placed the
@@ -1435,6 +1512,43 @@ mod tests {
             "claude-acp@0.66.0"
         );
         assert_eq!(agent_id_from_coordinate("vibe-chat@2.24.0"), "mistral-vibe");
+    }
+
+    #[test]
+    fn antigravity_community_bridge_is_platform_pinned_and_verified() {
+        let agent = community_acp_agent("antigravity").expect("community descriptor");
+        assert_eq!(agent.id, "antigravity-acp");
+        assert_eq!(agent.version, "1.0.0");
+        assert!(agent.distribution.npx.is_none());
+        assert!(agent.distribution.uvx.is_none());
+        for (platform, binary) in &agent.distribution.binary {
+            assert!(matches!(
+                platform.as_str(),
+                "darwin-aarch64" | "darwin-x86_64" | "linux-aarch64" | "linux-x86_64"
+            ));
+            assert!(binary.archive.starts_with(
+                "https://github.com/shubzkothekar/antigravity-acp/releases/download/v1.0.0/"
+            ));
+            assert_eq!(binary.sha256.as_deref().map(str::len), Some(64));
+            assert!(binary.cmd.starts_with("./agy-acp-"));
+        }
+        AcpRegistry {
+            version: "community-pinned".to_string(),
+            agents: vec![agent],
+        }
+        .validate()
+        .expect("community descriptor obeys registry hardening");
+    }
+
+    #[test]
+    fn antigravity_resolves_without_an_official_registry_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = AcpRegistryStore::new(dir.path());
+        let resolved = store
+            .resolve_agent("antigravity-acp")
+            .expect("built-in community descriptor");
+        assert_eq!(resolved.id, "antigravity-acp");
+        assert_eq!(resolved.version, "1.0.0");
     }
 
     #[test]

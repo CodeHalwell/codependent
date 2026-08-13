@@ -828,6 +828,19 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 Overlay::ConfirmModelRemove {
                     query, selected, ..
                 } => Overlay::ModelPicker { query, selected },
+                Overlay::ConfirmCommunityAcpInstall {
+                    query,
+                    selected,
+                    onboard_class,
+                    ..
+                } => match onboard_class {
+                    Some(class) => Overlay::OnboardProviderPicker {
+                        class,
+                        query,
+                        selected,
+                    },
+                    None => Overlay::ProviderPicker { query, selected },
+                },
                 // Backing out of the delete confirmation returns to the Docs
                 // Studio it floats over, not the base view.
                 Overlay::DocDeleteConfirm { .. } => Overlay::Docs,
@@ -3113,6 +3126,25 @@ fn confirm_top(state: &mut AppState) {
                 state.overlay = Overlay::ModelPicker { query, selected };
             }
         }
+        Overlay::ConfirmCommunityAcpInstall { .. } => {
+            if let Overlay::ConfirmCommunityAcpInstall { provider_id, .. } =
+                std::mem::take(&mut state.overlay)
+            {
+                state.outbox.push(Intent::QueryProviderModels {
+                    provider_id: provider_id.clone(),
+                    api_key: None,
+                    refresh: false,
+                });
+                state.overlay = Overlay::AddModelQuerying {
+                    provider_id: provider_id.clone(),
+                    api_key: None,
+                };
+                state.notice = Some((
+                    format!("installing and testing pinned {provider_id} v1.0.0…"),
+                    state.tick + 60,
+                ));
+            }
+        }
         // Confirmed: drive the pull. The overlay moves to the live-progress
         // step; a late `Action::UnslothPullProgress`/`PullFinished` for a
         // repo/quant this operator backed out of before confirming can never
@@ -4428,12 +4460,23 @@ fn submit_prompt(state: &mut AppState) {
             let can_list_models = card.can_list_models;
             let catalog_models = card.catalog_models;
             let has_key = card.has_key;
+            let requires_community_consent =
+                provider_id == "antigravity-acp" && card.auth.contains("third-party ToS risk");
             state.selected_provider = idx;
             state.onboard_flow = Some(OnboardFlow {
                 class,
                 provider_id: Some(provider_id.clone()),
                 awaiting_model: None,
             });
+            if requires_community_consent {
+                state.overlay = Overlay::ConfirmCommunityAcpInstall {
+                    provider_id,
+                    query,
+                    selected,
+                    onboard_class: Some(class),
+                };
+                return;
+            }
             enter_add_model_flow(
                 state,
                 provider_id,
@@ -4921,7 +4964,18 @@ fn submit_prompt(state: &mut AppState) {
                     let available = card.available;
                     let catalog_models = card.catalog_models;
                     let has_key = card.has_key;
+                    let requires_community_consent = provider_id == "antigravity-acp"
+                        && card.auth.contains("third-party ToS risk");
                     if available {
+                        if requires_community_consent {
+                            state.overlay = Overlay::ConfirmCommunityAcpInstall {
+                                provider_id,
+                                query,
+                                selected,
+                                onboard_class: None,
+                            };
+                            return;
+                        }
                         enter_add_model_flow(
                             state,
                             provider_id,
@@ -5461,7 +5515,18 @@ fn begin_add_model(state: &mut AppState) {
         submit_prompt(state);
         return;
     }
-    let (provider_id, protocol, requires_key, can_list_models, available, catalog_models, has_key) = {
+    let (
+        provider_id,
+        protocol,
+        requires_key,
+        can_list_models,
+        available,
+        catalog_models,
+        has_key,
+        requires_community_consent,
+        query,
+        selected,
+    ) = {
         let Overlay::ProviderPicker { query, selected } = &state.overlay else {
             return;
         };
@@ -5477,6 +5542,9 @@ fn begin_add_model(state: &mut AppState) {
                 card.available,
                 card.catalog_models,
                 card.has_key,
+                card.id == "antigravity-acp" && card.auth.contains("third-party ToS risk"),
+                query.clone(),
+                *selected,
             ),
             None => return,
         }
@@ -5488,6 +5556,15 @@ fn begin_add_model(state: &mut AppState) {
             ),
             state.tick + 40,
         ));
+        return;
+    }
+    if requires_community_consent {
+        state.overlay = Overlay::ConfirmCommunityAcpInstall {
+            provider_id,
+            query,
+            selected,
+            onboard_class: None,
+        };
         return;
     }
     enter_add_model_flow(
@@ -11315,6 +11392,106 @@ mod tests {
             }
         );
         assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
+    }
+
+    #[test]
+    fn antigravity_requires_explicit_risk_consent_before_install_or_probe() {
+        let mut s = AppState::new();
+        let mut antigravity = provider_card(
+            "antigravity-acp",
+            "Google Antigravity (community bridge)",
+            "acp",
+            "acp: verified install · third-party ToS risk",
+            true,
+        );
+        antigravity.available = true;
+        antigravity.can_list_models = true;
+        s.providers = vec![antigravity];
+        s.overlay = Overlay::ProviderPicker {
+            query: "anti".to_owned(),
+            selected: 0,
+        };
+
+        reduce(&mut s, Action::InputSubmit);
+
+        assert!(matches!(
+            s.overlay,
+            Overlay::ConfirmCommunityAcpInstall {
+                ref provider_id,
+                ref query,
+                selected: 0,
+                onboard_class: None,
+            } if provider_id == "antigravity-acp" && query == "anti"
+        ));
+        assert!(
+            s.drain_outbox().is_empty(),
+            "opening consent downloads nothing"
+        );
+
+        reduce(&mut s, Action::Dismiss);
+        assert_eq!(
+            s.overlay,
+            Overlay::ProviderPicker {
+                query: "anti".to_owned(),
+                selected: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn antigravity_consent_enters_the_verified_acp_model_probe() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::ConfirmCommunityAcpInstall {
+            provider_id: "antigravity-acp".to_owned(),
+            query: "anti".to_owned(),
+            selected: 0,
+            onboard_class: None,
+        };
+
+        reduce(&mut s, Action::ConfirmCancel);
+
+        assert_eq!(
+            s.overlay,
+            Overlay::AddModelQuerying {
+                provider_id: "antigravity-acp".to_owned(),
+                api_key: None,
+            }
+        );
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::QueryProviderModels {
+                provider_id: "antigravity-acp".to_owned(),
+                api_key: None,
+                refresh: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn installed_antigravity_bridge_does_not_repeat_the_consent_prompt() {
+        let mut s = AppState::new();
+        let mut antigravity = provider_card(
+            "antigravity-acp",
+            "Google Antigravity (community bridge)",
+            "acp",
+            "acp: local · pinned community bridge",
+            true,
+        );
+        antigravity.available = true;
+        antigravity.can_list_models = true;
+        s.providers = vec![antigravity];
+        s.overlay = Overlay::ProviderPicker {
+            query: String::new(),
+            selected: 0,
+        };
+
+        reduce(&mut s, Action::InputSubmit);
+
+        assert!(matches!(s.overlay, Overlay::AddModelQuerying { .. }));
+        assert!(matches!(
+            s.drain_outbox().as_slice(),
+            [Intent::QueryProviderModels { provider_id, .. }] if provider_id == "antigravity-acp"
+        ));
     }
 
     #[test]
