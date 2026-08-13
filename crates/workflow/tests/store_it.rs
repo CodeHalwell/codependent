@@ -3,7 +3,8 @@
 //! changed graph signature is refused.
 
 use codypendent_workflow::{
-    compile_yaml, db, NodeState, WorkflowRunState, WorkflowStore, WorkflowStoreError,
+    compile_yaml, db, NodeState, WorkflowRunAttribution, WorkflowRunState, WorkflowStore,
+    WorkflowStoreError,
 };
 use serde_json::json;
 
@@ -112,6 +113,73 @@ async fn create_run_idempotent_dedups_by_key() {
         .unwrap();
     assert_ne!(first, other);
     assert_eq!(store.list_incomplete_runs(&pool).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn owned_idempotent_runs_bind_the_principal_atomically() {
+    let (_tmp, pool) = temp_pool().await;
+    let compiled = compile_yaml(MANIFEST).unwrap();
+    let store = WorkflowStore::new();
+
+    let first = store
+        .create_run_idempotent_owned(
+            &pool,
+            &compiled,
+            "cmd-owned",
+            &json!({}),
+            WorkflowRunAttribution {
+                manifest: Some(MANIFEST),
+                repository: None,
+                owner_uid: 1_001,
+            },
+        )
+        .await
+        .unwrap();
+    let owner: Option<i64> = sqlx::query_scalar("SELECT owner_uid FROM workflow_runs WHERE id = ?")
+        .bind(&first)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(owner, Some(1_001));
+
+    let duplicate = store
+        .create_run_idempotent_owned(
+            &pool,
+            &compiled,
+            "cmd-owned",
+            &json!({}),
+            WorkflowRunAttribution {
+                manifest: Some(MANIFEST),
+                repository: None,
+                owner_uid: 1_001,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate, first);
+
+    let other = store
+        .create_run_idempotent_owned(
+            &pool,
+            &compiled,
+            "cmd-owned",
+            &json!({}),
+            WorkflowRunAttribution {
+                manifest: Some(MANIFEST),
+                repository: None,
+                owner_uid: 2_002,
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(other, first, "different owners have independent key spaces");
+    let other_owner: Option<i64> =
+        sqlx::query_scalar("SELECT owner_uid FROM workflow_runs WHERE id = ?")
+            .bind(&other)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(other_owner, Some(2_002));
 }
 
 #[tokio::test]

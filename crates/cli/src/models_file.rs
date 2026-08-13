@@ -25,10 +25,13 @@
 //! that models only one section.** Adding a table to `models.toml` requires no
 //! change to this module — an unknown table is carried through untouched.
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{anyhow, Context};
-use codypendent_runtime::models::ModelConfig;
+use codypendent_runtime::models::{load_models, ModelConfig};
+use fs4::FileExt;
 
 /// Replace the `[[model]]` array in `path` with `configs`, preserving every
 /// other table, and install it atomically at mode 0600.
@@ -37,6 +40,53 @@ use codypendent_runtime::models::ModelConfig;
 /// rather than something to overwrite — that is a user's file with content this
 /// code does not understand.
 pub fn write_model_entries(path: &Path, configs: &[ModelConfig]) -> anyhow::Result<()> {
+    update_model_entries(path, |current| {
+        current.clear();
+        current.extend_from_slice(configs);
+        Ok(())
+    })
+}
+
+/// Serialize one read-modify-write of the shared model list under an advisory
+/// lock. The edit closure sees the latest file contents after earlier writers
+/// commit, so independent CLI/TUI/ACP updates cannot erase each other.
+pub fn update_model_entries<R>(
+    path: &Path,
+    edit: impl FnOnce(&mut Vec<ModelConfig>) -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{}: has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let lock_path = parent.join(".models.toml.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("securing {}", lock_path.display()))?;
+    }
+    lock.lock_exclusive()
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+
+    let mut configs = if path.exists() {
+        load_models(path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        Vec::new()
+    };
+    let result = edit(&mut configs)?;
+    write_model_entries_locked(path, &configs)?;
+    FileExt::unlock(&lock).with_context(|| format!("unlocking {}", lock_path.display()))?;
+    Ok(result)
+}
+
+fn write_model_entries_locked(path: &Path, configs: &[ModelConfig]) -> anyhow::Result<()> {
     let mut document = if path.exists() {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -57,7 +107,6 @@ pub fn write_model_entries(path: &Path, configs: &[ModelConfig]) -> anyhow::Resu
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("{}: has no parent directory", path.display()))?;
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     // Unique per WRITE, not per process. The previous name was pid-only and its
     // comment claimed that stopped concurrent writers sharing a temp file — it
     // did not: two writes inside one process (the TUI's background model pull
@@ -65,16 +114,20 @@ pub fn write_model_entries(path: &Path, configs: &[ModelConfig]) -> anyhow::Resu
     // other's half-written render into place. A counter plus the pid is unique
     // for both cases.
     //
-    // This makes the temp file safe. It does NOT make the read-modify-write
-    // safe: two callers that each loaded `configs` before the other's rename
-    // still lose one of the two edits. Closing that needs a lock held across
-    // load→edit→write, which is a larger change than this comment; the honest
-    // position is that this is last-writer-wins and known to be.
     static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let ticket = WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp = parent.join(format!(".models-{}-{ticket}.tmp", std::process::id()));
-    std::fs::write(&temp, rendered.as_bytes())
+    let mut temp_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp)
+        .with_context(|| format!("creating {}", temp.display()))?;
+    temp_file
+        .write_all(rendered.as_bytes())
         .with_context(|| format!("writing {}", temp.display()))?;
+    temp_file
+        .sync_all()
+        .with_context(|| format!("syncing {}", temp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -84,6 +137,10 @@ pub fn write_model_entries(path: &Path, configs: &[ModelConfig]) -> anyhow::Resu
             .with_context(|| format!("securing {}", temp.display()))?;
     }
     std::fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))?;
+    #[cfg(unix)]
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("syncing {}", parent.display()))?;
     Ok(())
 }
 
@@ -181,5 +238,36 @@ setting = true
         let models = codypendent_runtime::models::load_models(&path).expect("load");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id.0, "openai/gpt-4o");
+    }
+
+    #[test]
+    fn concurrent_model_updates_are_serialized_without_lost_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("models.toml");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let model = entry(&format!("concurrent/{index}"));
+                update_model_entries(&path, |models| {
+                    models.push(model);
+                    Ok(())
+                })
+                .expect("serialized update");
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+        let models = load_models(&path).expect("load");
+        assert_eq!(models.len(), 8);
+        for index in 0..8 {
+            assert!(models
+                .iter()
+                .any(|model| model.id.0 == format!("concurrent/{index}")));
+        }
     }
 }

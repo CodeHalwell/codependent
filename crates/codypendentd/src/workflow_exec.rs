@@ -5141,6 +5141,7 @@ steps:
                 inputs: json!({ "pull_request": 7 }),
                 idempotency_key: "cmd-cancel-park".to_owned(),
                 repository: Some(repo.to_string_lossy().into_owned()),
+                owner_uid: 1_000,
                 client_id: ClientId::new(),
             })
             .await
@@ -5458,6 +5459,7 @@ steps:
             inputs: json!({ "pull_request": 7 }),
             idempotency_key: key.to_string(),
             repository: Some(repo.to_string_lossy().into_owned()),
+            owner_uid: 1_000,
             client_id: ClientId::new(),
         }
     }

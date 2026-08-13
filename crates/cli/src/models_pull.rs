@@ -24,7 +24,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use codypendent_integrations::unsloth::{pick_default_quant, HfCatalogApi};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::ModelId;
-use codypendent_runtime::models::{load_models, ModelConfig};
+#[cfg(test)]
+use codypendent_runtime::models::load_models;
+use codypendent_runtime::models::ModelConfig;
 
 /// The org `codypendent models pull <repo>` assumes when `repo` carries no
 /// explicit `org/` prefix.
@@ -264,13 +266,7 @@ pub fn register_pulled_model(
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating the data dir {}", data_dir.display()))?;
     let models_path = data_dir.join("models.toml");
-    let mut configs = if models_path.exists() {
-        load_models(&models_path).with_context(|| format!("reading {}", models_path.display()))?
-    } else {
-        Vec::new()
-    };
-    configs.retain(|c| c.id.0 != reference);
-    configs.push(ModelConfig {
+    let config = ModelConfig {
         id: ModelId(reference.clone()),
         provider: "openai-compatible".to_string(),
         base_url,
@@ -280,9 +276,12 @@ pub fn register_pulled_model(
         // A pulled GGUF is served by the local `ollama` provider, whose auth is
         // the catalog's `none` — no header resolution is needed.
         provider_id: Some("ollama".to_string()),
-    });
-
-    crate::models_file::write_model_entries(&models_path, &configs)?;
+    };
+    crate::models_file::update_model_entries(&models_path, |configs| {
+        configs.retain(|c| c.id.0 != reference);
+        configs.push(config);
+        Ok(())
+    })?;
     Ok(reference)
 }
 

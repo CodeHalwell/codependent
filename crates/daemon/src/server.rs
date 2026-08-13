@@ -1889,61 +1889,17 @@ async fn handle_request(
                         // — the fallback is applied at node-execution time, never
                         // resolved from a wandering `current_dir()` here.
                         repository: repository.clone(),
+                        owner_uid: conn.principal.uid(),
                         client_id: conn.client_id_or(request.client_id),
                     };
                     let reply = match starter.start(start).await {
-                        Ok(workflow_run_id) => {
-                            // Stamp the creating principal (0033). The store
-                            // inserts `run_id = NULL`, so this column is the
-                            // ONLY ownership a workflow run has until (and
-                            // unless) it is bound to a session run.
-                            //
-                            // A failure here is NOT survivable, so it is not
-                            // merely logged: the row would keep both `run_id`
-                            // and `owner_uid` null, every later read, pause,
-                            // cancel and blackboard request would resolve it as
-                            // missing while its execution carried on in the
-                            // background, and boot adoption has already run so
-                            // nothing repairs it short of a restart. Reporting
-                            // the failure is the honest outcome.
-                            match sqlx::query(
-                                "UPDATE workflow_runs SET owner_uid = ? WHERE id = ? \
-                                 AND owner_uid IS NULL",
-                            )
-                            .bind(i64::from(conn.principal.uid()))
-                            .bind(&workflow_run_id)
-                            .execute(&state.pool)
-                            .await
-                            {
-                                Ok(_) => Envelope::reply_to(
-                                    &request,
-                                    Payload::WorkflowRunStarted {
-                                        command_id: command.command_id,
-                                        workflow_run_id,
-                                    },
-                                ),
-                                Err(error) => {
-                                    warn!(
-                                        %workflow_run_id, %error,
-                                        "could not stamp the workflow-run owner; \
-                                         reporting the start as failed"
-                                    );
-                                    Envelope::reply_to(
-                                        &request,
-                                        Payload::CommandRejected(
-                                            codypendent_protocol::CodypendentError::new(
-                                                "workflow.owner-unrecorded",
-                                                "the workflow run started but its owner could not \
-                                                 be recorded; it is not reachable and must be \
-                                                 cancelled"
-                                                    .to_string(),
-                                                true,
-                                            ),
-                                        ),
-                                    )
-                                }
-                            }
-                        }
+                        Ok(workflow_run_id) => Envelope::reply_to(
+                            &request,
+                            Payload::WorkflowRunStarted {
+                                command_id: command.command_id,
+                                workflow_run_id,
+                            },
+                        ),
                         Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
                     };
                     send(writer, &reply).await?;

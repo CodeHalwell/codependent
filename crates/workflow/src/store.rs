@@ -24,6 +24,21 @@ use uuid::Uuid;
 
 use crate::compile::CompiledWorkflow;
 
+/// Server-attested metadata committed with an idempotent workflow run.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkflowRunAttribution<'a> {
+    pub manifest: Option<&'a str>,
+    pub repository: Option<&'a str>,
+    pub owner_uid: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IdempotentRunContext<'a> {
+    manifest: Option<&'a str>,
+    repository: Option<&'a str>,
+    owner_uid: Option<u32>,
+}
+
 /// An error from the workflow store.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowStoreError {
@@ -53,6 +68,10 @@ pub enum WorkflowStoreError {
         expected: String,
         found: String,
     },
+    /// The same idempotency key was presented by a different authenticated
+    /// principal. Do not disclose either principal identifier in the error.
+    #[error("idempotency key {key} belongs to a different workflow owner")]
+    IdempotencyOwnerMismatch { key: String },
 }
 
 /// The lifecycle state of a workflow run.
@@ -315,7 +334,65 @@ impl WorkflowStore {
         manifest: Option<&str>,
         repository: Option<&str>,
     ) -> Result<String, WorkflowStoreError> {
-        let id = deterministic_run_id(idempotency_key);
+        self.create_run_idempotent_inner(
+            pool,
+            compiled,
+            idempotency_key,
+            inputs,
+            IdempotentRunContext {
+                manifest,
+                repository,
+                owner_uid: None,
+            },
+        )
+        .await
+    }
+
+    /// Create an idempotent run whose owner is committed in the same SQLite
+    /// transaction as the run and its nodes. A retry is accepted only for the
+    /// same owner, preventing a cross-principal idempotency collision.
+    pub async fn create_run_idempotent_owned(
+        &self,
+        pool: &SqlitePool,
+        compiled: &CompiledWorkflow,
+        idempotency_key: &str,
+        inputs: &Value,
+        attribution: WorkflowRunAttribution<'_>,
+    ) -> Result<String, WorkflowStoreError> {
+        self.create_run_idempotent_inner(
+            pool,
+            compiled,
+            idempotency_key,
+            inputs,
+            IdempotentRunContext {
+                manifest: attribution.manifest,
+                repository: attribution.repository,
+                owner_uid: Some(attribution.owner_uid),
+            },
+        )
+        .await
+    }
+
+    async fn create_run_idempotent_inner(
+        &self,
+        pool: &SqlitePool,
+        compiled: &CompiledWorkflow,
+        idempotency_key: &str,
+        inputs: &Value,
+        context: IdempotentRunContext<'_>,
+    ) -> Result<String, WorkflowStoreError> {
+        let IdempotentRunContext {
+            manifest,
+            repository,
+            owner_uid,
+        } = context;
+        // Principal-bound keys deduplicate independently: two authenticated
+        // users may legitimately generate the same client-local key without
+        // either blocking or adopting the other's run.
+        let id = owner_uid.map_or_else(
+            || deterministic_run_id(idempotency_key),
+            |owner_uid| deterministic_run_id(&format!("owner:{owner_uid}:{idempotency_key}")),
+        );
         let now = Utc::now().to_rfc3339();
         let signature = compiled.signature();
         let inputs_json = serde_json::to_string(inputs)?;
@@ -325,8 +402,8 @@ impl WorkflowStore {
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO workflow_runs \
              (id, workflow_id, workflow_version, graph_signature, run_id, inputs_json, state, \
-              manifest_yaml, repository, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, NULL, ?, 'pending', ?, ?, ?, ?)",
+              manifest_yaml, repository, owner_uid, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, NULL, ?, 'pending', ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&compiled.id)
@@ -335,6 +412,7 @@ impl WorkflowStore {
         .bind(&inputs_json)
         .bind(manifest)
         .bind(repository)
+        .bind(owner_uid.map(i64::from))
         .bind(&now)
         .bind(&now)
         .execute(&mut *tx)
@@ -345,12 +423,24 @@ impl WorkflowStore {
         // first application. Compare its stored signature against the incoming
         // compiled workflow's before treating this as a success (P5-D2).
         if inserted == 0 {
-            let (existing_signature, existing_inputs): (String, String) = sqlx::query_as(
-                "SELECT graph_signature, inputs_json FROM workflow_runs WHERE id = ?",
+            let (existing_signature, existing_inputs, existing_owner): (
+                String,
+                String,
+                Option<i64>,
+            ) = sqlx::query_as(
+                "SELECT graph_signature, inputs_json, owner_uid FROM workflow_runs WHERE id = ?",
             )
             .bind(&id)
             .fetch_one(&mut *tx)
             .await?;
+            if let Some(owner_uid) = owner_uid {
+                if existing_owner != Some(i64::from(owner_uid)) {
+                    tx.commit().await?;
+                    return Err(WorkflowStoreError::IdempotencyOwnerMismatch {
+                        key: idempotency_key.to_owned(),
+                    });
+                }
+            }
             tx.commit().await?;
             let existing_request_signature =
                 workflow_request_signature(&existing_signature, &existing_inputs);

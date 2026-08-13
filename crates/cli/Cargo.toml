@@ -83,6 +83,7 @@ sqlx = { workspace = true }
 # revision into a scratch checkout per run, so the vendored fixture itself is
 # never mutated.
 tempfile = { workspace = true }
+fs4 = { workspace = true }
 # Council run-report timestamps (`started_at`/`finished_at`, RFC3339) and the
 # report file stem's sortable stamp. Was dev-only; the council report artifact
 # (rubric 6) needs it at runtime too.

@@ -2135,7 +2135,15 @@ impl FrameworkAgentRuntime {
             return None;
         }
 
-        let items = builtin_registry_items(&candidates);
+        // Rank only the discretionary candidates. Ranking floor tools and then
+        // unioning the floor afterwards let an objective spend the entire top-k
+        // budget on tools that were already guaranteed, starving useful tools.
+        let discretionary: Vec<String> = candidates
+            .iter()
+            .filter(|name| !floor.contains(name))
+            .cloned()
+            .collect();
+        let items = builtin_registry_items(&discretionary);
         let indexes = match RetrievalIndexes::build(&items, HashingEmbedder::new()) {
             Ok(indexes) => indexes,
             Err(error) => {
@@ -8369,6 +8377,36 @@ context_tokens = 1000000
                 );
             }
         }
+    }
+
+    #[test]
+    fn retrieval_budget_is_reserved_for_non_floor_tools() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_docs(Arc::new(StubDocsChannel))
+            .with_task_board(Arc::new(RecordingTaskBoard::default()))
+            .with_builtin_top_k(2);
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "read the parser, edit the implementation, and run its tests",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        )
+        .with_board_repository("/repo");
+        let selected = runtime
+            .select_builtin_tools(&run)
+            .expect("the offered set is large enough to narrow");
+        let discretionary = selected
+            .iter()
+            .filter(|name| !ALWAYS_ADVERTISED_TOOLS.contains(&name.as_str()))
+            .count();
+        assert_eq!(
+            discretionary, 2,
+            "the full top-k budget must add non-floor tools: {selected:?}"
+        );
     }
 
     /// The safety property the floor exists to back up: narrowing the

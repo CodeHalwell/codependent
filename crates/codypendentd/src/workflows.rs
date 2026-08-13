@@ -65,9 +65,9 @@ use codypendent_runtime::workflow_control::{
 use codypendent_workflow::{
     compile_yaml, AgentRef, ApprovalPolicy, BudgetWarning, ConductorError, NodeExecutor,
     NodeObserver, NodeState, NodeTransition, OrchestrationReason, RetryPolicy, WorkflowBudget,
-    WorkflowConductor, WorkflowDefinition, WorkflowInput, WorkflowNodeRecord, WorkflowRunState,
-    WorkflowSourceRegistry, WorkflowStep, WorkflowStore, WorkflowStoreError, WorkspaceMode,
-    WorkspaceSpec,
+    WorkflowConductor, WorkflowDefinition, WorkflowInput, WorkflowNodeRecord,
+    WorkflowRunAttribution, WorkflowRunState, WorkflowSourceRegistry, WorkflowStep, WorkflowStore,
+    WorkflowStoreError, WorkspaceMode, WorkspaceSpec,
 };
 use sqlx::SqlitePool;
 use tracing::{info, warn};
@@ -425,6 +425,7 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
                 inputs,
                 idempotency_key,
                 repository,
+                owner_uid,
                 ..
             } = request;
 
@@ -503,19 +504,23 @@ impl<E: NodeExecutor + 'static> WorkflowStarter for WorkflowConductorHost<E> {
             // same retry would fail again) surfaced under its own dotted code
             // rather than the generic store-error.
             let run_id = WorkflowStore::new()
-                .create_run_idempotent(
+                .create_run_idempotent_owned(
                     &host.pool,
                     &compiled,
                     &idempotency_key,
                     &inputs,
-                    Some(&manifest),
-                    // Persist the run's repository so recovery carves each agent
-                    // node's isolated worktree from the right checkout (T5).
-                    repository.as_deref(),
+                    WorkflowRunAttribution {
+                        manifest: Some(&manifest),
+                        // Persist the run's repository so recovery carves each agent
+                        // node's isolated worktree from the right checkout (T5).
+                        repository: repository.as_deref(),
+                        owner_uid,
+                    },
                 )
                 .await
                 .map_err(|error| match error {
-                    WorkflowStoreError::IdempotencyKeyReused { .. } => CodypendentError::new(
+                    WorkflowStoreError::IdempotencyKeyReused { .. }
+                    | WorkflowStoreError::IdempotencyOwnerMismatch { .. } => CodypendentError::new(
                         "workflow.idempotency-mismatch",
                         error.to_string(),
                         false,
@@ -569,9 +574,20 @@ impl<E: NodeExecutor + 'static> WorkflowControlChannel for WorkflowConductorHost
             target,
             inputs,
             repository,
-            session_id: _,
+            session_id,
             idempotency_key,
         } = request;
+        let owner_uid = sqlx::query_scalar::<_, i64>("SELECT owner_uid FROM sessions WHERE id = ?")
+            .bind(session_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| {
+                WorkflowControlError::Backend(format!("could not resolve session owner: {error}"))
+            })?
+            .and_then(|uid| u32::try_from(uid).ok())
+            .ok_or_else(|| {
+                WorkflowControlError::Backend("the workflow session has no valid owner".to_string())
+            })?;
         let (workflow_id, manifest, named_id) = match target {
             WorkflowRunTarget::Named(id) => (id.clone(), String::new(), Some(id)),
             WorkflowRunTarget::Inline(draft) => {
@@ -588,6 +604,7 @@ impl<E: NodeExecutor + 'static> WorkflowControlChannel for WorkflowConductorHost
                 inputs,
                 idempotency_key,
                 repository: Some(repository),
+                owner_uid,
                 client_id: codypendent_protocol::ClientId::new(),
             },
         )
@@ -1281,6 +1298,7 @@ steps:
             inputs: json!({ "pull_request": 7 }),
             idempotency_key: key.to_owned(),
             repository: None,
+            owner_uid: 1_000,
             client_id: ClientId::new(),
         }
     }
@@ -1361,6 +1379,7 @@ steps:
                 inputs: json!(null),
                 idempotency_key: "cmd-bad".to_owned(),
                 repository: None,
+                owner_uid: 1_000,
                 client_id: ClientId::new(),
             })
             .await
@@ -1694,6 +1713,7 @@ steps:
                 inputs: json!({ "pull_request": 7 }),
                 idempotency_key: "cmd-shared-key".to_owned(),
                 repository: None,
+                owner_uid: 1_000,
                 client_id: ClientId::new(),
             })
             .await

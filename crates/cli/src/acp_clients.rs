@@ -418,17 +418,18 @@ pub fn disconnect(paths: &RuntimePaths, profile: &str) -> anyhow::Result<()> {
     if !models_path.exists() {
         bail!("no configured models");
     }
-    let mut configs = load_models(&models_path)?;
-    let before = configs.len();
     let child_prefix = format!("{profile}#");
-    configs.retain(|config| {
-        !(config.provider == "acp"
-            && (config.id.0 == profile || config.id.0.starts_with(&child_prefix)))
-    });
-    if configs.len() == before {
-        bail!("ACP profile `{profile}` is not configured");
-    }
-    write_models(&models_path, &configs)?;
+    crate::models_file::update_model_entries(&models_path, |configs| {
+        let before = configs.len();
+        configs.retain(|config| {
+            !(config.provider == "acp"
+                && (config.id.0 == profile || config.id.0.starts_with(&child_prefix)))
+        });
+        if configs.len() == before {
+            bail!("ACP profile `{profile}` is not configured");
+        }
+        Ok(())
+    })?;
     println!("disconnected ACP profile `{profile}`");
     Ok(())
 }
@@ -521,40 +522,33 @@ fn replace_profile_family(
     }
     std::fs::create_dir_all(&paths.data_dir)?;
     let path = paths.data_dir.join("models.toml");
-    let mut configs = if path.exists() {
-        load_models(&path)?
-    } else {
-        Vec::new()
-    };
-    if let Some(conflict) = configs.iter().find(|config| {
-        config.provider != "acp" && profiles.iter().any(|(profile, _)| config.id.0 == *profile)
-    }) {
-        bail!(
-            "ACP profile `{}` conflicts with an existing {} model",
-            conflict.id.0,
-            conflict.provider
-        );
-    }
-    configs.retain(|config| {
-        !(config.provider == "acp"
-            && (config.id.0 == base || config.id.0.starts_with(&family_prefix)))
-    });
-    configs.extend(profiles.iter().map(|(profile, agent)| ModelConfig {
-        id: ModelId(profile.clone()),
-        provider: "acp".to_string(),
-        base_url: String::new(),
-        model: agent.clone(),
-        api_key_env: String::new(),
-        context_tokens: None,
-        // An ACP agent is launched, not addressed over HTTP, so it has no
-        // catalog provider whose auth header would need resolving.
-        provider_id: None,
-    }));
-    write_models(&path, &configs)
-}
-
-fn write_models(path: &Path, configs: &[ModelConfig]) -> anyhow::Result<()> {
-    crate::models_file::write_model_entries(path, configs)
+    crate::models_file::update_model_entries(&path, |configs| {
+        if let Some(conflict) = configs.iter().find(|config| {
+            config.provider != "acp" && profiles.iter().any(|(profile, _)| config.id.0 == *profile)
+        }) {
+            bail!(
+                "ACP profile `{}` conflicts with an existing {} model",
+                conflict.id.0,
+                conflict.provider
+            );
+        }
+        configs.retain(|config| {
+            !(config.provider == "acp"
+                && (config.id.0 == base || config.id.0.starts_with(&family_prefix)))
+        });
+        configs.extend(profiles.iter().map(|(profile, agent)| ModelConfig {
+            id: ModelId(profile.clone()),
+            provider: "acp".to_string(),
+            base_url: String::new(),
+            model: agent.clone(),
+            api_key_env: String::new(),
+            context_tokens: None,
+            // An ACP agent is launched, not addressed over HTTP, so it has no
+            // catalog provider whose auth header would need resolving.
+            provider_id: None,
+        }));
+        Ok(())
+    })
 }
 
 fn distribution_label(
