@@ -32,6 +32,30 @@
 //! REPLACES the queued one rather than piling up, so speech tracks the
 //! conversation instead of falling behind it.
 //!
+//! ## Privacy (outbound)
+//!
+//! Capture is gated on the way IN: the daemon re-derives the stored artifact's
+//! classification and runs [`transcription_allowed`] before a byte is read
+//! (`codypendent_daemon::transcription::transcribe_envelope`). Until this fix,
+//! a finished assistant turn had **no gate on the way OUT** — every reply,
+//! source code included, was POSTed to the hosted `[speech]` endpoint
+//! regardless of `routing.toml` (2026-08-13 review, F8). The speech worker now
+//! runs the identical [`transcription_allowed`] check against the text about to
+//! be synthesized: it defaults to [`DEFAULT_MEDIA_CLASSIFICATION`]
+//! (`Confidential`, the same "assume worst case" label captured media gets,
+//! via [`speech_classification`]), evaluated against the SAME `routing.toml`
+//! `[policy].max_off_device` ceiling the daemon's transcriber reads
+//! (`codypendentd::transcription::HostedTranscriber::from_paths`), under
+//! [`TranscriptionMode::Local`]/[`TranscriptionMode::Remote`] read from the
+//! `[speech]` table's own `local` flag exactly as `[transcription]`'s is read
+//! for STT (see [`speech_mode`]) — one function, one default, one ceiling,
+//! applied to both directions of travel. A refusal never reaches the network:
+//! it is reported through `speech_error` exactly like a synthesis or playback
+//! failure, so a gagged reply is legible, not silently swallowed. The ceiling
+//! is read fresh before every utterance — unlike the recorder probe, which is
+//! cached once — so an operator who tightens `routing.toml` mid-session is
+//! obeyed on the very next reply, not only after a restart.
+//!
 //! ## Honesty
 //!
 //! **The machine this was developed on has no audio hardware, no microphone,
@@ -46,11 +70,16 @@ use std::time::Instant;
 
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::input::{
-    AudioArtifact, InputBlock, InputEnvelope, InputSource, ScopeLevel, DEFAULT_MEDIA_CLASSIFICATION,
+    transcription_allowed, AudioArtifact, InputBlock, InputEnvelope, InputSource, OffDevicePolicy,
+    ScopeLevel, TranscriptionMode, DEFAULT_MEDIA_CLASSIFICATION,
 };
-use codypendent_protocol::{ArtifactRef, EventBody, RunId, RunState, SessionEvent};
+use codypendent_protocol::{
+    ArtifactRef, DataClassification, EventBody, RunId, RunState, SessionEvent,
+};
 use codypendent_runtime::auth::AuthStore;
-use codypendent_runtime::models::{load_audio_models, AudioPlayer, AudioSynthesizer};
+use codypendent_runtime::models::{
+    load_audio_models, AudioModelConfig, AudioPlayer, AudioSynthesizer,
+};
 use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent};
 use serde::Deserialize;
 
@@ -548,6 +577,71 @@ async fn interrupt(child: &tokio::process::Child) {
         .await;
 }
 
+/// Whether a `[speech]` endpoint runs on-device — the OUTBOUND mirror of
+/// `AudioTranscriber::is_local` (`codypendent_runtime::models`), read from the
+/// exact same per-table `local` flag `[transcription]` uses for STT. Feeds the
+/// identical [`transcription_allowed`] gate STT runs, so a local speech server
+/// is always permitted and a hosted one is governed by the off-device ceiling.
+#[must_use]
+fn speech_mode(config: &AudioModelConfig) -> TranscriptionMode {
+    if config.local {
+        TranscriptionMode::Local
+    } else {
+        TranscriptionMode::Remote
+    }
+}
+
+/// The classification assistant text is treated as before speech synthesis
+/// (F8 — the outbound mirror of [`capture_classification`]): an assistant turn
+/// routinely contains repository source, diffs, and command output, and this
+/// build tracks no finer-grained per-turn classification, so it defaults to the
+/// same "assume worst case" label captured media gets rather than assuming
+/// text is safe to leave the device.
+#[must_use]
+pub fn speech_classification() -> DataClassification {
+    DEFAULT_MEDIA_CLASSIFICATION
+}
+
+/// The `[policy]` table's off-device ceiling, read straight from
+/// `<data_dir>/routing.toml` — its own minimal struct (like [`VoiceFile`]) so
+/// the rest of the file (name, version, lambdas, quality_threshold,
+/// escalation_chain) is neither required nor touched.
+#[derive(Debug, Default, Deserialize)]
+struct RoutingCeilingFile {
+    #[serde(default)]
+    policy: Option<RoutingCeilingPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutingCeilingPolicy {
+    max_off_device: DataClassification,
+}
+
+/// Read `<data_dir>/routing.toml`'s off-device ceiling — the SAME value the
+/// daemon's STT gate reads
+/// (`RoutingConfig::load(paths).policy.max_off_device` in
+/// `codypendentd::transcription::HostedTranscriber::from_paths`), so voice's
+/// two directions share one privacy posture rather than two independently
+/// maintained ones. Read fresh on every call (not cached like the recorder
+/// probe): an operator who tightens the ceiling mid-session must be obeyed on
+/// the very next reply, not only after a restart.
+///
+/// An absent or malformed file degrades to `Confidential` — exactly the
+/// `RoutingPolicy::balanced()` ceiling an absent/malformed `routing.toml`
+/// degrades to for STT (`RoutingConfig::default`/`RoutingConfig::invalid` both
+/// keep `policy: RoutingPolicy::balanced()`) — so a typo here can neither
+/// gag every reply nor open the gate wider than STT already tolerates.
+#[must_use]
+fn load_off_device_ceiling(data_dir: &Path) -> DataClassification {
+    std::fs::read_to_string(data_dir.join("routing.toml"))
+        .ok()
+        .and_then(|text| toml::from_str::<RoutingCeilingFile>(&text).ok())
+        .and_then(|file| file.policy)
+        .map_or(DataClassification::Confidential, |policy| {
+            policy.max_off_device
+        })
+}
+
 /// Start the synthesis+playback worker, or `None` when either half of spoken
 /// replies is unconfigured.
 ///
@@ -566,6 +660,9 @@ fn start_speech_worker(
     let auth = AuthStore::load(data_dir).unwrap_or_default();
     let synthesizer = AudioSynthesizer::new(&audio, auth).ok()?;
     let player = AudioPlayer::new(play_command.to_vec());
+    // Captured before `synthesizer` moves into the task below.
+    let mode = speech_mode(synthesizer.config());
+    let data_dir = data_dir.to_path_buf();
 
     let (tx, mut rx) = tokio::sync::watch::channel(None::<String>);
     tokio::spawn(async move {
@@ -575,6 +672,25 @@ fn start_speech_worker(
             let Some(text) = rx.borrow_and_update().clone() else {
                 continue;
             };
+            // Outbound privacy gate (F8): the SAME `transcription_allowed`
+            // check the daemon runs on audio-in before a byte is read, run
+            // here before a byte is sent. Confidential text — the default, and
+            // an assistant turn routinely carries source, diffs, and command
+            // output — may not leave the device unless a local endpoint or a
+            // raised ceiling says otherwise. This must stay the FIRST thing in
+            // the loop body, before any use of `synthesizer`.
+            let policy = OffDevicePolicy {
+                max_off_device: load_off_device_ceiling(&data_dir),
+            };
+            if let Err(refused) = transcription_allowed(speech_classification(), mode, &policy) {
+                if let Ok(mut slot) = errors.lock() {
+                    *slot = Some(format!(
+                        "voice: reply not spoken — {refused}; add a local [speech] endpoint \
+                         (local = true) or raise routing.toml's policy.max_off_device"
+                    ));
+                }
+                continue;
+            }
             let failure = match synthesizer.synthesize(&text).await {
                 Ok(spoken) => player
                     .play(&spoken.bytes)
@@ -1042,6 +1158,245 @@ mod tests {
         assert_eq!(
             artifact.sensitivity,
             codypendent_protocol::DataClassification::Confidential
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // F8: the outbound privacy gate.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn speech_mode_reads_the_tables_own_local_flag() {
+        let mut config = AudioModelConfig {
+            base_url: "https://example.invalid".to_string(),
+            model: "tts".to_string(),
+            api_key_env: String::new(),
+            voice: None,
+            format: None,
+            local: false,
+            timeout_secs: 30,
+        };
+        assert_eq!(speech_mode(&config), TranscriptionMode::Remote);
+        config.local = true;
+        assert_eq!(speech_mode(&config), TranscriptionMode::Local);
+    }
+
+    #[test]
+    fn the_default_speech_classification_matches_the_default_capture_classification() {
+        // Both directions assume the worst case by default; there is exactly
+        // one constant for "unclassified media/text", not two that could drift.
+        assert_eq!(speech_classification(), capture_classification());
+        assert_eq!(speech_classification(), DataClassification::Confidential);
+    }
+
+    #[test]
+    fn load_off_device_ceiling_defaults_to_confidential_when_absent_or_malformed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            load_off_device_ceiling(dir.path()),
+            DataClassification::Confidential,
+            "no routing.toml at all must not gag every reply"
+        );
+
+        std::fs::write(dir.path().join("routing.toml"), "not = [valid toml").expect("write");
+        assert_eq!(
+            load_off_device_ceiling(dir.path()),
+            DataClassification::Confidential,
+            "a typo must degrade exactly like STT's ceiling does, not fail closed differently"
+        );
+
+        std::fs::write(
+            dir.path().join("routing.toml"),
+            "enabled = true\n\n[policy]\nname = \"tight\"\nversion = 1\n\
+             quality_threshold = 0.7\nmax_off_device = { type = \"Internal\" }\n\n\
+             [policy.lambdas]\ncost = 1.0\nlatency = 1.0\nprivacy = 1.0\nfailure = 1.0\n",
+        )
+        .expect("write");
+        assert_eq!(
+            load_off_device_ceiling(dir.path()),
+            DataClassification::Internal,
+            "an explicit ceiling in routing.toml must be honored"
+        );
+    }
+
+    /// Write a `[speech]`-only `models.toml` pointed at `base_url`.
+    fn speech_models_toml(
+        dir: &tempfile::TempDir,
+        base_url: &str,
+        local: bool,
+    ) -> std::path::PathBuf {
+        let path = dir.path().join("models.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[speech]\nbase_url = \"{base_url}\"\nmodel = \"tts-1\"\n\
+                 api_key_env = \"\"\nlocal = {local}\n"
+            ),
+        )
+        .expect("write models.toml");
+        path
+    }
+
+    fn write_routing_ceiling(dir: &tempfile::TempDir, max_off_device: &str) {
+        std::fs::write(
+            dir.path().join("routing.toml"),
+            format!(
+                "enabled = true\n\n[policy]\nname = \"t\"\nversion = 1\n\
+                 quality_threshold = 0.7\nmax_off_device = {{ type = \"{max_off_device}\" }}\n\n\
+                 [policy.lambdas]\ncost = 1.0\nlatency = 1.0\nprivacy = 1.0\nfailure = 1.0\n"
+            ),
+        )
+        .expect("write routing.toml");
+    }
+
+    /// A stand-in "player": a shell that reads stdin and discards it, exactly
+    /// like `crates/runtime/tests/audio.rs`'s convention (no audio device
+    /// exists in this container).
+    fn discard_player() -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ]
+    }
+
+    /// Poll `server`'s recorded requests until `at_least` arrive or `timeout`
+    /// elapses, so the assertion does not race the background worker task.
+    async fn wait_for_requests(
+        server: &wiremock::MockServer,
+        at_least: usize,
+        timeout: std::time::Duration,
+    ) -> Vec<wiremock::Request> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let requests = server.received_requests().await.expect("recorded requests");
+            if requests.len() >= at_least || Instant::now() >= deadline {
+                return requests;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn confidential_text_never_reaches_a_speech_endpoint_under_a_restrictive_ceiling() {
+        // THE proof requested by the outcome-8 assignment: a stub speech
+        // endpoint that records what it receives, under a policy that permits
+        // only Internal off-device — below the Confidential default every
+        // assistant turn is assumed to carry.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/audio/speech"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(b"fake-mp3".to_vec())
+                    .insert_header("content-type", "audio/mpeg"),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models_toml = speech_models_toml(&dir, &server.uri(), false);
+        write_routing_ceiling(&dir, "Internal");
+
+        let errors: SpeechError = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sender =
+            start_speech_worker(&models_toml, dir.path(), &discard_player(), errors.clone())
+                .expect("both [speech] and play_command are configured");
+
+        sender
+            .send(Some("fix the auth bug in src/secrets.rs".to_string()))
+            .expect("send");
+        // Give the worker a bounded window to (wrongly) complete a full HTTP
+        // round trip if the gate were absent, then assert it did not.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert!(
+            requests.is_empty(),
+            "confidential text must NEVER reach the speech endpoint under a restrictive ceiling, got: {requests:?}"
+        );
+        let error = errors
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("the refusal is reported, not silently swallowed");
+        assert!(error.contains("not spoken"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_permissive_ceiling_lets_the_reply_reach_the_stub_endpoint() {
+        // The counterpart proof: the gate is a real gate, not a wire that
+        // always refuses. Under a ceiling that permits Confidential off-device
+        // (the default, unconfigured posture — see
+        // `load_off_device_ceiling`'s own default), speech proceeds.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/audio/speech"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(b"fake-mp3".to_vec())
+                    .insert_header("content-type", "audio/mpeg"),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models_toml = speech_models_toml(&dir, &server.uri(), false);
+        write_routing_ceiling(&dir, "Confidential");
+
+        let errors: SpeechError = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sender =
+            start_speech_worker(&models_toml, dir.path(), &discard_player(), errors.clone())
+                .expect("both [speech] and play_command are configured");
+
+        sender
+            .send(Some("all tests pass".to_string()))
+            .expect("send");
+        let requests = wait_for_requests(&server, 1, std::time::Duration::from_secs(3)).await;
+
+        assert_eq!(requests.len(), 1, "the permitted reply must reach the stub");
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("json request body");
+        assert_eq!(body["input"], "all tests pass");
+        assert!(
+            errors.lock().expect("lock").is_none(),
+            "a permitted reply must not report a privacy refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_speech_endpoint_marked_local_bypasses_the_ceiling_entirely() {
+        // Mirrors STT's `a_local_endpoint_is_local_under_any_ceiling`: an
+        // operator who marks their OWN `[speech]` endpoint `local = true` gets
+        // it honored even under the tightest possible ceiling.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/audio/speech"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_bytes(b"fake-mp3".to_vec())
+                    .insert_header("content-type", "audio/mpeg"),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models_toml = speech_models_toml(&dir, &server.uri(), true);
+        write_routing_ceiling(&dir, "Public");
+
+        let errors: SpeechError = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sender =
+            start_speech_worker(&models_toml, dir.path(), &discard_player(), errors.clone())
+                .expect("both [speech] and play_command are configured");
+
+        sender
+            .send(Some("a local endpoint is always permitted".to_string()))
+            .expect("send");
+        let requests = wait_for_requests(&server, 1, std::time::Duration::from_secs(3)).await;
+        assert_eq!(
+            requests.len(),
+            1,
+            "a local speech endpoint bypasses the off-device ceiling"
         );
     }
 }

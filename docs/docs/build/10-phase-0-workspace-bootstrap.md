@@ -12,7 +12,7 @@ What you build here and why it is shaped this way:
 
 - **Four crates, not nine.** The manual's target layout lists nine module directories; CONTRIBUTING forbids creating crates that merely mirror diagrams. Phase 0 needs exactly: `protocol` (wire types, IDs, framing, discovery), `daemon` (persistence + server, binary `codypendentd`), `cli` (binary `codypendent`), `test-support` (fixtures). Later phases add `runtime`, `tui`, `knowledge`, `integrations`, `sandbox` when they earn existence.
 - **The event ledger exists from day one.** Sessions and an append-only `events` table with `(session_id, sequence)` as primary key are created in the first migration, because every later subsystem (runs, approvals, projections, recovery) builds on this ordering authority.
-- **`agent-framework-core = "0.1.1"` is pinned now** in workspace dependencies (a roadmap Phase 0 deliverable) and first consumed in Phase 1.
+- **`agent-framework-core` is pinned now** in workspace dependencies (a roadmap Phase 0 deliverable) and first consumed in Phase 1. Pin whatever the CURRENT published version is at the time you follow this guide (`0.2.0` as of 2026-08-13 — verify with `cargo search agent-framework-core` or crates.io before typing a version into `Cargo.toml`; this exact guide already went stale once, see STEP 0.3's `rust-version` note below).
 - **Socket discovery is protocol.** Clients and daemon must independently resolve the same socket path; Unix socket paths are limited to ~104–108 bytes, so resolution prefers `$XDG_RUNTIME_DIR` and validates length with a structured error instead of an opaque `SUN_LEN` bind failure.
 
 ## STEP 0.1 — Verify the environment
@@ -23,7 +23,7 @@ What you build here and why it is shaped this way:
 rustc --version && cargo --version && git --version
 ```
 
-**EXPECT** — `rustc` ≥ 1.82 stable, any recent `cargo`, `git` ≥ 2.40. If `rustc` is missing or too old, install/update via rustup (see the [guide overview](00-how-to-use-this-guide.md)) before continuing.
+**EXPECT** — `rustc` ≥ 1.88 stable (the shipped tree's actual MSRV as of 2026-08-13 — see the note on `rust-version` in STEP 0.3 below; verify against the real `Cargo.toml` rather than trust a fixed number here), any recent `cargo`, `git` ≥ 2.40. If `rustc` is missing or too old, install/update via rustup (see the [guide overview](00-how-to-use-this-guide.md)) before continuing.
 
 ## STEP 0.2 — Create the repository skeleton
 
@@ -57,7 +57,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 repository = "https://github.com/CodeHalwell/codypendent"
 
 [workspace.dependencies]
@@ -67,8 +67,10 @@ codypendent-daemon = { path = "crates/daemon" }
 codypendent-test-support = { path = "crates/test-support" }
 
 # agent-framework-rs is pinned here in Phase 0 (roadmap requirement) and first
-# consumed by the runtime layer in Phase 1.
-agent-framework-core = "0.1.1"
+# consumed by the runtime layer in Phase 1. Pin whatever crates.io's current
+# published version is (0.2.0 as of 2026-08-13) — this guide has already gone
+# stale on this exact number once; do not copy 0.1.1 from an old draft.
+agent-framework-core = "0.2.0"
 
 # Async runtime and serialization
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "process", "fs", "sync"] }

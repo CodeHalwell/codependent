@@ -50,11 +50,14 @@ pub use learning::{
     MutationOutcome as LearningMutationOutcome, NewLearning, Verification,
 };
 pub use manifest::{
-    load_package, ManifestError, SkillEntrypoints, SkillLimits, SkillManifest, SkillPermissions,
-    SkillTrust,
+    hash_package, load_package, ManifestError, SkillEntrypoints, SkillLimits, SkillManifest,
+    SkillPermissions, SkillResourceLimits, SkillTrust,
 };
 pub use registry::{resolve_shadowed, Registry, RegistryError};
-pub use skill_exec::{profile_for_permissions, run_script, SkillExecError};
+pub use skill_exec::{
+    profile_for_permissions, run_module, run_script, substitute_placeholders, PlaceholderContext,
+    SkillExecError, SkillInvocation, SkillRunOutcome, SkillRunner,
+};
 pub use skills::{
     anchor_repository_id, install_package, is_retrievable_status, local_user_scope,
     repository_skills_root, scan_skill_root, user_skills_root, SkillInstallError, SkillScanOutcome,
@@ -73,8 +76,9 @@ pub use adapter::{
     ParseOutput, RustAdapter, ScriptAdapter, SemanticCapability, SymbolIndex, Workspace,
 };
 pub use codegraph::{
-    changed_between, stable_repository_id, CodeGraphError, GraphDelta, ParsedSymbol, SemanticEdge,
-    SymbolDelta, SymbolSnapshot,
+    changed_between, stable_repository_id, CodeGraphError, CodeGraphQueries, GraphAnswer,
+    GraphDelta, GraphHit, GraphQuestion, ParsedSymbol, SemanticEdge, SymbolDelta, SymbolSnapshot,
+    GRAPH_ANSWER_LIMIT, GRAPH_MAX_DEPTH,
 };
 pub use repomap::{
     hierarchical_map, ApiSymbol, MapEvidence, MapLevel, MapNode, ModuleEntry, PackageEntry,
@@ -82,13 +86,14 @@ pub use repomap::{
 };
 
 pub use memory::{
-    detect_secret, provenance_cards, CandidateMemory, Curation, ForgetAudit, MemoryError,
-    MemoryStore, ProvenanceCard,
+    detect_secret, provenance_cards, CandidateMemory, Curation, ForgetAudit, MemoryCorrection,
+    MemoryError, MemoryStore, ProvenanceCard,
 };
 pub use observer::{chronicle_candidates, extract_candidates};
 
 pub use context::{
-    assemble_context, ContextAssembler, ContextCard, ContextError, ContextManifest, ContextMemory,
+    assemble_context, ContextAssembler, ContextCard, ContextError, ContextLearning,
+    ContextManifest, ContextMemory,
 };
 
 pub use docs::apply::{apply_mutation, ApplyError, MutationEffect, MutationOutcome};
@@ -105,8 +110,9 @@ pub use docs::model::{
     LinkTarget, MutationKind, ResolvedSymbol,
 };
 pub use docs::render::{
-    plan_publication, publications, record_publication, render_document, Publication, PublishPlan,
-    PublishTarget,
+    pending_pull_request_publications, plan_publication, publications, record_publication,
+    record_pull_request_merge, render_document, Publication, PublishPlan, PublishTarget,
+    PullRequestHandle,
 };
 pub use docs::replica::DocumentReplica;
 pub use docs::staleness::{

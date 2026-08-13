@@ -20,7 +20,17 @@
 //!   pipeline rejects evidence-free candidates.
 //! - **Forgetting leaves no trace of content.** [`forget`](MemoryStore::forget)
 //!   deletes the row, writes a tombstone outbox event, and returns a
-//!   [`ForgetAudit`] that never contains the deleted statement text.
+//!   [`ForgetAudit`] that never contains the deleted statement text. The same
+//!   audit is also durably logged to `memory_forget_audits` (never the
+//!   statement) so "was X ever forgotten" survives past the call that did it —
+//!   see [`forget_audit_log`](MemoryStore::forget_audit_log).
+//! - **A correction is a newer fact, not a silent overwrite.**
+//!   [`correct`](MemoryStore::correct) — the "edit" half of the Chapter 06
+//!   inspect/edit/delete triad (2026-08-13 review F3) — is implemented as an
+//!   attributed [`supersede`](MemoryStore::supersede) of the live record: the
+//!   corrected statement becomes a new record whose `supersedes` names the one
+//!   it replaces, so an edit obeys the exact same "never delete, only
+//!   supersede" rule as an automatically detected contradiction.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -69,6 +79,18 @@ pub enum MemoryError {
          sequence-form revision (seq:<zero-padded number>), never a git SHA or label"
     )]
     NonOrderableRevision(String),
+    /// The requested memory does not exist — or, from a scope-checking caller
+    /// (e.g. a daemon handler), exists but is outside the caller's visible
+    /// scopes. The two are deliberately indistinguishable: a client must never
+    /// be able to use an inspect/edit/delete call as an oracle for "does
+    /// memory X exist in a repository I cannot see".
+    #[error("memory {0} was not found")]
+    NotFound(MemoryId),
+    /// A requested mutation itself violates store policy (e.g. an
+    /// evidence-free [`correct`](MemoryStore::correct) call, held to the same
+    /// provenance bar as [`curate`](MemoryStore::curate)).
+    #[error("memory policy rejected the request: {0}")]
+    Policy(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
@@ -256,8 +278,10 @@ impl MemoryStore {
 
     /// Forget a single memory: delete the row, enqueue a `MemoryChanged`
     /// tombstone (which drops it from the derived indexes when the indexer sees a
-    /// change event for an id no longer in `memories`), and return an audit
-    /// summary that records *which* id was removed but never its statement text.
+    /// change event for an id no longer in `memories`), durably log a
+    /// content-free [`ForgetAudit`] row (see [`forget_audit_log`](Self::forget_audit_log)),
+    /// and return that same audit summary — which records *which* id was
+    /// removed but never its statement text.
     pub async fn forget(
         &self,
         pool: &SqlitePool,
@@ -270,12 +294,14 @@ impl MemoryStore {
             .execute(&mut *tx)
             .await?;
         let removed = result.rows_affected() > 0;
+        let forgotten = if removed { vec![id] } else { Vec::new() };
         if removed {
             outbox::enqueue(&mut *tx, &KnowledgeIndexEvent::MemoryChanged(id), now).await?;
+            insert_forget_audit(&mut *tx, &forgotten, None, now).await?;
         }
         tx.commit().await?;
         Ok(ForgetAudit {
-            forgotten: if removed { vec![id] } else { Vec::new() },
+            forgotten,
             scope: None,
             removed_at: now,
         })
@@ -326,12 +352,106 @@ impl MemoryStore {
                 .execute(&mut *tx)
                 .await?;
         }
+        if !forgotten.is_empty() {
+            insert_forget_audit(&mut *tx, &forgotten, Some(scope), now).await?;
+        }
         tx.commit().await?;
         Ok(ForgetAudit {
             forgotten,
             scope: Some(scope.clone()),
             removed_at: now,
         })
+    }
+
+    /// Correct a **live** memory's statement/value from a client's explicit
+    /// edit (the "edit" half of Chapter 06's inspect/edit/delete triad —
+    /// 2026-08-13 review F3: memory could be inspected and, via
+    /// [`forget`](Self::forget), deleted, but never edited). Implemented as an
+    /// attributed [`supersede`](Self::supersede): `id` must currently be the
+    /// LIVE record (`valid_until IS NULL`) — a superseded/historical id, or one
+    /// that never existed, is refused with [`MemoryError::NotFound`] rather
+    /// than resurrected or silently rewritten, exactly as an automatically
+    /// detected contradiction is never a silent overwrite. The correction's
+    /// own [`EvidenceRef`]s are required — an edit is held to the same
+    /// provenance bar as any other durable memory ([`MemoryError::Policy`] when
+    /// empty).
+    pub async fn correct(
+        &self,
+        pool: &SqlitePool,
+        id: MemoryId,
+        correction: MemoryCorrection,
+    ) -> Result<MemoryRecord, MemoryError> {
+        if correction.provenance.is_empty() {
+            return Err(MemoryError::Policy(
+                "a correction must carry at least one evidence ref".to_string(),
+            ));
+        }
+        let existing = self
+            .get(pool, id)
+            .await?
+            .filter(|record| record.valid_until.is_none())
+            .ok_or(MemoryError::NotFound(id))?;
+        let now = Utc::now();
+        let new = MemoryRecord {
+            id: MemoryId::new(),
+            class: existing.class,
+            scope: existing.scope.clone(),
+            statement: correction.statement,
+            structured_value: correction.structured_value,
+            provenance: correction.provenance,
+            confidence: correction.confidence,
+            observed_at: now,
+            // A manual correction has no session ledger sequence to anchor to
+            // (unlike a curated candidate's `valid_from`); `edit:<uuid>` is
+            // deliberately NOT sequence-form, so an ordered ("as of revision
+            // X") query correctly refuses to compare it (`NonOrderableRevision`)
+            // rather than silently mis-ranking it against session-sequence
+            // revisions, exactly like the opaque git-SHA case the type models.
+            valid_from: Revision(format!("edit:{}", uuid::Uuid::now_v7())),
+            valid_until: None,
+            supersedes: Vec::new(),
+            sensitivity: existing.sensitivity,
+            retention: existing.retention.clone(),
+        };
+        self.supersede(pool, id, new).await
+    }
+
+    /// The durable, content-free audit trail of every completed
+    /// [`forget`](Self::forget)/[`forget_scope`](Self::forget_scope) call,
+    /// newest first (Chapter 06: "audit records that do not retain deleted
+    /// sensitive content"). Unlike the immediate [`ForgetAudit`] a `forget`
+    /// call hands back to its one caller, this survives past that call — the
+    /// durable half of the right-to-forget promise, and the read side a future
+    /// "was memory X ever forgotten" surface can query.
+    pub async fn forget_audit_log(
+        &self,
+        pool: &SqlitePool,
+        limit: i64,
+    ) -> Result<Vec<ForgetAudit>, MemoryError> {
+        let rows = sqlx::query(
+            "SELECT forgotten_ids_json, scope_tier, scope_key, removed_at \
+             FROM memory_forget_audits ORDER BY removed_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let ids_json: String = row.try_get("forgotten_ids_json")?;
+                let forgotten: Vec<MemoryId> = serde_json::from_str(&ids_json)?;
+                let scope_tier: Option<String> = row.try_get("scope_tier")?;
+                let scope_key: Option<String> = row.try_get("scope_key")?;
+                let scope = scope_tier
+                    .map(|tier| scope_from_parts(&tier, scope_key.as_deref()))
+                    .transpose()?;
+                let removed_at: String = row.try_get("removed_at")?;
+                Ok(ForgetAudit {
+                    forgotten,
+                    scope,
+                    removed_at: parse_ts(&removed_at, "removed_at")?,
+                })
+            })
+            .collect()
     }
 
     /// Run a [`CandidateMemory`] through the curator pipeline (Chapter 06). The
@@ -531,6 +651,22 @@ pub struct CandidateMemory {
     pub retention: Option<RetentionPolicy>,
 }
 
+/// A client's explicit correction to a live memory (see
+/// [`MemoryStore::correct`]). Deliberately narrower than [`CandidateMemory`]:
+/// `class`/`scope` are inherited from the record being corrected — an edit
+/// changes what a memory says, never what kind of fact it is or where it
+/// lives (a change of class/scope is a new memory, not a correction of this
+/// one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryCorrection {
+    pub statement: String,
+    pub structured_value: Option<serde_json::Value>,
+    /// Evidence for THIS correction (e.g. the user's own edit action).
+    /// Required — see [`MemoryStore::correct`].
+    pub provenance: Vec<EvidenceRef>,
+    pub confidence: f32,
+}
+
 /// The outcome of running a candidate through the curator pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Curation {
@@ -660,7 +796,24 @@ fn contradicts(existing: &str, candidate: &str) -> bool {
 }
 
 fn memories_contradict(existing: &MemoryRecord, candidate: &CandidateMemory) -> bool {
-    if contradicts(&existing.statement, &candidate.statement) {
+    // Failure-class statements are canonicalized to a constant "Run failed: "
+    // wrapper (`canonical_failure_statement`) before they ever reach here, so
+    // literally every failure lesson shares the same first-`": "` subject —
+    // "run failed" — regardless of what actually failed. Comparing on that
+    // wrapper made ANY two unrelated failures "contradict" (2026-08-13 review
+    // F5, reproduced live: two different `no model configured` causes silently
+    // superseded one another). Strip the wrapper first so the comparison runs
+    // on the SPECIFIC reason — the part that can actually agree or disagree —
+    // exactly as it already does for every other memory class.
+    let (existing_text, candidate_text) = if existing.class == MemoryClass::Failure {
+        (
+            failure_reason(&existing.statement),
+            failure_reason(&candidate.statement),
+        )
+    } else {
+        (existing.statement.as_str(), candidate.statement.as_str())
+    };
+    if contradicts(existing_text, candidate_text) {
         return true;
     }
     match (&existing.structured_value, &candidate.structured_value) {
@@ -683,6 +836,16 @@ fn memories_contradict(existing: &MemoryRecord, candidate: &CandidateMemory) -> 
         }
         _ => false,
     }
+}
+
+/// The specific reason inside a canonicalized failure statement
+/// (`"Run failed: <reason>"` -> `"<reason>"`), or the statement itself when it
+/// carries no such wrapper (e.g. `"shell.run failed"`, which
+/// `canonical_failure_statement` leaves alone). Used only to pick the text
+/// [`memories_contradict`] compares two Failure-class memories on, so the
+/// wrapper every failure shares can never itself read as a shared "subject".
+fn failure_reason(statement: &str) -> &str {
+    statement.strip_prefix("Run failed: ").unwrap_or(statement)
 }
 
 /// Split a statement into a normalized `(subject, value)` pair on the first
@@ -957,6 +1120,32 @@ async fn insert_row(
     Ok(())
 }
 
+/// Insert one durable, content-free row into `memory_forget_audits` (Chapter
+/// 06's "audit records that do not retain deleted sensitive content"), inside
+/// the caller's transaction so it commits atomically with the delete(s) and
+/// tombstone(s) it documents. `scope` is `Some` only for a `forget_scope` call
+/// — a single-id `forget` records no scope (mirrors [`ForgetAudit`] itself).
+async fn insert_forget_audit(
+    executor: impl sqlx::SqliteExecutor<'_>,
+    forgotten: &[MemoryId],
+    scope: Option<&Scope>,
+    removed_at: DateTime<Utc>,
+) -> Result<(), MemoryError> {
+    sqlx::query(
+        "INSERT INTO memory_forget_audits \
+         (id, forgotten_ids_json, scope_tier, scope_key, removed_at) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(serde_json::to_string(forgotten)?)
+    .bind(scope.map(Scope::tier))
+    .bind(scope.and_then(Scope::key))
+    .bind(removed_at.to_rfc3339())
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Decode a `memories` row (the [`MEMORY_COLUMNS`] projection) into a
 /// [`MemoryRecord`]. The scope is rebuilt from the flattened tier/key columns —
 /// exactly as [`Registry`] reconstructs its scope.
@@ -1098,6 +1287,89 @@ mod quality_tests {
             low_value_memory_reason(MemoryClass::Failure, "Cline requires re-authentication")
                 .is_none()
         );
+    }
+
+    /// Regression (2026-08-13 review F5, reproduced live): two DIFFERENT
+    /// failure reasons must never "contradict" each other merely because
+    /// `canonical_failure_statement` wraps every failure in the same
+    /// `"Run failed: "` prefix. Verified against the old behaviour first: with
+    /// `memories_contradict` comparing the raw (unstripped) statements — i.e.
+    /// reverting to `contradicts(&existing.statement, &candidate.statement)` —
+    /// this assertion fails, because both statements' first `": "` split
+    /// yields the identical subject `"run failed"`.
+    #[test]
+    fn two_unrelated_failure_reasons_never_contradict() {
+        let scope = Scope::Repository(codypendent_protocol::RepositoryId::new());
+        let existing = record_with(
+            scope.clone(),
+            MemoryClass::Failure,
+            "Run failed: no model configured (no models.toml)",
+        );
+        let candidate = candidate_with(
+            scope,
+            MemoryClass::Failure,
+            "Run failed: no model configured: every candidate failed for Build: \
+             unreachable-local: connection check to `http://127.0.0.1:59999/v1` failed",
+        );
+        assert!(
+            !memories_contradict(&existing, &candidate),
+            "two unrelated failure causes must not collapse into a contradiction"
+        );
+    }
+
+    /// A GENUINE failure contradiction — the same inner subject asserting a
+    /// different value — must still supersede. This is what keeps the F5 fix
+    /// from over-correcting into never detecting a real contradiction again.
+    #[test]
+    fn a_failure_contradiction_about_the_same_inner_subject_still_supersedes() {
+        let scope = Scope::Repository(codypendent_protocol::RepositoryId::new());
+        let existing = record_with(
+            scope.clone(),
+            MemoryClass::Failure,
+            "Run failed: node version requirement is 18",
+        );
+        let candidate = candidate_with(
+            scope,
+            MemoryClass::Failure,
+            "Run failed: node version requirement is 20",
+        );
+        assert!(
+            memories_contradict(&existing, &candidate),
+            "the same inner subject with a different value must still contradict"
+        );
+    }
+
+    fn record_with(scope: Scope, class: MemoryClass, statement: &str) -> MemoryRecord {
+        MemoryRecord {
+            id: codypendent_protocol::MemoryId::new(),
+            class,
+            scope,
+            statement: statement.to_string(),
+            structured_value: None,
+            provenance: Vec::new(),
+            confidence: 0.6,
+            observed_at: Utc::now(),
+            valid_from: Revision::sequence(1),
+            valid_until: None,
+            supersedes: Vec::new(),
+            sensitivity: DataClassification::Internal,
+            retention: RetentionPolicy::default(),
+        }
+    }
+
+    fn candidate_with(scope: Scope, class: MemoryClass, statement: &str) -> CandidateMemory {
+        CandidateMemory {
+            class,
+            scope: Some(scope),
+            statement: statement.to_string(),
+            structured_value: None,
+            provenance: Vec::new(),
+            confidence: 0.6,
+            observed_at: Utc::now(),
+            valid_from: Revision::sequence(2),
+            sensitivity: DataClassification::Internal,
+            retention: None,
+        }
     }
 
     #[test]

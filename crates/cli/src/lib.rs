@@ -14,8 +14,14 @@ pub mod council;
 pub mod doctor;
 pub mod eval;
 pub mod finetune;
+pub mod models_file;
 pub mod models_pull;
 pub mod restart;
+/// The skill-writer (outcome 4's authoring half, 2026-08-13 review F4.2):
+/// authors a validated `skill.toml` + `SKILL.md` package into the governed
+/// registry, landing as `draft`, through the same install pipeline
+/// `codypendent skill add` uses.
+pub mod skill_writer;
 pub mod stream;
 pub mod theme_select;
 pub mod tui;

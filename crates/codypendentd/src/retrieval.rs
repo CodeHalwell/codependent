@@ -471,9 +471,14 @@ impl RegistrySearch for PoolRegistrySearch {
 
         let by_id: std::collections::HashMap<_, _> =
             items.iter().map(|item| (item.id, item)).collect();
+        // Commands lead: `to_registry_card`'s `Command => "command"` arm was
+        // unreachable until `retrieve` started returning them, and a prepared
+        // `/fix-ci` is the most useful single line a search for "the ci is red"
+        // can return — more useful than the eighth tool card.
         let cards: Vec<RegistryCard> = result
-            .skills
+            .commands
             .iter()
+            .chain(result.skills.iter())
             .chain(result.tools.iter())
             .map(|card| to_registry_card(card, by_id.get(&card.id).copied()))
             .collect();

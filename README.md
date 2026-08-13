@@ -127,8 +127,11 @@ Normalize all input into a shared envelope over blocks:
 - editor selection / symbol references
 - GitHub references
 
-Voice supports push-to-talk, streaming transcription, optional TTS, and preserving original audio artifacts.
-Image ingestion preserves source image plus extracted/OCR interpretation.
+Voice supports push-to-talk, transcription against a configured hosted/local endpoint, optional TTS, and
+preserving original audio artifacts. Every block type in the envelope (text, audio, image, file, editor
+selection, code symbol, GitHub reference) contributes text the run can act on; image/file/editor-selection
+blocks are named honestly rather than read, since this build has no OCR or image-understanding pipeline —
+see `docs/reviews/2026-08-13-verticals/audio.md` for the current state of that gap.
 
 ## Fully Interactive TUI (Ratatui)
 

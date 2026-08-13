@@ -2,7 +2,13 @@
 
 ## Current package
 
-As of 14 July 2026, the published umbrella crate is `agent-framework` version `0.1.1`, requiring Rust 1.82 or newer.
+As of 2026-08-13, the workspace (`Cargo.toml`) pins `agent-framework-core`/
+`-openai`/`-anthropic` at version `0.2.0`, requiring Rust 1.88 or newer
+(`Cargo.toml`'s `rust-version = "1.88"` — the maximum declared `rust_version`
+across the whole resolved `--all-features` dependency graph, driven by
+`agent-client-protocol` 2.0.0, which is edition-2024). A reader who installs
+Rust 1.82 (this doc's earlier claim) and pins `rust-version = "1.82"` cannot
+compile the tree.
 
 The workspace includes core runtime and optional crates for:
 
@@ -88,14 +94,23 @@ Do not enable the umbrella `full` feature in the main binary by default. It incr
 
 Prefer selected dependencies:
 
+This example shows the SHAPE of a selective-dependency `Cargo.toml` — the
+version and crate list below is illustrative, not a description of what the
+shipped workspace actually pins today. The real `Cargo.toml` (verify with
+`grep agent-framework Cargo.toml`) pins exactly three: `agent-framework-core`,
+`agent-framework-openai`, `agent-framework-anthropic`, all `"0.2.0"`, all as
+plain (non-optional) workspace dependencies — no `-ollama`, `-mcp`, or `-a2a`
+crate appears anywhere in `Cargo.lock`, so a reader copying the six-crate
+snippet below verbatim would pin three crates the workspace never uses.
+
 ```toml
 [dependencies]
-agent-framework-core = "0.1.1"
-agent-framework-openai = { version = "0.1.1", optional = true }
-agent-framework-anthropic = { version = "0.1.1", optional = true }
-agent-framework-ollama = { version = "0.1.1", optional = true }
-agent-framework-mcp = { version = "0.1.1", optional = true }
-agent-framework-a2a = { version = "0.1.1", optional = true }
+agent-framework-core = "0.2.0"
+agent-framework-openai = { version = "0.2.0", optional = true }
+agent-framework-anthropic = { version = "0.2.0", optional = true }
+agent-framework-ollama = { version = "0.2.0", optional = true }
+agent-framework-mcp = { version = "0.2.0", optional = true }
+agent-framework-a2a = { version = "0.2.0", optional = true }
 
 [features]
 default = ["provider-openai"]

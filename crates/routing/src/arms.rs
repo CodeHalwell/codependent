@@ -1,15 +1,27 @@
 //! Routing-evaluation arms (STEP 7.3, exit criterion 1).
 //!
-//! `codypendent eval route --suite core` compares five arms
-//! ([Chapter 16](../../docs/docs/16-testing-strategy.md)) — static-strongest,
-//! static-cheap, router, router+escalation, local-first router — over the
-//! benchmark suite, reporting task success, cost, latency, escalation rate, and
-//! unsafe-proposal rate. The **release gate** (exit criterion 1) asserts:
+//! The five arms ([Chapter 16](../../docs/docs/16-testing-strategy.md)) —
+//! static-strongest, static-cheap, router, router+escalation, local-first
+//! router — and the **release gate** they exist to decide (exit criterion 1):
 //! *router+escalation ≥ the quality threshold at cost < static-strongest*.
 //!
-//! This module owns the arm→selection mapping (pure) and the report + gate check
-//! (pure aggregation). Actually *running* the cases through each arm is the eval
-//! harness's job (it executes and scores); this crate decides and compares.
+//! This module owns the arm→selection mapping ([`RouteArm::select`], pure) and
+//! the report + gate check ([`RouteEvalReport`], pure aggregation over measured
+//! results). Actually *running* the benchmark suite through each arm — five
+//! executions of every case, scored into a [`RouteArmResult`] — is the eval
+//! harness's job; this crate only decides and compares.
+//!
+//! **No shipped command drives this yet.** Earlier revisions of this doc
+//! advertised a `codypendent eval route --suite core`; it has never existed
+//! (`codypendent eval` has exactly one subcommand, `run`), so the exit
+//! criterion is not evaluable by any shipped path and the types below are
+//! exercised only by this crate's own tests. Building that driver needs more
+//! than a CLI arm: comparing arms requires several benchmarked
+//! `model_profiles` — including a hosted one with a real price, without which
+//! static-strongest and static-cheap collapse onto the same model and the gate
+//! compares nothing. The build plan tracks it as an open box
+//! (`docs/docs/build/17-phase-7-routing-and-learning.md`). Do not restore the
+//! command sentence here without the command.
 
 use serde::{Deserialize, Serialize};
 

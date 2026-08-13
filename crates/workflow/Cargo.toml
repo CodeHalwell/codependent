@@ -28,6 +28,10 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # The driver honours a node's retry backoff with `tokio::time::sleep` (STEP 5.2).
 tokio = { workspace = true }
+# The driver runs the ready frontier concurrently, bounded by
+# `budget.maximum_agents`. `FuturesUnordered` rather than `JoinSet`: node futures
+# borrow the compiled graph, the executor, and the observer.
+futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

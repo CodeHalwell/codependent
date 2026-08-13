@@ -50,7 +50,9 @@ use codypendent_protocol::{
     Envelope, LearningId, ModelId, Payload, RepositoryId, SessionEvent, SessionId, Subscription,
     UserId, WorkspaceId,
 };
-use codypendent_runtime::models::provider_auth_id;
+use codypendent_runtime::models::{
+    load_audio_models, provider_auth_id, MAX_PLAUSIBLE_CONTEXT_TOKENS,
+};
 use codypendent_tui::{
     accessible_snapshot, accessible_terminal_capabilities_message, map_accessible_input, map_event,
     reduce, render, render_splash, sanitize_accessible_text, terminal_capabilities_message, Action,
@@ -59,7 +61,7 @@ use codypendent_tui::{
     DocSuggestionView, GraphEdgeCard, Intent, KanbanCard, KeyStatus, KeyTarget, LearningCard,
     LearningMutation, MemoryCard, ModelCard, ModelListOrigin, ModelLocationLabel, ModelReadiness,
     ProjectionKind, ProviderCard, SkillCard, TerminalGuard, Theme, UnslothQuantCard,
-    UnslothRepoCard, WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
+    UnslothRepoCard, VoiceKeyRow, WorkflowNodeCard, WorkflowNodeUpdate, EDGE_PAGE_SIZE,
 };
 use crossterm::event::Event as CrosstermEvent;
 use serde::{Deserialize, Serialize};
@@ -1016,8 +1018,15 @@ async fn boot_phase(
     // the harness reads the files and folds the projection as an Action, the
     // same Action re-fired after every key write and daemon restart).
     {
-        let (models, tavily) = load_key_statuses(paths, &mut loader_warnings);
-        reduce(state, Action::ApiKeyStatusesLoaded { models, tavily });
+        let (models, tavily, voice) = load_key_statuses(paths, &mut loader_warnings);
+        reduce(
+            state,
+            Action::ApiKeyStatusesLoaded {
+                models,
+                tavily,
+                voice,
+            },
+        );
     }
     // Phase 5 STEP 5.2 + T8: seed the workflow-graph view by compiling the
     // repository's declared workflow manifests, then overlay each workflow's
@@ -2508,6 +2517,10 @@ async fn event_loop<P: Presentation>(
                     description: description.clone(),
                     chair: chair.clone(),
                     rounds: *rounds,
+                    // The wizard has no quorum step, so take the default rule
+                    // (a simple majority of members) rather than pinning a
+                    // number the user was never shown.
+                    quorum: None,
                     // The host-owned wizard has no evidence-mode step yet; a
                     // council created this way keeps rubric 6's "default
                     // behavior unchanged" and can still be flipped on later by
@@ -2763,7 +2776,7 @@ async fn event_loop<P: Presentation>(
                     continue;
                 };
                 let repository_id =
-                    codypendent_knowledge::stable_repository_id(Path::new(repository));
+                    codypendent_knowledge::anchor_repository_id(Path::new(repository));
                 let scopes = [
                     Scope::System,
                     Scope::Workspace(workspace_id),
@@ -2947,7 +2960,7 @@ async fn event_loop<P: Presentation>(
             if let Intent::SearchEdges { query, page } = &intent {
                 if let Some(pool) = docs_pool.as_ref() {
                     let repository_id =
-                        codypendent_knowledge::stable_repository_id(Path::new(repository));
+                        codypendent_knowledge::anchor_repository_id(Path::new(repository));
                     let mut warnings = Vec::new();
                     let (edges, total, page) =
                         load_edge_page(pool, repository_id, query, *page, &mut warnings).await;
@@ -4251,37 +4264,7 @@ fn write_add_model(
         context_tokens,
     });
 
-    // Replace only the `[[model]]` array. Voice, transcription, embedding,
-    // retrieval and future top-level settings share this file and must survive
-    // adding a model from the TUI.
-    #[derive(serde::Serialize)]
-    struct ModelsToml {
-        #[serde(rename = "model")]
-        model: Vec<ModelConfig>,
-    }
-    let mut root = if models_path.exists() {
-        let raw = std::fs::read_to_string(&models_path)
-            .with_context(|| format!("reading {}", models_path.display()))?;
-        raw.parse::<toml::Value>()
-            .with_context(|| format!("parsing {}", models_path.display()))?
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    let replacement =
-        toml::Value::try_from(ModelsToml { model: configs }).context("serializing models.toml")?;
-    let model = replacement
-        .get("model")
-        .cloned()
-        .unwrap_or_else(|| toml::Value::Array(Vec::new()));
-    root.as_table_mut()
-        .ok_or_else(|| anyhow!("models.toml must contain a TOML table"))?
-        .insert("model".to_owned(), model);
-    let rendered = toml::to_string_pretty(&root).context("serializing models.toml")?;
-    let models_tmp = data_dir.join("models.toml.tmp");
-    std::fs::write(&models_tmp, rendered.as_bytes())
-        .with_context(|| format!("writing {}", models_tmp.display()))?;
-    std::fs::rename(&models_tmp, &models_path)
-        .with_context(|| format!("replacing {}", models_path.display()))?;
+    crate::models_file::write_model_entries(&models_path, &configs)?;
 
     // Store the key (hosted providers only) in auth.json at 0600 — loaded
     // above, BEFORE models.toml was written, so a corrupt pre-existing
@@ -4674,12 +4657,47 @@ async fn apply_remove_model(state: &mut AppState, paths: &RuntimePaths, model_id
 /// id doubles as the entry key (the add-model flow's convention); the Tavily
 /// target maps onto the reserved, collision-proof `integrations/tavily` id the
 /// daemon's `TavilyKey::discover` reads.
+///
+/// The two voice ids are the `models.toml` TABLE names, and they are not free
+/// choices: `codypendent_runtime::models`'s `audio_api_key` looks the key up as
+/// `auth.get("transcription")` / `auth.get("speech")` (the same literals its
+/// `AudioTranscriber`/`AudioSynthesizer` pass), so any other spelling here
+/// would save a key that reads back as absent — worse than today's missing
+/// write path, because it would look like it worked. Pinned end to end by
+/// `a_transcription_key_saved_through_keys_is_the_one_the_transcriber_sends`.
 fn key_target_auth_id(target: &KeyTarget) -> String {
     match target {
         KeyTarget::Model(id) => id.clone(),
         KeyTarget::Tavily => codypendent_integrations::search::TAVILY_AUTH_ID.to_owned(),
+        KeyTarget::Transcription => TRANSCRIPTION_AUTH_ID.to_owned(),
+        KeyTarget::Speech => SPEECH_AUTH_ID.to_owned(),
     }
 }
+
+/// The host part of a `base_url`, for display only: scheme and path stripped,
+/// e.g. `https://api.groq.com/openai/v1` -> `api.groq.com`. Deliberately a
+/// string trim rather than a URL parse — this feeds a label, and a `base_url`
+/// this cannot make sense of should render as itself, not vanish.
+fn endpoint_host(base_url: &str) -> &str {
+    let rest = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest)
+        .trim_start_matches('/');
+    let host = rest.split('/').next().unwrap_or(rest);
+    if host.is_empty() {
+        base_url
+    } else {
+        host
+    }
+}
+
+/// The `auth.json` entry the `[transcription]` (speech-to-text) endpoint reads.
+/// See [`key_target_auth_id`] for why this string is load-bearing.
+const TRANSCRIPTION_AUTH_ID: &str = "transcription";
+
+/// The `auth.json` entry the `[speech]` (text-to-speech) endpoint reads.
+/// See [`key_target_auth_id`] for why this string is load-bearing.
+const SPEECH_AUTH_ID: &str = "speech";
 
 /// Apply an `Intent::SetApiKey` (`Some(key)`) or `Intent::RemoveApiKey`
 /// (`None`) to `<data_dir>/auth.json` (D1). This is the harness's job because
@@ -4748,6 +4766,26 @@ fn apply_set_api_key(state: &mut AppState, paths: &RuntimePaths, target: &KeyTar
                         Action::Notice("Tavily key saved — web search is ready".to_owned()),
                     );
                 }
+                // The transcriber/synthesizer are constructed once, when the
+                // daemon (STT) and the TUI (TTS) start, so unlike a model key
+                // this one does NOT apply to the next run — say so rather than
+                // letting the operator conclude voice is broken.
+                KeyTarget::Transcription => {
+                    reduce(
+                        state,
+                        Action::Notice(
+                            "voice input key saved — restart the daemon to use it".to_owned(),
+                        ),
+                    );
+                }
+                KeyTarget::Speech => {
+                    reduce(
+                        state,
+                        Action::Notice(
+                            "voice output key saved — restart the TUI to use it".to_owned(),
+                        ),
+                    );
+                }
             }
         }
         Err(error) => {
@@ -4780,6 +4818,24 @@ fn apply_remove_api_key(state: &mut AppState, paths: &RuntimePaths, target: &Key
                         Action::Notice("Tavily key removed — web search is disabled".to_owned()),
                     );
                 }
+                // Same snapshot-at-startup caveat as the set path: the running
+                // client still holds the key it was built with.
+                KeyTarget::Transcription => {
+                    reduce(
+                        state,
+                        Action::Notice(
+                            "voice input key removed — restart the daemon to apply".to_owned(),
+                        ),
+                    );
+                }
+                KeyTarget::Speech => {
+                    reduce(
+                        state,
+                        Action::Notice(
+                            "voice output key removed — restart the TUI to apply".to_owned(),
+                        ),
+                    );
+                }
             }
         }
         Err(error) => {
@@ -4794,7 +4850,9 @@ fn apply_remove_api_key(state: &mut AppState, paths: &RuntimePaths, target: &Key
 /// Read the `/keys` status projection (D1): one `(model_id, status)` per
 /// `models.toml` model, plus the Tavily row's status — `Stored` when an
 /// `auth.json` entry exists, else `Env(NAME)` when the model declares an
-/// `api_key_env` (the NAME only, never the value), else `Missing`.
+/// `api_key_env` (the NAME only, never the value), else `Missing` — plus one
+/// row per CONFIGURED voice table (`[transcription]`/`[speech]`), which follow
+/// the same precedence against their own `auth.json` entry id.
 ///
 /// The Tavily row mirrors the daemon's `TavilyKey::discover` precedence: the
 /// reserved `auth.json` entry first, then the `TAVILY_API_KEY` env var. The
@@ -4811,7 +4869,7 @@ fn apply_remove_api_key(state: &mut AppState, paths: &RuntimePaths, target: &Key
 fn load_key_statuses(
     paths: &RuntimePaths,
     warnings: &mut Vec<String>,
-) -> (Vec<(String, KeyStatus)>, KeyStatus) {
+) -> (Vec<(String, KeyStatus)>, KeyStatus, Vec<VoiceKeyRow>) {
     use codypendent_runtime::auth::AuthStore;
     use codypendent_runtime::models::load_models;
 
@@ -4849,7 +4907,57 @@ fn load_key_statuses(
     } else {
         KeyStatus::Missing
     };
-    (models, tavily)
+    // Voice rows exist only for a table that is actually configured: an absent
+    // `[transcription]`/`[speech]` has no endpoint, so there is nothing a key
+    // would authenticate against. A models.toml whose voice tables do not parse
+    // degrades to no rows with a diagnostic, matching this function's contract
+    // that statuses are a view and never the authority.
+    let audio = match load_audio_models(&data_dir.join("models.toml")) {
+        Ok(audio) => audio,
+        Err(error) => {
+            warnings.push(format!(
+                "could not read the [transcription]/[speech] tables in {}: {error}; \
+                 their /keys rows are hidden",
+                data_dir.join("models.toml").display()
+            ));
+            Default::default()
+        }
+    };
+    let voice = [
+        (
+            KeyTarget::Transcription,
+            "Voice input (speech-to-text)",
+            audio.transcription.as_ref(),
+        ),
+        (
+            KeyTarget::Speech,
+            "Voice output (text-to-speech)",
+            audio.speech.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(target, label, config)| {
+        let config = config?;
+        let status = if auth.get(&key_target_auth_id(&target)).is_some() {
+            KeyStatus::Stored
+        } else if config.api_key_env.trim().is_empty() {
+            KeyStatus::Missing
+        } else {
+            KeyStatus::Env(config.api_key_env.clone())
+        };
+        Some(VoiceKeyRow {
+            target,
+            label: label.to_owned(),
+            // The endpoint, not the key: which model at which host, so two
+            // configured voice rows are told apart at a glance. The HOST, not
+            // the whole base_url — the row's detail line also carries the key
+            // status, and a full URL pushes that off the panel.
+            detail: format!("{} · {}", config.model, endpoint_host(&config.base_url)),
+            status,
+        })
+    })
+    .collect();
+    (models, tavily, voice)
 }
 
 /// Re-read the key statuses and fold them into the TUI state (D1) — after the
@@ -4858,8 +4966,15 @@ fn load_key_statuses(
 /// notice, exactly like the boot-time seed's diagnostics.
 fn reload_key_statuses(state: &mut AppState, paths: &RuntimePaths) {
     let mut warnings = Vec::new();
-    let (models, tavily) = load_key_statuses(paths, &mut warnings);
-    reduce(state, Action::ApiKeyStatusesLoaded { models, tavily });
+    let (models, tavily, voice) = load_key_statuses(paths, &mut warnings);
+    reduce(
+        state,
+        Action::ApiKeyStatusesLoaded {
+            models,
+            tavily,
+            voice,
+        },
+    );
     for warning in warnings {
         reduce(state, Action::Issue(warning));
     }
@@ -4953,7 +5068,15 @@ fn parse_models_response(body: &str) -> Result<Vec<AddModelRow>, String> {
                 .name
                 .map(|name| name.trim().to_owned())
                 .filter(|name| !name.is_empty()),
-            context_tokens: entry.context_tokens.filter(|tokens| *tokens > 0),
+            // A provider's own reading is normally trusted over the curated
+            // catalog, but it is untrusted INPUT: `load_models` clamps it to
+            // `MAX_PLAUSIBLE_CONTEXT_TOKENS` on every read regardless of writer,
+            // so an over-large value here would only ever be displayed in the
+            // picker and persisted into models.toml as a number nothing honors.
+            // Reject it at the parse instead of showing a lie.
+            context_tokens: entry
+                .context_tokens
+                .filter(|tokens| *tokens > 0 && *tokens <= MAX_PLAUSIBLE_CONTEXT_TOKENS),
             cost_per_1m_input_usd: price_per_1m(pricing.prompt.as_ref()),
             cost_per_1m_output_usd: price_per_1m(pricing.completion.as_ref()),
             live: true,
@@ -5901,10 +6024,13 @@ async fn load_knowledge(
     };
 
     // Visible scopes: the System tier, this session's workspace, and THIS
-    // repository — where a run's harvested memories and documents live, derived
-    // from the same canonical path the daemon uses. The stores enforce
+    // repository — where a run's harvested memories and documents live. The
+    // identity must come from `anchor_repository_id`, which resolves the Git
+    // toplevel first, exactly as `codypendentd::scan::repository_id_for` does:
+    // hashing the opened directory instead made every one of these lists empty
+    // whenever the TUI was started from a subdirectory. The stores enforce
     // cross-scope isolation in SQL; an empty result is fine.
-    let repository = codypendent_knowledge::stable_repository_id(repo);
+    let repository = codypendent_knowledge::anchor_repository_id(repo);
     let scopes = vec![
         Scope::System,
         Scope::Workspace(workspace_id),
@@ -6548,28 +6674,51 @@ fn provider_requires_key(p: &codypendent_providers::Provider) -> bool {
     matches!(p.auth.first(), Some(AuthMethod::ApiKey { .. }))
 }
 
-/// Whether adding a model from `p` can use a live `/models` list: the protocol
-/// is OpenAI-compatible (`OpenAiChat`), a non-blank `base_url` is set, and the
-/// first auth method is `ApiKey` or `None` (or there is none at all). Native
-/// (Anthropic/Gemini), ACP, cloud-IAM, and OAuth providers — and any without a
-/// `base_url` — cannot list here and take the free-text path. A tiny pure
-/// expression (no I/O), extracted out of `load_provider_cards` so it is directly
-/// unit-testable against the real `codypendent_providers` enums.
-fn provider_can_list_models(p: &codypendent_providers::Provider) -> bool {
-    use codypendent_providers::{AuthMethod, Protocol};
-    matches!(p.protocol, Protocol::OpenAiChat)
-        && p.base_url.as_deref().is_some_and(|u| !u.trim().is_empty())
+/// The part of both provider gates below that is about the ENDPOINT rather than
+/// the wire protocol: a non-blank `base_url` and auth this build can actually
+/// supply (an API key, or none at all). Cloud-IAM and OAuth providers fail here
+/// whatever they speak. A tiny pure expression (no I/O), extracted out of
+/// `load_provider_cards` so it is directly unit-testable against the real
+/// `codypendent_providers` enums.
+fn provider_endpoint_usable(p: &codypendent_providers::Provider) -> bool {
+    use codypendent_providers::AuthMethod;
+    p.base_url.as_deref().is_some_and(|u| !u.trim().is_empty())
         && matches!(
             p.auth.first(),
             Some(AuthMethod::ApiKey { .. } | AuthMethod::None) | None
         )
 }
 
-/// The provider shapes today's runtime can execute. Keeping this separate from
-/// catalog visibility prevents native/ACP/cloud-auth cards from producing an
-/// apparently valid `openai-compatible` model entry that can only fail later.
+/// Whether adding a model from `p` can use a live `/models` list: the protocol
+/// is OpenAI-compatible (`OpenAiChat`) and [`provider_endpoint_usable`]. This is
+/// narrower than [`provider_runtime_supported`] on purpose, and Anthropic is
+/// exactly why: the query path this gates GETs `{base_url}/models`
+/// ([`models_url`]), while Anthropic's listing route is `/v1/models` against a
+/// bare `https://api.anthropic.com` — the same mismatch
+/// `ModelRegistry::check_model` had to special-case. Saying `false` here costs
+/// Anthropic nothing: it ships 10 curated catalog rows, and `enter_add_model_flow`
+/// serves those (`can_offer = can_list_models || catalog_models > 0`) instead of
+/// dropping to the free-text path.
+fn provider_can_list_models(p: &codypendent_providers::Provider) -> bool {
+    use codypendent_providers::Protocol;
+    matches!(p.protocol, Protocol::OpenAiChat) && provider_endpoint_usable(p)
+}
+
+/// The provider shapes today's runtime can EXECUTE — what decides whether
+/// `/provider` opens the add flow or refuses with "catalog-only". Keeping this
+/// separate from catalog visibility prevents ACP/cloud-auth cards from producing
+/// an apparently valid `openai-compatible` model entry that can only fail later.
+///
+/// `Anthropic` belongs here alongside `OpenAiChat` because
+/// `ModelRegistry::client_for` now has a real `Protocol::Anthropic` arm and
+/// `provider-anthropic` is a default feature of `codypendent-runtime` — an entry
+/// this flow writes (`provider = "openai-compatible"` + `provider_id =
+/// "anthropic"`) resolves through `config_to_protocol_auth` to a genuine
+/// `AnthropicClient`. Gemini-native and ACP-executor protocols are still
+/// unwired, so they keep failing this gate.
 fn provider_runtime_supported(p: &codypendent_providers::Provider) -> bool {
-    provider_can_list_models(p)
+    use codypendent_providers::Protocol;
+    matches!(p.protocol, Protocol::OpenAiChat | Protocol::Anthropic) && provider_endpoint_usable(p)
 }
 
 /// The provider picker's wire-protocol label — the same kebab-case spelling
@@ -6789,7 +6938,7 @@ async fn load_journey(
             &LearningQuery {
                 scopes: vec![
                     LearningScope::User(UserId("local".to_owned())),
-                    LearningScope::Repository(codypendent_knowledge::stable_repository_id(
+                    LearningScope::Repository(codypendent_knowledge::anchor_repository_id(
                         repository,
                     )),
                 ],
@@ -9805,7 +9954,7 @@ model = "qwen2.5-coder:14b"
         .expect("write models.toml");
 
         // Nothing stored yet: env-declared shows the NAME, the rest Missing.
-        let (models, _) = load_key_statuses(&paths, &mut Vec::new());
+        let (models, _, _) = load_key_statuses(&paths, &mut Vec::new());
         assert_eq!(
             models,
             vec![
@@ -9827,7 +9976,7 @@ model = "qwen2.5-coder:14b"
             Some("sk-x"),
         )
         .expect("set model key");
-        let (models, _) = load_key_statuses(&paths, &mut Vec::new());
+        let (models, _, _) = load_key_statuses(&paths, &mut Vec::new());
         assert_eq!(
             models,
             vec![
@@ -9835,6 +9984,135 @@ model = "qwen2.5-coder:14b"
                 ("openai/gpt".to_owned(), KeyStatus::Stored),
                 ("ollama/qwen".to_owned(), KeyStatus::Missing),
             ]
+        );
+    }
+
+    /// `models.toml` with a `[transcription]` table pointing at `base_url`.
+    fn seed_transcription_models_toml(paths: &RuntimePaths, base_url: &str, api_key_env: &str) {
+        std::fs::create_dir_all(&paths.data_dir).expect("create data dir");
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            format!(
+                r#"
+[[model]]
+id = "groq/llama"
+provider = "openai-compatible"
+base_url = "https://api.groq.com/openai/v1"
+model = "llama-3.1-8b"
+
+[transcription]
+base_url = "{base_url}"
+model = "whisper-large-v3-turbo"
+api_key_env = "{api_key_env}"
+"#
+            ),
+        )
+        .expect("seed models.toml");
+    }
+
+    /// Audio review F3, the whole point of the voice `/keys` rows: the key the
+    /// operator types into `/keys` must land under the entry the runtime's
+    /// `audio_api_key` actually reads. Nothing downstream of `write_api_key`
+    /// validates the entry NAME, so a wrong string here would save happily and
+    /// read back as absent — which is why this asserts on the wire a real
+    /// `AudioTranscriber` sends, not on the string itself.
+    #[tokio::test]
+    async fn a_transcription_key_saved_through_keys_is_the_one_the_transcriber_sends() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/audio/transcriptions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "text": "hello" })),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        // No `api_key_env` — the ONLY way a key can reach the endpoint here is
+        // the `auth.json` entry `/keys` writes.
+        seed_transcription_models_toml(&paths, &server.uri(), "");
+
+        write_api_key(&paths, &KeyTarget::Transcription, Some("sk-stt-from-keys"))
+            .expect("save the transcription key");
+
+        let audio = load_audio_models(&paths.data_dir.join("models.toml")).expect("audio tables");
+        let auth =
+            codypendent_runtime::auth::AuthStore::load(&paths.data_dir).expect("load auth.json");
+        let transcriber = codypendent_runtime::models::AudioTranscriber::new(&audio, auth)
+            .expect("[transcription] is configured");
+        let text = transcriber
+            .transcribe(b"fake-wav", "clip.wav", "audio/wav")
+            .await
+            .expect("transcribe");
+        assert_eq!(text, "hello");
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        let sent = requests
+            .first()
+            .expect("the transcriber called the endpoint")
+            .headers
+            .get("authorization")
+            .expect("the resolved key was sent")
+            .to_str()
+            .expect("ascii header");
+        assert_eq!(
+            sent, "Bearer sk-stt-from-keys",
+            "the /keys write must land under the auth.json entry `audio_api_key` reads"
+        );
+    }
+
+    /// The projection half: a configured voice table produces a `/keys` row
+    /// with the same Stored/Env/Missing precedence a model row gets, and an
+    /// UNconfigured one produces none (there is no endpoint to authenticate).
+    #[test]
+    fn load_key_statuses_projects_a_row_only_for_a_configured_voice_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        seed_transcription_models_toml(&paths, "https://api.groq.com/openai/v1", "GROQ_API_KEY");
+
+        let (_, _, voice) = load_key_statuses(&paths, &mut Vec::new());
+        assert_eq!(voice.len(), 1, "[speech] is absent, so it gets no row");
+        assert_eq!(voice[0].target, KeyTarget::Transcription);
+        assert_eq!(
+            voice[0].detail, "whisper-large-v3-turbo · api.groq.com",
+            "the row identifies the endpoint compactly, with no key material"
+        );
+        assert_eq!(
+            voice[0].status,
+            KeyStatus::Env("GROQ_API_KEY".to_owned()),
+            "with no auth.json entry the declared env NAME is shown"
+        );
+
+        write_api_key(&paths, &KeyTarget::Transcription, Some("sk-stt")).expect("save");
+        let (_, _, voice) = load_key_statuses(&paths, &mut Vec::new());
+        assert_eq!(
+            voice[0].status,
+            KeyStatus::Stored,
+            "a saved key outranks the env NAME, exactly as a model row does"
+        );
+
+        write_api_key(&paths, &KeyTarget::Transcription, None).expect("remove");
+        let (_, _, voice) = load_key_statuses(&paths, &mut Vec::new());
+        assert_eq!(voice[0].status, KeyStatus::Env("GROQ_API_KEY".to_owned()));
+    }
+
+    #[test]
+    fn load_key_statuses_has_no_voice_rows_when_models_toml_configures_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).expect("create data dir");
+        std::fs::write(
+            paths.data_dir.join("models.toml"),
+            "[[model]]\nid = \"groq/llama\"\nprovider = \"openai-compatible\"\nbase_url = \
+             \"https://api.groq.com/openai/v1\"\nmodel = \"llama-3.1-8b\"\n",
+        )
+        .expect("seed models.toml");
+        let (_, _, voice) = load_key_statuses(&paths, &mut Vec::new());
+        assert!(
+            voice.is_empty(),
+            "voice is opt-in; an unconfigured table must not offer a credential row"
         );
     }
 
@@ -9852,25 +10130,25 @@ model = "qwen2.5-coder:14b"
 
         // 1. Neither source → Missing.
         std::env::remove_var(TAVILY_API_KEY_ENV);
-        let (_, tavily) = load_key_statuses(&paths, &mut Vec::new());
+        let (_, tavily, _) = load_key_statuses(&paths, &mut Vec::new());
         assert_eq!(tavily, KeyStatus::Missing);
 
         // 2. Env set (no auth.json entry) → Env(NAME) — the variable NAME
         //    only; the value is never read into the projection.
         std::env::set_var(TAVILY_API_KEY_ENV, "tvly-env-key");
-        let (_, tavily) = load_key_statuses(&paths, &mut Vec::new());
+        let (_, tavily, _) = load_key_statuses(&paths, &mut Vec::new());
         assert_eq!(tavily, KeyStatus::Env(TAVILY_API_KEY_ENV.to_owned()));
 
         // 3. A blank env value counts as absent (exactly like `discover`).
         std::env::set_var(TAVILY_API_KEY_ENV, "   ");
-        let (_, tavily) = load_key_statuses(&paths, &mut Vec::new());
+        let (_, tavily, _) = load_key_statuses(&paths, &mut Vec::new());
         assert_eq!(tavily, KeyStatus::Missing);
 
         // 4. A stored entry beats the env — the file wins, exactly like
         //    `TavilyKey::discover`.
         std::env::set_var(TAVILY_API_KEY_ENV, "tvly-env-key");
         write_api_key(&paths, &KeyTarget::Tavily, Some("tvly-stored")).expect("set tavily");
-        let (_, tavily) = load_key_statuses(&paths, &mut Vec::new());
+        let (_, tavily, _) = load_key_statuses(&paths, &mut Vec::new());
         assert_eq!(tavily, KeyStatus::Stored);
 
         std::env::remove_var(TAVILY_API_KEY_ENV);
@@ -10387,6 +10665,74 @@ api_key_env = ""
         assert!(!provider_can_list_models(&oauth));
     }
 
+    // -- provider_runtime_supported (the /provider "catalog-only" gate) -------
+
+    /// ACP-models review F3: `/provider` refused Anthropic as "catalog-only"
+    /// because the runtime gate was a thin delegate to the LISTING gate, which
+    /// requires `Protocol::OpenAiChat`. `ModelRegistry::client_for` now has a
+    /// real `Protocol::Anthropic` arm (`provider-anthropic` is a default
+    /// feature), so that refusal hid the catalog's 10 priced Anthropic rows
+    /// behind a message that was no longer true.
+    #[test]
+    fn runtime_supported_accepts_anthropic_even_though_it_cannot_list() {
+        use codypendent_providers::{AuthMethod, Protocol};
+        let anthropic = provider_listable(
+            Protocol::Anthropic,
+            Some("https://api.anthropic.com"),
+            vec![AuthMethod::ApiKey {
+                env: vec!["ANTHROPIC_API_KEY".to_string()],
+                header: "x-api-key".to_string(),
+                prefix: String::new(),
+            }],
+        );
+        assert!(
+            provider_runtime_supported(&anthropic),
+            "the add flow must open for Anthropic"
+        );
+        assert!(
+            !provider_can_list_models(&anthropic),
+            "but it must NOT be sent at `{{base_url}}/models`, which 404s for \
+             Anthropic — its curated rows answer instead"
+        );
+    }
+
+    /// The gate must stay closed for what is genuinely unwired, or the
+    /// "catalog-only" message would be replaced by a later, worse failure.
+    #[test]
+    fn runtime_supported_still_refuses_unwired_protocols_and_unusable_endpoints() {
+        use codypendent_providers::{AuthMethod, Protocol};
+        let api_key = || {
+            vec![AuthMethod::ApiKey {
+                env: vec!["KEY".to_string()],
+                header: "Authorization".to_string(),
+                prefix: "Bearer ".to_string(),
+            }]
+        };
+        for protocol in [Protocol::GeminiNative, Protocol::Acp] {
+            let p = provider_listable(protocol, Some("https://example.com/v1"), api_key());
+            assert!(
+                !provider_runtime_supported(&p),
+                "protocol {protocol:?} has no ChatClient arm"
+            );
+        }
+        assert!(
+            !provider_runtime_supported(&provider_listable(Protocol::Anthropic, None, api_key())),
+            "no base_url means nothing to execute against"
+        );
+        assert!(
+            !provider_runtime_supported(&provider_listable(
+                Protocol::Anthropic,
+                Some("https://api.anthropic.com"),
+                vec![AuthMethod::CloudIam {
+                    variant: "aws_sigv4".to_string(),
+                    env: Default::default(),
+                    scopes: vec![],
+                }],
+            )),
+            "cloud-IAM auth is not something this build can supply"
+        );
+    }
+
     // -- ACP model discovery (the picker's agent-model plumbing) --------------
 
     #[test]
@@ -10506,6 +10852,39 @@ api_key_env = ""
         assert!((rows[0].cost_per_1m_output_usd.expect("output price") - 0.4).abs() < 1e-9);
         assert_eq!(rows[1].context_tokens, Some(163_840));
         assert!((rows[1].cost_per_1m_input_usd.expect("input price") - 0.5).abs() < 1e-9);
+    }
+
+    /// ACP-models review F4: `context_tokens` is not display-only — the picker's
+    /// number is what `write_add_model` persists, and from there it becomes the
+    /// Ollama `num_ctx` hint and the footer's context-usage denominator. A
+    /// misconfigured or hostile gateway reporting an absurd `context_length` got
+    /// carried straight through. `load_models` now clamps on every read, so the
+    /// picker must not DISPLAY a number the loader is going to cap anyway.
+    #[test]
+    fn parse_models_response_drops_an_implausible_context_length() {
+        let body = format!(
+            r#"{{"data":[
+                {{"id":"honest","context_length":131072}},
+                {{"id":"absurd","context_length":9223372036854775807}},
+                {{"id":"at-the-ceiling","context_length":{ceiling}}}
+            ]}}"#,
+            ceiling = MAX_PLAUSIBLE_CONTEXT_TOKENS
+        );
+        let rows = parse_models_response(&body).expect("parse");
+        assert_eq!(rows[0].context_tokens, Some(131_072));
+        assert!(
+            rows[1].context_tokens.is_none(),
+            "an implausible reading is dropped, not shown and not persisted"
+        );
+        assert_eq!(
+            rows[2].context_tokens,
+            Some(MAX_PLAUSIBLE_CONTEXT_TOKENS),
+            "the ceiling itself is still a legitimate reading"
+        );
+        assert_eq!(
+            rows[1].id, "absurd",
+            "the row itself survives — only the bad column is dropped"
+        );
     }
 
     /// A price this build cannot make sense of is dropped, not guessed: a

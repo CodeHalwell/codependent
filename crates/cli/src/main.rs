@@ -93,6 +93,17 @@ enum TopCommand {
         /// Repository the run operates in. Defaults to the current directory.
         #[arg(long)]
         repo: Option<PathBuf>,
+        /// Pin the run to this configured model id (as it appears in
+        /// `codypendent models list`), e.g. `openai/gpt-5.4` or `acp/cursor`.
+        /// Without it, model selection falls to routing (if enabled) or the
+        /// resolver's first reachable candidate in `models.toml` FILE ORDER —
+        /// with several models configured, which one that is is not obvious
+        /// from the command line alone. A pin overrides quality/routing
+        /// choice, never the security ceiling: a pinned hosted model for
+        /// classified data is still refused (fail-closed), same as the TUI's
+        /// `/model` picker.
+        #[arg(long)]
+        model: Option<String>,
         /// Stream every session event to stdout as JSONL until the run
         /// terminates. Currently required — interactive attach lands with
         /// the TUI (STEP 1.12).
@@ -188,6 +199,14 @@ enum TopCommand {
     Council {
         #[command(subcommand)]
         command: CouncilCommand,
+    },
+    /// Configure live measured routing (Phase 7 STEP 7.2/7.3, outcome 11):
+    /// per-task-node model selection from benched profiles, instead of the
+    /// Phase-1 resolver's first-reachable-candidate-in-file-order. Reads and
+    /// writes `<data_dir>/routing.toml`. Default OFF.
+    Routing {
+        #[command(subcommand)]
+        command: RoutingCommand,
     },
     /// Hand a session off to an IDE (STEP 3.7): print how to attach, and launch
     /// the editor if it is on `PATH`. The IDE attaches as a contributor to the
@@ -313,6 +332,32 @@ enum SkillCommand {
     Add {
         /// The package directory — the one holding `skill.toml`.
         directory: PathBuf,
+    },
+    /// Author a new skill package and register it as a `draft` — installed and
+    /// inspectable, but never disclosed to a run until a human promotes it
+    /// (outcome 4). Validated and installed through the same pipeline `add`
+    /// runs; nothing here can register an `active` skill.
+    New {
+        /// The skill's manifest id (also its directory name under
+        /// `<data_dir>/skills/`).
+        id: String,
+        /// Human-readable name.
+        #[arg(long)]
+        name: String,
+        /// One sentence on what the skill is for — what retrieval matches on.
+        #[arg(long)]
+        description: String,
+        /// `user` (this machine's operator) or `repository` (anchored to the
+        /// checkout this command runs in).
+        #[arg(long, default_value = "user")]
+        scope: String,
+        /// A Markdown file holding the `SKILL.md` procedure body.
+        #[arg(long)]
+        procedure: PathBuf,
+        /// Where to author the package before installing. Defaults to a
+        /// temporary directory; pass one to keep the authored source to edit.
+        #[arg(long)]
+        directory: Option<PathBuf>,
     },
 }
 
@@ -699,7 +744,25 @@ enum ModelsCommand {
         /// The `models.toml` model id to benchmark (its `base_url` is the
         /// endpoint the profile + probe are keyed under).
         id: String,
+        /// Set (or override) this model's blended per-1M-token price for
+        /// routing's cost/utility scoring, e.g. `3.5` for an average of $3.5
+        /// per million tokens. Without it, a HOSTED model's price is looked
+        /// up from the built-in provider catalog when the entry names a
+        /// known `provider_id` (the same catalog `models add` reads); when
+        /// neither is available the model is benched with an unpriced
+        /// profile and stays ineligible for routing (Chapter 09's hard
+        /// filter — a hosted model can never be silently treated as free).
+        /// A LOCAL model needs no price to route (routing costs it at $0
+        /// genuinely, not as the harness's "unmeasured" sentinel), so this
+        /// flag is normally only needed for a hosted endpoint the catalog
+        /// does not curate.
+        #[arg(long, value_name = "USD_PER_1M")]
+        price_per_1m_usd: Option<f64>,
     },
+    /// List the built-in + user-extended provider catalog: id, display name,
+    /// wire protocol, and whether it curates any prefilled models — the
+    /// input `models add <provider> <model-id>` expects.
+    ListProviders,
     /// Pull a GGUF model from the Unsloth catalog on Hugging Face and register
     /// it against the `ollama` provider. Resolves `<hf-repo>[:<quant>]`
     /// (defaulting a bare repo name to the `unsloth/` org and, with no
@@ -713,6 +776,26 @@ enum ModelsCommand {
         /// `Qwen3-32B-GGUF:UD-Q4_K_XL`, or `some-org/Some-Model-GGUF:Q8_0`.
         spec: String,
     },
+}
+
+#[derive(Subcommand)]
+enum RoutingCommand {
+    /// Show whether the routing seam is enabled and what `routing.toml`
+    /// currently declares (outcome 11).
+    Status,
+    /// Turn on live measured routing: task nodes are sent to
+    /// `codypendent-routing`'s `Router` over benched model profiles instead
+    /// of the Phase-1 resolver's first-reachable-candidate order.
+    Enable {
+        /// The most sensitive data this scope is asserted to handle
+        /// (`public`|`internal`|`confidential`|`secret`). Governs which
+        /// models may be selected for off-device (hosted) routing — omit to
+        /// keep the fail-closed default (`Unknown`, local-only).
+        #[arg(long)]
+        data_classification: Option<String>,
+    },
+    /// Turn off live measured routing (the Phase-1 resolver decides again).
+    Disable,
 }
 
 #[derive(Subcommand)]
@@ -1014,13 +1097,15 @@ async fn main() -> anyhow::Result<()> {
             objective,
             mode,
             repo,
+            model,
             jsonl,
         } => {
             let repo = match repo {
                 Some(repo) => repo,
                 None => std::env::current_dir()?,
             };
-            let exit_code = commands::run(&paths, objective, mode.into(), repo, jsonl).await?;
+            let exit_code =
+                commands::run(&paths, objective, mode.into(), repo, model, jsonl).await?;
             std::process::exit(exit_code);
         }
         TopCommand::Attach {
@@ -1031,9 +1116,28 @@ async fn main() -> anyhow::Result<()> {
         TopCommand::Index {
             command: IndexCommand::Rebuild,
         } => commands::index_rebuild(&paths).await,
-        TopCommand::Skill {
-            command: SkillCommand::Add { directory },
-        } => commands::skill_add(&paths, &directory).await,
+        TopCommand::Skill { command } => match command {
+            SkillCommand::Add { directory } => commands::skill_add(&paths, &directory).await,
+            SkillCommand::New {
+                id,
+                name,
+                description,
+                scope,
+                procedure,
+                directory,
+            } => {
+                commands::skill_new(
+                    &paths,
+                    &id,
+                    &name,
+                    &description,
+                    &scope,
+                    &procedure,
+                    directory.as_deref(),
+                )
+                .await
+            }
+        },
         TopCommand::Workflow { command } => match command {
             WorkflowCommand::Validate { file, agents } => {
                 commands::workflow_validate(&file, agents.as_deref())
@@ -1105,7 +1209,11 @@ async fn main() -> anyhow::Result<()> {
                 id,
             } => commands::models_add(&paths, &provider, &model, key_env.as_deref(), id.as_deref()),
             ModelsCommand::Check { id } => commands::models_check(&paths, &id).await,
-            ModelsCommand::Bench { id } => commands::models_bench(&paths, &id).await,
+            ModelsCommand::Bench {
+                id,
+                price_per_1m_usd,
+            } => commands::models_bench(&paths, &id, price_per_1m_usd).await,
+            ModelsCommand::ListProviders => commands::models_list_providers(&paths),
             ModelsCommand::Pull { spec } => {
                 let hf = codypendent_integrations::unsloth::HfHubClient::hub()?;
                 codypendent_cli::models_pull::run(
@@ -1303,6 +1411,13 @@ async fn main() -> anyhow::Result<()> {
                 codypendent_cli::council::run(&paths, &name, objective, repository, json, evidence)
                     .await
             }
+        },
+        TopCommand::Routing { command } => match command {
+            RoutingCommand::Status => commands::routing_status(&paths),
+            RoutingCommand::Enable {
+                data_classification,
+            } => commands::routing_enable(&paths, data_classification.as_deref()).await,
+            RoutingCommand::Disable => commands::routing_disable(&paths).await,
         },
         TopCommand::Open {
             session_id,

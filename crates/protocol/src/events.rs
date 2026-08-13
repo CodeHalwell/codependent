@@ -190,6 +190,31 @@ pub enum EventBody {
         /// The run chronicle, stored as a JSON artifact.
         chronicle: ArtifactRef,
     },
+    /// What a run actually consumed, as **measured** by the daemon after the
+    /// loop finished (outcome 20). This is the wire half of migration 0032's
+    /// `runs.prompt_tokens` / `completion_tokens` / `cost_micros`: without it a
+    /// client can only ever learn a run's cost by reading the daemon's database
+    /// directly, which no client does.
+    ///
+    /// [`BudgetWarning`](EventBody::BudgetWarning) is deliberately NOT this
+    /// event: it reports a limit being approached, so it says nothing at all
+    /// about a run with no configured budget — the common case. Usage is a
+    /// fact about the run; a warning is a fact about a policy.
+    ///
+    /// Every dimension is optional because an unmeasured one must stay absent
+    /// rather than be reported as zero: a provider that returns no token counts,
+    /// or a model with no price on file, would otherwise make a run read as
+    /// free. Clients render only what is present (`cost_micros` is USD
+    /// millionths).
+    RunUsage {
+        run_id: RunId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_micros: Option<u64>,
+    },
     /// A content-free projection of newly curated learning after a successful
     /// run. Facts, provenance, and confidence stay in the governed learning
     /// store; clients receive only counts and opaque ids for review affordances.
@@ -365,6 +390,12 @@ mod tests {
             },
             chronicle: artifact_ref(),
         });
+        round_trip(EventBody::RunUsage {
+            run_id,
+            prompt_tokens: Some(1002),
+            completion_tokens: Some(60),
+            cost_micros: None,
+        });
         round_trip(EventBody::LearningsCaptured {
             run_id: RunId::new(),
             proposed_count: 1,
@@ -438,6 +469,46 @@ mod tests {
             EventBody::ToolStarted { label, .. } => assert_eq!(label, None),
             other => panic!("expected ToolStarted, got {other:?}"),
         }
+    }
+
+    /// An unmeasured dimension must be ABSENT on the wire, never `0` — a zero
+    /// would render as "this run was free" in a client that shows a cost chip.
+    #[test]
+    fn run_usage_omits_unmeasured_dimensions() {
+        let event = event_with(EventBody::RunUsage {
+            run_id: RunId::new(),
+            prompt_tokens: Some(1002),
+            completion_tokens: Some(60),
+            cost_micros: None,
+        });
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(json.contains("prompt_tokens"));
+        assert!(!json.contains("cost_micros"));
+    }
+
+    /// A run the daemon could measure nothing about still round-trips, and
+    /// serializes to the bare tag — the shape an older client sees as
+    /// `Unknown` and a newer one renders as "no measurement".
+    #[test]
+    fn run_usage_with_nothing_measured_carries_only_its_run() {
+        let run_id = RunId::new();
+        let json = serde_json::to_string(&event_with(EventBody::RunUsage {
+            run_id,
+            prompt_tokens: None,
+            completion_tokens: None,
+            cost_micros: None,
+        }))
+        .expect("serialize");
+        let parsed: SessionEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            parsed.body,
+            EventBody::RunUsage {
+                run_id,
+                prompt_tokens: None,
+                completion_tokens: None,
+                cost_micros: None,
+            }
+        );
     }
 
     #[test]

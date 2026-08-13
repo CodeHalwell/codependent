@@ -311,6 +311,16 @@ export type EventBody =
   | { type: "SteeringApplied"; run_id: Uuid }
   | { type: "BudgetWarning"; run_id: Uuid; dimension: BudgetDimension; used: number; limit: number }
   | { type: "RunCompleted"; run_id: Uuid; disposition: RunDisposition; chronicle: ArtifactRef }
+  // Every field is optional because the daemon omits what the provider did not
+  // measure — an absent `cost_micros` means "unmeasured", never "free", so a
+  // renderer must distinguish undefined from 0 rather than defaulting it.
+  | {
+      type: "RunUsage";
+      run_id: Uuid;
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      cost_micros?: number;
+    }
   | {
       type: "LearningsCaptured";
       run_id: Uuid;

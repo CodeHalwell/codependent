@@ -168,6 +168,7 @@ impl EvalCase {
             assertion_results,
             within_cost,
             within_duration,
+            run_completed: obs.run_completed,
         }
     }
 }
@@ -195,6 +196,19 @@ pub struct RunObservation {
     pub patch_files_changed: usize,
     pub cost_usd: f64,
     pub duration_ms: u64,
+    /// Whether the run reached `RunState::Completed`. A run that failed before
+    /// the agent ever acted (no model configured, provider unreachable) leaves
+    /// every absence-shaped assertion — `file-unchanged`, `command-not-executed`
+    /// — trivially true, so without this the suite scores a PASS for work that
+    /// never happened. `evals/README.md` records dropping two other absence-only
+    /// assertion kinds for exactly this reason; `file-unchanged` was left, and
+    /// cases 002/005/007 are built entirely from it.
+    ///
+    /// `#[serde(default)]` deliberately deserializes a legacy stored report to
+    /// `false`: a report from before this field existed carries no evidence its
+    /// runs executed, and this value gates promotion. Fail closed.
+    #[serde(default)]
+    pub run_completed: bool,
 }
 
 /// The pass/fail of one assertion.
@@ -211,13 +225,21 @@ pub struct CaseResult {
     pub assertion_results: Vec<AssertionResult>,
     pub within_cost: bool,
     pub within_duration: bool,
+    /// Carried from [`RunObservation::run_completed`] — see there for why a
+    /// case cannot pass without it.
+    #[serde(default)]
+    pub run_completed: bool,
 }
 
 impl CaseResult {
-    /// A case passes iff every assertion holds and both budgets are respected.
+    /// A case passes iff the run actually executed, every assertion holds, and
+    /// both budgets are respected.
     #[must_use]
     pub fn passed(&self) -> bool {
-        self.within_cost && self.within_duration && self.assertion_results.iter().all(|a| a.passed)
+        self.run_completed
+            && self.within_cost
+            && self.within_duration
+            && self.assertion_results.iter().all(|a| a.passed)
     }
 
     /// The assertion labels that failed (for reporting).
@@ -307,6 +329,7 @@ mod tests {
             patch_files_changed: 1,
             cost_usd: 0.10,
             duration_ms: 20_000,
+            run_completed: true,
             ..Default::default()
         }
     }
@@ -316,6 +339,45 @@ mod tests {
         let result = case().score(&passing_obs());
         assert!(result.passed());
         assert!(result.failures().is_empty());
+    }
+
+    #[test]
+    fn a_case_of_only_absence_assertions_fails_when_the_run_never_executed() {
+        // The shape that made `codypendent eval run` report 3/12 PASS with no
+        // model configured: cases 002/005/007 assert only `file-unchanged`, so
+        // a run that failed before the agent acted satisfies every one of them.
+        let case = EvalCase {
+            id: "absence-only".into(),
+            repository_revision: "HEAD".into(),
+            prompt: "explain this module".into(),
+            policy: "default".into(),
+            expected: vec![Assertion::FileUnchanged {
+                path: "src/lib.rs".into(),
+            }],
+            maximum_cost_usd: None,
+            maximum_duration_ms: None,
+            task_class: None,
+        };
+
+        let never_ran = RunObservation::default();
+        let scored = case.score(&never_ran);
+        assert!(
+            scored.assertion_results.iter().all(|a| a.passed),
+            "the assertion itself is vacuously satisfied — that is the trap"
+        );
+        assert!(
+            !scored.passed(),
+            "a run that never reached Completed must not score a pass"
+        );
+
+        let ran = RunObservation {
+            run_completed: true,
+            ..Default::default()
+        };
+        assert!(
+            case.score(&ran).passed(),
+            "the same case still passes when the run actually executed"
+        );
     }
 
     #[test]

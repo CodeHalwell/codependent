@@ -198,6 +198,7 @@ async fn drive(events: Vec<SessionEvent>) -> (Vec<u8>, RunExit) {
             "diagnose the failing test".to_string(),
             AgentMode::Build,
             "/repo/under/test",
+            None,
             &mut out,
         ),
     )
@@ -378,6 +379,67 @@ async fn a_different_runs_event_is_forwarded_but_not_treated_as_terminal() {
     assert_eq!(envelopes.len(), scripted.len());
     // ...but the stream only ends on *our* run's terminal event.
     assert_eq!(exit, RunExit::Completed);
+}
+
+#[tokio::test]
+async fn a_failed_runs_reason_reaches_the_client_not_only_daemon_log() {
+    // The daemon's real terminal path (`crates/daemon/src/recovery.rs::fail_run`,
+    // and the plain agent loop's own finish in `crates/runtime/src/agent.rs`)
+    // always publishes a bare `RunStateChanged{Failed}` immediately followed,
+    // in the same transaction, by a `RunCompleted{disposition: Failed{reason}}`
+    // carrying the human-readable reason. This is the exact two-event sequence
+    // a real "no model configured" failure produces — scripted here rather
+    // than only a lone `RunCompleted` (as `failed_run_maps_to_exit_code_two`
+    // does) so this test can catch a regression to "stop at the first
+    // terminal-shaped event", which would silently drop the second event and
+    // its `reason` — the review's exact finding (F7): three real failed runs
+    // that surfaced nothing but `RunStateChanged{Failed}` on `--jsonl`, the
+    // actual reason visible only in `daemon.log`.
+    let run_id = RunId::new();
+    let scripted = vec![
+        run_started(run_id),
+        event(
+            4,
+            EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Failed,
+            },
+        ),
+        event(
+            5,
+            EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Failed {
+                    reason: "no model configured: every candidate failed for Build".to_string(),
+                },
+                chronicle: artifact_ref(),
+            },
+        ),
+    ];
+
+    let (out, exit) = drive(scripted.clone()).await;
+
+    let envelopes = parse_jsonl(&out);
+    // Both terminal-shaped events reached the client's own JSONL output — not
+    // just the first of the two.
+    assert_eq!(
+        envelopes.len(),
+        scripted.len(),
+        "the stream must not end at RunStateChanged, before RunCompleted's \
+         reason ever arrives"
+    );
+    let reason_line = std::str::from_utf8(&out)
+        .expect("utf8")
+        .lines()
+        .find(|line| line.contains("no model configured"));
+    assert!(
+        reason_line.is_some(),
+        "the client's own JSONL output must carry the failure reason \
+         (RunCompleted's disposition), not leave it only in daemon.log:\n{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(exit, RunExit::Failed);
+    assert_eq!(exit.exit_code(), 2);
 }
 
 // Sanity-check `ClientCapabilities::default()` stays wired through the

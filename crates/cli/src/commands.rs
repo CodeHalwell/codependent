@@ -3,7 +3,7 @@
 //! `docs publish` (Phase 4 STEP 4.4).
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -12,15 +12,16 @@ use codypendent_daemon::policy::{ApprovalAction, MergedPolicy, PolicyEngine};
 use codypendent_integrations::mcp::{load_mcp_config, McpConfig};
 use codypendent_knowledge::{
     anchor_repository_id, db as knowledge_db, install_package, is_retrievable_status,
-    plan_publication, publications, register_builtins, retrieve, user_skills_root, DocumentStore,
-    HashingEmbedder, Publication, PublishTarget as KnowledgePublishTarget, Registry,
-    RetrievalConfig, RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
+    local_user_scope, plan_publication, publications, register_builtins, retrieve,
+    user_skills_root, DocumentStore, HashingEmbedder, Publication,
+    PublishTarget as KnowledgePublishTarget, Registry, RetrievalConfig, RetrievalIndexes,
+    RetrievalQuery, RiskClass, Scope,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     AgentMode, ApprovalDecision, ApprovalScope, ClientRole, CommandBody, CommandId, DaemonStatus,
-    DocumentId, Payload, PromotionAction, SessionId, Subscription, WorkflowEvent, WorkflowNodeView,
-    WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceId,
+    DocumentId, ModelId, Payload, PromotionAction, SessionId, Subscription, WorkflowEvent,
+    WorkflowNodeView, WorkflowRunPhase, WorkflowRunSnapshot, WorkspaceId,
 };
 
 use crate::client;
@@ -367,6 +368,7 @@ pub async fn run(
     objective: String,
     mode: AgentMode,
     repo: PathBuf,
+    model: Option<String>,
     jsonl: bool,
 ) -> anyhow::Result<i32> {
     if !jsonl {
@@ -384,6 +386,20 @@ pub async fn run(
     if !repo.is_dir() {
         anyhow::bail!("--repo {}: not a directory", repo.display());
     }
+    // Caught here, before the daemon is even contacted, so a typo'd `--model`
+    // fails fast with the same list a user would check by hand — not a
+    // StartRun round trip followed by an opaque daemon-side resolution error.
+    if let Some(id) = &model {
+        let configured =
+            codypendent_runtime::models::load_models(&paths.data_dir.join("models.toml"))
+                .unwrap_or_default();
+        if !configured.iter().any(|c| c.id.0 == *id) {
+            anyhow::bail!(
+                "--model `{id}` is not configured; see `codypendent models list` for the \
+                 configured ids"
+            );
+        }
+    }
 
     // The daemon-start banner ("daemon already running" / "daemon started
     // (pid N)") is Phase 0 human output; --jsonl's contract is that stdout
@@ -394,7 +410,9 @@ pub async fn run(
     let mut conn = Connection::connect(&paths.socket_path).await?;
     let mut stdout = std::io::stdout();
     let repository = repo.to_string_lossy().into_owned();
-    let exit = run_over_connection(&mut conn, objective, mode, &repository, &mut stdout).await?;
+    let model = model.map(ModelId);
+    let exit =
+        run_over_connection(&mut conn, objective, mode, &repository, model, &mut stdout).await?;
     Ok(exit.exit_code())
 }
 
@@ -408,6 +426,7 @@ pub async fn run_over_connection<W: Write>(
     objective: String,
     mode: AgentMode,
     repository: &str,
+    model: Option<ModelId>,
     out: &mut W,
 ) -> anyhow::Result<RunExit> {
     let hello = conn
@@ -478,8 +497,10 @@ pub async fn run_over_connection<W: Write>(
             // shared daemon does not store its memories under its own directory
             // (issue #6 item 1).
             repository: Some(repository.to_owned()),
-            // The headless `run` path pins no model; the daemon resolves/routes.
-            model: None,
+            // `--model` pins the run exactly like the TUI's `/model` picker
+            // (STEP MP2); `None` keeps the prior behavior — routing (if
+            // enabled) or the resolver's first reachable candidate.
+            model,
         })
         .await?;
     if let Payload::CommandRejected(error) = &start_reply.payload {
@@ -657,6 +678,88 @@ pub async fn skill_add(paths: &RuntimePaths, dir: &std::path::Path) -> anyhow::R
     Ok(())
 }
 
+/// `codypendent skill new <ID> --name … --description … --procedure <FILE>`
+/// (outcome 4): author a skill package from the command line and register it
+/// through the SAME validate-and-install pipeline [`skill_add`] runs — a thin
+/// dispatch over [`crate::skill_writer`], which owns the manifest rendering
+/// and its round-trip tests.
+///
+/// It always lands as `draft`: [`SkillDraft`](crate::skill_writer::SkillDraft)
+/// has no constructor that starts active, and retrieval hard-filters
+/// everything but Active. So a newly authored skill is installed and
+/// inspectable but never disclosed to a run until a human promotes it — the
+/// review gate outcome 4 asks for, enforced by construction rather than by
+/// remembering to check.
+pub async fn skill_new(
+    paths: &RuntimePaths,
+    id: &str,
+    name: &str,
+    description: &str,
+    scope: &str,
+    procedure: &std::path::Path,
+    directory: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let body = std::fs::read_to_string(procedure)
+        .with_context(|| format!("reading the procedure body {}", procedure.display()))?;
+
+    // Derived exactly as `skill_add` derives it: a `repository`-scoped skill
+    // registered under any other identity is invisible to every run.
+    let anchor = anchor_repository_id(&std::env::current_dir()?);
+    let scope = match scope {
+        "user" => local_user_scope(),
+        "repository" => Scope::Repository(anchor),
+        other => anyhow::bail!("unknown scope {other:?}: expected \"user\" or \"repository\""),
+    };
+    let draft = crate::skill_writer::SkillDraft::new(id, name, scope, description, body);
+
+    // Staging is throwaway — `author_and_install` copies the validated package
+    // under `<data_dir>/skills/`, and that copy is what the registry points at.
+    // Never a path built from `id`: only `install_package` vets it for
+    // traversal, and that happens after the authoring write.
+    let staging;
+    let source_dir = match directory {
+        Some(dir) => dir,
+        None => {
+            staging = tempfile::tempdir()
+                .with_context(|| "creating a staging directory for the drafted package")?;
+            staging.path()
+        }
+    };
+
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = knowledge_db::open(&database_path)
+        .await
+        .with_context(|| format!("opening {}", database_path.display()))?;
+    let skills_root = user_skills_root(&paths.data_dir);
+    let (item, installed) =
+        crate::skill_writer::author_and_install(&pool, source_dir, &skills_root, anchor, &draft)
+            .await
+            .with_context(|| format!("authoring the skill package {id}"))?;
+
+    println!(
+        "authored skill {} {} ({}) -> {}",
+        item.name,
+        item.version.0,
+        item.scope.tier(),
+        installed.display()
+    );
+    if !is_retrievable_status(item.status) {
+        // The version bump is not optional advice: a same-version status flip
+        // re-registers as `Modified`, not `Active`, because the registry
+        // detects the changed hash (see `skill_writer`'s module doc).
+        println!(
+            "status is {:?}: registered, but retrieval will not disclose it until it is \
+             promoted — in {}/skill.toml set `status = \"active\"`, bump `version`, then \
+             re-run `codypendent skill add {}`",
+            item.status,
+            installed.display(),
+            installed.display()
+        );
+    }
+    Ok(())
+}
+
 /// `codypendent open <session> --in <ide>` (STEP 3.7). Print how the IDE should
 /// attach to the session, then best-effort launch the editor with the session in
 /// its environment. The IDE joins as a *contributor* to the SAME session — the
@@ -757,8 +860,10 @@ pub async fn docs_list(paths: &RuntimePaths) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("opening {}", database_path.display()))?;
 
-    let repository =
-        codypendent_knowledge::stable_repository_id(&std::env::current_dir()?.canonicalize()?);
+    // `anchor_repository_id`, not `stable_repository_id`: the daemon stores rows
+    // under the Git toplevel, so hashing the current directory listed nothing
+    // whenever this was run from a subdirectory of the checkout.
+    let repository = anchor_repository_id(&std::env::current_dir()?);
     let scopes = [Scope::Repository(repository), Scope::System];
     let summaries = DocumentStore::new().list(&pool, &scopes).await?;
     if summaries.is_empty() {
@@ -923,13 +1028,25 @@ pub async fn docs_publish(
     }
 
     let existing = publications(&pool, document_id).await?.len();
-    match wait_for_new_publication(&pool, document_id, existing).await {
-        Some(publication) => println!(
+    match wait_for_publish_outcome(&pool, document_id, approval_id, existing).await {
+        PublishOutcome::Published(publication) => println!(
             "Published \"{}\" ({document_id}) -> commit {}",
             doc.title,
             publication.git_commit.as_deref().unwrap_or("(none)")
         ),
-        None => println!(
+        // A terminal job state is a verdict, not a delay: telling the user to
+        // re-run would loop them forever on a publish that already resolved.
+        // Non-zero exit so a script can tell these from a success.
+        PublishOutcome::Failed => anyhow::bail!(
+            "Publish failed; nothing was written. The daemon recorded approval {approval_id} \
+             as failed — see {} for the reason.",
+            paths.log_dir.join("daemon.log").display()
+        ),
+        PublishOutcome::Cancelled => anyhow::bail!(
+            "Publish was cancelled before it ran; nothing was written. Approval {approval_id} \
+             was rejected or expired before the daemon executed it."
+        ),
+        PublishOutcome::StillRunning => println!(
             "Publish approved; the daemon is still executing it in the background. \
              Check the daemon log, or re-run `codypendent docs publish` shortly to see \
              the recorded commit."
@@ -1088,23 +1205,71 @@ fn slugify(title: &str) -> String {
     }
 }
 
-/// Poll the publication history for a fresh row beyond `existing_count`
-/// (the daemon's execution is fire-and-forget once the approval resolves),
-/// or give up after a generous bound and let the caller report "still
-/// running" rather than hang indefinitely.
-async fn wait_for_new_publication(
+/// What became of an approved publish, as read back from the daemon's own
+/// database by [`wait_for_publish_outcome`].
+enum PublishOutcome {
+    /// The daemon recorded a publication row.
+    Published(Box<Publication>),
+    /// `document_publish_jobs.state = 'failed'` — the execution ran and lost.
+    Failed,
+    /// `document_publish_jobs.state = 'cancelled'` — the approval was rejected
+    /// or expired before execution, so nothing ever ran.
+    Cancelled,
+    /// The bound elapsed with the job still pending or executing.
+    StillRunning,
+}
+
+/// The recorded state of the publish job this invocation parked, or `None`
+/// while the row is not yet readable. Keyed by `approval_id` — the table's
+/// primary key, and the exact job this CLI invocation caused, so a concurrent
+/// publish of the same document cannot be mistaken for ours.
+async fn publish_job_state(
+    pool: &sqlx::SqlitePool,
+    approval_id: codypendent_protocol::ApprovalId,
+) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT state FROM document_publish_jobs WHERE approval_id = ?")
+        .bind(approval_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Poll for the outcome of an approved publish: a fresh publication row beyond
+/// `existing_count`, or a terminal state for this approval's job. The daemon's
+/// execution is fire-and-forget once the approval resolves, so a failure is
+/// recorded ONLY in `document_publish_jobs` — watching publications alone left
+/// a failed publish reporting "still executing, re-run shortly" forever
+/// (2026-08-13 review F8). Gives up after a generous bound rather than hang.
+async fn wait_for_publish_outcome(
     pool: &sqlx::SqlitePool,
     document_id: DocumentId,
+    approval_id: codypendent_protocol::ApprovalId,
     existing_count: usize,
-) -> Option<Publication> {
+) -> PublishOutcome {
     for _ in 0..100 {
-        let published = publications(pool, document_id).await.ok()?;
+        // Publications first: the daemon records the row *before* it marks the
+        // job `completed`, so a success is never reported as anything else.
+        let Ok(published) = publications(pool, document_id).await else {
+            // A read error is not a verdict — never claim a failure the
+            // database did not state.
+            return PublishOutcome::StillRunning;
+        };
         if published.len() > existing_count {
-            return published.into_iter().next();
+            if let Some(publication) = published.into_iter().next() {
+                return PublishOutcome::Published(Box::new(publication));
+            }
+        }
+        match publish_job_state(pool, approval_id).await.as_deref() {
+            Some("failed") => return PublishOutcome::Failed,
+            Some("cancelled") => return PublishOutcome::Cancelled,
+            // `pending`/`executing`/`completed` (whose publication row is
+            // written first, so it was already caught above) — keep waiting.
+            _ => {}
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    None
+    PublishOutcome::StillRunning
 }
 
 /// `codypendent workflow validate <FILE> [--agents <DIR>]` (Phase 5 STEP 5.1):
@@ -1555,9 +1720,9 @@ fn run_phase_label(phase: WorkflowRunPhase) -> &'static str {
     }
 }
 
-/// Render a node's measured cost JSON (`wall_time_secs`, `tool_calls`) as a human
-/// string, or `None` when empty. Only measured dimensions — never a fabricated
-/// token/USD figure (T8).
+/// Render a node's measured cost JSON (`wall_time_secs`, `tool_calls`,
+/// `tokens`, `cost_micros`) as a human string, or `None` when empty. Only
+/// measured dimensions — never a fabricated token/USD figure (T8).
 fn render_cost(cost: &serde_json::Value) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(secs) = cost.get("wall_time_secs").and_then(|v| v.as_u64()) {
@@ -1570,6 +1735,15 @@ fn render_cost(cost: &serde_json::Value) -> Option<String> {
             "tool calls"
         };
         parts.push(format!("{calls} {unit}"));
+    }
+    // Measured-only, exactly like the producer (`NodeCost::to_json` omits an
+    // unmeasured dimension): an absent key prints nothing rather than a zero
+    // that would read as "this node was free".
+    if let Some(tokens) = cost.get("tokens").and_then(|v| v.as_u64()) {
+        parts.push(format!("{tokens} tokens"));
+    }
+    if let Some(micros) = cost.get("cost_micros").and_then(|v| v.as_u64()) {
+        parts.push(format!("${:.4}", micros as f64 / 1_000_000.0));
     }
     if parts.is_empty() {
         None
@@ -2761,6 +2935,30 @@ steps:
             "github.update-pull-request"
         );
     }
+
+    /// Outcome 15: a worker's spend must be *visible*. `NodeCost` measures
+    /// tokens and `cost_micros` and stores them in `workflow_nodes.cost_json`;
+    /// `workflow watch` used to read only wall-time and tool calls, dropping
+    /// both at the last inch.
+    #[test]
+    fn render_cost_shows_measured_tokens_and_money() {
+        let rendered = render_cost(&serde_json::json!({
+            "wall_time_secs": 3, "tool_calls": 1, "tokens": 1200, "cost_micros": 2500
+        }))
+        .expect("a measured node renders");
+        assert!(rendered.contains("1200 tokens"), "{rendered}");
+        assert!(rendered.contains("$0.0025"), "{rendered}");
+    }
+
+    #[test]
+    fn render_cost_never_fabricates_an_unmeasured_dimension() {
+        // Both keys absent from `cost_json` — the default install, where
+        // routing (the only price source) is off. Neither may print a zero.
+        let bare = render_cost(&serde_json::json!({"wall_time_secs": 3, "tool_calls": 1}))
+            .expect("wall time still renders");
+        assert!(!bare.contains("tokens") && !bare.contains('$'), "{bare}");
+        assert_eq!(render_cost(&serde_json::json!({})), None);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2891,18 +3089,7 @@ pub fn models_add(
             .and_then(|row| row.context_tokens),
     });
 
-    #[derive(serde::Serialize)]
-    struct ModelsToml {
-        #[serde(rename = "model")]
-        model: Vec<ModelConfig>,
-    }
-    let rendered = toml::to_string_pretty(&ModelsToml { model: configs })
-        .context("serializing models.toml")?;
-    let tmp = data_dir.join("models.toml.tmp");
-    std::fs::write(&tmp, rendered.as_bytes())
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &models_path)
-        .with_context(|| format!("replacing {}", models_path.display()))?;
+    crate::models_file::write_model_entries(&models_path, &configs)?;
     println!(
         "{} model {display_id} ({})",
         if replaced { "updated" } else { "added" },
@@ -2962,7 +3149,11 @@ pub async fn models_check(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> 
 /// `model_profiles` table the live daemon only *reads* (and only when routing is
 /// enabled, default OFF). SQLite WAL + the shared `busy_timeout` make the
 /// concurrent open safe.
-pub async fn models_bench(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
+pub async fn models_bench(
+    paths: &RuntimePaths,
+    id: &str,
+    price_per_1m_usd: Option<f64>,
+) -> anyhow::Result<()> {
     use codypendent_runtime::agent::FrameworkModelDriver;
     use codypendent_runtime::bench::{BenchOptions, DriverBenchTarget};
     use codypendent_runtime::models::{load_models, ModelRegistry};
@@ -2997,10 +3188,11 @@ pub async fn models_bench(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> 
     // The persisted profile's location is derived from the endpoint (fail-closed
     // to hosted). `models bench` is a LOCAL-model harness; warn loudly when it is
     // pointed at a non-local endpoint rather than silently mislabelling it.
-    if matches!(
+    let hosted = matches!(
         codypendent_runtime::bench::endpoint_location(&endpoint),
         codypendent_routing::ModelLocation::Hosted
-    ) {
+    );
+    if hosted {
         eprintln!(
             "models bench: WARNING — `{endpoint}` is not a local endpoint; the profile will be \
              stored as HOSTED (so the routing hard filter still applies) and its token price is \
@@ -3008,23 +3200,61 @@ pub async fn models_bench(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> 
         );
     }
 
+    // A HOSTED model needs a real per-token price to ever clear the router's
+    // "unmeasured hosted model" hard filter (outcome 11, F11.4) — this harness
+    // measures timing, never a real endpoint's price. A LOCAL model needs
+    // neither — its price is genuinely $0, not the harness's sentinel.
+    let known_price_per_1k_usd = if !hosted {
+        None
+    } else {
+        let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+            &paths.data_dir.join("providers.toml"),
+        )
+        .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+        let price = resolve_hosted_price(&config, &catalog, price_per_1m_usd);
+        if price.is_none() {
+            eprintln!(
+                "models bench: WARNING — no catalog price found for `{id}` (provider_id={:?}, \
+                 model={:?}); the profile will be stored UNPRICED and stay ineligible for \
+                 routing until one is set — re-run with `--price-per-1m-usd <blended $/1M>`.",
+                config.provider_id, config.model
+            );
+        }
+        price
+    };
+
     eprintln!("models bench: measuring `{id}` at {endpoint} (this drives the model)...");
     let profile = {
         let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
             .await
             .context("opening the database to persist the model profile")?;
-        bench_to_store(&pool, &endpoint, &target, BenchOptions::default()).await?
+        bench_to_store(
+            &pool,
+            &endpoint,
+            &target,
+            BenchOptions::default(),
+            known_price_per_1k_usd,
+        )
+        .await?
     };
 
     let bench = profile
         .bench
         .as_ref()
         .expect("a benched profile carries a LocalBench");
+    let price_line = if hosted {
+        match known_price_per_1k_usd {
+            Some(p) => format!("\n  price: ${:.4}/1K tokens (blended, routable)", p),
+            None => "\n  price: none (unpriced — ineligible for routing)".to_string(),
+        }
+    } else {
+        String::new()
+    };
     println!(
         "measured `{id}` (persisted to model_profiles @ {endpoint}):\n  \
          tokens/sec: {:.1}\n  time-to-first-token: {:.0} ms\n  warm-up: {:.0} ms\n  \
          memory: {} MB\n  context limit: {}\n  structured-output reliability: {:.2}\n  \
-         tool-call accuracy: {:.2}\n  coding-eval score: {:.2}",
+         tool-call accuracy: {:.2}\n  coding-eval score: {:.2}{price_line}",
         bench.tokens_per_second,
         bench.time_to_first_token_ms,
         bench.warmup_ms,
@@ -3037,15 +3267,44 @@ pub async fn models_bench(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// The per-1K-token price a benched HOSTED model should be persisted with, so
+/// it can clear the router's "unmeasured hosted model" hard filter (outcome
+/// 11, F11.4 — `2026-08-13-verticals/sandbox-eval-routing.md`): (1) an
+/// explicit `--price-per-1m-usd` override always wins; (2) otherwise the
+/// built-in provider catalog's own price for this exact `provider_id` +
+/// provider-side `model`, when known (both `cost_per_1m_input_usd` and
+/// `cost_per_1m_output_usd` present — a partial catalog row is treated as
+/// unpriced rather than blending a real number against a missing one); (3)
+/// `None` — an operator who wants this model routable must supply a price
+/// through one of the first two, never a fabricated one.
+fn resolve_hosted_price(
+    config: &codypendent_runtime::models::ModelConfig,
+    catalog: &codypendent_providers::Catalog,
+    override_per_1m_usd: Option<f64>,
+) -> Option<f64> {
+    if let Some(price) = override_per_1m_usd {
+        return Some(price / 1000.0);
+    }
+    let provider_id = config.provider_id.as_deref()?;
+    let row = catalog.model(provider_id, &config.model)?;
+    let (input, output) = (row.cost_per_1m_input_usd?, row.cost_per_1m_output_usd?);
+    Some(codypendent_runtime::bench::blended_price_per_1k_usd(
+        input, output,
+    ))
+}
+
 /// Run the bench against `target` and persist the measured profile to the store,
 /// returning the persisted profile. The persistence core, split from
 /// [`models_bench`] so a test drives it with a scripted target and a temp DB
-/// (no model, no network).
+/// (no model, no network). `known_price_per_1k_usd` rides straight into
+/// [`BenchOutcome::into_profile`] — see that method's doc comment for why a
+/// hosted model needs one to be routable at all.
 async fn bench_to_store(
     pool: &sqlx::SqlitePool,
     endpoint: &str,
     target: &dyn codypendent_runtime::bench::BenchTarget,
     options: codypendent_runtime::bench::BenchOptions,
+    known_price_per_1k_usd: Option<f64>,
 ) -> anyhow::Result<codypendent_routing::ModelProfile> {
     let outcome = codypendent_runtime::bench::run_bench(target, options)
         .await
@@ -3054,12 +3313,257 @@ async fn bench_to_store(
     // endpoint stored as `Local` would short-circuit the routing hard filter
     // (`endpoint_location` fails closed to `Hosted`).
     let location = codypendent_runtime::bench::endpoint_location(endpoint);
-    let profile = outcome.into_profile(location);
+    let profile = outcome.into_profile(location, known_price_per_1k_usd);
     codypendent_daemon::model_profiles::ModelProfileStore::new()
         .upsert(pool, endpoint, &profile)
         .await
         .context("persisting the measured model profile")?;
     Ok(profile)
+}
+
+/// `codypendent models list-providers`: the built-in + user-extended catalog's
+/// providers, one per line — id, wire protocol, and how many models it
+/// curates (F8: the `models add --help` text has always pointed here; this is
+/// what makes that true). Local providers (Ollama, LM Studio, vLLM) are
+/// marked so a user scanning the list can tell which ones need no API key.
+pub fn models_list_providers(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let catalog = codypendent_providers::Catalog::load_with_user_overrides(
+        &paths.data_dir.join("providers.toml"),
+    )
+    .unwrap_or_else(|_| codypendent_providers::Catalog::builtin());
+    for provider in catalog.providers() {
+        let curated = catalog
+            .models()
+            .filter(|m| m.provider_id == provider.id)
+            .count();
+        let protocol = match provider.protocol {
+            codypendent_providers::Protocol::OpenAiChat => "openai-chat",
+            codypendent_providers::Protocol::Anthropic => "anthropic",
+            codypendent_providers::Protocol::GeminiNative => "gemini-native",
+            codypendent_providers::Protocol::Acp => "acp",
+            _ => "unknown",
+        };
+        println!(
+            "{:20} {:14} {} model(s) curated{}",
+            provider.id,
+            protocol,
+            curated,
+            if provider.local { "  (local)" } else { "" }
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `codypendent routing status | enable | disable` (outcome 11)
+// ---------------------------------------------------------------------------
+//
+// `crates/codypendentd/src/routing.rs`'s `RoutingConfig::load` reads
+// `<data_dir>/routing.toml`, but nothing in the shipped CLI ever wrote one —
+// the 2026-08-13 review (`2026-08-13-verticals/sandbox-eval-routing.md`,
+// 11.8) found the routing-decision explanation surface fully built and
+// reachable from real code, gated behind exactly this file, with "no CLI
+// command that writes routing.toml" as the one missing piece keeping it from
+// ever firing on a default install. These three commands are that piece.
+//
+// This is a SEPARATE writer from `RoutingConfig::load`'s reader by
+// necessity (`codypendentd`'s `routing` module is private to that crate, and
+// `crates/cli` cannot reach its `RoutingConfigFile` type — see this
+// function's own doc comments for why that boundary is intentional rather
+// than worked around), so it deliberately does the minimum a shared-file
+// writer must: read the file as a generic [`toml::Value`] (never a struct
+// that only models the keys this command knows about), touch only the
+// specific keys each subcommand is documented to set, and write everything
+// else in the table back untouched — an operator's hand-edited `[policy]`
+// table (there is no CLI surface for authoring one; RULE: don't build a
+// second, narrower one that silently drops it) survives `routing enable`/
+// `disable` exactly as they left it.
+
+/// `codypendent routing status`: whether the routing seam is enabled, and
+/// what `<data_dir>/routing.toml` currently declares. Prints the raw file
+/// state, not a re-validated one — `codypendentd`'s own fail-closed loader
+/// (which rejects a malformed policy) is the daemon-side authority; this is
+/// "here is what is on disk," useful precisely when those two might disagree.
+pub fn routing_status(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let path = paths.data_dir.join("routing.toml");
+    let Some(doc) = read_routing_toml(&path)? else {
+        println!(
+            "routing: disabled (no {} — the Phase-1 resolver picks a model)",
+            path.display()
+        );
+        return Ok(());
+    };
+    let enabled = doc
+        .get("enabled")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    println!(
+        "routing: {} ({})",
+        if enabled { "ENABLED" } else { "disabled" },
+        path.display()
+    );
+    match doc
+        .get("data_classification")
+        .and_then(|v| v.get("type"))
+        .and_then(toml::Value::as_str)
+    {
+        Some(kind) => println!("  data_classification ceiling: {kind}"),
+        None => println!(
+            "  data_classification ceiling: (undeclared — fails closed to Unknown, local-only)"
+        ),
+    }
+    println!(
+        "  policy: {}",
+        if doc.get("policy").is_some() {
+            "custom (see routing.toml [policy])"
+        } else {
+            "default (router/balanced/1)"
+        }
+    );
+    if enabled {
+        println!(
+            "  note: routing also requires at least one benched profile \
+             (`codypendent models bench <id>`) — with none, every run still \
+             fails closed rather than silently falling back."
+        );
+    }
+    Ok(())
+}
+
+/// `codypendent routing enable [--data-classification <level>]`: sets
+/// `enabled = true`, creating `routing.toml` if absent. `--data-classification`
+/// (`public`|`internal`|`confidential`|`secret`, case-insensitive) sets the
+/// operator-declared ceiling; without it the ceiling stays whatever the file
+/// already had, or the fail-closed `Unknown` default (local-only routing) on a
+/// fresh file — enabling routing is never, by itself, an act of permitting
+/// off-device data.
+pub async fn routing_enable(
+    paths: &RuntimePaths,
+    data_classification: Option<&str>,
+) -> anyhow::Result<()> {
+    let path = paths.data_dir.join("routing.toml");
+    let mut doc = read_routing_toml(&path)?.unwrap_or_else(empty_table);
+    let has_classification = {
+        let table = doc.as_table_mut().ok_or_else(|| {
+            anyhow::anyhow!("{}: not a TOML table at the top level", path.display())
+        })?;
+        table.insert("enabled".to_string(), toml::Value::Boolean(true));
+        if let Some(level) = data_classification {
+            let variant = classification_variant_name(level).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--data-classification `{level}`: expected one of public, internal, \
+                     confidential, secret"
+                )
+            })?;
+            let mut classification = toml::map::Map::new();
+            classification.insert("type".to_string(), toml::Value::String(variant.to_string()));
+            table.insert(
+                "data_classification".to_string(),
+                toml::Value::Table(classification),
+            );
+        }
+        table.contains_key("data_classification")
+    };
+    write_routing_toml(&path, &doc)?;
+    report_routing_change(paths, "enabled", &path).await;
+    if !has_classification {
+        println!(
+            "  data_classification ceiling is undeclared — fails closed to Unknown \
+             (local-only). Pass --data-classification to permit hosted models."
+        );
+    }
+    println!("  next: `codypendent models bench <id>` at least one model, then run normally.");
+    Ok(())
+}
+
+/// Whether a daemon is answering right now.
+///
+/// `routing.toml` is read ONCE, when `RuntimeExecutor` builds its
+/// `RoutingCoordinator`, and held in an `Arc` for the daemon's lifetime — there
+/// is no reload and no IPC notification. So a running daemon keeps routing
+/// exactly as it was until it restarts, and a bare "routing: disabled" would
+/// tell a user their data had stopped going off-device while it was still
+/// going off-device. That is the one thing this command must not do.
+async fn daemon_is_live(paths: &RuntimePaths) -> bool {
+    client::ping(&paths.socket_path).await
+}
+
+/// Print the truth about when a routing change takes effect.
+async fn report_routing_change(paths: &RuntimePaths, what: &str, path: &std::path::Path) {
+    if daemon_is_live(paths).await {
+        println!("routing: {what} in {}", path.display());
+        println!(
+            "  the running daemon still has the PREVIOUS routing policy loaded — it reads \
+             routing.toml once at startup."
+        );
+        println!("  run `codypendent daemon restart` to apply it.");
+    } else {
+        println!("routing: {what} ({})", path.display());
+    }
+}
+
+/// `codypendent routing disable`: sets `enabled = false`, preserving every
+/// other declared key (a `disable`/`enable` round trip must not discard a
+/// hand-set policy or classification ceiling). A no-op, not an error, when no
+/// `routing.toml` exists yet — routing is already off.
+pub async fn routing_disable(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let path = paths.data_dir.join("routing.toml");
+    let Some(mut doc) = read_routing_toml(&path)? else {
+        println!("routing: already disabled (no {})", path.display());
+        return Ok(());
+    };
+    let table = doc
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("{}: not a TOML table at the top level", path.display()))?;
+    table.insert("enabled".to_string(), toml::Value::Boolean(false));
+    write_routing_toml(&path, &doc)?;
+    report_routing_change(paths, "disabled", &path).await;
+    Ok(())
+}
+
+/// Map a case-insensitive CLI spelling to `DataClassification`'s exact
+/// `#[serde(tag = "type")]` variant name (`crates/protocol/src/artifact.rs`) —
+/// the derived (un-renamed) Serde encoding is the Rust variant name verbatim
+/// (`"Internal"`, not `"internal"`), so this is not optional sugar; the wrong
+/// case is a silent parse failure the NEXT time `routing.toml` is read.
+/// `Unknown` is deliberately not offered — it is the fail-closed default an
+/// operator reaches by declaring nothing, not something to opt into.
+fn classification_variant_name(level: &str) -> Option<&'static str> {
+    match level.to_ascii_lowercase().as_str() {
+        "public" => Some("Public"),
+        "internal" => Some("Internal"),
+        "confidential" => Some("Confidential"),
+        "secret" => Some("Secret"),
+        _ => None,
+    }
+}
+
+fn empty_table() -> toml::Value {
+    toml::Value::Table(toml::map::Map::new())
+}
+
+/// Read `path` as a generic TOML document. `Ok(None)` for an absent file
+/// (routing is simply off); a present-but-malformed file is a hard error here
+/// — surfacing the exact parse problem beats silently treating it as absent
+/// and clobbering whatever the operator meant to keep on a later `enable`/
+/// `disable`.
+fn read_routing_toml(path: &Path) -> anyhow::Result<Option<toml::Value>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let value: toml::Value =
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+            Ok(Some(value))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn write_routing_toml(path: &Path, doc: &toml::Value) -> anyhow::Result<()> {
+    let text =
+        toml::to_string_pretty(doc).with_context(|| format!("serializing {}", path.display()))?;
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 /// The conservative declared capabilities a benched local model is described
@@ -3201,9 +3705,15 @@ mod models_bench_tests {
             .unwrap();
         let endpoint = "http://localhost:11434/v1";
 
-        let profile = bench_to_store(&pool, endpoint, &ScriptedTarget, BenchOptions::default())
-            .await
-            .unwrap();
+        let profile = bench_to_store(
+            &pool,
+            endpoint,
+            &ScriptedTarget,
+            BenchOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(profile.is_local());
         assert_eq!(profile.id, ModelId("qwen-local".into()));
 
@@ -3232,12 +3742,238 @@ mod models_bench_tests {
             "https://api.openai.com/v1",
             &ScriptedTarget,
             BenchOptions::default(),
+            None,
         )
         .await
         .unwrap();
         assert!(
             !profile.is_local(),
             "a non-local base_url is stored as hosted, so the classification filter still applies"
+        );
+        assert_eq!(
+            profile.performance.cost_per_1k_tokens_usd, 0.0,
+            "with no catalog/override price, a hosted profile stays unpriced \
+             (never a fabricated price) — and therefore ineligible for routing"
+        );
+    }
+
+    fn model_config(
+        model: &str,
+        provider_id: Option<&str>,
+    ) -> codypendent_runtime::models::ModelConfig {
+        codypendent_runtime::models::ModelConfig {
+            id: ModelId(format!("test/{model}")),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.example.test/v1".to_string(),
+            model: model.to_string(),
+            api_key_env: String::new(),
+            provider_id: provider_id.map(str::to_owned),
+            context_tokens: None,
+        }
+    }
+
+    #[test]
+    fn resolve_hosted_price_prefers_the_explicit_override() {
+        let catalog = codypendent_providers::Catalog::builtin();
+        let config = model_config("claude-opus-5", Some("anthropic"));
+        // $10/1M override -> $0.01/1K, regardless of what the catalog says.
+        assert_eq!(
+            resolve_hosted_price(&config, &catalog, Some(10.0)),
+            Some(0.01)
+        );
+    }
+
+    #[test]
+    fn resolve_hosted_price_falls_back_to_the_catalogs_blended_price() {
+        let catalog = codypendent_providers::Catalog::builtin();
+        // The curated anthropic/claude-opus-5 row: $5/1M in, $25/1M out ->
+        // blended $15/1M -> $0.015/1K.
+        let config = model_config("claude-opus-5", Some("anthropic"));
+        assert_eq!(resolve_hosted_price(&config, &catalog, None), Some(0.015));
+    }
+
+    #[test]
+    fn resolve_hosted_price_is_none_when_neither_source_has_one() {
+        let catalog = codypendent_providers::Catalog::builtin();
+        // No provider_id at all.
+        assert_eq!(
+            resolve_hosted_price(&model_config("mystery", None), &catalog, None),
+            None
+        );
+        // A provider_id the catalog does not curate this model under.
+        assert_eq!(
+            resolve_hosted_price(
+                &model_config("not-a-real-model-xyz", Some("anthropic")),
+                &catalog,
+                None
+            ),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod routing_command_tests {
+    use super::*;
+    use codypendent_protocol::discovery::RuntimePaths;
+
+    fn temp_paths() -> (tempfile::TempDir, RuntimePaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        (dir, paths)
+    }
+
+    #[test]
+    fn classification_variant_name_is_case_insensitive_and_matches_the_wire_spelling() {
+        // Must match `DataClassification`'s un-renamed Serde encoding exactly
+        // (`crates/protocol/src/artifact.rs`) — the Rust variant name, PascalCase.
+        assert_eq!(classification_variant_name("internal"), Some("Internal"));
+        assert_eq!(classification_variant_name("INTERNAL"), Some("Internal"));
+        assert_eq!(
+            classification_variant_name("Confidential"),
+            Some("Confidential")
+        );
+        assert_eq!(classification_variant_name("public"), Some("Public"));
+        assert_eq!(classification_variant_name("secret"), Some("Secret"));
+        // `Unknown` is the fail-closed default, deliberately not an accepted spelling.
+        assert_eq!(classification_variant_name("unknown"), None);
+        assert_eq!(classification_variant_name("nonsense"), None);
+    }
+
+    #[tokio::test]
+    async fn routing_enable_creates_the_file_and_status_reflects_it() {
+        let (_dir, paths) = temp_paths();
+        let path = paths.data_dir.join("routing.toml");
+        assert!(!path.exists());
+
+        routing_enable(&paths, Some("internal")).await.unwrap();
+        assert!(path.exists());
+
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc.get("enabled").and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            doc.get("data_classification")
+                .and_then(|v| v.get("type"))
+                .and_then(toml::Value::as_str),
+            Some("Internal")
+        );
+
+        // `status` does not error and does not require re-parsing here — this
+        // just pins that it runs cleanly against what `enable` just wrote.
+        routing_status(&paths).unwrap();
+    }
+
+    #[tokio::test]
+    async fn routing_enable_rejects_an_unknown_classification_and_writes_nothing() {
+        let (_dir, paths) = temp_paths();
+        let path = paths.data_dir.join("routing.toml");
+        let err = routing_enable(&paths, Some("nonsense")).await.unwrap_err();
+        assert!(err.to_string().contains("nonsense"));
+        assert!(
+            !path.exists(),
+            "a rejected classification must not leave a half-written routing.toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_disable_preserves_everything_else_including_an_unmodeled_policy_table() {
+        let (_dir, paths) = temp_paths();
+        let path = paths.data_dir.join("routing.toml");
+        // A hand-authored file with a full [policy] table this command's
+        // struct-free toml::Value approach has never heard of — the "don't
+        // build a second, narrower writer" requirement this module's own doc
+        // comment states.
+        std::fs::write(
+            &path,
+            r#"
+enabled = true
+
+[data_classification]
+type = "Confidential"
+
+[policy]
+name = "coding"
+version = 3
+quality_threshold = 0.7
+max_off_device = { type = "Confidential" }
+
+[policy.lambdas]
+cost = 1.0
+latency = 0.05
+privacy = 0.5
+failure = 0.5
+"#,
+        )
+        .unwrap();
+
+        routing_disable(&paths).await.unwrap();
+
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc.get("enabled").and_then(toml::Value::as_bool),
+            Some(false),
+            "enabled must flip to false"
+        );
+        assert_eq!(
+            doc.get("data_classification")
+                .and_then(|v| v.get("type"))
+                .and_then(toml::Value::as_str),
+            Some("Confidential"),
+            "the classification ceiling survives a disable"
+        );
+        assert_eq!(
+            doc.get("policy")
+                .and_then(|p| p.get("name"))
+                .and_then(toml::Value::as_str),
+            Some("coding"),
+            "the hand-authored [policy] table survives untouched"
+        );
+        assert_eq!(
+            doc.get("policy")
+                .and_then(|p| p.get("lambdas"))
+                .and_then(|l| l.get("cost"))
+                .and_then(toml::Value::as_float),
+            Some(1.0),
+            "nested [policy.lambdas] survives too"
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_disable_without_a_file_is_a_clean_no_op() {
+        let (_dir, paths) = temp_paths();
+        // Must not error and must not create a file just to say "already off".
+        routing_disable(&paths).await.unwrap();
+        assert!(!paths.data_dir.join("routing.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn routing_status_without_a_file_reports_disabled_and_does_not_error() {
+        let (_dir, paths) = temp_paths();
+        routing_status(&paths).unwrap();
+    }
+
+    #[tokio::test]
+    async fn enable_then_disable_round_trips_without_dropping_the_classification() {
+        let (_dir, paths) = temp_paths();
+        routing_enable(&paths, Some("secret")).await.unwrap();
+        routing_disable(&paths).await.unwrap();
+        let doc: toml::Value =
+            toml::from_str(&std::fs::read_to_string(paths.data_dir.join("routing.toml")).unwrap())
+                .unwrap();
+        assert_eq!(
+            doc.get("enabled").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            doc.get("data_classification")
+                .and_then(|v| v.get("type"))
+                .and_then(toml::Value::as_str),
+            Some("Secret"),
+            "disable must not erase a classification enable had set"
         );
     }
 }
@@ -3597,5 +4333,140 @@ mod daemon_restart_tests {
             "got: {message}"
         );
         assert!(message.contains("did not become ready"), "got: {message}");
+    }
+}
+
+#[cfg(test)]
+mod docs_publish_outcome_tests {
+    use super::*;
+    use codypendent_protocol::ApprovalId;
+
+    /// A migrated database holding the foreign-key chain a publish job needs
+    /// (`sessions` -> `runs`, plus `documents`), and the ids to address it by.
+    async fn seeded_pool(
+        dir: &std::path::Path,
+    ) -> (sqlx::SqlitePool, DocumentId, codypendent_protocol::RunId) {
+        let pool = knowledge_db::open(&dir.join("codypendent.db"))
+            .await
+            .expect("migrated database");
+        let session_id = SessionId::new();
+        let run_id = codypendent_protocol::RunId::new();
+        let document_id = DocumentId::new();
+        let now = "2026-08-13T00:00:00Z";
+
+        sqlx::query(
+            "INSERT INTO sessions (id, workspace_id, title, state, created_at, updated_at, \
+             revision) VALUES (?, NULL, 'test', 'open', ?, ?, 0)",
+        )
+        .bind(session_id.to_string())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, \
+             budget_json) VALUES (?, ?, 'publish', 'running', 'Build', 'default', '{}')",
+        )
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO documents (id, title, scope_json, scope_tier, scope_key, status, \
+             metadata_json, crdt_snapshot, links_json, citations_json, revision, created_at, \
+             updated_at) VALUES (?, 'Doc', ?, 'system', NULL, 'draft', '{}', ?, '[]', '[]', 1, \
+             ?, ?)",
+        )
+        .bind(document_id.to_string())
+        .bind(serde_json::to_string(&Scope::System).unwrap())
+        .bind(Vec::<u8>::new())
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        (pool, document_id, run_id)
+    }
+
+    async fn park_job(
+        pool: &sqlx::SqlitePool,
+        approval_id: ApprovalId,
+        run_id: codypendent_protocol::RunId,
+        document_id: DocumentId,
+        state: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO document_publish_jobs (approval_id, run_id, document_id, plan_json, \
+             state, created_at, updated_at) VALUES (?, ?, ?, '{}', ?, ?, ?)",
+        )
+        .bind(approval_id.to_string())
+        .bind(run_id.to_string())
+        .bind(document_id.to_string())
+        .bind(state)
+        .bind("2026-08-13T00:00:00Z")
+        .bind("2026-08-13T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// 2026-08-13 review F8: a publish whose job already says `failed` must
+    /// report a failure. Before this, only `document_publications` was polled,
+    /// so the CLI printed "still executing … re-run shortly" forever.
+    #[tokio::test]
+    async fn a_failed_publish_job_is_reported_as_failed_not_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, document_id, run_id) = seeded_pool(dir.path()).await;
+        let approval_id = ApprovalId::new();
+        park_job(&pool, approval_id, run_id, document_id, "failed").await;
+
+        let outcome = wait_for_publish_outcome(&pool, document_id, approval_id, 0).await;
+        assert!(
+            matches!(outcome, PublishOutcome::Failed),
+            "a job recorded as failed must not be reported as still running"
+        );
+    }
+
+    /// A rejected/expired approval never executes: distinct from a failure,
+    /// and equally not something re-running the command would resolve.
+    #[tokio::test]
+    async fn a_cancelled_publish_job_is_reported_as_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, document_id, run_id) = seeded_pool(dir.path()).await;
+        let approval_id = ApprovalId::new();
+        park_job(&pool, approval_id, run_id, document_id, "cancelled").await;
+
+        assert!(matches!(
+            wait_for_publish_outcome(&pool, document_id, approval_id, 0).await,
+            PublishOutcome::Cancelled
+        ));
+    }
+
+    /// A concurrent publish of the SAME document must not be read as ours —
+    /// the probe is keyed by the approval this invocation parked. (Testing the
+    /// probe rather than the loop: an "ours is still pending" assertion would
+    /// have to sit through the whole poll bound to prove a negative.)
+    #[tokio::test]
+    async fn the_job_probe_is_keyed_by_approval_not_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, document_id, run_id) = seeded_pool(dir.path()).await;
+        let theirs = ApprovalId::new();
+        let ours = ApprovalId::new();
+        park_job(&pool, theirs, run_id, document_id, "failed").await;
+        park_job(&pool, ours, run_id, document_id, "pending").await;
+
+        assert_eq!(
+            publish_job_state(&pool, ours).await.as_deref(),
+            Some("pending")
+        );
+        assert_eq!(
+            publish_job_state(&pool, theirs).await.as_deref(),
+            Some("failed")
+        );
+        // A job row that has not appeared yet is not a verdict either.
+        assert_eq!(publish_job_state(&pool, ApprovalId::new()).await, None);
     }
 }

@@ -293,6 +293,21 @@ pub enum ProposedAction {
     CouncilResultRead {
         selector: String,
     },
+    /// Read the repository's derived code graph (the `graph.callers_of` /
+    /// `graph.blast_radius` / `graph.tests_covering` runtime tools, outcome 5).
+    /// A pure read of Codypendent's OWN derived projection — no filesystem,
+    /// command, network, or remote effect, and the model-supplied symbol or path
+    /// is matched against stored `code_nodes` rows, never opened. Always
+    /// policy-`Allow`ed like [`Self::SearchRegistry`], and likewise never
+    /// serialized into a `ToolProposed`, so it needs no golden wire vector.
+    CodeGraphQuery {
+        /// The canonical repository whose graph is read (server-derived from the
+        /// run context, never model-supplied).
+        repository: String,
+        /// A short human rendering of the question (e.g. `callers of
+        /// Router::decide`), for the trace.
+        summary: String,
+    },
     #[serde(other)]
     Unknown,
 }

@@ -39,9 +39,11 @@ use serde_json::Value;
 /// refused.
 pub const SKILL_DOCUMENT_MAX_BYTES: usize = 8 * 1024;
 
-/// How many cards a single search discloses. Matches the context manifest's tool
-/// budget, so an agent-initiated search costs what a system-assembled context
-/// costs.
+/// How many TOOL cards a single search discloses. Deliberately tighter than the
+/// context manifest's 12 (`RetrievalConfig::disclose_tools_max`): the manifest is
+/// assembled once per session, while this runs whenever the model asks, so a
+/// mid-run search buys focus rather than paying the opening budget again. Skill
+/// and command cards carry their own budgets on top.
 pub const SEARCH_CARD_LIMIT: usize = 8;
 
 /// The `skills.search` tool: query the registry for the tools and skills that
@@ -189,10 +191,18 @@ pub fn render_registry_search(outcome: &RegistrySearchOutcome) -> String {
             } else {
                 card.permissions.join(", ")
             };
+            // A command is invoked by the user typing `/name`, not called as a
+            // tool, so it is rendered the way it is typed — otherwise the model
+            // reads `command fix-ci` as one more callable name and tries it.
+            let name = if card.kind == "command" {
+                format!("/{}", card.name)
+            } else {
+                card.name.clone()
+            };
             let _ = writeln!(
                 out,
-                "{} {} — {}\n  permissions: {permissions}",
-                card.kind, card.name, card.summary
+                "{} {name} — {}\n  permissions: {permissions}",
+                card.kind, card.summary
             );
         }
     }

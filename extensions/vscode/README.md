@@ -141,6 +141,10 @@ npm test            # vitest (pure protocol + client, no VS Code runtime)
 npm run build       # esbuild bundles -> dist/extension.js + dist/webview.js
 ```
 
+`npm install` also builds `@codypendent/ui` (the local `file:../../sdk/ui`
+dependency this package uses) via that package's own `prepare` script — no
+separate `cd ../../sdk/ui && npm ci && npm run build` step needed first.
+
 Press `F5` in VS Code (or Cursor) to launch an Extension Development Host.
 The test suite also runs jsdom structural visual conformance against the SDK's
 shared loading/empty/error/long-content story across public points, themes, and

@@ -11,7 +11,8 @@ use codypendent_knowledge::types::{
     EvidenceRef, MemoryClass, MemoryRecord, RetentionPolicy, Revision, Scope,
 };
 use codypendent_knowledge::{
-    db, extract_candidates, provenance_cards, CandidateMemory, Curation, MemoryError, MemoryStore,
+    db, extract_candidates, provenance_cards, CandidateMemory, Curation, MemoryCorrection,
+    MemoryError, MemoryStore,
 };
 use codypendent_protocol::{
     Actor, ArtifactId, ArtifactRef, DataClassification, EventBody, MemoryId, RepositoryId,
@@ -243,6 +244,201 @@ async fn contradicting_candidate_supersedes_via_the_curator() {
     let live = store.query(&pool, &[scope], None).await.unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].statement, "release channel is nightly");
+}
+
+/// Regression (2026-08-13 review F5), reproduced live: two DIFFERENT failure
+/// causes captured back to back used to "contradict" and silently supersede
+/// one another purely because `canonical_failure_statement` wraps every
+/// failure lesson in the identical `"Run failed: "` prefix, so the naive
+/// first-`": "` split always read that shared wrapper as the "subject". Both
+/// must survive curation as independent, live lessons.
+#[tokio::test]
+async fn two_unrelated_failure_lessons_both_remain_live_after_curation() {
+    let (_tmp, pool) = temp_pool().await;
+    let store = MemoryStore::new();
+    let scope = Scope::Repository(RepositoryId::new());
+
+    let first = candidate(
+        Some(scope.clone()),
+        MemoryClass::Failure,
+        "Run 019ff882-4c44-7fb1-8d53-af8de9b31222 failed: no model configured (no models.toml)",
+        some_evidence(),
+    );
+    let Curation::Accepted(first_record) = store.curate(&pool, first).await.unwrap() else {
+        panic!("first failure lesson should be accepted");
+    };
+
+    let second = candidate(
+        Some(scope.clone()),
+        MemoryClass::Failure,
+        "Run 019ff882-5071-7980-bfed-fd3ee2e6243d failed: no model configured: every candidate \
+         failed for Build: unreachable-local: connection check to `http://127.0.0.1:59999/v1` \
+         failed",
+        some_evidence(),
+    );
+    let second_record = match store.curate(&pool, second).await.unwrap() {
+        Curation::Accepted(record) => record,
+        other => panic!("expected the second, unrelated failure to be accepted, got {other:?}"),
+    };
+
+    let live = store.query(&pool, &[scope], None).await.unwrap();
+    let live_ids: Vec<_> = live.iter().map(|m| m.id).collect();
+    assert!(
+        live_ids.contains(&first_record.id),
+        "the first lesson must still be visible: {live_ids:?}"
+    );
+    assert!(
+        live_ids.contains(&second_record.id),
+        "the second lesson must still be visible: {live_ids:?}"
+    );
+    assert_eq!(live.len(), 2, "neither lesson may supersede the other");
+}
+
+// --------------------------------------------------------------------------
+// Correction (edit)
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn correct_supersedes_the_live_record_and_refuses_a_historical_one() {
+    let (_tmp, pool) = temp_pool().await;
+    let store = MemoryStore::new();
+    let scope = Scope::Repository(RepositoryId::new());
+    let original = record(
+        scope.clone(),
+        MemoryClass::Semantic,
+        "test command is cargo test",
+        "rev1",
+    );
+    store.insert(&pool, &original).await.unwrap();
+
+    let corrected = store
+        .correct(
+            &pool,
+            original.id,
+            MemoryCorrection {
+                statement: "test command is cargo nextest run".to_string(),
+                structured_value: None,
+                provenance: some_evidence(),
+                confidence: 0.95,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(corrected.statement, "test command is cargo nextest run");
+    assert!(corrected.supersedes.contains(&original.id));
+
+    // The old record still exists (never deleted) but is no longer live.
+    let old = store.get(&pool, original.id).await.unwrap().unwrap();
+    assert!(old.valid_until.is_some());
+    let live = store.query(&pool, &[scope], None).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].id, corrected.id);
+
+    // Correcting the now-historical original id (rather than the live,
+    // corrected record) is refused, not silently applied to the wrong row.
+    let err = store
+        .correct(
+            &pool,
+            original.id,
+            MemoryCorrection {
+                statement: "test command is pytest".to_string(),
+                structured_value: None,
+                provenance: some_evidence(),
+                confidence: 0.9,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MemoryError::NotFound(id) if id == original.id));
+}
+
+#[tokio::test]
+async fn correct_without_evidence_is_refused_and_changes_nothing() {
+    let (_tmp, pool) = temp_pool().await;
+    let store = MemoryStore::new();
+    let scope = Scope::Repository(RepositoryId::new());
+    let original = record(
+        scope,
+        MemoryClass::Semantic,
+        "test command is cargo test",
+        "rev1",
+    );
+    store.insert(&pool, &original).await.unwrap();
+
+    let err = store
+        .correct(
+            &pool,
+            original.id,
+            MemoryCorrection {
+                statement: "test command is cargo nextest run".to_string(),
+                structured_value: None,
+                provenance: Vec::new(),
+                confidence: 0.9,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MemoryError::Policy(_)));
+    let still_there = store.get(&pool, original.id).await.unwrap().unwrap();
+    assert_eq!(still_there.statement, "test command is cargo test");
+    assert!(still_there.valid_until.is_none());
+}
+
+// --------------------------------------------------------------------------
+// Durable forget audit
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn forget_writes_a_durable_content_free_audit_row() {
+    let (_tmp, pool) = temp_pool().await;
+    let store = MemoryStore::new();
+    let scope = Scope::Repository(RepositoryId::new());
+    let mem = record(
+        scope,
+        MemoryClass::Semantic,
+        "deploy uses a blue-green strategy",
+        "rev1",
+    );
+    store.insert(&pool, &mem).await.unwrap();
+
+    store.forget(&pool, mem.id).await.unwrap();
+
+    let log = store.forget_audit_log(&pool, 10).await.unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].forgotten, vec![mem.id]);
+    let debug = format!("{log:?}");
+    assert!(
+        !debug.contains("blue-green"),
+        "the durable audit log must not retain deleted content: {debug}"
+    );
+}
+
+#[tokio::test]
+async fn forget_scope_audit_log_records_the_scope() {
+    let (_tmp, pool) = temp_pool().await;
+    let store = MemoryStore::new();
+    let scope = Scope::Repository(RepositoryId::new());
+    store
+        .insert(
+            &pool,
+            &record(scope.clone(), MemoryClass::Semantic, "a", "rev1"),
+        )
+        .await
+        .unwrap();
+    store
+        .insert(
+            &pool,
+            &record(scope.clone(), MemoryClass::Semantic, "b", "rev1"),
+        )
+        .await
+        .unwrap();
+
+    store.forget_scope(&pool, &scope).await.unwrap();
+
+    let log = store.forget_audit_log(&pool, 10).await.unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].forgotten.len(), 2);
+    assert_eq!(log[0].scope, Some(scope));
 }
 
 // --------------------------------------------------------------------------

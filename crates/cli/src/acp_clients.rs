@@ -554,35 +554,7 @@ fn replace_profile_family(
 }
 
 fn write_models(path: &Path, configs: &[ModelConfig]) -> anyhow::Result<()> {
-    // `models.toml` is a shared configuration document: voice,
-    // transcription, embeddings, and retrieval live beside `[[model]]`.
-    // Replacing the whole file from a model-only struct silently erased those
-    // tables whenever an ACP client connected or disconnected.
-    let mut document = if path.exists() {
-        let raw =
-            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        toml::from_str::<toml::Value>(&raw).with_context(|| format!("parse {}", path.display()))?
-    } else {
-        toml::Value::Table(toml::map::Map::new())
-    };
-    let table = document
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("models.toml root must be a table"))?;
-    table.insert("model".to_string(), toml::Value::try_from(configs)?);
-    let bytes = toml::to_string_pretty(&document)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("models path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(".models-{}.tmp", std::process::id()));
-    std::fs::write(&temp, bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&temp, path)?;
-    Ok(())
+    crate::models_file::write_model_entries(path, configs)
 }
 
 fn distribution_label(

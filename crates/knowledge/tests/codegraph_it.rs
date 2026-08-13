@@ -442,3 +442,306 @@ async fn repository_map_renders_apis_and_tests() {
     // The change surface slot renders (empty stub in v1).
     assert!(rendered.contains("change surface: (none)"));
 }
+
+// --------------------------------------------------------------------------
+// The named query surface (`graph.callers_of` / `blast_radius` /
+// `tests_covering`) and the deleted-file retirement the live watcher needs
+// --------------------------------------------------------------------------
+
+/// The live watcher's other half: a file that DISAPPEARS is never reparsed, so
+/// nothing retires its symbols. Without `remove_file_graph` a deleted file's
+/// nodes linger in the graph — and in the repository map handed to the model —
+/// until the next whole-repository rebuild.
+#[tokio::test]
+async fn remove_file_graph_retires_a_deleted_files_symbols() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+
+    codegraph::upsert_file_graph(&pool, repo, &rev(), "src/gone.rs", "pub fn vanishes() {}\n")
+        .await
+        .unwrap();
+    // Another file calls into it, so the retirement must also drop the INCOMING
+    // edge — foreign keys are on, and a node with a live referrer cannot be
+    // deleted.
+    codegraph::upsert_file_graph(
+        &pool,
+        repo,
+        &rev(),
+        "src/keeps.rs",
+        "pub fn caller() { vanishes(); }\n",
+    )
+    .await
+    .unwrap();
+    assert!(has_node(
+        &codegraph::nodes(&pool, repo).await.unwrap(),
+        "vanishes",
+        CodeNodeKind::Function
+    ));
+
+    let retired = codegraph::remove_file_graph(&pool, repo, "src/gone.rs")
+        .await
+        .unwrap();
+    assert!(retired > 0, "the deleted file's nodes were retired");
+
+    let nodes = codegraph::nodes(&pool, repo).await.unwrap();
+    assert!(
+        !nodes.iter().any(|n| n.key.source_path == "src/gone.rs"),
+        "no node survives for the deleted path"
+    );
+    assert!(
+        has_node(&nodes, "caller", CodeNodeKind::Function),
+        "the surviving file is untouched"
+    );
+    // Retiring a path with nothing under it is a no-op, not an error.
+    assert_eq!(
+        codegraph::remove_file_graph(&pool, repo, "src/gone.rs")
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+/// The translation every `graph.*` call depends on: a caller names a symbol the
+/// way it appears in source (`tick`, `Engine::tick`), never by the
+/// `path|package::name#Kind@hash` composite the graph keys on.
+#[tokio::test]
+async fn graph_answers_callers_of_a_plainly_named_symbol() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    codegraph::upsert_file_graph(&pool, repo, &rev(), "src/engine.rs", FIXTURE)
+        .await
+        .unwrap();
+
+    let answer = codegraph::answer(
+        &pool,
+        repo,
+        &codegraph::GraphQuestion::CallersOf {
+            symbol: "compute".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let names: Vec<&str> = answer
+        .hits
+        .iter()
+        .map(|h| h.qualified_name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"Engine::tick"),
+        "the method that calls it: {names:?}"
+    );
+    assert!(
+        names.contains(&"tests::engine_ticks"),
+        "the test that calls it: {names:?}"
+    );
+    assert!(
+        !answer.targets.is_empty(),
+        "the answer names what it resolved to"
+    );
+    let rendered = answer.render();
+    assert!(rendered.contains("callers of `compute`"), "{rendered}");
+    assert!(rendered.contains("src/engine.rs"), "{rendered}");
+}
+
+/// Depth is a real bound, not decoration: `new` is reached only THROUGH `tick`'s
+/// caller chain, so depth 1 must not report it.
+#[tokio::test]
+async fn blast_radius_is_depth_bounded_and_names_the_test_that_reaches_it() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    codegraph::upsert_file_graph(&pool, repo, &rev(), "src/engine.rs", FIXTURE)
+        .await
+        .unwrap();
+
+    let shallow = codegraph::answer(
+        &pool,
+        repo,
+        &codegraph::GraphQuestion::BlastRadius {
+            symbol: "compute".to_owned(),
+            depth: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let deep = codegraph::answer(
+        &pool,
+        repo,
+        &codegraph::GraphQuestion::BlastRadius {
+            symbol: "compute".to_owned(),
+            // Deliberately over the ceiling: it is clamped, never rejected.
+            depth: 99,
+        },
+    )
+    .await
+    .unwrap();
+
+    let shallow_names: Vec<&str> = shallow
+        .hits
+        .iter()
+        .map(|h| h.qualified_name.as_str())
+        .collect();
+    let deep_names: Vec<&str> = deep
+        .hits
+        .iter()
+        .map(|h| h.qualified_name.as_str())
+        .collect();
+    assert!(shallow_names.contains(&"Engine::tick"), "{shallow_names:?}");
+    assert!(deep_names.contains(&"Engine::tick"), "{deep_names:?}");
+    assert!(
+        deep.total >= shallow.total,
+        "a deeper walk never reaches fewer nodes: {} vs {}",
+        deep.total,
+        shallow.total
+    );
+    assert!(
+        deep.render().contains("depth 5"),
+        "an over-ceiling depth is clamped and SAID to be: {}",
+        deep.render()
+    );
+}
+
+/// A missed lookup offers a next step instead of a bare "not found".
+#[tokio::test]
+async fn a_missed_lookup_suggests_candidates() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    codegraph::upsert_file_graph(&pool, repo, &rev(), "src/engine.rs", FIXTURE)
+        .await
+        .unwrap();
+
+    let answer = codegraph::answer(
+        &pool,
+        repo,
+        &codegraph::GraphQuestion::CallersOf {
+            symbol: "computer".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(answer.targets.is_empty());
+    assert!(
+        answer.candidates.iter().any(|c| c == "compute"),
+        "candidates: {:?}",
+        answer.candidates
+    );
+    assert!(
+        answer.render().contains("did you mean"),
+        "{}",
+        answer.render()
+    );
+}
+
+/// `tests_covering` accepts a path suffix, because nobody types the full
+/// repo-relative path, and returns only `Test` nodes.
+#[tokio::test]
+async fn tests_covering_accepts_a_path_suffix_and_returns_only_tests() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    codegraph::upsert_file_graph(&pool, repo, &rev(), "crates/x/src/engine.rs", FIXTURE)
+        .await
+        .unwrap();
+
+    let answer = codegraph::answer(
+        &pool,
+        repo,
+        &codegraph::GraphQuestion::TestsCovering {
+            path: "engine.rs".to_owned(),
+            depth: 3,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        answer.hits.iter().any(
+            |h| h.qualified_name == "tests::engine_ticks" || h.qualified_name == "engine_ticks"
+        ),
+        "hits: {:?}",
+        answer.hits
+    );
+    assert!(
+        answer.hits.iter().all(|h| h.kind == CodeNodeKind::Test),
+        "only tests are returned: {:?}",
+        answer.hits
+    );
+}
+
+/// F10: a BFS seeded in repository A must not walk THROUGH repository B and
+/// back, reporting a node whose only path to the target runs via a foreign
+/// symbol the answer never shows.
+#[tokio::test]
+async fn blast_radius_does_not_traverse_through_another_repository() {
+    let (_tmp, pool) = temp_pool().await;
+    let a = RepositoryId::new();
+    let b = RepositoryId::new();
+    // A defines the target and an `outer` that calls into B's bridge; B's bridge
+    // calls A's target. The only path target ← outer runs through B.
+    codegraph::upsert_file_graph(
+        &pool,
+        a,
+        &rev(),
+        "src/lib.rs",
+        "pub fn target() {}\npub fn outer() { bridge(); }\n",
+    )
+    .await
+    .unwrap();
+    codegraph::upsert_file_graph(
+        &pool,
+        b,
+        &rev(),
+        "src/lib.rs",
+        "pub fn bridge() { target(); }\n",
+    )
+    .await
+    .unwrap();
+
+    let node = |nodes: Vec<CodeNode>, name: &str| {
+        nodes
+            .into_iter()
+            .find(|n| n.key.qualified_name == name && n.key.kind == CodeNodeKind::Function)
+            .unwrap()
+    };
+    let a_nodes = codegraph::nodes(&pool, a).await.unwrap();
+    let a_target = node(a_nodes.clone(), "target");
+    let a_outer = node(a_nodes, "outer");
+    let b_bridge = node(codegraph::nodes(&pool, b).await.unwrap(), "bridge");
+
+    // The two cross-repository edges the semantic (LSP) layer can produce once
+    // it resolves references across checkouts served by one daemon.
+    for (from, to) in [(b_bridge.id, a_target.id), (a_outer.id, b_bridge.id)] {
+        sqlx::query(
+            "INSERT INTO code_edges (id, from_node, to_node, relation, confidence, \
+             evidence_kind, evidence_artifact, revision, created_at) \
+             VALUES (?, ?, ?, 'calls', 1.0, 'lsp_resolved', NULL, ?, ?)",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(from.to_string())
+        .bind(to.to_string())
+        .bind(&rev().0)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let answer = codegraph::answer(
+        &pool,
+        a,
+        &codegraph::GraphQuestion::BlastRadius {
+            symbol: "target".to_owned(),
+            depth: 3,
+        },
+    )
+    .await
+    .unwrap();
+    // Before the repository scope moved INTO the walk, the BFS hopped to B's
+    // `bridge`, spent a depth layer there, came back to A's `outer`, and
+    // `nodes_by_ids` then dropped `bridge` — leaving `outer` in the answer with
+    // no visible path to `target`.
+    assert!(
+        answer.hits.iter().all(|h| h.qualified_name != "outer"),
+        "no node reachable only through another repository: {:?}",
+        answer.hits
+    );
+    assert_eq!(answer.total, 0, "hits: {:?}", answer.hits);
+}

@@ -99,14 +99,141 @@ pub struct SkillPermissions {
     pub secrets: Vec<String>,
 }
 
-/// The `[limits]` table. Parsed for validation only (see [`SkillManifest::limits`]);
-/// enforcement of iteration / duration / cost ceilings lands in Phase 5.
+/// The `[limits]` table.
+///
+/// These used to be parsed for validation and thrown away, so a skill declaring
+/// `maximum_duration_seconds = 1800` actually ran under a hardcoded 60-second
+/// wall clock. [`SkillLimits::resolve`] now turns the table into
+/// [`SkillResourceLimits`], which is lowered into the sandbox profile and the
+/// WASM store — a ceiling that terminates, not a comment.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillLimits {
+    /// Agent-loop iteration ceiling. Carried through to
+    /// [`SkillResourceLimits`] for the caller that drives the loop; this crate
+    /// does not run the loop, so it does not enforce it here.
     pub maximum_iterations: Option<u32>,
+    /// Wall-clock ceiling for one execution. **Enforced**: the sandbox kills the
+    /// process group past this, and the WASM host refuses to refuel past it.
     pub maximum_duration_seconds: Option<u64>,
+    /// Model-spend ceiling. Still **not** enforced here — budget accounting is
+    /// not this crate's, and a skill's script/module spends no model tokens.
+    /// Kept so the manifest shape is stable and the value reaches a future
+    /// budget owner rather than being silently dropped.
     pub maximum_cost_usd: Option<f64>,
+    /// CPU-time ceiling. **Enforced**: `prlimit --cpu` for a script, a fuel
+    /// budget for a WASM guest.
+    pub maximum_cpu_seconds: Option<u64>,
+    /// Address-space ceiling in MiB. **Enforced**: `prlimit --as` for a script,
+    /// the linear-memory cap for a WASM guest.
+    pub maximum_memory_mb: Option<u64>,
+    /// Captured-output ceiling in MiB. **Enforced**: output past it is truncated
+    /// and flagged.
+    pub maximum_output_mb: Option<u64>,
+}
+
+/// Conservative defaults for a skill that declares no explicit `[limits]`.
+/// These are the values `skill_exec` used to hardcode; they are the *default*
+/// now, not the only possibility.
+pub const DEFAULT_SKILL_MEMORY_MB: u64 = 128;
+pub const DEFAULT_SKILL_CPU_SECONDS: u64 = 30;
+pub const DEFAULT_SKILL_WALL_SECONDS: u64 = 60;
+pub const DEFAULT_SKILL_OUTPUT_MB: u64 = 8;
+
+/// Hard ceilings no manifest may exceed. A package asking for more is **refused
+/// at load**, not clamped: silently granting less than a manifest asks for
+/// produces a skill that mysteriously fails halfway, whereas refusing tells its
+/// author to fix the manifest.
+pub const MAX_SKILL_MEMORY_MB: u64 = 4096;
+pub const MAX_SKILL_CPU_SECONDS: u64 = 3600;
+pub const MAX_SKILL_WALL_SECONDS: u64 = 3600;
+pub const MAX_SKILL_OUTPUT_MB: u64 = 64;
+
+/// The resolved, validated resource ceilings for one skill execution — the
+/// shape the sandbox profile and the WASM store are built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkillResourceLimits {
+    /// Address-space ceiling (MiB).
+    pub memory_mb: u64,
+    /// CPU-time ceiling (seconds).
+    pub cpu_seconds: u64,
+    /// Wall-clock ceiling (seconds).
+    pub wall_seconds: u64,
+    /// Captured-output ceiling (MiB).
+    pub output_mb: u64,
+    /// Agent-loop iteration ceiling, for the caller that drives the loop.
+    pub maximum_iterations: Option<u32>,
+}
+
+impl Default for SkillResourceLimits {
+    fn default() -> Self {
+        Self {
+            memory_mb: DEFAULT_SKILL_MEMORY_MB,
+            cpu_seconds: DEFAULT_SKILL_CPU_SECONDS,
+            wall_seconds: DEFAULT_SKILL_WALL_SECONDS,
+            output_mb: DEFAULT_SKILL_OUTPUT_MB,
+            maximum_iterations: None,
+        }
+    }
+}
+
+impl SkillLimits {
+    /// Resolve the declared table into enforceable ceilings, refusing a value
+    /// that is zero (which would read as "unlimited" downstream) or above the
+    /// hard ceiling.
+    pub fn resolve(&self) -> Result<SkillResourceLimits, ManifestError> {
+        let defaults = SkillResourceLimits::default();
+        let mut resolved = SkillResourceLimits {
+            memory_mb: self.maximum_memory_mb.unwrap_or(defaults.memory_mb),
+            cpu_seconds: self.maximum_cpu_seconds.unwrap_or(defaults.cpu_seconds),
+            wall_seconds: self
+                .maximum_duration_seconds
+                .unwrap_or(defaults.wall_seconds),
+            output_mb: self.maximum_output_mb.unwrap_or(defaults.output_mb),
+            maximum_iterations: self.maximum_iterations,
+        };
+        for (field, value, ceiling) in [
+            ("maximum_memory_mb", resolved.memory_mb, MAX_SKILL_MEMORY_MB),
+            (
+                "maximum_cpu_seconds",
+                resolved.cpu_seconds,
+                MAX_SKILL_CPU_SECONDS,
+            ),
+            (
+                "maximum_duration_seconds",
+                resolved.wall_seconds,
+                MAX_SKILL_WALL_SECONDS,
+            ),
+            ("maximum_output_mb", resolved.output_mb, MAX_SKILL_OUTPUT_MB),
+        ] {
+            if value == 0 {
+                return Err(ManifestError::InvalidLimit {
+                    field,
+                    value,
+                    detail: "must be greater than zero (zero is not `unlimited`)".into(),
+                });
+            }
+            if value > ceiling {
+                return Err(ManifestError::InvalidLimit {
+                    field,
+                    value,
+                    detail: format!("exceeds the {ceiling} ceiling"),
+                });
+            }
+        }
+        if matches!(resolved.maximum_iterations, Some(0)) {
+            return Err(ManifestError::InvalidLimit {
+                field: "maximum_iterations",
+                value: 0,
+                detail: "must be greater than zero".into(),
+            });
+        }
+        // A CPU budget above the wall clock can never be reached, which makes
+        // the manifest read as if it grants more than it does. Pull it down so
+        // the two ceilings tell the same story.
+        resolved.cpu_seconds = resolved.cpu_seconds.min(resolved.wall_seconds);
+        Ok(resolved)
+    }
 }
 
 /// The `[entrypoints]` table. Every declared path must exist on disk under the
@@ -120,8 +247,14 @@ pub struct SkillEntrypoints {
     pub tests: Option<String>,
     /// The references directory.
     pub references: Option<String>,
-    /// The scripts directory (recorded but not runnable until Phase 6).
+    /// The scripts directory. Its contents run confined through the OS sandbox
+    /// (STEP 6.4).
     pub scripts: Option<String>,
+    /// A WebAssembly module (STEP 6.3) run by
+    /// [`WasmHost`](codypendent_sandbox::WasmHost). A guest gets no ambient
+    /// capabilities: WASI is not linked, and every privileged act it attempts is
+    /// re-checked against the run policy.
+    pub module: Option<String>,
 }
 
 impl SkillEntrypoints {
@@ -132,9 +265,16 @@ impl SkillEntrypoints {
             self.tests.as_ref(),
             self.references.as_ref(),
             self.scripts.as_ref(),
+            self.module.as_ref(),
         ]
         .into_iter()
         .flatten()
+    }
+
+    /// Whether the package carries anything that can actually be executed.
+    #[must_use]
+    pub fn has_behaviour(&self) -> bool {
+        self.scripts.is_some() || self.module.is_some()
     }
 }
 
@@ -184,6 +324,30 @@ pub enum ManifestError {
     /// registration.
     #[error("skill package exceeds the {limit}-byte size ceiling (at least {seen} bytes)")]
     PackageTooLarge { seen: u64, limit: u64 },
+    /// A `[limits]` value is zero, or above the hard ceiling. Refused at load so
+    /// the package's author sees it, rather than the skill quietly running under
+    /// a limit it did not ask for.
+    #[error("`[limits] {field} = {value}` is not usable: {detail}")]
+    InvalidLimit {
+        /// The offending key.
+        field: &'static str,
+        /// The value as declared.
+        value: u64,
+        /// Why it was refused.
+        detail: String,
+    },
+    /// The manifest declares a capability no executor can currently enforce.
+    /// Refused at **load** rather than at the first run: the 2026-08-13 review
+    /// found the one shipped skill package structurally unrunnable for exactly
+    /// this reason, and discovering that at install time is the difference
+    /// between a fixable error and a mystery.
+    #[error("`[permissions] {capability}` cannot be enforced: {detail}")]
+    UnenforceableCapability {
+        /// The `[permissions]` key.
+        capability: &'static str,
+        /// Why no executor can honour it yet.
+        detail: String,
+    },
 }
 
 /// Load and validate the skill package at `dir`, folding it into a
@@ -231,16 +395,44 @@ pub fn load_package(dir: &Path, scope: Scope) -> Result<RegistryItem, ManifestEr
     }
     let status = parse_status(&manifest.status)?;
 
+    // `[limits]` are resolved here, not at run time, so a package that asks for
+    // an unusable ceiling is refused while its author is still looking at it.
+    let _limits = manifest.limits.resolve()?;
+
+    // A network allowlist has no enforcer: `validate_enforceable_profile` refuses
+    // any non-empty `network_allowlist` on both platforms because a `host:port`
+    // grant needs a broker that does not exist. Accepting the declaration and
+    // failing at the first run is how the shipped `fix-ci` package came to be
+    // installable but unrunnable — so it is refused here instead.
+    if !manifest.permissions.network.is_empty() {
+        return Err(ManifestError::UnenforceableCapability {
+            capability: "network",
+            detail: "host:port grants require an outbound broker, which does not exist yet; \
+                     no sandbox backend will admit a non-empty network allowlist"
+                .into(),
+        });
+    }
+    if !manifest.permissions.secrets.is_empty() {
+        return Err(ManifestError::UnenforceableCapability {
+            capability: "secrets",
+            detail: "brokered secrets require the secrets daemon, which does not exist yet; \
+                     no executor reads `brokered_secrets`"
+                .into(),
+        });
+    }
+
     let content_hash = hash_package(dir)?;
 
     let permissions = flatten_permissions(&manifest.permissions);
     let risk = RiskClass::from_permissions(&permissions);
 
     // STEP 6.4: the Phase-2 "scripts recorded but not runnable" restriction is
-    // lifted — the OS sandbox ([`crate::skill_exec`]) now confines skill scripts,
-    // so a skill's behaviour is executable. The sandbox executor still fails closed
-    // at run time where no backend is available.
-    let executable = true;
+    // lifted — the OS sandbox ([`crate::skill_exec`]) confines skill scripts and
+    // the WASM host runs `[entrypoints] module`. But the flag is a statement
+    // about THIS package, not about the platform: a skill that ships neither a
+    // script nor a module has no behaviour to execute, and saying otherwise was
+    // how every skill came to be marked executable regardless of content.
+    let executable = manifest.entrypoints.has_behaviour();
 
     let tier = if manifest.trust.publisher == LOCAL_PUBLISHER {
         TrustTier::FirstParty
@@ -372,7 +564,7 @@ const MAX_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
 /// changes the digest. Files are streamed through the hasher one chunk at a time
 /// — never all held in memory at once — and the total is capped at
 /// [`MAX_PACKAGE_BYTES`].
-fn hash_package(dir: &Path) -> Result<String, ManifestError> {
+pub fn hash_package(dir: &Path) -> Result<String, ManifestError> {
     let mut files = Vec::new();
     collect_files(dir, dir, &mut files)?;
     files.sort();
@@ -427,4 +619,206 @@ fn collect_files(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codypendent_protocol::RepositoryId;
+
+    /// Write a minimal, valid skill package into `dir`, with `extra` spliced in
+    /// before `[trust]` so a test can vary one table at a time.
+    fn write_package(dir: &Path, extra: &str) {
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(dir.join("scripts").join("run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join("SKILL.md"), "# Demo\n").unwrap();
+        let manifest = format!(
+            "schema_version = 1\n\
+             id = \"demo.skill\"\n\
+             name = \"Demo\"\n\
+             version = \"0.1.0\"\n\
+             scope = \"repository\"\n\
+             status = \"active\"\n\
+             description = \"A demo skill.\"\n\
+             \n{extra}\n\
+             [entrypoints]\n\
+             instructions = \"SKILL.md\"\n\
+             scripts = \"scripts/\"\n\
+             \n\
+             [trust]\n\
+             publisher = \"local-user\"\n\
+             signature_required = false\n"
+        );
+        std::fs::write(dir.join("skill.toml"), manifest).unwrap();
+    }
+
+    fn load(extra: &str) -> Result<RegistryItem, ManifestError> {
+        let dir = tempfile::tempdir().unwrap();
+        write_package(dir.path(), extra);
+        load_package(dir.path(), Scope::Repository(RepositoryId::new()))
+    }
+
+    #[test]
+    fn absent_limits_resolve_to_the_conservative_defaults() {
+        let resolved = SkillLimits::default().resolve().unwrap();
+        assert_eq!(resolved.memory_mb, DEFAULT_SKILL_MEMORY_MB);
+        assert_eq!(resolved.wall_seconds, DEFAULT_SKILL_WALL_SECONDS);
+        assert_eq!(resolved.output_mb, DEFAULT_SKILL_OUTPUT_MB);
+        assert_eq!(resolved.cpu_seconds, DEFAULT_SKILL_CPU_SECONDS);
+    }
+
+    #[test]
+    fn a_declared_duration_becomes_the_enforced_wall_clock() {
+        // The defect this closes: `maximum_duration_seconds = 1800` was parsed
+        // and discarded, so the skill actually ran under a hardcoded 60s clock.
+        let limits = SkillLimits {
+            maximum_duration_seconds: Some(1800),
+            ..Default::default()
+        };
+        let resolved = limits.resolve().unwrap();
+        assert_eq!(resolved.wall_seconds, 1800);
+        assert_ne!(
+            resolved.wall_seconds, DEFAULT_SKILL_WALL_SECONDS,
+            "the manifest value must win over the default"
+        );
+    }
+
+    #[test]
+    fn a_cpu_budget_above_the_wall_clock_is_pulled_down_to_it() {
+        // A CPU cap that can never be reached makes the manifest read as if it
+        // grants more than it does.
+        let limits = SkillLimits {
+            maximum_duration_seconds: Some(30),
+            maximum_cpu_seconds: Some(3000),
+            ..Default::default()
+        };
+        assert_eq!(limits.resolve().unwrap().cpu_seconds, 30);
+    }
+
+    #[test]
+    fn a_zero_limit_is_refused_rather_than_read_as_unlimited() {
+        for limits in [
+            SkillLimits {
+                maximum_duration_seconds: Some(0),
+                ..Default::default()
+            },
+            SkillLimits {
+                maximum_memory_mb: Some(0),
+                ..Default::default()
+            },
+            SkillLimits {
+                maximum_output_mb: Some(0),
+                ..Default::default()
+            },
+            SkillLimits {
+                maximum_iterations: Some(0),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                limits.resolve().unwrap_err(),
+                ManifestError::InvalidLimit { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn a_limit_above_the_hard_ceiling_is_refused_not_clamped() {
+        let limits = SkillLimits {
+            maximum_memory_mb: Some(MAX_SKILL_MEMORY_MB + 1),
+            ..Default::default()
+        };
+        let err = limits.resolve().unwrap_err();
+        match err {
+            ManifestError::InvalidLimit { field, .. } => assert_eq!(field, "maximum_memory_mb"),
+            other => panic!("expected InvalidLimit, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_bad_limit_refuses_the_whole_package_at_load() {
+        let err = load("[limits]\nmaximum_duration_seconds = 0\n").unwrap_err();
+        assert!(matches!(err, ManifestError::InvalidLimit { .. }));
+    }
+
+    #[test]
+    fn a_network_permission_is_refused_at_load_not_at_the_first_run() {
+        // The shipped `fix-ci` package used to install cleanly and then fail on
+        // every run, because no backend admits a non-empty network allowlist.
+        let err = load("[permissions]\nnetwork = [\"api.github.com:443\"]\n").unwrap_err();
+        match err {
+            ManifestError::UnenforceableCapability { capability, .. } => {
+                assert_eq!(capability, "network");
+            }
+            other => panic!("expected UnenforceableCapability, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_secrets_permission_is_refused_at_load() {
+        let err = load("[permissions]\nsecrets = [\"github-token\"]\n").unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestError::UnenforceableCapability {
+                capability: "secrets",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn executable_reflects_the_package_not_the_platform() {
+        // With a `scripts/` entrypoint there is behaviour to run.
+        let item = load("[permissions]\ncommands = [\"cargo\"]\n").unwrap();
+        assert!(item.executable);
+
+        // Without one there is not. Marking every skill executable regardless of
+        // contents is what made the flag meaningless.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SKILL.md"), "# Docs only\n").unwrap();
+        std::fs::write(
+            dir.path().join("skill.toml"),
+            "schema_version = 1\n\
+             id = \"demo.docs\"\n\
+             name = \"Docs\"\n\
+             version = \"0.1.0\"\n\
+             scope = \"repository\"\n\
+             status = \"active\"\n\
+             description = \"Instructions only.\"\n\
+             \n\
+             [entrypoints]\n\
+             instructions = \"SKILL.md\"\n\
+             \n\
+             [trust]\n\
+             publisher = \"local-user\"\n\
+             signature_required = false\n",
+        )
+        .unwrap();
+        let item = load_package(dir.path(), Scope::Repository(RepositoryId::new())).unwrap();
+        assert!(
+            !item.executable,
+            "a skill with no script and no module has no behaviour to execute"
+        );
+    }
+
+    #[test]
+    fn a_declared_module_entrypoint_must_exist_and_makes_the_skill_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package(dir.path(), "[permissions]\n");
+        let raw = std::fs::read_to_string(dir.path().join("skill.toml")).unwrap();
+        std::fs::write(
+            dir.path().join("skill.toml"),
+            raw.replace("scripts = \"scripts/\"", "module = \"skill.wasm\""),
+        )
+        .unwrap();
+        // Declared but absent ⇒ refused, like every other entrypoint.
+        assert!(matches!(
+            load_package(dir.path(), Scope::Repository(RepositoryId::new())).unwrap_err(),
+            ManifestError::MissingEntrypoint { .. }
+        ));
+
+        std::fs::write(dir.path().join("skill.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        let item = load_package(dir.path(), Scope::Repository(RepositoryId::new())).unwrap();
+        assert!(item.executable);
+    }
 }

@@ -61,6 +61,34 @@ pub struct AdvancePromotionRequest {
     pub client_id: ClientId,
 }
 
+/// A client's submission of the eval evidence a candidate's regression gate
+/// will consume.
+///
+/// This exists because the alternative was worse: `codypendent eval run
+/// --candidate-id` used to open the daemon's own SQLite file and `INSERT` the
+/// `eval_suite_reports` row itself, so the "durable evidence" the gate later
+/// read had never crossed an authenticated boundary — anyone able to write that
+/// file could hand-author an all-passing report and clear the gate for any
+/// candidate. Routing it through the socket makes the daemon the only writer of
+/// its own evidence table, and lets it re-derive the candidate's artifact
+/// identity rather than accept the caller's.
+///
+/// It does NOT make the daemon the *producer* of the measurements — the cases
+/// still execute in the client. What it removes is the unauthenticated write
+/// path; see the implementation for the checks that survive.
+#[derive(Debug, Clone)]
+pub struct SubmitEvalEvidenceRequest {
+    pub candidate_id: String,
+    /// The suite that ran; the regression gate consumes `core`.
+    pub suite: String,
+    /// The routing policy the suite ran under, or `daemon-default`.
+    pub routing_policy: String,
+    /// A serialized `codypendent_eval::SuiteReport`. Parsed and validated by
+    /// the implementation — never stored verbatim on trust.
+    pub report_json: String,
+    pub client_id: ClientId,
+}
+
 /// A client's request to approve (and thereby promote) a candidate. `approver`
 /// is constructed by `server.rs` from the connection's role — see the module
 /// doc — never taken from the wire.
@@ -106,6 +134,12 @@ pub trait PromotionGateway: Send + Sync {
     fn propose(&self, request: ProposePromotionRequest) -> PromotionProposeFuture<'_>;
     /// Advance a candidate through one legal transition.
     fn advance(&self, request: AdvancePromotionRequest) -> PromotionActionFuture<'_>;
+    /// Persist the eval evidence a later `RunRegression` will read. The
+    /// implementation re-derives the candidate's artifact kind/name/version
+    /// from its own store and refuses evidence that does not parse or carries
+    /// no cases — see [`SubmitEvalEvidenceRequest`].
+    fn submit_eval_evidence(&self, request: SubmitEvalEvidenceRequest)
+        -> PromotionActionFuture<'_>;
     /// Approve (and promote + activate) a candidate. Refused unless
     /// `request.approver` is `Actor::Human` — enforced by
     /// `codypendent_eval::promote::Candidate::approve` itself, not merely by

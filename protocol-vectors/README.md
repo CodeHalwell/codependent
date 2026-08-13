@@ -92,10 +92,20 @@ The TypeScript test only checks the subset the extension actually types.
 Known, intentional gaps (not drift — the extension simply does not model these
 yet):
 
-- `document.json`, `blackboard.json`, `workflow.json`, `input.json` — the
-  extension does not subscribe to `Document`/`Blackboard`/`Workflow` streams
-  and has no `InputEnvelope` capture path, so it has no TypeScript type for
-  these at all.
+- `document.json`, `blackboard.json`, `board.json`, `workflow.json`,
+  `workflow_graph.json`, `input.json` — the extension does not subscribe to
+  `Document`/`Blackboard`/`Workflow` streams and has no `InputEnvelope` capture
+  path, so it has no TypeScript type for these at all.
+- `history.json`, `memory.json`, `promotion_evidence.json`, `voice.json` —
+  daemon- or CLI-side domains the extension never issues and never receives.
+
+  This list is no longer maintained by hand alone: the TypeScript suite's
+  `protocol-vectors/ file inventory` test partitions the real directory
+  listing into covered-vs-excluded and fails on any file in neither. It exists
+  because the three files added for outcome 20 (`usage.json`, `memory.json`,
+  `promotion_evidence.json`) landed while every assertion in that suite still
+  passed — a whole new wire event went unmodeled with nothing to notice it.
+  Adding a vector file now forces a decision here.
 - `CommandBody`: only the 9 variants the extension actually sends
   (`AttachSession`, `SubmitUserInput`, `StartRun`, `ResolveApproval`,
   `CancelRun`, `PauseRun`, `ResumeRun`, `QueueSteering`, `UpdateIdeContext`) are

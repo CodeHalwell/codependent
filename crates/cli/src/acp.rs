@@ -71,6 +71,25 @@ fn require_accepted(
     }
 }
 
+/// `AttachSession` is answered with the session's catch-up snapshot, never with
+/// `CommandAccepted` — it is served ahead of the command ledger like the other
+/// connection-level commands (`server::handle_attach`). Checking it with
+/// [`require_accepted`] failed every attach, and therefore every `session/prompt`
+/// this backend served. `commands::expect_catchup` is the same contract for the
+/// `run`/`attach` clients.
+fn require_attached(reply: codypendent_protocol::Envelope) -> Result<(), AcpError> {
+    match &reply.payload {
+        Payload::Catchup { .. } => Ok(()),
+        Payload::CommandRejected(error) => Err(AcpError::Backend(format!(
+            "AttachSession rejected: {} ({})",
+            error.message, error.code
+        ))),
+        other => Err(AcpError::Backend(format!(
+            "unexpected reply to AttachSession: {other:?}"
+        ))),
+    }
+}
+
 /// The two options every permission request offers.
 fn permission_options() -> Vec<PermissionOption> {
     vec![
@@ -122,7 +141,7 @@ impl AcpBackend for DaemonAcpBackend {
 
         // Attach so this connection receives the run's events, then start the
         // run with the prompt as its objective.
-        require_accepted(
+        require_attached(
             conn.send_command(CommandBody::AttachSession {
                 session_id: session,
                 last_seen_sequence: None,
@@ -136,7 +155,6 @@ impl AcpBackend for DaemonAcpBackend {
             })
             .await
             .map_err(|e| AcpError::Backend(e.to_string()))?,
-            "AttachSession",
         )?;
         let start_reply = require_accepted(
             conn.send_command(CommandBody::StartRun {

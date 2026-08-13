@@ -38,6 +38,7 @@ mod docs;
 mod edit_file;
 mod git;
 mod github;
+mod graph;
 mod label;
 mod memory;
 mod read_file;
@@ -85,6 +86,10 @@ pub use github::{
     render_pull_request, CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
     CreateDraftPullRequestInput, GetPullRequest, GetPullRequestInput, ListCheckRuns,
     ListCheckRunsInput, UpdatePullRequestInput, UpdatePullRequestTool,
+};
+pub use graph::{
+    graph_proposed_action, parse_symbol_question, parse_tests_covering, summarize_graph_question,
+    GraphBlastRadius, GraphCallersOf, GraphTestsCovering,
 };
 pub use label::tool_label;
 pub use memory::{parse_memory_remember, MemoryRemember, MemoryRememberInput};

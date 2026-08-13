@@ -615,6 +615,54 @@ mod tests {
         );
     }
 
+    /// The filter this pins (`is_eligible`, above: "a hosted zero price is the
+    /// benchmark harness's 'unmeasured' sentinel") is exercised end to end by
+    /// `crates/codypendentd/src/routing.rs`'s
+    /// `a_benched_hosted_model_without_a_price_is_ineligible`, but nothing in
+    /// THIS crate's own test suite pinned it directly before now — outcome 11
+    /// (`2026-08-13-verticals/sandbox-eval-routing.md`, F11.4): "any benched
+    /// hosted model is permanently ineligible... what is missing is the
+    /// price-entry surface that makes hosted routing reachable at all."
+    /// `crates/runtime/src/bench.rs::into_profile`'s new `known_price_per_1k_usd`
+    /// parameter (fed from the catalog by `codypendent models bench`, or a
+    /// `--price-per-1m-usd` override) is that surface; this test is the router
+    /// side of the same fix — a hosted model that carries a real price clears
+    /// the filter a zero price fails.
+    #[test]
+    fn a_supplied_price_makes_a_hosted_model_eligible() {
+        let unpriced = vec![model(
+            "hosted-unpriced",
+            ModelLocation::Hosted,
+            0.90,
+            0.0, // the harness's "never benched a real price" sentinel
+            500.0,
+            200_000,
+        )];
+        let policy = RoutingPolicy::balanced();
+        let router = Router::new(&unpriced, &policy);
+        assert!(
+            matches!(
+                router.route(&node(DataClassification::Internal)),
+                Err(RoutingError::NoEligibleModel { .. })
+            ),
+            "an unpriced hosted model must not be routable"
+        );
+
+        let priced = vec![model(
+            "hosted-priced",
+            ModelLocation::Hosted,
+            0.90,
+            0.0025, // e.g. from into_profile(_, Some(blended_price_per_1k_usd(..)))
+            500.0,
+            200_000,
+        )];
+        let router = Router::new(&priced, &policy);
+        let d = router
+            .route(&node(DataClassification::Internal))
+            .expect("a priced hosted model must be routable");
+        assert_eq!(d.model, ModelId("hosted-priced".into()));
+    }
+
     #[test]
     fn classified_data_with_no_local_model_fails_rather_than_leaks() {
         // No local model + secret data + restrictive policy ⇒ the router refuses

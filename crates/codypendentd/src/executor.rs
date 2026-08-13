@@ -60,7 +60,7 @@ use codypendent_protocol::{
 };
 use codypendent_runtime::agent::{
     cancellation, mode_overlay, ApprovalRequest, CancellationHandle, CancellationToken,
-    FrameworkAgentRuntime, FrameworkModelDriver, RunContext, RunJournal, TurnItem,
+    FrameworkAgentRuntime, FrameworkModelDriver, RunContext, RunJournal, RunOutcome, TurnItem,
 };
 use codypendent_runtime::models::{
     load_models, resolve_model, ModelPolicy, ModelRegistry, RetrievalSettings,
@@ -143,6 +143,14 @@ pub struct RuntimeExecutor {
     /// matches the folded revision re-scans; a run at the same revision reuses
     /// the graph exactly as before. `Arc<Mutex<…>>` so every clone shares one map.
     scanned: Arc<Mutex<HashMap<RepositoryId, GitRevision>>>,
+    /// The live code-graph watcher for each repository this daemon has folded
+    /// (outcome 14). Armed once, right after a repository's first successful
+    /// scan, and kept for the daemon's life: a watcher is one `notify` thread
+    /// plus one debouncing task, so a per-repository entry is cheap, while
+    /// re-arming per run would leak a thread per run. `Arc<Mutex<…>>` so every
+    /// clone of this executor shares ONE registry — otherwise the clone the
+    /// server holds and the clone `spawn_run` holds would each arm their own.
+    watchers: Arc<Mutex<HashMap<RepositoryId, scan::RepositoryWatcher>>>,
     /// Live per-run cancellation handles, keyed by `RunId`. `spawn_run` registers
     /// a run's handle before its loop starts and removes it once the loop is
     /// terminal; [`cancel_run`](RunExecutor::cancel_run) fires the matching handle
@@ -305,6 +313,7 @@ impl RuntimeExecutor {
             subscriptions,
             approvals,
             scanned: Arc::new(Mutex::new(scanned)),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
             pending_cancellations: Arc::new(Mutex::new(HashSet::new())),
             pending_pauses: Arc::new(Mutex::new(HashSet::new())),
@@ -501,8 +510,20 @@ impl RuntimeExecutor {
     /// A checkout with no resolvable `HEAD` reports the same `"workdir"`
     /// placeholder every time, so it scans exactly once, as before.
     ///
-    /// The lock is released before the (async) scan — a `std` mutex is never held
-    /// across an await.
+    /// The `std` mutex over the revision map is never held across an await; the
+    /// mutual exclusion that matters is [`scan::lock_repository`], an async lock
+    /// held across the whole scan.
+    ///
+    /// **Two callers fire this for one `codypendent run`** — the server's
+    /// `CreateSession` hook (via [`Self::ensure_repository_scanned`]) and
+    /// `spawn_run`. Before the async lock, both read the revision map, both saw
+    /// "not folded", and both ran `clear_repository` + a full rebuild against the
+    /// same database: reproducibly `database is locked`, after which the losing
+    /// scan never recorded its revision (so the repository re-scanned on every
+    /// later run), and a run could read the repository map between the winner's
+    /// clear and its rebuild — a torn graph in the model's opening note
+    /// (2026-08-13 review, F6). The guard is re-checked *under* the lock, so the
+    /// second caller finds the fold already recorded and does no work.
     async fn ensure_scanned(&self, repository: RepositoryId, root: &Path) {
         let revision = scan::head_revision(root);
         let folded_current = {
@@ -512,12 +533,32 @@ impl RuntimeExecutor {
         if folded_current {
             return;
         }
+        let guard = scan::lock_repository(repository).await;
+        // Re-check: another caller may have folded this exact revision while
+        // this one waited for the lock. This is the check that makes the pair of
+        // triggers idempotent — the cheap pre-check above only avoids the wait.
+        let already_folded = {
+            let seen = self.scanned.lock().expect("scanned map lock");
+            seen.get(&repository) == Some(&revision)
+        };
+        if already_folded {
+            return;
+        }
         match scan::scan_repository(&self.pool, repository, root).await {
             Ok(()) => {
                 self.scanned
                     .lock()
                     .expect("scanned map lock")
                     .insert(repository, revision);
+                // Outcome 14: arm the live watcher the moment a repository has a
+                // valid graph, so an edit made DURING the session — the agent's
+                // own `edit_file` included — is folded incrementally and is
+                // visible to the next tool call, with no commit and no restart.
+                self.ensure_watching(repository, root);
+                // Released before the docs sweep below: that sweep reads the
+                // graph but never writes it, and holding the graph's writer lock
+                // across it would stall the watcher for the sweep's duration.
+                drop(guard);
                 // The graph just changed, which is exactly when documentation
                 // can have gone stale — so run the `/update-docs` sweep against
                 // it (STEP 4.6, previously tested but never wired). It only
@@ -542,6 +583,30 @@ impl RuntimeExecutor {
             Err(error) => {
                 warn!(%repository, %error, "code-graph scan failed; a later run will retry");
             }
+        }
+    }
+
+    /// Arm this repository's live code-graph watcher, once (outcome 14).
+    ///
+    /// Idempotent by construction: the registry entry IS the "already watching"
+    /// flag, so the second run against a repository re-uses the first run's
+    /// watcher. A watcher that cannot be armed (an unsupported platform, an
+    /// inotify limit) is logged and skipped — the daemon keeps working exactly
+    /// as it did before, with a graph that only moves on `HEAD`.
+    fn ensure_watching(&self, repository: RepositoryId, root: &Path) {
+        let mut watchers = self.watchers.lock().expect("code-graph watcher registry");
+        if watchers.contains_key(&repository) {
+            return;
+        }
+        match scan::arm_watcher(self.pool.clone(), repository, root) {
+            Ok(watcher) => {
+                watchers.insert(repository, watcher);
+            }
+            Err(error) => warn!(
+                %repository,
+                %error,
+                "could not arm the code-graph watcher; the graph will refresh only on a revision change"
+            ),
         }
     }
 
@@ -795,9 +860,21 @@ impl RuntimeExecutor {
         // `emit_context` just used.
         runtime = runtime
             .with_mcp_top_k(self.retrieval.mcp_top_k)
+            .with_builtin_top_k(self.retrieval.builtin_top_k)
             .with_registry_search(Arc::new(PoolRegistrySearch::new(
                 self.pool.clone(),
                 self.embedder.clone(),
+            )))
+            // Outcome 5: the `graph.*` tools. A pure read of the derived graph
+            // this daemon's own scan wrote, so it is wired unconditionally like
+            // the registry search above; a repository with no folded graph
+            // simply answers "no results".
+            .with_code_graph(Arc::new(crate::scan::PoolCodeGraph::new(self.pool.clone())))
+            // Outcome 11: the writeback that fills `performance.task_class_success`.
+            // Unconditional like the reads above — the store no-ops for a model
+            // with no benched profile, so an unbenched deployment is unaffected.
+            .with_routing_outcomes(Arc::new(crate::routing_outcomes::PoolRoutingOutcomes::new(
+                self.pool.clone(),
             )));
         // The `docs.*` tools (rubric #4): always wired — this daemon always has
         // the knowledge fabric. What an agent may actually do to a document is
@@ -898,11 +975,64 @@ impl RuntimeExecutor {
         // Drive the loop, then release the worktree — the guard releases it even if
         // the loop unwinds (the manager preserves any unmerged work as a patch
         // before teardown; a read-only run bound no worktree, so release is a no-op).
-        let result = runtime
-            .execute_run(&driver, ctx, token)
+        let outcome = runtime.execute_run(&driver, ctx, token).await;
+        // Outcome 20: persist the run's MEASURED usage where a `SELECT` can find
+        // it (migration 0032's `runs.prompt_tokens` / `completion_tokens` /
+        // `cost_micros`). This used to be `.execute_run(...).await.map(|_| ())`
+        // — the ONLY consumer of `RunOutcome.usage` anywhere was the workflow
+        // NODE path (`workflow_exec.rs`'s `node_cost_micros`), so an ordinary
+        // `codypendent run` measured its tokens honestly (the chronicle proves
+        // it) and then threw the number away right here. Best-effort and after
+        // the run's own terminal state is already journaled: a ledger write
+        // failure must never turn an otherwise-successful run into one the user
+        // sees fail.
+        if let Ok(RunOutcome { usage, .. }) = &outcome {
+            let (prompt_tokens, completion_tokens, cost_micros) = match usage {
+                Some(usage) => (
+                    Some(usage.prompt_tokens),
+                    Some(usage.completion_tokens),
+                    usage.cost_micros,
+                ),
+                None => (None, None, None),
+            };
+            if let Err(error) = ledger::record_run_usage(
+                &self.pool,
+                launch.run_id,
+                prompt_tokens,
+                completion_tokens,
+                cost_micros,
+            )
             .await
-            .map(|_| ())
-            .map_err(|e| format!("run failed: {e}"));
+            {
+                warn!(run_id = %launch.run_id, %error, "could not record the run's measured usage");
+            }
+            // …and the same measurement over the wire, so a client learns a
+            // run's cost without reading the daemon's database. Nothing is
+            // emitted when the provider measured nothing: an all-`None` event
+            // would be indistinguishable from a genuinely free run.
+            if usage.is_some() {
+                match ledger::append_next_event(
+                    &self.pool,
+                    launch.session_id,
+                    &Actor::System,
+                    &EventBody::RunUsage {
+                        run_id: launch.run_id,
+                        prompt_tokens,
+                        completion_tokens,
+                        cost_micros,
+                    },
+                    Utc::now(),
+                )
+                .await
+                {
+                    Ok(event) => self.subscriptions.publish(launch.session_id, event),
+                    Err(error) => {
+                        warn!(run_id = %launch.run_id, %error, "could not publish the run's measured usage")
+                    }
+                }
+            }
+        }
+        let result = outcome.map(|_| ()).map_err(|e| format!("run failed: {e}"));
         guard.release().await;
         result
     }
@@ -1801,12 +1931,33 @@ impl RuntimeExecutor {
         let store = MemoryStore::new();
         for candidate in candidates {
             match store.curate(&self.pool, candidate).await {
-                Ok(Curation::Accepted(record)) | Ok(Curation::Superseded { record, .. }) => {
+                Ok(Curation::Accepted(record)) => {
                     if let Err(error) = self
                         .emit_note(
                             session_id,
                             run_id,
                             format!("remembered: {}", record.statement),
+                        )
+                        .await
+                    {
+                        warn!(%session_id, %run_id, %error, "could not emit curated-memory note");
+                    }
+                }
+                // A detected contradiction resolves by supersession — never a
+                // silent overwrite — but the note used to say exactly the same
+                // generic "remembered:" an ordinary accepted fact gets, so the
+                // user was never told a contradiction was found at all
+                // (2026-08-13 review F5: "explicit contradiction resolution").
+                // Say so directly, distinct from a plain new memory.
+                Ok(Curation::Superseded { record, .. }) => {
+                    if let Err(error) = self
+                        .emit_note(
+                            session_id,
+                            run_id,
+                            format!(
+                                "remembered (replacing an earlier, contradicting note): {}",
+                                record.statement
+                            ),
                         )
                         .await
                     {
@@ -2484,6 +2635,17 @@ impl RunExecutor for RuntimeExecutor {
         Some(Arc::new(self.promotion.clone()))
     }
 
+    fn memory_gateway(&self) -> Option<Arc<dyn codypendent_daemon::memory::MemoryGateway>> {
+        // Inspect/correct/forget a curated memory, and open the evidence behind
+        // one (outcome 17). Needs the artifact store as well as the pool: a
+        // correction's own receipt is written there, and evidence may BE an
+        // artifact.
+        Some(Arc::new(crate::memory_ops::MemoryStoreGateway::new(
+            self.pool.clone(),
+            self.artifacts(),
+        )))
+    }
+
     fn blackboard_reader(&self) -> Option<Arc<dyn BlackboardReader>> {
         // Read a durable run's board for a `ReadBlackboard` command over the
         // workflow `BlackboardStore` on the shared pool (Phase 5 STEP 5.3).
@@ -2766,6 +2928,36 @@ pub(crate) async fn release_run_worktree(
     }
 }
 
+/// Release a run's worktree whose contents are ALREADY captured durably
+/// elsewhere — a workflow agent node whose diff became a content-addressed
+/// `proposed_patch` artifact before this call.
+///
+/// `force` is safe here for exactly that reason, and only that reason. The
+/// protective (`force: false`) path retains the directory whenever the tree is
+/// dirty or the branch holds unmerged commits, which is *always* true of an
+/// implementer node — it edits files by design — so a fan-out of eight workers
+/// left eight retained trees and eight `codypendent/run-*` refs per run, each a
+/// second copy of bytes that were already durable and already reachable
+/// (F15.5).
+///
+/// The manager still exports a patch spanning `base_commit -> working tree`
+/// before removing anything, and still refuses to remove when that export comes
+/// back empty, so this cannot destroy work the node's own capture missed
+/// (staged-but-uncommitted edits, or commits, which `git diff` alone does not
+/// carry).
+pub(crate) async fn release_captured_run_worktree(
+    pool: &SqlitePool,
+    artifacts: &ArtifactStore,
+    manager: &WorktreeManager,
+    binding: &WorktreeBinding,
+) {
+    if let Some(lease_id) = binding.lease {
+        if let Err(error) = manager.release(pool, artifacts, lease_id, true).await {
+            warn!(%lease_id, %error, "could not release the run's captured worktree");
+        }
+    }
+}
+
 /// Releases a run's bound worktree **even if the drive panics**. A plain
 /// post-await `release_run_worktree` is skipped when the agent loop unwinds,
 /// leaking the lease + worktree for the process lifetime — startup reconciliation
@@ -2806,6 +2998,18 @@ impl WorktreeReleaseGuard {
     pub(crate) async fn release(mut self) {
         if let Some(binding) = self.binding.take() {
             release_run_worktree(&self.pool, &self.artifacts, &self.manager, &binding).await;
+        }
+    }
+
+    /// Teardown for a worktree whose contents are already durable elsewhere —
+    /// see [`release_captured_run_worktree`]. The caller must have proof of that
+    /// capture in hand (a `Some` patch artifact), never merely an expectation of
+    /// one. Consumes the guard, so an unwind before this point still takes the
+    /// protective path.
+    pub(crate) async fn release_captured(mut self) {
+        if let Some(binding) = self.binding.take() {
+            release_captured_run_worktree(&self.pool, &self.artifacts, &self.manager, &binding)
+                .await;
         }
     }
 }

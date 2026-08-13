@@ -57,6 +57,30 @@ impl RunExit {
     }
 }
 
+/// The human-readable text worth echoing to stderr for a terminal
+/// disposition — `Failed`'s `reason` always, `Cancelled`'s `reason` when the
+/// canceller gave one, and nothing for a plain `Completed` (a summary there
+/// is routine output, not a diagnostic; the JSONL line already carries it for
+/// a caller that wants it).
+fn disposition_reason(disposition: &RunDisposition) -> Option<&str> {
+    match disposition {
+        RunDisposition::Failed { reason } => Some(reason.as_str()),
+        RunDisposition::Cancelled {
+            reason: Some(reason),
+        } => Some(reason.as_str()),
+        _ => None,
+    }
+}
+
+/// Past-tense verb for the stderr summary line.
+fn exit_verb(exit: RunExit) -> &'static str {
+    match exit {
+        RunExit::Completed => "completed",
+        RunExit::Failed => "failed",
+        RunExit::Cancelled => "cancelled",
+    }
+}
+
 /// Write one JSONL line: `serde_json::to_string(&envelope)` + `\n`, flushed
 /// immediately so a consuming pipe observes each event as it arrives rather
 /// than waiting for a buffer to fill.
@@ -125,6 +149,27 @@ pub fn replay_catchup<W: Write>(
 /// end the stream. This matters if a second client concurrently starts a
 /// second run in the same session: STEP 1.13 defines `run`'s exit code for
 /// the run it itself started, not for whichever run happens to finish first.
+///
+/// `RunCompleted { disposition, .. }`, not `RunStateChanged { state, .. }`, is
+/// what ends the stream. Every terminal path in the daemon (the plain agent
+/// loop's own finish, `crates/runtime/src/agent.rs`; the ACP bridge's
+/// `finish_acp_run`; and `crates/daemon/src/recovery.rs::fail_run`, reached
+/// when a run cannot even start — no model configured, every candidate
+/// unreachable, ...) persists+publishes a `RunStateChanged` carrying only the
+/// bare terminal `state`, immediately followed by a `RunCompleted` carrying
+/// the full [`RunDisposition`] — the human-readable `reason` (`Failed`) or
+/// `summary` (`Completed`). Both are forwarded to `out` either way, so a
+/// client reading the raw stream still sees the bare state change; what
+/// changed is which one this function treats as authoritative for the
+/// returned [`RunExit`] and, before this fix, for ending the stream at all —
+/// returning on the first (`RunStateChanged`) closed the connection before
+/// the richer `RunCompleted` ever arrived, so a scripted `--jsonl` caller saw
+/// a bare `Failed` with no reason anywhere in its own output (the reason
+/// existed only in `daemon.log`). If the connection ends before a matching
+/// `RunCompleted` arrives — a terminal `RunStateChanged` was seen but nothing
+/// followed it (an older daemon, or a crash between the two publishes) — that
+/// remembered state is the fallback, so this still cannot regress into a hang
+/// where it previously exited.
 pub async fn stream_until_terminal<W: Write>(
     conn: &mut Connection,
     out: &mut W,
@@ -133,10 +178,15 @@ pub async fn stream_until_terminal<W: Write>(
     // The authoritative binding is the run id the daemon reported for OUR
     // StartRun; first-observed `RunStarted` is only the older-daemon fallback.
     let mut run_id: Option<RunId> = expected_run;
+    // Set once a terminal `RunStateChanged` for `run_id` is observed; used
+    // only if the connection ends before `RunCompleted` follows it.
+    let mut pending_exit: Option<RunExit> = None;
     loop {
-        let envelope = conn.next_envelope().await?.ok_or_else(|| {
-            anyhow!("daemon closed the connection before the run reached a terminal state")
-        })?;
+        let Some(envelope) = conn.next_envelope().await? else {
+            return pending_exit.ok_or_else(|| {
+                anyhow!("daemon closed the connection before the run reached a terminal state")
+            });
+        };
         let Payload::Event(event) = &envelope.payload else {
             continue; // not an Event payload (e.g. a stray reply); ignore
         };
@@ -150,13 +200,27 @@ pub async fn stream_until_terminal<W: Write>(
         if !owns_event {
             continue;
         }
-        let exit = match &event.body {
-            EventBody::RunCompleted { disposition, .. } => RunExit::from_disposition(disposition),
-            EventBody::RunStateChanged { state, .. } => RunExit::from_state(*state),
-            _ => None,
-        };
-        if let Some(exit) = exit {
-            return Ok(exit);
+        match &event.body {
+            EventBody::RunCompleted { disposition, .. } => {
+                if let Some(exit) = RunExit::from_disposition(disposition) {
+                    // The JSONL line already written above carries the full
+                    // disposition (a scripted consumer can read `reason` off
+                    // it directly), but a non-Failed exit code alone tells a
+                    // human running this interactively nothing about why —
+                    // and stdout's "nothing but JSONL" contract means it
+                    // cannot go there, so stderr is the only place left for
+                    // it. Mirrors the daemon-mismatch warning's stderr-only
+                    // convention just above this function's caller.
+                    if let Some(reason) = disposition_reason(disposition) {
+                        eprintln!("codypendent: run {} — {reason}", exit_verb(exit));
+                    }
+                    return Ok(exit);
+                }
+            }
+            EventBody::RunStateChanged { state, .. } => {
+                pending_exit = RunExit::from_state(*state).or(pending_exit);
+            }
+            _ => {}
         }
     }
 }
@@ -182,19 +246,125 @@ pub async fn stream_forever<W: Write>(conn: &mut Connection, out: &mut W) -> any
 /// (rather than private) so `crate::eval`'s suite runner can reuse the exact
 /// same run-ownership rule `stream_until_terminal` uses, instead of a second
 /// copy drifting from this one within the same crate.
+///
+/// Outcome 20 (F-20-3): `ToolDenied` is run-scoped exactly like
+/// `ToolProposed`/`ToolStarted` — a policy denial that is missing here is a
+/// policy denial `stream_until_terminal`'s caller and `crate::eval`'s suite
+/// runner can never see, even though the daemon journaled it under this run's
+/// id. Keep this list in sync with the server's copy; both must omit exactly
+/// the session-scoped (non-run) event bodies, never a run-scoped one.
+///
+/// `RunUsage` and `LearningsCaptured` are here for that same reason: the
+/// server's copy resolves both to a run, and a copy that disagrees makes the
+/// CLI's notion of "this run's events" narrower than the daemon's — the drift
+/// this doc comment exists to forbid. The unit test below pins the rule so a
+/// new run-scoped variant cannot land in one copy only.
 pub(crate) fn event_run_id(body: &EventBody) -> Option<RunId> {
     match body {
         EventBody::RunStarted { run_id, .. }
         | EventBody::RunStateChanged { run_id, .. }
         | EventBody::ModelStreamDelta { run_id, .. }
         | EventBody::ToolProposed { run_id, .. }
+        | EventBody::ToolDenied { run_id, .. }
         | EventBody::ToolStarted { run_id, .. }
         | EventBody::ToolCompleted { run_id, .. }
         | EventBody::PatchProposed { run_id, .. }
         | EventBody::SteeringQueued { run_id }
         | EventBody::SteeringApplied { run_id }
         | EventBody::BudgetWarning { run_id, .. }
-        | EventBody::RunCompleted { run_id, .. } => Some(*run_id),
+        | EventBody::RunCompleted { run_id, .. }
+        | EventBody::RunUsage { run_id, .. }
+        | EventBody::LearningsCaptured { run_id, .. } => Some(*run_id),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use codypendent_protocol::{
+        ArtifactId, ArtifactRef, BudgetDimension, DataClassification, RunDisposition, RunState,
+    };
+
+    /// Every run-scoped [`EventBody`] this build knows, each carrying `run`.
+    ///
+    /// The guard below is a list rather than a derived enumeration because Rust
+    /// cannot iterate a non-`unit` enum's variants at runtime; adding a
+    /// run-scoped variant means adding it here, which is exactly the moment to
+    /// notice the two `event_run_id` copies must move together.
+    fn run_scoped_bodies(run: RunId) -> Vec<EventBody> {
+        let artifact = ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "text/markdown".to_owned(),
+            byte_length: 12,
+            sha256: "a".repeat(64),
+            sensitivity: DataClassification::Internal,
+        };
+        vec![
+            EventBody::RunStateChanged {
+                run_id: run,
+                state: RunState::Running,
+            },
+            EventBody::ModelStreamDelta {
+                run_id: run,
+                text: String::new(),
+            },
+            EventBody::SteeringQueued { run_id: run },
+            EventBody::SteeringApplied { run_id: run },
+            EventBody::BudgetWarning {
+                run_id: run,
+                dimension: BudgetDimension::WallClock,
+                used: 1,
+                limit: 2,
+            },
+            EventBody::RunCompleted {
+                run_id: run,
+                disposition: RunDisposition::Completed { summary: None },
+                chronicle: artifact,
+            },
+            EventBody::RunUsage {
+                run_id: run,
+                prompt_tokens: Some(1),
+                completion_tokens: Some(2),
+                cost_micros: None,
+            },
+            EventBody::LearningsCaptured {
+                run_id: run,
+                proposed_count: 1,
+                proposed_ids: Vec::new(),
+                activated_count: 0,
+                activated_ids: Vec::new(),
+            },
+        ]
+    }
+
+    /// The invariant this function's doc states: a body carrying a `run_id` is
+    /// run-scoped, so it must resolve to that run. `RunUsage` and
+    /// `LearningsCaptured` were each journaled under a run id by the daemon
+    /// while this copy still answered `None` for them.
+    #[test]
+    fn every_run_scoped_body_resolves_to_its_run() {
+        let run = RunId::new();
+        for body in run_scoped_bodies(run) {
+            assert_eq!(
+                event_run_id(&body),
+                Some(run),
+                "run-scoped body answered None: {body:?}"
+            );
+        }
+    }
+
+    /// The other half: a session-scoped body must stay `None`, or
+    /// `stream_until_terminal` would attribute it to whatever run is live.
+    #[test]
+    fn a_session_scoped_body_belongs_to_no_run() {
+        assert_eq!(
+            event_run_id(&EventBody::SessionCreated {
+                title: "t".to_owned()
+            }),
+            None
+        );
+        assert_eq!(event_run_id(&EventBody::SessionClosed), None);
     }
 }

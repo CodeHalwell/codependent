@@ -44,6 +44,20 @@ pub struct PullRequest {
     /// The base ref (target branch).
     #[serde(default)]
     pub base: Option<GitRef>,
+    /// Whether the PR has been merged. `state` alone cannot distinguish
+    /// "merged" from "closed without merging" — this is the field the
+    /// 2026-08-13 review (F9) found nothing anywhere ever read: no model
+    /// field, no stored handle, no schema column, so a documentation PR's
+    /// merge status never reflected back into the document that proposed it.
+    #[serde(default)]
+    pub merged: bool,
+    /// When the PR was merged, if it has been (RFC 3339; `null`/absent
+    /// otherwise).
+    #[serde(default)]
+    pub merged_at: Option<String>,
+    /// The merge commit SHA, once merged.
+    #[serde(default)]
+    pub merge_commit_sha: Option<String>,
 }
 
 impl PullRequest {

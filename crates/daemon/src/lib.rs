@@ -20,8 +20,17 @@ pub mod blackboard;
 pub mod commands;
 pub mod documents;
 pub mod executor;
+// Outcome 17: the curated-memory store's inspect/correct/forget seam, filled by
+// the assembly (only it can name `codypendent-knowledge`).
+pub mod memory;
 pub mod model_profiles;
 pub mod policy;
+// Outcomes 12/13: the daemon-side implementation of the sandbox capability
+// seam — the one layer where the run and plugin capability models both belong.
+pub mod policy_gate;
+// Outcome 19: the connection principal, derived from the socket's peer
+// credentials rather than asserted by the client.
+pub mod principal;
 pub mod projections;
 pub mod promotion;
 pub mod recovery;

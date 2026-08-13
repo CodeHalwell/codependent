@@ -21,10 +21,10 @@ use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    read_envelope, write_envelope, Actor, Catchup, ClientId, ClientRole, Command, CommandBody,
-    CommandId, DaemonStatus, DataClassification, Envelope, EventBody, FrameError, InputBlock,
-    Payload, ProtocolError, ServerHello, SessionEvent, SessionId, Subscription, BUILD_ID,
-    PROTOCOL_V1,
+    board_scope_id, read_envelope, write_envelope, Actor, Catchup, ClientId, ClientRole, Command,
+    CommandBody, CommandId, DaemonStatus, DataClassification, Envelope, EventBody, FrameError,
+    InputBlock, Payload, ProtocolError, ServerHello, SessionEvent, SessionId, Subscription,
+    BUILD_ID, PROTOCOL_V1,
 };
 use codypendent_sandbox::{LifecycleState, UiTarget};
 use sqlx::SqlitePool;
@@ -50,10 +50,11 @@ use crate::documents::{
 use crate::executor::{RunExecutor, RunLaunch};
 use crate::instance::InstanceRecord;
 use crate::ledger;
+use crate::principal::PeerPrincipal;
 use crate::projections;
 use crate::promotion::{
     AdvancePromotionRequest, ApprovePromotionRequest, PromotionGateway, ProposePromotionRequest,
-    RollbackPromotionRequest,
+    RollbackPromotionRequest, SubmitEvalEvidenceRequest,
 };
 use crate::remote_ui::{
     broker_error, RemoteUiBroker, UiBrokerFrame, UiBrokerTarget, UiMediatedAction,
@@ -149,6 +150,14 @@ pub struct ServerState {
     pub paths: RuntimePaths,
     pub instance: InstanceRecord,
     pub started_at: DateTime<Utc>,
+    /// The uid this daemon process runs as, read off the socket inode it has
+    /// just bound (a file's owner is the creating process's effective uid, so
+    /// this is exact and needs no libc). It is the owner of last resort: rows
+    /// written before migration 0031, and daemon-internal sessions created
+    /// outside the command write path, carry no `owner_uid`, and the single
+    /// local user the daemon serves is the only principal that can have made
+    /// them. See `session_owner_uid`.
+    pub daemon_uid: u32,
     /// Optional integration failures projected through `DaemonStatus`.
     pub integration_health: IntegrationHealth,
     pub shutdown: watch::Sender<bool>,
@@ -244,6 +253,11 @@ pub struct ServerState {
     /// `promotion.transport-unavailable`); the assembly injects a
     /// `codypendent-eval`-backed implementation over the pool.
     pub promotion: Option<Arc<dyn PromotionGateway>>,
+    /// Backs the client-facing memory inspect/correct/forget commands (outcome
+    /// 17). `None` in a lib-only / test embedding (every memory command is then
+    /// rejected `memory.transport-unavailable`); the assembly injects a
+    /// `codypendent-knowledge`-backed implementation over the pool.
+    pub memory: Option<Arc<dyn crate::memory::MemoryGateway>>,
     /// Turns a `SubmitUserInput`'s stored audio into text (voice v1, rubric 8).
     /// `None` in a lib-only / test embedding (an un-transcribed audio envelope is
     /// then rejected `voice.transport-unavailable`); the assembly injects an
@@ -395,6 +409,7 @@ pub async fn run_with_executor_on_and_health(
     let starter = executor.as_ref().and_then(|e| e.workflow_starter());
     let lifecycle = executor.as_ref().and_then(|e| e.workflow_lifecycle());
     let promotion = executor.as_ref().and_then(|e| e.promotion_gateway());
+    let memory = executor.as_ref().and_then(|e| e.memory_gateway());
     let documents = DocumentHub::new();
     // The blackboard read seam, bundled with the executor by the assembly. Unlike
     // the document hub, the per-run blackboard fan-out is REUSED from the executor
@@ -494,11 +509,50 @@ pub async fn run_with_executor_on_and_health(
         }
     };
 
+    // The daemon's own uid, taken from the socket inode it just bound. Read
+    // before the first connection is accepted so no request can observe a
+    // half-initialized owner-of-last-resort.
+    let daemon_uid = daemon_uid_from_socket(&paths)?;
+    // Adopt every pre-0031 session. These rows predate the ownership column and
+    // can only have been created by the local user this daemon serves, so
+    // stamping them once at boot makes the column self-describing instead of
+    // leaving the gate to infer the same thing on every request.
+    let adopted = sqlx::query("UPDATE sessions SET owner_uid = ? WHERE owner_uid IS NULL")
+        .bind(i64::from(daemon_uid))
+        .execute(&pool)
+        .await?
+        .rows_affected();
+    if adopted > 0 {
+        info!(
+            sessions = adopted,
+            uid = daemon_uid,
+            "adopted pre-0031 sessions for the local user"
+        );
+    }
+    // The same one-shot adoption for pre-0033 workflow runs. Without it every
+    // such row has neither a bound session nor an owner uid, and
+    // `principal_may_read_workflow` fails them closed — which would make a
+    // pre-upgrade user's existing workflow runs abruptly unreadable.
+    let adopted_workflows =
+        sqlx::query("UPDATE workflow_runs SET owner_uid = ? WHERE owner_uid IS NULL")
+            .bind(i64::from(daemon_uid))
+            .execute(&pool)
+            .await?
+            .rows_affected();
+    if adopted_workflows > 0 {
+        info!(
+            workflow_runs = adopted_workflows,
+            uid = daemon_uid,
+            "adopted pre-0033 workflow runs for the local user"
+        );
+    }
+
     let state = Arc::new(ServerState {
         pool,
         paths: paths.clone(),
         instance,
         started_at: Utc::now(),
+        daemon_uid,
         integration_health,
         shutdown: shutdown_tx,
         commands,
@@ -516,6 +570,7 @@ pub async fn run_with_executor_on_and_health(
         lifecycle,
         publisher,
         promotion,
+        memory,
         blackboards,
         blackboard_reader,
         blackboard_writer,
@@ -582,6 +637,21 @@ pub async fn run_with_executor_on_and_health(
     Ok(())
 }
 
+/// The uid this daemon process runs as, read from the socket inode it has just
+/// bound. A file's owner is the effective uid of the process that created it,
+/// so this is exact — and it needs no `libc`/`unsafe` (the workspace denies
+/// `unsafe_code`) and no new dependency.
+fn daemon_uid_from_socket(paths: &RuntimePaths) -> anyhow::Result<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::metadata(&paths.socket_path).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot determine the daemon's own uid from {}: {error}",
+            paths.socket_path.display()
+        )
+    })?;
+    Ok(metadata.uid())
+}
+
 /// Refuse to start if a live daemon already owns the socket; remove the
 /// socket file if it is stale (bind would otherwise fail with AddrInUse).
 async fn prepare_socket(paths: &RuntimePaths) -> anyhow::Result<()> {
@@ -604,16 +674,24 @@ async fn prepare_socket(paths: &RuntimePaths) -> anyhow::Result<()> {
 /// Per-connection mutable state established by the handshake and updated by
 /// `AttachSession`.
 struct ConnState {
-    /// The client's identity — from `ClientHello` (its envelope, or a valid
-    /// resume token). `None` until the connection handshakes.
+    /// **Who this connection is**, derived by the server from the socket's peer
+    /// credentials at accept time (outcome 19). Never read from a frame, never
+    /// mutated after construction: it is the only thing on this struct a client
+    /// cannot choose. Every ownership decision and every `Actor::Human` the
+    /// daemon records comes from here.
+    principal: PeerPrincipal,
+    /// A **correlation** token — from `ClientHello` (its envelope, or a valid
+    /// resume token). `None` until the connection handshakes. It ties reconnects,
+    /// presence and event attribution together and confers no authority: a client
+    /// choosing someone else's `client_id` gains nothing by it.
     client_id: Option<ClientId>,
     /// The role applied to commands on this connection. A handshaken local
-    /// client defaults to [`ClientRole::Controller`]: the Phase 1 socket is
-    /// user-private (0700 dirs, OS peer identity), so the single connecting user
-    /// is trusted to create sessions and control their own runs without a prior
-    /// attach. An explicit `AttachSession` may narrow (or re-assert) the role —
-    /// e.g. an observer-only view. Remote transports (later phases) will default
-    /// to `Observer` and require authenticated elevation.
+    /// client defaults to [`ClientRole::Controller`]: it is already the owning
+    /// principal (peer uid), so it may create sessions and control its own runs
+    /// without a prior attach. An explicit `AttachSession` may narrow (or
+    /// re-assert) the role — e.g. an observer-only view — but the role only ever
+    /// *subtracts*: it cannot reach a session the principal does not own, so
+    /// asserting `Approver` grants nothing the principal did not already have.
     role: ClientRole,
     /// Whether a `ClientHello` has been seen (session interaction requires it).
     handshaken: bool,
@@ -624,8 +702,9 @@ struct ConnState {
 }
 
 impl ConnState {
-    fn new() -> Self {
+    fn new(principal: PeerPrincipal) -> Self {
         Self {
+            principal,
             client_id: None,
             role: ClientRole::Controller,
             handshaken: false,
@@ -652,9 +731,22 @@ impl ConnState {
 /// stamps a shared last-activity instant the heartbeat task consults to decide
 /// when a silent client should be dropped.
 async fn handle_connection(stream: UnixStream, state: Arc<ServerState>) -> anyhow::Result<()> {
+    // Establish the principal from the TRANSPORT, before a single byte of the
+    // client's is read. `SO_PEERCRED` is filled in by the kernel at connect(2)
+    // from the connecting process's credentials, so this is the one fact about
+    // the caller it cannot choose. Fail closed: for a connected AF_UNIX socket
+    // this cannot legitimately fail, so a failure means something we do not
+    // understand, and an unidentified connection gets served nothing.
+    let principal = match PeerPrincipal::from_stream(&stream) {
+        Ok(principal) => principal,
+        Err(error) => {
+            warn!(%error, "refusing a connection with no derivable peer credentials");
+            return Ok(());
+        }
+    };
     let (mut read_half, write_half) = stream.into_split();
     let writer: SharedWriter = Arc::new(Mutex::new(write_half));
-    let mut conn = ConnState::new();
+    let mut conn = ConnState::new(principal);
     // Keyed by session: a re-attach to the same session on this connection
     // replaces (aborts) the prior forwarder instead of stacking a duplicate
     // that would double-deliver every live event.
@@ -1190,8 +1282,13 @@ async fn handle_request(
                 .await?;
                 return Ok(false);
             };
-            // A valid resume token restores the prior identity; an invalid or
-            // expired one is ignored (proceed as a fresh client, do not drop).
+            // A valid resume token restores the prior correlation id; an invalid
+            // or expired one is ignored (proceed as a fresh client, do not drop).
+            // This is deliberately NOT an authentication step: the connection's
+            // identity was already fixed by the kernel at accept time
+            // (`conn.principal`). A `client_id` — resumed or self-asserted —
+            // correlates frames, presence and idempotency keys and authorizes
+            // nothing, so a stolen resume token grants no access.
             let client_id = hello
                 .resume_token
                 .as_ref()
@@ -1309,6 +1406,9 @@ async fn handle_request(
                 // a ledger command — upsert it directly and acknowledge, mirroring
                 // the AttachSession interception above (Phase 3 STEP 3.4).
                 CommandBody::UpdateIdeContext { session_id, update } => {
+                    if reject_unowned_session(state, conn, writer, &request, *session_id).await? {
+                        return Ok(false);
+                    }
                     // Read-only clients must not overwrite the IDE-context
                     // projection the run read-path uses for provenance labeling.
                     if conn.role == ClientRole::Observer {
@@ -1467,6 +1567,9 @@ async fn handle_request(
                     document_id,
                     mutation,
                 } => {
+                    if reject_unowned_document(state, conn, writer, &request, *document_id).await? {
+                        return Ok(false);
+                    }
                     // Role gate (the seam additionally enforces the document's
                     // collaboration mode and edit leases; this is the coarse role
                     // gate the daemon owns). An Observer may not mutate at all.
@@ -1572,6 +1675,14 @@ async fn handle_request(
                         send(writer, &reply).await?;
                         return Ok(false);
                     };
+                    // Ownership AFTER role + transport, so those refusals keep
+                    // their existing meaning; this is the gate a Controller peer
+                    // that knows a document id has to pass.
+                    if reject_unowned_document(state, conn, writer, &request, lease.document_id)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
                     let acquire = DocumentLeaseRequest {
                         document_id: lease.document_id,
                         block_id: lease.block_id.clone(),
@@ -1781,13 +1892,58 @@ async fn handle_request(
                         client_id: conn.client_id_or(request.client_id),
                     };
                     let reply = match starter.start(start).await {
-                        Ok(workflow_run_id) => Envelope::reply_to(
-                            &request,
-                            Payload::WorkflowRunStarted {
-                                command_id: command.command_id,
-                                workflow_run_id,
-                            },
-                        ),
+                        Ok(workflow_run_id) => {
+                            // Stamp the creating principal (0033). The store
+                            // inserts `run_id = NULL`, so this column is the
+                            // ONLY ownership a workflow run has until (and
+                            // unless) it is bound to a session run.
+                            //
+                            // A failure here is NOT survivable, so it is not
+                            // merely logged: the row would keep both `run_id`
+                            // and `owner_uid` null, every later read, pause,
+                            // cancel and blackboard request would resolve it as
+                            // missing while its execution carried on in the
+                            // background, and boot adoption has already run so
+                            // nothing repairs it short of a restart. Reporting
+                            // the failure is the honest outcome.
+                            match sqlx::query(
+                                "UPDATE workflow_runs SET owner_uid = ? WHERE id = ? \
+                                 AND owner_uid IS NULL",
+                            )
+                            .bind(i64::from(conn.principal.uid()))
+                            .bind(&workflow_run_id)
+                            .execute(&state.pool)
+                            .await
+                            {
+                                Ok(_) => Envelope::reply_to(
+                                    &request,
+                                    Payload::WorkflowRunStarted {
+                                        command_id: command.command_id,
+                                        workflow_run_id,
+                                    },
+                                ),
+                                Err(error) => {
+                                    warn!(
+                                        %workflow_run_id, %error,
+                                        "could not stamp the workflow-run owner; \
+                                         reporting the start as failed"
+                                    );
+                                    Envelope::reply_to(
+                                        &request,
+                                        Payload::CommandRejected(
+                                            codypendent_protocol::CodypendentError::new(
+                                                "workflow.owner-unrecorded",
+                                                "the workflow run started but its owner could not \
+                                                 be recorded; it is not reachable and must be \
+                                                 cancelled"
+                                                    .to_string(),
+                                                true,
+                                            ),
+                                        ),
+                                    )
+                                }
+                            }
+                        }
                         Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
                     };
                     send(writer, &reply).await?;
@@ -1803,6 +1959,14 @@ async fn handle_request(
                     if let Some(lifecycle) =
                         workflow_control_seam(state, conn, writer, &request, "pause").await?
                     {
+                        // Ownership AFTER role/transport: a role refusal describes the
+                        // connection, not the resource, so it leaks nothing and must keep
+                        // its existing contract. This gate is what stops a Controller peer.
+                        if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                            .await?
+                        {
+                            return Ok(false);
+                        }
                         let reply = match lifecycle
                             .pause(PauseWorkflowRequest {
                                 workflow_run_id: workflow_run_id.clone(),
@@ -1829,6 +1993,14 @@ async fn handle_request(
                     if let Some(lifecycle) =
                         workflow_control_seam(state, conn, writer, &request, "resume").await?
                     {
+                        // Ownership AFTER role/transport: a role refusal describes the
+                        // connection, not the resource, so it leaks nothing and must keep
+                        // its existing contract. This gate is what stops a Controller peer.
+                        if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                            .await?
+                        {
+                            return Ok(false);
+                        }
                         let reply = match lifecycle
                             .resume(ResumeWorkflowRequest {
                                 workflow_run_id: workflow_run_id.clone(),
@@ -1858,6 +2030,11 @@ async fn handle_request(
                     if let Some(lifecycle) =
                         workflow_control_seam(state, conn, writer, &request, "retry").await?
                     {
+                        if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                            .await?
+                        {
+                            return Ok(false);
+                        }
                         let reply = match lifecycle
                             .retry_node(RetryWorkflowNodeRequest {
                                 workflow_run_id: workflow_run_id.clone(),
@@ -1890,6 +2067,14 @@ async fn handle_request(
                     if let Some(lifecycle) =
                         workflow_control_seam(state, conn, writer, &request, "cancel").await?
                     {
+                        // Ownership AFTER role/transport: a role refusal describes the
+                        // connection, not the resource, so it leaks nothing and must keep
+                        // its existing contract. This gate is what stops a Controller peer.
+                        if reject_unowned_workflow(state, conn, writer, &request, workflow_run_id)
+                            .await?
+                        {
+                            return Ok(false);
+                        }
                         let reply = match lifecycle
                             .cancel(CancelWorkflowRequest {
                                 workflow_run_id: workflow_run_id.clone(),
@@ -1925,6 +2110,18 @@ async fn handle_request(
                     version,
                     requires_permission_review,
                 } => {
+                    if conn.principal.uid() != state.daemon_uid {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     if conn.role == ClientRole::Observer {
                         let reply = Envelope::reply_to(
                             &request,
@@ -1976,6 +2173,18 @@ async fn handle_request(
                     candidate_id,
                     action,
                 } => {
+                    if conn.principal.uid() != state.daemon_uid {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     if conn.role != ClientRole::Controller {
                         let reply = Envelope::reply_to(
                             &request,
@@ -2031,6 +2240,18 @@ async fn handle_request(
                 // let alone succeed; `Candidate::approve` then refuses a
                 // non-human actor a second, structural time regardless.
                 CommandBody::ApprovePromotion { candidate_id } => {
+                    if conn.principal.uid() != state.daemon_uid {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     if conn.role != ClientRole::Controller {
                         let reply = Envelope::reply_to(
                             &request,
@@ -2059,10 +2280,11 @@ async fn handle_request(
                     let approve = ApprovePromotionRequest {
                         candidate_id: candidate_id.clone(),
                         // The ONE place an `Actor::Human` is minted for this
-                        // command — from the authenticated connection's role,
-                        // never from client-supplied data.
+                        // command — from the connection's peer credentials, so
+                        // the audit trail names the OS user that actually
+                        // approved rather than a UUID the caller chose.
                         approver: codypendent_protocol::Actor::Human {
-                            user_id: codypendent_protocol::ids::UserId(client_id.to_string()),
+                            user_id: conn.principal.user_id(),
                         },
                         client_id,
                     };
@@ -2087,6 +2309,18 @@ async fn handle_request(
                 // the system-attributed auto-rollback a canary regression
                 // produces on its own (`AdvancePromotion { ObserveCanary }`).
                 CommandBody::RollbackPromotion { candidate_id } => {
+                    if conn.principal.uid() != state.daemon_uid {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     if conn.role != ClientRole::Controller {
                         let reply = Envelope::reply_to(
                             &request,
@@ -2115,11 +2349,234 @@ async fn handle_request(
                     let rollback = RollbackPromotionRequest {
                         candidate_id: candidate_id.clone(),
                         actor: codypendent_protocol::Actor::Human {
-                            user_id: codypendent_protocol::ids::UserId(client_id.to_string()),
+                            user_id: conn.principal.user_id(),
                         },
                         client_id,
                     };
                     let reply = match gateway.rollback(rollback).await {
+                        Ok(()) => Envelope::reply_to(
+                            &request,
+                            Payload::CommandAccepted {
+                                command_id: command.command_id,
+                                sequence: None,
+                                created_run: None,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // Outcome 17: the curated-memory store lives outside the session
+                // ledger, so — like the promotion commands — these are
+                // intercepted here and applied through the assembly's
+                // `MemoryGateway` seam. Reads are open to any handshaken client;
+                // the two destructive verbs are `Controller`-only. The scope
+                // gate lives INSIDE the seam, where the memory is fetched, and
+                // refuses "not visible" identically to "not there".
+                CommandBody::InspectMemory { id, repository } => {
+                    let Some(gateway) =
+                        memory_seam(state, conn, writer, &request, false, "inspect").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match gateway
+                        .inspect(crate::memory::InspectMemoryRequest {
+                            id: *id,
+                            repository: repository.clone(),
+                        })
+                        .await
+                    {
+                        Ok(memory) => Envelope::reply_to(
+                            &request,
+                            Payload::Memory {
+                                command_id: command.command_id,
+                                memory,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::CorrectMemory {
+                    id,
+                    repository,
+                    statement,
+                    structured_value,
+                    confidence,
+                } => {
+                    let Some(gateway) =
+                        memory_seam(state, conn, writer, &request, true, "correct").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match gateway
+                        .correct(crate::memory::CorrectMemoryRequest {
+                            id: *id,
+                            repository: repository.clone(),
+                            statement: statement.clone(),
+                            structured_value: structured_value.clone(),
+                            confidence: *confidence,
+                        })
+                        .await
+                    {
+                        Ok(memory) => Envelope::reply_to(
+                            &request,
+                            Payload::Memory {
+                                command_id: command.command_id,
+                                memory,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::ForgetMemory { id, repository } => {
+                    let Some(gateway) =
+                        memory_seam(state, conn, writer, &request, true, "forget").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match gateway
+                        .forget(crate::memory::ForgetMemoryRequest {
+                            id: Some(*id),
+                            repository: repository.clone(),
+                            tier: codypendent_protocol::MemoryScopeTier::Unknown,
+                        })
+                        .await
+                    {
+                        Ok(forgotten) => Envelope::reply_to(
+                            &request,
+                            Payload::MemoryForgotten {
+                                command_id: command.command_id,
+                                forgotten,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::ForgetMemoryScope { repository, tier } => {
+                    let Some(gateway) =
+                        memory_seam(state, conn, writer, &request, true, "forget").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match gateway
+                        .forget(crate::memory::ForgetMemoryRequest {
+                            id: None,
+                            repository: repository.clone(),
+                            tier: *tier,
+                        })
+                        .await
+                    {
+                        Ok(forgotten) => Envelope::reply_to(
+                            &request,
+                            Payload::MemoryForgotten {
+                                command_id: command.command_id,
+                                forgotten,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::OpenMemoryEvidence {
+                    id,
+                    repository,
+                    evidence_index,
+                } => {
+                    let Some(gateway) =
+                        memory_seam(state, conn, writer, &request, false, "inspect").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match gateway
+                        .open_evidence(crate::memory::OpenMemoryEvidenceRequest {
+                            id: *id,
+                            repository: repository.clone(),
+                            evidence_index: *evidence_index,
+                        })
+                        .await
+                    {
+                        Ok(evidence) => Envelope::reply_to(
+                            &request,
+                            Payload::MemoryEvidence {
+                                command_id: command.command_id,
+                                evidence,
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                // The regression evidence a promotion gate consumes must arrive
+                // over THIS socket, from an authenticated Controller, so the
+                // daemon writes `eval_suite_reports` itself. Before this command
+                // existed the CLI opened the daemon's own SQLite file and
+                // INSERTed the row directly — which made migration 0017's "the
+                // regression verdict is derived from a persisted SuiteReport" a
+                // statement about the caller's own claim, not about anything the
+                // daemon observed.
+                CommandBody::SubmitEvalEvidence {
+                    candidate_id,
+                    suite,
+                    routing_policy,
+                    report_json,
+                } => {
+                    // The promotion store is daemon-wide, exactly like the
+                    // memory store, so it belongs to the uid the daemon runs as
+                    // and there is no per-row owner to compare against. `role`
+                    // is REQUESTED by the client, so it authenticates nothing:
+                    // without this a peer able to reach the socket could submit
+                    // a syntactically valid, all-passing SuiteReport for any
+                    // known candidate and the role-only promotion controls would
+                    // then consume that fabricated evidence. The refusal reuses
+                    // the transport-unavailable error so a foreign principal
+                    // cannot distinguish "not allowed" from "not enabled here".
+                    if conn.principal.uid() != state.daemon_uid {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    if conn.role != ClientRole::Controller {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "protocol.role-denied",
+                                "only a Controller may submit promotion eval evidence".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
+                    let Some(gateway) = state.promotion.as_ref() else {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                                "promotion.transport-unavailable",
+                                "promotion transport is not enabled on this daemon".to_string(),
+                                false,
+                            )),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    };
+                    let submit = SubmitEvalEvidenceRequest {
+                        candidate_id: candidate_id.clone(),
+                        suite: suite.clone(),
+                        routing_policy: routing_policy.clone(),
+                        report_json: report_json.clone(),
+                        client_id: conn.client_id_or(request.client_id),
+                    };
+                    let reply = match gateway.submit_eval_evidence(submit).await {
                         Ok(()) => Envelope::reply_to(
                             &request,
                             Payload::CommandAccepted {
@@ -2159,6 +2616,21 @@ async fn handle_request(
                         send(writer, &reply).await?;
                         return Ok(false);
                     };
+                    // A repository board read re-points at a synthetic board run
+                    // the assembly resolves, so gate on what the client named:
+                    // the board repository when present, the workflow run id
+                    // otherwise. Both go through the same ownership rule.
+                    let gated_id = board_repository
+                        .as_deref()
+                        .map_or_else(|| workflow_run_id.clone(), board_scope_id);
+                    if !principal_may_read_workflow(state, conn.principal, &gated_id).await? {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(workflow_run_not_found(workflow_run_id)),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     let read = ReadBlackboardRequest {
                         workflow_run_id: workflow_run_id.clone(),
                         board_repository: board_repository.clone(),
@@ -2185,6 +2657,16 @@ async fn handle_request(
                 // an agent writes through its own `blackboard.*` / `task.*` tools
                 // (which carry server-built agent attribution) rather than here.
                 CommandBody::PostBlackboardItem { scope, item } => {
+                    // Every scope, not only WorkflowRun: a repository board is
+                    // now owner-checked too (see principal_may_read_workflow),
+                    // and scoping this to workflow runs was what left the board
+                    // writable by any peer that could name the checkout.
+                    if let Some(gated_id) = board_scope_gate_id(scope) {
+                        if reject_unowned_workflow(state, conn, writer, &request, &gated_id).await?
+                        {
+                            return Ok(false);
+                        }
+                    }
                     let Some(target) = board_target(scope) else {
                         let reply = Envelope::reply_to(
                             &request,
@@ -2223,6 +2705,16 @@ async fn handle_request(
                     ordinal,
                     payload,
                 } => {
+                    // Every scope, not only WorkflowRun: a repository board is
+                    // now owner-checked too (see principal_may_read_workflow),
+                    // and scoping this to workflow runs was what left the board
+                    // writable by any peer that could name the checkout.
+                    if let Some(gated_id) = board_scope_gate_id(scope) {
+                        if reject_unowned_workflow(state, conn, writer, &request, &gated_id).await?
+                        {
+                            return Ok(false);
+                        }
+                    }
                     let Some(target) = board_target(scope) else {
                         let reply = Envelope::reply_to(
                             &request,
@@ -2269,6 +2761,19 @@ async fn handle_request(
                     after_sequence,
                     limit,
                 } => {
+                    // The gate the review walked straight through: a fresh,
+                    // never-attached client read another session's entire
+                    // history — prompts, model output, the context manifest.
+                    // Ownership is re-derived here, at the FETCH, not inherited
+                    // from an attach that may never have happened.
+                    if !principal_may_use_session(state, conn.principal, *session_id).await? {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(session_not_found(*session_id)),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     let reply = match read_session_events_page(
                         &state.pool,
                         *session_id,
@@ -2310,6 +2815,14 @@ async fn handle_request(
                         send(writer, &reply).await?;
                         return Ok(false);
                     };
+                    if !principal_may_read_workflow(state, conn.principal, workflow_run_id).await? {
+                        let reply = Envelope::reply_to(
+                            &request,
+                            Payload::CommandRejected(workflow_run_not_found(workflow_run_id)),
+                        );
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     let read = ReadWorkflowRunRequest {
                         workflow_run_id: workflow_run_id.clone(),
                         client_id: conn.client_id_or(request.client_id),
@@ -2355,9 +2868,21 @@ async fn handle_request(
                 // path under the role recorded at attach (role enforcement is
                 // inherited from the pipeline).
                 _ => {
+                    // Ownership, before anything else this command might do —
+                    // and before the role check inside the pipeline, so a
+                    // principal probing another user's ids learns nothing from
+                    // the difference between `role-denied` and `not-found`.
+                    if let Err(denial) =
+                        authorize_command(state, conn.principal, &command.body).await?
+                    {
+                        let reply = Envelope::reply_to(&request, Payload::CommandRejected(denial));
+                        send(writer, &reply).await?;
+                        return Ok(false);
+                    }
                     let ctx = ApplyContext {
                         client_id: conn.client_id_or(request.client_id),
                         role: conn.role,
+                        principal: conn.principal,
                     };
                     // Hold the shared admission guard across the whole apply so an
                     // idle-guarded shutdown (`ShutdownIfIdle`) cannot check the run
@@ -3694,6 +4219,355 @@ async fn read_remote_ui_projection(
     }
 }
 
+// --- the connection principal's authority over stored resources ---------------
+//
+// One rule, one place (outcome 19, F-19-1 / F-19-5 / F-19-8). Every by-id read,
+// every subscription, and every command that names a pre-existing resource
+// resolves that resource to an owner **in the daemon's own storage** and
+// compares it to the connection's kernel-derived principal. Nothing here ever
+// reads an identity out of a request.
+//
+// Every refusal below reuses the resource's ordinary *not-found* error, byte for
+// byte. "You may not" and "it does not exist" must be indistinguishable or the
+// gate becomes an enumeration oracle — the mistake recorded as F-19-7 on the
+// artifact path. `authorize_workflow_resource` below already had this shape and
+// is the pattern the rest now follow.
+
+/// The principal that owns `session_id`, or `None` when this daemon has never
+/// seen it. A `NULL` `owner_uid` (a pre-0031 row, or a daemon-internal session
+/// created outside the command write path) resolves to the daemon's own uid:
+/// the single local user it serves is the only principal that could have
+/// created one.
+async fn session_owner_uid(
+    state: &ServerState,
+    session_id: SessionId,
+) -> anyhow::Result<Option<u32>> {
+    Ok(ledger::session_owner_uid(&state.pool, session_id)
+        .await?
+        .map(|owner| owner.unwrap_or(state.daemon_uid)))
+}
+
+/// Whether `principal` may see `session_id` at all. Existence and ownership are
+/// decided by the same query and collapse to the same answer, so a caller
+/// learns nothing about sessions it does not own.
+async fn principal_may_use_session(
+    state: &ServerState,
+    principal: PeerPrincipal,
+    session_id: SessionId,
+) -> anyhow::Result<bool> {
+    Ok(session_owner_uid(state, session_id)
+        .await?
+        .is_some_and(|owner| principal.owns(owner)))
+}
+
+/// Refuse a connection-level command that names a resource this principal does
+/// not own, with the resource's own not-found error so a refusal is
+/// indistinguishable from a miss.
+///
+/// The connection-level branches are intercepted BEFORE the command ledger and
+/// therefore never reach [`authorize_command`], which is where by-id ownership
+/// is enforced for everything else. The first pass of the multi-uid work gated
+/// the read and subscribe paths and left every write and lifecycle path on this
+/// side of that fence — so a peer that knew an id could mutate what it could not
+/// read. These helpers exist so the check is one call at each site rather than a
+/// pattern each site is trusted to remember.
+async fn reject_unowned_workflow(
+    state: &ServerState,
+    conn: &ConnState,
+    writer: &SharedWriter,
+    request: &Envelope,
+    workflow_run_id: &str,
+) -> anyhow::Result<bool> {
+    if principal_may_read_workflow(state, conn.principal, workflow_run_id).await? {
+        return Ok(false);
+    }
+    let reply = Envelope::reply_to(
+        request,
+        Payload::CommandRejected(workflow_run_not_found(workflow_run_id)),
+    );
+    send(writer, &reply).await?;
+    Ok(true)
+}
+
+async fn reject_unowned_document(
+    state: &ServerState,
+    conn: &ConnState,
+    writer: &SharedWriter,
+    request: &Envelope,
+    document_id: codypendent_protocol::DocumentId,
+) -> anyhow::Result<bool> {
+    if principal_may_read_document(state, conn.principal, document_id).await? {
+        return Ok(false);
+    }
+    let reply = Envelope::reply_to(
+        request,
+        Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+            "document.not-found",
+            format!("no document {document_id}"),
+            false,
+        )),
+    );
+    send(writer, &reply).await?;
+    Ok(true)
+}
+
+async fn reject_unowned_session(
+    state: &ServerState,
+    conn: &ConnState,
+    writer: &SharedWriter,
+    request: &Envelope,
+    session_id: SessionId,
+) -> anyhow::Result<bool> {
+    if principal_may_use_session(state, conn.principal, session_id).await? {
+        return Ok(false);
+    }
+    let reply = Envelope::reply_to(
+        request,
+        Payload::CommandRejected(session_not_found(session_id)),
+    );
+    send(writer, &reply).await?;
+    Ok(true)
+}
+
+/// Whether `principal` may read a workflow run's observability snapshot or its
+/// blackboard, live or by id.
+///
+/// A **repository task board** (`board:<canonical repo>`) is deliberately
+/// allowed: it is a synthetic run with no owning session, it is the shared
+/// kanban for a checkout on this machine, and every principal that can reach it
+/// is by definition the local user.
+///
+/// An **unbound workflow run** — one whose `workflow_runs.run_id` is NULL — is
+/// governed by its own `owner_uid` (migration 0033). That case is the norm, not
+/// an edge: `WorkflowStore::create_run_idempotent` inserts `run_id = NULL`
+/// unconditionally, so *every* client-created workflow run is unbound. An
+/// earlier version of this gate allowed unbound runs outright on the reasoning
+/// that they had no owner to protect — true of the schema as it stood, and
+/// wrong the moment you notice which runs are unbound: it made every workflow
+/// run in the product readable by any principal that could guess its id.
+///
+/// A run that IS bound to a session run is governed by that session's owner.
+/// Binding can only ever narrow who may read a run, never widen it.
+///
+/// A row with neither (created before 0033) is adopted for the daemon's own uid
+/// once at boot, exactly as pre-0031 sessions are, so this path sees it as
+/// owned rather than having to infer the same thing on every request.
+async fn principal_may_read_workflow(
+    state: &ServerState,
+    principal: PeerPrincipal,
+    workflow_run_id: &str,
+) -> anyhow::Result<bool> {
+    if is_repository_board_id(workflow_run_id) {
+        // A repository task board is a synthetic run with no owning session and
+        // no owner_uid — its id is `board:<canonical repo>`, which any peer that
+        // knows the checkout path can construct. I previously returned true here
+        // and wrote "deliberately shared" in the comment, which was an assumption
+        // about who can reach the socket rather than anything derived: a peer
+        // could read and, via the repository-scoped board writes, corrupt another
+        // user's kanban.
+        //
+        // It is daemon-wide state with no per-row owner, exactly like the memory
+        // and promotion stores, so it takes the same answer they do: it belongs
+        // to the uid the daemon runs as.
+        return Ok(principal.uid() == state.daemon_uid);
+    }
+    match workflow_run_owner(&state.pool, workflow_run_id).await? {
+        WorkflowOwner::Session(session_id) => {
+            principal_may_use_session(state, principal, session_id).await
+        }
+        WorkflowOwner::Uid(owner_uid) => Ok(principal.uid() == owner_uid),
+        WorkflowOwner::Missing => Ok(false),
+    }
+}
+
+/// Who owns a workflow run, distinguishing "no such run" from "a real run that
+/// was never bound to a session" — a distinction the earlier inner-join lookup
+/// collapsed into `None`, which is what made every unbound run unreadable.
+enum WorkflowOwner {
+    /// The run is bound to a session run; that session's owner governs.
+    Session(SessionId),
+    /// The run has no session bound, but carries the uid of the principal that
+    /// created it (migration 0033). This is the common case.
+    Uid(u32),
+    /// No such workflow run — or one with neither owner, which cannot survive
+    /// boot adoption and so is treated as absent rather than as public.
+    Missing,
+}
+
+async fn workflow_run_owner(
+    pool: &SqlitePool,
+    workflow_run_id: &str,
+) -> anyhow::Result<WorkflowOwner> {
+    // LEFT JOIN, so an unbound run still yields a row (with a NULL session).
+    let row: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT r.session_id, w.owner_uid FROM workflow_runs w \
+         LEFT JOIN runs r ON r.id = w.run_id WHERE w.id = ?",
+    )
+    .bind(workflow_run_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        None => WorkflowOwner::Missing,
+        // A bound session governs; it is the narrower of the two.
+        Some((Some(id), _)) if SessionId::from_str(&id).is_ok() => {
+            WorkflowOwner::Session(SessionId::from_str(&id).expect("checked above"))
+        }
+        Some((_, Some(uid))) => match u32::try_from(uid) {
+            Ok(uid) => WorkflowOwner::Uid(uid),
+            Err(_) => WorkflowOwner::Missing,
+        },
+        // Neither: a pre-0033 row that boot adoption did not reach. Fail closed.
+        Some(_) => WorkflowOwner::Missing,
+    })
+}
+
+/// The id a board scope is authorized against, or `None` for a scope this
+/// daemon does not understand (rejected separately by `board_target`).
+fn board_scope_gate_id(scope: &codypendent_protocol::BlackboardScope) -> Option<String> {
+    match scope {
+        codypendent_protocol::BlackboardScope::WorkflowRun { workflow_run_id } => {
+            Some(workflow_run_id.clone())
+        }
+        codypendent_protocol::BlackboardScope::RepositoryBoard { repository } => {
+            Some(codypendent_protocol::board_scope_id(repository))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `workflow_run_id` names a repository task board rather than a real
+/// durable workflow run. Boards are minted by
+/// [`codypendent_protocol::board_scope_id`] as `board:<canonical repo>`.
+fn is_repository_board_id(workflow_run_id: &str) -> bool {
+    workflow_run_id.starts_with("board:")
+}
+
+/// The one gate every write-path command passes before it reaches the
+/// crash-consistent pipeline: if the command names a resource that already
+/// exists, that resource must resolve to a session this principal owns.
+///
+/// `Ok(())` means "carry on" — either the command names nothing pre-existing
+/// (`CreateSession`), or the principal owns what it named. The `Err` is always
+/// the resource's own not-found rejection, so a refusal is indistinguishable
+/// from a miss.
+///
+/// **`ResolveApproval` is the reason this function exists.** The review parked a
+/// `shell.run ls -la`, resolved it from an unrelated never-attached socket
+/// client, and the daemon executed it: the human-in-the-loop gate in front of
+/// arbitrary command execution held against nothing. An approval now has to
+/// resolve `approval → run → session → owner_uid` and match the connection's
+/// peer credentials.
+async fn authorize_command(
+    state: &ServerState,
+    principal: PeerPrincipal,
+    body: &CommandBody,
+) -> anyhow::Result<Result<(), codypendent_protocol::CodypendentError>> {
+    let target = match body {
+        CommandBody::StartRun { session_id, .. }
+        | CommandBody::SubmitUserInput { session_id, .. } => {
+            CommandTarget::Session(*session_id, session_not_found(*session_id))
+        }
+        CommandBody::CancelRun { run_id }
+        | CommandBody::PauseRun { run_id }
+        | CommandBody::ResumeRun { run_id }
+        | CommandBody::QueueSteering { run_id, .. } => CommandTarget::Run(
+            *run_id,
+            codypendent_protocol::CodypendentError::new(
+                "protocol.run-not-found",
+                format!("no run {run_id}"),
+                false,
+            ),
+        ),
+        CommandBody::ResolveApproval { approval_id, .. } => CommandTarget::Approval(
+            *approval_id,
+            codypendent_protocol::CodypendentError::new(
+                "approval.not-found",
+                format!("no approval {approval_id}"),
+                false,
+            ),
+        ),
+        // Nothing pre-existing is named: `CreateSession` mints its own id (and
+        // records this principal as its owner), and the remaining bodies in the
+        // generic write path carry no session/run/approval reference.
+        _ => return Ok(Ok(())),
+    };
+
+    let (session_id, denial) = match target {
+        CommandTarget::Session(session_id, denial) => (Some(session_id), denial),
+        CommandTarget::Run(run_id, denial) => {
+            (projections::run_session(&state.pool, run_id).await?, denial)
+        }
+        CommandTarget::Approval(approval_id, denial) => {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT r.session_id FROM approvals a JOIN runs r ON a.run_id = r.id WHERE a.id = ?",
+            )
+            .bind(approval_id.to_string())
+            .fetch_optional(&state.pool)
+            .await?;
+            (row.and_then(|(id,)| SessionId::from_str(&id).ok()), denial)
+        }
+    };
+
+    // Deny-first: an id that resolves to no session (missing, or an orphaned row)
+    // fails exactly as one owned by another principal does.
+    let permitted = match session_id {
+        Some(session_id) => principal_may_use_session(state, principal, session_id).await?,
+        None => false,
+    };
+    if permitted {
+        Ok(Ok(()))
+    } else {
+        Ok(Err(denial))
+    }
+}
+
+/// What a write-path command names, paired with the not-found rejection that
+/// both "missing" and "not yours" collapse to.
+enum CommandTarget {
+    Session(SessionId, codypendent_protocol::CodypendentError),
+    Run(
+        codypendent_protocol::RunId,
+        codypendent_protocol::CodypendentError,
+    ),
+    Approval(
+        codypendent_protocol::ApprovalId,
+        codypendent_protocol::CodypendentError,
+    ),
+}
+
+/// Whether `principal` may follow a collaborative document's live CRDT sync.
+///
+/// Documents carry a knowledge `Scope`, not an owner: in practice they are
+/// repository-, system- or organization-scoped (`docs_job::parse_scope`), so
+/// there is no per-session owner to re-derive. The honest gate for a
+/// single-local-user daemon is therefore the daemon's own uid — a *session*
+/// scoped document additionally has to belong to a session this principal owns.
+/// An unknown document id is refused like an unowned one.
+async fn principal_may_read_document(
+    state: &ServerState,
+    principal: PeerPrincipal,
+    document_id: codypendent_protocol::DocumentId,
+) -> anyhow::Result<bool> {
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT scope_tier, scope_key FROM documents WHERE id = ?")
+            .bind(document_id.to_string())
+            .fetch_optional(&state.pool)
+            .await?;
+    let Some((scope_tier, scope_key)) = row else {
+        return Ok(false);
+    };
+    if scope_tier == "session" {
+        let Some(session_id) = scope_key
+            .as_deref()
+            .and_then(|key| SessionId::from_str(key).ok())
+        else {
+            return Ok(false);
+        };
+        return principal_may_use_session(state, principal, session_id).await;
+    }
+    Ok(principal.owns(state.daemon_uid))
+}
+
 fn authorize_session_resource(
     session_id: SessionId,
     resource_id: Option<&str>,
@@ -3853,9 +4727,9 @@ async fn mediate_remote_ui_action(
 ) {
     let invocation_id = action.invocation.invocation_id.clone();
     let result = match remote_ui_command(&action.invocation) {
-        Ok(body) => match ensure_remote_ui_command_session(&state.pool, session_id, &body).await {
+        Ok(body) => match ensure_remote_ui_command_session(state, session_id, &body).await {
             Err(error) => Err(error),
-            Ok(()) => match action.requester {
+            Ok(owner_uid) => match action.requester {
                 None => Err(codypendent_protocol::CodypendentError::new(
                     "ui.action.user-context-required",
                     "component commands require an attached user renderer",
@@ -3868,6 +4742,11 @@ async fn mediate_remote_ui_action(
                     apply_remote_ui_workflow_control(state, role, &body).await
                 }
                 Some((client_id, role)) => {
+                    // A plugin acts inside a session, never on its own account,
+                    // so its principal is that session's recorded owner — read
+                    // out of the daemon's own storage by the authorization step
+                    // above, never carried in from the plugin.
+                    let principal = PeerPrincipal::from_uid(owner_uid);
                     let command_id = codypendent_protocol::CommandId::new();
                     let body_digest = {
                         use sha2::{Digest as _, Sha256};
@@ -3888,7 +4767,15 @@ async fn mediate_remote_ui_action(
                     };
                     let outcome = state
                         .commands
-                        .apply(&state.pool, ApplyContext { client_id, role }, command)
+                        .apply(
+                            &state.pool,
+                            ApplyContext {
+                                client_id,
+                                role,
+                                principal,
+                            },
+                            command,
+                        )
                         .await;
                     if outcome.is_ok() {
                         if let (Some(executor), CommandBody::CancelRun { run_id }) =
@@ -3942,11 +4829,29 @@ async fn mediate_remote_ui_action(
     }
 }
 
+/// Authorize one mediated Remote-UI command against the broker session, and
+/// return that session's **owning principal's uid** — the identity the command
+/// is then applied under. Returning the owner rather than `()` is what keeps the
+/// plugin path from having to name a principal of its own: there is exactly one
+/// lookup, in the daemon's storage, and its answer is both the gate and the
+/// identity.
 async fn ensure_remote_ui_command_session(
-    pool: &SqlitePool,
+    state: &ServerState,
     session_id: SessionId,
     body: &CommandBody,
-) -> Result<(), codypendent_protocol::CodypendentError> {
+) -> Result<u32, codypendent_protocol::CodypendentError> {
+    let pool = &state.pool;
+    let owner_uid = match session_owner_uid(state, session_id).await {
+        Ok(Some(owner_uid)) => owner_uid,
+        Ok(None) => return Err(session_not_found(session_id)),
+        Err(error) => {
+            return Err(codypendent_protocol::CodypendentError::new(
+                "ui.action.lookup-failed",
+                error.to_string(),
+                true,
+            ))
+        }
+    };
     let run_id = match body {
         CommandBody::PauseRun { run_id }
         | CommandBody::ResumeRun { run_id }
@@ -3961,6 +4866,7 @@ async fn ensure_remote_ui_command_session(
         | CommandBody::CancelWorkflow { workflow_run_id } => {
             return authorize_workflow_resource(pool, session_id, workflow_run_id)
                 .await
+                .map(|()| owner_uid)
                 .map_err(|_| {
                     codypendent_protocol::CodypendentError::new(
                         "ui.action.cross-session",
@@ -3969,10 +4875,10 @@ async fn ensure_remote_ui_command_session(
                     )
                 });
         }
-        _ => return Ok(()),
+        _ => return Ok(owner_uid),
     };
     match projections::run_session(pool, run_id).await {
-        Ok(Some(owner)) if owner == session_id => Ok(()),
+        Ok(Some(owner)) if owner == session_id => Ok(owner_uid),
         Ok(_) => Err(codypendent_protocol::CodypendentError::new(
             "ui.action.cross-session",
             "the requested run does not belong to the Remote UI broker session",
@@ -4311,13 +5217,15 @@ async fn handle_attach(
     // through to creating a fresh session.
     maybe_scan_repository(state, repository).await;
 
-    // Reject an attach to a session this daemon has never seen. An empty
-    // catch-up here used to make a typo'd id indistinguishable from a valid
-    // empty session — the client then bound a blank UI to a dead id whose
-    // every `StartRun` rejected `session-not-found`. Clients that probe a
-    // remembered id (the TUI's resume flow) treat a non-`Catchup` reply as
-    // "gone" and fall through to creating a fresh session.
-    if !ledger::session_exists(&state.pool, session_id).await? {
+    // Reject an attach to a session this daemon has never seen — or to one this
+    // principal does not own. An empty catch-up here used to make a typo'd id
+    // indistinguishable from a valid empty session — the client then bound a
+    // blank UI to a dead id whose every `StartRun` rejected `session-not-found`.
+    // Clients that probe a remembered id (the TUI's resume flow) treat a
+    // non-`Catchup` reply as "gone" and fall through to creating a fresh
+    // session. Another principal's session answers identically to a missing one,
+    // so an attach cannot be used to enumerate what exists.
+    if !principal_may_use_session(state, conn.principal, session_id).await? {
         let reply = Envelope::reply_to(
             request,
             Payload::Error(ProtocolError {
@@ -4386,36 +5294,67 @@ async fn handle_attach(
             handle.abort();
         }
     }
-    let new_doc_forwarders: Vec<JoinHandle<()>> = subscriptions
-        .iter()
-        .filter_map(|subscription| match subscription {
+    // Each of these subscriptions names a resource by an id the CLIENT chose,
+    // independent of the session being attached — so owning this session buys no
+    // access to them. Every one is re-derived against the connection's principal
+    // from what the server stored, exactly like a by-id read. A subscription the
+    // principal may not have is dropped silently rather than refused: naming it
+    // must not reveal whether it exists (F-19-7), and the attach itself is
+    // legitimate.
+    let mut new_doc_forwarders: Vec<JoinHandle<()>> = Vec::new();
+    for subscription in &subscriptions {
+        match subscription {
             Subscription::Document { document_id } => {
+                if !principal_may_read_document(state, conn.principal, *document_id).await? {
+                    warn!(
+                        %document_id,
+                        uid = conn.principal.uid(),
+                        "dropping a document subscription this principal does not own"
+                    );
+                    continue;
+                }
                 let receiver = state.documents.subscribe(*document_id);
-                Some(tokio::spawn(forward_document_syncs(
+                new_doc_forwarders.push(tokio::spawn(forward_document_syncs(
                     Arc::clone(writer),
                     receiver,
                     client_id,
-                )))
+                )));
             }
             Subscription::Blackboard { workflow_run_id } => {
+                if !principal_may_read_workflow(state, conn.principal, workflow_run_id).await? {
+                    warn!(
+                        workflow_run_id,
+                        uid = conn.principal.uid(),
+                        "dropping a blackboard subscription this principal does not own"
+                    );
+                    continue;
+                }
                 let receiver = state.blackboards.subscribe(workflow_run_id.clone());
-                Some(tokio::spawn(forward_blackboard_posts(
+                new_doc_forwarders.push(tokio::spawn(forward_blackboard_posts(
                     Arc::clone(writer),
                     receiver,
                     client_id,
-                )))
+                )));
             }
             Subscription::Workflow { workflow_run_id } => {
+                if !principal_may_read_workflow(state, conn.principal, workflow_run_id).await? {
+                    warn!(
+                        workflow_run_id,
+                        uid = conn.principal.uid(),
+                        "dropping a workflow subscription this principal does not own"
+                    );
+                    continue;
+                }
                 let receiver = state.workflows.subscribe(workflow_run_id.clone());
-                Some(tokio::spawn(forward_workflow_events(
+                new_doc_forwarders.push(tokio::spawn(forward_workflow_events(
                     Arc::clone(writer),
                     receiver,
                     client_id,
-                )))
+                )));
             }
-            _ => None,
-        })
-        .collect();
+            _ => {}
+        }
+    }
     if !new_doc_forwarders.is_empty() {
         doc_forwarders.insert(session_id, new_doc_forwarders);
     }
@@ -4611,6 +5550,11 @@ fn event_run_id(event: &SessionEvent) -> Option<codypendent_protocol::RunId> {
         | RunStateChanged { run_id, .. }
         | ModelStreamDelta { run_id, .. }
         | ToolProposed { run_id, .. }
+        // A policy denial belongs to the run that proposed the action. Omitting
+        // it made `RunTrace` — "the detailed trace of one run" — the ONE
+        // subscription that never showed a denial, so a client watching a
+        // single run saw the safe actions and none of the refused ones.
+        | ToolDenied { run_id, .. }
         | ToolStarted { run_id, .. }
         | ToolCompleted { run_id, .. }
         | PatchProposed { run_id, .. }
@@ -4618,6 +5562,7 @@ fn event_run_id(event: &SessionEvent) -> Option<codypendent_protocol::RunId> {
         | SteeringApplied { run_id }
         | BudgetWarning { run_id, .. }
         | RunCompleted { run_id, .. }
+        | RunUsage { run_id, .. }
         | LearningsCaptured { run_id, .. } => Some(*run_id),
         _ => None,
     }
@@ -4663,6 +5608,74 @@ async fn workflow_control_seam<'a>(
     Ok(Some(lifecycle))
 }
 
+/// The shared gate for a memory command (outcome 17): the assembly's
+/// [`MemoryGateway`](crate::memory::MemoryGateway) must be wired, and a
+/// *mutating* verb additionally requires the `Controller` role — an Observer may
+/// read what the fabric remembers, never rewrite or erase it. On either failure
+/// this frames the rejection onto `writer` and returns `None`.
+///
+/// The scope check is deliberately NOT here: it belongs where the memory is
+/// fetched, inside the seam, so "you may not see this" and "this does not
+/// exist" collapse to one answer instead of two.
+async fn memory_seam<'a>(
+    state: &'a Arc<ServerState>,
+    conn: &ConnState,
+    writer: &SharedWriter,
+    request: &Envelope,
+    mutating: bool,
+    verb: &str,
+) -> anyhow::Result<Option<&'a Arc<dyn crate::memory::MemoryGateway>>> {
+    // The memory store is daemon-wide: its scopes are System, the local user,
+    // and a repository — there is no per-row owner to resolve, so unlike a
+    // session or a workflow run there is nothing here to compare a principal
+    // AGAINST. The store therefore belongs to the uid the daemon runs as, and
+    // only that principal may touch it.
+    //
+    // The role check below is NOT a substitute: `ClientRole` is requested by
+    // the client, so without this a peer that can reach the socket could ask
+    // for `Controller` and issue `ForgetMemoryScope { tier: User | System }`,
+    // erasing every memory in a shared scope without knowing a single id. The
+    // socket directory's 0700 mode normally keeps other users out; this is the
+    // check that does not depend on that being true.
+    if conn.principal.uid() != state.daemon_uid {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "memory.transport-unavailable",
+                "the memory store is not enabled on this daemon".to_string(),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    }
+    if mutating && conn.role != ClientRole::Controller {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "protocol.role-denied",
+                format!("only a Controller may {verb} a memory"),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    }
+    let Some(memory) = state.memory.as_ref() else {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "memory.transport-unavailable",
+                "the memory store is not enabled on this daemon".to_string(),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    };
+    Ok(Some(memory))
+}
+
 /// Lower a wire [`BlackboardScope`] to the daemon's [`BoardTarget`], or `None`
 /// for the `Unknown` variant a newer client's scope parses into — rejected
 /// structurally at the edge rather than guessed at (Phase B kanban).
@@ -4679,6 +5692,31 @@ fn board_target(scope: &codypendent_protocol::BlackboardScope) -> Option<BoardTa
 }
 
 /// The rejection for a board scope this daemon does not understand.
+/// The refusal every session-ownership gate returns.
+///
+/// Deliberately identical — code, message, retryability — to the rejection a
+/// genuinely missing session gets (`commands::validate`, `handle_attach`), so a
+/// caller cannot tell "not yours" from "not there" and cannot enumerate the
+/// daemon's sessions by probing ids.
+fn session_not_found(session_id: SessionId) -> codypendent_protocol::CodypendentError {
+    codypendent_protocol::CodypendentError::new(
+        "protocol.session-not-found",
+        format!("no session {session_id}"),
+        false,
+    )
+}
+
+/// The workflow-run equivalent of [`session_not_found`], matching byte for byte
+/// what the assembly's `WorkflowReader` returns for a run that does not exist
+/// (`codypendentd::workflows`, `workflow.run-not-found`).
+fn workflow_run_not_found(workflow_run_id: &str) -> codypendent_protocol::CodypendentError {
+    codypendent_protocol::CodypendentError::new(
+        "workflow.run-not-found",
+        format!("no workflow run {workflow_run_id}"),
+        false,
+    )
+}
+
 fn unknown_board_scope() -> codypendent_protocol::CodypendentError {
     codypendent_protocol::CodypendentError::new(
         "blackboard.unknown-scope",
@@ -4953,6 +5991,73 @@ mod tests {
         IntegrationHealth, REMOTE_UI_ACTIONS,
     };
 
+    /// `WorkflowStore::create_run_idempotent` inserts `run_id = NULL`
+    /// unconditionally, so EVERY client-created workflow run is unbound. An
+    /// earlier version of this gate read "unbound" as "no owner to protect" and
+    /// allowed those outright — which made every workflow run in the product
+    /// readable by any principal that could guess its id. Migration 0033 gives
+    /// the run its own owner; these pin the three cases apart.
+    ///
+    /// Driven at `workflow_run_owner` rather than over the socket on purpose:
+    /// the first version of this test sent `ReadWorkflowRun` to a test daemon
+    /// that has no workflow transport, so it was refused with
+    /// `workflow.transport-unavailable` before the gate was ever consulted and
+    /// passed against the bug it was written to catch.
+    #[tokio::test]
+    async fn an_unbound_workflow_run_is_owned_by_its_creator_not_by_everyone() {
+        use super::{workflow_run_owner, WorkflowOwner};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = crate::db::open_database(&dir.path().join("test.db"))
+            .await
+            .expect("migrated pool");
+        let now = Utc::now().to_rfc3339();
+
+        let insert = |id: &'static str, owner: Option<i64>| {
+            let pool = pool.clone();
+            let now = now.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO workflow_runs \
+                     (id, workflow_id, workflow_version, graph_signature, run_id, inputs_json, \
+                      state, created_at, updated_at, owner_uid) \
+                     VALUES (?, 'demo', 1, 'sig', NULL, '{}', 'pending', ?, ?, ?)",
+                )
+                .bind(id)
+                .bind(&now)
+                .bind(&now)
+                .bind(owner)
+                .execute(&pool)
+                .await
+                .expect("seed workflow run");
+            }
+        };
+        insert("wf-owned", Some(4242)).await;
+        insert("wf-legacy", None).await;
+
+        assert!(
+            matches!(
+                workflow_run_owner(&pool, "wf-owned").await.expect("query"),
+                WorkflowOwner::Uid(4242)
+            ),
+            "an unbound run must be governed by the uid that created it"
+        );
+        assert!(
+            matches!(
+                workflow_run_owner(&pool, "wf-legacy").await.expect("query"),
+                WorkflowOwner::Missing
+            ),
+            "a pre-0033 row boot adoption never reached must fail closed, not open"
+        );
+        assert!(
+            matches!(
+                workflow_run_owner(&pool, "wf-absent").await.expect("query"),
+                WorkflowOwner::Missing
+            ),
+            "an absent run is Missing — the same answer a foreign one produces"
+        );
+    }
+
     #[test]
     fn integration_health_is_sanitized_and_deduplicated() {
         let health = IntegrationHealth::default();
@@ -4976,7 +6081,8 @@ mod tests {
     }
     use chrono::Utc;
     use codypendent_protocol::{
-        AgentMode, ClientId, CommandBody, CommandId, Payload, RunId, SessionId,
+        AgentMode, ClientId, CommandBody, CommandId, Payload, RunId, SessionEvent, SessionId,
+        Subscription,
     };
 
     fn invocation(
@@ -4994,6 +6100,55 @@ mod tests {
             interaction_token: None,
             interaction_event_type: None,
         }
+    }
+
+    fn run_event(body: codypendent_protocol::EventBody) -> SessionEvent {
+        SessionEvent {
+            sequence: 1,
+            occurred_at: Utc::now(),
+            causation_id: None,
+            correlation_id: None,
+            actor: codypendent_protocol::Actor::System,
+            body,
+        }
+    }
+
+    /// `Subscription::RunTrace` is "the detailed trace of one run" — a policy
+    /// denial and a measured-usage report are both part of that trace, and both
+    /// were dropped because [`super::event_run_id`] did not match them.
+    #[test]
+    fn run_trace_carries_denials_and_usage_for_its_own_run() {
+        use codypendent_protocol::EventBody;
+        let run_id = RunId::new();
+        let other = RunId::new();
+        let trace = vec![Subscription::RunTrace { run_id }];
+
+        let denied = |run| {
+            run_event(EventBody::ToolDenied {
+                run_id: run,
+                action: codypendent_protocol::ProposedAction::ExecuteCommand {
+                    program: "rm".into(),
+                    args: vec!["-rf".into(), "/".into()],
+                    environment: Vec::new(),
+                    cwd: None,
+                },
+                reasons: vec!["program is not allow-listed".into()],
+            })
+        };
+        let usage = |run| {
+            run_event(EventBody::RunUsage {
+                run_id: run,
+                prompt_tokens: Some(1002),
+                completion_tokens: Some(60),
+                cost_micros: None,
+            })
+        };
+
+        assert!(super::subscription_matches(&trace, &denied(run_id)));
+        assert!(super::subscription_matches(&trace, &usage(run_id)));
+        // …and the filter is still a filter: another run's denial stays out.
+        assert!(!super::subscription_matches(&trace, &denied(other)));
+        assert!(!super::subscription_matches(&trace, &usage(other)));
     }
 
     #[test]

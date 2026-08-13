@@ -36,7 +36,7 @@
  * excluded, so a future Rust vector nobody accounted for fails loudly instead
  * of silently slipping through a gap.
  */
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -552,6 +552,14 @@ function reconstructEventBody(r: Record<string, unknown>): EventBody {
         disposition: reconstructRunDisposition(rec(r, "disposition")),
         chronicle: reconstructArtifactRef(rec(r, "chronicle")),
       };
+    case "RunUsage":
+      return {
+        type: "RunUsage",
+        run_id: str(r, "run_id"),
+        prompt_tokens: optNum(r, "prompt_tokens"),
+        completion_tokens: optNum(r, "completion_tokens"),
+        cost_micros: optNum(r, "cost_micros"),
+      };
     case "LearningsCaptured":
       return {
         type: "LearningsCaptured",
@@ -928,9 +936,11 @@ describe("envelope.json against Payload (src/protocol/types.ts)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// events.json: Actor (5/5, full coverage) and EventBody (18/18, full
-// coverage — this is where ProposedAction::ExecuteCommand's S1 fields are
-// exercised inside a realistic ApprovalRequested event).
+// events.json: Actor (5/5, full coverage) and EventBody (18/19 — this is where
+// ProposedAction::ExecuteCommand's S1 fields are exercised inside a realistic
+// ApprovalRequested event). The 19th, RunUsage, ships its own vector file and
+// is covered by the usage.json block below, so this count is deliberately not
+// "all of EventBody" — read the two blocks together.
 // ---------------------------------------------------------------------------
 
 describe("events.json against Actor + EventBody (src/protocol/types.ts)", () => {
@@ -969,6 +979,40 @@ describe("events.json against Actor + EventBody (src/protocol/types.ts)", () => 
       ["PATH", "/usr/bin:/bin"],
     ]);
     expect(action.cwd).toBe("/home/user/project");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// usage.json: EventBody::RunUsage (outcome 20), the measured-usage event. It
+// lives in its own vector file rather than in events.json, so this block is
+// what keeps it inside the drift suite at all — without it a new wire event
+// would be invisible here and the extension's silent `default:` arm would be
+// the only thing "handling" it.
+// ---------------------------------------------------------------------------
+
+describe("usage.json against EventBody (src/protocol/types.ts)", () => {
+  const vectors = loadVectors("usage.json");
+
+  for (const name of keysWithPrefix(vectors, "EventBody")) {
+    it(`decodes and re-encodes ${name} identically`, () => {
+      const original = vectors[name];
+      const reconstructed = reconstructSessionEvent(asRecord(original, name));
+      expectReconstructionMatches(name, original, reconstructed);
+    });
+  }
+
+  it("keeps an unmeasured field absent rather than defaulting it to zero", () => {
+    const original = asRecord(vectors.EventBody_RunUsage, "EventBody_RunUsage");
+    const body = reconstructEventBody(rec(original, "body"));
+    if (body.type !== "RunUsage") {
+      throw new Error(`expected RunUsage, got ${body.type}`);
+    }
+    expect(body.prompt_tokens).toBe(1002);
+    expect(body.completion_tokens).toBe(60);
+    // The daemon omits what the provider never measured; a 0 here would assert
+    // the run was free, which is a different and false claim.
+    expect(body.cost_micros).toBeUndefined();
+    expect("cost_micros" in rec(original, "body")).toBe(false);
   });
 });
 
@@ -1252,5 +1296,62 @@ describe("ide.json against IDE-context types (src/protocol/types.ts)", () => {
       vectors.IdeContextUpdate,
       reconstructIdeContextUpdate(asRecord(vectors.IdeContextUpdate, "IdeContextUpdate")),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The file-level "guard the guard". The per-file partition checks above only
+// cover vector FILES this suite loads, so a wholly new vector file was
+// invisible here: outcome 20 shipped usage.json, memory.json and
+// promotion_evidence.json at once, and every assertion in this suite still
+// passed while a new wire event went unmodeled. This closes that: every
+// committed vector file must be either exercised above or listed as a known
+// gap with a reason.
+// ---------------------------------------------------------------------------
+
+describe("protocol-vectors/ file inventory", () => {
+  /** Vector files some describe block above calls `loadVectors` on. */
+  const COVERED_FILES = [
+    "artifact.json",
+    "capabilities.json",
+    "catchup.json",
+    "command.json",
+    "envelope.json",
+    "error.json",
+    "events.json",
+    "handshake.json",
+    "ide.json",
+    "run.json",
+    "usage.json",
+  ];
+
+  /**
+   * Wire domains the extension has no TypeScript type for at all, so there is
+   * nothing here to drift against. Adding a type for one of these means moving
+   * its file up into `COVERED_FILES` with a describe block.
+   */
+  const UNMODELED_FILES = [
+    // No Document/Blackboard/Workflow subscriptions and no InputEnvelope
+    // capture path in the extension (see protocol-vectors/README.md).
+    "blackboard.json",
+    "board.json",
+    "document.json",
+    "input.json",
+    "workflow.json",
+    "workflow_graph.json",
+    // Daemon-side or CLI-side domains the extension never issues or receives:
+    // session history compaction, the curated-memory triad, promotion
+    // evidence, and voice capture.
+    "history.json",
+    "memory.json",
+    "promotion_evidence.json",
+    "voice.json",
+  ];
+
+  it("accounts for every committed vector file", () => {
+    const onDisk = readdirSync(VECTORS_DIR)
+      .filter((name) => name.endsWith(".json"))
+      .sort();
+    assertPartitionIsComplete("protocol-vectors", onDisk, COVERED_FILES, UNMODELED_FILES);
   });
 });

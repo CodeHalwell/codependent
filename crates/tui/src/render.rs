@@ -1201,12 +1201,20 @@ fn split_line_cells(line: &Line<'_>, width: u16) -> Vec<Line<'static>> {
     out
 }
 
+/// One transcript fold's full address: the run it belongs to, then its entry
+/// index within that run. The conversation stacks every run, so an entry index
+/// on its own does not identify a card.
+type FoldAddress = (usize, usize);
+
+/// A visible fold head: the built line it starts on, and the fold it opens.
+type FoldHit = (usize, FoldAddress);
+
 /// One transcript row before placement (see module-level virtualization note).
 struct Row<'a> {
     kind: RowKind<'a>,
-    /// The transcript-entry index this row is a click target for (fold heads in
-    /// the selected run). `None` unless tagged (Task 8).
-    hit_entry: Option<usize>,
+    /// The address this row is a click target for (fold heads, in any run of
+    /// the stacked conversation). `None` unless tagged (Task 8).
+    hit_entry: Option<FoldAddress>,
     /// A full-width background for this row (the `You` container). Cosmetic —
     /// `columns()`/`rows()` ignore it; applied only to visible rows at build.
     bg: Option<Color>,
@@ -1359,16 +1367,17 @@ fn style_for(role: SpanRole, theme: &Theme) -> Style {
 }
 
 /// The frame-constant inputs the transcript walk needs beyond the runs
-/// themselves: the live theme, which run owns this frame's click targets,
-/// which fold (if any) is being browsed, the reading width rows are measured
-/// against, and the animation tick its spinners turn on. Passed as one value
-/// so the measure pass and the build pass provably walk with identical
-/// parameters.
+/// themselves: the live theme, which fold (if any) is being browsed, the
+/// reading width rows are measured against, and the animation tick its spinners
+/// turn on. Passed as one value so the measure pass and the build pass provably
+/// walk with identical parameters.
+///
+/// `browsed` is a `(run, entry)` address, not a bare entry index: the walk
+/// stacks every run, so a fold is only identified by naming its run too.
 #[derive(Clone, Copy)]
 struct TranscriptView<'t> {
     theme: &'t Theme,
-    selected_run: usize,
-    browsed: Option<usize>,
+    browsed: Option<FoldAddress>,
     inner_width: u16,
     tick: u64,
 }
@@ -1380,7 +1389,6 @@ struct TranscriptView<'t> {
 fn for_each_row<'a>(runs: &'a [RunView], view: TranscriptView<'_>, mut visit: impl FnMut(Row<'a>)) {
     let TranscriptView {
         theme,
-        selected_run,
         browsed,
         inner_width,
         tick,
@@ -1475,13 +1483,13 @@ fn for_each_row<'a>(runs: &'a [RunView], view: TranscriptView<'_>, mut visit: im
                     // Highlighted only while the transcript is being BROWSED
                     // (`Alt-↑`/`Alt-↓`); a stale `transcript_selected` from an
                     // earlier click must not paint a selection nobody asked for.
-                    let selected = run_idx == selected_run && browsed == Some(idx);
+                    let selected = browsed == Some((run_idx, idx));
                     entry_lines_with_run(other, run, theme, selected, false, &mut scratch);
-                    let hit = if run_idx == selected_run {
-                        fold_hit_entry(other, idx)
-                    } else {
-                        None
-                    };
+                    // Every run's fold heads are click targets, not just the
+                    // selected run's: each follow-up message opens a new run, so
+                    // gating on the selection made every card from an earlier
+                    // turn permanently un-expandable.
+                    let hit = fold_hit_entry(other, idx).map(|entry| (run_idx, entry));
                     let is_user = matches!(other, TranscriptEntry::User { .. });
                     // No distinct raised surface (ansi16/monochrome): mark the
                     // You container with a leading accent bar instead of a
@@ -1667,7 +1675,6 @@ fn transcript_rows(runs: &[RunView], theme: &Theme, inner_width: u16) -> u16 {
         runs,
         TranscriptView {
             theme,
-            selected_run: usize::MAX,
             browsed: None,
             inner_width,
             tick: 0,
@@ -1703,13 +1710,13 @@ fn build_transcript_window<'a>(
     view: TranscriptView<'_>,
     first_row: u16,
     height: u16,
-) -> (Vec<Line<'a>>, u16, Vec<(usize, usize)>) {
+) -> (Vec<Line<'a>>, u16, Vec<FoldHit>) {
     let TranscriptView {
         theme, inner_width, ..
     } = view;
     let last_row = first_row.saturating_add(height);
     let mut out: Vec<Line> = Vec::with_capacity(height as usize + 2);
-    let mut hits: Vec<(usize, usize)> = Vec::new();
+    let mut hits: Vec<FoldHit> = Vec::new();
     let mut cursor: u16 = 0;
     let mut scroll: u16 = 0;
     let mut first_seen = false;
@@ -1837,11 +1844,16 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     // the viewport below.
     let browsed = state
         .transcript_browse
-        .then(|| state.selected_run().map(|run| run.transcript_selected))
+        .then(|| {
+            let run_idx = state.fold_focus_run();
+            state
+                .runs
+                .get(run_idx)
+                .map(|run| (run_idx, run.transcript_selected))
+        })
         .flatten();
     let view = TranscriptView {
         theme,
-        selected_run: state.selected_run,
         browsed,
         inner_width,
         tick: state.tick,
@@ -1895,7 +1907,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     // (bounded by the viewport, never the whole history — virtualization
     // preserved). One of `top_pad`/`r0` is always 0 (see their derivation
     // above), so this formula exactly places a single-row fold head.
-    for (line_index, entry) in &hits {
+    for (line_index, (run, entry)) in &hits {
         let screen_y = inner.y as i32 + top_pad as i32 + *line_index as i32 - r0 as i32;
         if screen_y >= inner.y as i32 && screen_y < (inner.y + inner.height) as i32 {
             state.register_hit(
@@ -1905,7 +1917,10 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
                     width: inner.width,
                     height: 1,
                 },
-                Action::ActivateRow(*entry),
+                Action::ActivateFold {
+                    run: *run,
+                    entry: *entry,
+                },
             );
         }
     }
@@ -1922,7 +1937,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
         ("Alt-Y copy", Action::CopyFocusedCard),
     ];
     let recovery_is_focused = state.transcript_browse
-        && state.selected_run().is_some_and(|run| {
+        && state.fold_focus().is_some_and(|run| {
             matches!(
                 run.transcript.get(run.transcript_selected),
                 Some(TranscriptEntry::Completed {
@@ -3174,6 +3189,16 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                     "Tavily API key for web.search (stored locally in auth.json, mode 0600)"
                         .to_owned()
                 }
+                KeyTarget::Transcription => {
+                    "API key for voice input / speech-to-text (stored locally in auth.json, \
+                     mode 0600)"
+                        .to_owned()
+                }
+                KeyTarget::Speech => {
+                    "API key for voice output / text-to-speech (stored locally in auth.json, \
+                     mode 0600)"
+                        .to_owned()
+                }
             };
             render_masked_prompt(frame, area, state, theme, &title, &buffer.0);
         }
@@ -3186,6 +3211,18 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 KeyTarget::Tavily => (
                     "Remove the saved Tavily key?".to_owned(),
                     "web.search stops using it immediately (env fallback may remain).",
+                ),
+                // Unlike the two above, a voice client snapshots its key when
+                // it is built at startup, so the removal is not felt until the
+                // process that owns it restarts.
+                KeyTarget::Transcription => (
+                    "Remove the saved voice-input key?".to_owned(),
+                    "Speech-to-text falls back to its api_key_env (if any) after a daemon \
+                     restart.",
+                ),
+                KeyTarget::Speech => (
+                    "Remove the saved voice-output key?".to_owned(),
+                    "Text-to-speech falls back to its api_key_env (if any) after a TUI restart.",
                 ),
             };
             render_confirm_box(frame, area, state, theme, &what, effect);
@@ -3229,14 +3266,45 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 "The block and its text are removed from the document.",
             );
         }
-        Overlay::DocPublishPath { buffer, .. } => {
+        Overlay::DocPublishTarget { selected, .. } => {
+            render_docs(frame, area, state, theme);
+            render_doc_publish_target(frame, area, state, theme, *selected);
+        }
+        // The prompt names the chosen target, so the operator can see which of
+        // the three flows they are in without backing out to check.
+        Overlay::DocPublishPath { target, buffer, .. } => {
             render_docs(frame, area, state, theme);
             render_prompt(
                 frame,
                 area,
                 state,
                 theme,
-                "Publish to repository Markdown path (approval required)",
+                &format!(
+                    "{}: repository Markdown path (approval required)",
+                    target.label()
+                ),
+                buffer,
+            );
+        }
+        Overlay::DocPublishBranch { target, buffer, .. } => {
+            render_docs(frame, area, state, theme);
+            render_prompt(
+                frame,
+                area,
+                state,
+                theme,
+                &format!("{}: branch name (approval required)", target.label()),
+                buffer,
+            );
+        }
+        Overlay::DocPublishTitle { buffer, .. } => {
+            render_docs(frame, area, state, theme);
+            render_prompt(
+                frame,
+                area,
+                state,
+                theme,
+                "Documentation pull request: title (approval required)",
                 buffer,
             );
         }
@@ -3530,10 +3598,14 @@ fn render_onboard(
         }
     }
 
-    let hint = if rows[2].width < 54 {
-        "↑/↓ select · Enter choose · Esc back"
-    } else {
-        "↑/↓ select · Enter choose · Esc back · keyboard and mouse supported"
+    // The `/` affordance is only advertised on triage, which is where the
+    // reducer accepts it; a confirmation must not offer a way out of itself.
+    let triage = matches!(step, OnboardStep::Triage { .. });
+    let hint = match (triage, rows[2].width < 54) {
+        (true, true) => "↑/↓ select · Enter choose · / commands",
+        (true, false) => "↑/↓ select · Enter choose · Esc back · / opens all commands",
+        (false, true) => "↑/↓ select · Enter choose · Esc back",
+        (false, false) => "↑/↓ select · Enter choose · Esc back · keyboard and mouse supported",
     };
     frame.render_widget(
         Paragraph::new(Line::styled(hint, Style::default().fg(theme.text.muted)))
@@ -3902,16 +3974,12 @@ fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     let first = first_visible_row(state.selected_ui_plugin, state.ui_plugins.len(), visible);
     let mut items = Vec::new();
     if state.ui_plugins.is_empty() {
-        items.push(ListItem::new(vec![
-            Line::styled(
-                "  No installed Remote UI plugins",
-                Style::default().fg(theme.text.secondary),
-            ),
-            Line::styled(
-                "  Install one with `codypendent plugin install`",
-                Style::default().fg(theme.text.muted),
-            ),
-        ]));
+        items.push(empty_state_item(
+            "No installed Remote UI plugins",
+            "Install one with `codypendent plugin install`.",
+            cols[0].width,
+            theme,
+        ));
     }
     for (index, plugin) in state
         .ui_plugins
@@ -4061,16 +4129,12 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     let first = first_visible_row(state.selected_skill, state.skills.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.skills.is_empty() {
-        items.push(ListItem::new(vec![
-            Line::styled(
-                "  No registered skills",
-                Style::default().fg(theme.text.secondary),
-            ),
-            Line::styled(
-                "  Registry inspection only; installation is not wired here.",
-                Style::default().fg(theme.text.muted),
-            ),
-        ]));
+        items.push(empty_state_item(
+            "No registered skills",
+            "Registry inspection only; installation is not wired here.",
+            list_area.width,
+            theme,
+        ));
     }
     for (idx, skill) in state
         .skills
@@ -4943,6 +5007,86 @@ fn render_theme_picker(
     );
 }
 
+/// Publish step 1 (outcome 18 F10): which of the three publish targets the
+/// focused document is heading for. A fixed three-row list — no filter line,
+/// because there is nothing to filter — where each row states what the operator
+/// is actually authorizing, in the approval card's own terms. Colors are Theme
+/// tokens only (RULE 7).
+fn render_doc_publish_target(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    selected: usize,
+) {
+    let rect = centered_modal(area, 72, 14);
+    let inner = modal_surface(
+        frame,
+        rect,
+        "Publish document  ·  choose a target".to_owned(),
+        state,
+        theme,
+    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let list_block = modal_panel("Target".to_owned(), theme);
+    let list_area = list_block.inner(rows[0]);
+    frame.render_widget(list_block, rows[0]);
+
+    let items: Vec<ListItem> = crate::state::DOC_PUBLISH_TARGETS
+        .iter()
+        .enumerate()
+        .map(|(row, target)| {
+            let is_selected = row == selected;
+            let head = Line::from(vec![
+                Span::styled(
+                    if is_selected { "▎ " } else { "  " },
+                    theme.selection_aware_text_style(is_selected, theme.focus.active),
+                ),
+                Span::styled(
+                    truncate_display_width(
+                        target.label(),
+                        usize::from(list_area.width.saturating_sub(2)),
+                    ),
+                    theme.selection_aware_text_style(is_selected, theme.text.primary),
+                ),
+            ]);
+            let detail = Line::styled(
+                format!("      {}", target.detail()),
+                theme.selection_aware_text_style(is_selected, theme.text.muted),
+            );
+            let item = ListItem::new(vec![head, detail]);
+            if is_selected {
+                item.style(theme.selection_style())
+            } else {
+                item
+            }
+        })
+        .collect();
+    frame.render_widget(
+        List::new(items).style(Style::default().bg(theme.surface.panel)),
+        list_area,
+    );
+    for row in 0..crate::state::DOC_PUBLISH_TARGETS.len() {
+        let Some(hit) = visible_row_hit(list_area, row, 2) else {
+            break;
+        };
+        state.register_hit(hit, Action::ActivateRow(row));
+    }
+
+    let hint = Line::styled(
+        "↑/↓ select · Enter continue · Esc cancel",
+        Style::default().fg(theme.text.muted),
+    )
+    .alignment(Alignment::Center);
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().bg(theme.surface.overlay)),
+        rows[1],
+    );
+}
+
 /// The `/keys` overlay (D1): the same filter-line + list shape as
 /// [`render_mode_picker`], over one row per configured model plus a final
 /// `Tavily (web.search)` row. Each row shows a status GLYPH (● saved in
@@ -4959,8 +5103,12 @@ fn render_api_keys(
     query: &str,
     selected: usize,
 ) {
-    let matches = filter_key_rows(&state.models, query);
-    let total = state.models.len().saturating_add(1);
+    let matches = filter_key_rows(&state.models, &state.voice_key_rows, query);
+    let total = state
+        .models
+        .len()
+        .saturating_add(1)
+        .saturating_add(state.voice_key_rows.len());
     let rect = centered_modal(area, 84, 24);
     let inner = modal_surface(
         frame,
@@ -5001,7 +5149,9 @@ fn render_api_keys(
     }
     for (row, &idx) in matches.iter().enumerate().skip(first) {
         // The row's label, provider/sub-line prefix, and status: indices into
-        // `state.models` are model rows; `models.len()` is the Tavily row.
+        // `state.models` are model rows; `models.len()` is the Tavily row;
+        // anything past it is a configured voice endpoint, which carries its
+        // own label/detail/status rather than living in `key_status`.
         let (label, provider, status) = match state.models.get(idx) {
             Some(card) => {
                 let status = state
@@ -5012,11 +5162,17 @@ fn render_api_keys(
                     .unwrap_or(&KeyStatus::Missing);
                 (card.id.0.clone(), card.provider.clone(), status.clone())
             }
-            None => (
-                "Tavily (web.search)".to_owned(),
-                "web search".to_owned(),
-                state.tavily_key_status.clone(),
-            ),
+            None => match idx
+                .checked_sub(state.models.len() + 1)
+                .and_then(|offset| state.voice_key_rows.get(offset))
+            {
+                Some(row) => (row.label.clone(), row.detail.clone(), row.status.clone()),
+                None => (
+                    "Tavily (web.search)".to_owned(),
+                    "web search".to_owned(),
+                    state.tavily_key_status.clone(),
+                ),
+            },
         };
         let (glyph, glyph_color, detail) = key_status_render(&status, theme);
         let is_selected = row == selected;
@@ -5099,6 +5255,11 @@ fn key_status_render(status: &KeyStatus, theme: &Theme) -> (&'static str, Color,
     }
 }
 
+/// Shown in place of the last body row when the terminal is too short to carry
+/// the whole notice. A trust prompt that is silently cut reads as the complete
+/// prompt, so the cut has to be on screen.
+const CONFIRM_TRUNCATED_HINT: &str = "… (widen the terminal to read the rest)";
+
 /// A small yes/no confirm box in the [`render_confirm`] shape, parameterized
 /// so run/workflow cancellation and `/keys` removal share a compact, responsive
 /// shape. Text is key-free by construction (it names a target, never a value).
@@ -5110,39 +5271,43 @@ fn render_confirm_box(
     title: &str,
     detail: &str,
 ) {
-    // Size from the wrapped body rather than a fixed percentage. Long trust
-    // prompts must never push the decision labels below the card: hiding the
-    // affirmative/negative controls would make the consent boundary both
-    // confusing and inaccessible. The extra row per non-empty logical line is
-    // a conservative allowance for ratatui's word wrapping (which may break
-    // before the raw display-cell boundary).
+    // Size from the wrapped body rather than a fixed percentage: a long trust
+    // prompt must not push the decision labels below the card. Width does not
+    // depend on height, so the provisional box measures the wrap.
     let provisional = centered_rect_min(60, 20, 48, 7, area);
     let inner_width = provisional.width.saturating_sub(2).max(1);
-    let detail_rows = detail.lines().fold(0u16, |rows, line| {
-        rows.saturating_add(cell_wrap_rows(std::iter::once(line), inner_width))
-            .saturating_add(u16::from(!line.is_empty()))
-    });
-    let required_height = detail_rows
-        .saturating_add(4) // title + decisions + two border rows
+    // Wrap here rather than leaving it to `Paragraph`: the exact row count is
+    // what sizes the card and what decides whether the notice had to be cut, so
+    // the layout must know it before drawing. Word-aware — a trust warning that
+    // breaks mid-word reads as damaged text.
+    let columns = usize::from(inner_width);
+    let heading = Style::default()
+        .fg(theme.text.heading)
+        .add_modifier(Modifier::BOLD);
+    let mut body: Vec<Line<'static>> = wrap_display_width(title, columns)
+        .into_iter()
+        .map(|row| Line::styled(row, heading))
+        .collect();
+    for line in detail.lines() {
+        let secondary = Style::default().fg(theme.text.secondary);
+        // A blank source line is a paragraph break and must survive the wrap.
+        if line.trim().is_empty() {
+            body.push(Line::styled(String::new(), secondary));
+            continue;
+        }
+        body.extend(
+            wrap_display_width(line, columns)
+                .into_iter()
+                .map(|row| Line::styled(row, secondary)),
+        );
+    }
+    let required_height = u16::try_from(body.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(3) // decisions row + two border rows
         .max(7);
     let rect = centered_rect_min(60, 20, 48, required_height, area);
     shield_modal(state, rect);
     frame.render_widget(Clear, rect);
-    let mut lines = vec![Line::styled(
-        title.to_owned(),
-        Style::default()
-            .fg(theme.text.heading)
-            .add_modifier(Modifier::BOLD),
-    )];
-    lines.extend(
-        detail
-            .lines()
-            .map(|line| Line::styled(line.to_owned(), Style::default().fg(theme.text.secondary))),
-    );
-    lines.push(Line::from(vec![
-        Span::styled("[y] yes   ", Style::default().fg(theme.status.warning)),
-        Span::styled("[n] no", Style::default().fg(theme.status.success)),
-    ]));
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Confirm ")
@@ -5152,11 +5317,28 @@ fn render_confirm_box(
                 .bg(theme.surface.overlay)
                 .fg(theme.text.primary),
         );
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    // The decisions row owns the LAST inner row unconditionally. `centered_rect_min`
+    // clamps the card to the terminal, so on a short terminal something has to
+    // give — and it must be prose, never the control that declines.
+    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    let capacity = usize::from(rows[0].height);
+    if body.len() > capacity {
+        body.truncate(capacity.saturating_sub(1));
+        body.push(Line::styled(
+            truncate_display_width(CONFIRM_TRUNCATED_HINT, usize::from(inner_width)),
+            Style::default().fg(theme.status.warning),
+        ));
+    }
+    // No `Wrap`: every row was already split to `inner_width` above.
+    frame.render_widget(Paragraph::new(body), rows[0]);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        rect,
+        Paragraph::new(Line::from(vec![
+            Span::styled("[y] yes   ", Style::default().fg(theme.status.warning)),
+            Span::styled("[n] no", Style::default().fg(theme.status.success)),
+        ])),
+        rows[1],
     );
 }
 
@@ -5213,16 +5395,12 @@ fn render_journey(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         .split(rows[0]);
     let mut items = Vec::new();
     if state.learnings.is_empty() {
-        items.push(ListItem::new(vec![
-            Line::styled(
-                "  No useful learnings yet",
-                Style::default().fg(theme.text.secondary),
-            ),
-            Line::styled(
-                "  Explicit preferences and verified outcomes appear here.",
-                Style::default().fg(theme.text.muted),
-            ),
-        ]));
+        items.push(empty_state_item(
+            "No useful learnings yet",
+            "Explicit preferences and verified outcomes appear here.",
+            cols[0].width,
+            theme,
+        ));
     }
     for (idx, card) in state.learnings.iter().enumerate() {
         let selected = idx == state.selected_learning;
@@ -5340,16 +5518,12 @@ fn render_memory(
     let first = first_visible_row(state.selected_memory, state.memories.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.memories.is_empty() {
-        items.push(ListItem::new(vec![
-            Line::styled(
-                "  No curated memories yet",
-                Style::default().fg(theme.text.secondary),
-            ),
-            Line::styled(
-                "  Durable facts appear after completed runs.",
-                Style::default().fg(theme.text.muted),
-            ),
-        ]));
+        items.push(empty_state_item(
+            "No curated memories yet",
+            "Durable facts appear after completed runs.",
+            list_area.width,
+            theme,
+        ));
     }
     for (idx, memory) in state
         .memories
@@ -5529,16 +5703,12 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let first = first_visible_row(state.selected_doc, state.docs.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.docs.is_empty() {
-        items.push(ListItem::new(vec![
-            Line::styled(
-                "  No collaborative documents yet",
-                Style::default().fg(theme.text.secondary),
-            ),
-            Line::styled(
-                "  Press n to create one, or ask an agent to draft it from this session.",
-                Style::default().fg(theme.text.muted),
-            ),
-        ]));
+        items.push(empty_state_item(
+            "No collaborative documents yet",
+            "Press n to create one, or ask an agent to draft it from this session.",
+            list_area.width,
+            theme,
+        ));
     }
     for (idx, doc) in state.docs.iter().enumerate().skip(first).take(visible_rows) {
         let selected = idx == state.selected_doc;
@@ -6178,16 +6348,12 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
     let graph = workflow_lanes(&state.workflow, list_area.width);
     let mut items: Vec<ListItem> = Vec::new();
     if state.workflow.is_empty() {
-        items.push(ListItem::new(vec![
-            Line::styled(
-                "  No workflow manifests found",
-                Style::default().fg(theme.text.secondary),
-            ),
-            Line::styled(
-                "  Add YAML under .codypendent/workflows, then reopen this view.",
-                Style::default().fg(theme.text.muted),
-            ),
-        ]));
+        items.push(empty_state_item(
+            "No workflow manifests found",
+            "Add YAML under .codypendent/workflows, then reopen this view.",
+            list_area.width,
+            theme,
+        ));
     }
     for (idx, node) in state
         .workflow
@@ -6672,16 +6838,12 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     let first = first_visible_row(state.selected_item, state.blackboard.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
     if state.blackboard.is_empty() {
-        items.push(ListItem::new(vec![
-            Line::styled(
-                "  No Blackboard evidence, decisions, or artifacts yet",
-                Style::default().fg(theme.text.secondary),
-            ),
-            Line::styled(
-                "  Start a workflow, then press n to post an open question (example: What should review verify?).",
-                Style::default().fg(theme.text.muted),
-            ),
-        ]));
+        items.push(empty_state_item(
+            "No Blackboard evidence, decisions, or artifacts yet",
+            "Start a workflow, then press n to post an open question (example: What should review verify?).",
+            list_area.width,
+            theme,
+        ));
     }
     for (idx, card) in state
         .blackboard
@@ -7255,10 +7417,18 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             .add_modifier(Modifier::BOLD),
     ));
     lines.push(Line::raw(""));
+    // Pad to the widest binding actually in the table. A fixed 12 silently
+    // stopped padding for every longer key, so those rows ran their label
+    // straight into their description ("Delete / Ctrl-Dremove a model").
+    let key_width = crate::input::KEY_BINDINGS
+        .iter()
+        .map(|b| b.keys.chars().count())
+        .max()
+        .unwrap_or(12);
     for binding in crate::input::KEY_BINDINGS {
         let mut spans = vec![
             Span::styled(
-                format!("  {:<12}", binding.keys),
+                format!("  {:<key_width$}  ", binding.keys),
                 Style::default()
                     .fg(theme.status.info)
                     .add_modifier(Modifier::BOLD),
@@ -7291,10 +7461,26 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .bg(theme.surface.overlay)
                 .fg(theme.text.primary),
         );
+    // Wrapped height at this width, so paging stops at the last real row.
+    let inner_width = usize::from(rect.width.saturating_sub(2)).max(1);
+    let inner_height = rect.height.saturating_sub(2);
+    let wrapped: usize = lines
+        .iter()
+        .map(|line| {
+            let width = line.width().max(1);
+            width.div_ceil(inner_width)
+        })
+        .sum();
+    let max_scroll =
+        u16::try_from(wrapped.saturating_sub(usize::from(inner_height))).unwrap_or(u16::MAX);
+    state.help_max_scroll.set(max_scroll);
+    let offset = state.help_scroll.min(max_scroll);
+
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((offset, 0)),
         rect,
     );
 }
@@ -8207,16 +8393,12 @@ fn render_council_browser(frame: &mut Frame, area: Rect, state: &AppState, theme
     let first = first_visible_row(state.selected_council, state.councils.len(), visible);
     let mut items = Vec::new();
     if state.councils.is_empty() {
-        items.push(ListItem::new(vec![
-            Line::styled(
-                "  No councils configured",
-                Style::default().fg(theme.text.secondary),
-            ),
-            Line::styled(
-                "  Press n to create one",
-                Style::default().fg(theme.text.muted),
-            ),
-        ]));
+        items.push(empty_state_item(
+            "No councils configured",
+            "Press n to create one.",
+            cols[0].width,
+            theme,
+        ));
     }
     for (index, council) in state.councils.iter().enumerate().skip(first).take(visible) {
         let selected = index == state.selected_council;
@@ -9378,6 +9560,77 @@ fn picker_regions(area: Rect) -> (Rect, Option<Rect>) {
     }
 }
 
+/// Wrap `text` onto rows of at most `width` display columns, breaking at spaces
+/// and hard-splitting any single word too wide to fit. Measured in columns, not
+/// chars, so CJK and emoji copy breaks where the terminal actually breaks it.
+fn wrap_display_width(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    let mut row_width = 0usize;
+    for word in text.split_whitespace() {
+        let word_width = UnicodeWidthStr::width(word);
+        // A word wider than the whole row (a long path, URL, or hash) is split
+        // on grapheme boundaries rather than overflowing the pane.
+        if word_width > width {
+            if !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                row_width = 0;
+            }
+            for grapheme in UnicodeSegmentation::graphemes(word, true) {
+                let grapheme_width = UnicodeWidthStr::width(grapheme);
+                if row_width + grapheme_width > width {
+                    rows.push(std::mem::take(&mut row));
+                    row_width = 0;
+                }
+                row.push_str(grapheme);
+                row_width += grapheme_width;
+            }
+            continue;
+        }
+        let gap = usize::from(!row.is_empty());
+        if row_width + gap + word_width > width {
+            rows.push(std::mem::take(&mut row));
+            row_width = 0;
+        } else if gap == 1 {
+            row.push(' ');
+            row_width += 1;
+        }
+        row.push_str(word);
+        row_width += word_width;
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+/// An empty browser's explanation, laid out for the pane it is drawn into.
+///
+/// This copy is written for a full-width pane and then rendered into a narrow
+/// list column, where the `List` widget hard-clips it mid-word with no ellipsis
+/// — while every picker in the product ellipses, so the shell was inconsistent
+/// with itself. It is the FIRST thing a user sees in each of these surfaces, so
+/// it wraps to the column instead of being cut.
+fn empty_state_item(headline: &str, hint: &str, width: u16, theme: &Theme) -> ListItem<'static> {
+    // The same two-column indent the populated rows carry.
+    const INDENT: &str = "  ";
+    let columns = usize::from(width).saturating_sub(INDENT.len());
+    let mut lines = vec![Line::styled(
+        format!("{INDENT}{}", truncate_display_width(headline, columns)),
+        Style::default().fg(theme.text.secondary),
+    )];
+    lines.extend(wrap_display_width(hint, columns).into_iter().map(|row| {
+        Line::styled(
+            format!("{INDENT}{row}"),
+            Style::default().fg(theme.text.muted),
+        )
+    }));
+    ListItem::new(lines)
+}
+
 fn truncate_display_width(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
@@ -9674,12 +9927,11 @@ mod tests {
         })
     }
 
-    /// The default transcript walk parameters for the geometry tests: no run
-    /// owns click targets, nothing is browsed, tick 0.
+    /// The default transcript walk parameters for the geometry tests: nothing
+    /// is browsed, tick 0.
     fn test_view<'t>(theme: &'t Theme, inner_width: u16) -> TranscriptView<'t> {
         TranscriptView {
             theme,
-            selected_run: 0,
             browsed: None,
             inner_width,
             tick: 0,
@@ -9696,6 +9948,72 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|f| render(f, state, theme)).expect("draw");
         terminal.backend().buffer().clone()
+    }
+
+    /// The Help overlay lists every binding in `KEY_BINDINGS`, which is taller
+    /// than the modal on an ordinary terminal. Without a scroll offset the tail
+    /// was simply not drawn — the Council and Board keys, the last rows of the
+    /// table, could not be reached by any input. `PgDn` scrolls the modal now
+    /// instead of scrolling the transcript behind it.
+    #[test]
+    fn the_help_overlay_can_reach_its_last_binding() {
+        let last = crate::input::KEY_BINDINGS
+            .last()
+            .expect("the binding table is not empty");
+        // The key column, not the description: it sits at the start of its line
+        // and so is never split by wrapping.
+        let needle = last.keys;
+
+        let mut state = AppState::new();
+        state.overlay = crate::state::Overlay::Help;
+        let unscrolled = render_to_string(&state, 100, 24);
+        assert!(
+            !unscrolled.contains(needle),
+            "precondition: the last binding should be below the fold at 100x24"
+        );
+
+        // Page down until it appears, exactly as a user would.
+        let mut found = false;
+        for _ in 0..12 {
+            crate::reduce::reduce(&mut state, crate::action::Action::ScrollPageDown);
+            if render_to_string(&state, 100, 24).contains(needle) {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "the last binding `{}` must be reachable by paging the Help overlay",
+            last.keys
+        );
+    }
+
+    /// A key label longer than the old fixed 12-column pad ran straight into
+    /// its description ("K · ← / → (Board)open the task board · …"). Checks
+    /// every binding actually on screen, not one chosen row — the table is
+    /// taller than the modal, so a fixed pick can silently test nothing.
+    #[test]
+    fn help_key_labels_never_touch_their_descriptions() {
+        let mut state = AppState::new();
+        state.overlay = crate::state::Overlay::Help;
+        let text = render_to_string(&state, 120, 60);
+
+        let mut checked = 0;
+        for binding in crate::input::KEY_BINDINGS {
+            let glued = format!("{}{}", binding.keys, binding.description);
+            if text.contains(binding.keys) {
+                checked += 1;
+            }
+            assert!(
+                !text.contains(&glued),
+                "`{}` runs into its description",
+                binding.keys
+            );
+        }
+        assert!(
+            checked > 5,
+            "precondition: the assertion must have seen real rendered rows, saw {checked}"
+        );
     }
 
     #[test]
@@ -10090,6 +10408,60 @@ mod tests {
         assert!(
             empty.contains("No council selected"),
             "empty detail pane:\n{empty}"
+        );
+    }
+
+    /// Every browser's empty state was written for a full-width pane and then
+    /// drawn into a ~40-column list column, where the `List` widget cut it dead
+    /// mid-word with no ellipsis — `"No Blackboard evidence, decisions, or
+    /// artif"`. It is the first thing a user sees in each of these surfaces.
+    #[test]
+    fn empty_browsers_show_their_whole_explanation() {
+        // (overlay, the LAST word of the hint — the half that used to be lost)
+        let cases: [(Overlay, &str); 7] = [
+            (Overlay::Blackboard, "verify?)."),
+            (Overlay::Memory { source_open: false }, "runs."),
+            (Overlay::Journey, "here."),
+            (Overlay::UiPlugins, "install`."),
+            (Overlay::Docs, "session."),
+            (Overlay::Workflow, "view."),
+            (Overlay::Skills, "here."),
+        ];
+        for (overlay, tail) in cases {
+            let mut state = AppState::new();
+            let label = format!("{overlay:?}");
+            state.overlay = overlay;
+            for (w, h) in [(120, 40), (100, 30), (80, 24)] {
+                let text = render_to_string(&state, w, h);
+                assert!(
+                    text.contains(tail),
+                    "{label} at {w}x{h} loses the end of its own copy:\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrapping_measures_display_columns_not_chars() {
+        // A CJK row is two columns per glyph: counting chars would let it
+        // overflow the pane and shear every column to its right.
+        let rows = wrap_display_width("日本語のテキストです", 8);
+        assert!(
+            rows.iter()
+                .all(|row| UnicodeWidthStr::width(row.as_str()) <= 8),
+            "{rows:?}"
+        );
+        assert_eq!(rows.concat(), "日本語のテキストです", "nothing is dropped");
+
+        // Words break at spaces, never mid-word, while a single over-wide word
+        // is hard-split rather than overflowing.
+        assert_eq!(
+            wrap_display_width("press n to create one", 10),
+            vec!["press n to", "create one"]
+        );
+        assert_eq!(
+            wrap_display_width(".codypendent/workflows", 8),
+            vec![".codypen", "dent/wor", "kflows"]
         );
     }
 
@@ -12205,9 +12577,119 @@ mod tests {
         assert!(
             !hits.iter().any(|(rect, action)| {
                 rect.height > 3
-                    && matches!(action, Action::ActivateRow(_) | Action::FocusPane(Pane::Transcript))
+                    && matches!(
+                        action,
+                        Action::ActivateRow(_)
+                            | Action::ActivateFold { .. }
+                            | Action::FocusPane(Pane::Transcript)
+                    )
             }),
             "transcript must reserve drag selection; only small fold heads may be clickable: {hits:?}"
+        );
+    }
+
+    /// The conversation stacks every run and each follow-up message opens a new
+    /// one, so from the second turn onward most of the cards on screen belong to
+    /// an *earlier* run. They were drawn with no hit target registered and no
+    /// way for `Alt-↑` to select them: the expanded tool-card renderer existed
+    /// and was unreachable. Every visible fold head is now addressable.
+    #[test]
+    fn fold_heads_in_earlier_runs_are_clickable_and_expandable() {
+        let mut state = AppState::new();
+        let first = RunId::new();
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStarted {
+                run_id: first,
+                objective: "read the failing test".to_owned(),
+                mode: codypendent_protocol::AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::ToolStarted {
+                run_id: first,
+                tool: "workspace.read_file".to_owned(),
+                args_digest: "abc".to_owned(),
+                label: Some("tests/smoke.rs".to_owned()),
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::ToolCompleted {
+                run_id: first,
+                tool: "workspace.read_file".to_owned(),
+                outcome: ToolOutcome::Failed {
+                    message: "unknown tool workspace.read_file".to_owned(),
+                },
+                artifact: None,
+            }),
+        );
+        // The follow-up turn. `RunStarted` moves `selected_run` to run 1.
+        let second = RunId::new();
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStarted {
+                run_id: second,
+                objective: "now fix it".to_owned(),
+                mode: codypendent_protocol::AgentMode::Build,
+            }),
+        );
+        assert_eq!(
+            state.selected_run, 1,
+            "precondition: the new run is current"
+        );
+
+        let collapsed = render_to_string(&state, 100, 30);
+        assert!(
+            collapsed.contains("workspace.read_file"),
+            "turn 1's card is still on screen:\n{collapsed}"
+        );
+        assert!(
+            !collapsed.contains("unknown tool"),
+            "and it is collapsed:\n{collapsed}"
+        );
+
+        // The renderer registers a click target for it even though it belongs to
+        // a run that is not selected.
+        let hit = state
+            .hit_map
+            .borrow()
+            .iter()
+            .find_map(|(_, action)| match action {
+                Action::ActivateFold { run, entry } => Some((*run, *entry)),
+                _ => None,
+            })
+            .expect("turn 1's fold head registers a hit target");
+        assert_eq!(hit.0, 0, "the target names the run it belongs to");
+
+        // Keyboard parity, driven from the raw key events a terminal delivers
+        // (not from hand-built actions), so the mapper is in the loop too: the
+        // user presses Alt-↑ then Alt-Enter with the composer focused.
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let press = |code| Event::Key(KeyEvent::new(code, KeyModifiers::ALT | KeyModifiers::NONE));
+        for code in [KeyCode::Up, KeyCode::Enter] {
+            let action = crate::input::map_event(
+                &press(code),
+                state.input_mode(),
+                100,
+                &state.hit_map.borrow().clone(),
+            );
+            reduce(&mut state, action);
+        }
+        assert_eq!(
+            (state.fold_focus_run(), state.runs[0].transcript_selected),
+            hit,
+            "Alt-↑ landed on the same fold the click targets"
+        );
+        let expanded = render_to_string(&state, 100, 30);
+        assert!(
+            expanded.contains("unknown tool"),
+            "the expanded card renderer is reachable from an earlier turn:\n{expanded}"
+        );
+        assert!(
+            state.composer.is_empty(),
+            "Alt-Enter opened the card instead of typing a newline"
         );
     }
 
@@ -12862,6 +13344,67 @@ mod tests {
         assert!(text.contains("[y] yes"), "{text}");
     }
 
+    /// This dialog gates downloading and executing a third-party binary, and its
+    /// notice is the longest confirm detail in the product (~430 characters). A
+    /// consent boundary whose decline control has scrolled off the bottom of the
+    /// card is a real defect, so the decisions row is pinned to the last inner
+    /// row at every terminal size the shell still draws a full frame at.
+    #[test]
+    fn the_consent_dialog_never_clips_its_own_decision_controls() {
+        let mut state = running_build_state();
+        state.overlay = Overlay::ConfirmCommunityAcpInstall {
+            provider_id: "antigravity-acp".to_owned(),
+            query: "anti".to_owned(),
+            selected: 0,
+            onboard_class: None,
+        };
+
+        for (w, h) in [(80, 24), (80, 20), (100, 16), (60, 12), (48, 10), (120, 40)] {
+            let text = render_to_string(&state, w, h);
+            assert!(
+                text.contains("[y] yes"),
+                "the accept control is off-card at {w}x{h}:\n{text}"
+            );
+            assert!(
+                text.contains("[n] no"),
+                "the DECLINE control is off-card at {w}x{h}:\n{text}"
+            );
+            // The warning's first sentence always survives, so consent is never
+            // asked for with a blank card.
+            assert!(
+                text.contains("not provided or endorsed"),
+                "the notice vanished at {w}x{h}:\n{text}"
+            );
+        }
+    }
+
+    /// When the card cannot show the whole notice the cut must be visible: a
+    /// silently clipped trust warning reads as the complete warning.
+    #[test]
+    fn a_clipped_consent_notice_says_so() {
+        let mut state = running_build_state();
+        state.overlay = Overlay::ConfirmCommunityAcpInstall {
+            provider_id: "antigravity-acp".to_owned(),
+            query: String::new(),
+            selected: 0,
+            onboard_class: None,
+        };
+
+        let roomy = render_to_string(&state, 120, 40);
+        assert!(
+            // The notice's closing words: it reached its end uncut.
+            roomy.contains("stored by Codypendent."),
+            "the whole notice fits here:\n{roomy}"
+        );
+        assert!(!roomy.contains(CONFIRM_TRUNCATED_HINT), "{roomy}");
+
+        let cramped = render_to_string(&state, 60, 12);
+        assert!(
+            cramped.contains(CONFIRM_TRUNCATED_HINT),
+            "a clipped notice must admit it:\n{cramped}"
+        );
+    }
+
     #[test]
     fn mode_picker_snapshot_lists_the_modes_and_marks_the_current_default() {
         // PR C2 (plan mode): the picker lists every submission mode and marks
@@ -13029,6 +13572,78 @@ mod tests {
         assert!(
             !text.contains("tvly-"),
             "no Tavily key material either:\n{text}"
+        );
+    }
+
+    /// Outcome 18 F10: the publish flow now starts with a visible choice of all
+    /// three targets, each stating what it authorizes — a PR is a git PUSH, and
+    /// the operator sees that before typing anything.
+    #[test]
+    fn doc_publish_target_picker_lists_all_three_targets_with_what_they_authorize() {
+        let mut state = api_keys_state();
+        state.overlay = Overlay::DocPublishTarget {
+            document_id: codypendent_protocol::DocumentId::new(),
+            selected: 0,
+        };
+        let text = render_to_string(&state, 110, 34);
+        assert!(text.contains("choose a target"), "title missing:\n{text}");
+        for label in [
+            "Repository file",
+            "Docs-branch commit",
+            "Documentation pull request",
+        ] {
+            assert!(text.contains(label), "{label} missing:\n{text}");
+        }
+        assert!(
+            text.contains("rated High"),
+            "the PR row states the risk the approval card will state:\n{text}"
+        );
+    }
+
+    /// Audio review F3: a configured voice endpoint must actually be VISIBLE in
+    /// `/keys` — the row is what makes the credential nameable at all, and the
+    /// detail line has to identify the endpoint without carrying its key.
+    #[test]
+    fn api_keys_overlay_lists_a_row_for_each_configured_voice_endpoint() {
+        let mut state = api_keys_state();
+        state.voice_key_rows = vec![
+            crate::state::VoiceKeyRow {
+                target: crate::action::KeyTarget::Transcription,
+                label: "Voice input (speech-to-text)".to_owned(),
+                detail: "whisper-large-v3-turbo · api.groq.com".to_owned(),
+                status: crate::state::KeyStatus::Stored,
+            },
+            crate::state::VoiceKeyRow {
+                target: crate::action::KeyTarget::Speech,
+                label: "Voice output (text-to-speech)".to_owned(),
+                detail: "tts-1 · api.openai.com".to_owned(),
+                status: crate::state::KeyStatus::Env("OPENAI_API_KEY".to_owned()),
+            },
+        ];
+        state.overlay = Overlay::ApiKeys {
+            query: String::new(),
+            selected: 0,
+        };
+        let text = render_to_string(&state, 120, 40);
+        assert!(
+            text.contains("● Voice input (speech-to-text)"),
+            "a stored voice key renders ● on its own row:\n{text}"
+        );
+        assert!(
+            text.contains("◐ Voice output (text-to-speech)"),
+            "an env-declared voice key renders ◐:\n{text}"
+        );
+        assert!(
+            text.contains("whisper-large-v3-turbo · api.groq.com · key saved"),
+            "the detail line names the endpoint AND fits beside the status:\n{text}"
+        );
+        assert!(
+            text.contains("5 of 5 entries"),
+            "the count covers the voice rows too:\n{text}"
+        );
+        assert!(
+            !text.contains("sk-live-test-key"),
+            "key material must never render:\n{text}"
         );
     }
 
@@ -14667,19 +15282,21 @@ mod tests {
         let state = state_with_tool_and_patch();
         let _ = render_to_string(&state, 100, 30);
         let map = state.hit_map.borrow();
-        let rows: Vec<usize> = map
+        // The address carries the owning run, so a card in any earlier turn of
+        // the stacked conversation is clickable too.
+        let rows: Vec<(usize, usize)> = map
             .iter()
             .filter_map(|(_, action)| match action {
-                Action::ActivateRow(n) => Some(*n),
+                Action::ActivateFold { run, entry } => Some((*run, *entry)),
                 _ => None,
             })
             .collect();
         assert!(
-            rows.contains(&1),
+            rows.contains(&(0, 1)),
             "the tool card's head must be clickable: {rows:?}"
         );
         assert!(
-            rows.contains(&2),
+            rows.contains(&(0, 2)),
             "the patch head must be clickable: {rows:?}"
         );
     }

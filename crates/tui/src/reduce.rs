@@ -30,10 +30,10 @@ use crate::state::{
     filter_onboard_providers, filter_providers, filter_themes, filter_unsloth_quants,
     filter_unsloth_repos, key_row_target, AddModelRow, AppState, CouncilBuilderState,
     CouncilBuilderStep, CouncilMemberDraft, DocBlockView, DocEdit, DocFocus, DocLeaseState,
-    DocSuggestionView, KeyStatus, ModelListOrigin, ModelReadiness, OnboardFlow,
-    OnboardProviderClass, OnboardStep, Overlay, Pane, PatchSummary, PendingApproval,
+    DocPublishTargetKind, DocSuggestionView, KeyStatus, ModelListOrigin, ModelReadiness,
+    OnboardFlow, OnboardProviderClass, OnboardStep, Overlay, Pane, PatchSummary, PendingApproval,
     PendingRunStart, RunActivity, RunStartDraftTarget, RunView, ToolCard, ToolStatus,
-    TranscriptEntry, UnslothQuantCard, UnslothRepoCard, EDGE_PAGE_SIZE,
+    TranscriptEntry, UnslothQuantCard, UnslothRepoCard, DOC_PUBLISH_TARGETS, EDGE_PAGE_SIZE,
 };
 
 /// Above this size a message stays on the fast plain path (its single parse
@@ -81,7 +81,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
             | Overlay::DocNew { .. }
             | Overlay::DocInsert { .. }
             | Overlay::DocDeleteConfirm { .. }
+            | Overlay::DocPublishTarget { .. }
             | Overlay::DocPublishPath { .. }
+            | Overlay::DocPublishBranch { .. }
+            | Overlay::DocPublishTitle { .. }
     );
     match action {
         Action::DaemonEvent(event) => {
@@ -481,6 +484,7 @@ pub fn reduce(state: &mut AppState, action: Action) {
         }
         Action::FocusPane(pane) => state.focus = pane,
         Action::ActivateRow(n) => activate_row(state, n),
+        Action::ActivateFold { run, entry } => activate_fold(state, run, entry),
         Action::SelectRun(n) => {
             let mut idx = n;
             clamp(&mut idx, state.runs.len());
@@ -789,13 +793,20 @@ pub fn reduce(state: &mut AppState, action: Action) {
             }
         }
         Action::OpenPalette => {
-            state.overlay = match state.overlay {
-                Overlay::Edges => Overlay::EdgeSearch(state.edge_query.clone()),
-                Overlay::Palette { .. } => Overlay::None,
-                _ => Overlay::Palette {
-                    query: String::new(),
-                    selected: 0,
-                },
+            // Toggling the palette shut has the same return address as `Esc`.
+            // Not an early `return`: the post-match Docs-lease release below
+            // must run for every action.
+            if matches!(state.overlay, Overlay::Palette { .. }) && state.palette_from_onboard {
+                open_onboard(state);
+            } else {
+                state.overlay = match state.overlay {
+                    Overlay::Edges => Overlay::EdgeSearch(state.edge_query.clone()),
+                    Overlay::Palette { .. } => Overlay::None,
+                    _ => Overlay::Palette {
+                        query: String::new(),
+                        selected: 0,
+                    },
+                }
             }
         }
         Action::BeginAddModel => begin_add_model(state),
@@ -809,7 +820,11 @@ pub fn reduce(state: &mut AppState, action: Action) {
         Action::Help => {
             state.overlay = match state.overlay {
                 Overlay::Help => Overlay::None,
-                _ => Overlay::Help,
+                _ => {
+                    // Always open at the top, however the last visit was left.
+                    state.help_scroll = 0;
+                    Overlay::Help
+                }
             }
         }
         Action::Detach => state.should_detach = true,
@@ -847,7 +862,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 Overlay::DocEdit { .. }
                 | Overlay::DocNew { .. }
                 | Overlay::DocInsert { .. }
-                | Overlay::DocPublishPath { .. } => Overlay::Docs,
+                | Overlay::DocPublishTarget { .. }
+                | Overlay::DocPublishPath { .. }
+                | Overlay::DocPublishBranch { .. }
+                | Overlay::DocPublishTitle { .. } => Overlay::Docs,
                 _ => Overlay::None,
             };
         }
@@ -938,9 +956,14 @@ pub fn reduce(state: &mut AppState, action: Action) {
         } => on_model_key_verified(state, &model_id, ok, &reason),
 
         // --- `/keys` (D1): the harness's key-status projection ---
-        Action::ApiKeyStatusesLoaded { models, tavily } => {
+        Action::ApiKeyStatusesLoaded {
+            models,
+            tavily,
+            voice,
+        } => {
             state.key_status = models;
             state.tavily_key_status = tavily;
+            state.voice_key_rows = voice;
         }
 
         // --- Local models: Unsloth catalog browse/pull ---
@@ -973,7 +996,10 @@ pub fn reduce(state: &mut AppState, action: Action) {
             | Overlay::DocNew { .. }
             | Overlay::DocInsert { .. }
             | Overlay::DocDeleteConfirm { .. }
+            | Overlay::DocPublishTarget { .. }
             | Overlay::DocPublishPath { .. }
+            | Overlay::DocPublishBranch { .. }
+            | Overlay::DocPublishTitle { .. }
     );
     if docs_surface_was_open
         && (!remains_in_docs_flow || state.should_detach || state.session_closed)
@@ -2296,8 +2322,15 @@ fn nav(state: &mut AppState, delta: i32) {
             ref query,
             ref mut selected,
         } => {
-            let indices = filter_key_rows(&state.models, query);
+            let indices = filter_key_rows(&state.models, &state.voice_key_rows, query);
             step(selected, indices.len(), delta);
+            return;
+        }
+        // A fixed, unfiltered three-row list — the cursor is all there is to move.
+        Overlay::DocPublishTarget {
+            ref mut selected, ..
+        } => {
+            step(selected, DOC_PUBLISH_TARGETS.len(), delta);
             return;
         }
         Overlay::CouncilBuilder(ref mut builder) => {
@@ -2436,7 +2469,10 @@ fn nav_to_edge(state: &mut AppState, last: bool) {
             *selected = edge(filter_themes(&state.themes, query).len());
         }
         Overlay::ApiKeys { query, selected } => {
-            *selected = edge(filter_key_rows(&state.models, query).len());
+            *selected = edge(filter_key_rows(&state.models, &state.voice_key_rows, query).len());
+        }
+        Overlay::DocPublishTarget { selected, .. } => {
+            *selected = edge(DOC_PUBLISH_TARGETS.len());
         }
         Overlay::AddModelPick {
             models,
@@ -2502,6 +2538,17 @@ const PAGE: u16 = 10;
 const WHEEL_LINES: u16 = 3;
 
 fn scroll_lines(state: &mut AppState, up: bool) {
+    if matches!(state.overlay, Overlay::Help) {
+        state.help_scroll = if up {
+            state.help_scroll.saturating_sub(WHEEL_LINES)
+        } else {
+            state
+                .help_scroll
+                .saturating_add(WHEEL_LINES)
+                .min(state.help_max_scroll.get())
+        };
+        return;
+    }
     if matches!(state.overlay, Overlay::CouncilResults) {
         state.council_result_scroll = if up {
             state.council_result_scroll.saturating_sub(WHEEL_LINES)
@@ -2514,6 +2561,17 @@ fn scroll_lines(state: &mut AppState, up: bool) {
 }
 
 fn scroll_page(state: &mut AppState, up: bool) {
+    if matches!(state.overlay, Overlay::Help) {
+        state.help_scroll = if up {
+            state.help_scroll.saturating_sub(PAGE)
+        } else {
+            state
+                .help_scroll
+                .saturating_add(PAGE)
+                .min(state.help_max_scroll.get())
+        };
+        return;
+    }
     if matches!(state.overlay, Overlay::CouncilResults) {
         state.council_result_scroll = if up {
             state.council_result_scroll.saturating_sub(PAGE)
@@ -2586,49 +2644,77 @@ fn request_edge_page(state: &mut AppState, page: usize) {
     });
 }
 
-/// `Alt-↑`/`Alt-↓`: walk the selected run's *foldable* entries — tool cards,
-/// patch diffs, the backstage fold, long notes, failed-run errors — and mark
-/// the transcript as being browsed, so the renderer highlights the landing
-/// entry, keeps it in the viewport, and `Alt-Enter` expands it. Stepping only
-/// over foldable entries means every stop has something to open (the mouse's
-/// click targets are exactly this set — see `TranscriptEntry::is_foldable`).
-/// A no-op when the selected run has no foldable entry at all.
+/// Every foldable transcript entry in the whole session, as `(run, entry)`
+/// addresses in the order the conversation stacks them.
+///
+/// The walk deliberately spans runs: `render_conversation` draws EVERY run in
+/// one continuous timeline and each follow-up message opens a new run, so a
+/// cursor confined to `selected_run` left every tool card and patch diff from
+/// an earlier turn visible-but-inert. The mouse's click targets are exactly
+/// this set (`fold_hit_entry` shares `TranscriptEntry::is_foldable`), so
+/// keyboard and mouse reach the same cards (RULE 3).
+fn session_folds(state: &AppState) -> Vec<(usize, usize)> {
+    state
+        .runs
+        .iter()
+        .enumerate()
+        .flat_map(|(run_idx, run)| {
+            run.transcript
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.is_foldable())
+                .map(move |(idx, _)| (run_idx, idx))
+        })
+        .collect()
+}
+
+/// Point the fold cursor at one `(run, entry)` address.
+fn set_fold_cursor(state: &mut AppState, (run_idx, entry): (usize, usize)) {
+    state.transcript_focus_run = run_idx;
+    if let Some(run) = state.runs.get_mut(run_idx) {
+        run.transcript_selected = entry;
+    }
+}
+
+/// The cursor's current address, or `None` when the session has no run.
+fn fold_cursor(state: &AppState) -> Option<(usize, usize)> {
+    let run_idx = state.fold_focus_run();
+    state
+        .runs
+        .get(run_idx)
+        .map(|run| (run_idx, run.transcript_selected))
+}
+
+/// `Alt-↑`/`Alt-↓`: walk the session's *foldable* entries — tool cards, patch
+/// diffs, the backstage fold, long notes, failed-run errors — across every run,
+/// and mark the transcript as being browsed, so the renderer highlights the
+/// landing entry, keeps it in the viewport, and `Alt-Enter` expands it.
+/// Stepping only over foldable entries means every stop has something to open.
+/// A no-op when the session has no foldable entry at all.
 fn browse_fold(state: &mut AppState, delta: i32) {
     if !matches!(state.overlay, Overlay::None) {
         return;
     }
-    let browsing = state.transcript_browse;
-    let Some(run) = state.selected_run_mut() else {
-        return;
-    };
-    let folds: Vec<usize> = run
-        .transcript
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.is_foldable())
-        .map(|(idx, _)| idx)
-        .collect();
+    let folds = session_folds(state);
     let Some(&last) = folds.last() else {
         return;
     };
-    // The first Alt-↑/Alt-↓ enters browse mode at the newest fold (the one the
-    // tail of the conversation is showing); later presses walk from there.
-    if !browsing {
-        run.transcript_selected = last;
+    // The first Alt-↑/Alt-↓ enters browse mode at the newest fold in the whole
+    // conversation (the one the tail is showing); later presses walk from there.
+    if !state.transcript_browse {
         state.transcript_browse = true;
+        set_fold_cursor(state, last);
         return;
     }
-    let current = run.transcript_selected;
-    let position = folds
-        .iter()
-        .position(|&idx| idx == current)
+    let position = fold_cursor(state)
+        .and_then(|current| folds.iter().position(|&fold| fold == current))
         .unwrap_or(folds.len() - 1);
     let next = if delta < 0 {
         position.saturating_sub(1)
     } else {
         (position + 1).min(folds.len() - 1)
     };
-    run.transcript_selected = folds[next];
+    set_fold_cursor(state, folds[next]);
 }
 
 /// Leave transcript-browse mode: the selection stops being highlighted and
@@ -2636,6 +2722,9 @@ fn browse_fold(state: &mut AppState, delta: i32) {
 /// that means "I am driving the composer or the viewport again".
 fn end_browse(state: &mut AppState) {
     state.transcript_browse = false;
+    // Idle, the fold cursor belongs to the run the composer talks to; the next
+    // `Alt-↑` re-enters at the session's newest fold anyway.
+    state.transcript_focus_run = state.selected_run;
 }
 
 fn expand_selected(state: &mut AppState) {
@@ -2670,7 +2759,7 @@ fn expand_selected(state: &mut AppState) {
     if state.layout == crate::state::LayoutMode::Workspace && state.focus != Pane::Transcript {
         return;
     }
-    let idx = state.selected_run;
+    let idx = state.fold_focus_run();
     if let Some(run) = state.runs.get_mut(idx) {
         if let Some(entry) = run.transcript.get_mut(run.transcript_selected) {
             match entry {
@@ -2686,7 +2775,7 @@ fn expand_selected(state: &mut AppState) {
 }
 
 fn focused_transcript_entry(state: &AppState) -> Option<(&RunView, &TranscriptEntry)> {
-    let run = state.selected_run()?;
+    let run = state.fold_focus()?;
     run.transcript
         .get(run.transcript_selected)
         .map(|entry| (run, entry))
@@ -2770,7 +2859,7 @@ fn copy_focused_card(state: &mut AppState) {
 }
 
 fn failed_run_context(state: &AppState) -> Option<(String, AgentMode, Option<ModelId>, usize)> {
-    let run = state.selected_run()?;
+    let run = state.fold_focus()?;
     let entry = run.transcript.get(run.transcript_selected)?;
     matches!(
         entry,
@@ -2784,7 +2873,7 @@ fn failed_run_context(state: &AppState) -> Option<(String, AgentMode, Option<Mod
             run.objective.clone(),
             run.mode,
             run.model.clone(),
-            state.selected_run,
+            state.fold_focus_run(),
         )
     })
 }
@@ -3397,33 +3486,69 @@ fn begin_doc_delete(state: &mut AppState) {
     }
 }
 
+/// A lowercase, dash-separated slug of `title`, for seeding a publish path or
+/// branch name. Never empty: an all-punctuation title falls back to `document`.
+fn publish_slug(title: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for c in title.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+            last_dash = false;
+        } else if !last_dash && !slug.is_empty() {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        slug.push_str("document");
+    }
+    slug
+}
+
+/// Begin publishing the focused document (`P`). Step 1 is the TARGET, not the
+/// path: the daemon accepts a repository-file write, a docs-branch commit, or a
+/// documentation PR, and which one it is changes both the fields needed and the
+/// risk the approval card will state (outcome 18 F10).
 fn begin_doc_publish(state: &mut AppState) {
     if !matches!(state.overlay, Overlay::Docs) {
         return;
     }
     if let Some(doc) = state.focused_doc() {
-        let mut slug = String::new();
-        let mut last_dash = false;
-        for c in doc.title.chars().flat_map(char::to_lowercase) {
-            if c.is_ascii_alphanumeric() {
-                slug.push(c);
-                last_dash = false;
-            } else if !last_dash && !slug.is_empty() {
-                slug.push('-');
-                last_dash = true;
-            }
-        }
-        while slug.ends_with('-') {
-            slug.pop();
-        }
-        if slug.is_empty() {
-            slug.push_str("document");
-        }
-        state.overlay = Overlay::DocPublishPath {
+        state.overlay = Overlay::DocPublishTarget {
             document_id: doc.document_id,
-            buffer: format!("docs/{slug}.md"),
+            selected: 0,
         };
     }
+}
+
+/// Advance from the target picker to the path prompt, seeding the path from the
+/// document's title exactly as the single-target flow used to.
+fn choose_doc_publish_target(state: &mut AppState) {
+    let Overlay::DocPublishTarget {
+        document_id,
+        selected,
+    } = &state.overlay
+    else {
+        return;
+    };
+    let Some(&target) = DOC_PUBLISH_TARGETS.get(*selected) else {
+        return;
+    };
+    let document_id = *document_id;
+    let slug = state
+        .docs
+        .iter()
+        .find(|doc| doc.document_id == document_id)
+        .map_or_else(|| "document".to_owned(), |doc| publish_slug(&doc.title));
+    state.overlay = Overlay::DocPublishPath {
+        document_id,
+        target,
+        buffer: format!("docs/{slug}.md"),
+    };
 }
 
 /// Acquire `block_id`'s edit lease and queue `mutation` to fire once the daemon
@@ -3756,7 +3881,9 @@ fn edit_prompt(state: &mut AppState, edit: &Edit) {
         Overlay::DocInsert { buffer, .. } => append(buffer, edit),
         Overlay::DocEdit { buffer, .. } => append(buffer, edit),
         Overlay::LearningEdit { buffer, .. } => append(buffer, edit),
-        Overlay::DocPublishPath { buffer, .. } => append(buffer, edit),
+        Overlay::DocPublishPath { buffer, .. }
+        | Overlay::DocPublishBranch { buffer, .. }
+        | Overlay::DocPublishTitle { buffer, .. } => append(buffer, edit),
         Overlay::AddModelId { buffer, .. } => append(buffer, edit),
         // The key buffer is a redacting newtype; edit its inner String.
         Overlay::AddModelKey { buffer, .. } => append(&mut buffer.0, edit),
@@ -3875,6 +4002,26 @@ fn input_char(state: &mut AppState, c: char) {
         };
         return;
     }
+    // First-run setup is `InputMode::Palette` but has no query buffer, so every
+    // printable key — including the `/` its own splash advertises — used to fall
+    // through `edit_prompt`'s `_ => {}` and vanish. The palette is the product's
+    // advertised front door; it must work on the very first screen, and `Esc`
+    // brings the gate back (see `input_cancel`).
+    if c == '/'
+        && matches!(
+            state.overlay,
+            Overlay::Onboard {
+                step: OnboardStep::Triage { .. }
+            }
+        )
+    {
+        state.palette_from_onboard = true;
+        state.overlay = Overlay::Palette {
+            query: String::new(),
+            selected: 0,
+        };
+        return;
+    }
     edit_prompt(state, &Edit::Insert(c.to_string()));
     detach_history_on_edit(state);
 }
@@ -3914,16 +4061,24 @@ fn begin_remove_selected(state: &mut AppState) {
     let Overlay::ApiKeys { query, selected } = &state.overlay else {
         return;
     };
-    let Some(&idx) = filter_key_rows(&state.models, query).get(*selected) else {
+    let Some(&idx) = filter_key_rows(&state.models, &state.voice_key_rows, query).get(*selected)
+    else {
         return;
     };
-    let target = key_row_target(&state.models, idx);
+    let target = key_row_target(&state.models, &state.voice_key_rows, idx);
     let stored = match &target {
         KeyTarget::Model(id) => state
             .key_status
             .iter()
             .any(|(model_id, status)| model_id == id && matches!(status, KeyStatus::Stored)),
         KeyTarget::Tavily => matches!(state.tavily_key_status, KeyStatus::Stored),
+        // A voice row carries its own status (it is not in `key_status`, which
+        // is keyed by model id) — match on the target, not the row index, so
+        // the filtered selection can never point at the wrong row's status.
+        voice => state
+            .voice_key_rows
+            .iter()
+            .any(|row| &row.target == voice && matches!(row.status, KeyStatus::Stored)),
     };
     if stored {
         state.overlay = Overlay::ApiKeyRemoveConfirm { target };
@@ -3984,6 +4139,7 @@ fn history_next(state: &mut AppState) {
 
 fn open_onboard(state: &mut AppState) {
     state.onboard_flow = None;
+    state.palette_from_onboard = false;
     state.overlay = Overlay::Onboard {
         step: OnboardStep::Triage { selected: 0 },
     };
@@ -4167,6 +4323,12 @@ fn input_cancel(state: &mut AppState) {
         end_browse(state);
         return;
     }
+    // The palette opened over first-run setup returns to it; closing to an inert
+    // chat would strand an operator who still has no runnable model.
+    if matches!(state.overlay, Overlay::Palette { .. }) && state.palette_from_onboard {
+        open_onboard(state);
+        return;
+    }
     match state.overlay {
         Overlay::None => {
             state.composer.clear();
@@ -4203,7 +4365,12 @@ fn input_cancel(state: &mut AppState) {
         | Overlay::DocNew { .. }
         | Overlay::DocInsert { .. }
         | Overlay::DocDeleteConfirm { .. } => state.overlay = Overlay::Docs,
-        Overlay::DocPublishPath { .. } => state.overlay = Overlay::Docs,
+        // Every publish step abandons back to the browser: nothing is sent
+        // until the last one, so there is no partial publish to unwind.
+        Overlay::DocPublishTarget { .. }
+        | Overlay::DocPublishPath { .. }
+        | Overlay::DocPublishBranch { .. }
+        | Overlay::DocPublishTitle { .. } => state.overlay = Overlay::Docs,
         Overlay::EdgeSearch(_) => state.overlay = Overlay::Edges,
         Overlay::WorkflowInputs { .. } => state.overlay = Overlay::Workflow,
         Overlay::KanbanNew { .. } => state.overlay = Overlay::Kanban,
@@ -4244,6 +4411,10 @@ fn set_overlay_selected(state: &mut AppState, n: usize) {
             ref mut selected, ..
         }
         | Overlay::UnslothQuants {
+            ref mut selected, ..
+        }
+        // A fixed three-row list, so the clicked index IS the selection.
+        | Overlay::DocPublishTarget {
             ref mut selected, ..
         } => {
             *selected = n;
@@ -4373,6 +4544,7 @@ fn activate_row(state: &mut AppState, n: usize) {
         | Overlay::ModePicker { .. }
         | Overlay::ThemePicker { .. }
         | Overlay::ApiKeys { .. }
+        | Overlay::DocPublishTarget { .. }
         | Overlay::AddModelPick { .. }
         | Overlay::CouncilBuilder(_)
         | Overlay::UnslothRepos { .. }
@@ -4381,21 +4553,37 @@ fn activate_row(state: &mut AppState, n: usize) {
             submit_prompt(state);
         }
         Overlay::None => {
-            state.focus = Pane::Transcript;
-            let idx = state.selected_run;
-            if let Some(run) = state.runs.get_mut(idx) {
-                if n < run.transcript.len() {
-                    run.transcript_selected = n;
-                    // A clicked fold becomes the browsed one, so the keyboard
-                    // can carry on from where the mouse left off (and the row
-                    // the click landed on is visibly selected).
-                    state.transcript_browse = true;
-                }
-            }
-            expand_selected(state);
+            let run_idx = state.selected_run;
+            activate_fold(state, run_idx, n);
         }
         _ => {}
     }
+}
+
+/// Toggle the transcript fold at `(run, entry)` — the mouse's path to a tool
+/// card, patch diff, or long note anywhere in the stacked conversation, not
+/// only in the run the composer happens to be pointed at.
+fn activate_fold(state: &mut AppState, run_idx: usize, entry: usize) {
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    state.focus = Pane::Transcript;
+    // A click whose address no longer exists (the projection moved under the
+    // frame it was drawn from) must not fall through and toggle whatever the
+    // cursor happened to be on.
+    if state
+        .runs
+        .get(run_idx)
+        .is_none_or(|run| entry >= run.transcript.len())
+    {
+        return;
+    }
+    set_fold_cursor(state, (run_idx, entry));
+    // A clicked fold becomes the browsed one, so the keyboard can carry on
+    // from where the mouse left off (and the row the click landed on is
+    // visibly selected).
+    state.transcript_browse = true;
+    expand_selected(state);
 }
 
 fn submit_prompt(state: &mut AppState) {
@@ -4696,14 +4884,29 @@ fn submit_prompt(state: &mut AppState) {
                 start_doc_edit(state, document_id, None, mutation);
             }
         }
+        // Publish step 1: the chosen target decides which prompts follow.
+        // `mem::take` already cleared the overlay, so put it back for
+        // `choose_doc_publish_target` to read the focused row from.
+        Overlay::DocPublishTarget {
+            document_id,
+            selected,
+        } => {
+            state.overlay = Overlay::DocPublishTarget {
+                document_id,
+                selected,
+            };
+            choose_doc_publish_target(state);
+        }
         Overlay::DocPublishPath {
             document_id,
+            target,
             buffer,
         } => {
             let path = buffer.trim().to_owned();
             if !valid_publish_path(&path) {
                 state.overlay = Overlay::DocPublishPath {
                     document_id,
+                    target,
                     buffer,
                 };
                 state.notice = Some((
@@ -4711,6 +4914,16 @@ fn submit_prompt(state: &mut AppState) {
                         .to_owned(),
                     state.tick + 30,
                 ));
+            } else if target.needs_branch() {
+                // The branch defaults to one derived from the path, so the
+                // common case is Enter-Enter rather than inventing a name.
+                let slug = publish_slug(path.trim_end_matches(".md"));
+                state.overlay = Overlay::DocPublishBranch {
+                    document_id,
+                    target,
+                    path,
+                    buffer: format!("docs/{slug}"),
+                };
             } else {
                 state.outbox.push(Intent::PublishDocument {
                     document_id,
@@ -4723,9 +4936,96 @@ fn submit_prompt(state: &mut AppState) {
                 ));
             }
         }
+        // Publish step 3: the branch. Validated with the same conservative
+        // shape rule the path uses — a branch name reaches `git` on the daemon
+        // side, so shell/refspec metacharacters and traversal never leave here.
+        Overlay::DocPublishBranch {
+            document_id,
+            target,
+            path,
+            buffer,
+        } => {
+            let branch = buffer.trim().to_owned();
+            if !valid_publish_branch(&branch) {
+                state.overlay = Overlay::DocPublishBranch {
+                    document_id,
+                    target,
+                    path,
+                    buffer,
+                };
+                state.notice = Some((
+                    "enter a branch name of letters, digits, `.`, `_`, `-` and `/` \
+                     (no leading dash, no `..`)"
+                        .to_owned(),
+                    state.tick + 30,
+                ));
+            } else if matches!(target, DocPublishTargetKind::DocumentationPr) {
+                state.overlay = Overlay::DocPublishTitle {
+                    document_id,
+                    path,
+                    branch,
+                    // A PR needs a human title; seed it from the document so an
+                    // empty submit is never the fast path.
+                    buffer: state
+                        .docs
+                        .iter()
+                        .find(|doc| doc.document_id == document_id)
+                        .map_or_else(String::new, |doc| format!("docs: {}", doc.title)),
+                };
+            } else {
+                state.outbox.push(Intent::PublishDocument {
+                    document_id,
+                    target: codypendent_protocol::PublishTarget::DocsBranchCommit { branch, path },
+                });
+                state.overlay = Overlay::Docs;
+                state.notice = Some((
+                    "preparing publish plan for approval…".to_owned(),
+                    state.tick + 40,
+                ));
+            }
+        }
+        // Publish step 4: the PR title. Only its emptiness is checked — it is
+        // prose destined for a PR body, not a path or a ref.
+        Overlay::DocPublishTitle {
+            document_id,
+            path,
+            branch,
+            buffer,
+        } => {
+            let title = buffer.trim().to_owned();
+            if title.is_empty() {
+                state.overlay = Overlay::DocPublishTitle {
+                    document_id,
+                    path,
+                    branch,
+                    buffer,
+                };
+                state.notice = Some((
+                    "enter a title for the pull request".to_owned(),
+                    state.tick + 30,
+                ));
+            } else {
+                state.outbox.push(Intent::PublishDocument {
+                    document_id,
+                    target: codypendent_protocol::PublishTarget::DocumentationPr {
+                        branch,
+                        path,
+                        title,
+                    },
+                });
+                state.overlay = Overlay::Docs;
+                state.notice = Some((
+                    "preparing publish plan for approval…".to_owned(),
+                    state.tick + 40,
+                ));
+            }
+        }
         // `mem::take` already closed the palette (left `None`); run the
         // highlighted command, which may open its own overlay.
         Overlay::Palette { query, selected } => {
+            // The chosen command owns the flow from here, so `Esc` belongs to
+            // whatever it opened rather than to the setup gate behind it.
+            state.palette_from_onboard = false;
             if let Some(selector) = parse_council_result_query(&query) {
                 state.overlay = Overlay::CouncilResults;
                 state.outbox.push(Intent::LoadCouncilResults { selector });
@@ -5034,9 +5334,11 @@ fn submit_prompt(state: &mut AppState) {
         // pickers use): a query matching nothing opens nothing. `mem::take`
         // already closed the picker; the prompt replaces it.
         Overlay::ApiKeys { query, selected } => {
-            if let Some(&idx) = filter_key_rows(&state.models, &query).get(selected) {
+            if let Some(&idx) =
+                filter_key_rows(&state.models, &state.voice_key_rows, &query).get(selected)
+            {
                 state.overlay = Overlay::ApiKeySet {
-                    target: key_row_target(&state.models, idx),
+                    target: key_row_target(&state.models, &state.voice_key_rows, idx),
                     buffer: SecretKey(String::new()),
                 };
             }
@@ -5322,6 +5624,26 @@ fn submit_prompt(state: &mut AppState) {
     }
 }
 
+/// Whether `branch` is a safe git branch name to hand the daemon's publish
+/// engine (outcome 18 F10). Deliberately a small allowlist rather than a
+/// re-implementation of `git check-ref-format`: this value ends up in a
+/// `git` invocation and a PR head ref on the daemon side, so anything outside
+/// letters, digits, `.`, `_`, `-` and `/` is refused here rather than relied on
+/// to be rejected there. `..` is excluded for the same reason a publish path
+/// excludes `ParentDir`, and a leading `-` cannot be read as a flag.
+fn valid_publish_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.starts_with('-')
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && !branch.ends_with(".lock")
+        && !branch.contains("..")
+        && !branch.contains("//")
+        && branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
 fn valid_publish_path(path: &str) -> bool {
     use std::path::Component;
 
@@ -5468,7 +5790,8 @@ fn begin_verify_key(state: &mut AppState) {
     let Overlay::ApiKeys { query, selected } = &state.overlay else {
         return;
     };
-    let Some(&idx) = filter_key_rows(&state.models, query).get(*selected) else {
+    let Some(&idx) = filter_key_rows(&state.models, &state.voice_key_rows, query).get(*selected)
+    else {
         return;
     };
     let Some(card) = state.models.get(idx) else {
@@ -5990,7 +6313,10 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
                 state.focus = Pane::Transcript;
             }
         }
-        PaletteCommand::Help => state.overlay = Overlay::Help,
+        PaletteCommand::Help => {
+            state.help_scroll = 0;
+            state.overlay = Overlay::Help;
+        }
         PaletteCommand::Detach => state.should_detach = true,
         PaletteCommand::NewConversation => {
             release_doc_lease(state);
@@ -6028,7 +6354,10 @@ fn refresh_open_projection(state: &mut AppState) {
         | Overlay::DocNew { .. }
         | Overlay::DocInsert { .. }
         | Overlay::DocDeleteConfirm { .. }
-        | Overlay::DocPublishPath { .. } => Some(ProjectionKind::Docs),
+        | Overlay::DocPublishTarget { .. }
+        | Overlay::DocPublishPath { .. }
+        | Overlay::DocPublishBranch { .. }
+        | Overlay::DocPublishTitle { .. } => Some(ProjectionKind::Docs),
         Overlay::Workflow | Overlay::WorkflowInputs { .. } => Some(ProjectionKind::Workflow),
         _ => None,
     };
@@ -6172,6 +6501,7 @@ pub(crate) fn capability_label(action: &ProposedAction) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::VoiceKeyRow;
     use chrono::Utc;
     use codypendent_protocol::{
         AgentMode, ApprovalId, ArtifactId, ArtifactRef, ChangeSetId, DataClassification, ModelId,
@@ -8512,10 +8842,20 @@ mod tests {
         let _ = s.drain_outbox(); // projection refresh + live watch
 
         reduce(&mut s, Action::PublishDoc);
+        // Step 1 is the target picker, defaulting to the narrowest target.
+        assert_eq!(
+            s.overlay,
+            Overlay::DocPublishTarget {
+                document_id,
+                selected: 0,
+            }
+        );
+        reduce(&mut s, Action::InputSubmit);
         assert_eq!(
             s.overlay,
             Overlay::DocPublishPath {
                 document_id,
+                target: DocPublishTargetKind::RepositoryFile,
                 buffer: "docs/payments-retry-guide.md".to_owned(),
             }
         );
@@ -8533,6 +8873,164 @@ mod tests {
         );
     }
 
+    /// Outcome 18 F10: the daemon has always accepted three publish targets and
+    /// rates each one's risk on its own approval card, but the Studio could
+    /// construct only `RepositoryFile` — the other two were unreachable from
+    /// the shipped UI. This drives the longest path (a documentation PR) end to
+    /// end through the reducer.
+    #[test]
+    fn docs_publish_can_reach_a_documentation_pull_request() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("Payments & Retry Guide")];
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::OpenDocs);
+        let _ = s.drain_outbox();
+
+        reduce(&mut s, Action::PublishDoc);
+        // Move to the third row: the documentation PR.
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::InputSubmit);
+        assert!(matches!(
+            s.overlay,
+            Overlay::DocPublishPath {
+                target: DocPublishTargetKind::DocumentationPr,
+                ..
+            }
+        ));
+        reduce(&mut s, Action::InputSubmit);
+        // The branch step exists only for the two git-branch targets, and it
+        // defaults to a name derived from the path.
+        assert_eq!(
+            s.overlay,
+            Overlay::DocPublishBranch {
+                document_id,
+                target: DocPublishTargetKind::DocumentationPr,
+                path: "docs/payments-retry-guide.md".to_owned(),
+                buffer: "docs/docs-payments-retry-guide".to_owned(),
+            }
+        );
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.overlay,
+            Overlay::DocPublishTitle {
+                document_id,
+                path: "docs/payments-retry-guide.md".to_owned(),
+                branch: "docs/docs-payments-retry-guide".to_owned(),
+                buffer: "docs: Payments & Retry Guide".to_owned(),
+            }
+        );
+        assert!(s.outbox.is_empty(), "nothing is sent until the last step");
+        reduce(&mut s, Action::InputSubmit);
+
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::PublishDocument {
+                document_id,
+                target: codypendent_protocol::PublishTarget::DocumentationPr {
+                    branch: "docs/docs-payments-retry-guide".to_owned(),
+                    path: "docs/payments-retry-guide.md".to_owned(),
+                    title: "docs: Payments & Retry Guide".to_owned(),
+                },
+            }]
+        );
+    }
+
+    /// The picker is mouse-reachable too: a click must select the clicked row
+    /// and advance, not the row the keyboard cursor happened to be on.
+    #[test]
+    fn docs_publish_target_row_click_selects_and_advances() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("Release Notes")];
+        reduce(&mut s, Action::OpenDocs);
+        let _ = s.drain_outbox();
+        reduce(&mut s, Action::PublishDoc);
+        reduce(&mut s, Action::ActivateRow(2));
+        assert!(matches!(
+            s.overlay,
+            Overlay::DocPublishPath {
+                target: DocPublishTargetKind::DocumentationPr,
+                ..
+            }
+        ));
+    }
+
+    /// The docs-branch target stops one step earlier — it needs no PR title.
+    #[test]
+    fn docs_publish_docs_branch_commit_stops_at_the_branch() {
+        let mut s = AppState::new();
+        s.docs = vec![doc("Release Notes")];
+        let document_id = s.docs[0].document_id;
+        reduce(&mut s, Action::OpenDocs);
+        let _ = s.drain_outbox();
+
+        reduce(&mut s, Action::PublishDoc);
+        reduce(&mut s, Action::SelectNext);
+        reduce(&mut s, Action::InputSubmit); // target -> path
+        reduce(&mut s, Action::InputSubmit); // path -> branch
+        reduce(&mut s, Action::InputSubmit); // branch -> send
+        assert_eq!(s.overlay, Overlay::Docs);
+        assert_eq!(
+            s.drain_outbox(),
+            vec![Intent::PublishDocument {
+                document_id,
+                target: codypendent_protocol::PublishTarget::DocsBranchCommit {
+                    branch: "docs/docs-release-notes".to_owned(),
+                    path: "docs/release-notes.md".to_owned(),
+                },
+            }]
+        );
+    }
+
+    /// A branch name reaches `git` on the daemon side, so the shapes that could
+    /// be read as a flag, a refspec, or traversal never leave the prompt.
+    #[test]
+    fn docs_publish_rejects_unsafe_branch_names() {
+        let mut s = AppState::new();
+        let document_id = codypendent_protocol::DocumentId::new();
+        for invalid in [
+            "",
+            "-force",
+            "/leading",
+            "trailing/",
+            "docs/../main",
+            "docs//main",
+            "docs/branch.lock",
+            "docs/branch;rm -rf /",
+            "docs/branch\u{7f}",
+        ] {
+            s.overlay = Overlay::DocPublishBranch {
+                document_id,
+                target: DocPublishTargetKind::DocsBranchCommit,
+                path: "docs/report.md".to_owned(),
+                buffer: invalid.to_owned(),
+            };
+            reduce(&mut s, Action::InputSubmit);
+            assert!(
+                matches!(s.overlay, Overlay::DocPublishBranch { .. }),
+                "{invalid:?} must remain in the prompt"
+            );
+            assert!(s.outbox.is_empty(), "{invalid:?} must send nothing");
+        }
+        assert!(valid_publish_branch("docs/payments-retry_guide.v2"));
+    }
+
+    /// A PR with no title is refused rather than sent with an empty one.
+    #[test]
+    fn docs_publish_rejects_a_blank_pull_request_title() {
+        let mut s = AppState::new();
+        s.overlay = Overlay::DocPublishTitle {
+            document_id: codypendent_protocol::DocumentId::new(),
+            path: "docs/report.md".to_owned(),
+            branch: "docs/report".to_owned(),
+            buffer: "   ".to_owned(),
+        };
+        reduce(&mut s, Action::InputSubmit);
+        assert!(matches!(s.overlay, Overlay::DocPublishTitle { .. }));
+        assert!(s.outbox.is_empty());
+    }
+
     #[test]
     fn docs_publish_rejects_absolute_and_parent_traversal_paths() {
         let mut s = AppState::new();
@@ -8540,6 +9038,7 @@ mod tests {
         for invalid in ["/tmp/report.md", "../report.md"] {
             s.overlay = Overlay::DocPublishPath {
                 document_id,
+                target: DocPublishTargetKind::RepositoryFile,
                 buffer: invalid.to_owned(),
             };
             reduce(&mut s, Action::InputSubmit);
@@ -11187,6 +11686,68 @@ mod tests {
         assert_eq!(s.drain_outbox(), vec![Intent::SetOnboardSkipped]);
     }
 
+    /// First-run setup is `InputMode::Palette` with no query buffer, so every
+    /// printable key fell through `edit_prompt`'s `_ => {}` and was swallowed —
+    /// typing `/model` ate six keystrokes and then `Enter` activated whatever
+    /// triage row happened to be highlighted. The splash advertises `/`, and it
+    /// is the only front door to the rest of the product.
+    #[test]
+    fn slash_opens_the_command_palette_from_first_run_setup() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenOnboard);
+
+        reduce(&mut s, Action::InputChar('/'));
+        assert!(
+            matches!(s.overlay, Overlay::Palette { .. }),
+            "`/` opens the palette instead of vanishing: {:?}",
+            s.overlay
+        );
+
+        // The query then filters normally rather than steering the triage list.
+        for c in "model".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        let Overlay::Palette { query, .. } = &s.overlay else {
+            unreachable!("still the palette")
+        };
+        assert_eq!(query, "model", "the keystrokes reached the filter");
+
+        reduce(&mut s, Action::InputSubmit);
+        assert!(
+            matches!(s.overlay, Overlay::ModelPicker { .. }),
+            "the highlighted command ran: {:?}",
+            s.overlay
+        );
+    }
+
+    #[test]
+    fn escaping_that_palette_returns_to_first_run_setup() {
+        let mut s = AppState::new();
+        reduce(&mut s, Action::OpenOnboard);
+        reduce(&mut s, Action::InputChar('/'));
+
+        reduce(&mut s, Action::InputCancel);
+        assert!(
+            matches!(
+                s.overlay,
+                Overlay::Onboard {
+                    step: OnboardStep::Triage { .. }
+                }
+            ),
+            "Esc must not strand a zero-model operator in an inert chat: {:?}",
+            s.overlay
+        );
+        assert!(!s.palette_from_onboard, "the return address is consumed");
+
+        // A palette opened the ordinary way still closes to the base view.
+        reduce(&mut s, Action::InputCancel); // triage → skip confirm
+        reduce(&mut s, Action::InputSubmit); // skip setup
+        reduce(&mut s, Action::InputChar('/'));
+        assert!(matches!(s.overlay, Overlay::Palette { .. }));
+        reduce(&mut s, Action::InputCancel);
+        assert_eq!(s.overlay, Overlay::None);
+    }
+
     #[test]
     fn onboard_provider_classes_are_mutually_exclusive_and_cannot_roam() {
         let mut hosted = provider_card("groq", "Groq", "openai-chat", "api-key: GROQ", false);
@@ -11788,8 +12349,10 @@ mod tests {
     // -- `/keys` (D1): API key management ------------------------------------
 
     /// Seed two models + statuses and open the `/keys` overlay through the
-    /// palette, mirroring `open_mode_picker`.
-    fn open_api_keys(s: &mut AppState) {
+    /// palette, mirroring `open_mode_picker`. `voice_rows` seeds the
+    /// `[transcription]`/`[speech]` rows the harness contributes for whichever
+    /// voice table `models.toml` configures — empty for the common case.
+    fn open_api_keys_with_voice(s: &mut AppState, voice_rows: Vec<VoiceKeyRow>) {
         s.models = vec![
             crate::state::ModelCard {
                 id: ModelId("groq/llama".to_owned()),
@@ -11819,6 +12382,7 @@ mod tests {
                     ),
                 ],
                 tavily: KeyStatus::Missing,
+                voice: voice_rows,
             },
         );
         reduce(s, Action::OpenPalette);
@@ -11826,6 +12390,21 @@ mod tests {
             reduce(s, Action::InputChar(c));
         }
         reduce(s, Action::InputSubmit);
+    }
+
+    /// The common case: no voice table configured, so no voice rows.
+    fn open_api_keys(s: &mut AppState) {
+        open_api_keys_with_voice(s, Vec::new());
+    }
+
+    /// A `[transcription]` row exactly as the harness projects one.
+    fn transcription_row(status: KeyStatus) -> VoiceKeyRow {
+        VoiceKeyRow {
+            target: KeyTarget::Transcription,
+            label: "Voice input (speech-to-text)".to_owned(),
+            detail: "whisper-large-v3-turbo · https://api.groq.com/openai/v1".to_owned(),
+            status,
+        }
     }
 
     #[test]
@@ -11842,7 +12421,7 @@ mod tests {
         assert_eq!(s.input_mode(), crate::state::InputMode::Palette);
         // Two model rows + the final Tavily row, in list order.
         assert_eq!(
-            crate::state::filter_key_rows(&s.models, ""),
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, ""),
             vec![0, 1, 2],
             "the rows are built from state (models, then Tavily)"
         );
@@ -11863,14 +12442,20 @@ mod tests {
             }
             other => panic!("expected the /keys overlay, got {other:?}"),
         }
-        assert_eq!(crate::state::filter_key_rows(&s.models, "gpt"), vec![1]);
+        assert_eq!(
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, "gpt"),
+            vec![1]
+        );
         // The provider substring filters too (both models share it here).
         assert_eq!(
-            crate::state::filter_key_rows(&s.models, "openai-compatible"),
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, "openai-compatible"),
             vec![0, 1]
         );
         // The Tavily row matches its own label.
-        assert_eq!(crate::state::filter_key_rows(&s.models, "tavily"), vec![2]);
+        assert_eq!(
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, "tavily"),
+            vec![2]
+        );
     }
 
     #[test]
@@ -11902,6 +12487,117 @@ mod tests {
             }
             other => panic!("expected the set prompt, got {other:?}"),
         }
+    }
+
+    /// The finding this closes (audio review F3): a `[transcription]`/`[speech]`
+    /// table deserializes into its own `AudioModelConfig`, never a `ModelCard`,
+    /// so before the voice rows existed `/keys` could name the STT/TTS
+    /// credential from no index at all — while the user guide said it could.
+    #[test]
+    fn api_keys_enter_on_the_voice_row_targets_the_transcription_table() {
+        let mut s = AppState::new();
+        open_api_keys_with_voice(&mut s, vec![transcription_row(KeyStatus::Missing)]);
+        // Two model rows, Tavily, then the one configured voice row.
+        assert_eq!(
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, ""),
+            vec![0, 1, 2, 3]
+        );
+        for _ in 0..3 {
+            reduce(&mut s, Action::SelectNext);
+        }
+        reduce(&mut s, Action::InputSubmit);
+        match &s.overlay {
+            Overlay::ApiKeySet { target, .. } => assert_eq!(*target, KeyTarget::Transcription),
+            other => panic!("expected the set prompt, got {other:?}"),
+        }
+    }
+
+    /// The voice row is reachable by its own label/detail, not only by scrolling
+    /// past every model — and filtering must not shift which target a row index
+    /// resolves to.
+    #[test]
+    fn api_keys_filter_matches_a_voice_row_and_keeps_its_target() {
+        let mut s = AppState::new();
+        open_api_keys_with_voice(
+            &mut s,
+            vec![
+                transcription_row(KeyStatus::Missing),
+                VoiceKeyRow {
+                    target: KeyTarget::Speech,
+                    label: "Voice output (text-to-speech)".to_owned(),
+                    detail: "tts-1 · https://api.openai.com/v1".to_owned(),
+                    status: KeyStatus::Stored,
+                },
+            ],
+        );
+        assert_eq!(
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, "speech"),
+            vec![3, 4],
+            "both voice labels carry the word `speech`"
+        );
+        assert_eq!(
+            crate::state::filter_key_rows(&s.models, &s.voice_key_rows, "text-to-speech"),
+            vec![4]
+        );
+        assert_eq!(
+            key_row_target(&s.models, &s.voice_key_rows, 4),
+            KeyTarget::Speech
+        );
+    }
+
+    /// `Delete` opens the remove confirm only for a row that HAS a stored key.
+    /// A voice row's status lives on the row itself, not in `key_status` (which
+    /// is keyed by model id), so this is the arm that could silently read the
+    /// wrong row's status.
+    #[test]
+    fn api_keys_delete_on_a_voice_row_confirms_only_when_a_key_is_stored() {
+        let mut s = AppState::new();
+        open_api_keys_with_voice(&mut s, vec![transcription_row(KeyStatus::Missing)]);
+        for _ in 0..3 {
+            reduce(&mut s, Action::SelectNext);
+        }
+        reduce(&mut s, Action::RemoveSelected);
+        assert!(
+            matches!(s.overlay, Overlay::ApiKeys { .. }),
+            "nothing is stored for this row, so there is nothing to remove"
+        );
+
+        let mut s = AppState::new();
+        open_api_keys_with_voice(&mut s, vec![transcription_row(KeyStatus::Stored)]);
+        for _ in 0..3 {
+            reduce(&mut s, Action::SelectNext);
+        }
+        reduce(&mut s, Action::RemoveSelected);
+        assert_eq!(
+            s.overlay,
+            Overlay::ApiKeyRemoveConfirm {
+                target: KeyTarget::Transcription
+            }
+        );
+    }
+
+    /// End of the client-side round trip: the intent the harness turns into an
+    /// `auth.json` write names the voice table, so the key lands where the
+    /// runtime's `audio_api_key` looks for it.
+    #[test]
+    fn api_key_set_submit_on_a_voice_row_emits_a_transcription_intent() {
+        let mut s = AppState::new();
+        open_api_keys_with_voice(&mut s, vec![transcription_row(KeyStatus::Missing)]);
+        for _ in 0..3 {
+            reduce(&mut s, Action::SelectNext);
+        }
+        reduce(&mut s, Action::InputSubmit);
+        for c in "sk-stt".chars() {
+            reduce(&mut s, Action::InputChar(c));
+        }
+        reduce(&mut s, Action::InputSubmit);
+        assert_eq!(
+            s.outbox,
+            vec![Intent::SetApiKey {
+                target: KeyTarget::Transcription,
+                key: SecretKey("sk-stt".to_owned()),
+            }]
+        );
     }
 
     #[test]
@@ -13434,6 +14130,114 @@ mod tests {
             s.runs[0].transcript_selected, 3,
             "saturates at the newest fold"
         );
+    }
+
+    /// A follow-up message: the daemon seeds a continuation run, whose
+    /// `RunStarted` moves `selected_run` onto it. Everything turn 1 produced is
+    /// still drawn — the conversation stacks every run — so it must stay live.
+    fn add_a_second_turn(s: &mut AppState) {
+        let run_id = RunId::new();
+        reduce(
+            s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "and now the tests".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            s,
+            system_ev(EventBody::ToolStarted {
+                run_id,
+                tool: "workspace.read_file".to_owned(),
+                args_digest: "def".to_owned(),
+                label: Some("README.md".to_owned()),
+            }),
+        );
+    }
+
+    #[test]
+    fn alt_arrows_walk_folds_across_runs_not_just_the_selected_one() {
+        let mut s = run_with_two_folds();
+        add_a_second_turn(&mut s);
+        assert_eq!(s.selected_run, 1, "the follow-up run is selected");
+        assert_eq!(s.runs.len(), 2);
+
+        // Entry point is the newest fold in the whole conversation.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!((s.fold_focus_run(), s.runs[1].transcript_selected), (1, 1));
+
+        // Alt-↑ crosses the run boundary into turn 1's patch — before this it
+        // saturated inside run 1 and every earlier card was unreachable.
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!(s.fold_focus_run(), 0, "the walk crossed into the older run");
+        assert_eq!(s.runs[0].transcript_selected, 3);
+        reduce(&mut s, Action::InputNewline);
+        assert!(
+            patch_expanded(&s),
+            "Alt-Enter expands a diff from an earlier turn"
+        );
+        assert!(
+            s.composer.is_empty(),
+            "…instead of inserting a newline in the composer"
+        );
+
+        reduce(&mut s, Action::BrowseFoldPrev);
+        assert_eq!((s.fold_focus_run(), s.runs[0].transcript_selected), (0, 1));
+        reduce(&mut s, Action::InputNewline);
+        assert!(tool_expanded(&s), "and expands its tool card");
+
+        // Alt-↓ walks forward over the same boundary.
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert_eq!((s.fold_focus_run(), s.runs[0].transcript_selected), (0, 3));
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert_eq!(s.fold_focus_run(), 1, "and back into the newest run");
+        reduce(&mut s, Action::BrowseFoldNext);
+        assert_eq!(
+            s.fold_focus_run(),
+            1,
+            "saturating at the session's newest fold"
+        );
+
+        // The composer still submits against the selected run: browsing an old
+        // card must not silently re-target the next message.
+        assert_eq!(s.selected_run, 1);
+    }
+
+    #[test]
+    fn clicking_a_fold_in_an_earlier_run_expands_that_run_s_card() {
+        let mut s = run_with_two_folds();
+        add_a_second_turn(&mut s);
+
+        reduce(&mut s, Action::ActivateFold { run: 0, entry: 1 });
+        assert!(tool_expanded(&s), "the click toggled turn 1's tool card");
+        assert!(
+            s.transcript_browse,
+            "the clicked fold becomes the browsed one"
+        );
+        assert_eq!((s.fold_focus_run(), s.runs[0].transcript_selected), (0, 1));
+        assert_eq!(s.selected_run, 1, "clicking a card does not switch runs");
+
+        // Alt-Y copies the card the mouse just focused, not the selected run's.
+        reduce(&mut s, Action::CopyFocusedCard);
+        let copied = s
+            .drain_outbox()
+            .into_iter()
+            .find_map(|intent| match intent {
+                Intent::CopyText { text } => Some(text),
+                _ => None,
+            })
+            .expect("the focused card was copied");
+        assert!(copied.contains("shell.run"), "{copied}");
+    }
+
+    #[test]
+    fn an_out_of_range_fold_click_is_inert() {
+        let mut s = run_with_two_folds();
+        reduce(&mut s, Action::ActivateFold { run: 9, entry: 0 });
+        assert!(!s.transcript_browse);
+        assert!(!tool_expanded(&s));
+        assert!(!patch_expanded(&s));
     }
 
     #[test]

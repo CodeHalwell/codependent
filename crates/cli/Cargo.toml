@@ -88,5 +88,12 @@ tempfile = { workspace = true }
 # (rubric 6) needs it at runtime too.
 chrono = { workspace = true }
 
+[dev-dependencies]
+# Stands in for a `[speech]`/`[transcription]` HTTP endpoint in the voice
+# outbound-privacy-gate tests (F8): proves confidential text never reaches the
+# wire when the ceiling refuses it, exactly as `codypendent-runtime`'s own
+# audio tests already use it for the client layer below this one.
+wiremock = { workspace = true }
+
 [lints]
 workspace = true

@@ -107,6 +107,7 @@ fn a_recurring_failure_clusters_becomes_a_guard_case_and_a_fix_promotes() {
         case_id.clone(),
         RunObservation {
             tests_passed: Some(true),
+            run_completed: true,
             ..Default::default()
         },
     );

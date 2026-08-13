@@ -74,6 +74,11 @@ use codypendent_knowledge::{
     RiskClass, Scope,
 };
 use codypendent_protocol::ide::{DirtyBufferDigest, SourceProvenance};
+// Outcome 11: the loop classifies a finished run's objective with the SAME rules
+// the router selects a model with, so the outcome it writes back lands on the
+// class routing consulted. `codypendent-routing` is a protocol-only leaf crate
+// (its own Cargo.toml comment), so this adds no cycle.
+use codypendent_routing::{classify, TaskClass, TaskSignals};
 // THE untrusted-content chokepoint for MCP tool results (PR B): every byte a
 // server returns passes through `sanitize_untrusted` before it can enter the
 // model's observation stream — never raw.
@@ -96,15 +101,16 @@ use crate::models::ModelRegistry;
 use crate::models::{classify_provider_message, FailureClass};
 use crate::tools::{
     council_create_action, council_result_action, council_run_action, docs_proposed_action,
-    new_pull_request, parse_artifact_read, parse_blackboard_post, parse_blackboard_query,
-    parse_council_create, parse_council_result, parse_council_run, parse_create_check_run,
-    parse_create_draft_pull_request, parse_docs_create, parse_docs_edit, parse_docs_read,
-    parse_docs_suggest, parse_edit_file as parse_edit_file_args, parse_get_pull_request,
-    parse_list_check_runs, parse_memory_remember, parse_skills_search, parse_task_create,
-    parse_task_list, parse_task_move, parse_task_update, parse_update_pull_request,
-    parse_web_search, parse_workflow_create, parse_workflow_query, parse_workflow_run,
-    parse_write_file as parse_write_file_args, render_check_runs, render_pull_request,
-    render_registry_search, render_search_outcome, task_read_action, task_write_action, tool_label,
+    graph_proposed_action, new_pull_request, parse_artifact_read, parse_blackboard_post,
+    parse_blackboard_query, parse_council_create, parse_council_result, parse_council_run,
+    parse_create_check_run, parse_create_draft_pull_request, parse_docs_create, parse_docs_edit,
+    parse_docs_read, parse_docs_suggest, parse_edit_file as parse_edit_file_args,
+    parse_get_pull_request, parse_list_check_runs, parse_memory_remember, parse_skills_search,
+    parse_symbol_question, parse_task_create, parse_task_list, parse_task_move, parse_task_update,
+    parse_tests_covering, parse_update_pull_request, parse_web_search, parse_workflow_create,
+    parse_workflow_query, parse_workflow_run, parse_write_file as parse_write_file_args,
+    render_check_runs, render_pull_request, render_registry_search, render_search_outcome,
+    summarize_graph_question, task_read_action, task_write_action, tool_label,
     workflow_create_action, workflow_run_action, ApplyPatch, ApplyPatchInput, ArtifactRead,
     ArtifactReadInput, ArtifactReader, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
     BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CouncilCreateInput,
@@ -112,13 +118,14 @@ use crate::tools::{
     CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
     CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool, DocsEditInput, DocsEditTool,
     DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool, EditFile, EditFileInput,
-    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, ListCheckRuns,
-    ListCheckRunsInput, MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput,
-    RegistrySearch, RegistrySearchRequest, RepositoryTest, Search, SearchInput, Shell,
-    SkillsSearch, SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool,
-    TaskMoveTool, TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput, UpdatePullRequestTool,
-    WebSearch, WebSearchInput, WorkflowCreateInput, WorkflowCreateTool, WorkflowQueryInput,
-    WorkflowQueryTool, WorkflowRunInput, WorkflowRunTool, WriteFile, WriteFileInput,
+    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput,
+    GraphBlastRadius, GraphCallersOf, GraphTestsCovering, ListCheckRuns, ListCheckRunsInput,
+    MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput, RegistrySearch,
+    RegistrySearchRequest, RepositoryTest, Search, SearchInput, Shell, SkillsSearch,
+    SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool,
+    TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput, UpdatePullRequestTool, WebSearch,
+    WebSearchInput, WorkflowCreateInput, WorkflowCreateTool, WorkflowQueryInput, WorkflowQueryTool,
+    WorkflowRunInput, WorkflowRunTool, WriteFile, WriteFileInput,
 };
 use crate::workflow_control::{
     WorkflowControlChannel, WorkflowCreateRequest, WorkflowRunRequest, WorkflowRunTarget,
@@ -822,6 +829,18 @@ pub trait ModelDriver: Send + Sync {
     fn context_window(&self) -> Option<u64> {
         None
     }
+
+    /// The endpoint (base URL) this driver's model is served from, if known.
+    ///
+    /// This is the second half of the `(model_id, endpoint)` key every stored
+    /// model profile lives under — `codypendent models bench <id>` persists a
+    /// profile keyed on the model's `base_url` — so it is what a routing-outcome
+    /// writeback must report. Defaults to `None` so a scripted or test driver
+    /// never fabricates one; a run under such a driver records no outcome rather
+    /// than folding a result into the wrong profile row.
+    fn endpoint(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A driver backed by a fixed queue of pre-set steps — the deterministic engine
@@ -841,6 +860,10 @@ pub struct ScriptedDriver {
     /// scripts a known window so a test can exercise the plain loop's
     /// `BudgetWarning{Tokens}` emission (context-window protection, T3).
     context_window: Option<u64>,
+    /// The endpoint [`ModelDriver::endpoint`] reports. `None` (the default via
+    /// [`Self::new`]) keeps the honest "no endpoint" answer a scripted driver
+    /// should give — a run under it records no routing outcome.
+    endpoint: Option<String>,
 }
 
 impl ScriptedDriver {
@@ -852,7 +875,15 @@ impl ScriptedDriver {
             model_id: ModelId("scripted".to_string()),
             usage: None,
             context_window: None,
+            endpoint: None,
         }
+    }
+
+    /// Script the endpoint the driver reports, so a test can exercise the
+    /// routing-outcome writeback (outcome 11) without a live provider.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = Some(endpoint.into());
+        self
     }
 
     /// Set the reported model id (defaults to `scripted`).
@@ -888,6 +919,10 @@ impl ModelDriver for ScriptedDriver {
 
     fn context_window(&self) -> Option<u64> {
         self.context_window
+    }
+
+    fn endpoint(&self) -> Option<String> {
+        self.endpoint.clone()
     }
 
     async fn next_step(
@@ -1120,9 +1155,24 @@ pub struct RunContext {
     /// `None` — the default, and the value for every run whose bridge offers at
     /// most `mcp_top_k` tools — means "advertise every MCP tool the bridge
     /// offers", exactly today's behavior. `Some(names)` is the top-k subset a
-    /// large MCP surface was narrowed to. Only the `mcp.*` family is ever gated:
-    /// the core built-in tools are always advertised in full.
+    /// large MCP surface was narrowed to.
     pub mcp_advertised: Option<Vec<String>>,
+    /// This run's retrieval-narrowed BUILT-IN advertisement (rubric 9), computed
+    /// ONCE per run by [`FrameworkAgentRuntime::select_builtin_tools`] and read
+    /// by [`advertised_tool_definitions`](FrameworkAgentRuntime::advertised_tool_definitions)
+    /// on every step.
+    ///
+    /// `None` means "advertise every offered built-in", the behavior before the
+    /// funnel fed this decision. `Some(names)` is
+    /// [`ALWAYS_ADVERTISED_TOOLS`] ∪ the funnel's top-k for this run's objective.
+    ///
+    /// It narrows only what the model is SHOWN. It is deliberately NOT consulted
+    /// by [`offered_tool_names`](FrameworkAgentRuntime::offered_tool_names), so a
+    /// tool the model learned about earlier — from a prior turn's transcript,
+    /// from `skills.search`, or from a continuation's carried context — still
+    /// dispatches. Narrowing advertisement can cost the model an idea; narrowing
+    /// dispatch would strand it mid-task.
+    pub tools_advertised: Option<Vec<String>>,
 }
 
 impl RunContext {
@@ -1149,6 +1199,7 @@ impl RunContext {
             steering: None,
             prior: Vec::new(),
             mcp_advertised: None,
+            tools_advertised: None,
         }
     }
 
@@ -1228,6 +1279,42 @@ pub fn mode_overlay(mode: AgentMode) -> ModeOverlay {
         // An unknown/future mode collapses to the most restrictive overlay.
         _ => ModeOverlay::read_only(),
     }
+}
+
+/// The lowercase mode token the rule classifier reads. Must agree with the
+/// daemon's `routing::mode_str`, which is what the ROUTER classified this run's
+/// objective with when it picked the model — a different token here would file
+/// the outcome under a class the routing decision never considered. An
+/// unknown/future mode maps to the empty string, which the classifier reads as
+/// "no mode signal".
+fn mode_signal(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Build => "build",
+        AgentMode::Explore => "explore",
+        AgentMode::Ask => "ask",
+        AgentMode::Plan => "plan",
+        AgentMode::Review => "review",
+        _ => "",
+    }
+}
+
+/// Classify a run's objective the way the router classified it at selection
+/// time (outcome 11).
+///
+/// The node kind is `"agent"` because that is what BOTH of the daemon's routing
+/// call sites pass — `executor.rs`'s plain-run path and `workflow_exec.rs`'s
+/// agent-node path — and the CI-diagnosis rule keys off it. `input_tokens`
+/// reproduces the daemon's `routing::estimate_input_tokens` formula rather than
+/// the run's measured token count: the two must be the same number for the class
+/// to be the same, and today's rules do not read it at all — copying the formula
+/// keeps that true if a future rule starts to.
+fn classify_run(run: &RunContext) -> codypendent_routing::Classification {
+    classify(&TaskSignals::from_objective(
+        mode_signal(run.mode),
+        "agent",
+        ((run.objective.len() as u64) / 4).max(256),
+        &run.objective,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1329,6 +1416,54 @@ impl RunJournal {
 }
 
 // ---------------------------------------------------------------------------
+// The routing-outcome writeback (outcome 11)
+// ---------------------------------------------------------------------------
+
+/// One run's terminal result, keyed the way the model-profile store keys a
+/// profile: `(model, endpoint)` plus the task class the run belonged to.
+#[derive(Debug, Clone)]
+pub struct RoutingOutcome<'a> {
+    /// The model that served the run.
+    pub model: &'a ModelId,
+    /// The endpoint it was served from — [`ModelDriver::endpoint`], which is the
+    /// same `base_url` a benched profile is stored under.
+    pub endpoint: &'a str,
+    /// The class the run's objective classified as, decided here (not by the
+    /// implementation) so the recorded class comes from the same rules the
+    /// router selects with.
+    pub task_class: TaskClass,
+    /// Whether the run reached a successful terminal state. Only the two
+    /// unambiguous dispositions are reported; see
+    /// [`FrameworkAgentRuntime::with_routing_outcomes`].
+    pub success: bool,
+    /// The run the observation came from — the store deduplicates on it, so a
+    /// replayed or retried terminal event cannot inflate a model's success rate.
+    pub run_id: RunId,
+}
+
+/// Pool-erased writeback for a finished run's per-task-class result.
+///
+/// The routing table `performance.task_class_success` is what makes the
+/// nine-class classifier actually change which model is picked; it was
+/// permanently empty because the only non-test constructor of a `ModelProfile`
+/// (the bench harness) always wrote an empty map and nothing ever folded a real
+/// run into it. The writer exists —
+/// `codypendent_daemon::model_profiles::ModelProfileStore::record_outcome` — but
+/// it takes a `SqlitePool`, which this crate cannot name (ADR-009, see the
+/// module docs). So the loop reports through this trait exactly as it reaches
+/// the ledger through [`RunJournal`], and the daemon assembly implements it over
+/// the pool.
+///
+/// An implementation must treat this as advisory telemetry: it is called after
+/// the run's terminal event is already published, and an `Err` is logged and
+/// dropped, never surfaced to the run.
+#[async_trait]
+pub trait RoutingOutcomeSink: Send + Sync {
+    /// Record one terminal outcome. `Err` is a legible reason for the log.
+    async fn record(&self, outcome: RoutingOutcome<'_>) -> Result<(), String>;
+}
+
+// ---------------------------------------------------------------------------
 // Trace metadata (Chapter 13 groundwork)
 // ---------------------------------------------------------------------------
 
@@ -1387,6 +1522,15 @@ pub struct FrameworkAgentRuntime {
     /// gate outright — every offered MCP tool is advertised, today's behavior.
     /// Set from `models.toml`'s `[retrieval] mcp_top_k`.
     mcp_top_k: usize,
+    /// Retrieval gating for the BUILT-IN tool family (rubric 9): how many tools
+    /// the funnel picks on top of [`ALWAYS_ADVERTISED_TOOLS`]. `0` disables the
+    /// gate outright (advertise every offered built-in — the behavior before
+    /// this existed). Set from `models.toml`'s `[retrieval] builtin_top_k`.
+    builtin_top_k: usize,
+    /// The code graph the `graph.*` tools query (outcome 5), if wired. Like
+    /// `registry`, a process-wide read seam over the daemon's own derived
+    /// projection; `None` leaves the three tools unoffered.
+    code_graph: Option<Arc<dyn codypendent_knowledge::CodeGraphQueries>>,
     /// The registry the `skills.search` tool queries (rubric 9), if wired.
     /// Process-wide (one knowledge pool), like `github`/`mcp`, so it lives on
     /// the runtime rather than the run context. `None` leaves the tool unoffered
@@ -1416,6 +1560,10 @@ pub struct FrameworkAgentRuntime {
     task_board: Option<Arc<dyn TaskBoardChannel>>,
     /// Persisted multi-model councils, available to ordinary chat runs.
     councils: Option<Arc<dyn CouncilService>>,
+    /// Where a finished run's per-task-class result is reported (outcome 11), if
+    /// wired. `None` leaves the loop's behavior exactly as it was — no
+    /// classification, no writeback.
+    routing_outcomes: Option<Arc<dyn RoutingOutcomeSink>>,
 }
 
 /// How a run terminated, before it is folded into a [`RunDisposition`].
@@ -1451,6 +1599,8 @@ impl FrameworkAgentRuntime {
             search: None,
             blackboard: None,
             mcp_top_k: crate::models::DEFAULT_MCP_TOP_K,
+            builtin_top_k: crate::models::DEFAULT_BUILTIN_TOP_K,
+            code_graph: None,
             registry: None,
             docs: None,
             artifacts: None,
@@ -1458,7 +1608,21 @@ impl FrameworkAgentRuntime {
             workflow_control: None,
             task_board: None,
             councils: None,
+            routing_outcomes: None,
         }
+    }
+
+    /// Inject the sink a finished run's per-task-class result is reported to
+    /// (outcome 11). Without it the loop records nothing, exactly as before.
+    ///
+    /// Only `Completed` and `Failed` runs are reported. A `Cancelled` run is
+    /// deliberately skipped: a human stopping a run says nothing about whether
+    /// the model was doing well, and counting it either way would bias the
+    /// routing table the classifier reads.
+    #[must_use]
+    pub fn with_routing_outcomes(mut self, sink: Arc<dyn RoutingOutcomeSink>) -> Self {
+        self.routing_outcomes = Some(sink);
+        self
     }
 
     /// Inject the GitHub client the `github.*` tools call. Without it those tools
@@ -1507,6 +1671,18 @@ impl FrameworkAgentRuntime {
         self
     }
 
+    /// Set the BUILT-IN retrieval-gating budget (rubric 9) from `models.toml`'s
+    /// `[retrieval] builtin_top_k`: how many tools the funnel selects on top of
+    /// the [`ALWAYS_ADVERTISED_TOOLS`] floor. `0` disables the gate — every
+    /// offered built-in is advertised, exactly as before this existed — which is
+    /// the escape hatch if an operator ever finds the narrowing wrong for their
+    /// workload.
+    #[must_use]
+    pub fn with_builtin_top_k(mut self, builtin_top_k: usize) -> Self {
+        self.builtin_top_k = builtin_top_k;
+        self
+    }
+
     /// Inject the registry the `skills.search` tool queries (rubric 9). Without
     /// it the tool is never offered, so a run's surface is unchanged. The daemon
     /// binds it over the knowledge pool and the same retrieval funnel context
@@ -1514,6 +1690,20 @@ impl FrameworkAgentRuntime {
     #[must_use]
     pub fn with_registry_search(mut self, registry: Arc<dyn RegistrySearch>) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Inject the code-graph seam the `graph.*` tools query (outcome 5). Without
+    /// it the tools are never offered and a run behaves exactly as before. The
+    /// daemon binds it over the same pool and the same `repository_id_for` the
+    /// startup scan wrote the graph under — deriving that identity any other way
+    /// is how a caller ends up querying an id nothing was ever stored beneath.
+    #[must_use]
+    pub fn with_code_graph(
+        mut self,
+        code_graph: Arc<dyn codypendent_knowledge::CodeGraphQueries>,
+    ) -> Self {
+        self.code_graph = Some(code_graph);
         self
     }
 
@@ -1688,6 +1878,20 @@ impl FrameworkAgentRuntime {
         if self.registry.is_some() {
             names.push(SkillsSearch::NAME.to_string());
         }
+        // Outcome 5: offered whenever the graph seam is wired — a read of the
+        // daemon's own derived projection, so like `skills.search` the
+        // configured gate alone decides and no mode overlay removes it.
+        if self.code_graph.is_some() {
+            names.extend(
+                [
+                    GraphCallersOf::NAME,
+                    GraphBlastRadius::NAME,
+                    GraphTestsCovering::NAME,
+                ]
+                .iter()
+                .map(|name| (*name).to_string()),
+            );
+        }
         if self.offers_blackboard(run) {
             names.extend(
                 [BlackboardPostTool::NAME, BlackboardQueryTool::NAME]
@@ -1815,21 +2019,38 @@ impl FrameworkAgentRuntime {
     /// client): the static catalog filtered to exactly
     /// [`offered_tool_names`](Self::offered_tool_names) (the FIX 1 projection —
     /// a name absent there is fail-safe omitted even if the catalog and the
-    /// offered set ever drift), PLUS one definition per tool the MCP bridge
-    /// currently offers, carrying the server-supplied description and
-    /// `inputSchema` VERBATIM. MCP definitions are declaration-only
+    /// offered set ever drift), then narrowed by this run's retrieval selection
+    /// ([`RunContext::tools_advertised`], rubric 9), PLUS one definition per tool
+    /// the MCP bridge currently offers, carrying the server-supplied description
+    /// and `inputSchema` VERBATIM. MCP definitions are declaration-only
     /// (`executor: None`, `ApprovalMode::NeverRequire`) — the loop executes
     /// them, and the daemon's policy engine (not the framework) gates them.
     /// The MCP half projects through the SAME offered set (PR C2: a mode whose
-    /// overlay forbids commands drops `mcp.*` from both sides, keeping
-    /// advertised ≡ offered in every mode).
+    /// overlay forbids commands drops `mcp.*` from both sides).
+    ///
+    /// **Advertised ⊆ offered, and no longer ≡ offered.** Advertisement is what
+    /// the model is shown; the offered set is what `prepare` will dispatch. The
+    /// funnel narrows only the former, because a wrong ranking must cost the
+    /// model an idea and never the ability to finish (see
+    /// [`RunContext::tools_advertised`]). The relationship in the other
+    /// direction is still exact: a name absent from `offered` is never
+    /// advertised, in any mode.
     #[must_use]
     pub fn advertised_tool_definitions(&self, run: &RunContext) -> Vec<ToolDefinition> {
         use agent_framework_core::tools::{ApprovalMode, ToolKind};
         let offered = self.offered_tool_names(run);
+        let advertise = |name: &String| {
+            offered.contains(name)
+                && match &run.tools_advertised {
+                    // `mcp.*` has its own gate (`mcp_advertised`, already applied
+                    // inside `offered_tool_names`), so it is never re-filtered here.
+                    Some(selected) => name.starts_with("mcp.") || selected.contains(name),
+                    None => true,
+                }
+        };
         let mut definitions: Vec<ToolDefinition> = static_tool_definitions()
             .into_iter()
-            .filter(|def| offered.contains(&def.name))
+            .filter(|def| advertise(&def.name))
             .collect();
         if let Some(bridge) = &self.mcp {
             definitions.extend(
@@ -1851,13 +2072,126 @@ impl FrameworkAgentRuntime {
         definitions
     }
 
+    /// Choose which BUILT-IN tools this run advertises (rubric 9 — vector top-k
+    /// tool selection instead of injecting every description), or `None` to
+    /// advertise them all.
+    ///
+    /// This is the half of rubric 9 that used to be missing. The doc comment on
+    /// [`select_mcp_tools`](Self::select_mcp_tools) below used to claim the
+    /// built-in set "stays static and fully advertised — ALWAYS", and it did: two
+    /// runs with unrelated objectives produced byte-identical 21-definition tool
+    /// arrays, so on a default install (no MCP servers) retrieval gated exactly
+    /// zero tools. The funnel's ranked output reached the model only as prose in
+    /// a context card, next to the full schemas of everything.
+    ///
+    /// Now the same funnel (`codypendent_knowledge::retrieve`) ranks the run's
+    /// OFFERED built-ins — each projected into an in-memory registry item
+    /// carrying the schema catalog's description plus, when the knowledge crate
+    /// registers the same name, its curated intents and keywords — and the
+    /// advertisement is the floor plus the top `builtin_top_k`.
+    ///
+    /// # The floor
+    ///
+    /// [`ALWAYS_ADVERTISED_TOOLS`] is unioned in unconditionally (intersected
+    /// with what the run is offered, so a mode overlay's denials still win). The
+    /// outcome asks for "top-k selection instead of injecting all descriptions",
+    /// not "let retrieval decide whether the agent can read a file": the ranker
+    /// is a fuzzy lexical signal over one sentence of objective, and a query that
+    /// happens not to mention writing must not leave a Build run unable to write.
+    /// The floor is the set whose absence is unrecoverable; everything else the
+    /// model can get back by ranking, by naming it (dispatch is never narrowed),
+    /// or by asking `skills.search` — which is itself in the floor for exactly
+    /// that reason.
+    ///
+    /// Returns `None` (advertise everything, unchanged behavior) when: the gate
+    /// is disabled (`builtin_top_k == 0`), the run offers so few built-ins that
+    /// floor + k already covers them, or the funnel itself fails. Retrieval is an
+    /// aid, never a gate on running — a degraded funnel widens the
+    /// advertisement, never narrows it wrongly.
+    ///
+    /// Computed once per run (see [`execute_run`](Self::execute_run)), like the
+    /// MCP gate and for the same reason: the query is the objective plus the
+    /// latest user turn, and neither changes between steps.
+    #[must_use]
+    pub fn select_builtin_tools(&self, run: &RunContext) -> Option<Vec<String>> {
+        if self.builtin_top_k == 0 {
+            return None;
+        }
+        // `mcp.*` is excluded here and left to `select_mcp_tools`: the two
+        // families have different budgets and different failure modes, and
+        // ranking them in one pool would let a large MCP surface crowd out the
+        // built-ins (or vice versa).
+        let candidates: Vec<String> = self
+            .offered_tool_names(run)
+            .into_iter()
+            .filter(|name| !name.starts_with("mcp."))
+            .collect();
+        let floor: Vec<String> = ALWAYS_ADVERTISED_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .filter(|name| candidates.contains(name))
+            .collect();
+        if candidates.len() <= floor.len() + self.builtin_top_k {
+            return None;
+        }
+
+        let items = builtin_registry_items(&candidates);
+        let indexes = match RetrievalIndexes::build(&items, HashingEmbedder::new()) {
+            Ok(indexes) => indexes,
+            Err(error) => {
+                warn_builtin_gate_degraded(&error.to_string());
+                return None;
+            }
+        };
+        // Every projected item is System-scoped, Active, executable, FirstParty
+        // and uniformly `Low` risk (see `builtin_registry_items`), and the ceiling
+        // is `High` — so the funnel's hard filters admit the whole family and this
+        // is a pure relevance ranking. Nothing here is a security decision: the
+        // mode overlay in `offered_tool_names`, `prepare`, and the policy engine
+        // remain the only things that decide what a run may DO.
+        let query = RetrievalQuery::new(
+            retrieval_query_text(run),
+            vec![Scope::System],
+            RiskClass::High,
+        );
+        let config = RetrievalConfig {
+            disclose_tools_min: self.builtin_top_k,
+            disclose_tools_max: self.builtin_top_k,
+            // The projection has no skills or commands, so ask for none.
+            disclose_skills_min: 0,
+            disclose_skills_max: 0,
+            disclose_commands_max: 0,
+            ..RetrievalConfig::default()
+        };
+        match retrieve(&items, &indexes, &query, &config) {
+            Ok(result) => {
+                let mut selected = floor;
+                for card in result.tools {
+                    if !selected.contains(&card.name) {
+                        selected.push(card.name);
+                    }
+                }
+                tracing::info!(
+                    run_id = %run.run_id,
+                    offered = candidates.len(),
+                    advertised = selected.len(),
+                    "retrieval narrowed this run's built-in tool advertisement"
+                );
+                Some(selected)
+            }
+            Err(error) => {
+                warn_builtin_gate_degraded(&error.to_string());
+                None
+            }
+        }
+    }
+
     /// Choose which `mcp.*` tools this run advertises (rubric 9 — retrieval-gated
     /// tool advertisement), or `None` to advertise them all.
     ///
-    /// The built-in tool set is small, fixed, and always relevant, so it stays
-    /// static and fully advertised — ALWAYS. The MCP family is the opposite: it
-    /// grows without bound with the operator's server list, and every tool in it
-    /// used to be injected on every step. Above the `mcp_top_k` threshold this
+    /// The MCP family grows without bound with the operator's server list, and
+    /// every tool in it used to be injected on every step. Above the `mcp_top_k`
+    /// threshold this
     /// runs the SAME retrieval funnel the knowledge fabric uses for context
     /// assembly (`codypendent_knowledge::retrieve`) over the bridge's tools — each
     /// projected into an in-memory registry item carrying the server-supplied
@@ -1963,6 +2297,13 @@ impl FrameworkAgentRuntime {
         // `None` result means "advertise every offered MCP tool", the behavior
         // before this existed.
         run.mcp_advertised = self.select_mcp_tools(&run);
+        // Rubric 9, the other half: narrow the BUILT-IN advertisement to the
+        // floor plus the top-k most relevant to this objective, ONCE, here — for
+        // the same reason as the MCP gate above, and read by
+        // `advertised_tool_definitions` on every step. `None` means "advertise
+        // every offered built-in", the behavior before this existed. Dispatch is
+        // untouched: `offered_tool_names` never consults this.
+        run.tools_advertised = self.select_builtin_tools(&run);
         let model_id = driver.model_id();
         let run_actor = Actor::Agent {
             agent_id: AgentId::new(),
@@ -2582,7 +2923,57 @@ impl FrameworkAgentRuntime {
         )
         .await?;
 
+        // Outcome 11: fold this run into the model's per-task-class success
+        // table. AFTER the terminal event, and best-effort: this is telemetry,
+        // so it must never delay a run's completion nor fail an already-terminal
+        // run.
+        self.record_routing_outcome(&run, driver, &disposition)
+            .await;
+
         Ok(RunOutcome { disposition, usage })
+    }
+
+    /// Report a finished run's result to the routing-outcome sink, if one is
+    /// wired and the run produced an unambiguous signal.
+    ///
+    /// Three conditions each skip the write rather than guess:
+    /// no sink; a driver with no known endpoint (a scripted/test driver — see
+    /// [`ModelDriver::endpoint`]); and a `Cancelled` disposition, which says
+    /// nothing about model quality in either direction.
+    async fn record_routing_outcome(
+        &self,
+        run: &RunContext,
+        driver: &dyn ModelDriver,
+        disposition: &RunDisposition,
+    ) {
+        let Some(sink) = self.routing_outcomes.as_ref() else {
+            return;
+        };
+        let success = match disposition {
+            RunDisposition::Completed { .. } => true,
+            RunDisposition::Failed { .. } => false,
+            _ => return,
+        };
+        let Some(endpoint) = driver.endpoint() else {
+            return;
+        };
+        let model = driver.model_id();
+        let outcome = RoutingOutcome {
+            model: &model,
+            endpoint: &endpoint,
+            task_class: classify_run(run).class,
+            success,
+            run_id: run.run_id,
+        };
+        if let Err(reason) = sink.record(outcome).await {
+            tracing::warn!(
+                run_id = %run.run_id,
+                model = %model,
+                endpoint = %endpoint,
+                reason,
+                "could not record the run's routing outcome"
+            );
+        }
     }
 
     // -- event helpers -----------------------------------------------------
@@ -3294,6 +3685,44 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::SkillsSearch(input),
                 })
             }
+            // Outcome 5: the three code-graph reads. Match-guarded on a wired
+            // seam (the blackboard idiom), so a call with no graph falls through
+            // to the unknown-tool refusal the offering already promised. The
+            // depth a model asks for is carried, never rejected: the store
+            // clamps it, so an absurd number answers narrowly instead of failing.
+            GraphCallersOf::NAME if self.code_graph.is_some() => {
+                let (symbol, _) = parse_symbol_question(args, GraphCallersOf::NAME)?;
+                let question = codypendent_knowledge::GraphQuestion::CallersOf { symbol };
+                Ok(Prepared {
+                    action: graph_proposed_action(
+                        &run.repository,
+                        summarize_graph_question(&question),
+                    ),
+                    tool: PreparedTool::CodeGraph(question),
+                })
+            }
+            GraphBlastRadius::NAME if self.code_graph.is_some() => {
+                let (symbol, depth) = parse_symbol_question(args, GraphBlastRadius::NAME)?;
+                let question = codypendent_knowledge::GraphQuestion::BlastRadius { symbol, depth };
+                Ok(Prepared {
+                    action: graph_proposed_action(
+                        &run.repository,
+                        summarize_graph_question(&question),
+                    ),
+                    tool: PreparedTool::CodeGraph(question),
+                })
+            }
+            GraphTestsCovering::NAME if self.code_graph.is_some() => {
+                let (path, depth) = parse_tests_covering(args)?;
+                let question = codypendent_knowledge::GraphQuestion::TestsCovering { path, depth };
+                Ok(Prepared {
+                    action: graph_proposed_action(
+                        &run.repository,
+                        summarize_graph_question(&question),
+                    ),
+                    tool: PreparedTool::CodeGraph(question),
+                })
+            }
             // `artifact.read`: gated on a wired reader exactly as
             // `offered_tool_names` gates the offer (the blackboard match-guard
             // idiom) — a call with no reader falls through to the unknown-tool
@@ -3797,7 +4226,22 @@ impl FrameworkAgentRuntime {
                         open: input.open.as_deref(),
                         // Server-derived, never model-supplied: a search sees
                         // exactly this run's repository scope.
-                        repository: &run.repository,
+                        //
+                        // The run's repository IDENTITY, not its policy read root
+                        // (`run.repository`). In the default Build mode those
+                        // differ: the read root is a dedicated LINKED WORKTREE, and
+                        // `git rev-parse --show-toplevel` inside one returns the
+                        // worktree — so deriving the scope from it produced a
+                        // `RepositoryId` no repository-scoped skill is registered
+                        // under, and every build-mode search reported the run's own
+                        // installed skills as "not among the skills this search
+                        // disclosed" while the context manifest was advertising
+                        // their cards. The board and GitHub wiring already key off
+                        // this identity; only the registry search was missed.
+                        repository: run
+                            .board_repository
+                            .as_deref()
+                            .map_or(run.repository.as_path(), Path::new),
                     };
                     match registry.search(request).await {
                         Ok(outcome) => (
@@ -3814,6 +4258,29 @@ impl FrameworkAgentRuntime {
                         ),
                     }
                 }
+            },
+            // Outcome 5: first-party content — symbol names and repo-relative
+            // paths this daemon's own parser produced — and already bounded by
+            // the store's answer limit, so unlike the MCP/web/skill arms it needs
+            // no sanitize-and-cap pass before entering the observation stream.
+            PreparedTool::CodeGraph(question) => match self.code_graph.as_ref() {
+                None => (
+                    "the code graph is unavailable (no graph connection)".to_string(),
+                    None,
+                    ToolOutcome::Failed {
+                        message: "graph.unavailable".to_string(),
+                    },
+                ),
+                Some(graph) => match graph.ask(&run.repository, question).await {
+                    Ok(answer) => (answer.render(), None, ToolOutcome::Succeeded),
+                    Err(reason) => (
+                        format!("code-graph query failed: {reason}"),
+                        None,
+                        ToolOutcome::Failed {
+                            message: "graph.failed".to_string(),
+                        },
+                    ),
+                },
             },
             PreparedTool::Mcp { server, tool, args } => match self.mcp.as_ref() {
                 None => mcp_unavailable(&format!("mcp.{server}.{tool}")),
@@ -4634,6 +5101,9 @@ enum PreparedTool {
     /// A `skills.search` call (rubric 9): the parsed query plus the optional
     /// skill name whose procedure to open.
     SkillsSearch(SkillsSearchInput),
+    /// A `graph.*` call (outcome 5): the typed question, already bounded by its
+    /// parser and clamped again by the store.
+    CodeGraph(codypendent_knowledge::GraphQuestion),
     DocsCreate(DocsCreateInput),
     DocsRead(DocsReadInput),
     DocsEdit(DocsEditInput),
@@ -4800,6 +5270,111 @@ fn mcp_unavailable(tool: &str) -> (String, Option<ArtifactRef>, ToolOutcome) {
 /// pure relevance comparison among peers and the funnel's hard filters admit all
 /// of them. This projection is NOT a security decision: an MCP call is
 /// dispositioned by the daemon's policy engine at dispatch, exactly as before.
+/// The built-in tools advertised on EVERY step, whatever retrieval ranks — the
+/// floor under [`select_builtin_tools`](FrameworkAgentRuntime::select_builtin_tools).
+///
+/// **Why a floor at all.** The funnel's default embedder is a character-trigram
+/// hash, not a semantic model, and the query is one sentence of objective. It
+/// ranks well enough to choose *which specialist tools to mention*; it is nowhere
+/// near reliable enough to decide whether a Build run is allowed to see the write
+/// tools. "Refactor the parser" does not lexically resemble "write a file", and a
+/// run that cannot write is not a narrowed run — it is a broken one. So the
+/// motor skills are unconditional and only the specialists compete for the top-k.
+///
+/// **Why these seven.** They are the tools whose absence is unrecoverable:
+/// reading, searching, creating, editing, and patching files, running a command,
+/// and — the escape hatch — asking the registry what else exists. Everything an
+/// agent does that changes the world routes through one of them.
+///
+/// **Why not more.** `git.diff`, `repository.test`, `web.search`,
+/// `memory.remember`, and the `task.*`/`workflow.*`/`council.*`/`docs.*` families
+/// are deliberately OUT. Each is either reachable another way (`git.diff` and
+/// `repository.test` are `shell.run` with a nicer shape) or is a specialist whose
+/// whole point is to appear when the objective calls for it. Putting them in the
+/// floor would rebuild inject-everything one sympathetic exception at a time.
+///
+/// The floor is intersected with the run's offered set before use, so a mode
+/// overlay that denies writes or commands still removes them — a floor can never
+/// widen what a mode permits.
+const ALWAYS_ADVERTISED_TOOLS: &[&str] = &[
+    Shell::NAME,
+    ReadFile::NAME,
+    Search::NAME,
+    WriteFile::NAME,
+    EditFile::NAME,
+    ApplyPatch::NAME,
+    SkillsSearch::NAME,
+];
+
+/// Project this run's offered built-in tool names into in-memory registry items
+/// the funnel can rank.
+///
+/// The description is the SCHEMA CATALOG's — the exact prose the model would be
+/// shown — so the ranker reads what the advertisement would say. Intents and
+/// keywords come from `codypendent_knowledge::builtin_tools()` when it registers
+/// the same name, which is the whole value of keeping the two catalogs in sync:
+/// "the ci is red" matches `/fix-ci`'s curated intents, never its description.
+/// A name the knowledge crate does not register still ranks, on its description
+/// and its dotted name alone.
+///
+/// Risk and trust are deliberately UNIFORM (`Low`, `FirstParty`). The rerank
+/// applies a risk penalty and a trust bonus; letting real values through would
+/// quietly bias advertisement by danger, and this projection must be pure
+/// relevance — the run's actual security decisions happen in the policy engine.
+fn builtin_registry_items(names: &[String]) -> Vec<RegistryItem> {
+    use codypendent_knowledge::{
+        builtin_tools, Provenance as KnowledgeProvenance, RegistryItemKind, RegistryStatus,
+        TrustMetadata, TrustTier, Version,
+    };
+    let catalog = static_tool_definitions();
+    let registered = builtin_tools();
+    let now = chrono::Utc::now();
+    names
+        .iter()
+        .filter_map(|name| {
+            // A name with no schema can never be advertised, so ranking it would
+            // only waste a top-k slot on a tool the model will never be shown.
+            let definition = catalog.iter().find(|def| &def.name == name)?;
+            let known = registered.iter().find(|item| &item.name == name);
+            // The dotted name's own segments ("docs", "create") are what a user
+            // types when they mean a family, so they seed the exact-overlap arm
+            // alongside any curated keywords.
+            let mut keywords: Vec<String> = name.split('.').map(str::to_string).collect();
+            if let Some(item) = known {
+                keywords.extend(item.keywords.iter().cloned());
+            }
+            Some(RegistryItem {
+                id: codypendent_protocol::RegistryItemId::new(),
+                kind: RegistryItemKind::Tool,
+                name: name.clone(),
+                version: Version("1.0.0".to_string()),
+                scope: Scope::System,
+                description: definition.description.clone(),
+                intents: known.map(|item| item.intents.clone()).unwrap_or_default(),
+                keywords,
+                examples: Vec::new(),
+                input_schema: None,
+                output_schema: None,
+                dependencies: Vec::new(),
+                permissions: Vec::new(),
+                risk: RiskClass::Low,
+                provenance: KnowledgeProvenance::BuiltIn,
+                trust: TrustMetadata {
+                    publisher: "codypendent".to_string(),
+                    signature_required: false,
+                    signature: None,
+                    tier: TrustTier::FirstParty,
+                },
+                status: RegistryStatus::Active,
+                content_hash: String::new(),
+                executable: true,
+                created_at: now,
+                updated_at: now,
+            })
+        })
+        .collect()
+}
+
 fn mcp_registry_item(info: &McpToolInfo) -> RegistryItem {
     use codypendent_knowledge::{
         Provenance as KnowledgeProvenance, RegistryItemKind, RegistryStatus, TrustMetadata,
@@ -4869,6 +5444,16 @@ fn warn_mcp_gate_degraded(reason: &str) {
     tracing::warn!(
         %reason,
         "mcp retrieval gate unavailable; advertising every offered mcp tool"
+    );
+}
+
+/// Log a degraded built-in gate: the funnel failed, so this run advertises every
+/// offered built-in — the pre-gate behavior. Warned rather than propagated for
+/// the same reason as the MCP gate: retrieval is an aid, never a gate on running.
+fn warn_builtin_gate_degraded(reason: &str) {
+    tracing::warn!(
+        %reason,
+        "built-in retrieval gate unavailable; advertising every offered built-in tool"
     );
 }
 
@@ -5465,6 +6050,11 @@ pub struct FrameworkModelDriver {
     /// (the default via [`Self::new`]) means "unknown": [`Self::context_window`]
     /// honestly returns `None`, never a fabricated default.
     context_tokens: Option<u64>,
+    /// The endpoint (base URL) this model is served from, sourced from
+    /// `ModelConfig.base_url` by [`Self::from_registry`]. `None` (the default
+    /// via [`Self::new`]) means "unknown", which suppresses the routing-outcome
+    /// writeback rather than guessing a key — see [`ModelDriver::endpoint`].
+    endpoint: Option<String>,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -5481,6 +6071,7 @@ impl FrameworkModelDriver {
             client,
             model_id,
             context_tokens: None,
+            endpoint: None,
         }
     }
 
@@ -5489,7 +6080,22 @@ impl FrameworkModelDriver {
     /// [`Self::context_window`] can answer honestly (`Some` when configured,
     /// `None` when unset).
     pub async fn from_registry(models: &ModelRegistry, model_id: ModelId) -> anyhow::Result<Self> {
-        let context_tokens = models.get(&model_id).and_then(|cfg| cfg.context_tokens);
+        // Through [`ModelRegistry::context_tokens_for`], not
+        // `ModelConfig::context_tokens` directly: `context_tokens` crosses a
+        // trust boundary (a provider's own `/models` response can win over the
+        // curated catalog and is persisted to `models.toml` verbatim), and this
+        // value is load-bearing downstream — it is forwarded as Ollama's
+        // `num_ctx` request hint and is the denominator of the TUI's
+        // context-usage percentage. `context_tokens_for` clamps to the TIGHTER
+        // of the absolute plausibility ceiling and the specific catalog row's
+        // own documented window, so an overstated reading for a curated model
+        // is caught even when it sits under the absolute cap.
+        let context_tokens = models.context_tokens_for(&model_id);
+        // The endpoint the profile store keys on alongside the model id:
+        // `codypendent models bench <id>` persists under `ModelConfig::base_url`
+        // (`crates/cli/src/commands.rs`), so a routing-outcome writeback must
+        // report the same string or it lands under a key no profile row has.
+        let endpoint = models.get(&model_id).map(|cfg| cfg.base_url.clone());
         let client = models
             .client_for(&model_id)
             .await
@@ -5498,6 +6104,7 @@ impl FrameworkModelDriver {
             client,
             model_id,
             context_tokens,
+            endpoint,
         })
     }
 }
@@ -5585,6 +6192,20 @@ fn workflow_draft_schema() -> Value {
     })
 }
 
+/// The full catalog of built-in tool schemas.
+///
+/// This is the CATALOG, not the advertisement: every name here must also appear
+/// in [`offered_tool_names`](FrameworkAgentRuntime::offered_tool_names) for the
+/// run before it can reach the model, and
+/// [`advertised_tool_definitions`](FrameworkAgentRuntime::advertised_tool_definitions)
+/// narrows it further through the retrieval funnel. A tool missing here is
+/// therefore invisible to the model even when it is offered AND dispatchable —
+/// which is exactly what happened to the four `docs.*` tools: added to the
+/// offered set and to `prepare`, never to this vec, so the doc-writer could not
+/// be invoked by any agent. Adding a dispatchable tool means touching three
+/// places (offer, dispatch, and this catalog), and
+/// `every_offered_tool_has_a_schema_in_the_catalog` fails the build if the
+/// first and the third ever disagree again.
 pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
     use agent_framework_core::tools::{ApprovalMode, ToolDefinition, ToolKind};
     let decl = |name: &str, description: &str, parameters: Value| ToolDefinition {
@@ -6031,6 +6652,129 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         ),
+        // Outcome 5: the agent's window onto the code graph. Offered only when
+        // the daemon wired the graph seam; retrieval then decides whether a given
+        // objective is one these answer.
+        decl(
+            GraphCallersOf::NAME,
+            "List the symbols that call a function, method, or type in this repository. Name \
+                 the symbol as it appears in the source (`decide`, `Router::decide`); you do not \
+                 need a file path. Use this before changing a signature.",
+            json!({
+                "type": "object",
+                "properties": {"symbol": {"type": "string"}},
+                "required": ["symbol"]
+            }),
+        ),
+        decl(
+            GraphBlastRadius::NAME,
+            "List everything that transitively reaches a symbol — what could break if you \
+                 change it. `depth` is the number of call layers to walk (default 2, clamped to \
+                 the store's ceiling).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string"},
+                    "depth": {"type": "integer", "minimum": 1, "maximum": 5}
+                },
+                "required": ["symbol"]
+            }),
+        ),
+        decl(
+            GraphTestsCovering::NAME,
+            "List the tests that exercise a file: tests defined in it, plus tests elsewhere \
+                 that reach a symbol it defines. `path` may be a suffix (`router.rs`).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "depth": {"type": "integer", "minimum": 1, "maximum": 5}
+                },
+                "required": ["path"]
+            }),
+        ),
+        // The doc-writer (rubric #4). These four were dispatchable and offered
+        // from the day they shipped but had no entry here, so the intersection in
+        // `advertised_tool_definitions` dropped every one of them and no agent
+        // could ever call one. The descriptions say "not a Markdown file in the
+        // worktree" because the failure mode without them is not an error — it is
+        // the model quietly reaching for `workspace.write_file` instead.
+        decl(
+            DocsCreateTool::NAME,
+            "Draft a new document in the knowledge fabric (Docs Studio) — the durable, \
+                 block-structured, reviewable place documentation lives. Use this, not \
+                 `workspace.write_file`, when asked to write something up. Returns the new \
+                 document's id.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "scope": {
+                        "type": "string",
+                        "description": "Visibility: `repository` (default) or `system`."
+                    },
+                    "markdown": {
+                        "type": "string",
+                        "description": "The document body as Markdown; omit for an empty draft."
+                    }
+                },
+                "required": ["title"]
+            }),
+        ),
+        decl(
+            DocsReadTool::NAME,
+            "Read a document as Markdown, or — with no arguments — list the documents this \
+                 repository can see. Read before editing: `docs.edit` and `docs.suggest` need a \
+                 block id, and block ids come from here.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "document_id": {
+                        "type": "string",
+                        "description": "The document to read; omit to list the visible documents."
+                    }
+                }
+            }),
+        ),
+        decl(
+            DocsEditTool::NAME,
+            "Replace one block's text in a document. Whether this lands as a direct edit or as \
+                 a reviewable suggestion is decided by the document's collaboration mode, not by \
+                 you — an organization-scoped document turns this into a suggestion.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string"},
+                    "block_id": {"type": "string"},
+                    "text": {
+                        "type": "string",
+                        "description": "The block's new text (may be empty to clear it)."
+                    }
+                },
+                "required": ["document_id", "block_id", "text"]
+            }),
+        ),
+        decl(
+            DocsSuggestTool::NAME,
+            "Propose a replacement for a character range inside a block, for a human to accept \
+                 or reject. Prefer this over `docs.edit` when the document is someone else's or \
+                 the change is a judgement call. Omitting the range inserts at the block start.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string"},
+                    "block_id": {"type": "string"},
+                    "range_start": {"type": "integer", "minimum": 0},
+                    "range_end": {"type": "integer", "minimum": 0},
+                    "replacement": {"type": "string"},
+                    "rationale": {
+                        "type": "string",
+                        "description": "Why the change is proposed; shown to the reviewer."
+                    }
+                },
+                "required": ["document_id", "block_id", "replacement"]
+            }),
+        ),
     ]
 }
 
@@ -6101,6 +6845,10 @@ impl ModelDriver for FrameworkModelDriver {
 
     fn context_window(&self) -> Option<u64> {
         self.context_tokens
+    }
+
+    fn endpoint(&self) -> Option<String> {
+        self.endpoint.clone()
     }
 
     async fn next_step(
@@ -7002,6 +7750,60 @@ mod tests {
     }
 
     #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn framework_driver_context_window_is_clamped_to_the_catalog_rows_own_ceiling() {
+        // `context_tokens` crosses a trust boundary: a provider's own `/models`
+        // response can beat the curated catalog and is persisted to
+        // `models.toml` verbatim. From here it is forwarded as Ollama's
+        // `num_ctx` request hint and used as the context-usage denominator, so
+        // `from_registry` must read it through `ModelRegistry::context_tokens_for`
+        // — which applies the catalog row's OWN documented ceiling — not off
+        // `ModelConfig::context_tokens` directly. This reading (1.9M against a
+        // curated 1M row) sits under the absolute plausibility clamp, so only
+        // the catalog-aware path catches it.
+        let provider_toml = r#"
+[[provider]]
+id = "anthropic"
+name = "Anthropic (Claude)"
+protocol = "anthropic"
+base_url = "https://api.anthropic.com"
+[[provider.auth]]
+kind = "api_key"
+env = ["ANTHROPIC_API_KEY_UNSET_AGENT_TEST"]
+header = "x-api-key"
+prefix = ""
+
+[[model]]
+id = "claude-opus-5"
+provider_id = "anthropic"
+context_tokens = 1000000
+"#;
+        let file: codypendent_providers::ProvidersFile =
+            toml::from_str(provider_toml).expect("provider toml");
+        let catalog = codypendent_providers::Catalog::from_parts(file.providers, file.models);
+        let id = ModelId("anthropic/claude-opus-5".to_string());
+        let registry = ModelRegistry::new([crate::models::ModelConfig {
+            id: id.clone(),
+            provider: "openai-compatible".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            model: "claude-opus-5".to_string(),
+            api_key_env: String::new(),
+            context_tokens: Some(1_900_000),
+            provider_id: Some("anthropic".to_string()),
+        }])
+        .with_catalog(catalog);
+
+        let driver = FrameworkModelDriver::from_registry(&registry, id)
+            .await
+            .expect("driver builds from a registered model");
+        assert_eq!(
+            driver.context_window(),
+            Some(1_000_000),
+            "an overstated provider reading must not reach num_ctx or the context-usage denominator"
+        );
+    }
+
+    #[cfg(feature = "provider-openai")]
     #[test]
     fn apply_context_window_sets_ollama_num_ctx_when_known() {
         // Context-window protection (BT4): a known window must be forwarded as
@@ -7341,6 +8143,332 @@ mod tests {
         assert!(
             names.contains(&Shell::NAME) && names.contains(&ReadFile::NAME),
             "the unconditional baseline tools are still advertised: {names:?}"
+        );
+    }
+
+    // -- Rubric 9 / #4: retrieval-gated built-in advertisement ---------------
+
+    /// A do-nothing document channel: enough to flip the `self.docs.is_some()`
+    /// gate. What the tools DO is covered by `codypendentd`'s docs integration
+    /// test; what is covered here is whether the model is ever shown them.
+    struct StubDocsChannel;
+
+    #[async_trait]
+    impl DocsChannel for StubDocsChannel {
+        async fn create(
+            &self,
+            _author: &DocsAuthor,
+            _request: DocsCreate,
+            _repository: &str,
+        ) -> Result<String, DocsChannelError> {
+            Ok("doc-1".to_string())
+        }
+        async fn read(
+            &self,
+            _document_id: Option<&str>,
+            _repository: &str,
+        ) -> Result<String, DocsChannelError> {
+            Ok(String::new())
+        }
+        async fn edit(
+            &self,
+            _author: &DocsAuthor,
+            _repository: &str,
+            _request: DocsEdit,
+        ) -> Result<DocsWriteEffect, DocsChannelError> {
+            Ok(DocsWriteEffect::Applied { revision: 1 })
+        }
+        async fn suggest(
+            &self,
+            _author: &DocsAuthor,
+            _repository: &str,
+            _request: DocsSuggest,
+        ) -> Result<DocsWriteEffect, DocsChannelError> {
+            Ok(DocsWriteEffect::Suggested {
+                suggestion_id: "s-1".to_string(),
+            })
+        }
+    }
+
+    /// The advertisement half of rubric #4, which the shipped proof test skipped.
+    ///
+    /// `docs_agent_it.rs` asserted on `offered_tool_names` and then drove the
+    /// calls with a `ScriptedDriver`, so it verified dispatch and never noticed
+    /// that `static_tool_definitions()` had no `docs.*` entry — the intersection
+    /// in `advertised_tool_definitions` dropped all four, and no real model could
+    /// call a tool it was never shown. This is the `task.*` pattern
+    /// (`the_task_tools_are_advertised_to_a_plain_chat_run`) applied to `docs.*`.
+    #[test]
+    fn the_docs_tools_are_advertised_when_a_document_channel_is_wired() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        // Without a channel: neither offered nor advertised.
+        let bare = solo_run(session_id, repo.path());
+        assert!(
+            !runtime
+                .advertised_tool_definitions(&bare)
+                .iter()
+                .any(|def| def.name.starts_with("docs.")),
+            "no channel → no docs.* advertisement"
+        );
+
+        let wired = runtime.with_docs(Arc::new(StubDocsChannel));
+        // The objective names documentation, so the funnel ranks `docs.*` up —
+        // and the FLOOR is present regardless.
+        let mut run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "document the charge path and write it up as a knowledge doc",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        run.tools_advertised = wired.select_builtin_tools(&run);
+
+        let advertised: Vec<String> = wired
+            .advertised_tool_definitions(&run)
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        for tool in [
+            DocsCreateTool::NAME,
+            DocsReadTool::NAME,
+            DocsEditTool::NAME,
+            DocsSuggestTool::NAME,
+        ] {
+            assert!(
+                advertised.iter().any(|name| name == tool),
+                "{tool} must be advertised for a documentation objective: {advertised:?}"
+            );
+        }
+    }
+
+    /// The structural guard that makes F4.1's class of bug a build failure: every
+    /// name a run can be OFFERED must have a schema in the catalog. A tool added
+    /// to `offered_tool_names` and to `prepare` but not to
+    /// `static_tool_definitions()` is dispatchable-but-invisible — exactly what
+    /// happened to `docs.*` — and silently so, because the intersection just
+    /// drops it. Run with the gate off, so this asserts about the CATALOG rather
+    /// than about what retrieval happened to rank.
+    #[test]
+    fn every_offered_tool_has_a_schema_in_the_catalog() {
+        let (runtime, _events, session_id) = test_runtime();
+        // Wire every configured gate that has an in-crate stub, so the offered
+        // set is as wide as this test can make it.
+        let runtime = runtime
+            .with_docs(Arc::new(StubDocsChannel))
+            .with_search(Arc::new(StubSearchApi {
+                result: Ok(stub_outcome("x")),
+            }))
+            .with_task_board(Arc::new(RecordingTaskBoard::default()))
+            .with_builtin_top_k(0);
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "anything",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        )
+        .with_board_repository("/repo");
+
+        let catalog: Vec<String> = static_tool_definitions()
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        let missing: Vec<String> = runtime
+            .offered_tool_names(&run)
+            .into_iter()
+            .filter(|name| !name.starts_with("mcp.") && !catalog.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "offered but absent from static_tool_definitions(), so the model can never \
+             see them: {missing:?}"
+        );
+    }
+
+    /// Rubric 9's headline claim, as a unit: the advertisement a run gets now
+    /// DEPENDS on what the run is doing. Before this, two unrelated objectives
+    /// produced byte-identical tool arrays.
+    #[test]
+    fn retrieval_narrows_the_builtin_advertisement_per_objective() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_docs(Arc::new(StubDocsChannel))
+            .with_task_board(Arc::new(RecordingTaskBoard::default()));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let advertise = |objective: &str| -> Vec<String> {
+            let mut run = RunContext::new(
+                session_id,
+                RunId::new(),
+                objective,
+                AgentMode::Build,
+                repo.path(),
+                repo.path(),
+            )
+            .with_board_repository("/repo");
+            run.tools_advertised = runtime.select_builtin_tools(&run);
+            let mut names: Vec<String> = runtime
+                .advertised_tool_definitions(&run)
+                .into_iter()
+                .map(|def| def.name)
+                .collect();
+            names.sort();
+            names
+        };
+
+        let offered_count = {
+            let run = RunContext::new(
+                session_id,
+                RunId::new(),
+                "x",
+                AgentMode::Build,
+                repo.path(),
+                repo.path(),
+            )
+            .with_board_repository("/repo");
+            runtime.offered_tool_names(&run).len()
+        };
+
+        let docs = advertise("document the charge path and write it up as a knowledge doc");
+        let backlog = advertise("break this feature into kanban backlog cards for the board");
+
+        assert_ne!(
+            docs, backlog,
+            "two unrelated objectives must not get the same tool array"
+        );
+        assert!(
+            docs.len() < offered_count && backlog.len() < offered_count,
+            "the advertisement must be narrower than the offered set \
+             (docs {}, backlog {}, offered {offered_count})",
+            docs.len(),
+            backlog.len()
+        );
+        assert!(
+            docs.iter().any(|name| name.starts_with("docs.")),
+            "a documentation objective selects the docs tools: {docs:?}"
+        );
+        assert!(
+            backlog.iter().any(|name| name.starts_with("task.")),
+            "a backlog objective selects the board tools: {backlog:?}"
+        );
+        // The floor holds in BOTH, whatever the ranking did.
+        for names in [&docs, &backlog] {
+            for floor in ALWAYS_ADVERTISED_TOOLS {
+                // `skills.search` needs a wired registry seam, which this runtime
+                // has not got, so it is not offered here and cannot be floored in.
+                if *floor == SkillsSearch::NAME {
+                    continue;
+                }
+                assert!(
+                    names.iter().any(|name| name == floor),
+                    "{floor} is in the floor and must always be advertised: {names:?}"
+                );
+            }
+        }
+    }
+
+    /// The safety property the floor exists to back up: narrowing the
+    /// advertisement never narrows DISPATCH. A tool retrieval declined to show
+    /// still prepares, so a model that learned the name from an earlier turn (or
+    /// from `skills.search`) is never stranded mid-task.
+    #[tokio::test]
+    async fn a_narrowed_advertisement_still_dispatches_every_offered_tool() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_task_board(Arc::new(RecordingTaskBoard::default()))
+            .with_docs(Arc::new(StubDocsChannel));
+        let repo = tempfile::tempdir().expect("tempdir");
+        // `repository.test` detects its command from the worktree's build
+        // manifest, so give it one — otherwise a `prepare` failure here would be
+        // an absent Cargo.toml, not the dispatch gate this test is about.
+        std::fs::write(
+            repo.path().join("Cargo.toml"),
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo.toml");
+        let mut run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "read the parser and explain how tokens are produced",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        )
+        .with_board_repository("/repo");
+        run.tools_advertised = runtime.select_builtin_tools(&run);
+
+        let advertised: Vec<String> = runtime
+            .advertised_tool_definitions(&run)
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        let dropped: Vec<String> = runtime
+            .offered_tool_names(&run)
+            .into_iter()
+            .filter(|name| !advertised.contains(name))
+            .collect();
+        assert!(
+            !dropped.is_empty(),
+            "this objective is expected to narrow something"
+        );
+        for name in &dropped {
+            assert!(
+                runtime
+                    .prepare(name, &tool_probe_args(name), &run)
+                    .await
+                    .is_ok(),
+                "`{name}` was dropped from the advertisement but must still dispatch"
+            );
+        }
+    }
+
+    /// Minimal valid arguments for the tools this test file may need to prepare.
+    fn tool_probe_args(name: &str) -> Value {
+        match name {
+            "shell.run" | "repository.test" => json!({"program": "true"}),
+            "workspace.read_file" => json!({"path": "a.txt"}),
+            "workspace.search" => json!({"pattern": "x"}),
+            "workspace.write_file" => json!({"path": "a.txt", "content": "x"}),
+            "workspace.edit_file" => json!({"path": "a.txt", "old": "x", "new": "y"}),
+            "git.apply_patch" => json!({"patch": "diff"}),
+            "memory.remember" => json!({"statement": "a fact"}),
+            "task.create" => json!({"title": "t"}),
+            "task.update" | "task.move" => json!({"item_id": "1", "status": "doing"}),
+            "docs.create" => json!({"title": "t"}),
+            "docs.edit" => json!({"document_id": "d", "block_id": "b", "text": "x"}),
+            "docs.suggest" => json!({"document_id": "d", "block_id": "b", "replacement": "x"}),
+            _ => json!({}),
+        }
+    }
+
+    /// `builtin_top_k = 0` restores full injection exactly — the operator escape
+    /// hatch, and the property that makes this change reversible in production
+    /// without a rebuild.
+    #[test]
+    fn a_zero_builtin_budget_disables_the_gate() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_docs(Arc::new(StubDocsChannel))
+            .with_builtin_top_k(0);
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut run = solo_run(session_id, repo.path());
+        run.tools_advertised = runtime.select_builtin_tools(&run);
+        assert!(run.tools_advertised.is_none(), "the gate is disabled");
+
+        let advertised: Vec<String> = runtime
+            .advertised_tool_definitions(&run)
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        let offered = runtime.offered_tool_names(&run);
+        assert_eq!(
+            advertised.len(),
+            offered.len(),
+            "with the gate off, advertised ≡ offered: {advertised:?} vs {offered:?}"
         );
     }
 
@@ -9823,6 +10951,258 @@ mod tests {
             }
         }
         out
+    }
+
+    // -----------------------------------------------------------------------
+    // Outcome 11: the routing-outcome writeback.
+    //
+    // `ModelProfileStore::record_outcome` is the writer that fills
+    // `performance.task_class_success` — the per-task-class table the nine-class
+    // classifier routes on, which stayed permanently empty because nothing ever
+    // called it. These tests pin the loop's half of that: which runs report,
+    // which deliberately do not, and that the class reported is the one the
+    // router would have classified the same objective as.
+    // -----------------------------------------------------------------------
+
+    /// One observation a [`RecordingOutcomeSink`] captured — the borrowed
+    /// [`RoutingOutcome`] in owned form, so a test can read it back after the
+    /// run that produced it has returned.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedOutcome {
+        model: ModelId,
+        endpoint: String,
+        task_class: TaskClass,
+        success: bool,
+        run_id: RunId,
+    }
+
+    /// A [`RoutingOutcomeSink`] that records what it was handed.
+    #[derive(Default)]
+    struct RecordingOutcomeSink {
+        recorded: Mutex<Vec<RecordedOutcome>>,
+    }
+
+    #[async_trait]
+    impl RoutingOutcomeSink for RecordingOutcomeSink {
+        async fn record(&self, outcome: RoutingOutcome<'_>) -> Result<(), String> {
+            self.recorded
+                .lock()
+                .expect("recording sink mutex poisoned")
+                .push(RecordedOutcome {
+                    model: outcome.model.clone(),
+                    endpoint: outcome.endpoint.to_string(),
+                    task_class: outcome.task_class,
+                    success: outcome.success,
+                    run_id: outcome.run_id,
+                });
+            Ok(())
+        }
+    }
+
+    /// A driver whose request always fails, so the loop reaches
+    /// `Terminal::Failed` — the disposition the writeback must report as
+    /// `success: false` rather than skip.
+    struct FailingDriver;
+
+    #[async_trait]
+    impl ModelDriver for FailingDriver {
+        fn model_id(&self) -> ModelId {
+            ModelId("qwen-local".to_string())
+        }
+
+        fn endpoint(&self) -> Option<String> {
+            Some("http://localhost:11434/v1".to_string())
+        }
+
+        async fn next_step(
+            &self,
+            _transcript: &[TurnItem],
+            _tools: &[ToolDefinition],
+            _sink: &mut dyn DeltaSink,
+        ) -> anyhow::Result<StepOutcome> {
+            Err(anyhow::anyhow!("endpoint refused the connection"))
+        }
+    }
+
+    /// A runtime with a routing-outcome sink attached, plus the sink handle.
+    fn test_runtime_recording_outcomes(
+    ) -> (FrameworkAgentRuntime, Arc<RecordingOutcomeSink>, SessionId) {
+        let (runtime, _events, session_id) = test_runtime();
+        let sink = Arc::new(RecordingOutcomeSink::default());
+        let runtime = runtime.with_routing_outcomes(sink.clone());
+        (runtime, sink, session_id)
+    }
+
+    fn scripted_finishing_driver() -> ScriptedDriver {
+        ScriptedDriver::new(vec![ModelStep::Finish {
+            summary: "done".to_string(),
+        }])
+        .with_model(ModelId("qwen-local".to_string()))
+        .with_endpoint("http://localhost:11434/v1")
+    }
+
+    #[tokio::test]
+    async fn a_completed_run_reports_its_task_class_to_the_routing_outcome_sink() {
+        let (runtime, sink, session_id) = test_runtime_recording_outcomes();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run_id = RunId::new();
+        let ctx = RunContext::new(
+            session_id,
+            run_id,
+            "fix the failing test in the parser",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(
+                &scripted_finishing_driver(),
+                ctx,
+                CancellationToken::never(),
+            )
+            .await
+            .expect("scripted run completes");
+
+        let recorded = sink.recorded.lock().expect("mutex").clone();
+        assert_eq!(
+            recorded,
+            vec![RecordedOutcome {
+                model: ModelId("qwen-local".to_string()),
+                // The endpoint, not the model id alone: `record_outcome` keys on
+                // BOTH, and a profile is stored under the model's `base_url`.
+                endpoint: "http://localhost:11434/v1".to_string(),
+                // The class the router's own rules give this objective — a
+                // failing test that is not the CI system itself.
+                task_class: TaskClass::FailingTestDiagnosis,
+                success: true,
+                run_id,
+            }],
+            "a completed run must fold exactly one success into its model's \
+             per-task-class table"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_reports_a_failure_rather_than_reporting_nothing() {
+        // The table is only useful if it records both sides. A writeback that
+        // only ever appended successes would drive every rate to 1.0.
+        let (runtime, sink, session_id) = test_runtime_recording_outcomes();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "refactor the extractor",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&FailingDriver, ctx, CancellationToken::never())
+            .await
+            .expect("a driver error is a failed run, not a returned error");
+
+        let recorded = sink.recorded.lock().expect("mutex").clone();
+        assert_eq!(recorded.len(), 1, "a failed run reports exactly once");
+        assert_eq!(recorded[0].task_class, TaskClass::SafeRefactor);
+        assert!(
+            !recorded[0].success,
+            "a failed run must report success = false"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_reports_nothing_and_an_endpointless_driver_reports_nothing() {
+        // Two deliberate silences, pinned together because both are "skip rather
+        // than guess": a human stopping a run is not evidence about the model,
+        // and a driver with no endpoint has no `(model, endpoint)` key to fold
+        // into — writing under a guessed key would corrupt another profile's row.
+        let repo = tempfile::tempdir().expect("tempdir");
+
+        let (runtime, sink, session_id) = test_runtime_recording_outcomes();
+        let (handle, token) = cancellation();
+        handle.cancel();
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "fix the failing test in the parser",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&scripted_finishing_driver(), ctx, token)
+            .await
+            .expect("a cancelled run completes cleanly");
+        assert!(
+            sink.recorded.lock().expect("mutex").is_empty(),
+            "a cancelled run is not a model-quality signal in either direction"
+        );
+
+        let (runtime, sink, session_id) = test_runtime_recording_outcomes();
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "fix the failing test in the parser",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            // `ScriptedDriver::new` reports no endpoint — the honest default.
+            .execute_run(
+                &ScriptedDriver::new(vec![ModelStep::Finish {
+                    summary: "done".to_string(),
+                }]),
+                ctx,
+                CancellationToken::never(),
+            )
+            .await
+            .expect("scripted run completes");
+        assert!(
+            sink.recorded.lock().expect("mutex").is_empty(),
+            "a driver with no endpoint must not fabricate one"
+        );
+    }
+
+    #[test]
+    fn the_recorded_class_matches_the_class_the_router_selected_on() {
+        // The writeback is worthless if it files an outcome under a different
+        // class than the router consulted when it picked the model. The daemon
+        // routes with `classify(TaskSignals::from_objective(mode_str(mode),
+        // "agent", estimate_input_tokens(objective), objective))`
+        // (`crates/codypendentd/src/routing.rs::build_task_node`); this pins that
+        // `classify_run` reproduces every input of that call.
+        let repo = std::path::Path::new("/nonexistent");
+        for (mode, objective, expected) in [
+            (
+                AgentMode::Build,
+                "fix the failing test in the parser",
+                TaskClass::FailingTestDiagnosis,
+            ),
+            (
+                AgentMode::Explore,
+                "explain the architecture of the daemon",
+                TaskClass::ArchitectureExplanation,
+            ),
+            (
+                AgentMode::Build,
+                "add a regression test for the gate",
+                TaskClass::RegressionTestAddition,
+            ),
+            (AgentMode::Build, "fix the bug", TaskClass::SmallBugFix),
+            (AgentMode::Build, "do the thing", TaskClass::General),
+        ] {
+            let ctx = RunContext::new(SessionId::new(), RunId::new(), objective, mode, repo, repo);
+            let ours = classify_run(&ctx);
+            let routers = classify(&TaskSignals::from_objective(
+                mode_signal(mode),
+                "agent",
+                ((objective.len() as u64) / 4).max(256),
+                objective,
+            ));
+            assert_eq!(ours, routers, "classification drifted for `{objective}`");
+            assert_eq!(ours.class, expected, "unexpected class for `{objective}`");
+        }
     }
 
     #[tokio::test]

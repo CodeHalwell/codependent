@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::approvals::{ApprovalBroker, ApprovalError};
+use crate::principal::PeerPrincipal;
 use crate::projections;
 use crate::subscriptions::SubscriptionHub;
 
@@ -56,13 +57,23 @@ const DEFAULT_MODEL_POLICY: &str = "hosted-default";
 /// Likewise the run budget: an empty JSON object until the agent loop sets one.
 const DEFAULT_BUDGET_JSON: &str = "{}";
 
-/// Who is issuing a command, for validation and event attribution. The role
-/// gates *which* commands are permitted (see [`role_permits`]); the client id is
-/// recorded on the `commands` row and stamped on the events it causes.
+/// Who is issuing a command, for validation and event attribution.
+///
+/// Three separate things, deliberately not conflated:
+///
+/// * `principal` — **who you are**, derived by the server from the connection's
+///   peer credentials ([`PeerPrincipal`]). This is what authorizes access to a
+///   session and what every `Actor::Human` is minted from.
+/// * `role` — **what you asked to be limited to**. A client-supplied assertion
+///   that can only narrow (see [`role_permits`]); it never widens what the
+///   principal may reach.
+/// * `client_id` — **which connection this is**, for correlation: the
+///   `commands` row, presence, and event attribution. Not authority.
 #[derive(Debug, Clone)]
 pub struct ApplyContext {
     pub client_id: ClientId,
     pub role: ClientRole,
+    pub principal: PeerPrincipal,
 }
 
 /// The recorded result of applying a command, stored as `commands.result_json`
@@ -454,6 +465,7 @@ impl CommandProcessor {
             PreInsert::Session {
                 session_id,
                 title: &title,
+                owner_uid: ctx.principal.uid(),
             },
             events,
             ProjectionOp::None,
@@ -713,7 +725,11 @@ impl CommandProcessor {
                 approval_id,
                 decision,
                 scope,
-                ctx.client_id.to_string(),
+                // `approvals.resolved_by` and the `Actor::Human` on the appended
+                // `ApprovalResolved` both come from here. It used to be the
+                // client's own UUID, which made the audit trail a record of what
+                // the caller typed; it is now the peer uid the kernel reported.
+                ctx.principal.user_id().0,
                 now,
             )
             .await
@@ -920,15 +936,22 @@ impl CommandProcessor {
 
         // Session pre-insert must precede its events (the events FK references
         // sessions(id)).
-        if let PreInsert::Session { session_id, title } = pre {
+        if let PreInsert::Session {
+            session_id,
+            title,
+            owner_uid,
+        } = pre
+        {
             sqlx::query(
-                "INSERT INTO sessions (id, title, state, created_at, updated_at, revision) \
-                 VALUES (?, ?, 'open', ?, ?, 0)",
+                "INSERT INTO sessions \
+                 (id, title, state, created_at, updated_at, revision, owner_uid) \
+                 VALUES (?, ?, 'open', ?, ?, 0, ?)",
             )
             .bind(session_id.to_string())
             .bind(title)
             .bind(&now_str)
             .bind(&now_str)
+            .bind(i64::from(owner_uid))
             .execute(&mut *tx)
             .await?;
         }
@@ -1599,6 +1622,10 @@ enum PreInsert<'a> {
     Session {
         session_id: SessionId,
         title: &'a str,
+        /// The creating principal's uid, recorded so every later by-id read and
+        /// every subscription can re-derive permission from what the *server*
+        /// stored rather than from what the request claims (outcome 19).
+        owner_uid: u32,
     },
 }
 
@@ -1641,10 +1668,17 @@ mod tests {
             .expect("open database")
     }
 
+    /// The unit tests here drive the write path directly, without a socket, so
+    /// they name a principal explicitly. Ownership *enforcement* lives at the
+    /// wire boundary (`server::authorize_command`) and is covered by
+    /// `tests/multi_user_it.rs` against a real daemon.
+    const TEST_UID: u32 = 4242;
+
     fn ctx(role: ClientRole) -> ApplyContext {
         ApplyContext {
             client_id: ClientId::new(),
             role,
+            principal: PeerPrincipal::from_uid(TEST_UID),
         }
     }
 

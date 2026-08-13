@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-cli"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -708,14 +708,16 @@ dependencies = [
  "tokio",
  "toml",
  "toml_edit",
+ "wiremock",
 ]
 
 [[package]]
 name = "codypendent-codypendentd"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "codypendent-council",
  "codypendent-daemon",
@@ -744,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-council"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -760,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-daemon"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -791,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-eval"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -809,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-integrations"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -839,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-knowledge"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -862,11 +864,12 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-rust",
  "uuid",
+ "wat",
 ]
 
 [[package]]
 name = "codypendent-protocol"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "directories",
@@ -879,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-providers"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -891,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-routing"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "codypendent-protocol",
  "serde",
@@ -901,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-runtime"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "agent-framework-anthropic",
  "agent-framework-core",
@@ -935,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-sandbox"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -948,11 +951,13 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "uuid",
+ "wasmi",
+ "wat",
 ]
 
 [[package]]
 name = "codypendent-test-support"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "codypendent-protocol",
  "serde_json",
@@ -960,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-tui"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "codypendent-protocol",
@@ -980,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "codypendent-ui-host"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "codypendent-protocol",
  "codypendent-sandbox",
@@ -994,18 +999,19 @@ dependencies = [
 
 [[package]]
 name = "codypendent-ui-worker-launcher"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "nix",
 ]
 
 [[package]]
 name = "codypendent-workflow"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "futures",
  "hex",
  "serde",
  "serde_json",
@@ -2479,6 +2485,12 @@ name = "leb128"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c83bff1d572d6b9aeef67ddfc8448e4a3737909cb28e81f97c791b9018703e52"
+
+[[package]]
+name = "leb128fmt"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "levenshtein_automata"
@@ -4331,6 +4343,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
 
 [[package]]
+name = "string-interner"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23de088478b31c349c9ba67816fa55d9355232d63c3afea8bf513e31f0f1d2c0"
+dependencies = [
+ "hashbrown 0.15.5",
+ "serde",
+]
+
+[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4621,7 +4643,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -5230,6 +5252,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-encoder"
+version = "0.256.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec1492381bfd5ea51c2a99a919b676662559925cb8d7490547ec2e14c1ad3eb1"
+dependencies = [
+ "leb128fmt",
+ "wasmparser 0.256.0",
+]
+
+[[package]]
 name = "wasm-streams"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5240,6 +5272,89 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "wasmi"
+version = "0.51.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb321403ce594274827657a908e13d1d9918aa02257b8bf8391949d9764023ff"
+dependencies = [
+ "spin",
+ "wasmi_collections",
+ "wasmi_core",
+ "wasmi_ir",
+ "wasmparser 0.228.0",
+]
+
+[[package]]
+name = "wasmi_collections"
+version = "0.51.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9b8e98e45a2a534489f8225e765cbf1cb9a3078072605e58158910cf4749172"
+dependencies = [
+ "string-interner",
+]
+
+[[package]]
+name = "wasmi_core"
+version = "0.51.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c25f375c0cdf14810eab07f532f61f14d4966f09c747a55067fdf3196e8512e6"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "wasmi_ir"
+version = "0.51.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "624e2a68a4293ecb8f564260b68394b29cf3b3edba6bce35532889a2cb33c3d9"
+dependencies = [
+ "wasmi_core",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.228.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4abf1132c1fdf747d56bbc1bb52152400c70f336870f968b85e89ea422198ae3"
+dependencies = [
+ "bitflags 2.13.1",
+ "indexmap 2.14.0",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.256.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60bd825ffedc6cba8a642924ba7ae424afbc47811cffbcb7b92031ec24e59b4c"
+dependencies = [
+ "bitflags 2.13.1",
+ "indexmap 2.14.0",
+ "semver",
+]
+
+[[package]]
+name = "wast"
+version = "256.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3ad42723fc9222da007f05812a3249c9a4ee7af79d497fc2a2079579ad7efe6"
+dependencies = [
+ "bumpalo",
+ "leb128fmt",
+ "memchr",
+ "unicode-width 0.2.0",
+ "wasm-encoder",
+]
+
+[[package]]
+name = "wat"
+version = "1.256.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37cc86c54d8011b3202e265bfebada440733ea3a788ffaf46d395f7d2fdeacfb"
+dependencies = [
+ "wast",
 ]
 
 [[package]]
@@ -5303,7 +5418,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

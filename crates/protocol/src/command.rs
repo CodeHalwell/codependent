@@ -12,8 +12,11 @@ use crate::blackboard::{BlackboardItemDraft, BlackboardScope};
 use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
-use crate::ids::{ApprovalId, CommandId, DocumentId, ModelId, RunId, SessionId, WorkspaceId};
+use crate::ids::{
+    ApprovalId, CommandId, DocumentId, MemoryId, ModelId, RunId, SessionId, WorkspaceId,
+};
 use crate::input::InputEnvelope;
+use crate::memory::MemoryScopeTier;
 use crate::run::{AgentMode, ApprovalDecision, ApprovalScope};
 
 /// An idempotent, optionally revision-guarded request.
@@ -583,6 +586,91 @@ pub enum CommandBody {
     /// at the connection level (artifacts live outside the session ledger) and
     /// gated to the [`Controller`](crate::handshake::ClientRole::Controller)
     /// role — an upload is operator-supplied input, not an observer surface.
+    /// Read one curated memory (Chapter 06's right to *inspect* what the
+    /// fabric remembers). Handled at the connection level like `ReadBlackboard`
+    /// — the memory store lives outside the session ledger — through the
+    /// assembly's memory seam. A **read**: any handshaken client may issue it.
+    ///
+    /// `repository` names the checkout whose memories are in view; the daemon
+    /// derives the repository identity from it with its own single source of
+    /// truth (never from a client-supplied id) and answers only from the scopes
+    /// that identity can see. A memory outside those scopes is refused
+    /// **identically** to one that does not exist (`memory.not-found`), so this
+    /// command is not an enumeration oracle for another checkout's memories.
+    InspectMemory {
+        id: MemoryId,
+        repository: String,
+    },
+    /// Correct a memory (Chapter 06's right to *edit*). The store never edits in
+    /// place: the correction is stored as a new record that `supersedes` the one
+    /// it replaces, so the history of what was believed, and when, survives.
+    /// Reserved to the [`Controller`](crate::handshake::ClientRole::Controller)
+    /// role — an Observer may read a memory, never rewrite one. Refused
+    /// `memory.not-found` for an absent, already-superseded, or out-of-scope id,
+    /// all three identically. Replies
+    /// [`Memory`](crate::envelope::Payload::Memory) with the NEW record.
+    CorrectMemory {
+        id: MemoryId,
+        repository: String,
+        statement: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_value: Option<serde_json::Value>,
+        confidence: f32,
+    },
+    /// Forget one memory (Chapter 06's right to *delete* — the one operation
+    /// that really removes rows rather than superseding them). `Controller`-only
+    /// and refused identically for absent and out-of-scope, like
+    /// [`CorrectMemory`](CommandBody::CorrectMemory). Replies
+    /// [`MemoryForgotten`](crate::envelope::Payload::MemoryForgotten) with a
+    /// content-free audit of what was removed.
+    ForgetMemory {
+        id: MemoryId,
+        repository: String,
+    },
+    /// Forget every memory in one of the caller's visible scopes — "forget what
+    /// you know about this repository". `Controller`-only. The target is named
+    /// by TIER, never by a scope key, so a bulk delete can only ever be aimed at
+    /// a scope the caller can already see (see
+    /// [`MemoryScopeTier`](crate::memory::MemoryScopeTier)).
+    ForgetMemoryScope {
+        repository: String,
+        tier: MemoryScopeTier,
+    },
+    /// Fetch the content behind one of a memory's evidence refs — Chapter 06's
+    /// "every retrieved memory opens its source", actually fetched instead of
+    /// merely named. `evidence_index` is a position in
+    /// [`MemoryView::evidence`](crate::memory::MemoryView::evidence). A **read**,
+    /// gated by exactly the same scope check as `InspectMemory`: the memory is
+    /// re-fetched under the caller's scopes before its evidence is opened, so a
+    /// client cannot reach an artifact by naming a memory it may not see.
+    OpenMemoryEvidence {
+        id: MemoryId,
+        repository: String,
+        evidence_index: u32,
+    },
+    /// Submit the eval evidence a promotion's regression gate consumes (the
+    /// socket replacement for a client writing `eval_suite_reports` into the
+    /// daemon's database itself — see
+    /// [`PromotionAction::RunRegression`]). `Controller`-only, like every other
+    /// promotion verb: an automated CI-triggered `eval run --candidate-id` binds
+    /// the same role, so this does not need `Actor::Human` the way
+    /// `ApprovePromotion` does.
+    ///
+    /// The daemon re-derives the candidate's artifact kind/name/version from
+    /// `promotion_candidates` and refuses a `report_json` that does not parse as
+    /// a suite report or carries no cases at all — the verdict is computed by
+    /// the daemon from the submitted cases, never taken as a caller-supplied
+    /// pass/fail.
+    SubmitEvalEvidence {
+        candidate_id: String,
+        /// The eval suite that ran. The regression gate consumes `core`.
+        suite: String,
+        /// The routing policy the suite ran under, or `daemon-default`.
+        routing_policy: String,
+        /// A serialized `codypendent_eval::SuiteReport`. Opaque here: protocol
+        /// must not depend on `codypendent-eval`.
+        report_json: String,
+    },
     PutArtifact {
         /// IANA media type of the bytes, e.g. `audio/wav`.
         media_type: String,

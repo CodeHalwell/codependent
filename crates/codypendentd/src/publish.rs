@@ -61,8 +61,9 @@ use codypendent_daemon::{ledger, projections};
 use codypendent_integrations::github::model::NewPullRequest;
 use codypendent_integrations::github::{GitHubApi, GitHubError, RepoId};
 use codypendent_knowledge::{
-    plan_publication, record_publication, DocStoreError, DocumentStatus, DocumentStore,
-    PublishPlan, PublishTarget as KnowledgeTarget,
+    pending_pull_request_publications, plan_publication, record_publication,
+    record_pull_request_merge, DocStoreError, DocumentStatus, DocumentStore, PublishPlan,
+    PublishTarget as KnowledgeTarget, PullRequestHandle,
 };
 use codypendent_protocol::document::PublishTarget as WireTarget;
 use codypendent_protocol::{
@@ -198,8 +199,98 @@ impl KnowledgePublisher {
                 }
             }
         }
+
+        // Best-effort merge-status catch-up (2026-08-13 review F9): a
+        // documentation PR opened before a restart may have merged while this
+        // daemon was down, and nothing else polls for that. This is not the
+        // only place a sync should eventually run from (a live daemon has no
+        // periodic trigger for it yet — see the review proposal), but it is a
+        // genuine, real caller today rather than leaving the capability
+        // built-and-unused. Never affects `recovered`'s count or fails
+        // recovery: a poll failure here is a display concern, not a lost
+        // write — the publication itself already landed.
+        let synced = sync_pull_request_merge_status(
+            &self.pool,
+            &self.repository_root,
+            self.github.as_deref(),
+        )
+        .await;
+        if synced > 0 {
+            tracing::info!(
+                updated = synced,
+                "reflected polled pull request merge status into document publications"
+            );
+        }
+
         Ok(recovered)
     }
+}
+
+/// Poll GitHub for every OPEN documentation-PR publication's merge status
+/// (across every document) and reflect a merged one back via
+/// [`record_pull_request_merge`] (2026-08-13 review F9: "nothing reads PR
+/// merge status back into a document" — this is that read-back; pairs with
+/// [`open_documentation_pr`] now persisting the handle there is something to
+/// read back). Best-effort throughout: a poll or write failure for one PR is
+/// logged and skipped, never propagated — this augments whatever called it,
+/// it never gates it. Returns how many publication rows were updated.
+async fn sync_pull_request_merge_status(
+    pool: &SqlitePool,
+    repository_root: &Path,
+    github: Option<&dyn GitHubApi>,
+) -> usize {
+    let Some(github) = github else {
+        return 0; // no GitHub client configured; nothing to poll
+    };
+    let pending = match pending_pull_request_publications(pool).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            warn!(%error, "could not load pending pull request publications");
+            return 0;
+        }
+    };
+    if pending.is_empty() {
+        return 0;
+    }
+    let Some(repo) = crate::executor::resolve_github_repo(repository_root).await else {
+        return 0; // no GitHub remote to poll against
+    };
+    let mut updated = 0usize;
+    for publication in pending {
+        let Some(pr_number) = publication.pr_number else {
+            continue;
+        };
+        match github.get_pull_request(&repo, pr_number).await {
+            Ok(pr) if pr.merged => {
+                match record_pull_request_merge(
+                    pool,
+                    publication.document_id,
+                    pr_number,
+                    true,
+                    pr.merged_at.as_deref(),
+                    pr.merge_commit_sha.as_deref(),
+                )
+                .await
+                {
+                    Ok(rows) => updated += rows as usize,
+                    Err(error) => warn!(
+                        document_id = %publication.document_id,
+                        pr_number,
+                        %error,
+                        "could not record a polled pull request merge"
+                    ),
+                }
+            }
+            Ok(_) => {} // still open
+            Err(error) => warn!(
+                document_id = %publication.document_id,
+                pr_number,
+                %error,
+                "could not poll pull request merge status"
+            ),
+        }
+    }
+    updated
 }
 
 impl DocumentPublisher for KnowledgePublisher {
@@ -374,9 +465,15 @@ async fn execute_approved_plan(
     )
     .await
     {
-        Ok(git_commit) => {
-            if let Err(error) =
-                record_publication(&pool, document_id, &plan, git_commit.as_deref()).await
+        Ok(executed) => {
+            if let Err(error) = record_publication(
+                &pool,
+                document_id,
+                &plan,
+                executed.git_commit.as_deref(),
+                executed.pull_request.as_ref(),
+            )
+            .await
             {
                 warn!(%document_id, %error, "publish executed but recording it failed");
                 let _ = set_publish_job_state(&pool, approval_id, "failed").await;
@@ -490,10 +587,18 @@ fn validate_branch(branch: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Execute an approved plan's Git action, returning the resulting commit-ish
-/// (or `None` when a target genuinely has no single commit to report — none do
-/// today, but the return stays optional to match [`record_publication`]'s
-/// `git_commit: Option<&str>`).
+/// What executing an approved plan produced: the resulting commit-ish (or
+/// `None` when a target genuinely has no single commit to report — none do
+/// today, but the field stays optional to match [`record_publication`]'s
+/// `git_commit: Option<&str>`), and — for a `DocumentationPr` target only —
+/// the opened PR's handle to persist.
+#[derive(Debug)]
+struct ExecutedPublish {
+    git_commit: Option<String>,
+    pull_request: Option<PullRequestHandle>,
+}
+
+/// Execute an approved plan's Git action.
 async fn execute_plan(
     repository_root: &Path,
     pool: &SqlitePool,
@@ -501,7 +606,7 @@ async fn execute_plan(
     github: Option<&dyn GitHubApi>,
     plan: &PublishPlan,
     document_id: DocumentId,
-) -> Result<Option<String>, PublishExecError> {
+) -> Result<ExecutedPublish, PublishExecError> {
     validate_target(&plan.target).map_err(PublishExecError::UnsafeTarget)?;
     match &plan.target {
         KnowledgeTarget::RepositoryFile { path } => {
@@ -514,11 +619,17 @@ async fn execute_plan(
                 &plan.rendered,
             )
             .await?;
-            Ok(Some(sha))
+            Ok(ExecutedPublish {
+                git_commit: Some(sha),
+                pull_request: None,
+            })
         }
         KnowledgeTarget::DocsBranchCommit { branch, path } => {
             let sha = commit_on_docs_branch(repository_root, branch, path, &plan.rendered).await?;
-            Ok(Some(sha))
+            Ok(ExecutedPublish {
+                git_commit: Some(sha),
+                pull_request: None,
+            })
         }
         KnowledgeTarget::DocumentationPr {
             branch,
@@ -526,20 +637,32 @@ async fn execute_plan(
             title,
         } => {
             let github = github.ok_or(PublishExecError::NoGitHubClient)?;
+            // Both preconditions are checked BEFORE any write (2026-08-13
+            // review F7): `resolve_github_repo` used to run only AFTER the
+            // docs branch was committed and pushed to the user's remote —
+            // reproduced live: with a non-GitHub `origin`, a `docs/pr2` branch
+            // landed on the real remote, no publication row was ever written,
+            // and the job silently ended up `failed`. Resolving the owner/repo
+            // first makes that failure a clean no-op — nothing touched, exactly
+            // like the `NoGitHubClient` case already was.
+            let repo = crate::executor::resolve_github_repo(repository_root)
+                .await
+                .ok_or(PublishExecError::NoGitHubRemote)?;
             let sha = commit_on_docs_branch(repository_root, branch, path, &plan.rendered).await?;
             run_git(
                 repository_root,
                 &["push", "origin", &format!("{branch}:{branch}")],
             )
             .await?;
-            let repo = crate::executor::resolve_github_repo(repository_root)
-                .await
-                .ok_or(PublishExecError::NoGitHubRemote)?;
             let base = current_branch(repository_root)
                 .await
                 .unwrap_or_else(|| FALLBACK_BASE_BRANCH.to_string());
-            open_documentation_pr(github, &repo, branch, &base, title, document_id).await?;
-            Ok(Some(sha))
+            let pull_request =
+                open_documentation_pr(github, &repo, branch, &base, title, document_id).await?;
+            Ok(ExecutedPublish {
+                git_commit: Some(sha),
+                pull_request: Some(pull_request),
+            })
         }
     }
 }
@@ -663,11 +786,16 @@ async fn commit_path(dir: &Path, path: &str, message: &str) -> Result<String, Pu
 }
 
 /// Open (or, via the hidden-marker convention, find) a draft documentation PR
-/// through the Phase 3 GitHub write path (target 3). Split out from
-/// [`execute_plan`] so the idempotency behavior — the same document+branch
-/// always derives the same key, so a retried publish resolves to the existing
-/// PR rather than opening a duplicate — is directly testable against a
-/// GitHub double without needing a real `github.com`-resolvable remote.
+/// through the Phase 3 GitHub write path (target 3), returning its handle to
+/// persist. Split out from [`execute_plan`] so the idempotency behavior — the
+/// same document+branch always derives the same key, so a retried publish
+/// resolves to the existing PR rather than opening a duplicate — is directly
+/// testable against a GitHub double without needing a real
+/// `github.com`-resolvable remote.
+///
+/// 2026-08-13 review F9: this used to discard the `PullRequest` GitHub
+/// returned outright (`.await?; Ok(())`), so the PR number/URL were never
+/// persisted — nothing existed anywhere to later poll for merge status.
 async fn open_documentation_pr(
     github: &dyn GitHubApi,
     repo: &RepoId,
@@ -675,15 +803,18 @@ async fn open_documentation_pr(
     base: &str,
     title: &str,
     document_id: DocumentId,
-) -> Result<(), PublishExecError> {
+) -> Result<PullRequestHandle, PublishExecError> {
     // Stable per (document, branch): a retried publish of the same document to
     // the same docs branch is one logical PR, however many times it runs.
     let idempotency_key = format!("docs-publish:{document_id}:{branch}");
     let request = NewPullRequest::draft(title.to_string(), branch.to_string(), base.to_string());
-    github
+    let pr = github
         .create_draft_pull_request(repo, &request, &idempotency_key)
         .await?;
-    Ok(())
+    Ok(PullRequestHandle {
+        number: pr.number,
+        url: pr.html_url,
+    })
 }
 
 /// A unique scratch-worktree path outside `repo_root`'s working tree, in the
@@ -1850,6 +1981,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn documentation_pr_target_with_a_non_github_remote_fails_before_touching_git() {
+        // Regression (2026-08-13 review F7), reproduced live: `resolve_github_repo`
+        // used to be checked AFTER `commit_on_docs_branch` + `git push`, so a
+        // non-GitHub `origin` let a branch land on the real remote before the
+        // job failed with no publication row recording it. A GitHub CLIENT is
+        // configured here (so `NoGitHubClient` cannot be what trips this) but
+        // `origin` is a plain local bare repo — not github.com-resolvable — so
+        // only `NoGitHubRemote` can explain the failure, and it must fire
+        // BEFORE any commit or push.
+        let dir = tempfile::tempdir().unwrap();
+        let pool = temp_pool(dir.path()).await;
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let bare = dir.path().join("origin.git");
+        git(
+            dir.path(),
+            &["init", "--bare", "-q", bare.to_str().unwrap()],
+        );
+        git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        let artifacts = ArtifactStore::new(dir.path().join("artifacts"));
+        let document_id = DocumentId::new();
+        let github = FakeGitHub::default();
+
+        let plan = PublishPlan {
+            target: KnowledgeTarget::DocumentationPr {
+                branch: "docs/pr2".to_string(),
+                path: "docs/pr2.md".to_string(),
+                title: "Publish: PR2".to_string(),
+            },
+            changed_files: vec!["docs/pr2.md".to_string()],
+            git_action: "open documentation PR".to_string(),
+            rendered: "# PR2\n".to_string(),
+            rendered_hash: "deadbeef".to_string(),
+            revision: 1,
+        };
+
+        let error = execute_plan(&repo, &pool, &artifacts, Some(&github), &plan, document_id)
+            .await
+            .expect_err("a non-GitHub origin must fail");
+        assert!(
+            matches!(error, PublishExecError::NoGitHubRemote),
+            "expected NoGitHubRemote, got {error:?}"
+        );
+
+        // Nothing was touched — the exact bug: a branch used to be created
+        // AND pushed to `origin` before this check ran.
+        let branches = git_output(&repo, &["branch", "--list"]);
+        assert!(
+            !branches.contains("docs/pr2"),
+            "no branch must be created: {branches}"
+        );
+        let worktrees = git_output(&repo, &["worktree", "list"]);
+        assert_eq!(
+            worktrees.lines().count(),
+            1,
+            "no worktree must be created: {worktrees}"
+        );
+        let remote_branches = git_output(&bare, &["branch", "--list"]);
+        assert!(
+            !remote_branches.contains("docs/pr2"),
+            "nothing must be pushed to the remote: {remote_branches}"
+        );
+        assert_eq!(github.prs.lock().unwrap().len(), 0, "no PR must be opened");
+    }
+
+    #[tokio::test]
     async fn docs_branch_push_reaches_a_real_remote() {
         // Proves the exact invocation `execute_plan`'s PR target relies on
         // (`git push origin <branch>:<branch>`) actually lands the commit on a
@@ -1889,6 +2086,21 @@ mod tests {
         prs: std::sync::Mutex<Vec<PullRequest>>,
     }
 
+    impl FakeGitHub {
+        /// Test-only: mark a previously opened PR merged, as GitHub itself
+        /// would report it on a later poll.
+        fn mark_merged(&self, number: u64, merged_at: &str, merge_commit_sha: &str) {
+            let mut prs = self.prs.lock().unwrap();
+            let pr = prs
+                .iter_mut()
+                .find(|pr| pr.number == number)
+                .expect("pr must have been opened first");
+            pr.merged = true;
+            pr.merged_at = Some(merged_at.to_string());
+            pr.merge_commit_sha = Some(merge_commit_sha.to_string());
+        }
+    }
+
     fn unused_error() -> GitHubError {
         GitHubError::Api {
             status: 501,
@@ -1901,9 +2113,18 @@ mod tests {
         async fn get_pull_request(
             &self,
             _repo: &RepoId,
-            _number: u64,
+            number: u64,
         ) -> Result<PullRequest, GitHubError> {
-            Err(unused_error())
+            self.prs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|pr| pr.number == number)
+                .cloned()
+                .ok_or_else(|| GitHubError::Api {
+                    status: 404,
+                    message: format!("no such pr {number}"),
+                })
         }
 
         async fn list_check_runs(
@@ -1967,6 +2188,9 @@ mod tests {
                 html_url: format!("https://github.com/octocat/hello-world/pull/{number}"),
                 head: None,
                 base: None,
+                merged: false,
+                merged_at: None,
+                merge_commit_sha: None,
             };
             prs.push(pr.clone());
             Ok(pr)
@@ -2043,5 +2267,179 @@ mod tests {
         .await
         .expect("a different document opens its own PR");
         assert_eq!(github.prs.lock().unwrap().len(), 2);
+    }
+
+    /// Point `origin` at a URL that LOOKS like github.com (so
+    /// `resolve_github_repo` runs the real path, not a stub) while
+    /// transparently redirecting the actual `git push` to a local bare repo
+    /// via `pushInsteadOf` — `git remote get-url` still reports the
+    /// github.com URL (verified empirically: `insteadOf` rewrites `get-url`
+    /// too, `pushInsteadOf` does not), so no network is needed to exercise
+    /// the FULL `DocumentationPr` success path end to end.
+    fn redirect_github_origin_to_local_bare(repo: &Path, bare: &Path) {
+        git(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/octocat/hello-world.git",
+            ],
+        );
+        git(
+            repo,
+            &[
+                "config",
+                &format!("url.{}.pushInsteadOf", bare.to_str().unwrap()),
+                "https://github.com/octocat/hello-world.git",
+            ],
+        );
+    }
+
+    /// End-to-end proof of 2026-08-13 review F9: the FULL production path
+    /// (`KnowledgePublisher::publish` -> approval -> `execute_plan` ->
+    /// `open_documentation_pr` -> `record_publication`) persists the PR
+    /// handle GitHub returned, rather than discarding it
+    /// (`.await?; Ok(())`, as it used to).
+    #[tokio::test]
+    async fn documentation_pr_publish_persists_the_pr_handle_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = temp_pool(dir.path()).await;
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let bare = dir.path().join("origin.git");
+        git(
+            dir.path(),
+            &["init", "--bare", "-q", bare.to_str().unwrap()],
+        );
+        redirect_github_origin_to_local_bare(&repo, &bare);
+        let document_id = seed_document(&pool, "Architecture").await;
+        let approvals = ApprovalBroker::new();
+        let github = Arc::new(FakeGitHub::default());
+        let publisher = KnowledgePublisher::new(
+            pool.clone(),
+            approvals.clone(),
+            repo.clone(),
+            ArtifactStore::new(dir.path().join("artifacts")),
+        )
+        .with_github(github.clone());
+
+        let parked = publisher
+            .publish(publish_request(
+                document_id,
+                WireTarget::DocumentationPr {
+                    branch: "docs/publish".to_string(),
+                    path: "docs/architecture.md".to_string(),
+                    title: "Publish: Architecture".to_string(),
+                },
+            ))
+            .await
+            .expect("publish parks an approval");
+        resolve(
+            &pool,
+            &approvals,
+            parked.approval_id,
+            ApprovalDecision::Approve,
+        )
+        .await;
+
+        let published = wait_for_publication_count(&pool, document_id, 1).await;
+        assert!(published[0].git_commit.is_some());
+        assert_eq!(
+            published[0].pr_number,
+            Some(1),
+            "the PR handle GitHub returned must be persisted, not discarded"
+        );
+        assert!(
+            published[0]
+                .pr_url
+                .as_deref()
+                .is_some_and(|url| url.contains("/pull/1")),
+            "the PR url must be persisted: {:?}",
+            published[0].pr_url
+        );
+        assert!(!published[0].pr_merged);
+
+        // The push really reached the (redirected) remote — proof this ran
+        // the real `execute_plan` path, not a stub.
+        let remote_branches = git_output(&bare, &["branch", "--list"]);
+        assert!(
+            remote_branches.contains("docs/publish"),
+            "the branch must really be on the remote: {remote_branches}"
+        );
+    }
+
+    /// End-to-end proof of 2026-08-13 review F9's read-back half: once a
+    /// PR's handle is persisted, `recover_pending`'s best-effort merge-status
+    /// sync (run on every daemon restart) polls GitHub and reflects a merged
+    /// PR back onto the SAME publication row.
+    #[tokio::test]
+    async fn recover_pending_syncs_a_merged_pull_requests_status_back_to_the_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = temp_pool(dir.path()).await;
+        let repo = dir.path().join("repo");
+        init_repo(&repo);
+        let bare = dir.path().join("origin.git");
+        git(
+            dir.path(),
+            &["init", "--bare", "-q", bare.to_str().unwrap()],
+        );
+        redirect_github_origin_to_local_bare(&repo, &bare);
+        let document_id = seed_document(&pool, "Architecture").await;
+        let approvals = ApprovalBroker::new();
+        let github = Arc::new(FakeGitHub::default());
+        let publisher = KnowledgePublisher::new(
+            pool.clone(),
+            approvals.clone(),
+            repo.clone(),
+            ArtifactStore::new(dir.path().join("artifacts")),
+        )
+        .with_github(github.clone());
+
+        let parked = publisher
+            .publish(publish_request(
+                document_id,
+                WireTarget::DocumentationPr {
+                    branch: "docs/publish".to_string(),
+                    path: "docs/architecture.md".to_string(),
+                    title: "Publish: Architecture".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        resolve(
+            &pool,
+            &approvals,
+            parked.approval_id,
+            ApprovalDecision::Approve,
+        )
+        .await;
+        let published = wait_for_publication_count(&pool, document_id, 1).await;
+        assert!(!published[0].pr_merged, "not merged yet");
+
+        // GitHub now reports the PR merged.
+        github.mark_merged(1, "2026-08-13T12:00:00Z", "deadbeefsha");
+
+        // A fresh publisher instance models a daemon restart; its
+        // `recover_pending` runs the merge-status sync even though there is
+        // no PENDING approval left to re-arm (the publish already completed).
+        let recovered_publisher = KnowledgePublisher::new(
+            pool.clone(),
+            ApprovalBroker::new(),
+            repo.clone(),
+            ArtifactStore::new(dir.path().join("artifacts")),
+        )
+        .with_github(github.clone());
+        recovered_publisher.recover_pending().await.unwrap();
+
+        let after = codypendent_knowledge::publications(&pool, document_id)
+            .await
+            .unwrap();
+        assert!(after[0].pr_merged, "merge status must be reflected back");
+        assert_eq!(
+            after[0].pr_merged_at.as_deref(),
+            Some("2026-08-13T12:00:00Z")
+        );
+        assert_eq!(after[0].pr_merge_commit_sha.as_deref(), Some("deadbeefsha"));
     }
 }
