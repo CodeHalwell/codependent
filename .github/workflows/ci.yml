@@ -141,6 +141,23 @@ jobs:
       - name: Eval corpus regression gate (deterministic stub model)
         run: evals/ci/run_gate.sh
 
+  # Docs-drift gate: every `<!-- doc-count:test ... -->` marker in ROADMAP.md
+  # (and any other doc a future marker gets added to) must still match a real
+  # count over its named source files — see `.github/scripts/
+  # check_doc_test_counts.py`'s own module doc for the full rationale and its
+  # one deliberate limitation (static `#[test]` counting, not `cargo test
+  # --list`, so this job needs no build and runs on every PR). This is the
+  # actual fix for "a test count in the docs was accurate the day it was
+  # written and nobody re-derived it since" — the exact failure mode a 2026-08
+  # docs-accuracy review found across eight separate numbers in this file.
+  # Pure Python + git, no toolchain, no build — as fast and cheap as `deny`.
+  doc-counts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Doc test-count markers still match reality
+        run: python3 .github/scripts/check_doc_test_counts.py
+
   # Supply-chain gate (every-release hygiene): advisories, licenses, bans, and
   # sources per `deny.toml`. A separate lightweight job — it needs no build, only
   # the lockfile and the RustSec advisory database the action fetches. Its dated

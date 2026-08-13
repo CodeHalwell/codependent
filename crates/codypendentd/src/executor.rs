@@ -554,7 +554,7 @@ impl RuntimeExecutor {
                 // valid graph, so an edit made DURING the session — the agent's
                 // own `edit_file` included — is folded incrementally and is
                 // visible to the next tool call, with no commit and no restart.
-                // PROBE: watcher arming disabled
+                self.ensure_watching(repository, root);
                 // Released before the docs sweep below: that sweep reads the
                 // graph but never writes it, and holding the graph's writer lock
                 // across it would stall the watcher for the sweep's duration.

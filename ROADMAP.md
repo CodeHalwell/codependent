@@ -104,7 +104,8 @@ the release gate is the
 > `claude/roadmap-completion-w20`, PR #19): 19 tasks + the two–project-review defect
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
-> `-D warnings`, `cargo test --workspace` = **≈2700 tests as of 2026-08-13**
+> `-D warnings`, `cargo test --workspace` = **≈2716 tests as of 2026-08-13**
+<!-- doc-count:test sources="crates" expect=2716 label="workspace total" -->
 > (a `#[test]`/`#[tokio::test]` count over every `crates/**/*.rs` file at HEAD —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with
@@ -450,6 +451,8 @@ live client-capture paths (voice/clipboard) are the remaining wiring.
       guarded state machine carrying each plugin's trust record; and neutralizes
       untrusted plugin/MCP output (origin label, size cap, control-sequence strip)
       before it enters context. 154 unit tests (measured 2026-08-13: `git show HEAD:crates/sandbox/src/*.rs` summed, `#[test]`/`#[tokio::test]`; plus 11 more in `crates/sandbox/tests/`). **Surfaced to users** via
+<!-- doc-count:test sources="crates/sandbox/src" expect=154 label="sandbox unit tests" -->
+      <!-- doc-count:test sources="crates/sandbox/tests" expect=11 label="sandbox integration tests" -->
       `codypendent plugin inspect <file>` (renders identity + the requested
       capability list + resource caps + trust posture — the "evaluate permissions"
       step) and `codypendent plugin diff <installed> <update>` (prints the
@@ -466,6 +469,7 @@ live client-capture paths (voice/clipboard) are the remaining wiring.
       classification gate (`transcription_allowed`, media default `Confidential`)
       permits local transcription always but blocks remote transcription when the
       data exceeds an `OffDevicePolicy` ceiling. 29 round-trip/gate tests (measured 2026-08-13: `crates/protocol/src/input.rs` 9 + `envelope.rs` 20).
+<!-- doc-count:test sources="crates/protocol/src/input.rs,crates/protocol/src/envelope.rs" expect=29 label="multimodal round-trip/gate tests" -->
 - [x] **6.6 (themes + theme packs)** — six semantic-token variants beyond dark
       (light, high-contrast, color-blind-safe Okabe–Ito, 256-color, 16-color,
       monochrome); `ColorDepth::detect()` (NO_COLOR/COLORTERM/TERM) +
@@ -473,6 +477,7 @@ live client-capture paths (voice/clipboard) are the remaining wiring.
       **data-only** theme-pack loader that structurally rejects any pack declaring
       capabilities/permissions (README: theme plugins get no execution
       permissions). 23 tests (legibility invariants per variant; measured 2026-08-13: `crates/tui/src/theme.rs` 13 + `theme_pack.rs` 10).
+<!-- doc-count:test sources="crates/tui/src/theme.rs,crates/tui/src/theme_pack.rs" expect=23 label="theme tests" -->
 - [ ] **6.2/6.3/6.4 (enforcement + WASM + executable hooks)** — the native OS
       sandbox (bubblewrap+seccomp / sandbox-exec / AppContainer), the `wasmtime`
       component runtime + WASM SDK, the brokered-secrets host, and executing hooks
@@ -526,6 +531,7 @@ and tested; only the live measurement is deferred).
       complete transition. The five eval-route arms + the release-gate report
       (router+escalation ≥ quality at cost < static-strongest) land here too (exit
       criterion 1). 53 tests (measured 2026-08-13, `crates/routing/src/*.rs`). *Remaining:* daemon wiring behind the model-execution
+<!-- doc-count:test sources="crates/routing/src" expect=53 label="router tests" -->
       seam and running the arms over a real suite.
 - [x] **7.4 (graders + clustering + regression suite)** — execution-grounded
       `Signal`s (+patch-applies … −policy-violation) from a terminal-run `Trace`
@@ -543,6 +549,7 @@ and tested; only the live measurement is deferred).
       `ActiveVersions::rollback` restores the predecessor (attributable +
       reversible, exit criterion 4); synthesized skill candidates must pass
       permission review first. 21 tests incl. "an agent cannot promote itself" (measured 2026-08-13: `crates/eval/src/promote.rs`'s own `#[test]` count).
+<!-- doc-count:test sources="crates/eval/src/promote.rs" expect=21 label="promotion pipeline tests" -->
       *Remaining:* the daemon commands + persistence and the real shadow/canary
       execution + eval-export privacy scrubbing.
 
@@ -571,6 +578,7 @@ alongside this work.)
       palette) toggles to a workspace layout** — Runs │ conversation │ approvals
       panes for at-a-glance state — sharing the same composer, footer, and input
       model, so the panes are context, not a separate mode. Pure-reducer; 568 TUI
+<!-- doc-count:test sources="crates/tui/src" expect=568 label="TUI shell tests" -->
       tests green (whole-crate count, measured 2026-08-13 — grows with every outcome the TUI vertical adds; re-derive rather than trust a fixed number here).
 - [x] **Command palette** (`/`) — one searchable surface for every command, the
       command hub now that typing composes a message rather than firing single-key
