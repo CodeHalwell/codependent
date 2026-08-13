@@ -5997,7 +5997,7 @@ fn workflow_draft_schema() -> Value {
 /// offered set and to `prepare`, never to this vec, so the doc-writer could not
 /// be invoked by any agent. Adding a dispatchable tool means touching three
 /// places (offer, dispatch, and this catalog), and
-/// `advertised_definitions_cover_every_offered_tool` fails the build if the
+/// `every_offered_tool_has_a_schema_in_the_catalog` fails the build if the
 /// first and the third ever disagree again.
 pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
     use agent_framework_core::tools::{ApprovalMode, ToolDefinition, ToolKind};
