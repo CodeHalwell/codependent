@@ -411,6 +411,17 @@ pub enum Overlay {
     /// [`Overlay::ModelPicker`]. `Enter` (or `Tab`) begins the add-model flow
     /// for the focused provider (model-discovery).
     ProviderPicker { query: String, selected: usize },
+    /// Explicit consent for Codypendent's pinned Antigravity community bridge.
+    /// Google does not provide this ACP server and the bridge project warns of
+    /// possible Terms/account risk. The originating picker state is retained so
+    /// declining is a lossless return; confirmation alone permits the verified
+    /// download and ACP handshake.
+    ConfirmCommunityAcpInstall {
+        provider_id: String,
+        query: String,
+        selected: usize,
+        onboard_class: Option<OnboardProviderClass>,
+    },
     /// The mode picker (PR C2 — plan mode): a fuzzy-filterable list of the
     /// submission modes for the next run (see [`MODE_CARDS`]), opened from the
     /// command palette's `/mode` entry. `query` filters by label/summary
@@ -2493,6 +2504,7 @@ impl AppState {
             | Overlay::ConfirmCouncilDelete { .. }
             | Overlay::ConfirmLearningDelete { .. }
             | Overlay::ConfirmModelRemove { .. }
+            | Overlay::ConfirmCommunityAcpInstall { .. }
             | Overlay::UnslothConfirmPull { .. }
             | Overlay::DocDeleteConfirm { .. } => InputMode::Confirm,
             // The palette, the model picker, the provider picker, the mode

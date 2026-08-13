@@ -1,4 +1,5 @@
-//! Manage external ACP agents from the official registry.
+//! Manage external ACP agents from the official registry and narrowly pinned,
+//! explicitly acknowledged community adapters.
 
 use std::path::Path;
 
@@ -8,7 +9,8 @@ use codypendent_integrations::acp::PermissionOption;
 use codypendent_integrations::acp_client::{AcpClient, AcpClientError, AcpEventSink};
 use codypendent_integrations::acp_registry::{
     agent_coordinate, agent_coordinate_with_model, agent_id_from_coordinate,
-    agent_model_from_coordinate, local_acp_agent_specs, AcpRegistry, AcpRegistryStore,
+    agent_model_from_coordinate, community_acp_agent, local_acp_agent_specs, AcpRegistry,
+    AcpRegistryStore,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{EventBody, ModelId, RunId};
@@ -66,6 +68,31 @@ pub async fn list(paths: &RuntimePaths, refresh: bool, json: bool) -> anyhow::Re
                 "connectedProfiles": connected.iter().filter_map(|(id, registry_id)| (agent_id_from_coordinate(registry_id) == spec.registry_id).then_some(id)).collect::<Vec<_>>()
             }));
         }
+        if !rows
+            .iter()
+            .any(|row| row["id"].as_str() == Some("antigravity-acp"))
+        {
+            let agent = community_acp_agent("antigravity-acp")
+                .expect("built-in Antigravity community descriptor");
+            let status = agent_status(&store, &agent);
+            let connected_profiles = connected
+                .iter()
+                .filter_map(|(id, registry_id)| {
+                    (agent_id_from_coordinate(registry_id) == agent.id).then_some(id)
+                })
+                .collect::<Vec<_>>();
+            rows.push(serde_json::json!({
+                "id": agent.id,
+                "name": agent.name,
+                "version": agent.version,
+                "description": agent.description,
+                "repository": agent.repository,
+                "distribution": "verified community binary (explicit risk consent required)",
+                "ready": status.starts_with("ready"),
+                "status": status,
+                "connectedProfiles": connected_profiles
+            }));
+        }
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
@@ -114,6 +141,19 @@ pub async fn list(paths: &RuntimePaths, refresh: bool, json: bool) -> anyhow::Re
             spec.registry_id, spec.name, spec.version, state
         );
     }
+    if registry.get("antigravity-acp").is_none()
+        && codypendent_integrations::acp_registry::local_acp_agent_spec("antigravity-acp").is_none()
+    {
+        let agent = community_acp_agent("antigravity-acp")
+            .expect("built-in Antigravity community descriptor");
+        println!(
+            "{:<24} {:<28} {:<12} {} · --accept-community-risk required",
+            agent.id,
+            agent.name,
+            agent.version,
+            agent_status(&store, &agent)
+        );
+    }
     Ok(())
 }
 
@@ -144,9 +184,11 @@ pub async fn install(
     agent: &str,
     refresh: bool,
     allow_unverified: bool,
+    accept_community_risk: bool,
 ) -> anyhow::Result<()> {
+    require_community_risk_acceptance(agent, accept_community_risk)?;
     let store = AcpRegistryStore::new(&paths.data_dir);
-    load_registry(&store, refresh).await?;
+    ensure_agent_catalog(&store, agent, refresh).await?;
     let spec = store.install(agent, allow_unverified).await?;
     println!(
         "installed {} {} ({})",
@@ -163,10 +205,12 @@ pub async fn connect(
     profile: Option<&str>,
     refresh: bool,
     allow_unverified: bool,
+    accept_community_risk: bool,
     repository: &Path,
 ) -> anyhow::Result<()> {
+    require_community_risk_acceptance(agent, accept_community_risk)?;
     let store = AcpRegistryStore::new(&paths.data_dir);
-    load_registry(&store, refresh).await?;
+    ensure_agent_catalog(&store, agent, refresh).await?;
     let spec = store.install(agent, allow_unverified).await?;
 
     // Handshake before changing models.toml: a missing launcher, incompatible
@@ -257,13 +301,15 @@ pub async fn probe(
     prompt: &str,
     refresh: bool,
     allow_unverified: bool,
+    accept_community_risk: bool,
     repository: &Path,
 ) -> anyhow::Result<()> {
     if prompt.is_empty() || prompt.len() > 32 * 1024 || prompt.contains('\0') {
         bail!("ACP probe prompt must contain 1..=32768 bytes and no NUL");
     }
+    require_community_risk_acceptance(agent, accept_community_risk)?;
     let store = AcpRegistryStore::new(&paths.data_dir);
-    load_registry(&store, refresh).await?;
+    ensure_agent_catalog(&store, agent, refresh).await?;
     let spec = store.install(agent, allow_unverified).await?;
     let command = spec.command.to_string_lossy();
     let mut client = AcpClient::spawn(
@@ -315,6 +361,15 @@ pub async fn probe(
     {
         bail!(
             "ACP agent `{agent}` ended the turn without returning an assistant message; update or re-authenticate the agent, then retry"
+        );
+    }
+    Ok(())
+}
+
+fn require_community_risk_acceptance(agent: &str, accepted: bool) -> anyhow::Result<()> {
+    if agent_id_from_coordinate(agent) == "antigravity-acp" && !accepted {
+        bail!(
+            "Antigravity's ACP bridge is third-party software, not provided or endorsed by Google. Its maintainer warns that third-party Antigravity OAuth use may violate Google's Terms and risk account suspension. Review the bridge and re-run with `--accept-community-risk` to continue"
         );
     }
     Ok(())
@@ -412,6 +467,20 @@ async fn load_registry(store: &AcpRegistryStore, refresh: bool) -> anyhow::Resul
         return Ok(store.refresh().await?);
     }
     Ok(store.load_or_refresh().await?)
+}
+
+async fn ensure_agent_catalog(
+    store: &AcpRegistryStore,
+    agent: &str,
+    refresh: bool,
+) -> anyhow::Result<()> {
+    let id = agent_id_from_coordinate(agent);
+    if codypendent_integrations::acp_registry::local_acp_agent_spec(&id).is_some()
+        || community_acp_agent(&id).is_some()
+    {
+        return Ok(());
+    }
+    load_registry(store, refresh).await.map(|_| ())
 }
 
 fn connected_profiles(paths: &RuntimePaths) -> anyhow::Result<Vec<(String, String)>> {
@@ -769,6 +838,19 @@ api_key_env = ""
         let message = handshake_failure("demo-acp", &plain).to_string();
         assert!(message.contains("broken pipe"), "{message}");
         assert!(!message.contains("own CLI"), "{message}");
+    }
+
+    #[test]
+    fn antigravity_cli_requires_warning_specific_acknowledgement() {
+        let error = require_community_risk_acceptance("antigravity", false)
+            .expect_err("community bridge must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("not provided or endorsed by Google"));
+        assert!(message.contains("--accept-community-risk"));
+        require_community_risk_acceptance("antigravity-acp", true)
+            .expect("explicit acknowledgement");
+        require_community_risk_acceptance("codex", false)
+            .expect("official agents do not use the community warning");
     }
 
     #[tokio::test]

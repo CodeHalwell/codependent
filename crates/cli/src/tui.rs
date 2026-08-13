@@ -4346,6 +4346,7 @@ fn is_acp_provider(paths: &RuntimePaths, provider_id: &str) -> bool {
         .ok()
         .is_some_and(|registry| registry.get(provider_id).is_some())
         || codypendent_integrations::acp_registry::local_acp_agent_spec(provider_id).is_some()
+        || codypendent_integrations::acp_registry::community_acp_agent(provider_id).is_some()
 }
 
 /// The `models.toml` profile id for a connected ACP agent — `acp/<agent>`, or
@@ -6457,22 +6458,45 @@ async fn load_provider_cards(
             has_key: false,
         });
     }
-    // Google does not currently ship a native Antigravity ACP server. Keep the
-    // opt-in community bridge discoverable without downloading or launching it
-    // behind the user's back; its own documentation warns of account/ToS risk.
-    if !cards.iter().any(|card| card.id == "antigravity-acp") {
-        cards.push(ProviderCard {
-            id: "antigravity-acp".to_string(),
-            name: "Google Antigravity (community bridge)".to_string(),
-            protocol: "acp".to_string(),
-            auth: "acp: install agy-acp · third-party ToS risk".to_string(),
-            local: true,
-            requires_key: false,
-            can_list_models: false,
-            available: false,
-            catalog_models: 0,
-            has_key: false,
-        });
+    // Google does not currently ship a native Antigravity ACP server. The
+    // community bridge is actionable only on platforms for which Codypendent
+    // carries an immutable URL+SHA-256 descriptor. The pure reducer presents a
+    // host-owned risk confirmation before this can reach the install/probe
+    // intent; nothing is downloaded merely by opening the catalog.
+    let community = codypendent_integrations::acp_registry::community_acp_agent("antigravity-acp");
+    let installable = community.as_ref().is_some_and(|agent| {
+        agent
+            .distribution
+            .binary
+            .get(codypendent_integrations::acp_registry::current_platform())
+            .is_some_and(|binary| binary.sha256.is_some())
+    });
+    let ready = acp_store.launch_spec("antigravity-acp").is_ok();
+    let antigravity = ProviderCard {
+        id: "antigravity-acp".to_string(),
+        name: "Google Antigravity (community bridge)".to_string(),
+        protocol: "acp".to_string(),
+        auth: if ready {
+            "acp: local · pinned community bridge".to_string()
+        } else {
+            "acp: verified install · third-party ToS risk".to_string()
+        },
+        local: true,
+        requires_key: false,
+        // Selecting the card leads to an explicit confirmation and then the
+        // normal ACP handshake-backed model list.
+        can_list_models: ready || installable,
+        available: ready || installable,
+        catalog_models: 0,
+        has_key: false,
+    };
+    if let Some(card) = cards.iter_mut().find(|card| card.id == "antigravity-acp") {
+        // Keep this host-owned warning even if an upstream catalog later
+        // publishes a row with the same id. It must not be possible for a
+        // remote registry update to bypass the explicit community-risk gate.
+        *card = antigravity;
+    } else {
+        cards.push(antigravity);
     }
     // Put usable providers first, with local endpoints before hosted ones. The
     // complete catalog remains searchable below them as an honest preview.

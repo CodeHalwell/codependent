@@ -3139,6 +3139,14 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
                 "{model_id}\nprovider: {provider}\n\nOnly this user-configured models.toml entry and its model-specific saved key are removed. Comments, ordering, and the provider catalogue remain intact."
             ),
         ),
+        Overlay::ConfirmCommunityAcpInstall { .. } => render_confirm_box(
+            frame,
+            area,
+            state,
+            theme,
+            "Install the Antigravity community ACP bridge?",
+            "This bridge is not provided or endorsed by Google. Its maintainer warns that using third-party software with Antigravity OAuth may violate Google's Terms and risk account suspension.\n\nCodypendent will download pinned v1.0.0 from the project's GitHub release, verify its published SHA-256, and install it privately. Your credentials are not downloaded or stored by Codypendent.",
+        ),
         Overlay::ModelPicker { query, selected } => {
             render_model_picker(frame, area, state, theme, query, *selected);
         }
@@ -5102,22 +5110,39 @@ fn render_confirm_box(
     title: &str,
     detail: &str,
 ) {
-    let rect = centered_rect_min(60, 20, 48, 7, area);
+    // Size from the wrapped body rather than a fixed percentage. Long trust
+    // prompts must never push the decision labels below the card: hiding the
+    // affirmative/negative controls would make the consent boundary both
+    // confusing and inaccessible. The extra row per non-empty logical line is
+    // a conservative allowance for ratatui's word wrapping (which may break
+    // before the raw display-cell boundary).
+    let provisional = centered_rect_min(60, 20, 48, 7, area);
+    let inner_width = provisional.width.saturating_sub(2).max(1);
+    let detail_rows = detail.lines().fold(0u16, |rows, line| {
+        rows.saturating_add(cell_wrap_rows(std::iter::once(line), inner_width))
+            .saturating_add(u16::from(!line.is_empty()))
+    });
+    let required_height = detail_rows
+        .saturating_add(4) // title + decisions + two border rows
+        .max(7);
+    let rect = centered_rect_min(60, 20, 48, required_height, area);
     shield_modal(state, rect);
     frame.render_widget(Clear, rect);
-    let lines = vec![
-        Line::styled(
-            title.to_owned(),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(detail.to_owned(), Style::default().fg(theme.text.secondary)),
-        Line::from(vec![
-            Span::styled("[y] yes   ", Style::default().fg(theme.status.warning)),
-            Span::styled("[n] no", Style::default().fg(theme.status.success)),
-        ]),
-    ];
+    let mut lines = vec![Line::styled(
+        title.to_owned(),
+        Style::default()
+            .fg(theme.text.heading)
+            .add_modifier(Modifier::BOLD),
+    )];
+    lines.extend(
+        detail
+            .lines()
+            .map(|line| Line::styled(line.to_owned(), Style::default().fg(theme.text.secondary))),
+    );
+    lines.push(Line::from(vec![
+        Span::styled("[y] yes   ", Style::default().fg(theme.status.warning)),
+        Span::styled("[n] no", Style::default().fg(theme.status.success)),
+    ]));
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Confirm ")
@@ -12904,6 +12929,27 @@ mod tests {
             !text.contains("stage"),
             "the dead 'stage' copy must be gone:\n{text}"
         );
+    }
+
+    #[test]
+    fn antigravity_consent_names_third_party_terms_and_verified_install() {
+        let mut state = running_build_state();
+        state.overlay = Overlay::ConfirmCommunityAcpInstall {
+            provider_id: "antigravity-acp".to_owned(),
+            query: "anti".to_owned(),
+            selected: 0,
+            onboard_class: None,
+        };
+
+        let text = render_to_string(&state, 120, 40);
+        assert!(
+            text.contains("not provided or endorsed by Google"),
+            "{text}"
+        );
+        assert!(text.contains("risk account suspension"), "{text}");
+        assert!(text.contains("pinned v1.0.0"), "{text}");
+        assert!(text.contains("SHA-256"), "{text}");
+        assert!(text.contains("[y] yes"), "{text}");
     }
 
     #[test]

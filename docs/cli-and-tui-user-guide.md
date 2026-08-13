@@ -1,7 +1,7 @@
 # Codypendent CLI & TUI User Guide
 
 > **Product:** Codypendent — The local-first agentic developer environment
-> **Version:** 0.4.5
+> **Version:** 0.4.6
 > **Documentation Target:** CLI reference, Ratatui TUI shortcuts, environment setup, and workflow operations.
 
 ---
@@ -44,7 +44,7 @@ codypendent update --check
 
 # Install the newest published release, or pin an exact tag.
 codypendent update
-codypendent update v0.4.5
+codypendent update v0.4.6
 ```
 
 Updating never kills an active run. An idle daemon restarts immediately; a busy
@@ -497,14 +497,24 @@ The older official `kimi` registry entry remains separately addressable as
 `kimi-cli`.
 
 Google Antigravity does not currently ship a native ACP server. Codypendent can
-detect an explicitly installed `agy-acp`/`antigravity-acp` community bridge and
-shows it as `antigravity-acp`; it never downloads or launches that bridge
-automatically. The bridge project's own documentation warns that using
-third-party software with an Antigravity OAuth account may violate Google's
-Terms of Service and risk account suspension. Review those terms and the
-bridge source before opting in. Installing the bridge executable on `PATH`,
-then opening `/provider` (or running `codypendent acp connect antigravity`), is
-the complete Codypendent-side setup.
+use the third-party `antigravity-acp` bridge, but never downloads it merely
+because the provider catalog was opened. Selecting it in `/provider` presents a
+host-owned confirmation explaining that the bridge is not provided or endorsed
+by Google and that its maintainer warns third-party Antigravity OAuth use may
+violate Google's Terms of Service and risk account suspension. Only `y`/Enter
+continues. Codypendent then downloads the pinned v1.0.0 platform binary from the
+bridge's GitHub release, verifies its published SHA-256, installs it privately,
+and opens the normal live ACP model selector. An explicitly installed
+`agy-acp`/`antigravity-acp` on `PATH` still takes precedence and is never
+replaced. The equivalent non-interactive command requires the warning-specific
+acknowledgement:
+
+```bash
+codypendent acp connect antigravity --accept-community-risk
+```
+
+Review Google's terms and the bridge source before opting in. Codypendent does
+not read or store Antigravity credentials.
 
 Discovery tracks the latest catalogue, but connecting snapshots an immutable
 `agent-id@version` coordinate into the model profile. A daily registry refresh
