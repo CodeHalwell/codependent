@@ -253,6 +253,12 @@ pub async fn stream_forever<W: Write>(conn: &mut Connection, out: &mut W) -> any
 /// runner can never see, even though the daemon journaled it under this run's
 /// id. Keep this list in sync with the server's copy; both must omit exactly
 /// the session-scoped (non-run) event bodies, never a run-scoped one.
+///
+/// `RunUsage` and `LearningsCaptured` are here for that same reason: the
+/// server's copy resolves both to a run, and a copy that disagrees makes the
+/// CLI's notion of "this run's events" narrower than the daemon's — the drift
+/// this doc comment exists to forbid. The unit test below pins the rule so a
+/// new run-scoped variant cannot land in one copy only.
 pub(crate) fn event_run_id(body: &EventBody) -> Option<RunId> {
     match body {
         EventBody::RunStarted { run_id, .. }
@@ -266,7 +272,99 @@ pub(crate) fn event_run_id(body: &EventBody) -> Option<RunId> {
         | EventBody::SteeringQueued { run_id }
         | EventBody::SteeringApplied { run_id }
         | EventBody::BudgetWarning { run_id, .. }
-        | EventBody::RunCompleted { run_id, .. } => Some(*run_id),
+        | EventBody::RunCompleted { run_id, .. }
+        | EventBody::RunUsage { run_id, .. }
+        | EventBody::LearningsCaptured { run_id, .. } => Some(*run_id),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use codypendent_protocol::{
+        ArtifactId, ArtifactRef, BudgetDimension, DataClassification, RunDisposition, RunState,
+    };
+
+    /// Every run-scoped [`EventBody`] this build knows, each carrying `run`.
+    ///
+    /// The guard below is a list rather than a derived enumeration because Rust
+    /// cannot iterate a non-`unit` enum's variants at runtime; adding a
+    /// run-scoped variant means adding it here, which is exactly the moment to
+    /// notice the two `event_run_id` copies must move together.
+    fn run_scoped_bodies(run: RunId) -> Vec<EventBody> {
+        let artifact = ArtifactRef {
+            id: ArtifactId::new(),
+            media_type: "text/markdown".to_owned(),
+            byte_length: 12,
+            sha256: "a".repeat(64),
+            sensitivity: DataClassification::Internal,
+        };
+        vec![
+            EventBody::RunStateChanged {
+                run_id: run,
+                state: RunState::Running,
+            },
+            EventBody::ModelStreamDelta {
+                run_id: run,
+                text: String::new(),
+            },
+            EventBody::SteeringQueued { run_id: run },
+            EventBody::SteeringApplied { run_id: run },
+            EventBody::BudgetWarning {
+                run_id: run,
+                dimension: BudgetDimension::WallClock,
+                used: 1,
+                limit: 2,
+            },
+            EventBody::RunCompleted {
+                run_id: run,
+                disposition: RunDisposition::Completed { summary: None },
+                chronicle: artifact,
+            },
+            EventBody::RunUsage {
+                run_id: run,
+                prompt_tokens: Some(1),
+                completion_tokens: Some(2),
+                cost_micros: None,
+            },
+            EventBody::LearningsCaptured {
+                run_id: run,
+                proposed_count: 1,
+                proposed_ids: Vec::new(),
+                activated_count: 0,
+                activated_ids: Vec::new(),
+            },
+        ]
+    }
+
+    /// The invariant this function's doc states: a body carrying a `run_id` is
+    /// run-scoped, so it must resolve to that run. `RunUsage` and
+    /// `LearningsCaptured` were each journaled under a run id by the daemon
+    /// while this copy still answered `None` for them.
+    #[test]
+    fn every_run_scoped_body_resolves_to_its_run() {
+        let run = RunId::new();
+        for body in run_scoped_bodies(run) {
+            assert_eq!(
+                event_run_id(&body),
+                Some(run),
+                "run-scoped body answered None: {body:?}"
+            );
+        }
+    }
+
+    /// The other half: a session-scoped body must stay `None`, or
+    /// `stream_until_terminal` would attribute it to whatever run is live.
+    #[test]
+    fn a_session_scoped_body_belongs_to_no_run() {
+        assert_eq!(
+            event_run_id(&EventBody::SessionCreated {
+                title: "t".to_owned()
+            }),
+            None
+        );
+        assert_eq!(event_run_id(&EventBody::SessionClosed), None);
     }
 }

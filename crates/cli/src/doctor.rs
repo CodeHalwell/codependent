@@ -485,20 +485,20 @@ fn check_voice_endpoint(
             format!("{} · model {} · {locality}", config.base_url, config.model),
         );
     } else {
-        // `/keys` cannot save a [transcription]/[speech] credential today (the
-        // 2026-08-13 review's F3): `auth.json`'s "transcription"/"speech" rows
-        // are unreachable from any UI the product ships, so an env var is the
-        // only path that currently works — and it must be set in the RIGHT
-        // process, which `doctor`'s own environment does not prove.
+        // A key saved through `/keys` (an `auth.json` entry named for the
+        // table) outranks the env var and is not tied to any process's
+        // environment; the env var remains the alternative, and it must be
+        // exported in the RIGHT process, which `doctor` cannot prove from here.
         report.warn(
             label,
             format!(
-                "{} · model {} — {} is not set in doctor's own environment",
+                "{} · model {} — no key saved in auth.json and {} is not set in doctor's own \
+                 environment",
                 config.base_url, config.model, config.api_key_env
             ),
             &format!(
-                "export {} before starting — {env_hint}; `/keys` cannot save this credential yet, \
-                 so an environment variable is the only supported path",
+                "save the key in the TUI's `/keys` overlay (it now lists a row per configured \
+                 voice endpoint), or export {} before starting — {env_hint}",
                 config.api_key_env
             ),
         );
