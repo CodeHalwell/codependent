@@ -1344,7 +1344,36 @@ mod worktree_inspection_tests {
         let pool = open_database(&dir.path().join("codypendent.db"))
             .await
             .expect("open a freshly migrated database");
+        // `workspace_leases.owner_run_id REFERENCES runs(id)` (migration 0002),
+        // and a run references its session — so the lease cannot be allocated
+        // for a run id the database has never seen. The daemon always has both
+        // rows by the time a writing tool first calls `allocate`.
         let run_id = RunId::new();
+        let session_id = codypendent_protocol::SessionId::new();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query("INSERT INTO sessions (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)")
+            .bind(session_id.to_string())
+            .bind("eval-worktree-layout")
+            .bind(&now)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .expect("seed the owning session");
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, budget_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(run_id.to_string())
+        .bind(session_id.to_string())
+        .bind("eval worktree layout cross-check")
+        .bind("Running")
+        .bind("Build")
+        .bind("hosted-default")
+        .bind("{}")
+        .execute(&pool)
+        .await
+        .expect("seed the owning run");
+
         let lease = WorktreeManager::new()
             .allocate(&pool, &repo, run_id)
             .await
