@@ -1146,92 +1146,120 @@ fn composer_rendered_rows(composer: &str, width: u16) -> u16 {
         .max(1)
 }
 
-/// The one cell-granularity wrapping rule the transcript's measure pass and
-/// its draw pass share: a row breaks BEFORE the grapheme that would overflow
-/// `width`, and a grapheme wider than the whole viewport is force-placed
-/// alone (progress guarantee; the terminal clips it). [`cell_wrap_rows`]
-/// counts rows and [`split_line_cells`] materializes them by driving this
-/// same state machine, so measurement and drawing can never disagree — the
-/// old ceil-based measure under ratatui's word-wrap drew MORE rows than were
-/// measured on wrap-heavy content, under-estimating `max_scroll` and leaving
-/// follow mode clipping the newest lines.
-struct CellWrap {
+/// One grapheme's wrap-relevant facts: the columns it occupies, and whether a
+/// row may end just after it.
+#[derive(Clone, Copy)]
+struct WrapCell {
     width: usize,
-    col: usize,
-    rows: u16,
+    /// A space — the only break opportunity. Breaking after it means the space
+    /// itself is dropped rather than left dangling at the row edge.
+    breakable: bool,
 }
 
-impl CellWrap {
-    fn new(width: u16) -> Self {
-        Self {
-            width: usize::from(width).max(1),
-            col: 0,
-            rows: 1,
-        }
-    }
+/// The one wrapping rule the transcript's measure pass and its draw pass share:
+/// a row ends at the last space that fits, so a word is never split across
+/// rows; a word longer than the whole row is broken at the grapheme that would
+/// overflow (progress guarantee), and a single grapheme wider than the viewport
+/// is force-placed alone.
+///
+/// Both [`cell_wrap_rows`] and [`split_line_cells`] call this — measurement and
+/// drawing cannot disagree, which is the property the transcript depends on:
+/// under ratatui's own word-wrap the draw pass produced MORE rows than the
+/// measure pass on wrap-heavy content, under-estimating `max_scroll` and
+/// leaving follow mode clipping the newest lines. Character wrapping kept the
+/// two in step but broke mid-word — `so i` / `t needs one`.
+fn wrap_ranges(cells: &[WrapCell], width: u16) -> Vec<std::ops::Range<usize>> {
+    let width = usize::from(width).max(1);
+    let mut rows: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut start = 0usize;
+    let mut col = 0usize;
+    let mut last_space: Option<usize> = None;
+    let mut i = 0usize;
 
-    /// Feed one grapheme of display width `w`; returns `true` when it starts
-    /// a new visual row. Zero-width graphemes join the current cell.
-    fn push(&mut self, w: usize) -> bool {
-        if w == 0 {
-            return false;
+    while i < cells.len() {
+        let cell = cells[i];
+        // Zero-width graphemes (combining marks) join the cell before them.
+        if cell.width == 0 {
+            i += 1;
+            continue;
         }
-        if self.col + w > self.width && self.col > 0 {
-            self.rows = self.rows.saturating_add(1);
-            self.col = w.min(self.width);
-            true
-        } else {
-            self.col += w;
-            false
+        if col + cell.width > width && col > 0 {
+            // Prefer the last space in this row; fall back to a hard break for
+            // a word that cannot fit a row on its own.
+            // `s > start`, not `>=`: breaking at a space that is itself the
+            // row's first cell would emit an empty row and make no progress.
+            let (row_end, next_start) = match last_space {
+                Some(s) if s > start => (s, s + 1),
+                _ => (i, i),
+            };
+            rows.push(start..row_end);
+            start = next_start;
+            // The carried-over graphemes have to be re-measured into the new row.
+            col = cells[start..i].iter().map(|c| c.width).sum();
+            last_space = None;
+            continue; // re-examine cells[i] against the fresh row
         }
+        if cell.breakable {
+            last_space = Some(i);
+        }
+        col += cell.width;
+        i += 1;
     }
+    rows.push(start..cells.len());
+    rows
 }
 
-/// Visual row count of one logical line (its text in span order) cell-wrapped
-/// into `width` columns. Exactly `split_line_cells(..).len()` — both drive
-/// [`CellWrap`].
+/// Visual row count of one logical line (its text in span order) wrapped into
+/// `width` columns. Exactly `split_line_cells(..).len()` — both drive
+/// [`wrap_ranges`].
 fn cell_wrap_rows<'x>(texts: impl Iterator<Item = &'x str>, width: u16) -> u16 {
-    let mut wrap = CellWrap::new(width);
-    for text in texts {
-        for grapheme in UnicodeSegmentation::graphemes(text, true) {
-            wrap.push(UnicodeWidthStr::width(grapheme));
-        }
-    }
-    wrap.rows
+    let cells: Vec<WrapCell> = texts
+        .flat_map(|text| {
+            UnicodeSegmentation::graphemes(text, true).map(|g| WrapCell {
+                width: UnicodeWidthStr::width(g),
+                breakable: g == " ",
+            })
+        })
+        .collect();
+    u16::try_from(wrap_ranges(&cells, width).len()).unwrap_or(u16::MAX)
 }
 
-/// Split one styled `Line` into its visual rows at cell granularity (see
-/// [`CellWrap`]), preserving span styles across break points. The transcript
-/// `Paragraph` renders these rows UNwrapped, so the drawn geometry equals the
-/// measured geometry by construction.
+/// Split one styled `Line` into its visual rows (see [`wrap_ranges`]),
+/// preserving span styles across break points. The transcript `Paragraph`
+/// renders these rows UNwrapped, so the drawn geometry equals the measured
+/// geometry by construction.
 fn split_line_cells(line: &Line<'_>, width: u16) -> Vec<Line<'static>> {
-    let mut wrap = CellWrap::new(width);
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let mut row: Vec<Span<'static>> = Vec::new();
-    let mut fragment = String::new();
-    let mut fragment_style = Style::default();
-    let flush_fragment = |row: &mut Vec<Span<'static>>, fragment: &mut String, style: Style| {
-        if !fragment.is_empty() {
-            row.push(Span::styled(std::mem::take(fragment), style));
-        }
-    };
+    let mut cells: Vec<WrapCell> = Vec::new();
+    let mut graphemes: Vec<(&str, Style)> = Vec::new();
     for span in &line.spans {
-        flush_fragment(&mut row, &mut fragment, fragment_style);
-        fragment_style = span.style;
         for grapheme in UnicodeSegmentation::graphemes(span.content.as_ref(), true) {
-            if wrap.push(UnicodeWidthStr::width(grapheme)) {
-                flush_fragment(&mut row, &mut fragment, fragment_style);
-                let mut visual = Line::from(std::mem::take(&mut row));
-                visual.style = line.style;
-                out.push(visual);
+            cells.push(WrapCell {
+                width: UnicodeWidthStr::width(grapheme),
+                breakable: grapheme == " ",
+            });
+            graphemes.push((grapheme, span.style));
+        }
+    }
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for range in wrap_ranges(&cells, width) {
+        let mut row: Vec<Span<'static>> = Vec::new();
+        let mut fragment = String::new();
+        let mut fragment_style = Style::default();
+        for &(grapheme, style) in &graphemes[range] {
+            if !fragment.is_empty() && style != fragment_style {
+                row.push(Span::styled(std::mem::take(&mut fragment), fragment_style));
             }
+            fragment_style = style;
             fragment.push_str(grapheme);
         }
+        if !fragment.is_empty() {
+            row.push(Span::styled(fragment, fragment_style));
+        }
+        let mut visual = Line::from(row);
+        visual.style = line.style;
+        out.push(visual);
     }
-    flush_fragment(&mut row, &mut fragment, fragment_style);
-    let mut visual = Line::from(row);
-    visual.style = line.style;
-    out.push(visual);
     out
 }
 
@@ -15251,14 +15279,71 @@ mod tests {
                         "row overflows {width} cols: {visual:?}"
                     );
                 }
-                // Nothing is lost across the split.
+                // Nothing but the break itself is lost. Word wrap consumes the
+                // space it breaks at — leaving it would dangle past the row
+                // edge — so the rows rejoin to the original minus at most one
+                // space per break, and never minus anything else.
+                let original = format!("▌ {case}");
                 let rejoined: String = split
                     .iter()
                     .flat_map(|l| l.spans.iter())
                     .map(|s| s.content.as_ref())
                     .collect();
-                assert_eq!(rejoined, format!("▌ {case}"));
+                let without_spaces = |s: &str| s.replace(' ', "");
+                assert_eq!(
+                    without_spaces(&rejoined),
+                    without_spaces(&original),
+                    "content lost at width {width} for {case:?}"
+                );
+                let dropped = original.chars().count() - rejoined.chars().count();
+                assert!(
+                    dropped < split.len(),
+                    "dropped {dropped} chars across {} row(s) at width {width} for {case:?}",
+                    split.len()
+                );
+                // A wrapped row never ends or starts on the space it broke at.
+                for visual in &split {
+                    let text: String = visual.spans.iter().map(|s| s.content.as_ref()).collect();
+                    assert!(
+                        !text.is_empty(),
+                        "empty visual row at width {width} for {case:?}"
+                    );
+                }
             }
+        }
+    }
+
+    /// Prose wraps at spaces, not mid-word. A user reported reading
+    /// `… in a git worktree, so i` / `t needs one — open Codypendent …` in the
+    /// transcript: every paragraph wider than the pane was split at whatever
+    /// grapheme happened to land on the boundary.
+    #[test]
+    fn a_wrapped_paragraph_never_splits_a_word() {
+        let prose = "Codypendent isolates each Build run in a git worktree, \
+                     so it needs one — open Codypendent inside a git repository.";
+        for width in [24_u16, 37, 48, 60, 79] {
+            let line = Line::from(vec![Span::raw(prose.to_owned())]);
+            let rows: Vec<String> = split_line_cells(&line, width)
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+
+            // Every word of the original survives whole in some row.
+            let words: Vec<&str> = prose.split(' ').filter(|w| !w.is_empty()).collect();
+            for word in &words {
+                assert!(
+                    rows.iter().any(|r| r.split(' ').any(|w| w == *word)),
+                    "word {word:?} was split across rows at width {width}: {rows:#?}"
+                );
+            }
+            // And the rows are still the same sequence of words, in order.
+            let rejoined: Vec<String> = rows
+                .iter()
+                .flat_map(|r| r.split(' '))
+                .filter(|w| !w.is_empty())
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(rejoined, words, "word order changed at width {width}");
         }
     }
 
