@@ -1,4 +1,0 @@
-# Runbook
-
-secret body
-

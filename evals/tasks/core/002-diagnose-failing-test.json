@@ -1,9 +1,10 @@
 {
   "id": "diagnose-failing-test",
   "repository_revision": "8e7644ddbbe0dd04052b47f0e2bfefd45b535ee6",
-  "prompt": "Running `cargo test` in this repository, `math::tests::add_one_increments` fails. Investigate and explain, in your response, exactly why it fails and which function is responsible. Do not modify any file yet — this is investigation only.",
+  "prompt": "Running `cargo test` in this repository, `math::tests::add_one_increments` fails. Read the implementation with a shell command (for example `cat src/math.rs`) and then explain, in your response, exactly why it fails and which function is responsible. Do not modify any file yet — this is investigation only.",
   "policy": "coding-balanced",
   "expected": [
+    { "assert": "command-executed", "contains": "src/math.rs" },
     { "assert": "file-unchanged", "path": "src/math.rs" },
     { "assert": "file-unchanged", "path": "src/greet.rs" }
   ],

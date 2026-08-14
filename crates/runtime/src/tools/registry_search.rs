@@ -139,10 +139,11 @@ pub struct RegistrySearchRequest<'a> {
     pub query: &'a str,
     /// The skill whose `SKILL.md` to include, if any.
     pub open: Option<&'a str>,
-    /// The run's repository root, from which the implementation derives the
-    /// repository scope the funnel filters by. Server-derived from the run
-    /// context — never model-supplied, so a search can never widen its own
-    /// visibility.
+    /// The run's DURABLE repository identity (`RunContext::repository_identity`),
+    /// from which the implementation derives the repository scope the funnel
+    /// filters by — never the worktree the run executes in, which is a different
+    /// id and is deleted when the run ends. Server-derived from the run context —
+    /// never model-supplied, so a search can never widen its own visibility.
     pub repository: &'a Path,
 }
 

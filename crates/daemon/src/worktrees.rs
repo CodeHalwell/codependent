@@ -125,6 +125,18 @@ pub struct WorkspaceLease {
 pub struct ReleaseOutcome {
     /// The lease that was released (always ends in [`LeaseState::Released`]).
     pub lease_id: Uuid,
+    /// The run the lease belonged to, so a caller can attribute what it reports
+    /// to the run (and the session) the user is watching. Carried on the outcome
+    /// because the release already read the lease row: an assembly that wants to
+    /// TELL somebody a worktree was retained should not have to re-query for who
+    /// to tell.
+    pub owner_run_id: RunId,
+    /// The retained (or removed) worktree directory, so a report names the path
+    /// the user will actually find on disk.
+    pub worktree_path: PathBuf,
+    /// The per-run branch, likewise — `branch_deleted` says whether it is still
+    /// there, and this says what it is called.
+    pub branch: String,
     /// `true` when the worktree directory was retained because it held work
     /// that would otherwise be lost (and `force` was not set).
     pub preserved: bool,
@@ -428,6 +440,9 @@ impl WorktreeManager {
             mark_released(pool, lease_id).await?;
             return Ok(ReleaseOutcome {
                 lease_id,
+                owner_run_id: lease.owner_run_id,
+                worktree_path: lease.worktree_path.clone(),
+                branch: lease.branch.clone(),
                 preserved: true,
                 worktree_removed: false,
                 // The tree — and so the branch — is retained precisely because
@@ -451,6 +466,9 @@ impl WorktreeManager {
                 mark_released(pool, lease_id).await?;
                 return Ok(ReleaseOutcome {
                     lease_id,
+                    owner_run_id: lease.owner_run_id,
+                    worktree_path: lease.worktree_path.clone(),
+                    branch: lease.branch.clone(),
                     preserved: true,
                     worktree_removed: false,
                     branch_deleted: false,
@@ -498,6 +516,9 @@ impl WorktreeManager {
         mark_released(pool, lease_id).await?;
         Ok(ReleaseOutcome {
             lease_id,
+            owner_run_id: lease.owner_run_id,
+            worktree_path: lease.worktree_path.clone(),
+            branch: lease.branch.clone(),
             preserved: false,
             worktree_removed: removed,
             branch_deleted,

@@ -173,15 +173,28 @@ impl DocumentLeaseStore {
         }
     }
 
-    /// Release a lease by id (idempotent — releasing an already-released or
-    /// unknown lease is a no-op).
-    pub async fn release(&self, pool: &SqlitePool, lease_id: &str) -> Result<(), LeaseError> {
+    /// Release a lease `holder` holds, by id (idempotent — releasing an
+    /// already-released or unknown lease is a no-op).
+    ///
+    /// The holder predicate is the single-writer guarantee, not a nicety: without
+    /// it the lease id alone was a bearer capability over *someone else's* lease,
+    /// so any peer that learned one could drop the lock a writer was mid-edit
+    /// behind. A release by a non-holder updates no row and reports the same
+    /// success an unknown lease does — which is also what keeps a refusal from
+    /// telling the caller which lease ids exist.
+    pub async fn release(
+        &self,
+        pool: &SqlitePool,
+        lease_id: &str,
+        holder: &DocumentAuthor,
+    ) -> Result<(), LeaseError> {
         sqlx::query(
             "UPDATE document_leases SET state = 'released', released_at = ? \
-             WHERE id = ? AND state = 'active'",
+             WHERE id = ? AND state = 'active' AND holder_key = ?",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(lease_id)
+        .bind(Self::holder_key(holder))
         .execute(pool)
         .await?;
         Ok(())

@@ -154,7 +154,22 @@ async fn release_frees_the_range() {
         .acquire(&pool, doc, Some("p"), &writer("alice"), TTL)
         .await
         .unwrap();
-    store.release(&pool, &lease.id).await.unwrap();
+    // A release by somebody who does not hold the lease changes nothing: the
+    // lease id is not a bearer capability over another writer's lock.
+    store
+        .release(&pool, &lease.id, &writer("mallory"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.active_holder(&pool, doc, Some("p")).await.unwrap(),
+        Some(writer("alice")),
+        "a non-holder must not be able to release Alice's lease"
+    );
+
+    store
+        .release(&pool, &lease.id, &writer("alice"))
+        .await
+        .unwrap();
 
     // Released: no holder, and Bob may acquire.
     assert_eq!(
@@ -166,7 +181,10 @@ async fn release_frees_the_range() {
         .await
         .unwrap();
     // Releasing again is a no-op.
-    store.release(&pool, &lease.id).await.unwrap();
+    store
+        .release(&pool, &lease.id, &writer("alice"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

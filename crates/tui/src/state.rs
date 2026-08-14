@@ -996,6 +996,17 @@ pub struct RunView {
     pub context_percent: Option<u16>,
     /// Cost so far, in minor currency units, projected from the cost budget.
     pub cost_minor: Option<u64>,
+    /// The run's MEASURED usage, from [`EventBody::RunUsage`]
+    /// (`codypendent_protocol::EventBody::RunUsage`) — what the provider
+    /// actually charged for, as opposed to `context_percent`, which is an
+    /// estimate from a budget warning. Each dimension is independently
+    /// optional: a provider that reports no token counts, or a model with no
+    /// price on file, leaves that one `None`. `None` means UNMEASURED, never
+    /// zero — a run must never read as free because nobody priced it.
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    /// Measured cost in USD millionths.
+    pub cost_micros: Option<u64>,
     pub disposition: Option<RunDisposition>,
     /// The ordered transcript.
     pub transcript: Vec<TranscriptEntry>,
@@ -1030,6 +1041,9 @@ impl RunView {
             worktree: None,
             context_percent: None,
             cost_minor: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            cost_micros: None,
             disposition: None,
             transcript: Vec::new(),
             entry_times: Vec::new(),
@@ -2188,6 +2202,10 @@ pub struct StatusProjection {
     pub model: Option<ModelId>,
     pub context_percent: Option<u16>,
     pub cost_minor: Option<u64>,
+    /// The selected run's measured usage (see [`RunView::prompt_tokens`]).
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub cost_micros: Option<u64>,
     pub worktree: Option<String>,
     pub pending_approvals: usize,
 }
@@ -2453,6 +2471,16 @@ pub struct AppState {
     /// layout metric — never domain state — which is why it is a [`Cell`] the
     /// draw-only renderer may update through a shared reference.
     pub transcript_max_scroll: Cell<u16>,
+    /// The transcript's content width in columns, cached by the renderer each
+    /// frame (mirrors `transcript_max_scroll`). The reducer reads it to lay
+    /// markdown tables out to the real pane instead of a fixed 100 columns —
+    /// the only width-dependent product of the rich cache. `0` before the
+    /// first frame, meaning "no pane measured yet".
+    pub transcript_width: Cell<u16>,
+    /// The width the rich cache was last laid out at, so a resize invalidates
+    /// exactly the messages whose layout depended on it. Reducer-owned (plain
+    /// state, not a Cell) because it changes only when the reducer re-parses.
+    pub rich_layout_width: u16,
     /// A render→input geometry cache (mirrors `transcript_max_scroll`): every
     /// interactive widget registers its `Rect` + the `Action` a click fires here
     /// during render; the input layer resolves a left click to the topmost hit.
@@ -2578,6 +2606,8 @@ impl AppState {
             theme_selected: None,
             layout: LayoutMode::Chat,
             transcript_max_scroll: Cell::new(0),
+            transcript_width: Cell::new(0),
+            rich_layout_width: 0,
             hit_map: RefCell::new(Vec::new()),
             overlay: Overlay::None,
             default_mode: AgentMode::Build,
@@ -2953,6 +2983,9 @@ impl AppState {
             model: run.and_then(|r| r.model.clone()),
             context_percent: run.and_then(|r| r.context_percent),
             cost_minor: run.and_then(|r| r.cost_minor),
+            prompt_tokens: run.and_then(|r| r.prompt_tokens),
+            completion_tokens: run.and_then(|r| r.completion_tokens),
+            cost_micros: run.and_then(|r| r.cost_micros),
             worktree: run.and_then(|r| r.worktree.clone()),
             pending_approvals: self.pending_approvals.len(),
         }

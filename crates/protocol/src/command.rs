@@ -683,6 +683,181 @@ pub enum CommandBody {
     Unknown,
 }
 
+/// One resource, already in the daemon's storage, that a [`CommandBody`] names
+/// by id. See [`CommandBody::named_resources`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedResource<'a> {
+    Session(SessionId),
+    Run(RunId),
+    Approval(ApprovalId),
+    Document(DocumentId),
+    /// A document edit lease. A lease owns nothing itself: it is authorized
+    /// through the document it is held over.
+    DocumentLease(&'a str),
+    /// A durable workflow run, or the `board:<repository>` task board that
+    /// shares its id space (see [`board_scope_id`](crate::board_scope_id)).
+    Workflow(std::borrow::Cow<'a, str>),
+    /// A store with no per-row owner — every row in it is daemon-wide, so the
+    /// only principal that can own it is the uid the daemon runs as.
+    DaemonStore(DaemonStore),
+}
+
+/// A daemon-wide store a command addresses. Never on the wire: this is the
+/// daemon's ownership axis for the stores whose rows have no owner of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonStore {
+    /// Curated memories (`InspectMemory`, `ForgetMemoryScope`, …).
+    Memory,
+    /// The evaluation-gated promotion pipeline and its evidence.
+    Promotion,
+    /// Installed Remote UI plugins — an arbitrary-code surface for the worker
+    /// runtime, so it is gated exactly like the other two.
+    UiPlugins,
+}
+
+impl CommandBody {
+    /// **Every** pre-existing resource this body names, in ONE exhaustive match.
+    ///
+    /// It lives here, in the crate that defines the enum, for one reason: this
+    /// match has no wildcard arm, so a new `CommandBody` variant does not
+    /// compile until somebody says what it names. (`CommandBody` is
+    /// `#[non_exhaustive]`, so the same match in the daemon would need a
+    /// wildcard and a new variant would silently classify as "names nothing" —
+    /// which is precisely the failure this exists to prevent.)
+    ///
+    /// The daemon's socket server feeds this to its single ownership gate. Four
+    /// consecutive reviews found the same defect: ownership was checked per
+    /// command arm, and per-arm discipline leaks one arm at a time. The round-4
+    /// leak was `PublishDocument`, which parked a Git write against another
+    /// uid's document while both of its siblings re-derived ownership — and the
+    /// difference between its success and a `document.not-found` was itself an
+    /// enumeration oracle.
+    ///
+    /// An empty list means "names nothing that already exists": `CreateSession`
+    /// and `CreateDocument` mint their own ids, `StartWorkflow` creates its run,
+    /// `PutArtifact` stores fresh bytes.
+    #[must_use]
+    pub fn named_resources(&self) -> Vec<NamedResource<'_>> {
+        match self {
+            // The Remote UI plugin store is daemon-wide; `EnableUiPlugin` may
+            // additionally scope a plugin to a session, which is a second,
+            // per-row-owned id.
+            Self::InstallUiPlugin { .. }
+            | Self::SmokeTestUiPlugin { .. }
+            | Self::ListUiPlugins
+            | Self::UpdateUiPlugin { .. }
+            | Self::ApproveUiPluginUpdate { .. }
+            | Self::RejectUiPluginUpdate { .. }
+            | Self::RevokeUiPlugin { .. }
+            | Self::RemoveTrustedUiPublisher { .. } => {
+                vec![NamedResource::DaemonStore(DaemonStore::UiPlugins)]
+            }
+            Self::EnableUiPlugin { session_id, .. } => {
+                let mut named = vec![NamedResource::DaemonStore(DaemonStore::UiPlugins)];
+                named.extend(session_id.map(NamedResource::Session));
+                named
+            }
+            // `AttachSession` names a session and is deliberately absent: the
+            // requested role binds to the connection BEFORE the attach is
+            // evaluated (role bootstrap — a one-shot client asserts its role by
+            // attaching to an id it may not own), and a rejected attach answers
+            // `Payload::Error`, not `CommandRejected`. The daemon gates it
+            // inside its attach handler with the same ownership check and the
+            // same `protocol.session-not-found` answer.
+            Self::AttachSession { .. } => Vec::new(),
+            Self::CreateSession { .. }
+            | Self::CreateDocument { .. }
+            | Self::StartWorkflow { .. }
+            | Self::PutArtifact { .. }
+            | Self::Unknown => Vec::new(),
+            Self::StartRun { session_id, .. }
+            | Self::SubmitUserInput { session_id, .. }
+            | Self::UpdateIdeContext { session_id, .. }
+            | Self::ReadSessionEvents { session_id, .. } => {
+                vec![NamedResource::Session(*session_id)]
+            }
+            // The staleness sweep appends a note to whatever session it is
+            // handed, so that session is a resource it names.
+            Self::CheckDocuments { session_id, .. } => {
+                session_id.map(NamedResource::Session).into_iter().collect()
+            }
+            Self::CancelRun { run_id }
+            | Self::PauseRun { run_id }
+            | Self::ResumeRun { run_id }
+            | Self::QueueSteering { run_id, .. } => vec![NamedResource::Run(*run_id)],
+            Self::ResolveApproval { approval_id, .. } => {
+                vec![NamedResource::Approval(*approval_id)]
+            }
+            Self::MutateDocument { document_id, .. }
+            | Self::PublishDocument { document_id, .. } => {
+                vec![NamedResource::Document(*document_id)]
+            }
+            Self::AcquireDocumentLease { lease, .. } => {
+                vec![NamedResource::Document(lease.document_id)]
+            }
+            Self::ReleaseDocumentLease { lease_id } => {
+                vec![NamedResource::DocumentLease(lease_id.as_str())]
+            }
+            Self::PauseWorkflow { workflow_run_id }
+            | Self::ResumeWorkflow { workflow_run_id }
+            | Self::RetryWorkflowNode {
+                workflow_run_id, ..
+            }
+            | Self::CancelWorkflow { workflow_run_id }
+            | Self::ReadWorkflowRun { workflow_run_id } => {
+                vec![NamedResource::Workflow(std::borrow::Cow::Borrowed(
+                    workflow_run_id.as_str(),
+                ))]
+            }
+            // A repository board read re-points at a synthetic board run the
+            // daemon resolves, so what is named is the board when present and
+            // the workflow run otherwise.
+            Self::ReadBlackboard {
+                workflow_run_id,
+                board_repository,
+                ..
+            } => vec![NamedResource::Workflow(board_repository.as_deref().map_or(
+                std::borrow::Cow::Borrowed(workflow_run_id.as_str()),
+                |repository| std::borrow::Cow::Owned(crate::board_scope_id(repository)),
+            ))],
+            // Every board scope, not only `WorkflowRun`: a repository board is
+            // owner-checked too. A scope from a newer client names nothing here
+            // and is rejected structurally where it is lowered.
+            Self::PostBlackboardItem { scope, .. } | Self::UpdateBlackboardItem { scope, .. } => {
+                board_scope_resource(scope).into_iter().collect()
+            }
+            Self::InspectMemory { .. }
+            | Self::CorrectMemory { .. }
+            | Self::ForgetMemory { .. }
+            | Self::ForgetMemoryScope { .. }
+            | Self::OpenMemoryEvidence { .. } => {
+                vec![NamedResource::DaemonStore(DaemonStore::Memory)]
+            }
+            Self::ProposePromotion { .. }
+            | Self::AdvancePromotion { .. }
+            | Self::ApprovePromotion { .. }
+            | Self::RollbackPromotion { .. }
+            | Self::SubmitEvalEvidence { .. } => {
+                vec![NamedResource::DaemonStore(DaemonStore::Promotion)]
+            }
+        }
+    }
+}
+
+/// The workflow-run id a board scope is authorized against, or `None` for a
+/// scope this daemon does not understand.
+fn board_scope_resource(scope: &BlackboardScope) -> Option<NamedResource<'_>> {
+    match scope {
+        BlackboardScope::WorkflowRun { workflow_run_id } => Some(NamedResource::Workflow(
+            std::borrow::Cow::Borrowed(workflow_run_id.as_str()),
+        )),
+        BlackboardScope::RepositoryBoard { repository } => Some(NamedResource::Workflow(
+            std::borrow::Cow::Owned(crate::board_scope_id(repository)),
+        )),
+        _ => None,
+    }
+}
+
 /// `skip_serializing_if` helpers for the paged-history defaults: a zero is the
 /// field's default, so it is omitted on the wire (an older peer's exact shape).
 fn u64_is_zero(value: &u64) -> bool {

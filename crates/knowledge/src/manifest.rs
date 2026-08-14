@@ -279,19 +279,51 @@ impl SkillEntrypoints {
 }
 
 /// The `[trust]` table.
+///
+/// Everything in it is a **claim the package makes about itself**, recorded so
+/// an operator can read it — never a decision input. See [`PACKAGE_TRUST_TIER`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillTrust {
-    /// Publisher identity. The reserved value `"local-user"` maps to
-    /// [`TrustTier::FirstParty`]; anything else is [`TrustTier::Community`].
+    /// Publisher identity, as the package states it. Unverified: nothing signs
+    /// it and nothing checks it against the operator's trusted-publisher store,
+    /// so it is stored as text and read by no decision.
     pub publisher: String,
-    /// Whether a signature is required before the item may run.
+    /// Whether a signature is required before the item may run. Refused at load
+    /// when `true`, because no skill path verifies a signature — see
+    /// [`ManifestError::UnenforceableCapability`].
     #[serde(default)]
     pub signature_required: bool,
 }
 
-/// Publisher value that marks a package as locally authored (first-party trust).
-const LOCAL_PUBLISHER: &str = "local-user";
+/// The trust tier every package loaded from disk gets, whatever its manifest
+/// says.
+///
+/// Trust is a property of **how an item arrived**, not of what it says about
+/// itself. `[trust] publisher` is package-authored — the 2026-08-13 review
+/// installed a cloned package that wrote `publisher = "local-user"` and was
+/// recorded `trust_tier = first_party`, which is the tier
+/// [`crate::context`] renders as `first-party` on a disclosed card. The
+/// prompt-injection labelling that exists to mark author-controlled text as
+/// less authoritative was therefore bypassed by one line of TOML.
+///
+/// So: a package on disk is `Community`, full stop.
+///
+/// * [`TrustTier::FirstParty`] is reserved for items constructed in code
+///   ([`crate::builtin`]) — there is no manifest for those, so nothing can
+///   claim it.
+/// * [`TrustTier::Verified`] awaits a verified signature. `crates/sandbox`
+///   has the machinery ([`verify_artifact`] against the trusted-publisher
+///   store) but no skill path calls it, so no package can reach that tier
+///   today and pretending otherwise would be the same defect again.
+///
+/// The registration [`Scope`] is deliberately *not* used to soften this: the
+/// scope a package is installed under is itself derived from the manifest's own
+/// `scope` field (`crate::skills::install_package`), so keying trust on it
+/// would hand the same self-promotion back through a different field.
+///
+/// [`verify_artifact`]: https://docs.rs/codypendent-sandbox
+pub const PACKAGE_TRUST_TIER: TrustTier = TrustTier::Community;
 
 /// A failure loading or validating a skill package.
 #[derive(Debug, thiserror::Error)]
@@ -336,14 +368,18 @@ pub enum ManifestError {
         /// Why it was refused.
         detail: String,
     },
-    /// The manifest declares a capability no executor can currently enforce.
+    /// The manifest declares something no executor can currently enforce.
     /// Refused at **load** rather than at the first run: the 2026-08-13 review
     /// found the one shipped skill package structurally unrunnable for exactly
     /// this reason, and discovering that at install time is the difference
     /// between a fixable error and a mystery.
-    #[error("`[permissions] {capability}` cannot be enforced: {detail}")]
+    #[error("`[{table}] {capability}` cannot be enforced: {detail}")]
     UnenforceableCapability {
-        /// The `[permissions]` key.
+        /// The manifest table the key lives in (`permissions`, `trust`, …).
+        /// Carried separately so a key outside `[permissions]` does not report
+        /// itself as living there.
+        table: &'static str,
+        /// The key.
         capability: &'static str,
         /// Why no executor can honour it yet.
         detail: String,
@@ -406,6 +442,7 @@ pub fn load_package(dir: &Path, scope: Scope) -> Result<RegistryItem, ManifestEr
     // installable but unrunnable — so it is refused here instead.
     if !manifest.permissions.network.is_empty() {
         return Err(ManifestError::UnenforceableCapability {
+            table: "permissions",
             capability: "network",
             detail: "host:port grants require an outbound broker, which does not exist yet; \
                      no sandbox backend will admit a non-empty network allowlist"
@@ -414,9 +451,26 @@ pub fn load_package(dir: &Path, scope: Scope) -> Result<RegistryItem, ManifestEr
     }
     if !manifest.permissions.secrets.is_empty() {
         return Err(ManifestError::UnenforceableCapability {
+            table: "permissions",
             capability: "secrets",
             detail: "brokered secrets require the secrets daemon, which does not exist yet; \
                      no executor reads `brokered_secrets`"
+                .into(),
+        });
+    }
+    // Same rule, applied to the one other declaration nothing honours. A
+    // package asserting `signature_required = true` believes it will not run
+    // unverified; the field was parsed, stored, and read by nothing, so it
+    // would have run anyway. Refusing at load tells its author, exactly as for
+    // `network`/`secrets`, rather than leaving a protection that is only a
+    // string in a database.
+    if manifest.trust.signature_required {
+        return Err(ManifestError::UnenforceableCapability {
+            table: "trust",
+            capability: "signature_required",
+            detail: "no skill path verifies a signature: `[trust] signature` is never populated \
+                     and the trusted-publisher store is not consulted for skills, so requiring \
+                     one would be recorded and not enforced"
                 .into(),
         });
     }
@@ -434,16 +488,14 @@ pub fn load_package(dir: &Path, scope: Scope) -> Result<RegistryItem, ManifestEr
     // how every skill came to be marked executable regardless of content.
     let executable = manifest.entrypoints.has_behaviour();
 
-    let tier = if manifest.trust.publisher == LOCAL_PUBLISHER {
-        TrustTier::FirstParty
-    } else {
-        TrustTier::Community
-    };
+    // Derived from how the package arrived (on disk, unsigned), never from what
+    // it says about itself. `publisher` is carried through as an unverified
+    // claim so an operator can see who the package says wrote it.
     let trust = TrustMetadata {
         publisher: manifest.trust.publisher.clone(),
         signature_required: manifest.trust.signature_required,
         signature: None,
-        tier,
+        tier: PACKAGE_TRUST_TIER,
     };
 
     // Required tools are hard dependencies; optional tools are soft.
@@ -764,6 +816,93 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_package_cannot_promote_itself_to_first_party_trust() {
+        // The 2026-08-13 review: a cloned package writing `publisher =
+        // "local-user"` was recorded `trust_tier = first_party`, which is the
+        // tier `context.rs` renders as `first-party` on a disclosed card — so
+        // the prompt-injection labelling was bypassed by one line of TOML.
+        // `publisher` is package-authored; trust comes from how the package
+        // arrived, and every package arrives the same way: unsigned, on disk.
+        for publisher in ["local-user", "codypendent", "anyone-at-all"] {
+            let dir = tempfile::tempdir().unwrap();
+            write_package(dir.path(), "[permissions]\n");
+            let raw = std::fs::read_to_string(dir.path().join("skill.toml")).unwrap();
+            std::fs::write(
+                dir.path().join("skill.toml"),
+                raw.replace(
+                    "publisher = \"local-user\"",
+                    &format!("publisher = \"{publisher}\""),
+                ),
+            )
+            .unwrap();
+            let item = load_package(dir.path(), Scope::Repository(RepositoryId::new())).unwrap();
+            assert_eq!(
+                item.trust.tier,
+                TrustTier::Community,
+                "`publisher = {publisher:?}` must not move the tier"
+            );
+            assert_ne!(item.trust.tier, TrustTier::FirstParty);
+            // The claim is still recorded, so an operator can see it — it is
+            // just not a decision input.
+            assert_eq!(item.trust.publisher, publisher);
+        }
+    }
+
+    #[test]
+    fn a_user_scoped_package_is_no_more_trusted_than_a_repository_scoped_one() {
+        // The scope a package installs under is derived from the manifest's own
+        // `scope` field, so keying trust on it would hand the self-promotion
+        // back through a different attacker-controlled key.
+        let dir = tempfile::tempdir().unwrap();
+        write_package(dir.path(), "[permissions]\n");
+        let repository = load_package(dir.path(), Scope::Repository(RepositoryId::new())).unwrap();
+
+        let user_dir = tempfile::tempdir().unwrap();
+        write_package(user_dir.path(), "[permissions]\n");
+        let raw = std::fs::read_to_string(user_dir.path().join("skill.toml")).unwrap();
+        std::fs::write(
+            user_dir.path().join("skill.toml"),
+            raw.replace("scope = \"repository\"", "scope = \"user\""),
+        )
+        .unwrap();
+        let user = load_package(
+            user_dir.path(),
+            Scope::User(codypendent_protocol::UserId("u".into())),
+        )
+        .unwrap();
+
+        assert_eq!(repository.trust.tier, user.trust.tier);
+        assert_eq!(user.trust.tier, TrustTier::Community);
+    }
+
+    #[test]
+    fn requiring_a_signature_nobody_verifies_is_refused_at_load() {
+        // Same rule as `network`/`secrets`: a declaration no executor honours
+        // is refused while its author is looking at it, rather than recorded as
+        // a protection that does not exist.
+        let dir = tempfile::tempdir().unwrap();
+        write_package(dir.path(), "[permissions]\n");
+        let raw = std::fs::read_to_string(dir.path().join("skill.toml")).unwrap();
+        std::fs::write(
+            dir.path().join("skill.toml"),
+            raw.replace("signature_required = false", "signature_required = true"),
+        )
+        .unwrap();
+        let err = load_package(dir.path(), Scope::Repository(RepositoryId::new())).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ManifestError::UnenforceableCapability {
+                    table: "trust",
+                    capability: "signature_required",
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[test]

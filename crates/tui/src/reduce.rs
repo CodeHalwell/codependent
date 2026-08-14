@@ -45,6 +45,8 @@ const RICH_MARKDOWN_MAX_BYTES: usize = 64 * 1024;
 /// all stream-ending transitions without enumerating them. Idempotent (skips any
 /// entry already `Some`); bounded (O(total Model entries) cheap `is_none` checks).
 pub(crate) fn finalize_streamed_models(state: &mut AppState) {
+    invalidate_width_dependent_rich_cache(state);
+    let width = usize::from(state.transcript_width.get());
     let last_run = state.runs.len().checked_sub(1);
     for (idx, run) in state.runs.iter_mut().enumerate() {
         // The live streaming tail (only possible in the last run) is skipped.
@@ -59,11 +61,51 @@ pub(crate) fn finalize_streamed_models(state: &mut AppState) {
             }
             if let TranscriptEntry::Model { text, rendered } = entry {
                 if rendered.is_none() && text.len() <= RICH_MARKDOWN_MAX_BYTES {
-                    *rendered = Some(crate::markdown::parse(text));
+                    *rendered = Some(crate::markdown::parse(text, width));
                 }
             }
         }
     }
+}
+
+/// Drop the cached rich lines whose layout depended on a width that no longer
+/// holds, so the finalize pass above re-lays them for the new pane.
+///
+/// A markdown TABLE is the only width-dependent product of the parse — its
+/// columns are padded into the span text — so only messages that contain one
+/// are invalidated. Everything else wraps at draw time and survives a resize
+/// untouched, which keeps a resize O(cached lines) rather than O(re-parse) for
+/// the ordinary transcript.
+fn invalidate_width_dependent_rich_cache(state: &mut AppState) {
+    let width = state.transcript_width.get();
+    // 0 means "no pane measured yet" (before the first frame); a width that has
+    // not changed means every cached table is already laid out correctly.
+    if width == 0 || width == state.rich_layout_width {
+        return;
+    }
+    state.rich_layout_width = width;
+    for run in &mut state.runs {
+        for entry in &mut run.transcript {
+            if let TranscriptEntry::Model { rendered, .. } = entry {
+                if rendered.as_deref().is_some_and(has_table_row) {
+                    *rendered = None;
+                }
+            }
+        }
+    }
+}
+
+fn has_table_row(lines: &[crate::markdown::RichLine]) -> bool {
+    lines.iter().any(|line| {
+        line.spans.iter().any(|span| {
+            matches!(
+                span.role,
+                crate::markdown::SpanRole::TableHeader
+                    | crate::markdown::SpanRole::TableCell
+                    | crate::markdown::SpanRole::TableRule
+            )
+        })
+    })
 }
 
 /// Fold a single [`Action`] into the state. Pure: the only side effect is
@@ -123,6 +165,13 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 if state.tick >= *expires {
                     state.notice = None;
                 }
+            }
+            // A resize is not an event, so without this a table stays laid out
+            // for the old pane until the next daemon event arrives — which for
+            // a finished conversation is never. The comparison is one `u16`;
+            // the walk happens only on the tick after the width actually moved.
+            if state.transcript_width.get() != state.rich_layout_width {
+                finalize_streamed_models(state);
             }
             if state.tick.is_multiple_of(25) {
                 refresh_open_projection(state);
@@ -1949,6 +1998,38 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 run.activity = RunActivity::Idle;
             }
         }
+        // The run's MEASURED usage, emitted after RunCompleted. Without this arm
+        // it fell into the forward-compatibility catch-all below and the product
+        // printed `? unsupported event` where the tokens belong — a placeholder
+        // for a FUTURE protocol, triggered by an event from this same build.
+        // Quiet like `LearningsCaptured` (no card of its own): the numbers land
+        // on the run, and the run's own completion row, header, footer and Run
+        // detail render them.
+        //
+        // Each dimension is folded independently and only when present, because
+        // an absent one means "the provider did not measure it", not zero — an
+        // unpriced local model reports tokens and no money, and must not read as
+        // free. A repeat event (a resumed run measured twice) overwrites rather
+        // than accumulates: the daemon publishes the run's total, not a delta.
+        EventBody::RunUsage {
+            run_id,
+            prompt_tokens,
+            completion_tokens,
+            cost_micros,
+        } => {
+            if let Some(run) = state.run_mut(run_id) {
+                if prompt_tokens.is_some() {
+                    run.prompt_tokens = prompt_tokens;
+                }
+                if completion_tokens.is_some() {
+                    run.completion_tokens = completion_tokens;
+                }
+                if cost_micros.is_some() {
+                    run.cost_micros = cost_micros;
+                }
+            }
+        }
+
         // Capture is intentionally emitted after RunCompleted. Keep it quiet
         // (no transcript card), but always preserve the review count and
         // refresh an already-open Journey even though the run is terminal.
@@ -15439,5 +15520,186 @@ mod tests {
 
         assert_eq!(state.issues, vec!["MCP server unavailable"]);
         assert!(state.notice.is_none());
+    }
+
+    /// `RunUsage` is published by this same build's daemon after every measured
+    /// run. Without an arm it fell into the forward-compatibility catch-all and
+    /// pushed `TranscriptEntry::Unsupported` — the product telling the user its
+    /// own measurement was unsupported.
+    #[test]
+    fn run_usage_lands_on_the_run_and_pushes_no_unsupported_card() {
+        let mut state = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "summarise".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunUsage {
+                run_id,
+                prompt_tokens: Some(10_000),
+                completion_tokens: Some(642),
+                cost_micros: Some(3_400),
+            }),
+        );
+        let run = state.runs.first().expect("the run");
+        assert_eq!(run.prompt_tokens, Some(10_000));
+        assert_eq!(run.completion_tokens, Some(642));
+        assert_eq!(run.cost_micros, Some(3_400));
+        assert!(
+            !run.transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::Unsupported { .. })),
+            "usage is not an unsupported event: {:?}",
+            run.transcript
+        );
+        let status = state.status();
+        assert_eq!(status.prompt_tokens, Some(10_000));
+        assert_eq!(status.cost_micros, Some(3_400));
+    }
+
+    /// An absent dimension means "the provider did not measure it", never zero,
+    /// and a later event must not erase what an earlier one measured.
+    #[test]
+    fn run_usage_folds_only_the_dimensions_that_were_measured() {
+        let mut state = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "summarise".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunUsage {
+                run_id,
+                prompt_tokens: Some(1_234),
+                completion_tokens: Some(567),
+                cost_micros: None,
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunUsage {
+                run_id,
+                prompt_tokens: None,
+                completion_tokens: None,
+                cost_micros: Some(2_500),
+            }),
+        );
+        let run = state.runs.first().expect("the run");
+        assert_eq!(
+            run.prompt_tokens,
+            Some(1_234),
+            "an unmeasured field is not a reset"
+        );
+        assert_eq!(run.completion_tokens, Some(567));
+        assert_eq!(run.cost_micros, Some(2_500));
+    }
+
+    /// An event this build genuinely does not know still renders the RULE-1
+    /// placeholder — the catch-all must keep working for a NEWER daemon.
+    #[test]
+    fn a_genuinely_unknown_event_still_reaches_the_forward_compat_placeholder() {
+        let mut state = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "summarise".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        reduce(&mut state, system_ev(EventBody::Unknown));
+        assert!(
+            state
+                .runs
+                .first()
+                .expect("the run")
+                .transcript
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::Unsupported { .. })),
+            "protocol RULE 1 still holds for an event from a newer daemon"
+        );
+    }
+
+    /// A markdown table is laid out into the span text, so the cache has to be
+    /// rebuilt when the pane changes — otherwise a table parsed at 118 columns
+    /// shears on a 70-column terminal.
+    #[test]
+    fn a_narrower_pane_relays_out_a_cached_markdown_table() {
+        let mut state = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "table".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        state.transcript_width.set(118);
+        reduce(
+            &mut state,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "| column-one-is-long | column-two-is-long | column-three-is-long | column-four-is-long |\n\
+                       | --- | --- | --- | --- |\n\
+                       | aaaaaaaaaaaaaaaaaa | bbbbbbbbbbbbbbbbbb | cccccccccccccccccccc | dddddddddddddddddd |\n"
+                    .to_owned(),
+            }),
+        );
+        reduce(
+            &mut state,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+
+        let widest = |state: &AppState| -> usize {
+            state
+                .runs
+                .iter()
+                .flat_map(|run| run.transcript.iter())
+                .filter_map(|entry| match entry {
+                    TranscriptEntry::Model { rendered, .. } => rendered.as_ref(),
+                    _ => None,
+                })
+                .flat_map(|lines| lines.iter())
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| unicode_width::UnicodeWidthStr::width(span.text.as_str()))
+                        .sum::<usize>()
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        let wide = widest(&state);
+        assert!(
+            wide > 70,
+            "precondition: the table is wide at 118 columns ({wide})"
+        );
+
+        // The user drags the terminal narrower; the renderer publishes the new
+        // pane and the next tick re-lays the cache out for it.
+        state.transcript_width.set(70);
+        reduce(&mut state, Action::Tick);
+        let narrow = widest(&state);
+        assert!(
+            narrow <= 70,
+            "a table must fit the pane it is drawn into, got {narrow} columns for a 70-column pane"
+        );
+        assert!(narrow > 0, "the cache was rebuilt, not merely dropped");
     }
 }

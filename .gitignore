@@ -3,3 +3,12 @@
 
 # Claude Code local state (agent worktrees, local settings). Never committed.
 /.claude/
+
+# Bytecode from the doc/eval gate scripts (`.github/scripts/*.py`,
+# `evals/ci/*.py`) when they are run locally.
+__pycache__/
+
+# The vitest JSON report the `extension` CI job writes for the doc-count gate
+# (`.github/scripts/check_doc_test_counts.py --vitest-report`). Ephemeral in
+# CI; running the same two commands locally must not leave a tracked artifact.
+/vitest-extension.json

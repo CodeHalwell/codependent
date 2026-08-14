@@ -39,9 +39,17 @@
 //! | export | signature | required |
 //! |---|---|---|
 //! | `memory` | linear memory | yes |
-//! | `codypendent_run` | `() -> i32` | yes |
+//! | `codypendent_run` | `(i32) -> i32` | yes |
 //!
-//! and may import, from module `codypendent`:
+//! The entry point's single `i32` parameter is **reserved**: the host passes `0`
+//! today and a guest must accept and ignore it. It is in the signature so a
+//! future per-invocation handle can be threaded through without every shipped
+//! module becoming unloadable. The arity is checked exactly
+//! ([`WasmError::MissingExport`]), so this table is the ABI — a module built to
+//! a nullary `codypendent_run` is refused. There is no WASM SDK yet, which is
+//! why the table is normative rather than illustrative.
+//!
+//! A guest may import, from module `codypendent`:
 //!
 //! | import | signature | privileged |
 //! |---|---|---|
@@ -57,6 +65,13 @@
 //! `read_file` is the only privileged call. It goes through
 //! [`CapabilityBroker`], so it is refused unless the package's manifest
 //! declared the path **and** the run policy allows it.
+//!
+//! Every host call is metered before it does anything: it is charged fuel and
+//! the wall-clock deadline is checked, and a call made past the deadline
+//! terminates the guest (see [`WasmHost::run`]). A host call is otherwise a
+//! blind spot in both ceilings — fuel does not advance inside one, and the
+//! `OutOfFuel` yield a pure-compute guest hits need never happen for a guest
+//! that spends its life in host calls.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -81,6 +96,18 @@ const FUEL_SLICE: u64 = 2_000_000;
 /// never enters the OS scheduler's view.
 const FUEL_PER_CPU_SECOND: u64 = 200_000_000;
 
+/// Fuel charged for entering a host function, and per eight bytes it copies.
+///
+/// The engine does not meter host work at all: a guest that loops on
+/// `codypendent::input` consumed 800k fuel in 167 seconds (measured), so
+/// neither the fuel budget nor the slice boundary that carries the wall-clock
+/// check was ever reached. These charges make a host call cost something, so a
+/// host-call loop burns its instruction budget and yields on `OutOfFuel` like
+/// any other loop. They are a floor, not a measurement of host time — the
+/// deadline check in [`enter_host_call`] is what actually bounds it.
+const FUEL_PER_HOST_CALL: u64 = 1_000;
+const HOST_BYTES_PER_FUEL: usize = 8;
+
 /// Hard ceilings a manifest can never exceed, however it is written. A package
 /// declares what it needs *within* these; it cannot raise them.
 const MAX_MEMORY_BYTES: usize = 512 * 1024 * 1024;
@@ -104,8 +131,10 @@ pub struct WasmLimits {
     /// Linear-memory ceiling in bytes. `memory.grow` past this returns −1 to
     /// the guest (a spec-compliant allocation failure), it does not abort.
     pub memory_bytes: usize,
-    /// Wall-clock ceiling. Checked between fuel slices; overshoot is bounded by
-    /// one slice, not by guest behaviour.
+    /// Wall-clock ceiling. Checked between fuel slices **and** on entry to
+    /// every host call, and re-checked once the guest returns, so overshoot is
+    /// bounded by one fuel slice or one host call — whichever the guest is
+    /// inside — rather than by guest behaviour.
     pub wall: Duration,
     /// Captured-output ceiling. Output past this is dropped and flagged.
     pub output_bytes: usize,
@@ -267,6 +296,13 @@ struct HostState {
     host_bytes_read: usize,
     denials: Vec<String>,
     limits: StoreLimits,
+    /// When this invocation must be over. Carried in the store so a host
+    /// function can see it; the guest has no way to read or move it.
+    deadline: Instant,
+    /// Set by [`enter_host_call`] when it refuses. The trap it returns is
+    /// indistinguishable from any other host trap at the `wasmi` boundary, so
+    /// the reason is recorded here and read back by [`WasmHost::run`].
+    deadline_exceeded: bool,
 }
 
 impl HostState {
@@ -276,6 +312,38 @@ impl HostState {
             .push(format!("{} refused: {reason}", request.describe()));
         GUEST_REFUSED
     }
+}
+
+/// Charge `fuel` against the store's remaining budget, saturating at zero.
+///
+/// Zero is not a failure here: the guest traps `OutOfFuel` on its next
+/// instruction, which is a resumable yield the run loop already handles (and
+/// where it decides whether the total budget is exhausted).
+fn charge_fuel(caller: &mut Caller<'_, HostState>, fuel: u64) {
+    let remaining = caller.get_fuel().unwrap_or(0);
+    let _ = caller.set_fuel(remaining.saturating_sub(fuel));
+}
+
+/// The prologue **every** host function runs before doing anything.
+///
+/// Fuel is not consumed while execution is inside a host function, and a guest
+/// that spends its life in host calls need never reach the `OutOfFuel` slice
+/// boundary where the wall clock used to be checked — measured, a guest with
+/// zero declared permissions ran 166.8 s against a declared 1 s ceiling and the
+/// host reported `Ok`. Checking the deadline here closes that: the check is
+/// outside the guest, the guest cannot skip a host call it is making, and
+/// exceeding the ceiling **terminates** the invocation with an error rather
+/// than letting it complete.
+fn enter_host_call(caller: &mut Caller<'_, HostState>) -> Result<(), wasmi::Error> {
+    charge_fuel(caller, FUEL_PER_HOST_CALL);
+    let state = caller.data_mut();
+    if Instant::now() >= state.deadline {
+        state.deadline_exceeded = true;
+        return Err(wasmi::Error::new(
+            "wasm guest exceeded its wall-clock ceiling during a host call",
+        ));
+    }
+    Ok(())
 }
 
 /// Copy `len` bytes out of guest memory, refusing an out-of-bounds or
@@ -303,35 +371,38 @@ fn guest_memory(caller: &mut Caller<'_, HostState>) -> Option<wasmi::Memory> {
 
 /// `codypendent::input` — copy the invocation input into guest memory.
 /// Unprivileged: the input is what the *host* chose to pass.
-fn host_input(mut caller: Caller<'_, HostState>, ptr: i32, cap: i32) -> i32 {
+fn host_input(mut caller: Caller<'_, HostState>, ptr: i32, cap: i32) -> Result<i32, wasmi::Error> {
+    enter_host_call(&mut caller)?;
     let Some(memory) = guest_memory(&mut caller) else {
-        return GUEST_BAD_ARGUMENT;
+        return Ok(GUEST_BAD_ARGUMENT);
     };
     let Ok(cap) = usize::try_from(cap) else {
-        return GUEST_BAD_ARGUMENT;
+        return Ok(GUEST_BAD_ARGUMENT);
     };
     let Ok(ptr) = usize::try_from(ptr) else {
-        return GUEST_BAD_ARGUMENT;
+        return Ok(GUEST_BAD_ARGUMENT);
     };
     let input = caller.data().input.clone();
     let full = input.len();
     let n = cap.min(full);
+    charge_fuel(&mut caller, (n / HOST_BYTES_PER_FUEL) as u64);
     // A zero-capacity call is the documented "how big is my input?" query, so
     // it must not fail on a null pointer.
     if n > 0 && memory.write(&mut caller, ptr, &input[..n]).is_err() {
-        return GUEST_BAD_ARGUMENT;
+        return Ok(GUEST_BAD_ARGUMENT);
     }
-    i32::try_from(full).unwrap_or(i32::MAX)
+    Ok(i32::try_from(full).unwrap_or(i32::MAX))
 }
 
 /// `codypendent::log` — append to the captured output. Unprivileged, but capped:
 /// a guest cannot exhaust host memory by logging.
-fn host_log(mut caller: Caller<'_, HostState>, ptr: i32, len: i32) {
+fn host_log(mut caller: Caller<'_, HostState>, ptr: i32, len: i32) -> Result<(), wasmi::Error> {
+    enter_host_call(&mut caller)?;
     let Some(memory) = guest_memory(&mut caller) else {
-        return;
+        return Ok(());
     };
     let Ok(len) = usize::try_from(len) else {
-        return;
+        return Ok(());
     };
     let room = {
         let state = caller.data();
@@ -341,14 +412,16 @@ fn host_log(mut caller: Caller<'_, HostState>, ptr: i32, len: i32) {
     // a guest cannot suppress the truncation signal by writing one huge buffer
     // instead of many small ones. `room` bounds the host-side allocation.
     let wanted = len.min(room);
+    charge_fuel(&mut caller, (wanted / HOST_BYTES_PER_FUEL) as u64);
     let Some(bytes) = read_guest_bytes(&caller, &memory, ptr, wanted, room) else {
-        return;
+        return Ok(());
     };
     let state = caller.data_mut();
     state.output.extend_from_slice(&bytes);
     if len > wanted {
         state.output_truncated = true;
     }
+    Ok(())
 }
 
 /// `codypendent::read_file` — the only privileged host call.
@@ -363,22 +436,23 @@ fn host_read_file(
     path_len: i32,
     out_ptr: i32,
     out_cap: i32,
-) -> i32 {
+) -> Result<i32, wasmi::Error> {
+    enter_host_call(&mut caller)?;
     let Some(memory) = guest_memory(&mut caller) else {
-        return GUEST_BAD_ARGUMENT;
+        return Ok(GUEST_BAD_ARGUMENT);
     };
     // A path longer than this is not a path.
     let Ok(path_len) = usize::try_from(path_len) else {
-        return GUEST_BAD_ARGUMENT;
+        return Ok(GUEST_BAD_ARGUMENT);
     };
     let Some(raw) = read_guest_bytes(&caller, &memory, path_ptr, path_len, 4096) else {
-        return GUEST_BAD_ARGUMENT;
+        return Ok(GUEST_BAD_ARGUMENT);
     };
     let Ok(requested) = String::from_utf8(raw) else {
-        return GUEST_BAD_ARGUMENT;
+        return Ok(GUEST_BAD_ARGUMENT);
     };
     let (Ok(out_ptr), Ok(out_cap)) = (usize::try_from(out_ptr), usize::try_from(out_cap)) else {
-        return GUEST_BAD_ARGUMENT;
+        return Ok(GUEST_BAD_ARGUMENT);
     };
 
     // Resolve first, then decide, then open the resolved path. A missing file
@@ -386,7 +460,7 @@ fn host_read_file(
     // cannot use this call to probe for the existence of paths it may not read.
     let Ok(resolved) = std::fs::canonicalize(&requested) else {
         let request = HostRequest::ReadFile { path: requested };
-        return caller.data_mut().deny(&request, "unresolvable path");
+        return Ok(caller.data_mut().deny(&request, "unresolvable path"));
     };
     let request = HostRequest::ReadFile {
         path: resolved.to_string_lossy().into_owned(),
@@ -401,7 +475,7 @@ fn host_read_file(
         Ok(grant) => grant,
         Err(denied) => {
             let reason = denied.code.clone();
-            return caller.data_mut().deny(&request, &reason);
+            return Ok(caller.data_mut().deny(&request, &reason));
         }
     };
     debug_assert!(
@@ -411,21 +485,28 @@ fn host_read_file(
 
     let budget = caller.data().host_read_remaining;
     if budget == 0 {
-        return caller
+        return Ok(caller
             .data_mut()
-            .deny(&request, "host-read budget exhausted");
+            .deny(&request, "host-read budget exhausted"));
     }
     let bytes = match read_capped(&resolved, budget.min(out_cap)) {
         Ok(bytes) => bytes,
-        Err(_) => return caller.data_mut().deny(&request, "read failed"),
+        Err(_) => return Ok(caller.data_mut().deny(&request, "read failed")),
     };
-    if memory.write(&mut caller, out_ptr, &bytes).is_err() {
-        return GUEST_BAD_ARGUMENT;
-    }
+    // Account BEFORE the copy into guest memory, not after. The bytes have
+    // already come off the disk; whether the guest's destination pointer was
+    // valid is its problem, not the budget's. Returning early on a bad
+    // `out_ptr` skipped this and bought unmetered reads — measured, 500 calls
+    // against a granted 20 MB file pulled 9.3 GiB with `host_bytes_read = 0`
+    // and a 64 MiB ceiling that never engaged.
+    charge_fuel(&mut caller, (bytes.len() / HOST_BYTES_PER_FUEL) as u64);
     let state = caller.data_mut();
     state.host_read_remaining = state.host_read_remaining.saturating_sub(bytes.len());
     state.host_bytes_read += bytes.len();
-    i32::try_from(bytes.len()).unwrap_or(i32::MAX)
+    if memory.write(&mut caller, out_ptr, &bytes).is_err() {
+        return Ok(GUEST_BAD_ARGUMENT);
+    }
+    Ok(i32::try_from(bytes.len()).unwrap_or(i32::MAX))
 }
 
 /// Read at most `cap` bytes. Never allocates on the file's own claimed size, so
@@ -529,6 +610,7 @@ impl WasmHost {
             }
         }
 
+        let deadline = started + self.limits.wall;
         let state = HostState {
             profile: profile.clone(),
             gate,
@@ -539,6 +621,8 @@ impl WasmHost {
             host_read_remaining: self.limits.host_read_bytes,
             host_bytes_read: 0,
             denials: Vec::new(),
+            deadline,
+            deadline_exceeded: false,
             limits: StoreLimitsBuilder::new()
                 .memory_size(self.limits.memory_bytes)
                 // One memory, one table, one instance: a guest cannot multiply
@@ -585,7 +669,6 @@ impl WasmHost {
             .get_memory(&store, "memory")
             .ok_or(WasmError::MissingExport("memory"))?;
 
-        let deadline = started + self.limits.wall;
         let mut outputs = [Val::I32(0)];
         let mut remaining = self.limits.fuel;
         let mut granted = remaining.min(FUEL_SLICE);
@@ -596,7 +679,7 @@ impl WasmHost {
 
         let mut call = entry
             .call_resumable(&mut store, &[Val::I32(0)], &mut outputs)
-            .map_err(|e| self.classify_trap(e))?;
+            .map_err(|e| self.classify_trap(&store, e))?;
         let mut consumed: u64 = 0;
         loop {
             match call {
@@ -604,10 +687,19 @@ impl WasmHost {
                     consumed += granted.saturating_sub(store.get_fuel().unwrap_or(0));
                     break;
                 }
-                ResumableCall::HostTrap(_) => {
-                    // No host function returns an error, so reaching this means
-                    // the runtime's contract changed under us. Refuse.
-                    return Err(WasmError::Trap("host function trapped".into()));
+                ResumableCall::HostTrap(trap) => {
+                    // The only host function that returns an error is one whose
+                    // prologue refused, so this is where a guest that outlived
+                    // its wall clock inside a host call is terminated.
+                    if store.data().deadline_exceeded {
+                        return Err(WasmError::WallClockExceeded {
+                            wall: self.limits.wall,
+                        });
+                    }
+                    return Err(WasmError::Trap(format!(
+                        "host function trapped: {}",
+                        trap.host_error()
+                    )));
                 }
                 ResumableCall::OutOfFuel(next) => {
                     consumed += granted;
@@ -632,9 +724,19 @@ impl WasmHost {
                         .map_err(|e| WasmError::Runtime(e.to_string()))?;
                     call = next
                         .resume(&mut store, &mut outputs)
-                        .map_err(|e| self.classify_trap(e))?;
+                        .map_err(|e| self.classify_trap(&store, e))?;
                 }
             }
+        }
+
+        // A run that overran its declared ceiling is a refusal even when the
+        // guest returned normally: a single long host call could otherwise
+        // finish past the deadline and be reported as a successful completion,
+        // which is what made a 167x overshoot read as `Ok`.
+        if started.elapsed() >= self.limits.wall {
+            return Err(WasmError::WallClockExceeded {
+                wall: self.limits.wall,
+            });
         }
 
         let status = match outputs[0] {
@@ -660,8 +762,15 @@ impl WasmHost {
 
     /// Map a `wasmi` error onto a refusal. Fuel exhaustion inside a slice can
     /// surface as a plain error rather than a resumable state when the trap
-    /// escapes a host boundary, so it is recognised here too.
-    fn classify_trap(&self, error: wasmi::Error) -> WasmError {
+    /// escapes a host boundary, so it is recognised here too — as is a host
+    /// call refused by [`enter_host_call`], whose reason lives in the store
+    /// because `wasmi` gives every host error the same shape.
+    fn classify_trap(&self, store: &Store<HostState>, error: wasmi::Error) -> WasmError {
+        if store.data().deadline_exceeded {
+            return WasmError::WallClockExceeded {
+                wall: self.limits.wall,
+            };
+        }
         if matches!(error.as_trap_code(), Some(wasmi::core::TrapCode::OutOfFuel)) {
             return WasmError::FuelExhausted {
                 fuel: self.limits.fuel,

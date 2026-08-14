@@ -1319,7 +1319,7 @@ impl AgentLoopNodeExecutor {
         // The board/history subject is repository IDENTITY (`R`), like the GitHub
         // target below and unlike the policy read root — a node's cards belong to
         // the checkout, not to its throwaway worktree.
-        .with_board_repository(repository.to_string_lossy().into_owned());
+        .with_repository_identity(repository.to_string_lossy().into_owned());
         // The GitHub target is repository IDENTITY (`R`), NOT the policy read root —
         // a worktree shares R's remotes, but R is the stable slug source.
         if self.github.is_some() {

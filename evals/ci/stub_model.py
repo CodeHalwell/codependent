@@ -12,7 +12,7 @@ dispatch in `codypendentd` to run against it exactly as they would against
 any other OpenAI-compatible endpoint.
 
 WHAT IT IS NOT: an agent. It carries no model weights and does no reasoning.
-For each of the 12 pinned `evals/tasks/core/*.json` cases it recognizes the
+For each of the 13 pinned `evals/tasks/core/*.json` cases it recognizes the
 case by matching a literal, unique substring of that case's own `prompt`
 field against the incoming request, and then replays a fixed, hand-written
 sequence of tool calls (or a plain text answer for the read-only cases) —
@@ -320,28 +320,31 @@ suite.
 """
 
 # ---------------------------------------------------------------------------
-# The 12-case script. `match` is a literal, verified-unique ASCII substring of
+# The 13-case script. `match` is a literal, verified-unique ASCII substring of
 # that case's `prompt` field in `evals/tasks/core/*.json` (picked to avoid the
 # corpus's few non-ASCII em dashes, which is not a wire-safety requirement,
 # just a defensive simplification). `steps` is the fixed reply sequence: each
 # entry is either a single tool call (`tool` + `args`) or the final plain-text
 # answer (`text`) that ends the run with no further tool calls. Step N is
-# selected by counting how many prior tool round-trips the conversation
-# already carries — i.e. how many of this case's own tool calls have already
-# executed and reported back — so the script is stateless per HTTP request
-# and needs no server-side session tracking.
+# selected by counting THE MODEL'S OWN prior tool calls in the replayed
+# conversation (see `scripted_step_index`), so the script is stateless per
+# HTTP request and needs no server-side session tracking.
 #
 # `codypendent-runtime`'s agent loop does NOT replay tool history using the
 # OpenAI wire convention (`role: "tool"` + `tool_call_id`); it reformats a
 # completed round trip into plain `role: "assistant"` / `role: "user"`
 # messages reading `[calling <tool>: <args>]` / `[tool result: <tool>]\n...`
-# (verified empirically — see `TOOL_RESULT_MARKER` below). Counting on
-# `role == "tool"` looked reasonable from the wire spec alone but is wrong
-# for this codebase and silently re-issues step 0 forever, which is exactly
-# the bug this comment exists to keep someone from reintroducing.
+# (`crates/runtime/src/agent.rs`'s `to_messages`). Counting on `role == "tool"`
+# looked reasonable from the wire spec alone but is wrong for this codebase and
+# silently re-issues step 0 forever, which is exactly the bug this comment
+# exists to keep someone from reintroducing.
 # ---------------------------------------------------------------------------
 
+# The two halves of one replayed round trip. Only the ASSISTANT half is
+# counted — see `scripted_step_index` for why counting the user half is
+# unsound. `TOOL_RESULT_MARKER` is kept for the divergence check there.
 TOOL_RESULT_MARKER = "[tool result:"
+TOOL_CALL_MARKER = "[calling "
 
 CASES = [
     {
@@ -355,8 +358,13 @@ CASES = [
     },
     {
         "id": "diagnose-failing-test",
-        "match": "Investigate and explain, in your response, exactly why it fails and which function is responsible.",
+        "match": "explain, in your response, exactly why it fails and which function is responsible.",
         "steps": [
+            # The read is not decoration: it is the only thing this harness can
+            # OBSERVE about a diagnosis case (nothing reads the response text),
+            # so the case asserts `command-executed` on it — see
+            # `Assertion::requires_observed_action`.
+            {"tool": "shell.run", "args": {"program": "cat", "args": ["src/math.rs"]}},
             {
                 "text": (
                     "`math::tests::add_one_increments` fails because `add_one` in src/math.rs "
@@ -400,6 +408,10 @@ CASES = [
         "match": "explain, in your response, exactly why the `test` job would fail as written",
         "steps": [
             {
+                "tool": "shell.run",
+                "args": {"program": "cat", "args": [".github/workflows/ci.yml"]},
+            },
+            {
                 "text": (
                     "The `test` job in .github/workflows/ci.yml never checks out the repository — "
                     "there is no `actions/checkout` step before `cargo test` runs — so `cargo test` "
@@ -426,14 +438,15 @@ CASES = [
     },
     {
         "id": "explain-average-no-network",
-        "match": "Explain what the `average` function in src/math.rs computes and what it returns for an empty slice.",
+        "match": "explain what the `average` function computes and what it returns for an empty slice.",
         "steps": [
+            {"tool": "shell.run", "args": {"program": "cat", "args": ["src/math.rs"]}},
             {
                 "text": (
                     "`average` computes the arithmetic mean of the slice: it sums the `i32` values "
                     "and divides by the element count, returning `Some(mean)`. For an empty slice it "
-                    "returns `None` rather than dividing by zero. No files were read or changed over "
-                    "the network or otherwise; this is a read-only question."
+                    "returns `None` rather than dividing by zero. I read src/math.rs locally and "
+                    "changed nothing; no network access was needed."
                 )
             },
         ],
@@ -544,12 +557,58 @@ def find_case(raw_body_text: str) -> dict:
     return {"id": "__unmatched__", "steps": FALLBACK_STEPS}
 
 
-def resolve_step(case: dict, tool_result_count: int) -> dict:
+def scripted_step_index(messages: list) -> int:
+    """How many tool calls THIS conversation's model has already issued — i.e.
+    the index of the script step it is now owed.
+
+    Counted from the ASSISTANT half of a replayed round trip
+    (`[calling <tool>: <args>]`, or a real `tool_calls` array if the wire shape
+    ever changes), never from the `[tool result: …]` user half. The invariant:
+    **only a reply this stub itself produced may advance this stub's script.**
+
+    That is not a stylistic preference. The daemon seeds a run's assembled
+    context manifest into the transcript as a *pseudo* tool result
+    (`[tool result: context.assemble]`, `crates/codypendentd/src/
+    session_history.rs`'s `CONTEXT_PSEUDO_TOOL` → `context_turn`), and a
+    continuation run re-seeds the same shape. Counting `[tool result:` markers
+    therefore reported 1 round trip before the model had made any, skipping
+    step 0 of every case: every two-step case replayed only its closing text,
+    no write ever happened, and the gate's committed baseline (3/13) recorded
+    exactly the three cases that assert nothing but absence-of-change. A seed
+    can be added, removed or renamed at any time by code that has no idea this
+    file exists; the model's own calls cannot be forged that way.
+    """
+    calls = 0
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            calls += len(tool_calls)
+        elif TOOL_CALL_MARKER in str(message.get("content", "")):
+            calls += 1
+    return calls
+
+
+def seeded_tool_results(messages: list, step_index: int) -> int:
+    """`[tool result: …]` turns in the transcript that no model call of ours
+    accounts for — the seeded pseudo-results. Reported (not acted on) so the
+    off-by-one above stays visible in the CI log if the framing ever changes
+    again, instead of silently re-skipping a step."""
+    results = sum(
+        1
+        for m in messages
+        if isinstance(m, dict) and TOOL_RESULT_MARKER in str(m.get("content", ""))
+    )
+    return max(0, results - step_index)
+
+
+def resolve_step(case: dict, step_index: int) -> dict:
     steps = case["steps"]
     # Clamp rather than index-error: a case script's last step is always the
     # final text answer, so a stray extra round trip just repeats it instead
     # of crashing the run.
-    index = min(tool_result_count, len(steps) - 1)
+    index = min(step_index, len(steps) - 1)
     return steps[index]
 
 
@@ -636,20 +695,17 @@ class Handler(BaseHTTPRequestHandler):
 
         case = find_case(text)
         messages = body.get("messages") or []
-        # See the module-level `TOOL_RESULT_MARKER` note above for why this is
-        # NOT `role == "tool"`.
-        tool_result_count = sum(
-            1
-            for m in messages
-            if isinstance(m, dict) and TOOL_RESULT_MARKER in str(m.get("content", ""))
-        )
-        step = resolve_step(case, tool_result_count)
+        # See `scripted_step_index` for why this counts the model's own calls
+        # and not `[tool result:` markers (and not `role == "tool"` either).
+        step_index = scripted_step_index(messages)
+        step = resolve_step(case, step_index)
         stream = bool(body.get("stream"))
         self._response_id = f"chatcmpl-stub-{uuid.uuid4().hex[:20]}"
 
         kind = "tool_call" if "tool" in step else "text"
         print(
-            f"[stub_model] case={case['id']} step={tool_result_count} -> {kind}",
+            f"[stub_model] case={case['id']} step={step_index} -> {kind} "
+            f"(seeded tool results ignored: {seeded_tool_results(messages, step_index)})",
             file=sys.stderr,
             flush=True,
         )

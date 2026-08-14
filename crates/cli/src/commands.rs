@@ -11,11 +11,10 @@ use base64::Engine as _;
 use codypendent_daemon::policy::{ApprovalAction, MergedPolicy, PolicyEngine};
 use codypendent_integrations::mcp::{load_mcp_config, McpConfig};
 use codypendent_knowledge::{
-    anchor_repository_id, db as knowledge_db, install_package, is_retrievable_status,
-    local_user_scope, plan_publication, publications, register_builtins, retrieve,
-    user_skills_root, DocumentStore, HashingEmbedder, Publication,
-    PublishTarget as KnowledgePublishTarget, Registry, RetrievalConfig, RetrievalIndexes,
-    RetrievalQuery, RiskClass, Scope,
+    db as knowledge_db, install_package, is_retrievable_status, local_user_scope, plan_publication,
+    publications, register_builtins, retrieve, user_skills_root, DocumentStore, HashingEmbedder,
+    Publication, PublishTarget as KnowledgePublishTarget, Registry, RetrievalConfig,
+    RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
@@ -639,10 +638,18 @@ pub async fn index_rebuild(paths: &RuntimePaths) -> anyhow::Result<()> {
 /// the same root on its next boot, so an install taken while the daemon is down
 /// is picked up rather than lost.
 ///
-/// A package declaring `scope = "repository"` anchors to the checkout `dir`
-/// lives in (its Git toplevel), derived exactly as the daemon derives a run's
-/// repository identity — a mismatch there would register the skill under an
-/// identity no run ever queries, leaving it silently invisible.
+/// A package declaring `scope = "repository"` anchors to the checkout the
+/// OPERATOR is standing in, exactly as [`skill_new`] does — not to wherever the
+/// package directory happens to sit. `dir` is a source to copy from and carries
+/// no repository identity of its own: the 2026-08-13 review followed the
+/// skill-writer's own printed promotion instruction (`skill add
+/// <data_dir>/skills/<id>`), which anchored the promoted package to
+/// `<data_dir>`'s path, so `draft` landed under the checkout and `active`
+/// landed under an identity no run ever queries — an installed skill that
+/// retrieval never disclosed, reported as nothing at all. Adding a package kept
+/// outside the checkout (the natural place to keep one) failed the same way.
+///
+/// See [`crate::repo_anchor`] for the invariant this is one instance of.
 ///
 /// A non-`active` package installs and registers, but is reported loudly: the
 /// retrieval funnel hard-filters everything but Active, so a draft skill is
@@ -656,7 +663,7 @@ pub async fn skill_add(paths: &RuntimePaths, dir: &std::path::Path) -> anyhow::R
         .with_context(|| format!("opening {}", database_path.display()))?;
 
     let skills_root = user_skills_root(&paths.data_dir);
-    let anchor = anchor_repository_id(dir);
+    let anchor = crate::repo_anchor::anchor_repository_id(&std::env::current_dir()?);
     let (item, installed) = install_package(&pool, dir, &skills_root, anchor)
         .await
         .with_context(|| format!("installing the skill package at {}", dir.display()))?;
@@ -703,9 +710,11 @@ pub async fn skill_new(
     let body = std::fs::read_to_string(procedure)
         .with_context(|| format!("reading the procedure body {}", procedure.display()))?;
 
-    // Derived exactly as `skill_add` derives it: a `repository`-scoped skill
-    // registered under any other identity is invisible to every run.
-    let anchor = anchor_repository_id(&std::env::current_dir()?);
+    // Derived exactly as `skill_add` derives it — through the one accessor, so
+    // authoring and promoting a skill can never disagree about which checkout
+    // it belongs to. A `repository`-scoped skill registered under any other
+    // identity is invisible to every run.
+    let anchor = crate::repo_anchor::anchor_repository_id(&std::env::current_dir()?);
     let scope = match scope {
         "user" => local_user_scope(),
         "repository" => Scope::Repository(anchor),
@@ -860,10 +869,11 @@ pub async fn docs_list(paths: &RuntimePaths) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("opening {}", database_path.display()))?;
 
-    // `anchor_repository_id`, not `stable_repository_id`: the daemon stores rows
-    // under the Git toplevel, so hashing the current directory listed nothing
-    // whenever this was run from a subdirectory of the checkout.
-    let repository = anchor_repository_id(&std::env::current_dir()?);
+    // The checkout, never the current directory: the daemon stores rows under
+    // the Git toplevel, so hashing the directory as-opened listed nothing
+    // whenever this was run from a subdirectory. `crate::repo_anchor` is the
+    // one accessor for that resolution.
+    let repository = crate::repo_anchor::anchor_repository_id(&std::env::current_dir()?);
     let scopes = [Scope::Repository(repository), Scope::System];
     let summaries = DocumentStore::new().list(&pool, &scopes).await?;
     if summaries.is_empty() {
@@ -3054,12 +3064,20 @@ pub fn models_add(
     let provider = catalog
         .get(provider_id)
         .ok_or_else(|| anyhow::anyhow!("provider `{provider_id}` is not in the catalog"))?;
+    // Refuse through the SAME predicate `models list-providers` annotates with,
+    // and say what to do instead. "has no base URL and cannot be added" was
+    // true and useless: it named a fact about the catalog, not an action.
+    if let Some(reason) = crate::tui::provider_unusable_reason(provider) {
+        anyhow::bail!("provider `{provider_id}` cannot be added — {reason}");
+    }
     let base_url = provider
         .base_url
         .as_deref()
         .map(|url| url.trim().trim_end_matches('/').to_string())
         .filter(|url| !url.is_empty())
         .ok_or_else(|| {
+            // Unreachable via the gate above; kept so a future catalog shape
+            // cannot turn a blank URL into a silently malformed entry.
             anyhow::anyhow!("provider `{provider_id}` has no base URL and cannot be added")
         })?;
     let display_id = id
@@ -3323,6 +3341,12 @@ async fn bench_to_store(
 /// curates (F8: the `models add --help` text has always pointed here; this is
 /// what makes that true). Local providers (Ollama, LM Studio, vLLM) are
 /// marked so a user scanning the list can tell which ones need no API key.
+///
+/// Rows `models add` cannot serve carry the reason, from the same
+/// [`crate::tui::provider_unusable_reason`] that refuses them — the review
+/// found this listing printing 6 such providers unmarked, so a user picked one,
+/// hit a bare "has no base URL and cannot be added", and had nothing telling
+/// them which of the 42 rows were real.
 pub fn models_list_providers(paths: &RuntimePaths) -> anyhow::Result<()> {
     let catalog = codypendent_providers::Catalog::load_with_user_overrides(
         &paths.data_dir.join("providers.toml"),
@@ -3347,6 +3371,9 @@ pub fn models_list_providers(paths: &RuntimePaths) -> anyhow::Result<()> {
             curated,
             if provider.local { "  (local)" } else { "" }
         );
+        if let Some(reason) = crate::tui::provider_unusable_reason(provider) {
+            println!("{:20} └─ not addable: {reason}", "");
+        }
     }
     Ok(())
 }

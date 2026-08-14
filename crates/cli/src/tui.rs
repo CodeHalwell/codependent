@@ -298,16 +298,25 @@ pub async fn run(
     // plus every installed data-only pack (the TUI crate does no I/O, so packs
     // are parsed out here). The row matching the theme actually in force is
     // marked current, so the picker opens on what is already on screen.
-    state.themes.extend(
-        crate::theme_select::discover_theme_packs(paths)
-            .into_iter()
-            .map(|(id, theme)| codypendent_tui::ThemeChoice {
-                id,
-                summary: "installed theme pack".to_owned(),
-                theme,
-                pack: true,
-            }),
-    );
+    // A pack that FAILED to load becomes a boot warning rather than a silent
+    // absence — including the security refusal, which the operator has to see.
+    let discovered = crate::theme_select::discover_theme_packs(paths);
+    for warning in discovered.warnings {
+        push_boot_warning(&boot_warnings, warning);
+    }
+    state
+        .themes
+        .extend(
+            discovered
+                .packs
+                .into_iter()
+                .map(|(id, theme)| codypendent_tui::ThemeChoice {
+                    id,
+                    summary: "installed theme pack".to_owned(),
+                    theme,
+                    pack: true,
+                }),
+        );
     state.theme_selected = theme_override
         .as_deref()
         .or(store.theme.as_deref())
@@ -425,7 +434,9 @@ pub async fn run(
     if let Some(pool) = docs_pool {
         pool.close().await;
     }
-    result
+    // After the guard: the terminal is cooked again, so a lost-daemon report
+    // prints where a human can read it.
+    report_daemon_unavailable(result)
 }
 
 /// Run the full client over ordinary cooked stdin/stdout. Unlike the Ratatui
@@ -448,16 +459,23 @@ async fn run_accessible(
         theme_override.as_deref(),
         store.theme.as_deref(),
     )?;
-    state.themes.extend(
-        crate::theme_select::discover_theme_packs(paths)
-            .into_iter()
-            .map(|(id, theme)| codypendent_tui::ThemeChoice {
-                id,
-                summary: "installed theme pack".to_owned(),
-                theme,
-                pack: true,
-            }),
-    );
+    // Same discovery, same reporting duty as the graphical path — collected
+    // here and pushed once `boot_warnings` exists a few lines below.
+    let discovered = crate::theme_select::discover_theme_packs(paths);
+    let theme_pack_warnings = discovered.warnings;
+    state
+        .themes
+        .extend(
+            discovered
+                .packs
+                .into_iter()
+                .map(|(id, theme)| codypendent_tui::ThemeChoice {
+                    id,
+                    summary: "installed theme pack".to_owned(),
+                    theme,
+                    pack: true,
+                }),
+        );
     state.theme_selected = theme_override
         .as_deref()
         .or(store.theme.as_deref())
@@ -475,6 +493,9 @@ async fn run_accessible(
         });
     let (stage_tx, mut stage_rx) = watch::channel(SplashStage::StartingDaemon);
     let boot_warnings: BootWarnings = BootWarnings::default();
+    for warning in theme_pack_warnings {
+        push_boot_warning(&boot_warnings, warning);
+    }
     let booted = {
         let boot = boot_phase(
             paths,
@@ -550,7 +571,10 @@ async fn run_accessible(
     if let Some(pool) = docs_pool {
         pool.close().await;
     }
-    result
+    // Accessible mode never enters the alternate screen, but it reaches the
+    // same reconnect exhaustion — and a screen reader announcing a Rust
+    // backtrace is the worst version of this defect, not an exempt one.
+    report_daemon_unavailable(result)
 }
 
 fn ascii_stage(stage: &str) -> String {
@@ -810,6 +834,65 @@ fn drain_boot_warnings(state: &mut AppState, warnings: &BootWarnings) {
     for warning in collected {
         reduce(state, Action::Issue(warning));
     }
+}
+
+/// The TUI exhausted its reconnect budget and the daemon is still not
+/// answering — the one failure that ends an otherwise healthy session from
+/// outside it.
+///
+/// It is a distinct type purely so [`report_daemon_unavailable`] can recognise
+/// it after the terminal is restored. `event_loop` used to return the last
+/// connect error bare, and `main`'s `Termination` impl prints an
+/// `anyhow::Error` with `{:?}` — Debug, which includes the captured backtrace.
+/// The user's reward for `kill`ing a daemon was 36 stack frames ending in
+/// `_start`, with no mention of the daemon and nothing to act on. The crash-log
+/// machinery does not cover this either: it hooks panics, and this is not one,
+/// so `<data_dir>/logs/` stays empty and the next investigator reads that as
+/// "aborted or OS-killed".
+#[derive(Debug)]
+struct DaemonUnavailable {
+    socket: PathBuf,
+    cause: String,
+}
+
+impl std::fmt::Display for DaemonUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lost the connection to the codypendent daemon ({})",
+            self.socket.display()
+        )
+    }
+}
+
+impl std::error::Error for DaemonUnavailable {}
+
+/// If `result` failed because the daemon went away, print an actionable
+/// paragraph and swallow the error; otherwise hand it back unchanged.
+///
+/// Called by both clients AFTER the terminal guard is dropped, so the text
+/// lands on the restored cooked screen rather than the alternate one. Exit
+/// status stays 0: the session ended for a reason the user has now been told
+/// about in full, and the alternative — returning to `main` — is the backtrace
+/// dump this exists to prevent.
+fn report_daemon_unavailable(result: anyhow::Result<()>) -> anyhow::Result<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
+    let Some(lost) = error.downcast_ref::<DaemonUnavailable>() else {
+        return Err(error);
+    };
+    eprintln!("codypendent: {lost}.");
+    eprintln!("  reason: {}", lost.cause);
+    eprintln!();
+    eprintln!("Your session and its history are safe — they live in the daemon's");
+    eprintln!("database, not in this process. To carry on:");
+    eprintln!("  codypendent daemon status     # is it running?");
+    eprintln!("  codypendent daemon start      # start it again");
+    eprintln!("  codypendent                   # reopen the TUI; the session is restored");
+    eprintln!();
+    eprintln!("If it keeps stopping, its log is the place to look: `codypendent doctor`.");
+    Ok(())
 }
 
 /// Everything [`boot_phase`] produces that the event loop and teardown still
@@ -1716,7 +1799,18 @@ async fn event_loop<P: Presentation>(
                         }
                     }
                     let Some((next_live, catchup, pending)) = replacement else {
-                        return Err(failure.unwrap_or_else(|| anyhow!("reconnect failed")));
+                        // Typed, so `run`/`run_accessible` can render this as an
+                        // actionable paragraph on the restored cooked terminal.
+                        // Returned bare, `main`'s `Termination` impl printed
+                        // anyhow's Debug form — a 36-frame backtrace over the
+                        // user's screen, naming `anyhow/backtrace.rs` and
+                        // `_start` but never the daemon (2026-08-13 review, F3).
+                        return Err(anyhow::Error::new(DaemonUnavailable {
+                            socket: paths.socket_path.clone(),
+                            cause: failure
+                                .map(|error| format!("{error:#}"))
+                                .unwrap_or_else(|| "the daemon did not answer".to_owned()),
+                        }));
                     };
                     let missing_range = match &catchup {
                         Catchup::Snapshot { through, .. } if last_seen < *through => {
@@ -2775,8 +2869,7 @@ async fn event_loop<P: Presentation>(
                     );
                     continue;
                 };
-                let repository_id =
-                    codypendent_knowledge::anchor_repository_id(Path::new(repository));
+                let repository_id = crate::repo_anchor::anchor_repository_id(Path::new(repository));
                 let scopes = [
                     Scope::System,
                     Scope::Workspace(workspace_id),
@@ -2960,7 +3053,7 @@ async fn event_loop<P: Presentation>(
             if let Intent::SearchEdges { query, page } = &intent {
                 if let Some(pool) = docs_pool.as_ref() {
                     let repository_id =
-                        codypendent_knowledge::anchor_repository_id(Path::new(repository));
+                        crate::repo_anchor::anchor_repository_id(Path::new(repository));
                     let mut warnings = Vec::new();
                     let (edges, total, page) =
                         load_edge_page(pool, repository_id, query, *page, &mut warnings).await;
@@ -3065,7 +3158,8 @@ async fn event_loop<P: Presentation>(
             // key is the synthetic board run id, so nothing new is needed on the
             // wire beyond the board-scoped read.
             if matches!(intent, Intent::WatchBoard) {
-                let board_id = codypendent_protocol::board_scope_id(repository);
+                let anchored = board_repository(repository);
+                let board_id = codypendent_protocol::board_scope_id(&anchored);
                 let subscribed = subscriptions.iter().any(|subscription| {
                     matches!(
                         subscription,
@@ -3098,7 +3192,7 @@ async fn event_loop<P: Presentation>(
                         workflow_run_id: String::new(),
                         kind: Some("task".to_owned()),
                         include_superseded: false,
-                        board_repository: Some(repository.to_owned()),
+                        board_repository: Some(anchored),
                     },
                 );
                 if let Payload::Command(command) = &read.payload {
@@ -3851,6 +3945,28 @@ fn spawn_input_thread(tx: mpsc::Sender<ClientInput>, running: Arc<AtomicBool>) {
     });
 }
 
+/// The repository task board's durable key for the directory the TUI was opened
+/// in: the **checkout**, via [`crate::repo_anchor::anchor_repository_path`].
+///
+/// The board's channel id is `board:{path}` (`board_scope_id`), so the path IS
+/// the identity. Sending the opened directory instead — which every board call
+/// site did until the 2026-08-13 review — minted a second board per
+/// subdirectory: `repo/` showed 6 cards, `repo/src` showed 0, and a card
+/// created from `src/` was invisible from the root forever, with nothing
+/// reporting a problem. The daemon canonicalizes what it receives
+/// (`codypendentd::blackboard::repository_board_id`) but has no notion of a
+/// repository, so it cannot save a client that hands it a subdirectory; the
+/// anchoring has to happen where the checkout is known.
+///
+/// Every board-bound `repository` in this file goes through here — the read,
+/// the subscription's channel id, the card create, and the column move — so no
+/// one of them can drift back to the raw directory on its own.
+fn board_repository(repository: &str) -> String {
+    crate::repo_anchor::anchor_repository_path(Path::new(repository))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Map a reducer [`Intent`] to the wire [`CommandBody`], binding the session id
 /// the TUI is attached to. A pure 1:1 translation — the whole point of the
 /// outbox is that `reduce` stays I/O-free and this is the only place intents
@@ -3999,7 +4115,7 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         // publishes the replacement — so the pane never edits its own copy.
         Intent::MoveBoardCard { item_id, status } => CommandBody::UpdateBlackboardItem {
             scope: codypendent_protocol::BlackboardScope::RepositoryBoard {
-                repository: repository.to_owned(),
+                repository: board_repository(repository),
             },
             item_id,
             status: Some(status),
@@ -4009,7 +4125,7 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         },
         Intent::CreateBoardCard { title } => CommandBody::PostBlackboardItem {
             scope: BlackboardScope::RepositoryBoard {
-                repository: repository.to_owned(),
+                repository: board_repository(repository),
             },
             item: BlackboardItemDraft {
                 kind: "task".to_owned(),
@@ -6024,7 +6140,7 @@ async fn load_knowledge(
     // hashing the opened directory instead made every one of these lists empty
     // whenever the TUI was started from a subdirectory. The stores enforce
     // cross-scope isolation in SQL; an empty result is fine.
-    let repository = codypendent_knowledge::anchor_repository_id(repo);
+    let repository = crate::repo_anchor::anchor_repository_id(repo);
     let scopes = vec![
         Scope::System,
         Scope::Workspace(workspace_id),
@@ -6674,7 +6790,7 @@ fn provider_requires_key(p: &codypendent_providers::Provider) -> bool {
 /// whatever they speak. A tiny pure expression (no I/O), extracted out of
 /// `load_provider_cards` so it is directly unit-testable against the real
 /// `codypendent_providers` enums.
-fn provider_endpoint_usable(p: &codypendent_providers::Provider) -> bool {
+pub(crate) fn provider_endpoint_usable(p: &codypendent_providers::Provider) -> bool {
     use codypendent_providers::AuthMethod;
     p.base_url.as_deref().is_some_and(|u| !u.trim().is_empty())
         && matches!(
@@ -6710,9 +6826,44 @@ fn provider_can_list_models(p: &codypendent_providers::Provider) -> bool {
 /// "anthropic"`) resolves through `config_to_protocol_auth` to a genuine
 /// `AnthropicClient`. Gemini-native and ACP-executor protocols are still
 /// unwired, so they keep failing this gate.
-fn provider_runtime_supported(p: &codypendent_providers::Provider) -> bool {
+pub(crate) fn provider_runtime_supported(p: &codypendent_providers::Provider) -> bool {
     use codypendent_providers::Protocol;
     matches!(p.protocol, Protocol::OpenAiChat | Protocol::Anthropic) && provider_endpoint_usable(p)
+}
+
+/// Why `models add <provider>` cannot serve this provider, or [`None`] when it
+/// can — the single explanation behind BOTH provider enumerations and the
+/// `models add` refusal, so a provider can never be offered by one surface and
+/// rejected by another.
+///
+/// The 2026-08-13 review found `models list-providers` printing 42 rows of
+/// which 6 could not be added, with nothing marking them and `models add
+/// --help` naming one of them (`azure-openai`) as its worked example. The gate
+/// that refuses them ([`provider_runtime_supported`]) already existed — what
+/// was missing was the return path from the gate to the listing.
+///
+/// The reasons are ordered most-specific-first so an ACP agent is told about
+/// `acp connect` rather than about its missing base URL.
+pub(crate) fn provider_unusable_reason(
+    p: &codypendent_providers::Provider,
+) -> Option<&'static str> {
+    use codypendent_providers::Protocol;
+    if matches!(p.protocol, Protocol::Acp) {
+        // Reachable, just not through this door: `acp connect` spawns the agent
+        // and registers whatever models its session-config handshake offers.
+        return Some(
+            "connect it with `codypendent acp connect <id>` (an ACP agent, not an HTTP endpoint)",
+        );
+    }
+    if !provider_endpoint_usable(p) {
+        return Some(
+            "no usable endpoint in the catalog — supply your own resource URL in <data_dir>/providers.toml",
+        );
+    }
+    if !provider_runtime_supported(p) {
+        return Some("this build cannot speak its wire protocol");
+    }
+    None
 }
 
 /// The provider picker's wire-protocol label — the same kebab-case spelling
@@ -6932,9 +7083,7 @@ async fn load_journey(
             &LearningQuery {
                 scopes: vec![
                     LearningScope::User(UserId("local".to_owned())),
-                    LearningScope::Repository(codypendent_knowledge::anchor_repository_id(
-                        repository,
-                    )),
+                    LearningScope::Repository(crate::repo_anchor::anchor_repository_id(repository)),
                 ],
                 states: vec![LearningState::Proposed, LearningState::Active],
                 ..LearningQuery::default()
@@ -8320,6 +8469,75 @@ mod tests {
                 lease_id: "lease-1".into(),
             }),
             None
+        );
+    }
+
+    /// Every board-bound command carries the CHECKOUT, not the directory the
+    /// TUI was opened in.
+    ///
+    /// The board's channel id is `board:{path}`, so this path IS the board's
+    /// identity: opened from `repo/src`, the unanchored spelling minted a
+    /// second board — `repo/` showed 6 cards, `repo/src` showed 0, and a card
+    /// created from `src/` was invisible from the root forever, silently.
+    /// Revert `board_repository` to `repository.to_owned()` and both
+    /// assertions below fail with the subdirectory path.
+    #[test]
+    fn board_commands_anchor_to_the_checkout_not_the_opened_directory() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let status = std::process::Command::new("git")
+            .current_dir(repo.path())
+            .args(["init", "--quiet"])
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        let nested = repo.path().join("src").join("deep");
+        std::fs::create_dir_all(&nested).expect("mkdir -p");
+
+        let toplevel = crate::repo_anchor::anchor_repository_path(repo.path())
+            .to_string_lossy()
+            .into_owned();
+        let opened_in = nested.to_string_lossy().into_owned();
+        assert_ne!(
+            opened_in, toplevel,
+            "the test is vacuous unless the opened directory differs from the checkout"
+        );
+
+        let session_id = SessionId::new();
+        match intent_to_command(
+            Intent::CreateBoardCard {
+                title: "from a subdirectory".to_owned(),
+            },
+            session_id,
+            &opened_in,
+        ) {
+            CommandBody::PostBlackboardItem {
+                scope: BlackboardScope::RepositoryBoard { repository },
+                ..
+            } => assert_eq!(repository, toplevel),
+            other => panic!("expected a RepositoryBoard post, got {other:?}"),
+        }
+
+        match intent_to_command(
+            Intent::MoveBoardCard {
+                item_id: "item-1".to_owned(),
+                status: "doing".to_owned(),
+            },
+            session_id,
+            &opened_in,
+        ) {
+            CommandBody::UpdateBlackboardItem {
+                scope: codypendent_protocol::BlackboardScope::RepositoryBoard { repository },
+                ..
+            } => assert_eq!(repository, toplevel),
+            other => panic!("expected a RepositoryBoard update, got {other:?}"),
+        }
+
+        // And the subscription's channel id, which is derived from the same
+        // string — a read that anchored while the subscribe did not would
+        // load the right board and then never see a live update on it.
+        assert_eq!(
+            codypendent_protocol::board_scope_id(&board_repository(&opened_in)),
+            codypendent_protocol::board_scope_id(&toplevel)
         );
     }
 

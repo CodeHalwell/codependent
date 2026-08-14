@@ -173,10 +173,11 @@ impl DocumentLeaser for KnowledgeDocumentMutator {
         let leases = self.leases;
         Box::pin(async move {
             // Release is idempotent (releasing an unknown/already-released lease is
-            // a no-op); the lease id is the bearer capability the grant returned to
-            // the acquirer.
+            // a no-op) and scoped to the holder: the lease id is NOT a bearer
+            // capability, so a client can only release what it acquired. Releasing
+            // someone else's lease reports the same success and changes nothing.
             leases
-                .release(&pool, &request.lease_id)
+                .release(&pool, &request.lease_id, &human_author(request.client_id))
                 .await
                 .map_err(map_lease_error)
         })
@@ -381,6 +382,21 @@ mod tests {
 
         let a = ClientId::new();
         let grant = leaser.acquire(acquire(doc, Some("p"), a)).await.unwrap();
+
+        // Another client cannot release the lease it does not hold — the wire
+        // `lease_id` is not a bearer capability over A's lock.
+        let intruder = ClientId::new();
+        leaser
+            .release(DocumentLeaseReleaseRequest {
+                lease_id: grant.lease_id.clone(),
+                client_id: intruder,
+            })
+            .await
+            .expect("a non-holder release is an accepted no-op");
+        leaser
+            .acquire(acquire(doc, Some("p"), intruder))
+            .await
+            .expect_err("A's lease must still hold after a foreign release");
 
         // Release, then a different writer can take the same block.
         leaser

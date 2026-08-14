@@ -7,22 +7,49 @@
 //! an observed policy denial rather than absence-only checks.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use codypendent_eval::{Assertion, EvalCase};
 
-fn core_suite_dir() -> PathBuf {
+fn evals_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("evals")
-        .join("tasks")
-        .join("core")
 }
 
+fn core_suite_dir() -> PathBuf {
+    evals_root().join("tasks").join("core")
+}
+
+/// The one case in the whole tree allowed to be built entirely from
+/// absence-shaped assertions, by id, with the reason it is exempt.
+///
+/// `evals/tasks/regressions/001-…` exists to prove that an absence-only case FAILS
+/// when the run never executed (`RunObservation::run_completed`). Being
+/// absence-only is the property under test, so requiring it to carry evidence
+/// of work would delete the guard. Any other case, in either directory, must
+/// earn its pass — see [`every_shipped_case_can_only_pass_if_the_run_did_work`].
+const ANTI_VACUITY_EXEMPT: &[(&str, &str)] = &[(
+    "absence-only-case-must-fail-without-a-model",
+    "the guard case whose absence-only shape IS the regression it pins",
+)];
+
 fn load_core_suite() -> Vec<(PathBuf, EvalCase)> {
-    let dir = core_suite_dir();
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+    load_suite(&core_suite_dir())
+}
+
+/// Every case file shipped anywhere under `evals/` — the core corpus plus the
+/// regression guards. The anti-vacuity rule is a property of *shipped cases*,
+/// not of one directory, so it is checked over all of them.
+fn load_every_shipped_case() -> Vec<(PathBuf, EvalCase)> {
+    let mut all = load_suite(&core_suite_dir());
+    all.extend(load_suite(&evals_root().join("tasks").join("regressions")));
+    all
+}
+
+fn load_suite(dir: &Path) -> Vec<(PathBuf, EvalCase)> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
@@ -166,6 +193,69 @@ fn safety_assertions_are_non_vacuous() {
         has_command_denied,
         "no case requires an observed destructive-command denial"
     );
+}
+
+#[test]
+fn every_shipped_case_can_only_pass_if_the_run_did_work() {
+    // The rule the round-4 review's finding turns into an invariant. Banning
+    // two absence-only assertion KINDS (above) was the instance fix; it left
+    // `file-unchanged` — and `patch-scope<=N` — permitted, and three shipped
+    // cases were built entirely from those, so they passed if the harness did
+    // nothing at all. A reviewer's probe case, whose prompt the stub model
+    // could not even match, scored PASS 1/1 100%.
+    //
+    // The class fix is stated positively and over every shipped case: at least
+    // one assertion that CANNOT hold unless the run really acted. Which kinds
+    // qualify is decided once, on the type
+    // (`Assertion::requires_observed_action`), never re-listed here.
+    let exempt: std::collections::HashMap<&str, &str> =
+        ANTI_VACUITY_EXEMPT.iter().copied().collect();
+    let cases = load_every_shipped_case();
+    assert!(!cases.is_empty(), "no case files were loaded at all");
+
+    let mut exercised_exemptions = HashSet::new();
+    for (path, case) in &cases {
+        let evidence: Vec<String> = case
+            .expected
+            .iter()
+            .filter(|a| a.requires_observed_action())
+            .map(Assertion::label)
+            .collect();
+        if let Some(reason) = exempt.get(case.id.as_str()) {
+            exercised_exemptions.insert(case.id.clone());
+            assert!(
+                evidence.is_empty(),
+                "{}: case {:?} is on the anti-vacuity exemption list ({reason}) but now carries \
+                 evidence of work ({evidence:?}) — remove the exemption",
+                path.display(),
+                case.id
+            );
+            continue;
+        }
+        assert!(
+            !evidence.is_empty(),
+            "{}: case {:?} can pass without the run doing anything — every one of its assertions \
+             ({:?}) is satisfied by a completed run that changed nothing, executed nothing and \
+             contacted nothing. Add an assertion that requires an observed action \
+             (file-changed, tests-pass, command-executed, command-denied, network-denied, \
+             approval-requested), or add the case to ANTI_VACUITY_EXEMPT with a reason.",
+            path.display(),
+            case.id,
+            case.expected
+                .iter()
+                .map(Assertion::label)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // An exemption for a case that no longer exists is dead weight that would
+    // silently re-admit vacuity under that id later.
+    for (id, reason) in ANTI_VACUITY_EXEMPT {
+        assert!(
+            exercised_exemptions.contains(*id),
+            "ANTI_VACUITY_EXEMPT lists {id:?} ({reason}) but no shipped case has that id"
+        );
+    }
 }
 
 #[test]

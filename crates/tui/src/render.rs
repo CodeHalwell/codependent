@@ -431,11 +431,21 @@ fn render_run_telemetry(frame: &mut Frame, area: Rect, state: &AppState, theme: 
             text: format!("via {}", truncate_display_width(provider_label, 18)),
             color: theme.text.secondary,
         },
+        // What the run actually cost, measured. This used to be `format_cost`
+        // over the budget projection alone — a field whose only writer is a
+        // `BudgetWarning{Cost}` that nothing in the workspace emits, so it read
+        // `—` after every run while the provider's own token counts arrived on
+        // the same connection and were thrown away.
         TelemetryItem {
-            text: if verbose {
-                format!("cost {}", format_cost(status.cost_minor))
-            } else {
-                format_cost(status.cost_minor)
+            text: match usage_label(
+                status.prompt_tokens,
+                status.completion_tokens,
+                status.cost_micros,
+            ) {
+                Some(usage) if verbose => format!("usage {usage}"),
+                Some(usage) => usage,
+                None if verbose => format!("cost {}", format_cost(status.cost_minor)),
+                None => format_cost(status.cost_minor),
             },
             color: theme.status.warning,
         },
@@ -546,11 +556,20 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         .filter(|title| !title.eq_ignore_ascii_case("codypendent"))
         .map(|title| truncate(title, 30));
     let model = status.model.as_ref().map(|model| truncate(&model.0, 22));
+    // The measured figure when there is one, else the budget projection. The
+    // gate is "is anything known", so a run whose provider reported tokens but
+    // no price still gets a chip.
+    let cost = usage_label_compact(
+        status.prompt_tokens,
+        status.completion_tokens,
+        status.cost_micros,
+    )
+    .or_else(|| status.cost_minor.map(|minor| format_cost(Some(minor))));
     let mut show_title = title.is_some();
     let mut show_model = mid && model.is_some();
     let mut show_mode = mid;
     let mut show_context = status.context_percent.is_some();
-    let mut show_cost = status.cost_minor.is_some();
+    let mut show_cost = cost.is_some();
 
     // Pack by semantic priority rather than relying on saturating padding,
     // which merely lets the left group overwrite the right. The brand always
@@ -610,7 +629,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         }
         if show_cost {
             groups.push(vec![Span::styled(
-                format_cost(status.cost_minor),
+                cost.clone().unwrap_or_default(),
                 Style::default().fg(theme.status.warning),
             )]);
         }
@@ -1047,9 +1066,24 @@ fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &
                 .map_or("—".to_owned(), |p| format!("{p}%")),
             theme.status.info,
         ));
+        // Measured tokens first, then money: the tokens are what a local model
+        // reports, and a run with counts and no price must show the counts
+        // rather than a dash for both.
+        lines.push(field(
+            "tokens",
+            match (run.prompt_tokens, run.completion_tokens) {
+                (None, None) => "—".to_owned(),
+                (prompt, completion) => format!(
+                    "{} in / {} out",
+                    prompt.map_or_else(|| "—".to_owned(), thousands),
+                    completion.map_or_else(|| "—".to_owned(), thousands),
+                ),
+            },
+            theme.status.info,
+        ));
         lines.push(field(
             "cost",
-            format_cost(run.cost_minor),
+            cost_field(run.cost_micros, run.cost_minor),
             theme.status.warning,
         ));
         lines.push(field(
@@ -1861,6 +1895,9 @@ fn render_conversation(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     let (content_rows, browsed_span) = measure_transcript(&state.runs, view);
     let max_scroll = content_rows.saturating_sub(inner.height);
     state.transcript_max_scroll.set(max_scroll);
+    // Publish the pane the rich cache must be laid out for (markdown tables
+    // pad their columns into the span text, so they cannot adapt at draw time).
+    state.transcript_width.set(inner_width);
     let (follow, scroll) = state
         .selected_run()
         .map_or((true, 0), |run| (run.follow, run.scroll));
@@ -2152,10 +2189,21 @@ fn lifecycle_status_line(run: &RunView, theme: &Theme) -> Option<Line<'static>> 
         RunState::Failed | RunState::Running | RunState::Unknown => return None,
         _ => return None,
     };
-    Some(Line::styled(
+    let mut spans = vec![Span::styled(
         format!("{glyph} {label}"),
         Style::default().fg(color),
-    ))
+    )];
+    // A run's measured usage belongs beside its own outcome, not only in the
+    // header: the header shows the SELECTED run, and a stacked conversation
+    // has many. This is the row that used to be followed by
+    // `? unsupported event` — the same measurement, thrown away.
+    if let Some(usage) = usage_label(run.prompt_tokens, run.completion_tokens, run.cost_micros) {
+        spans.push(Span::styled(
+            format!("  ·  {usage}"),
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+    Some(Line::from(spans))
 }
 
 fn entry_lines_with_run<'a>(
@@ -2706,6 +2754,46 @@ fn backstage_lines<'a>(
     }
 }
 
+/// The chips a run's state offers: steer/pause/interrupt while it is live,
+/// new/commands once it is terminal (and the same for no run at all). Shared by
+/// the run-state branch and the notice branch, so a notice never silently takes
+/// away the controls of a run that is still going.
+fn run_state_chips(run_state: Option<RunState>) -> Vec<Chip> {
+    match run_state {
+        Some(
+            run_state @ (RunState::Queued
+            | RunState::Preparing
+            | RunState::Running
+            | RunState::Paused
+            | RunState::WaitingForApproval
+            | RunState::WaitingForUserInput
+            | RunState::Recovering),
+        ) => vec![
+            Chip::new("s", "steer", Action::Steer),
+            Chip::new(
+                "p",
+                if matches!(run_state, RunState::Paused) {
+                    "resume"
+                } else {
+                    "pause"
+                },
+                Action::Pause,
+            ),
+            Chip::new("c", "interrupt", Action::Cancel),
+        ],
+        _ => vec![
+            Chip::new("n", "new", Action::NewRun),
+            Chip::new("/", "commands", Action::OpenPalette),
+        ],
+    }
+}
+
+/// The columns the status line's left-hand text may occupy: everything but the
+/// two-cell indent, the glyph, and enough room for the smallest chip row.
+fn notice_width(area_width: u16) -> usize {
+    usize::from(area_width).saturating_sub(6).max(8)
+}
+
 fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let bg = Style::default().bg(theme.surface.background);
     let status = state.status();
@@ -2744,29 +2832,38 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
             ],
             right,
         )
-    } else if status.pending_approvals == 0 && status.run_state.is_none() && state.notice.is_some()
-    {
+    } else if status.pending_approvals == 0 && state.notice.is_some() {
+        // The gate here used to be `run_state.is_none()` — no run AT ALL — which
+        // is false from the first message onward, so every transient notice in
+        // the product (40+ call sites: copy confirmations, rejected commands,
+        // voice errors, and "connection lost · reconnecting…") was invisible for
+        // the whole life of any session that had run anything. A notice is a few
+        // seconds of feedback for something the user just did or something that
+        // just broke; it outranks a run-state label that is also visible in the
+        // transcript. What it must NOT do is take away a live run's controls, so
+        // the chips below stay whatever the run state says they are.
         let notice = state
             .notice
             .as_ref()
             .map(|(notice, _)| notice.as_str())
             .unwrap_or_default();
-        let right = if status.pending_approvals > 0 {
-            vec![
-                Chip::new("a", "once", Action::Approve(ApprovalScope::Once)),
-                Chip::new("A", "run", Action::Approve(ApprovalScope::Run)),
-                Chip::new("r", "reject", Action::Reject),
-            ]
-        } else if !state.issues.is_empty() {
+        let right = if !state.issues.is_empty() {
             vec![Chip::new("/", "diagnostics", Action::OpenIssues)]
         } else {
-            Vec::new()
+            run_state_chips(status.run_state)
         };
         (
             vec![
                 Span::raw("  "),
                 Span::styled("● ", Style::default().fg(theme.status.warning)),
-                Span::styled(notice.to_owned(), Style::default().fg(theme.text.secondary)),
+                Span::styled(
+                    // A notice is arbitrary-length text (a rejection reason, a
+                    // provider error) rendered into a fixed row: ellipse it in
+                    // the one place it is drawn rather than letting the row clip
+                    // it mid-word.
+                    truncate_display_width(notice, notice_width(area.width)),
+                    Style::default().fg(theme.text.secondary),
+                ),
             ],
             right,
         )
@@ -2795,7 +2892,10 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                 Span::raw("  "),
                 Span::styled("▲ ", Style::default().fg(theme.status.warning)),
                 Span::styled(
-                    format!("Setup needs attention · {} issue(s)", state.issues.len()),
+                    truncate_display_width(
+                        &format!("Setup needs attention · {} issue(s)", state.issues.len()),
+                        notice_width(area.width),
+                    ),
                     Style::default().fg(theme.status.warning),
                 ),
             ],
@@ -2888,35 +2988,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
                     Style::default().fg(theme.text.secondary),
                 ),
             ],
-            if matches!(
-                run_state,
-                RunState::Queued
-                    | RunState::Preparing
-                    | RunState::Running
-                    | RunState::Paused
-                    | RunState::WaitingForApproval
-                    | RunState::WaitingForUserInput
-                    | RunState::Recovering
-            ) {
-                vec![
-                    Chip::new("s", "steer", Action::Steer),
-                    Chip::new(
-                        "p",
-                        if matches!(run_state, RunState::Paused) {
-                            "resume"
-                        } else {
-                            "pause"
-                        },
-                        Action::Pause,
-                    ),
-                    Chip::new("c", "interrupt", Action::Cancel),
-                ]
-            } else {
-                vec![
-                    Chip::new("n", "new", Action::NewRun),
-                    Chip::new("/", "commands", Action::OpenPalette),
-                ]
-            },
+            run_state_chips(Some(run_state)),
         )
     } else {
         state.register_hit(area, Action::OpenPalette);
@@ -3642,12 +3714,7 @@ fn render_onboard_provider_picker(
         state,
         theme,
     );
-    let rows = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(inner);
+    let rows = modal_rows(inner, 1, 3);
     render_modal_search(frame, rows[0], query, theme);
     let (list_region, detail_region) = picker_regions(rows[1]);
 
@@ -3692,16 +3759,18 @@ fn render_onboard_provider_picker(
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
-            Line::styled(
+            picker_sub_line(
                 format!("      {} · {}", card.id, card.protocol),
+                list_area.width,
                 theme.selection_aware_text_style(focused, theme.text.muted),
             ),
-            Line::styled(
+            picker_sub_line(
                 format!(
                     "      {} · {}",
                     provider_location_label(card.local),
                     provider_listing_label(card)
                 ),
+                list_area.width,
                 theme.selection_aware_text_style(focused, theme.text.muted),
             ),
         ]);
@@ -3999,7 +4068,7 @@ fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
                 theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
-        let meta = Line::styled(
+        let meta = picker_sub_line(
             format!(
                 "    {}{}",
                 plugin.state,
@@ -4008,6 +4077,7 @@ fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
                     .as_ref()
                     .map_or_else(String::new, |scope| format!(" · {scope}"))
             ),
+            cols[0].width,
             theme.selection_aware_text_style(selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, meta]);
@@ -4155,8 +4225,9 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
-        let meta = Line::styled(
+        let meta = picker_sub_line(
             format!("    {} · {} · {}", skill.scope, skill.trust, skill.status),
+            list_area.width,
             theme.selection_aware_text_style(selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, meta]);
@@ -4307,14 +4378,7 @@ fn render_model_picker(
         theme,
     );
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let rows = modal_rows(inner, 1, 2);
     render_modal_search(frame, rows[0], query, theme);
 
     let (list_region, detail_region) = picker_regions(rows[1]);
@@ -4371,8 +4435,9 @@ fn render_model_picker(
                 theme.selection_aware_text_style(is_selected, theme.text.primary),
             ),
         ]);
-        let provider_line = Line::styled(
+        let provider_line = picker_sub_line(
             format!("      {}", card.provider),
+            list_area.width,
             theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, provider_line]);
@@ -4599,10 +4664,7 @@ fn render_provider_picker(
         theme,
     );
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
-        .split(inner);
+    let rows = modal_rows(inner, 0, 3);
     render_modal_search(frame, rows[0], query, theme);
 
     let (list_region, detail_region) = picker_regions(rows[1]);
@@ -4655,17 +4717,19 @@ fn render_provider_picker(
         // Keep the catalog dense enough to browse: availability is encoded by
         // the leading glyph, while the two supporting rows retain the provider
         // name, protocol, location, and auth requirement.
-        let name_line = Line::styled(
+        let name_line = picker_sub_line(
             format!("      {} · {}", card.name, card.protocol),
+            list_area.width,
             theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
-        let metadata_line = Line::styled(
+        let metadata_line = picker_sub_line(
             format!(
                 "      {} · {} · {}",
                 provider_location_label(card.local),
                 card.auth,
                 provider_listing_label(card),
             ),
+            list_area.width,
             theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, name_line, metadata_line]);
@@ -4799,14 +4863,7 @@ fn render_mode_picker(
         theme,
     );
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let rows = modal_rows(inner, 1, 2);
     render_modal_search(frame, rows[0], query, theme);
 
     // The filtered mode list: each row is 2 lines tall (label, summary), the
@@ -4850,8 +4907,9 @@ fn render_mode_picker(
                 theme.selection_aware_text_style(is_selected, theme.text.primary),
             ),
         ]);
-        let summary_line = Line::styled(
+        let summary_line = picker_sub_line(
             format!("      {}", card.summary),
+            list_area.width,
             theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, summary_line]);
@@ -4916,14 +4974,7 @@ fn render_theme_picker(
         theme,
     );
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let rows = modal_rows(inner, 1, 2);
     render_modal_search(frame, rows[0], query, theme);
 
     const ROW_LINES: usize = 2;
@@ -4969,6 +5020,9 @@ fn render_theme_picker(
         // A row's own swatch, drawn in ITS colours rather than the previewed
         // theme's: the list is the comparison, so each row has to show what it
         // would look like even while another row is previewing.
+        // The indent and four swatches are fixed furniture; only the summary
+        // is elastic, so it is what gets the remaining columns (and the "…").
+        const SWATCH_COLUMNS: u16 = 6 + 4 * 3 + 2;
         let swatch = Line::from(vec![
             Span::raw("      "),
             Span::styled("███", Style::default().fg(choice.theme.focus.active)),
@@ -4976,7 +5030,13 @@ fn render_theme_picker(
             Span::styled("███", Style::default().fg(choice.theme.status.success)),
             Span::styled("███", Style::default().fg(choice.theme.status.error)),
             Span::styled(
-                format!("  {}", choice.summary),
+                format!(
+                    "  {}",
+                    truncate_display_width(
+                        &choice.summary,
+                        usize::from(list_area.width.saturating_sub(SWATCH_COLUMNS)),
+                    )
+                ),
                 theme.selection_aware_text_style(is_selected, theme.text.muted),
             ),
         ]);
@@ -5053,8 +5113,9 @@ fn render_doc_publish_target(
                     theme.selection_aware_text_style(is_selected, theme.text.primary),
                 ),
             ]);
-            let detail = Line::styled(
+            let detail = picker_sub_line(
                 format!("      {}", target.detail()),
+                list_area.width,
                 theme.selection_aware_text_style(is_selected, theme.text.muted),
             );
             let item = ListItem::new(vec![head, detail]);
@@ -5118,14 +5179,7 @@ fn render_api_keys(
         theme,
     );
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let rows = modal_rows(inner, 1, 2);
     render_modal_search(frame, rows[0], query, theme);
 
     // The filtered row list: each row is 2 lines tall (glyph + id, provider ·
@@ -5204,8 +5258,9 @@ fn render_api_keys(
                 ModelReadiness::Unverified => String::new(),
             })
             .unwrap_or_default();
-        let detail_line = Line::styled(
+        let detail_line = picker_sub_line(
             format!("      {provider} · {detail}{verified}"),
+            list_area.width,
             theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, detail_line]);
@@ -5411,8 +5466,9 @@ fn render_journey(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
                     format!("{pin}{}", truncate(&card.statement, 34)),
                     theme.selection_aware_text_style(selected, theme.text.primary),
                 ),
-                Line::styled(
+                picker_sub_line(
                     format!("    {} · {} · {}", card.state, card.kind, card.scope),
+                    cols[0].width,
                     theme.selection_aware_text_style(selected, theme.text.muted),
                 ),
             ])
@@ -5544,8 +5600,9 @@ fn render_memory(
                 theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
-        let meta = Line::styled(
+        let meta = picker_sub_line(
             format!("    {} · {}", memory.class, memory.scope),
+            list_area.width,
             theme.selection_aware_text_style(selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, meta]);
@@ -5723,8 +5780,9 @@ fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
-        let meta = Line::styled(
+        let meta = picker_sub_line(
             format!("    {} · {} · {}", doc.scope, doc.status, doc.mode),
+            list_area.width,
             theme.selection_aware_text_style(selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, meta]);
@@ -6081,12 +6139,13 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
                 theme.selection_aware_text_style(selected, theme.text.secondary),
             ),
         ]);
-        let meta = Line::styled(
+        let meta = picker_sub_line(
             format!(
                 "    {} → {}",
                 truncate(&edge.from, 16),
                 truncate(&edge.to, 16)
             ),
+            list_area.width,
             theme.selection_aware_text_style(selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, meta]);
@@ -7054,14 +7113,7 @@ fn render_palette(
     let rect = centered_modal(area, 148, 34);
     let inner = modal_surface(frame, rect, "Command palette", state, theme);
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let rows = modal_rows(inner, 1, 2);
     render_modal_search(frame, rows[0], query, theme);
 
     // The filtered command list: name / description / shortcut columns,
@@ -7409,80 +7461,117 @@ fn render_help(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rect = centered_rect(70, 80, area);
     shield_modal(state, rect);
     frame.render_widget(Clear, rect);
+    let inner_width = usize::from(rect.width.saturating_sub(2)).max(1);
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::styled(
+    for row in wrap_display_width(
         "Keys — every mouse action has a keyboard equivalent",
-        Style::default()
-            .fg(theme.text.heading)
-            .add_modifier(Modifier::BOLD),
-    ));
+        inner_width,
+    ) {
+        lines.push(Line::styled(
+            row,
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     lines.push(Line::raw(""));
     // Pad to the widest binding actually in the table. A fixed 12 silently
     // stopped padding for every longer key, so those rows ran their label
     // straight into their description ("Delete / Ctrl-Dremove a model").
-    let key_width = crate::input::KEY_BINDINGS
+    let widest_key = crate::input::KEY_BINDINGS
         .iter()
-        .map(|b| b.keys.chars().count())
+        .map(|b| UnicodeWidthStr::width(b.keys))
         .max()
         .unwrap_or(12);
+    // The description column is laid out HERE rather than left to `Wrap`,
+    // which restarts every continuation at column 0: half of each description
+    // landed under the key column and the table read as a wall of fragments.
+    // Below a usable description column the two-column table stops being one at
+    // all (at 60 columns the gutter left ~14), so the row stacks instead: key on
+    // its own line, description indented under it. Either way a continuation
+    // line keeps its indent, which is the whole point.
+    const GUTTER: usize = 2;
+    const MIN_DESCRIPTION: usize = 24;
+    let stacked = inner_width < GUTTER * 2 + widest_key + MIN_DESCRIPTION;
+    let indent = if stacked {
+        GUTTER * 2
+    } else {
+        GUTTER * 2 + widest_key
+    };
+    let description_width = inner_width.saturating_sub(indent).max(8);
     for binding in crate::input::KEY_BINDINGS {
-        let mut spans = vec![
-            Span::styled(
-                format!("  {:<key_width$}  ", binding.keys),
-                Style::default()
-                    .fg(theme.status.info)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                binding.description.to_owned(),
-                Style::default().fg(theme.text.primary),
-            ),
-        ];
+        let mut description = binding.description.to_owned();
         if let Some(mouse) = binding.mouse {
-            spans.push(Span::styled(
-                format!("  (mouse: {mouse})"),
-                Style::default().fg(theme.text.muted),
+            description.push_str(&format!("  (mouse: {mouse})"));
+        }
+        let key_style = Style::default()
+            .fg(theme.status.info)
+            .add_modifier(Modifier::BOLD);
+        let body_style = Style::default().fg(theme.text.primary);
+        let mut rows = wrap_display_width(&description, description_width).into_iter();
+        if stacked {
+            lines.push(Line::styled(format!("  {}", binding.keys), key_style));
+        }
+        let first = rows.next().unwrap_or_default();
+        if stacked {
+            lines.push(Line::styled(
+                format!("{}{first}", " ".repeat(indent)),
+                body_style,
+            ));
+        } else {
+            let pad = widest_key.saturating_sub(UnicodeWidthStr::width(binding.keys));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}{}  ", binding.keys, " ".repeat(pad)),
+                    key_style,
+                ),
+                Span::styled(first, body_style),
+            ]));
+        }
+        for row in rows {
+            lines.push(Line::styled(
+                format!("{}{row}", " ".repeat(indent)),
+                body_style,
             ));
         }
-        lines.push(Line::from(spans));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "Ctrl-C detaches this client — it never stops the run.  ? or Esc closes.",
-        Style::default().fg(theme.text.secondary),
-    ));
+    for row in wrap_display_width(
+        "Ctrl-C detaches this client — it never stops the run.  PgUp / PgDn scrolls.  ? or Esc closes.",
+        inner_width,
+    ) {
+        lines.push(Line::styled(row, Style::default().fg(theme.text.secondary)));
+    }
 
+    let inner_height = rect.height.saturating_sub(2);
+    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let max_scroll = total.saturating_sub(inner_height);
+    state.help_max_scroll.set(max_scroll);
+    let offset = state.help_scroll.min(max_scroll);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Help ")
+        .title_bottom(Line::styled(
+            if max_scroll > 0 {
+                format!(
+                    " {} more rows · PgUp / PgDn ",
+                    max_scroll.saturating_sub(offset)
+                )
+            } else {
+                String::new()
+            },
+            Style::default().fg(theme.text.muted),
+        ))
         .border_style(Style::default().fg(theme.focus.active))
         .style(
             Style::default()
                 .bg(theme.surface.overlay)
                 .fg(theme.text.primary),
         );
-    // Wrapped height at this width, so paging stops at the last real row.
-    let inner_width = usize::from(rect.width.saturating_sub(2)).max(1);
-    let inner_height = rect.height.saturating_sub(2);
-    let wrapped: usize = lines
-        .iter()
-        .map(|line| {
-            let width = line.width().max(1);
-            width.div_ceil(inner_width)
-        })
-        .sum();
-    let max_scroll =
-        u16::try_from(wrapped.saturating_sub(usize::from(inner_height))).unwrap_or(u16::MAX);
-    state.help_max_scroll.set(max_scroll);
-    let offset = state.help_scroll.min(max_scroll);
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((offset, 0)),
-        rect,
-    );
+    // Every line above is already laid out to `inner_width`, so the paragraph
+    // needs no wrapping of its own and the scroll maximum is exact.
+    frame.render_widget(Paragraph::new(lines).block(block).scroll((offset, 0)), rect);
 }
 
 fn render_prompt(
@@ -7661,14 +7750,7 @@ fn render_add_model_pick(
         theme,
     );
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let rows = modal_rows(inner, 1, 2);
     render_modal_search(frame, rows[0], query, theme);
 
     let list_block = modal_panel(
@@ -7859,14 +7941,7 @@ fn render_unsloth_repos(
         theme,
     );
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let rows = modal_rows(inner, 1, 2);
     render_modal_search(frame, rows[0], query, theme);
 
     const ROW_LINES: usize = 2;
@@ -7974,14 +8049,7 @@ fn render_unsloth_quants(
         theme,
     );
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(inner);
+    let rows = modal_rows(inner, 1, 2);
     render_modal_search(frame, rows[0], query, theme);
 
     const ROW_LINES: usize = 2;
@@ -8020,8 +8088,9 @@ fn render_unsloth_quants(
         } else {
             format!("{} files", card.file_count)
         };
-        let metadata_line = Line::styled(
+        let metadata_line = picker_sub_line(
             format!("      {} · {files_label}", card.size_label),
+            list_area.width,
             theme.selection_aware_text_style(is_selected, theme.text.muted),
         );
         let item = ListItem::new(vec![head, metadata_line]);
@@ -8984,14 +9053,11 @@ fn render_council_member_picker(
     theme: &Theme,
     builder: &CouncilBuilderState,
 ) {
-    let rows = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .split(area);
+    // `[search, list, trailing gap]` — the gap is the loser on a short
+    // terminal, never the list (see `modal_rows`).
+    let rows = modal_rows(area, 1, 1);
     render_modal_search(frame, rows[0], &builder.query, theme);
-    let (list_area, detail_area) = picker_regions(rows[2]);
+    let (list_area, detail_area) = picker_regions(rows[1]);
     let list_block = modal_panel(
         format!("Configured profiles · {} selected", builder.members.len()),
         theme,
@@ -9112,14 +9178,11 @@ fn render_council_chair_picker(
     theme: &Theme,
     builder: &CouncilBuilderState,
 ) {
-    let rows = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .split(area);
+    // `[search, list, trailing gap]` — the gap is the loser on a short
+    // terminal, never the list (see `modal_rows`).
+    let rows = modal_rows(area, 1, 1);
     render_modal_search(frame, rows[0], &builder.query, theme);
-    let (list_area, detail_area) = picker_regions(rows[2]);
+    let (list_area, detail_area) = picker_regions(rows[1]);
     let list_block = modal_panel("Synthesis model", theme);
     let list_inner = list_block.inner(list_area);
     frame.render_widget(list_block, list_area);
@@ -9428,6 +9491,20 @@ fn modal_surface(
     inner
 }
 
+/// A picker row's supporting line, ELLIPSED to the pane it is drawn into.
+///
+/// `List` clips its items at the pane edge with no marker, so a sub-line built
+/// with a bare `format!` reads as a hard cut mid-identifier: `AWS_BEARER_TOKEN_BED`
+/// (the env-var NAME, cut), `acp: verified install · thir`, `connection check to
+/// \`http://127.0.`. Row TITLES have gone through `truncate_display_width` all
+/// along — this is the same rule for the lines under them, in ONE place so a
+/// sixth picker cannot quietly reintroduce the bare `format!`.
+///
+/// `text` carries its own leading indent, which is part of the budget.
+fn picker_sub_line<'a>(text: String, width: u16, style: Style) -> Line<'a> {
+    Line::styled(truncate_display_width(&text, usize::from(width)), style)
+}
+
 fn modal_panel<'a>(title: impl Into<String>, theme: &Theme) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
@@ -9442,7 +9519,64 @@ fn modal_panel<'a>(title: impl Into<String>, theme: &Theme) -> Block<'a> {
         .style(Style::default().bg(theme.surface.panel))
 }
 
+/// Split a search-over-list modal's interior into `[search, list, hint]`,
+/// sizing the LIST first.
+///
+/// The fixed `[Length(3), Min(0), Length(1)]` these pickers all used handed the
+/// search box its border and the hint its row before the list saw a single
+/// cell: on a 10-row terminal — an ordinary tmux split — the command palette,
+/// the model picker, `/keys` and the theme picker each drew a full set of
+/// chrome around a zero-height list, while their titles truthfully announced
+/// "27 of 27 results". `Min(0)` guarantees the list is the loser of every short
+/// split, and the list is the only part of a picker that is load-bearing.
+///
+/// So the list is reserved its floor first and the chrome gives way in order of
+/// what can be inferred without it: the search box drops to a single borderless
+/// line (still showing the query and the caret — see [`render_modal_search`]),
+/// then the hint row goes. `hint_rows` is 0 for a picker with no footer line;
+/// `row_lines` is how many lines one of this picker's rows occupies.
+fn modal_rows(inner: Rect, hint_rows: u16, row_lines: u16) -> [Rect; 3] {
+    const BOXED_SEARCH_ROWS: u16 = 3;
+    // A bordered list panel spends two rows on its own frame, and `List` draws
+    // nothing at all for an item taller than the space left — so the floor is
+    // the frame plus ONE WHOLE ROW of this picker's rows. Reserving less put
+    // three-line provider rows into a two-line hole, which renders as an empty
+    // panel just as surely as a zero-height one did.
+    let min_list = row_lines.max(1).saturating_add(2);
+
+    let mut search = BOXED_SEARCH_ROWS.min(inner.height);
+    let mut hint = hint_rows.min(inner.height.saturating_sub(search));
+    if search + hint + min_list > inner.height {
+        search = 1.min(inner.height);
+    }
+    if search + hint + min_list > inner.height {
+        hint = 0;
+    }
+    let list = inner.height.saturating_sub(search + hint);
+    let rows = Layout::vertical([
+        Constraint::Length(search),
+        Constraint::Length(list),
+        Constraint::Length(hint),
+    ])
+    .split(inner);
+    [rows[0], rows[1], rows[2]]
+}
+
 fn render_modal_search(frame: &mut Frame, area: Rect, query: &str, theme: &Theme) {
+    // Below three rows the box has no interior: draw the same line unframed
+    // rather than a border with the query hidden inside it.
+    if area.height < 3 {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  ⌕  ", Style::default().fg(theme.focus.active)),
+                modal_search_value(query, usize::from(area.width.saturating_sub(6)), theme),
+                Span::styled("▏", Style::default().fg(theme.focus.active)),
+            ]))
+            .style(Style::default().bg(theme.surface.panel)),
+            area,
+        );
+        return;
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -9454,26 +9588,30 @@ fn render_modal_search(frame: &mut Frame, area: Rect, query: &str, theme: &Theme
         .style(Style::default().bg(theme.surface.panel));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let value_width = usize::from(inner.width.saturating_sub(6));
-    let value = if query.is_empty() {
-        Span::styled(
-            truncate_display_width("Type to filter…", value_width),
-            Style::default().fg(theme.text.muted),
-        )
-    } else {
-        Span::styled(
-            tail_window(query, value_width),
-            Style::default().fg(theme.text.primary),
-        )
-    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("  ⌕  ", Style::default().fg(theme.focus.active)),
-            value,
+            modal_search_value(query, usize::from(inner.width.saturating_sub(6)), theme),
             Span::styled("▏", Style::default().fg(theme.focus.active)),
         ])),
         inner,
     );
+}
+
+/// The query itself: the live tail of what has been typed (so the caret stays
+/// visible on a long filter), or the placeholder.
+fn modal_search_value<'a>(query: &str, width: usize, theme: &Theme) -> Span<'a> {
+    if query.is_empty() {
+        Span::styled(
+            truncate_display_width("Type to filter…", width),
+            Style::default().fg(theme.text.muted),
+        )
+    } else {
+        Span::styled(
+            tail_window(query, width),
+            Style::default().fg(theme.text.primary),
+        )
+    }
 }
 
 fn shield_modal(state: &AppState, rect: Rect) {
@@ -9783,6 +9921,95 @@ fn format_cost(cost_minor: Option<u64>) -> String {
     match cost_minor {
         Some(c) => format!("${}.{:02}", c / 100, c % 100),
         None => "—".to_owned(),
+    }
+}
+
+/// A MEASURED cost, in USD millionths (`EventBody::RunUsage.cost_micros`).
+///
+/// Four decimals, matching `crates/cli/src/commands.rs`'s `render_cost` — a run
+/// against a cheap model costs a fraction of a cent, and a two-decimal figure
+/// would report almost every one of them as `$0.00`.
+fn format_cost_micros(micros: u64) -> String {
+    format!("${}.{:04}", micros / 1_000_000, (micros % 1_000_000) / 100)
+}
+
+/// `1234` → `1,234`. Token counts are the one place in the shell where the
+/// magnitude is the message; unseparated digits make 10000 and 100000 read
+/// alike at a glance.
+fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// The measured-usage chip: `1,234 in · 567 out · $0.0034`.
+///
+/// Only measured dimensions appear. An absent one means the provider did not
+/// report it, never zero — so a run with tokens and no price (every unpriced
+/// local model) shows its tokens and no money, rather than a dash that reads as
+/// "this run was free". `None` here means nothing at all was measured.
+fn usage_label(
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    cost_micros: Option<u64>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(tokens) = prompt_tokens {
+        parts.push(format!("{} in", thousands(tokens)));
+    }
+    if let Some(tokens) = completion_tokens {
+        parts.push(format!("{} out", thousands(tokens)));
+    }
+    if let Some(micros) = cost_micros {
+        parts.push(format_cost_micros(micros));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The same measurement packed for the header, where every column is contested:
+/// total tokens, abbreviated, plus the price when one was measured.
+fn usage_label_compact(
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    cost_micros: Option<u64>,
+) -> Option<String> {
+    let total = match (prompt_tokens, completion_tokens) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(total) = total {
+        parts.push(format!("{} tok", abbreviate_count(total)));
+    }
+    if let Some(micros) = cost_micros {
+        parts.push(format_cost_micros(micros));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// `950` → `950`; `1234` → `1.2k`; `10000` → `10k`; `1_500_000` → `1.5M`.
+fn abbreviate_count(value: u64) -> String {
+    match value {
+        0..=9_999 => thousands(value),
+        10_000..=999_999 => format!("{}k", value / 1_000),
+        _ => format!("{}.{}M", value / 1_000_000, (value % 1_000_000) / 100_000),
+    }
+}
+
+/// The status/telemetry cost field: the MEASURED cost when the daemon reported
+/// one, else the budget-projected cost, else a dash. Two inputs, one field —
+/// `format_cost` alone could only ever see the budget projection, which nothing
+/// in the workspace emits.
+fn cost_field(cost_micros: Option<u64>, cost_minor: Option<u64>) -> String {
+    match cost_micros {
+        Some(micros) => format_cost_micros(micros),
+        None => format_cost(cost_minor),
     }
 }
 
@@ -15885,5 +16112,364 @@ mod tests {
             "a kept theme renders exactly as booting in it would"
         );
         assert_ne!(background(&kept), background(&dark_frame));
+    }
+
+    // --- Outcome 20: the measured usage the daemon publishes, on screen ---
+
+    /// A completed run with `RunUsage` folded in — the state a real run reaches
+    /// the moment the daemon publishes its measurement.
+    fn measured_run_state(cost_micros: Option<u64>) -> AppState {
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "summarise the README".to_owned(),
+                mode: codypendent_protocol::AgentMode::Build,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStateChanged {
+                run_id,
+                state: RunState::Completed,
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("done".to_owned()),
+                },
+                chronicle: filler_chronicle(),
+            }),
+        );
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunUsage {
+                run_id,
+                prompt_tokens: Some(10_000),
+                completion_tokens: Some(642),
+                cost_micros,
+            }),
+        );
+        s
+    }
+
+    /// The headline outcome-20 defect: the daemon measured the run, published
+    /// `RunUsage` on the wire, and the TUI printed `? unsupported event` into
+    /// the transcript because no reducer arm existed. The numbers must be on
+    /// screen, and that placeholder must be gone.
+    #[test]
+    fn a_measured_run_shows_its_tokens_instead_of_unsupported_event() {
+        let state = measured_run_state(None);
+        let text = render_to_string(&state, 120, 40);
+        assert!(
+            !text.contains("unsupported event"),
+            "an event this build produces must never render as unsupported:\n{text}"
+        );
+        assert!(
+            text.contains("10,000 in") && text.contains("642 out"),
+            "the measured tokens must be on screen:\n{text}"
+        );
+    }
+
+    /// `cost_micros` is absent for every unpriced model, which is the common
+    /// case. The tokens that WERE measured must still be rendered — a dash for
+    /// the whole field reads as "this run was free".
+    #[test]
+    fn measured_tokens_render_even_when_no_cost_was_measured() {
+        let unpriced = render_to_string(&measured_run_state(None), 120, 40);
+        assert!(
+            unpriced.contains("10,000 in"),
+            "tokens without a price still render:\n{unpriced}"
+        );
+        let priced = render_to_string(&measured_run_state(Some(3_400)), 120, 40);
+        assert!(
+            priced.contains("$0.0034"),
+            "a measured sub-cent cost renders to four decimals, not $0.00:\n{priced}"
+        );
+    }
+
+    /// Header, footer and the workspace Run detail are the three places that
+    /// showed `cost: —` after every run. All three must show the measurement.
+    #[test]
+    fn header_footer_and_run_detail_all_carry_the_measurement() {
+        let mut state = measured_run_state(Some(3_400));
+        let chat = render_to_string(&state, 120, 40);
+        let header = chat.lines().next().unwrap_or_default().to_owned();
+        assert!(
+            header.contains("10.6k tok") || header.contains("$0.0034"),
+            "the header carries the measured usage: {header:?}"
+        );
+        let footer = chat.lines().last().unwrap_or_default().to_owned();
+        assert!(
+            footer.contains("10,000 in") && footer.contains("$0.0034"),
+            "the footer carries the measured usage: {footer:?}"
+        );
+
+        state.layout = crate::state::LayoutMode::Workspace;
+        let workspace = render_to_string(&state, 160, 40);
+        assert!(
+            workspace.contains("tokens:") && workspace.contains("10,000 in / 642 out"),
+            "the Run detail pane carries the measured tokens:\n{workspace}"
+        );
+        assert!(
+            !workspace.contains("cost: —"),
+            "a measured run never reads `cost: —`:\n{workspace}"
+        );
+    }
+
+    /// An unmeasured run keeps the honest dash — the fix must not fabricate a
+    /// zero for a provider that reported nothing.
+    #[test]
+    fn an_unmeasured_run_still_reads_as_unmeasured() {
+        let mut state = measured_run_state(None);
+        if let Some(run) = state.runs.first_mut() {
+            run.prompt_tokens = None;
+            run.completion_tokens = None;
+            run.cost_micros = None;
+        }
+        state.layout = crate::state::LayoutMode::Workspace;
+        let text = render_to_string(&state, 160, 40);
+        assert!(
+            text.contains("tokens: —") && text.contains("cost: —"),
+            "unmeasured dimensions stay a dash, never 0:\n{text}"
+        );
+    }
+
+    // --- Transient notices are visible once a session has run something ---
+
+    /// Every `state.notice` in the product was invisible for the life of any
+    /// session with a run, because the branch required `run_state.is_none()`.
+    #[test]
+    fn a_notice_is_visible_after_a_run_has_completed() {
+        let mut state = measured_run_state(None);
+        assert!(
+            state.status().run_state.is_some(),
+            "precondition: the session has a run, which is what used to hide notices"
+        );
+        reduce(
+            &mut state,
+            Action::Notice("connection lost · reconnecting…".to_owned()),
+        );
+        let text = render_to_string(&state, 120, 40);
+        assert!(
+            text.contains("connection lost"),
+            "a notice must reach the status line after a run:\n{text}"
+        );
+    }
+
+    /// A live run keeps its controls while a notice is showing: feedback must
+    /// not cost the user `s`/`p`/`c` on a run that is still going.
+    #[test]
+    fn a_notice_during_a_live_run_keeps_the_run_controls() {
+        let mut state = running_build_state();
+        reduce(&mut state, Action::Notice("copied focused card".to_owned()));
+        let text = render_to_string(&state, 120, 40);
+        assert!(
+            text.contains("copied focused card"),
+            "the notice shows during a live run:\n{text}"
+        );
+        assert!(
+            text.contains("interrupt") && text.contains("steer"),
+            "the live run's chips survive the notice:\n{text}"
+        );
+    }
+
+    // --- Short terminals: a picker must show rows, not just chrome ---
+
+    /// 120x10 is an ordinary tmux split. The command palette, the model
+    /// picker, `/keys` and the theme picker each drew their whole frame and
+    /// zero rows there, while the title said "27 of 27 results".
+    #[test]
+    fn every_picker_shows_rows_on_a_ten_row_terminal() {
+        let mut state = AppState::new();
+        state.models.push(crate::state::ModelCard {
+            id: ModelId("stub/fast".to_owned()),
+            provider: "openai-compatible".to_owned(),
+            readiness: crate::state::ModelReadiness::Ready,
+            location: None,
+            cost_per_1k_usd: None,
+            context_tokens: None,
+        });
+        state.providers.push(crate::state::ProviderCard {
+            id: "stub-provider".to_owned(),
+            name: "Stub Provider".to_owned(),
+            protocol: "openai-chat".to_owned(),
+            auth: "api-key: STUB_API_KEY".to_owned(),
+            local: false,
+            requires_key: true,
+            has_key: false,
+            can_list_models: true,
+            available: true,
+            catalog_models: 2,
+        });
+
+        // Each needle is a LIST ROW's own text — the row marker or readiness
+        // glyph the detail rail never draws — so a picker that renders only its
+        // chrome and its detail pane cannot satisfy it.
+        let first_command = crate::palette::COMMANDS
+            .first()
+            .expect("the palette is not empty")
+            .title;
+        let cases: Vec<(&str, crate::state::Overlay, String)> = vec![
+            (
+                "command palette",
+                crate::state::Overlay::Palette {
+                    query: String::new(),
+                    selected: 0,
+                },
+                format!("▎ {first_command}"),
+            ),
+            (
+                "model picker",
+                crate::state::Overlay::ModelPicker {
+                    query: String::new(),
+                    selected: 0,
+                },
+                "✓ stub/fast".to_owned(),
+            ),
+            (
+                "api keys",
+                crate::state::Overlay::ApiKeys {
+                    query: String::new(),
+                    selected: 0,
+                },
+                "▎ ○ stub/fast".to_owned(),
+            ),
+            (
+                "theme picker",
+                crate::state::Overlay::ThemePicker {
+                    query: String::new(),
+                    selected: 0,
+                },
+                format!("▎   {}", state.themes.first().expect("built-in themes").id),
+            ),
+            // Three-line rows. `List` draws NOTHING for an item taller than the
+            // space left, so a floor that only counts the panel's border leaves
+            // these two just as empty as a zero-height list did.
+            (
+                "provider picker",
+                crate::state::Overlay::ProviderPicker {
+                    query: String::new(),
+                    selected: 0,
+                },
+                "▎ ✓ stub-provider".to_owned(),
+            ),
+            (
+                "onboarding provider picker",
+                crate::state::Overlay::OnboardProviderPicker {
+                    class: crate::state::OnboardProviderClass::Hosted,
+                    query: String::new(),
+                    selected: 0,
+                },
+                "▎ ✓ Stub Provider".to_owned(),
+            ),
+        ];
+        for (name, overlay, needle) in cases {
+            state.overlay = overlay;
+            let text = render_to_string(&state, 120, 10);
+            assert!(
+                text.contains(&needle),
+                "the {name} must show at least one row at 120x10 (looking for {needle:?}):\n{text}"
+            );
+        }
+    }
+
+    /// The search line survives the squeeze too — losing its border is fine,
+    /// losing the query is not. The needle matches no command, so it can only
+    /// come from the search line itself.
+    #[test]
+    fn a_squeezed_picker_still_shows_what_was_typed() {
+        let needle = "zzq";
+        assert!(
+            crate::palette::filtered(needle).is_empty(),
+            "precondition: the needle must not appear in any command row"
+        );
+        let mut state = AppState::new();
+        state.overlay = crate::state::Overlay::Palette {
+            query: needle.to_owned(),
+            selected: 0,
+        };
+        let text = render_to_string(&state, 120, 10);
+        assert!(
+            text.contains(needle),
+            "the typed filter stays visible on a short terminal:\n{text}"
+        );
+    }
+
+    // --- Picker sub-lines ellipse rather than hard-cut ---
+
+    /// Row titles have always gone through `truncate_display_width`; the lines
+    /// UNDER them did not, so `List` clipped them mid-identifier with no "…".
+    #[test]
+    fn picker_sub_lines_ellipse_instead_of_cutting_mid_identifier() {
+        let mut state = AppState::new();
+        state.providers.push(crate::state::ProviderCard {
+            id: "amazon-bedrock".to_owned(),
+            name: "AWS Bedrock (mantle, bearer key)".to_owned(),
+            protocol: "openai-chat".to_owned(),
+            auth: "api-key: AWS_BEARER_TOKEN_BEDROCK".to_owned(),
+            local: false,
+            requires_key: true,
+            has_key: false,
+            can_list_models: false,
+            available: true,
+            catalog_models: 3,
+        });
+        state.overlay = crate::state::Overlay::ProviderPicker {
+            query: String::new(),
+            selected: 0,
+        };
+        let text = render_to_string(&state, 120, 40);
+        let cut = text
+            .lines()
+            .find(|line| line.contains("api-key: AWS_BEARER"))
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            cut.contains('…'),
+            "a clipped provider sub-line must end in an ellipsis, got {cut:?}"
+        );
+        assert!(
+            !cut.contains("AWS_BEARER_TOKEN_BEDROCK "),
+            "precondition: the line really is too wide for the pane, got {cut:?}"
+        );
+    }
+
+    // --- Help: wrapped rows keep the gutter ---
+
+    /// Every continuation of a wrapped description used to restart at column 0,
+    /// so half of each row landed under the key column and the table read as a
+    /// wall of fragments.
+    #[test]
+    fn help_descriptions_wrap_with_a_hanging_indent() {
+        let mut state = AppState::new();
+        state.overlay = crate::state::Overlay::Help;
+        // The two prose lines are the only unindented copy in the overlay.
+        let prose = "Keys — every mouse action has a keyboard equivalent              Ctrl-C detaches this client — it never stops the run.               PgUp / PgDn scrolls.  ? or Esc closes.";
+        for (width, height) in [(120u16, 40u16), (80, 24), (60, 20)] {
+            let text = render_to_string(&state, width, height);
+            let mut orphans: Vec<String> = Vec::new();
+            for line in text.lines() {
+                // Rows inside the modal: strip the frame, then look at what a
+                // continuation line starts with.
+                let Some(body) = line.split('│').nth(1) else {
+                    continue;
+                };
+                let trimmed = body.trim();
+                if trimmed.is_empty() || body.starts_with("  ") || prose.contains(trimmed) {
+                    continue;
+                }
+                orphans.push(trimmed.to_owned());
+            }
+            assert!(
+                orphans.is_empty(),
+                "every wrapped Help row keeps its indent at {width}x{height},                  these did not: {orphans:?}\n{text}"
+            );
+        }
     }
 }

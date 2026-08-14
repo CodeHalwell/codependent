@@ -151,11 +151,23 @@ mod tests {
     fn builtin_catalog_parses_and_has_known_providers() {
         let providers = builtin_providers();
         assert!(
-            providers.len() >= 40,
-            "expected ~40 providers, got {}",
+            providers.len() >= 39,
+            "expected ~39 providers, got {}",
             providers.len()
         );
         let cat = Catalog::builtin();
+        // A provider a user can select must be one they can reach. These three
+        // were live-probed dead on 2026-08-13 (ai21 and github-models answer
+        // HTTP 410 "retired"; api.lambda.ai does not resolve) and removed, each
+        // having curated zero models — so picking one produced a network/auth
+        // failure where the honest answer was "this API was retired". Re-adding
+        // any of them needs a fresh probe, not a hopeful commit.
+        for retired in ["ai21", "github-models", "lambda"] {
+            assert!(
+                cat.get(retired).is_none(),
+                "`{retired}` is dead upstream and must not be offered"
+            );
+        }
         assert_eq!(
             cat.get("openai").map(|p| p.protocol),
             Some(Protocol::OpenAiChat)

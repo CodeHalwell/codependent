@@ -35,7 +35,7 @@ use codypendent_daemon::executor::{PriorTurn, RunExecutor, RunLaunch};
 use codypendent_daemon::policy::{PolicyEngine, GITHUB_API_ENDPOINT, TAVILY_API_ENDPOINT};
 use codypendent_daemon::subscriptions::SubscriptionHub;
 use codypendent_daemon::workflow_stream::{WorkflowHub, WorkflowReader};
-use codypendent_daemon::worktrees::{WorktreeError, WorktreeManager};
+use codypendent_daemon::worktrees::{ReleaseOutcome, WorktreeError, WorktreeManager};
 use codypendent_daemon::{ledger, projections, recovery};
 use codypendent_integrations::acp::PermissionOption;
 use codypendent_integrations::acp_client::{
@@ -741,7 +741,11 @@ impl RuntimeExecutor {
         token: CancellationToken,
     ) -> Result<(), String> {
         let (registry, policy) = self.load_registry()?;
-        let model_id = match &launch.model {
+        // The routed model AND the measured price the router chose it with
+        // (outcome 20): the price is the only MEASURED rate in the product, it
+        // reaches this frame and nowhere else, and it used to be dropped here —
+        // which is why `runs.cost_micros` was NULL for every agent run.
+        let (model_id, price_per_1k_usd) = match &launch.model {
             // A model PINNED by the operator via the `/model` picker (STEP MP2):
             // run on exactly it — but a pin must NEVER bypass the classification
             // hard filter. When routing is ENABLED, validate the pin against the
@@ -769,7 +773,9 @@ impl RuntimeExecutor {
                 registry.check_model(pinned).await.map_err(|error| {
                     format!("pinned model `{pinned}` is not available: {error}")
                 })?;
-                pinned.clone()
+                // A pin bypasses routing, so no measured price exists for it.
+                // Unmeasured price ⇒ unmeasured cost, never a fabricated zero.
+                (pinned.clone(), None)
             }
             // No pin: the Phase-7 routing seam (STEP 7.2/7.3), DEFAULT OFF. When
             // routing is enabled the router picks the model from the measured
@@ -813,12 +819,13 @@ impl RuntimeExecutor {
                         {
                             warn!(run_id = %launch.run_id, %error, "could not record the routing decision in the trace");
                         }
-                        selection.model().clone()
+                        (selection.model().clone(), selection.price_per_1k_usd)
                     }
-                    None => {
+                    None => (
                         self.resolve_run_model(&registry, &policy, launch.mode)
-                            .await?
-                    }
+                            .await?,
+                        None,
+                    ),
                 }
             }
         };
@@ -832,7 +839,12 @@ impl RuntimeExecutor {
 
         let driver = FrameworkModelDriver::from_registry(&registry, model_id)
             .await
-            .map_err(|e| format!("could not build model client: {e}"))?;
+            .map_err(|e| format!("could not build model client: {e}"))?
+            // The routed model's measured rate, applied where the tokens are
+            // measured. `None` (a pin, routing off, or a profile with no
+            // measured price) keeps the run's cost UNMEASURED rather than
+            // reporting a zero nobody measured.
+            .with_price_per_1k_usd(price_per_1k_usd);
 
         let policy = self.load_run_policy(&launch.repository)?;
 
@@ -950,7 +962,7 @@ impl RuntimeExecutor {
         // the operating tree above, which for an isolated run is a throwaway
         // worktree. Cards must accumulate on one board per checkout, not scatter
         // across per-run worktrees (rubrics 5 / 10).
-        ctx = ctx.with_board_repository(launch.repository.to_string_lossy().into_owned());
+        ctx = ctx.with_repository_identity(launch.repository.to_string_lossy().into_owned());
         // Resolve the run's GitHub `owner/repo` from the checkout's origin remote,
         // so the `github.*` tools know their target. Uses the repository IDENTITY
         // (`R`), not the worktree read root. Only meaningful when a client is
@@ -2922,9 +2934,71 @@ pub(crate) async fn release_run_worktree(
     binding: &WorktreeBinding,
 ) {
     if let Some(lease_id) = binding.lease {
-        if let Err(error) = manager.release(pool, artifacts, lease_id, false).await {
-            warn!(%lease_id, %error, "could not release the run's worktree");
+        match manager.release(pool, artifacts, lease_id, false).await {
+            Ok(outcome) => announce_preserved_worktree(pool, &outcome).await,
+            Err(error) => warn!(%lease_id, %error, "could not release the run's worktree"),
         }
+    }
+}
+
+/// Tell the user when a released worktree was **retained** because it held work.
+///
+/// The protective release path exports a safety patch and keeps the directory
+/// and its `codypendent/run-*` branch precisely so a failed worker's work is not
+/// lost — and, until this existed, said so to nobody: the `ReleaseOutcome` that
+/// records it was computed in the daemon and dropped one frame below the only
+/// observer. A fan-out whose workers failed left orphan worktrees and branches in
+/// the user's repository with no explanation and no pointer to the patch. The
+/// run's own session ledger is where the user is already looking, so the note
+/// lands there, naming the path, the branch and the artifact.
+///
+/// Best effort throughout: a run that has already reached a terminal state must
+/// never fail because its epilogue could not be written.
+async fn announce_preserved_worktree(pool: &SqlitePool, outcome: &ReleaseOutcome) {
+    if !outcome.preserved {
+        return;
+    }
+    let session_id = match projections::run_session(pool, outcome.owner_run_id).await {
+        Ok(Some(session_id)) => session_id,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(%error, "could not attribute a preserved worktree to its session");
+            return;
+        }
+    };
+    let reason = match (outcome.unmerged_commits, outcome.dirty) {
+        (0, _) => "uncommitted changes".to_string(),
+        (1, false) => "1 unmerged commit".to_string(),
+        (commits, false) => format!("{commits} unmerged commits"),
+        (1, true) => "1 unmerged commit and uncommitted changes".to_string(),
+        (commits, true) => format!("{commits} unmerged commits and uncommitted changes"),
+    };
+    let patch = outcome.patch.as_ref().map_or_else(
+        || " No patch could be exported, so the worktree is the only copy.".to_string(),
+        |patch| format!(" Its diff is saved as artifact {}.", patch.id),
+    );
+    let text = format!(
+        "Kept the worktree {} and its branch `{}`: it held {reason}, so nothing was deleted.{patch} \
+         Recover or discard it with `git -C {} worktree remove {}` and `git branch -D {}`.",
+        outcome.worktree_path.display(),
+        outcome.branch,
+        outcome.worktree_path.display(),
+        outcome.worktree_path.display(),
+        outcome.branch,
+    );
+    if let Err(error) = ledger::append_next_event(
+        pool,
+        session_id,
+        &Actor::System,
+        &EventBody::NoteAppended {
+            text,
+            run_id: Some(outcome.owner_run_id),
+        },
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        warn!(%error, "could not note a preserved worktree on the session");
     }
 }
 
@@ -2952,8 +3026,13 @@ pub(crate) async fn release_captured_run_worktree(
     binding: &WorktreeBinding,
 ) {
     if let Some(lease_id) = binding.lease {
-        if let Err(error) = manager.release(pool, artifacts, lease_id, true).await {
-            warn!(%lease_id, %error, "could not release the run's captured worktree");
+        match manager.release(pool, artifacts, lease_id, true).await {
+            // `force` still preserves the tree when the safety export came back
+            // empty (the manager refuses to remove what it could not capture) —
+            // that is exactly the case a user must hear about, so this path
+            // reports too rather than assuming `force` always removes.
+            Ok(outcome) => announce_preserved_worktree(pool, &outcome).await,
+            Err(error) => warn!(%lease_id, %error, "could not release the run's captured worktree"),
         }
     }
 }
@@ -4302,6 +4381,65 @@ api_key_env = "CODYPENDENT_TEST_EXECUTOR_AUTHJSON_UNSET_9c1d"
             .await
             .unwrap();
         assert_eq!(state, "released");
+    }
+
+    /// A worker whose worktree is RETAINED (it held work) must tell the user so.
+    ///
+    /// The protective release path exports a patch and keeps the directory and
+    /// its branch on purpose — and reported it to nobody: `ReleaseOutcome` had no
+    /// reader outside the daemon's own tests, so a fan-out whose workers failed
+    /// left orphan worktrees and `codypendent/run-*` branches in the repository
+    /// with nothing in the product mentioning them.
+    #[tokio::test]
+    async fn a_retained_worktree_is_reported_on_the_run_s_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (pool, artifacts) = test_pool(tmp.path()).await;
+        let repo = init_git_repo(tmp.path());
+        let run_id = seed_run(&pool).await;
+        let manager = WorktreeManager::new();
+
+        let binding = bind_run_worktree(
+            &pool,
+            &manager,
+            run_id,
+            run_writes_to_worktree(AgentMode::Build),
+            &repo,
+        )
+        .await
+        .expect("Build binds a worktree");
+
+        // Dirty the worktree, so the protective path preserves it.
+        std::fs::write(binding.worktree.join("worker.txt"), b"half-finished work").unwrap();
+
+        release_run_worktree(&pool, &artifacts, &manager, &binding).await;
+        assert!(
+            binding.worktree.exists(),
+            "unmerged work must still be preserved"
+        );
+
+        let session_id = projections::run_session(&pool, run_id)
+            .await
+            .unwrap()
+            .expect("the run has a session");
+        let notes: Vec<String> = sqlx::query_scalar("SELECT body FROM events WHERE session_id = ?")
+            .bind(session_id.to_string())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let note = notes
+            .iter()
+            .find(|body| body.contains("Kept the worktree"))
+            .unwrap_or_else(|| {
+                panic!("a preserved worktree must be reported on the session, got {notes:?}")
+            });
+        assert!(
+            note.contains(&binding.worktree.display().to_string()),
+            "the note must name the retained path: {note}"
+        );
+        assert!(
+            note.contains("worktree remove") && note.contains("branch -D"),
+            "the note must tell the user how to recover or discard it: {note}"
+        );
     }
 
     #[tokio::test]

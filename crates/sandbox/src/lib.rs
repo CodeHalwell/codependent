@@ -79,9 +79,9 @@ pub use gate::{
 };
 pub use hook::{
     combine, parse_hook, validate_event_set, Authorized, FailurePolicy, HookDenied, HookError,
-    HookEvent, HookKind, HookNetwork, HookOutcome, HookOutput, HookPolicy, HookRuntime, HookSpec,
-    HookVerdict, PolicyReentry, ReentryContext, ToolCall, Unapproved, MAX_HOOKS_PER_EVENT,
-    SUPPORTED_HOOK_SCHEMA_VERSION,
+    HookEvent, HookKind, HookNetwork, HookOutcome, HookOutput, HookPolicy, HookRuntime, HookScope,
+    HookSpec, HookVerdict, PolicyReentry, ReentryContext, ToolCall, Unapproved, HOOK_PLACEHOLDERS,
+    MAX_HOOKS_PER_EVENT, SUPPORTED_HOOK_SCHEMA_VERSION,
 };
 pub use lifecycle::{
     InstalledPlugin, LifecycleError, LifecycleState, PendingUpdateApproval, TrustTier,

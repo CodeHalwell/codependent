@@ -18,3 +18,30 @@ Therefore, once a migration has merged to `main`:
 
 When authoring a new migration, get the comment right the first time; after
 merge, the file is frozen.
+
+## Corrections to frozen files
+
+A merged migration's comment cannot be edited, so where one has turned out to
+be wrong it is corrected here instead. Trust this section over the SQL comment.
+
+### `0026_skill_executions.sql` and `0027_hooks.sql` — no writer exists
+
+`0026`'s header says the table "is written by the skill runner itself
+(`crates/knowledge/src/skill_exec.rs`), once per invocation". **It is not, and
+as of 2026-08-14 neither table has any writer at all:**
+
+```
+$ grep -rn "skill_executions" --include=*.rs crates/   # nothing
+$ grep -rn "hook_dispatches"  --include=*.rs crates/   # nothing
+```
+
+`SkillRunner` has no production caller (`crates/daemon/src/policy_gate.rs:22-29`
+says so itself), and nothing discovers, registers, approves, dispatches or
+executes a hook. So a skill execution and a hook dispatch each leave **no audit
+record**. The schemas are the intended shape for whoever wires these up; do not
+read either file as evidence that an audit trail is being kept.
+
+A future writer for `hooks.scope_kind` should use
+`codypendent_sandbox::HookScope::as_str()` (`user`/`repository`/`organization`/
+`system`) rather than a free string — the Rust side is a closed enum as of
+round 4, and the column is not.

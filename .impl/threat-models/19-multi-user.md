@@ -138,6 +138,12 @@ Specifically **not** done: a distinct `protocol.not-authorized` code. It would
 be friendlier and it would be an enumeration oracle, which is the mistake
 F-19-7 records.
 
+For a resource whose "does not exist" answer is *not* an error, the refusal is
+that answer instead — see §8 on `ReleaseDocumentLease`. For the daemon-wide
+stores (memory, promotion, Remote UI plugins) the refusal reuses each store's own
+"not enabled on this daemon" error verbatim, so a foreign principal cannot
+distinguish "not yours" from "not built into this daemon".
+
 ## 6. Residual risk — stated plainly
 
 * **Not a containment boundary against the same uid.** By construction. Anything
@@ -170,3 +176,80 @@ F-19-7 records.
 4. Every such comparison fails with the same error as "does not exist".
 5. `ResolveApproval` resolves `approval_id → run → session → owner_uid` and
    refuses a mismatch. (Invariant 3 with the highest stakes.)
+
+## 8. How invariant 3 is enforced (round 4) — one choke point, not a habit
+
+The first implementation enforced invariant 3 **per command arm**, and the round-4
+review found what that always finds: the arm that was missed. `PublishDocument`
+checked the role and the transport and then built the publish, while both of its
+siblings (`MutateDocument`, `AcquireDocumentLease`) re-derived ownership — so a
+foreign uid could park a Git write, to a path it chose, into the owning user's
+approval queue, and the difference between that success and a `document.not-found`
+was itself the enumeration oracle §5 forbids. `ReleaseDocumentLease` was missed the
+same way.
+
+There is now exactly **one** gate, and it is fed by a classifier that the compiler
+will not let anyone forget:
+
+* `CommandBody::named_resources()` (`crates/protocol/src/command.rs`) returns every
+  pre-existing resource a body names. It lives in the crate that *defines*
+  `CommandBody`, so its match is exhaustive with **no wildcard arm** — a new
+  command variant does not compile until somebody classifies it. (In the daemon
+  the same match would need a wildcard, because `CommandBody` is
+  `#[non_exhaustive]` downstream, and a new variant would silently classify as
+  "names nothing".)
+* `authorize_command` (`crates/daemon/src/server.rs`) resolves each named resource
+  against the daemon's own storage and is called **once**, immediately after the
+  handshake check and **before** the dispatch match — so ownership is the OUTER
+  gate, ahead of every role, transport and seam check. A principal probing another
+  user's ids therefore cannot learn anything from the difference between
+  `role-denied`, `transport-unavailable` and `not-found` either.
+
+Resolution rules, by kind: session → `sessions.owner_uid`; run and approval →
+their session's owner; document → its session's owner when session-scoped, else
+the daemon uid; document lease → the document it is held over; workflow run and
+`board:<repo>` → `principal_may_read_workflow`; and the three **daemon-wide
+stores** (curated memory, promotion, Remote UI plugins) → the uid the daemon runs
+as, since none of their rows has an owner of its own. The plugin store is included
+because installing a plugin is an arbitrary-code surface for the worker runtime;
+before round 4 it was gated on the client-asserted `ClientRole` alone.
+
+**One documented exception**, and only one: `AttachSession`. The requested role
+binds to the connection *before* the attach is evaluated (role bootstrap — a
+one-shot client asserts its role by attaching to an id it may not own), and a
+rejected attach answers `Payload::Error`, not `CommandRejected`. It is gated
+inside `handle_attach` with the same `principal_may_use_session` call and answers
+the identical `protocol.session-not-found`.
+
+### Invariant 4 for an idempotent command
+
+`ReleaseDocumentLease` is documented idempotent: releasing an unknown lease
+succeeds and does nothing. "You may not" therefore cannot be an error — an error
+would be the oracle. Both an unknown lease and a lease over a document this
+principal does not own are answered with that same accepted no-op
+(`Refusal::AcceptedNoop`), and no release reaches the seam. Underneath, the store's
+`UPDATE` is additionally scoped by `holder_key`
+(`crates/knowledge/src/docs/leases.rs`), so a lease id is no longer a bearer
+capability over another writer's lock even for a same-uid peer.
+
+### Verified on the wire (round 4)
+
+Driven against a live `target/debug/codypendentd` as **uid 2000** against **uid 0**'s
+resources, with the socket deliberately opened (the `0700` run directory is the
+outer wall; these are the daemon's own gates behind it):
+
+```
+PublishDocument(uid 0's real doc)  -> CommandRejected document.not-found 'no document 019ffd94-ed42-…'
+PublishDocument(absent doc)        -> CommandRejected document.not-found 'no document 099ffd94-0000-…'
+MutateDocument(real / absent)      -> document.not-found  (identical pair)
+AcquireDocumentLease(real/absent)  -> document.not-found  (identical pair)
+ReleaseDocumentLease(real lease)   -> CommandAccepted     ; lease still 'active' in the DB
+ReleaseDocumentLease(absent lease) -> CommandAccepted     (identical)
+ListUiPlugins                      -> plugin.runtime-unavailable   (= the "not enabled here" answer)
+InspectMemory                      -> memory.transport-unavailable (= the "not enabled here" answer)
+ReadBlackboard / PostBlackboardItem(repo board) -> workflow.run-not-found
+```
+
+The owner (uid 0) is unaffected on the same daemon: lease granted, board read and
+written, and `PublishDocument` parked its approval
+(`DocumentPublishRequested … git_action='write docs/owner-publish-probe.md …'`).

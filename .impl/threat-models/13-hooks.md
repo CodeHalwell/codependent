@@ -56,7 +56,12 @@ an auto-allowed read into an unapproved arbitrary-command execution. If the
 rewrite happens *after* a human approved a different action, they have stolen
 that human's approval.
 
-### 3.2 The five structural defences
+### 3.2 The structural defences
+
+Every one of these is enforced by code in `crates/sandbox/src/hook.rs` and has a
+test. Defences that depend on a dispatcher, a registration flow, or an approval
+UI are **not** here — they are in §4.2, marked as unbuilt. That separation is
+the point: this section used to mix the two.
 
 **(a) A rewrite is not an action. It is a proposal, and the type says so.**
 
@@ -112,19 +117,51 @@ Two hooks that both want to rewrite the same call produce `Deny`, not
 higher-priority hook cannot overwrite a lower one's rewrite to launder it, and
 a hostile repo hook cannot cancel a user-scoped hook's `Deny`.
 
-**(e) A hook definition is itself a policy-gated, approval-gated artifact.**
+**(e) A hook cannot claim a scope it did not arrive in.**
 
-* A repository-scoped hook is **inert on discovery**. It is registered as a
-  `RegistryItemKind::Hook` with `RegistryStatus::Draft` and never dispatched
-  until a human approves it. Approval is bound to the hook's **content hash**,
-  so editing `hook.toml` after approval revokes it (the same
-  approve-then-substitute defence as `lifecycle.rs:417-425`).
-* `mutate` is the highest-risk kind and carries `RiskClass::High`
-  unconditionally, independent of what its `[permissions]` say.
-* A hook's own execution goes through the same `SandboxExecutor` +
-  `RunPolicyGate` pair as a skill (12 §0.3). `[policy] network = "deny"` is the
-  default and the only currently-supported value, since there is no broker.
-* Hooks cannot register hooks. There is no `hook.registered` event.
+`scope` decides which trust tier a hook inherits, and it was the one
+security-relevant field parsed as a bare `String`: the 2026-08-13 review showed
+`"system"`, `"organization"`, `"not-a-real-scope"` and `""` all parsing out of a
+repository-committed file. Two things now hold, and both are needed:
+
+* `HookScope` is a **closed enum** (`user | repository | organization |
+  system`), matching `hooks.scope_kind` in migration 0027. An unknown or empty
+  value is a parse error.
+* `parse_hook(raw, discovered)` takes the scope from **whatever walked the
+  directory** and refuses a declaration that disagrees
+  (`HookError::ScopeMismatch`). Closing the set alone would still let a
+  repository file claim `scope = "user"`; re-deriving from the discovery site
+  is what makes the declaration non-authoritative. This is the rule
+  `manifest::load_package` already applies to `skill.toml`.
+
+**(f) `mutate` must declare that a human stays in the loop.**
+
+`HookSpec::is_high_risk()` returns `true` for `mutate` — derived from
+authority, never from the package's self-description. The review found it had
+**zero callers**, so it was a label. It now decides something: `parse_hook`
+refuses a `mutate` hook whose `[policy] requires_approval` is `false`. A hook
+that can rewrite what the agent does cannot also declare that nobody need see
+the result.
+
+*What this does not do:* it does not map onto `RiskClass::High`. That enum
+lives in `crates/knowledge`, which depends on `crates/sandbox` and not the
+reverse, and minting a parallel risk enum here would be the "second vocabulary
+that drifts" defect of 12 §0.2. The mapping belongs to whatever registers a
+hook — which does not exist (§6).
+
+**(g) `working_directory` placeholders are checked against a closed table.**
+
+`HOOK_PLACEHOLDERS` is `{REPOSITORY, WORKTREE, HOME}` — the same names
+`skill_exec::substitute_placeholders` resolves, with the same tokenizer rules —
+and an unknown `$NAME` is a parse error. Previously a `$NOT_A_THING` was stored
+verbatim, which is the skills defect (12 §7, 12.7(2)) repeated.
+
+*What this does not do:* it does not substitute. The values are properties of a
+run and the resolver lives in a crate that depends on this one, so the caller
+substitutes. What is enforced here is that the caller will never meet a name its
+own table lacks.
+
+**(h) Hooks cannot register hooks.** There is no `hook.registered` event.
 
 ### 3.3 What is deliberately *not* claimed
 
@@ -141,27 +178,55 @@ sanitized, and attributed. Recorded as residual, not fixed.
 
 ## 4. Denied by default
 
-1. **No hook fires without a human-approved registration** bound to its content
-   hash. Discovery ≠ activation.
-2. **`mutate` hooks are off unless the operator opts the *scope* in.** A
-   repository-scoped `mutate` hook requires approval each time its content hash
-   changes; there is no "always allow" for repository-scoped mutate.
-3. **No network**, per `[policy] network = "deny"`; any other value is a parse
-   error until a broker exists (fail closed on an unimplemented field rather
-   than accept-and-ignore it).
-4. **Unknown fields are a parse error** (`deny_unknown_fields` throughout,
+Split honestly: what the code refuses today, and what is a requirement on the
+dispatcher nobody has built. A requirement written as a mitigation is how §6
+came to describe protections that do not exist.
+
+### 4.1 Enforced now, in `crates/sandbox/src/hook.rs`, with tests
+
+1. **No network**, per `[policy] network = "deny"`. `HookNetwork` is a
+   one-variant enum, so `network = "allow"` in a hostile `hook.toml` is a parse
+   error on this binary rather than a value accepted and ignored.
+2. **Unknown fields are a parse error** (`deny_unknown_fields` throughout,
    mirroring `plugin.toml`/`skill.toml` discipline) — a future
    `[policy] escalate = true` cannot be silently ignored by an old binary.
-5. **Unknown `event` / `kind` / `failure` values are parse errors**, not
-   defaults.
-6. **Bounded fan-out**: a per-event hook count ceiling and a per-event total
-   wall-clock budget, both enforced. A directory of 10 000 hooks is refused at
-   load.
-7. **No recursion**: a hook firing on an event cannot itself cause that event to
-   be re-dispatched. The dispatcher carries a depth token; depth > 0 disables
-   dispatch entirely.
-8. **`working_directory` placeholders resolve through the same exhaustive
-   substitution table as skills**; an unresolved placeholder is an error.
+3. **Unknown `event` / `kind` / `failure` / `scope` values are parse errors**,
+   not defaults.
+4. **A declared `scope` must equal the discovered scope** — §3.2(e).
+5. **A `mutate` hook must declare `requires_approval = true`** — §3.2(f).
+6. **A `mutate` hook may only bind to `tool.pre`**, the only point at which a
+   rewrite can still be re-checked before anything happens.
+7. **`failure = "block"` is refused on a post-hoc event**, which cannot prevent
+   anything.
+8. **`timeout_seconds = 0` is refused** rather than read as "unlimited".
+9. **An unknown `working_directory` placeholder is a parse error** — §3.2(g).
+10. **Bounded fan-out**: `MAX_HOOKS_PER_EVENT = 32`, refused at load
+    (`validate_event_set`). A directory of 10 000 hooks is refused.
+11. **Total, package-independent dispatch order**: `(priority, id)`, never
+    filesystem enumeration order.
+12. **A rewrite is not a tool call** — the `Unapproved`/`Authorized` wall,
+    §3.2(a)–(d). `Unapproved` also has a hand-written `Debug` that redacts the
+    value: the derived one printed the whole rewritten call, so "no accessor
+    yields the inner `ToolCall`" had a `{:?}`-shaped hole in exactly the place
+    (`tracing`) where it would be used.
+
+### 4.2 NOT enforced — requirements on a dispatcher that does not exist
+
+Previously written here as if enforced. Each was falsified by the 2026-08-13
+review; each is now stated as work, not as a defence.
+
+| Requirement | Status |
+|---|---|
+| No hook fires without a human-approved registration bound to its content hash; discovery ≠ activation | **Not built.** Nothing discovers, registers, or approves a hook. `HookSpec::content_digest` exists and has no caller. The `hooks` table (migration 0027) is written by no code. |
+| A hook is registered as `RegistryItemKind::Hook` with `RegistryStatus::Draft` | **Not built.** The enum label has no producer. |
+| A per-event total wall-clock budget, enforced | **Deleted as a claim.** Only the count ceiling (4.1.10) exists. There is no aggregate-budget type in the crate, and adding one with no dispatcher to call it would be another unenforced mitigation. |
+| No recursion: the dispatcher carries a depth token; depth > 0 disables dispatch | **Deleted as a claim.** There is no dispatcher, so there is nothing to bound. Whoever builds it owns this. |
+| A hook's own execution goes through the same `SandboxExecutor` + `RunPolicyGate` pair as a skill | **Not built.** `HookRuntime::Command` is parsed and never run. No hook process is spawned by anything. |
+| `working_directory` placeholders *resolve* through the substitution table | **Half built.** The names are validated (4.1.9); substitution is the caller's, and there is no caller. |
+
+The fail-closed direction is the safe one — a hook that cannot fire cannot
+bypass an approval — so none of this is a live hole. It is an outcome that does
+not exist, recorded as such.
 
 ## 5. Escapes I am explicitly NOT defending against
 
@@ -178,18 +243,29 @@ sanitized, and attributed. Recorded as residual, not fixed.
 
 ## 6. Honest status of this outcome
 
-The runtime dispatch seam — where `tool.pre` / `tool.post` / `run.*` events are
-actually emitted — is in `crates/runtime/src/agent.rs`, owned by
-**agent-retrieval**. I do not edit it. Therefore:
+**A hook cannot fire. Not one of the three verbs — observe, validate, deny —
+can be exercised on a real tool call.** The 2026-08-13 review planted a hostile
+`mutate` hook at `<repo>/.codypendent/hooks/hook.toml`, booted the daemon in
+that repository, and the `hooks` table stayed empty; nothing was discovered,
+parsed, registered, approved, or run.
 
-* The parser, the registry integration, the ordering/combination lattice, the
-  `Unapproved`/`Authorized` type wall, and migration 0027 ship here **with
-  tests**.
-* The call site that emits events ships as a proposal
-  (`.impl/proposals/agent-retrieval-from-agent-wasm.md`).
+What exists, and what does not:
 
-Until that proposal lands, **no hook can fire**, which is the correct
-fail-closed state for a half-built hook engine and is exactly what the brief
-asks for over "a half-built hook engine that can bypass approvals". The engine
-is built so that wiring it up cannot introduce the escalation path, because the
-type that a rewrite produces cannot be executed without re-entering policy.
+| Piece | State |
+|---|---|
+| `hook.toml` parser + validation (§4.1) | **Ships here, tested, adversarially.** |
+| Verdict lattice (`combine`), `Deny` absorbing | **Ships here, tested.** Zero callers outside its own tests. |
+| `Unapproved`/`Authorized` type wall + `reenter` | **Ships here, tested.** `PolicyReentry` is implemented by `crates/daemon/src/policy_gate.rs`, whose adapter has zero constructor calls anywhere. |
+| Migration 0027 (`hooks`, `hook_dispatches`) | Tables created; **written by no code**. |
+| Discovery of `.codypendent/hooks/` | **Does not exist.** `grep -rn "hook\.toml"` over `crates/` finds only doc comments. |
+| Registration / approval flow | **Does not exist.** |
+| Dispatch (emitting `tool.pre` and friends) | **Does not exist.** The seam is `crates/runtime/src/agent.rs`, which this agent does not own; it ships as a proposal. |
+| Execution of a hook's `[runtime]` | **Does not exist.** |
+| A `hook` CLI command or RPC | **Does not exist.** |
+
+"No hook can fire" is the correct fail-closed state for a half-built engine, and
+it is what the brief asks for over "a half-built hook engine that can bypass
+approvals". The engine is built so that wiring it up cannot introduce the
+escalation path, because the type a rewrite produces cannot be executed without
+re-entering policy. But the outcome is **not delivered**, and this document is
+not evidence that it is.

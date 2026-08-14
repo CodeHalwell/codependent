@@ -53,7 +53,7 @@ task node → data classification & policy (hard filter: eligible providers)
 
 1. Graders consume terminal-run traces and emit the [Chapter 13](../13-observability-evaluation-learning.md) objective signals (+patch applies … −policy violation) as structured `TraceGrade` rows; execution-grounded signals only — no model-vibes grading in the core set (an optional LLM rubric grader may exist but is marked subjective and never gates alone).
 2. Failure clustering: group failed/negative-signal traces by (task class, failing signal, tool, error fingerprint) into `failure_clusters` with exemplar traces — the input queue for improvement.
-3. Every historical failure that gets fixed adds its trace to the **regression suite** (`evals/regressions/`): re-run nightly/CI (exit criterion 3 grows over time).
+3. Every historical failure that gets fixed adds its trace to the **regression suite** (`evals/tasks/regressions/`): re-run nightly/CI (exit criterion 3 grows over time).
 4. OpenTelemetry: bridge framework spans + daemon events to an optional OTLP exporter (config-gated, off by default; local-first).
 
 **TESTS** — grader unit tests per signal; clustering determinism; a fixed failure lands in the regression suite and passes.

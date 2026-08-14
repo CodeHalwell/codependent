@@ -16,6 +16,10 @@ pub mod eval;
 pub mod finetune;
 pub mod models_file;
 pub mod models_pull;
+/// The one place this crate answers "which repository is this?" (2026-08-13
+/// review §1.1): a repository's durable identity is its checkout, on both the
+/// path axis and the id axis.
+pub mod repo_anchor;
 pub mod restart;
 /// The skill-writer (outcome 4's authoring half, 2026-08-13 review F4.2):
 /// authors a validated `skill.toml` + `SKILL.md` package into the governed

@@ -146,5 +146,10 @@ if [ ! -s "$BASELINE" ] || [ "$(python3 -c "import json,sys; print(len(json.load
 fi
 
 # Again, not `exec` — the cleanup trap has to run (see above).
-python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" --baseline "$BASELINE"
+# `--corpus-dir` is what makes "the suite shrank" visible: the baseline can only
+# describe what a past run REPORTED, so a case file the runner never loaded is
+# invisible to it (a reviewer deleted 10 of 13 cases and the gate printed
+# `success rate 1.0000 (3/3) … PASSED`).
+python3 "$REPO_ROOT/evals/ci/compare_baseline.py" "$REPORT_PATH" \
+  --baseline "$BASELINE" --corpus-dir "$REPO_ROOT/evals/tasks/core"
 exit $?

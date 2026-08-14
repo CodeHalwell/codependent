@@ -1,9 +1,11 @@
 //! Rich-text data model + markdown parse/highlight for the finalized agent
 //! message (client-only; see docs/superpowers/plans/2026-07-27-rich-formatting.md).
 //! Types are semantic (a `SpanRole`, never a concrete `Color`) so the cache is
-//! theme- and width-independent; styling happens at build time in `render.rs`.
+//! theme-independent; styling happens at build time in `render.rs`. Width is
+//! the one thing it cannot defer: a table's columns are padded into the span
+//! text, so [`parse`] takes the pane width and the cache is keyed on it.
 
-/// One rendered logical line: an owned, theme- and width-independent span list.
+/// One rendered logical line: an owned, theme-independent span list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RichLine {
     pub spans: Vec<RichSpan>,
@@ -74,16 +76,28 @@ pub fn parse_calls() -> usize {
     PARSE_CALLS.get()
 }
 
-/// Parse a finalized message's raw text into semantic `RichLine`s. Theme- and
-/// width-independent; called exactly once per message on finalize (never per
-/// frame). `pulldown-cmark` is total — malformed input degrades to best-effort
-/// text, never a panic.
-pub fn parse(text: &str) -> Vec<RichLine> {
+/// Parse a finalized message's raw text into semantic `RichLine`s for a pane
+/// `width` columns wide. Theme-independent, and called once per message per
+/// width (never per frame).  `pulldown-cmark` is total — malformed input
+/// degrades to best-effort text, never a panic.
+///
+/// `width` is the FULL row width, gutter included: a table is the one block
+/// whose layout cannot be deferred to the renderer (its columns are padded into
+/// the span text), so it is the one thing the parse must be told the viewport
+/// for. It used to be laid out to a fixed 100 columns whatever the terminal
+/// was, which sheared every wide table on a narrow pane; passing the width in
+/// is what keeps the cache correct instead of merely cheap. Pass 0 when no pane
+/// has been measured yet — that means "unknown", not "zero", and falls back to
+/// [`DEFAULT_TABLE_WIDTH`].
+pub fn parse(text: &str, width: usize) -> Vec<RichLine> {
     #[cfg(test)]
     PARSE_CALLS.set(PARSE_CALLS.get() + 1);
 
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
-    let mut b = Builder::default();
+    let mut b = Builder {
+        table_width: table_budget(width),
+        ..Builder::default()
+    };
     for ev in Parser::new_ext(text, opts) {
         b.event(ev);
     }
@@ -93,8 +107,22 @@ pub fn parse(text: &str) -> Vec<RichLine> {
 /// Width of a thematic break's rule (cosmetic; the Paragraph does not stretch it).
 const RULE_WIDTH: usize = 24;
 
-/// Cap a table's total content width so a pathological table cannot blow the pane.
-const MAX_TABLE_WIDTH: usize = 100;
+/// The columns every rendered line spends on its left rail (`"▌ "` / `"  "`),
+/// which a table's own columns do not get to use.
+const GUTTER_WIDTH: usize = 2;
+
+/// The table budget used when the caller has no measured pane yet.
+const DEFAULT_TABLE_WIDTH: usize = 100;
+
+/// The content columns a table may lay itself out into, given the full row
+/// width. Never below `RULE_WIDTH`: a pane too narrow for any table still has
+/// to produce readable cells rather than a column of ellipses.
+fn table_budget(width: usize) -> usize {
+    if width == 0 {
+        return DEFAULT_TABLE_WIDTH;
+    }
+    width.saturating_sub(GUTTER_WIDTH).max(RULE_WIDTH)
+}
 
 #[derive(Default)]
 struct Builder {
@@ -115,6 +143,8 @@ struct Builder {
     // Table state, collected across the Table/TableHead/TableRow/TableCell
     // events and laid out into aligned rows by `layout_table` at `TagEnd::Table`.
     table: Option<TableState>,
+    // Content columns a table may occupy — the viewport, less the gutter.
+    table_width: usize,
 }
 
 #[derive(Default)]
@@ -353,7 +383,7 @@ impl Builder {
     /// splice each into the output via `push_line` (gutter-prefixed).
     fn emit_table(&mut self) {
         let Some(t) = self.table.take() else { return };
-        for line in layout_table(&t) {
+        for line in layout_table(&t, self.table_width) {
             self.push_line(line);
         }
     }
@@ -377,9 +407,10 @@ fn heading_num(level: HeadingLevel) -> u8 {
 
 /// Lay a collected table out into gutter-less `RichLine` bodies: a header row, a
 /// "─┼─" rule row, then one row per body line. Column widths are the max cell
-/// display width, capped so the total stays within `MAX_TABLE_WIDTH`; overlong
-/// cells are truncated with a trailing "…".
-fn layout_table(t: &TableState) -> Vec<Vec<RichSpan>> {
+/// display width, capped so the total stays within `budget` — the pane the
+/// message is being laid out for; overlong cells are truncated with a
+/// trailing "…".
+fn layout_table(t: &TableState, budget: usize) -> Vec<Vec<RichSpan>> {
     let n_cols = t.rows.iter().map(Vec::len).max().unwrap_or(0);
     if n_cols == 0 {
         return Vec::new();
@@ -393,8 +424,9 @@ fn layout_table(t: &TableState) -> Vec<Vec<RichSpan>> {
     let cell_width =
         |cell: &[RichSpan]| -> usize { UnicodeWidthStr::width(cell_text(cell).as_str()) };
 
-    // Column widths, capped so n_cols columns + " │ " joins fit MAX_TABLE_WIDTH.
-    let cap = (MAX_TABLE_WIDTH / n_cols).max(3);
+    // Column widths, capped so n_cols columns + " │ " joins fit the budget.
+    let joins = n_cols.saturating_sub(1).saturating_mul(3);
+    let cap = (budget.saturating_sub(joins) / n_cols).max(3);
     let mut widths = vec![0usize; n_cols];
     for row in &t.rows {
         for (c, cell) in row.iter().enumerate() {
@@ -578,6 +610,10 @@ fn map_kind(kind: &str) -> Option<SyntaxRole> {
 mod tests {
     use super::*;
 
+    /// The pane these tests parse for: `DEFAULT_TABLE_WIDTH` plus the gutter,
+    /// so the existing assertions measure exactly the layout they always did.
+    const TEST_WIDTH: usize = DEFAULT_TABLE_WIDTH + GUTTER_WIDTH;
+
     #[test]
     fn richline_holds_roled_spans() {
         let line = RichLine {
@@ -609,7 +645,7 @@ mod tests {
 
     #[test]
     fn heading_becomes_one_line_of_heading_role() {
-        let lines = parse("## Title");
+        let lines = parse("## Title", TEST_WIDTH);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].spans[0].role, SpanRole::Gutter);
         assert_eq!(lines[0].spans[0].text, "▌ ");
@@ -621,7 +657,7 @@ mod tests {
 
     #[test]
     fn emphasis_strong_and_inline_code_get_their_roles() {
-        let lines = parse("plain **bold** *it* `code`");
+        let lines = parse("plain **bold** *it* `code`", TEST_WIDTH);
         let roles = body_roles(&lines[0]);
         assert!(roles.contains(&SpanRole::Body));
         assert!(roles.contains(&SpanRole::Strong));
@@ -631,7 +667,7 @@ mod tests {
 
     #[test]
     fn bullet_list_item_starts_with_a_list_marker() {
-        let lines = parse("- one\n- two");
+        let lines = parse("- one\n- two", TEST_WIDTH);
         assert_eq!(lines.len(), 2);
         assert_eq!(body_roles(&lines[0])[0], SpanRole::ListMarker);
         assert_eq!(lines[0].spans[1].text, "• ");
@@ -639,7 +675,7 @@ mod tests {
 
     #[test]
     fn ordered_list_numbers_items() {
-        let lines = parse("1. a\n2. b");
+        let lines = parse("1. a\n2. b", TEST_WIDTH);
         assert_eq!(lines[0].spans[1].text, "1. ");
         assert_eq!(lines[1].spans[1].text, "2. ");
         assert_eq!(body_roles(&lines[0])[0], SpanRole::ListMarker);
@@ -647,7 +683,7 @@ mod tests {
 
     #[test]
     fn block_quote_gets_a_bar_and_quote_body() {
-        let lines = parse("> quoted");
+        let lines = parse("> quoted", TEST_WIDTH);
         assert_eq!(lines[0].spans[1].text, "▏ ");
         assert_eq!(lines[0].spans[1].role, SpanRole::Gutter);
         assert!(body_roles(&lines[0]).contains(&SpanRole::BlockQuote));
@@ -655,13 +691,13 @@ mod tests {
 
     #[test]
     fn thematic_break_is_a_rule_line() {
-        let lines = parse("---");
+        let lines = parse("---", TEST_WIDTH);
         assert!(lines[0].spans.iter().any(|s| s.role == SpanRole::Rule));
     }
 
     #[test]
     fn link_text_is_roled_and_the_url_trails() {
-        let lines = parse("[Zed](https://zed.dev)");
+        let lines = parse("[Zed](https://zed.dev)", TEST_WIDTH);
         let roles = body_roles(&lines[0]);
         assert!(roles.contains(&SpanRole::Link));
         assert!(lines[0]
@@ -672,7 +708,7 @@ mod tests {
 
     #[test]
     fn fenced_code_is_plain_for_now() {
-        let lines = parse("```\nhello\n```");
+        let lines = parse("```\nhello\n```", TEST_WIDTH);
         assert!(lines
             .iter()
             .any(|l| l.spans.iter().any(|s| s.role == SpanRole::CodePlain)));
@@ -680,7 +716,7 @@ mod tests {
 
     #[test]
     fn soft_break_splits_paragraph_into_lines() {
-        let lines = parse("a\nb");
+        let lines = parse("a\nb", TEST_WIDTH);
         assert_eq!(lines.len(), 2);
     }
 
@@ -721,7 +757,7 @@ mod tests {
 
     #[test]
     fn fenced_code_in_parse_is_now_highlighted() {
-        let lines = parse("```rust\nfn a() {}\n```");
+        let lines = parse("```rust\nfn a() {}\n```", TEST_WIDTH);
         // parse re-wraps highlight's lines with the gutter, then a CodeToken(Keyword) shows.
         let roles: Vec<SpanRole> = lines
             .iter()
@@ -734,7 +770,7 @@ mod tests {
     #[test]
     fn table_renders_aligned_header_rule_and_rows() {
         let md = "| a | bb |\n| :- | -: |\n| 1 | 2 |\n| 33 | 4 |";
-        let lines = parse(md);
+        let lines = parse(md, TEST_WIDTH);
         // header + rule + 2 body rows (each a RichLine).
         assert!(lines.len() >= 4, "got {} lines", lines.len());
         // A header cell carries the TableHeader role.
@@ -759,7 +795,7 @@ mod tests {
     #[test]
     fn table_columns_align_by_display_width_not_char_count() {
         let md = "| name | n |\n| :- | -: |\n| 日本語 | 1 |\n| ab | 2 |\n| 🚀🚀 | 3 |";
-        let lines = parse(md);
+        let lines = parse(md, TEST_WIDTH);
         let display_width = |l: &RichLine| -> usize {
             l.spans
                 .iter()
@@ -783,7 +819,7 @@ mod tests {
     fn an_overlong_wide_cell_truncates_on_a_grapheme_boundary() {
         let long = "日".repeat(80);
         let md = format!("| a |\n| :- |\n| {long} |");
-        let lines = parse(&md);
+        let lines = parse(&md, TEST_WIDTH);
         let body = lines.last().expect("a body row");
         let text: String = body.spans.iter().map(|s| s.text.as_str()).collect();
         assert!(text.contains('…'), "an overlong cell is ellipsed: {text:?}");
@@ -806,5 +842,55 @@ mod tests {
             body_width, header_width,
             "the ellipsed cell keeps its budget"
         );
+    }
+
+    /// The budget used to be a fixed 100 columns whatever the terminal was, so
+    /// any wide table sheared on a narrow pane (the renderer then wrapped the
+    /// overflow back to column 0, breaking the alignment the layout is for).
+    #[test]
+    fn a_table_is_laid_out_to_the_pane_it_was_parsed_for() {
+        let md = "| column-one-is-long | column-two-is-long | column-three-is-long | \
+column-four-is-long |\n| --- | --- | --- | --- |\n\
+| aaaaaaaaaaaaaaaaaa | bbbbbbbbbbbbbbbbbb | cccccccccccccccccccc | dddddddddddddddddd |";
+        for pane in [40usize, 70, 120] {
+            let lines = parse(md, pane);
+            for (i, line) in lines.iter().enumerate() {
+                let width: usize = line
+                    .spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+                    .sum();
+                assert!(
+                    width <= pane,
+                    "row {i} is {width} columns wide in a {pane}-column pane"
+                );
+            }
+        }
+    }
+
+    /// Narrowing must not silently drop a column: every row keeps its cells and
+    /// its alignment, just ellipsed harder.
+    #[test]
+    fn a_narrow_table_keeps_every_column_aligned() {
+        let md = "| a | bb | ccc |\n| :- | :-: | -: |\n| 1111111 | 2222222 | 3333333 |";
+        let lines = parse(md, 30);
+        let width = |l: &RichLine| -> usize {
+            l.spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.text.as_str()))
+                .sum()
+        };
+        let header = width(&lines[0]);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(width(line), header, "row {i} lost alignment when narrowed");
+            assert_eq!(
+                line.spans
+                    .iter()
+                    .filter(|s| s.text.contains('│') || s.text.contains('┼'))
+                    .count(),
+                2,
+                "row {i} lost a column separator"
+            );
+        }
     }
 }

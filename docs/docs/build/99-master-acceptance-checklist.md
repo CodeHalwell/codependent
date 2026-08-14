@@ -1,6 +1,17 @@
 # Master Acceptance Checklist
 
-The final gate. Run this after Phase 7 (or, for an interim release, after any completed phase — sections are cumulative and marked by phase). Everything here restates exit criteria and release gates already defined in the [Roadmap](../15-roadmap.md), [Testing Strategy](../16-testing-strategy.md), and phase chapters; nothing new is introduced. A release candidate ships only when every applicable box is checked.
+> [!NOTE]
+> **Status, stated plainly: this checklist has never been executed.** 0 of its
+> 34 boxes are ticked (counted 2026-08-13) and releases up to and including
+> v0.5.1 have shipped without it. It is the acceptance document for a *finished*
+> 1.0 product, not the gate any shipped release passed. What actually gates a
+> release today is the `ci` workflow (`lint`, `test`, `eval-smoke`,
+> `eval-regression`, `doc-counts`, `deny`, `extension`) plus the release
+> workflow's own gates; `ROADMAP.md`'s "Every-release hygiene" section is the
+> maintained subset of the list below. Treat an unticked box here as "not yet
+> verified", never as "verified and failing".
+
+The intended final gate. Run this after Phase 7 (or, for an interim release, after any completed phase — sections are cumulative and marked by phase). Everything here restates exit criteria and release gates already defined in the [Roadmap](../15-roadmap.md), [Testing Strategy](../16-testing-strategy.md), and phase chapters; nothing new is introduced. A release candidate ships only when every applicable box is checked.
 
 ## 1. Hygiene (every release, any phase)
 
@@ -11,14 +22,19 @@ The final gate. Run this after Phase 7 (or, for an interim release, after any co
 - [ ] CI green on the release commit; working tree clean; every migration file
       unchanged since its first commit — **already violated once, and this
       criterion cannot be checked off honestly until that is reconciled**:
-      `migrations/0017_promotion_evidence.sql` gained five columns in commit
-      `7eef118` after `ed083ed` shipped it in v0.1.1 (`git log -- migrations/
-      0017_promotion_evidence.sql`); an upgrading v0.1.1 install's
-      `sqlx::migrate` refuses to boot over the checksum mismatch. Either
-      re-baseline (accept the historical breach, document it once here, and
-      hold the line from this release forward) or ship a migration that
-      repairs it — do not check this box while pretending the violation
-      didn't happen.
+      `migrations/0003_phase2.sql` shipped as sha256 `a5c81199c24b` in the
+      published builds `v0.1.0-build.43`, `.44` and `.45`, and as
+      `a29143289fa4` in every other release including v0.5.1 (verified
+      2026-08-13 by hashing the file at each tag). An install created by one of
+      those three builds hits `sqlx::migrate`'s checksum refusal on upgrade and
+      the daemon will not start. Either re-baseline (accept the historical
+      breach, document it once here, and hold the line from this release
+      forward) or ship a migration that repairs it — do not check this box
+      while pretending the violation didn't happen.
+      *(An earlier version of this entry named `0017_promotion_evidence.sql`.
+      That was wrong: 0017 is byte-identical at `v0.1.1-build.50`, `v0.5.1` and
+      HEAD — its edit landed before the tag was cut, and there is no `v0.1.1`
+      tag at all.)*
 
 ## 2. Phase exit criteria (cumulative)
 
