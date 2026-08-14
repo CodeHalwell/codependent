@@ -665,6 +665,13 @@ fn format_source(evidence: Option<&EvidenceRef>) -> String {
             Some(path) => format!("artifact {} ({path})", artifact.id),
             None => format!("artifact {}", artifact.id),
         },
+        // The rationale is the agent's own text, so it is named as a claim
+        // ("asserted by") rather than presented as a machine-verified source.
+        Some(EvidenceRef::AgentAssertion {
+            session_id,
+            run_id,
+            rationale,
+        }) => format!("asserted by run {run_id} (session {session_id}): {rationale}"),
         None => "(no evidence)".to_string(),
     }
 }

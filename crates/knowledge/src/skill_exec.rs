@@ -8,10 +8,25 @@
 //! [`SandboxProfile`](codypendent_sandbox::SandboxProfile) and a named script or
 //! module runs confined — output captured, sanitized, and origin-labeled.
 //!
-//! # The single production entry point
+//! # The intended entry point — which nothing calls yet
 //!
-//! [`SkillRunner`] is it. It takes a [`RegistryItem`] rather than a bare path so
-//! everything the registry knows is enforced before anything executes:
+//! [`SkillRunner`] is where a skill execution is meant to enter, and every
+//! precondition below really is enforced when it does. **It has no production
+//! caller.** `SkillRunner::new`/`::enforcing` are constructed only from
+//! `crates/knowledge/tests/skill_exec_it.rs`; `RunPolicyAdapter`
+//! (`crates/daemon/src/policy_gate.rs`), the one implementation of the run-policy
+//! gate, has zero references outside the file that defines it; and there is no
+//! `skill run` command, no skill-execution RPC, and no skill-invoking tool. So
+//! **no user can run a skill**, retrieval discloses skills that can never
+//! execute, and migration 0026 records nothing.
+//!
+//! This paragraph exists because the previous one said "the single production
+//! entry point", which read as a wired-up outcome for two review rounds. Wiring
+//! it is a design decision held above this crate; do not delete this note
+//! without deleting the reason for it.
+//!
+//! It takes a [`RegistryItem`] rather than a bare path so everything the
+//! registry knows is enforced before anything executes:
 //!
 //! * the item is `Active` (a draft or deprecated skill never runs);
 //! * the item is `executable` (it actually carries a script or a module);

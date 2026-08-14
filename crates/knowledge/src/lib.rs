@@ -36,6 +36,8 @@ pub use types::{
     EvidenceRef, GitRevision, JsonSchema, LanguageId, MemoryClass, MemoryRecord, Provenance,
     RegistryDependency, RegistryItem, RegistryItemKind, RegistryStatus, RetentionPolicy, Revision,
     RiskClass, Scope, SymbolKey, ToolCard, TrustMetadata, TrustTier, UsageExample, Version,
+    AGENT_ASSERTED_CONFIDENCE, COMPILER_RESOLVED_CONFIDENCE, LSP_RESOLVED_CONFIDENCE,
+    RUNTIME_OBSERVED_CONFIDENCE, SYNTAX_CALL_CONFIDENCE,
 };
 
 pub use outbox::KnowledgeIndexEvent;
@@ -76,9 +78,11 @@ pub use adapter::{
     ParseOutput, RustAdapter, ScriptAdapter, SemanticCapability, SymbolIndex, Workspace,
 };
 pub use codegraph::{
-    changed_between, stable_repository_id, CodeGraphError, CodeGraphQueries, GraphAnswer,
-    GraphDelta, GraphHit, GraphQuestion, ParsedSymbol, SemanticEdge, SymbolDelta, SymbolSnapshot,
-    GRAPH_ANSWER_LIMIT, GRAPH_MAX_DEPTH,
+    assert_agent_edges, changed_between, language_for, rebuild_repository, stable_repository_id,
+    supported_extensions, AgentEdgeAssertion, AssertionResult, CarriedEdges, CodeGraphError,
+    CodeGraphQueries, FoldedFile, GraphAnswer, GraphDelta, GraphHit, GraphQuestion, Language,
+    ParsedSymbol, RepositoryRebuild, RetiredFiles, ScanCoverage, ScanSummary, SemanticEdge,
+    SemanticUpsertOutcome, SymbolDelta, SymbolSnapshot, GRAPH_ANSWER_LIMIT, GRAPH_MAX_DEPTH,
 };
 pub use repomap::{
     hierarchical_map, ApiSymbol, MapEvidence, MapLevel, MapNode, ModuleEntry, PackageEntry,

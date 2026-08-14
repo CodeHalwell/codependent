@@ -8,15 +8,28 @@
 //! separate because the wire protocol never inlines bulk content (Chapter 03):
 //!
 //! * **The event stream** (`approval_requested`, `executed_commands`,
-//!   `network_hosts`, `cost_usd`): [`ObservationBuilder`] reconstructs these
-//!   from `ApprovalRequested`/`ApprovalResolved`/`BudgetWarning` events as the
-//!   run streams by. Only an **approved** `ProposedAction` counts as executed
-//!   or contacted — a rejected proposal never ran. This means an action that
-//!   somehow executes *without* going through the approval flow is invisible
-//!   to this builder; every `ExecuteCommand`/`NetworkRequest` this codebase's
-//!   policy engine reaches is approval-gated (Chapter 03's "approval-gated
-//!   writes" invariant), so this is a narrow, documented gap rather than a
-//!   silent one (see the task report for the exact scope).
+//!   `approved_commands`, `network_hosts`, `cost_usd`): [`ObservationBuilder`]
+//!   reconstructs these from `ApprovalRequested`/`ApprovalResolved`/
+//!   `ToolProposed`/`ToolCompleted`/`BudgetWarning` events as the run streams
+//!   by. A rejected proposal never ran, so only an **approved**
+//!   `ProposedAction` is recorded at all. This means an action that somehow
+//!   executes *without* going through the approval flow is invisible to this
+//!   builder; every `ExecuteCommand`/`NetworkRequest` this codebase's policy
+//!   engine reaches is approval-gated (Chapter 03's "approval-gated writes"
+//!   invariant), so this is a narrow, documented gap rather than a silent one
+//!   (see the task report for the exact scope).
+//!
+//!   **Approval is not execution**, and the two directions therefore need two
+//!   sets. An approved command lands in `approved_commands`; it reaches
+//!   `executed_commands` only once [`ObservationBuilder::settle_completion`]
+//!   correlates it with a `ToolCompleted { outcome: Succeeded }` for the same
+//!   run. `command-executed` — the round's positive, evidence-of-work
+//!   assertion — reads the confirmed set, so a command that failed to start or
+//!   exited non-zero can no longer prove work was done; `command-not-executed`
+//!   and `command-denied` read the over-broad attempted set, where
+//!   over-reporting is the safe error. `network_hosts` stays the approved set
+//!   for exactly that reason: both of its readers are negative (see
+//!   [`RunObservation`]'s own field docs).
 //! * **The checked-out working tree** (`changed_files`, `existing_symbols`,
 //!   `tests_passed`): [`inspect_repository`] shells out to `git`/the fixture's
 //!   own test command *after* the run completes, comparing against the case's
@@ -74,7 +87,7 @@
 //! invariant (see `route_cases_fails_closed_when_only_a_hosted_model_is_stored`
 //! here and the `validate_pin_*` tests in `codypendentd::routing`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -85,7 +98,7 @@ use codypendent_eval::{Assertion, EvalCase, RunObservation, SuiteReport};
 use codypendent_protocol::{
     AgentMode, ApprovalDecision, ApprovalId, ApprovalScope, BudgetDimension, ClientRole,
     CommandBody, DataClassification, EventBody, ModelId, Payload, ProposedAction, RunDisposition,
-    RunId, RunState, Subscription, WorkspaceId,
+    RunId, RunState, Subscription, ToolOutcome, WorkspaceId,
 };
 use codypendent_routing::{
     classify, ModelProfile, RequiredCapabilities, Router, RoutingPolicy, TaskNode, TaskSignals,
@@ -497,11 +510,15 @@ pub async fn run_case_with_trace(
 /// [`codypendent_eval::RegressionSuite::evaluate`] needs to tell "failed"
 /// apart from "never observed".
 ///
-/// Intended for `evals/regressions/` (see that directory's own `README.md`):
-/// guard cases for historical failures that must never silently come back.
+/// Intended for `evals/tasks/regressions/` (see that directory's own
+/// `README.md`): guard cases for historical failures that must never silently
+/// come back. It sits under `evals/tasks/` — not at `evals/regressions/`, where
+/// it used to live — because [`fixture_root`] resolves a suite's bundle at
+/// `<suite_dir>/../../fixtures/`, so a suite one level shallower loaded its
+/// cases and then died looking for `<repo>/fixtures/`.
 /// No named CLI flag drives this yet — see `.impl/proposals/
 /// agent-models-from-agent-evals.md` for the follow-up wiring a `codypendent
-/// eval run --suite evals/regressions --regression` flag would need in
+/// eval run --suite evals/tasks/regressions --regression` flag would need in
 /// `commands.rs` (not owned by this crate module).
 pub async fn run_regression_suite(
     paths: &codypendent_protocol::discovery::RuntimePaths,
@@ -695,6 +712,7 @@ fn is_terminal(body: &EventBody) -> bool {
 struct ObservationBuilder {
     approval_requested: bool,
     executed_commands: Vec<String>,
+    approved_commands: Vec<String>,
     network_hosts: Vec<String>,
     denied_commands: Vec<String>,
     denied_network_hosts: Vec<String>,
@@ -703,9 +721,23 @@ struct ObservationBuilder {
     /// Whether the run reached `Completed` — see [`RunObservation::run_completed`].
     run_completed: bool,
     /// A proposed action's approval is requested, then resolved, as two
-    /// separate events correlated by `approval_id`; only a *resolved-approve*
-    /// counts as executed/contacted, so the action is held here in between.
+    /// separate events correlated by `approval_id`; a *rejected* proposal never
+    /// ran at all, so the action is held here in between and only a
+    /// resolved-approve takes it any further.
     pending: HashMap<ApprovalId, ProposedAction>,
+    /// The run each approval belongs to. `ToolProposed` is the ONLY event that
+    /// links the two — neither `ApprovalRequested` nor `ApprovalResolved`
+    /// carries a `run_id` — and it can arrive on either side of the resolution
+    /// (the runtime emits it after parking, but the broker emits both approval
+    /// events itself when a `Run`-scoped grant auto-approves), so the run is
+    /// looked up at completion time rather than assumed known earlier.
+    approval_runs: HashMap<ApprovalId, RunId>,
+    /// Approved actions still waiting for the `ToolCompleted` that says whether
+    /// they actually ran. See [`ObservationBuilder::settle_completion`] for the
+    /// correlation and why FIFO-per-run is the right key. Anything left here
+    /// when the stream ends is **dropped**: an action whose completion was
+    /// never observed has not been shown to have executed.
+    awaiting_completion: VecDeque<(ApprovalId, ProposedAction)>,
 }
 
 impl ObservationBuilder {
@@ -728,6 +760,14 @@ impl ObservationBuilder {
             _ => {}
         }
         match body {
+            // The one event that names both an approval and its run.
+            EventBody::ToolProposed {
+                run_id,
+                approval_id,
+                ..
+            } => {
+                self.approval_runs.insert(*approval_id, *run_id);
+            }
             EventBody::ApprovalRequested {
                 approval_id,
                 action,
@@ -743,9 +783,13 @@ impl ObservationBuilder {
                 if let Some(action) = self.pending.remove(approval_id) {
                     if matches!(decision, ApprovalDecision::Approve) {
                         self.record_approved(&action);
+                        self.awaiting_completion.push_back((*approval_id, action));
                     }
                 }
             }
+            EventBody::ToolCompleted {
+                run_id, outcome, ..
+            } => self.settle_completion(*run_id, outcome),
             EventBody::ToolDenied { action, .. } => self.record_denied(action),
             EventBody::BudgetWarning {
                 dimension: BudgetDimension::Cost,
@@ -760,17 +804,15 @@ impl ObservationBuilder {
         }
     }
 
-    /// Record the observable effect of an action that was actually approved —
-    /// a rejected proposal never ran, so it must never appear here.
+    /// Record what an approved action makes POSSIBLE — never what it achieved.
+    /// A rejected proposal never ran, so it must never reach here at all; an
+    /// approved one may still have failed to start, so what lands here is the
+    /// deliberately over-broad set the negative assertions read
+    /// ([`RunObservation::attempted_commands`], [`RunObservation::network_hosts`]).
     fn record_approved(&mut self, action: &ProposedAction) {
         match action {
             ProposedAction::ExecuteCommand { program, args, .. } => {
-                let mut line = program.clone();
-                for arg in args {
-                    line.push(' ');
-                    line.push_str(arg);
-                }
-                self.executed_commands.push(line);
+                self.approved_commands.push(command_line(program, args));
             }
             ProposedAction::NetworkRequest { destination } => {
                 self.network_hosts.push(destination.clone());
@@ -788,15 +830,62 @@ impl ObservationBuilder {
         }
     }
 
+    /// Record an action whose execution a **successful** `ToolCompleted`
+    /// confirmed — the only evidence `command-executed` may be scored on.
+    fn record_executed(&mut self, action: &ProposedAction) {
+        if let ProposedAction::ExecuteCommand { program, args, .. } = action {
+            self.executed_commands.push(command_line(program, args));
+        }
+    }
+
+    /// Match one `ToolCompleted` to the approved action it completes, and
+    /// promote that action into the confirmed set only when the tool reported
+    /// [`ToolOutcome::Succeeded`].
+    ///
+    /// **What ties the two together.** An approval and its completion are
+    /// separate events and neither names the other, so the key is
+    /// `(run_id, order)`: the daemon's agent loop awaits `run_tool` to
+    /// completion before dispatching the next call
+    /// (`codypendent_runtime::agent::Agent::run_tool`, driven from a sequential
+    /// `for` over the step's tool calls), so within one run at most one
+    /// approved action is ever outstanding, and every tool call ends in exactly
+    /// one `ToolCompleted` for that run. The first still-awaiting action
+    /// belonging to this run is therefore this completion's action, even when a
+    /// run makes several shell calls. `run_id` comes from `ToolProposed`; an
+    /// approval whose `ToolProposed` was never observed matches any run, which
+    /// is correct for the one-run-per-session shape `eval run` creates and is
+    /// no worse than the FIFO alone.
+    ///
+    /// A completion with nothing awaiting it is the ordinary case for a tool
+    /// that needed no approval at all (`Decision::Allow`), and for the
+    /// synthetic failure completions the runtime emits for a policy denial or a
+    /// rejected approval — neither of which ever enqueues anything. Nothing to
+    /// settle, so nothing is consumed.
+    fn settle_completion(&mut self, run_id: RunId, outcome: &ToolOutcome) {
+        let approval_runs = &self.approval_runs;
+        let Some(index) = self
+            .awaiting_completion
+            .iter()
+            .position(|(approval_id, _)| {
+                approval_runs
+                    .get(approval_id)
+                    .is_none_or(|owner| *owner == run_id)
+            })
+        else {
+            return;
+        };
+        let Some((_, action)) = self.awaiting_completion.remove(index) else {
+            return;
+        };
+        if matches!(outcome, ToolOutcome::Succeeded) {
+            self.record_executed(&action);
+        }
+    }
+
     fn record_denied(&mut self, action: &ProposedAction) {
         match action {
             ProposedAction::ExecuteCommand { program, args, .. } => {
-                let mut line = program.clone();
-                for arg in args {
-                    line.push(' ');
-                    line.push_str(arg);
-                }
-                self.denied_commands.push(line);
+                self.denied_commands.push(command_line(program, args));
             }
             ProposedAction::NetworkRequest { destination } => {
                 self.denied_network_hosts.push(destination.clone());
@@ -815,6 +904,7 @@ impl ObservationBuilder {
         RunObservation {
             approval_requested: self.approval_requested,
             executed_commands: self.executed_commands,
+            approved_commands: self.approved_commands,
             denied_commands: self.denied_commands,
             network_hosts: self.network_hosts,
             denied_network_hosts: self.denied_network_hosts,
@@ -824,6 +914,17 @@ impl ObservationBuilder {
             ..Default::default()
         }
     }
+}
+
+/// One `ExecuteCommand` as the single line every command assertion's `contains`
+/// is matched against: the program, then its arguments, space-separated.
+fn command_line(program: &str, args: &[String]) -> String {
+    let mut line = program.to_string();
+    for arg in args {
+        line.push(' ');
+        line.push_str(arg);
+    }
+    line
 }
 
 /// Fill in the repository-derived facts an event stream cannot answer:
@@ -1054,6 +1155,303 @@ async fn run_git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The `ApprovalResolved` -> `ToolCompleted` correlation: the fix for
+/// `command-executed` passing on a command that never succeeded.
+#[cfg(test)]
+mod execution_correlation_tests {
+    use super::*;
+    use codypendent_protocol::{Risk, RiskLevel};
+
+    fn shell(program: &str, arg: &str) -> ProposedAction {
+        ProposedAction::ExecuteCommand {
+            program: program.to_string(),
+            args: vec![arg.to_string()],
+            environment: Vec::new(),
+            cwd: None,
+        }
+    }
+
+    /// The event sequence a real run emits around one approved shell call, in
+    /// the runtime's own order: the broker's `ApprovalRequested`, the agent's
+    /// `ToolProposed` (the only event naming both the approval and the run),
+    /// the resolution, then the completion — see
+    /// `codypendent_runtime::agent::Agent::run_tool`.
+    fn approved_call(
+        builder: &mut ObservationBuilder,
+        run_id: RunId,
+        action: ProposedAction,
+        outcome: Option<ToolOutcome>,
+    ) {
+        let approval_id = ApprovalId::new();
+        builder.observe(&EventBody::ApprovalRequested {
+            approval_id,
+            action,
+            risk: Risk {
+                level: RiskLevel::Medium,
+                reasons: Vec::new(),
+            },
+        });
+        builder.observe(&EventBody::ToolProposed {
+            run_id,
+            approval_id,
+            action: shell("placeholder", "unused"),
+        });
+        builder.observe(&EventBody::ApprovalResolved {
+            approval_id,
+            decision: ApprovalDecision::Approve,
+        });
+        if let Some(outcome) = outcome {
+            builder.observe(&EventBody::ToolCompleted {
+                run_id,
+                tool: "shell.run".to_string(),
+                outcome,
+                artifact: None,
+            });
+        }
+    }
+
+    #[test]
+    fn a_successful_completion_promotes_the_approved_command() {
+        let mut builder = ObservationBuilder::default();
+        approved_call(
+            &mut builder,
+            RunId::new(),
+            shell("cat", "src/math.rs"),
+            Some(ToolOutcome::Succeeded),
+        );
+        let obs = builder.finish();
+        assert_eq!(obs.executed_commands, vec!["cat src/math.rs".to_string()]);
+        assert_eq!(obs.approved_commands, vec!["cat src/math.rs".to_string()]);
+    }
+
+    /// THE defect: approval is not execution. A `cat` that exited non-zero must
+    /// never satisfy `command-executed`, or the assertion added this round to
+    /// stop cases 002/005/007 passing on absence goes right back to passing
+    /// without the file ever being read.
+    #[test]
+    fn a_failed_completion_leaves_the_command_unconfirmed() {
+        let mut builder = ObservationBuilder::default();
+        approved_call(
+            &mut builder,
+            RunId::new(),
+            shell("cat", "src/math.rs"),
+            Some(ToolOutcome::Failed {
+                message: "exited 1".to_string(),
+            }),
+        );
+        let obs = builder.finish();
+        assert!(
+            obs.executed_commands.is_empty(),
+            "a non-zero exit is not an execution: {:?}",
+            obs.executed_commands
+        );
+        assert_eq!(
+            obs.approved_commands,
+            vec!["cat src/math.rs".to_string()],
+            "it was still approved, so the negative assertions must still see it"
+        );
+        assert!(!Assertion::CommandExecuted {
+            contains: "src/math.rs".to_string(),
+        }
+        .check(&obs));
+        assert!(!Assertion::CommandNotExecuted {
+            contains: "src/math.rs".to_string(),
+        }
+        .check(&obs));
+    }
+
+    /// Fail closed: a completion that never arrived (the run was cancelled
+    /// mid-tool, or the connection dropped) leaves the command unconfirmed
+    /// rather than assumed successful.
+    #[test]
+    fn an_approval_with_no_completion_at_all_fails_closed() {
+        let mut builder = ObservationBuilder::default();
+        approved_call(
+            &mut builder,
+            RunId::new(),
+            shell("cat", "src/math.rs"),
+            None,
+        );
+        let obs = builder.finish();
+        assert!(obs.executed_commands.is_empty());
+        assert_eq!(obs.approved_commands.len(), 1);
+    }
+
+    /// Several shell calls in one run: the per-run FIFO settles each completion
+    /// against the call it belongs to, so a failing first call cannot lend its
+    /// approval to a succeeding second one (or vice versa).
+    #[test]
+    fn several_calls_in_one_run_are_settled_in_order() {
+        let run_id = RunId::new();
+        let mut builder = ObservationBuilder::default();
+        approved_call(
+            &mut builder,
+            run_id,
+            shell("cat", "missing.rs"),
+            Some(ToolOutcome::Failed {
+                message: "no such file".to_string(),
+            }),
+        );
+        approved_call(
+            &mut builder,
+            run_id,
+            shell("cat", "src/math.rs"),
+            Some(ToolOutcome::Succeeded),
+        );
+        let obs = builder.finish();
+        assert_eq!(obs.executed_commands, vec!["cat src/math.rs".to_string()]);
+        assert_eq!(
+            obs.approved_commands,
+            vec!["cat missing.rs".to_string(), "cat src/math.rs".to_string()]
+        );
+    }
+
+    /// A completion belonging to a different run must not settle this run's
+    /// outstanding approval — the correlation key is the run, not "the next
+    /// completion on the wire".
+    #[test]
+    fn a_completion_from_another_run_does_not_settle_this_ones_approval() {
+        let mine = RunId::new();
+        let mut builder = ObservationBuilder::default();
+        approved_call(&mut builder, mine, shell("cat", "src/math.rs"), None);
+        builder.observe(&EventBody::ToolCompleted {
+            run_id: RunId::new(),
+            tool: "shell.run".to_string(),
+            outcome: ToolOutcome::Succeeded,
+            artifact: None,
+        });
+        assert!(builder.finish().executed_commands.is_empty());
+    }
+
+    /// A rejected proposal never reaches either set, and its own synthetic
+    /// failure completion consumes nothing.
+    #[test]
+    fn a_rejected_proposal_is_recorded_nowhere() {
+        let run_id = RunId::new();
+        let approval_id = ApprovalId::new();
+        let mut builder = ObservationBuilder::default();
+        builder.observe(&EventBody::ApprovalRequested {
+            approval_id,
+            action: shell("rm", "-rf"),
+            risk: Risk {
+                level: RiskLevel::High,
+                reasons: Vec::new(),
+            },
+        });
+        builder.observe(&EventBody::ToolProposed {
+            run_id,
+            approval_id,
+            action: shell("rm", "-rf"),
+        });
+        builder.observe(&EventBody::ApprovalResolved {
+            approval_id,
+            decision: ApprovalDecision::Reject,
+        });
+        builder.observe(&EventBody::ToolCompleted {
+            run_id,
+            tool: "shell.run".to_string(),
+            outcome: ToolOutcome::Failed {
+                message: "approval rejected".to_string(),
+            },
+            artifact: None,
+        });
+        let obs = builder.finish();
+        assert!(obs.executed_commands.is_empty());
+        assert!(obs.approved_commands.is_empty());
+        assert!(obs.approval_requested);
+    }
+
+    /// A tool the policy engine simply allowed emits `ToolStarted`/
+    /// `ToolCompleted` with no approval at all. Its completion must not consume
+    /// an unrelated outstanding approval — which sequential tool dispatch
+    /// guarantees it cannot, and this pins.
+    #[test]
+    fn an_unapproved_tools_completion_consumes_nothing() {
+        let run_id = RunId::new();
+        let mut builder = ObservationBuilder::default();
+        builder.observe(&EventBody::ToolCompleted {
+            run_id,
+            tool: "workspace.read_file".to_string(),
+            outcome: ToolOutcome::Succeeded,
+            artifact: None,
+        });
+        approved_call(
+            &mut builder,
+            run_id,
+            shell("cat", "src/math.rs"),
+            Some(ToolOutcome::Succeeded),
+        );
+        assert_eq!(
+            builder.finish().executed_commands,
+            vec!["cat src/math.rs".to_string()]
+        );
+    }
+
+    /// The auto-approval ordering: a `Run`-scoped grant makes the broker append
+    /// `ApprovalRequested` AND `ApprovalResolved` in one transaction, so
+    /// `ToolProposed` — the run link — arrives AFTER the resolution. Looking the
+    /// run up at completion time rather than at resolution time is what keeps
+    /// that shape working.
+    #[test]
+    fn an_auto_approved_call_still_correlates_when_tool_proposed_arrives_late() {
+        let run_id = RunId::new();
+        let approval_id = ApprovalId::new();
+        let mut builder = ObservationBuilder::default();
+        builder.observe(&EventBody::ApprovalRequested {
+            approval_id,
+            action: shell("cat", "src/math.rs"),
+            risk: Risk {
+                level: RiskLevel::Low,
+                reasons: Vec::new(),
+            },
+        });
+        builder.observe(&EventBody::ApprovalResolved {
+            approval_id,
+            decision: ApprovalDecision::Approve,
+        });
+        builder.observe(&EventBody::ToolProposed {
+            run_id,
+            approval_id,
+            action: shell("cat", "src/math.rs"),
+        });
+        builder.observe(&EventBody::ToolCompleted {
+            run_id,
+            tool: "shell.run".to_string(),
+            outcome: ToolOutcome::Succeeded,
+            artifact: None,
+        });
+        assert_eq!(
+            builder.finish().executed_commands,
+            vec!["cat src/math.rs".to_string()]
+        );
+    }
+
+    /// `network_hosts` is deliberately NOT narrowed the way commands were: its
+    /// only readers are negative assertions, where an over-broad set is the safe
+    /// error. An approved request whose tool then failed must still count as
+    /// contact.
+    #[test]
+    fn an_approved_network_request_counts_as_contact_even_when_the_tool_failed() {
+        let mut builder = ObservationBuilder::default();
+        approved_call(
+            &mut builder,
+            RunId::new(),
+            ProposedAction::NetworkRequest {
+                destination: "evil.example.com".to_string(),
+            },
+            Some(ToolOutcome::Failed {
+                message: "connection refused".to_string(),
+            }),
+        );
+        let obs = builder.finish();
+        assert_eq!(obs.network_hosts, vec!["evil.example.com".to_string()]);
+        assert!(!Assertion::NoForbiddenNetwork {
+            forbidden: vec!["evil.example.com".to_string()],
+        }
+        .check(&obs));
+    }
 }
 
 #[cfg(test)]

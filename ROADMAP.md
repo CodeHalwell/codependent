@@ -7,9 +7,17 @@ slices**, not isolated subsystems — each one ends with something you can run.
 
 For the full narrative and exit criteria see
 [`docs/docs/15-roadmap.md`](docs/docs/15-roadmap.md); for step-by-step build
-plans see the [End-to-End Build Guide](docs/docs/build/00-how-to-use-this-guide.md);
-the release gate is the
-[Master Acceptance Checklist](docs/docs/build/99-master-acceptance-checklist.md).
+plans see the [End-to-End Build Guide](docs/docs/build/00-how-to-use-this-guide.md).
+
+**What actually gates a release** is the `ci` workflow — `lint`, `test`,
+`eval-smoke`, `eval-regression`, `doc-counts`, `deny`, `extension` — plus the
+release workflow's own gates. That is the gate every shipped release has passed.
+The [Master Acceptance Checklist](docs/docs/build/99-master-acceptance-checklist.md)
+is the *aspirational* acceptance document for the finished product: **0 of its 34
+boxes are ticked** (counted 2026-08-13) and v0.5.1 shipped anyway, so calling it
+"the release gate" was false. It is a to-do list for reaching 1.0, and the
+"Every-release hygiene" section at the end of this file is the honest,
+maintained subset.
 
 ---
 
@@ -104,8 +112,8 @@ the release gate is the
 > `claude/roadmap-completion-w20`, PR #19): 19 tasks + the two–project-review defect
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
-> `-D warnings`, `cargo test --workspace` = **≈2771 tests as of 2026-08-13**
-<!-- doc-count:test sources="crates" expect=2771 label="workspace total" -->
+> `-D warnings`, `cargo test --workspace` = **≈2926 tests as of 2026-08-14**
+<!-- doc-count:test sources="crates" expect=2926 label="workspace total" -->
 > (a `#[test]`/`#[tokio::test]` count over every `crates/**/*.rs` file at HEAD —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with
@@ -207,7 +215,11 @@ New `codypendent-integrations` crate; protocol `ide` module + `ProposedAction::G
 - [x] **3.2** GitHub in the agent loop + `/fix-ci` — five `github.*` tools wired into the runtime (get PR, list check-runs as network reads; create-draft-PR, update-PR, check-run-summary as approval-gated `GitHubMutation`s), the client injected from the personal-mode token at daemon startup, the policy admitting `api.github.com:443` only when configured, `/fix-ci` registered as a built-in `Command` (in the Skill Studio) with a hard-coded objective template. End-to-end tested: the /fix-ci sequence (read check → test → update PR → post summary) with each write parking for a durable approval before it happens; rejected/denied writes never call GitHub. *(The declarative workflow engine that replaces the prompt-encoded sequence is Phase 5.)*
 - [x] **3.3** Webhook ingestion — `X-Hub-Signature-256` HMAC verify **before** parse; normalize → internal events; `X-GitHub-Delivery` GUID replay dedup (migration `0005`); optional loopback listener wired into `codypendentd` (default off); policy-off ⇒ no workflow trigger
 - [x] **3.4** IDE bridge + source-provenance live-path — protocol `IdeContextUpdate`/`DirtyBufferDigest`/edit-request types + `SourceProvenance`; `UpdateIdeContext` command stored as a projection (migration `0006`); the run read path labels an excerpt whose disk bytes diverge from an unsaved editor buffer `unsaved-ide-buffer` in the trace; `IdeBridge` trait; deterministic debounce
-- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery mirroring the Rust protocol, a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 214 vitest tests, 8 files (measured 2026-08-13 via `npm test` in extensions/vscode/ — needs `sdk/ui` built first, see that crate's own README fix) + typecheck + lint green; Cursor compat note
+- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery mirroring the Rust protocol, a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 217 vitest tests
+<!-- doc-count:vitest project="extensions/vscode" metric="tests" expect=217 label="VS Code vitest suite" -->
+      across 8 files
+<!-- doc-count:vitest project="extensions/vscode" metric="files" expect=8 label="VS Code vitest files" -->
+      (re-derived from a real `npm test` run in the `extension` CI job — needs `sdk/ui` built first, which `npm install` now does) + typecheck + lint green; Cursor compat note
 - [x] **3.6** Zed via ACP adapter — minimal ACP over stdio JSON-RPC (initialize/session·new/prompt/cancel + permission requests) decoupled behind an `AcpBackend`; `codypendent acp` CLI subcommand; round-trip + cancellation tests
 - [x] **3.7** Session handoff + presence — `ClientPresenceChanged` event; the server publishes presence on attach/detach; `codypendent open <session> --in <ide>` hands a session to an editor as a contributor without restarting the run
 
@@ -220,7 +232,7 @@ diverging unsaved buffer is labeled `unsaved-ide-buffer` in the trace; a replaye
 webhook (same GUID) produces no second event and a forged signature is rejected
 before parsing; a second client attaching emits a `ClientPresenceChanged` the
 first observes; the ACP handshake/prompt/cancel round-trips over stdio; the VS
-Code extension's codec/discovery/reconnect pass its 214 vitest tests. `fmt` / `clippy
+Code extension's codec/discovery/reconnect pass its vitest suite. `fmt` / `clippy
 --all-features -D warnings` / `test --workspace` green; `extensions/vscode`
 typecheck/lint/test green.
 
@@ -450,9 +462,9 @@ live client-capture paths (voice/clipboard) are the remaining wiring.
       install-disabled → smoke-test → enable → update → revoke lifecycle as a
       guarded state machine carrying each plugin's trust record; and neutralizes
       untrusted plugin/MCP output (origin label, size cap, control-sequence strip)
-      before it enters context. 154 unit tests (measured 2026-08-13: `git show HEAD:crates/sandbox/src/*.rs` summed, `#[test]`/`#[tokio::test]`; plus 11 more in `crates/sandbox/tests/`). **Surfaced to users** via
-<!-- doc-count:test sources="crates/sandbox/src" expect=155 label="sandbox unit tests" -->
-      <!-- doc-count:test sources="crates/sandbox/tests" expect=11 label="sandbox integration tests" -->
+      before it enters context. 159 unit tests (measured 2026-08-14 over `crates/sandbox/src`, `#[test]`/`#[tokio::test]`; plus 19 more in `crates/sandbox/tests/`). **Surfaced to users** via
+<!-- doc-count:test sources="crates/sandbox/src" expect=159 label="sandbox unit tests" -->
+      <!-- doc-count:test sources="crates/sandbox/tests" expect=19 label="sandbox integration tests" -->
       `codypendent plugin inspect <file>` (renders identity + the requested
       capability list + resource caps + trust posture — the "evaluate permissions"
       step) and `codypendent plugin diff <installed> <update>` (prints the
@@ -500,7 +512,12 @@ The routing and learning engines landed as two daemon-free crates, and their
 enabled, the classification hard-filter fails closed — classified data never
 reaches a hosted provider), a persisted `model_profiles` store (migration 0014) +
 a local `models bench` harness + first-use capability probes; a **`codypendent
-eval run` CLI** + a runnable fixture corpus + CI smoke; and the **persisted
+eval run` CLI** + a runnable fixture corpus + a CI gate that runs it for real
+(`eval-regression`, baseline 13/13 — and see
+[`evals/README.md`](evals/README.md)'s "What this gate can and cannot detect"
+for what it does **not** prove: with a deterministic stub model, a prompt or
+skill edit cannot move this score, so "a skill or prompt edit that lowers the
+score fails CI" is not what this gate does); and the **persisted
 promotion pipeline** (migration 0015) driven through daemon commands with the
 ADR-010 human-approval gate. The remaining slice is the **live measured paths**:
 a real routing run over the eval suite + live escalation re-drive, and real
@@ -509,11 +526,15 @@ and tested; only the live measurement is deferred).
 
 - [x] **7.1 (eval harness core)** — `codypendent-eval`'s `case` module: the
       Chapter 16 `EvalCase`/`Assertion` model (tests-pass, file changed/unchanged,
-      symbol-exists, command-not-executed, citation, no-forbidden-network,
-      approval-requested, patch-scope-limit) scored against an objective
-      `RunObservation`, with cost/duration budgets and a `SuiteReport` aggregate.
-      *Remaining:* the `codypendent eval run` CLI over the JSONL client and the
-      50–100 pinned fixture cases in `evals/tasks/`.
+      symbol-exists, command executed/not-executed, command/network denied,
+      citation, no-forbidden-network, approval-requested, patch-scope-limit)
+      scored against an objective `RunObservation`, with cost/duration budgets
+      and a `SuiteReport` aggregate. **Every shipped case must carry at least one
+      assertion that cannot hold unless the run really acted**
+      (`Assertion::requires_observed_action`, enforced over every case file by
+      `crates/eval/tests/corpus_it.rs`) — three cases were previously built
+      entirely from `file-unchanged` and passed when the harness did nothing.
+      *Remaining:* the 50–100 pinned fixture cases in `evals/tasks/` (13 ship).
 - [x] **7.2 (capability + performance profiles)** — `codypendent-routing`'s
       `ModelCapabilities` (the Chapter 09 shape) + `RequiredCapabilities` hard
       filter, and a `ModelProfile` carrying **measured** performance (reliability,
@@ -577,9 +598,9 @@ alongside this work.)
       runs; a pending approval owns the input until resolved. **`F2` (or the
       palette) toggles to a workspace layout** — Runs │ conversation │ approvals
       panes for at-a-glance state — sharing the same composer, footer, and input
-      model, so the panes are context, not a separate mode. Pure-reducer; 579 TUI
-<!-- doc-count:test sources="crates/tui/src" expect=579 label="TUI shell tests" -->
-      tests green (whole-crate count, measured 2026-08-13 — grows with every outcome the TUI vertical adds; re-derive rather than trust a fixed number here).
+      model, so the panes are context, not a separate mode. Pure-reducer; 600 TUI
+<!-- doc-count:test sources="crates/tui/src" expect=600 label="TUI shell tests" -->
+      tests green (whole-crate count, measured 2026-08-14 — grows with every outcome the TUI vertical adds; re-derive rather than trust a fixed number here).
 - [x] **Command palette** (`/`) — one searchable surface for every command, the
       command hub now that typing composes a message rather than firing single-key
       actions.
@@ -642,17 +663,24 @@ From the broader Codex comparison, sequencing notes that touch several phases:
       + a CI `deny` job; three unmaintained-transitive advisories carried as dated
       exceptions
 - [x] CI green on the release commit; working tree clean
-- [ ] Migrations unchanged since first commit — **false, verified**:
-      `git log -- migrations/0017_promotion_evidence.sql` shows two commits.
-      `ed083ed` ("release: harden Codypendent v0.1.1") introduced the file;
-      `7eef118` ("fix: address release review feedback"), after v0.1.1 had
-      already shipped, added five columns (`candidate_id`, `artifact_kind`,
-      `artifact_name`, `artifact_version`, `routing_policy`) to
-      `eval_suite_reports` and renamed its index. `migrations/README.md`'s
-      own promise ("Never edit it. Not comments, not formatting, nothing.")
-      means `sqlx::migrate` refuses to boot for anyone who installed v0.1.1
-      and later upgrades ("migration N was previously applied but has been
-      modified"). Not hypothetical: `migrations/0003_phase2.sql` has this
-      exact history too (three commits, one of them literally titled
-      "restore 0003_phase2.sql byte-identically — migrations are immutable"
-      — the project catching itself doing this once already).
+- [ ] Migrations unchanged since first commit — **false, verified against the
+      published artifacts** (2026-08-13, by downloading the file at each tag and
+      hashing it):
+
+      | Published build | `migrations/0003_phase2.sql` sha256 (first 12) |
+      |---|---|
+      | `v0.1.0-build.42` | `a29143289fa4` |
+      | `v0.1.0-build.43`, `.44`, `.45` | **`a5c81199c24b`** |
+      | `v0.1.0-build.46` … `v0.5.1`, HEAD | `a29143289fa4` |
+
+      A four-line comment clarification shipped in three real releases and was
+      then reverted, so a database created by build.43/.44/.45 cannot be opened
+      by any later release: `sqlx::migrate` refuses to boot on a changed
+      checksum ("migration N was previously applied but has been modified").
+      **Correction to an earlier version of this entry**, which named
+      `0017_promotion_evidence.sql`: that migration is byte-identical
+      (`5d5adab8ca8a`) at `v0.1.1-build.50`, at `v0.5.1` and at HEAD — its
+      mutating commit `7eef118` landed *before* the tag was cut, so 0017 was
+      never shipped mutated, and there is no `v0.1.1` tag at all (the releases
+      API returns 404). The conclusion was right; the example was wrong.
+      `migrations/README.md` names the real one correctly.

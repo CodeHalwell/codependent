@@ -429,6 +429,86 @@ pub fn builtin_tools() -> Vec<RegistryItem> {
             ],
             Vec::new(),
         ),
+        // The `graph.*` family had no registry entry at all, so the retrieval
+        // funnel ranked it on its dotted name and one line of schema text. The
+        // objective wording a model actually uses ("what breaks if I change
+        // this", "wire this route to its handler") shares almost no lexical
+        // surface with that, which is how a dispatchable family stays
+        // unadvertised — the same gap round 3 found for `docs.*`.
+        tool(
+            "graph.callers_of",
+            "List the symbols that call a function, method, or type, from the code graph.",
+            &[
+                "who calls this",
+                "what uses this function",
+                "before I change this signature",
+                "find the call sites",
+            ],
+            &[
+                "graph", "callers", "callsites", "usages", "references", "who calls",
+            ],
+            Vec::new(),
+        ),
+        tool(
+            "graph.blast_radius",
+            "List everything that transitively reaches a symbol — what breaks if it changes.",
+            &[
+                "what breaks if I change this",
+                "impact of this change",
+                "how far does this reach",
+                "is this safe to rename",
+            ],
+            &[
+                "graph",
+                "blast",
+                "radius",
+                "impact",
+                "breaks",
+                "transitive",
+                "dependents",
+            ],
+            Vec::new(),
+        ),
+        tool(
+            "graph.tests_covering",
+            "List the tests that exercise a file, by walking the code graph back from its symbols.",
+            &[
+                "which tests cover this",
+                "what tests this file",
+                "is this covered by tests",
+            ],
+            &[
+                "graph", "tests", "covering", "coverage", "exercised", "verify",
+            ],
+            Vec::new(),
+        ),
+        tool(
+            "graph.assert_edge",
+            "Record a relationship between two symbols the parser cannot see — a route handler to \
+             the service it dispatches to, a config key to the code that reads it, a test to the \
+             behaviour it covers, a migration to the model it reshapes. Recorded as an agent \
+             assertion, which never overrides what a parser or compiler resolved.",
+            &[
+                "record how these are connected",
+                "the parser cannot see this link",
+                "wire this route to its handler",
+                "note that this test covers that",
+                "teach the code graph",
+            ],
+            &[
+                "graph",
+                "edge",
+                "assert",
+                "relationship",
+                "connect",
+                "dispatch",
+                "handler",
+                "covers",
+                "config",
+                "migration",
+            ],
+            Vec::new(),
+        ),
     ]
 }
 

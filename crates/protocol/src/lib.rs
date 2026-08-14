@@ -13,6 +13,8 @@ pub mod artifact;
 pub mod blackboard;
 pub mod capabilities;
 pub mod catchup;
+/// Client-facing code-graph views (`codypendent graph {build,status,show}`).
+pub mod codegraph;
 pub mod command;
 pub mod discovery;
 pub mod document;
@@ -34,7 +36,15 @@ pub use artifact::{ArtifactRef, DataClassification};
 pub use blackboard::{board_scope_id, BlackboardItemDraft, BlackboardItemView, BlackboardScope};
 pub use capabilities::ClientCapabilities;
 pub use catchup::{Catchup, PendingApprovalProjection, SessionProjection};
-pub use command::{CanaryMetrics, Command, CommandBody, PromotionAction, UiPluginLifecycleStatus};
+pub use codegraph::{
+    CodeGraphEdgeAssertion, CodeGraphEdgeView, CodeGraphGrammar, CodeGraphLanguageCount,
+    CodeGraphNodeView, CodeGraphPage, CodeGraphQuery, CodeGraphScanReport,
+    CodeGraphSkippedExtension, CodeGraphStatusView, CodeGraphTally,
+};
+pub use command::{
+    CanaryMetrics, Command, CommandBody, DaemonStore, NamedResource, PromotionAction,
+    UiPluginLifecycleStatus,
+};
 pub use document::{
     DocumentEditLease, DocumentLeaseGrant, DocumentMutation, DocumentSync, PublishTarget,
     SuggestionInput,

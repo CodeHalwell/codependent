@@ -1453,13 +1453,7 @@ steps:
         })
         .await
         .expect("pause accepted");
-        assert!(matches!(
-            live.recv().await.expect("paused phase delivered"),
-            WorkflowEvent::RunPhaseChanged {
-                phase: WorkflowRunPhase::Paused,
-                ..
-            }
-        ));
+        next_phase(&mut live, WorkflowRunPhase::Paused).await;
 
         host.resume(ResumeWorkflowRequest {
             workflow_run_id: run_id.clone(),
@@ -1467,13 +1461,7 @@ steps:
         })
         .await
         .expect("resume accepted");
-        assert!(matches!(
-            live.recv().await.expect("running phase delivered"),
-            WorkflowEvent::RunPhaseChanged {
-                phase: WorkflowRunPhase::Running,
-                ..
-            }
-        ));
+        next_phase(&mut live, WorkflowRunPhase::Running).await;
 
         gate.notify_one();
     }
@@ -1804,6 +1792,34 @@ steps:
             }
             NodeOutcome::completed()
         }
+    }
+
+    /// Await the next `RunPhaseChanged` on a live subscription, skipping node
+    /// transitions.
+    ///
+    /// A subscriber cannot assume the phase change is the *first* thing it sees.
+    /// Node transitions are persist-before-publish (see `PublishingNodeObserver`),
+    /// so a test that reaches its starting point by polling the store can subscribe
+    /// inside the window after the row is written and before its `NodeTransitioned`
+    /// is published — and then observe that event first. Asserting on the first
+    /// delivery made this test fail on `main` at c255bec while passing on the
+    /// identical tree an hour earlier.
+    async fn next_phase(
+        live: &mut tokio::sync::broadcast::Receiver<WorkflowEvent>,
+        target: WorkflowRunPhase,
+    ) {
+        for _ in 0..16 {
+            // Every non-phase event (a `NodeTransitioned`, or a variant a newer
+            // protocol adds — `WorkflowEvent` is `#[non_exhaustive]` here) is
+            // skipped rather than asserted on.
+            if let WorkflowEvent::RunPhaseChanged { phase, .. } =
+                live.recv().await.expect("phase delivered")
+            {
+                assert_eq!(phase, target, "unexpected run phase");
+                return;
+            }
+        }
+        panic!("no RunPhaseChanged({target:?}) within 16 events");
     }
 
     /// Poll until `node_id`'s store row reaches `target`, or panic — mirrors

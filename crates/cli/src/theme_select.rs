@@ -148,30 +148,76 @@ pub fn resolve_theme(
     resolve_theme_for_depth(paths, depth, None)
 }
 
-/// Every data-only theme pack installed under `<data-dir>/themes/*.toml`, as
-/// `(id, theme)` pairs sorted by id, skipping any file that fails to parse (a
-/// broken pack must not take the picker down with it).
+/// The result of scanning `<data-dir>/themes/`: the packs that loaded, and one
+/// line per pack that did not.
+///
+/// The rejections used to be the `?` in a `filter_map`'s `.ok()?` chain — every
+/// failure mode collapsed to "absent". The 2026-08-13 review installed three
+/// packs (a wrong-case `base = "Dark"`, an invalid color, and one declaring
+/// `[permissions]`) and the picker reported `7 of 7 themes`: the operator was
+/// never told that a pack on their own disk had asked for filesystem access and
+/// been refused. A security check whose evidence is discarded is indistinguishable
+/// from no check, so the reasons now travel with the packs.
+pub struct DiscoveredThemePacks {
+    /// Loaded packs as `(id, theme)` pairs, sorted by id.
+    pub packs: Vec<(String, Theme)>,
+    /// One diagnostic per pack that was dropped, naming the file and the reason.
+    pub warnings: Vec<String>,
+}
+
+/// Every data-only theme pack installed under `<data-dir>/themes/*.toml`, plus
+/// a diagnostic for each file that could not be loaded (a broken pack must not
+/// take the picker down with it — but it must not vanish either).
 ///
 /// The TUI crate performs no I/O, so the picker's rows have to arrive already
 /// parsed — this is the seam that reads them.
 #[must_use]
-pub fn discover_theme_packs(paths: &RuntimePaths) -> Vec<(String, Theme)> {
-    let Ok(entries) = std::fs::read_dir(paths.data_dir.join("themes")) else {
-        return Vec::new();
+pub fn discover_theme_packs(paths: &RuntimePaths) -> DiscoveredThemePacks {
+    let themes_dir = paths.data_dir.join("themes");
+    let Ok(entries) = std::fs::read_dir(&themes_dir) else {
+        // No themes directory at all is the default install, not a problem.
+        return DiscoveredThemePacks {
+            packs: Vec::new(),
+            warnings: Vec::new(),
+        };
     };
-    let mut packs: Vec<(String, Theme)> = entries
+    let mut packs: Vec<(String, Theme)> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut files: Vec<std::path::PathBuf> = entries
         .flatten()
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "toml"))
-        .filter_map(|entry| {
-            let path = entry.path();
-            let id = path.file_stem()?.to_str()?.to_owned();
-            let source = std::fs::read_to_string(&path).ok()?;
-            let theme = load_theme_pack(&source).ok()?;
-            Some((id, theme))
-        })
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
         .collect();
+    // Sort the FILES, so the warning order is stable too — not just the packs.
+    files.sort();
+    for path in files {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            warnings.push(format!(
+                "theme pack {name} ignored: its name is not valid UTF-8"
+            ));
+            continue;
+        };
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                warnings.push(format!("theme pack {name} ignored: {error}"));
+                continue;
+            }
+        };
+        match load_theme_pack(&source) {
+            // `ThemePackError`'s Display already spells out each failure,
+            // including the security refusal ("theme packs must not request
+            // execution permissions, but this pack declares: …").
+            Err(error) => warnings.push(format!("theme pack {name} ignored: {error}")),
+            Ok(theme) => packs.push((id.to_owned(), theme)),
+        }
+    }
     packs.sort_by(|a, b| a.0.cmp(&b.0));
-    packs
+    DiscoveredThemePacks { packs, warnings }
 }
 
 #[cfg(test)]
@@ -371,9 +417,11 @@ network = ["evil.example.com:443"]
     fn discover_theme_packs_lists_valid_packs_and_skips_broken_ones() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());
+        let empty = discover_theme_packs(&paths);
+        assert!(empty.packs.is_empty(), "no themes dir, no packs");
         assert!(
-            discover_theme_packs(&paths).is_empty(),
-            "no themes dir, no packs"
+            empty.warnings.is_empty(),
+            "a missing themes dir is the default install, not a diagnostic"
         );
 
         let themes_dir = tmp.path().join("themes");
@@ -391,9 +439,74 @@ network = ["evil.example.com:443"]
         std::fs::write(themes_dir.join("broken.toml"), "not = [valid").unwrap();
         std::fs::write(themes_dir.join("notes.txt"), "ignored").unwrap();
 
-        let packs = discover_theme_packs(&paths);
-        let ids: Vec<&str> = packs.iter().map(|(id, _)| id.as_str()).collect();
+        let discovered = discover_theme_packs(&paths);
+        let ids: Vec<&str> = discovered.packs.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, ["apple", "zebra"], "valid packs only, sorted by id");
-        assert_eq!(packs[1].1, Theme::variant(ThemeVariant::Dark));
+        assert_eq!(discovered.packs[1].1, Theme::variant(ThemeVariant::Dark));
+    }
+
+    /// Every way a pack can be dropped must come back with a reason. The
+    /// 2026-08-13 review installed exactly these three and the picker said
+    /// `7 of 7 themes` — a wrong-case base, an invalid color, and a pack
+    /// asking for filesystem permissions, all three indistinguishable from
+    /// "not installed". The security refusal is the one that matters: an
+    /// operator has to be told that something on their disk asked for
+    /// execution capability and was denied.
+    #[test]
+    fn a_dropped_pack_reports_why_it_was_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let themes_dir = tmp.path().join("themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+
+        // Correct field, wrong case: `ThemeVariant` is kebab-case.
+        std::fs::write(
+            themes_dir.join("reviewer-good.toml"),
+            "schema_version = 1\nid = \"reviewer-good\"\nbase = \"Dark\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            themes_dir.join("reviewer-broken.toml"),
+            "schema_version = 1\nid = \"reviewer-broken\"\n[tokens]\n\"status.error\" = \"not-a-color\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            themes_dir.join("reviewer-evil.toml"),
+            "schema_version = 1\nid = \"reviewer-evil\"\n[permissions]\nfilesystem = \"all\"\n",
+        )
+        .unwrap();
+        // One good pack alongside them: a bad neighbour must not hide it.
+        std::fs::write(
+            themes_dir.join("reviewer-ok.toml"),
+            "schema_version = 1\nid = \"reviewer-ok\"\nbase = \"dark\"\n",
+        )
+        .unwrap();
+
+        let discovered = discover_theme_packs(&paths);
+        let ids: Vec<&str> = discovered.packs.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["reviewer-ok"]);
+        assert_eq!(
+            discovered.warnings.len(),
+            3,
+            "one diagnostic per dropped pack, got: {:?}",
+            discovered.warnings
+        );
+        let joined = discovered.warnings.join("\n");
+        for file in [
+            "reviewer-good.toml",
+            "reviewer-broken.toml",
+            "reviewer-evil.toml",
+        ] {
+            assert!(joined.contains(file), "{file} not named in:\n{joined}");
+        }
+        // The refusal has to say WHY, not merely that something was skipped.
+        assert!(
+            joined.contains("must not request execution permissions"),
+            "the security refusal must state its reason:\n{joined}"
+        );
+        assert!(
+            joined.contains("not-a-color"),
+            "the invalid colour must be quoted back:\n{joined}"
+        );
     }
 }

@@ -12,14 +12,21 @@
 //! on the machine, and it needs no privilege to set up — which matters, because
 //! CI runs everything as one user.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use codypendent_daemon::documents::{
+    DocumentLeaseFuture, DocumentLeaseReleaseRequest, DocumentLeaseRequest, DocumentLeaser,
+    DocumentPublisher, DocumentReleaseFuture, PublishDocumentFuture, PublishDocumentRequest,
+    PublishParked,
+};
+use codypendent_daemon::executor::{RunExecutor, RunLaunch};
 use codypendent_daemon::{db, instance, server};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
     read_envelope, write_envelope, ApprovalDecision, ApprovalId, ApprovalScope, ClientCapabilities,
-    ClientHello, ClientId, ClientRole, Command, CommandBody, CommandId, Envelope, EventBody,
-    Payload, RunId, SessionId, Subscription, PROTOCOL_V1,
+    ClientHello, ClientId, ClientRole, Command, CommandBody, CommandId, DocumentId, Envelope,
+    EventBody, Payload, RunId, SessionId, Subscription, PROTOCOL_V1,
 };
 use sqlx::SqlitePool;
 use tokio::net::UnixStream;
@@ -28,6 +35,20 @@ use tokio::task::JoinHandle;
 type ServerTask = JoinHandle<anyhow::Result<()>>;
 
 async fn start_server(tmp: &tempfile::TempDir) -> (RuntimePaths, ServerTask, SqlitePool) {
+    let (paths, task, pool, _) = start_server_with_documents(tmp).await;
+    (paths, task, pool)
+}
+
+/// Boot with the document seams **wired**, recording what reaches them.
+///
+/// The executor-less server rejects every document command
+/// `document.transport-unavailable`, which would make an ownership test
+/// vacuous — it would pass whether or not the gate exists. These tests need to
+/// see that a foreign principal's command never reaches the seam that would
+/// have parked a Git write or dropped somebody's lease.
+async fn start_server_with_documents(
+    tmp: &tempfile::TempDir,
+) -> (RuntimePaths, ServerTask, SqlitePool, RecordingDocuments) {
     let paths = RuntimePaths::from_data_dir(tmp.path().to_path_buf());
     paths.ensure_directories().expect("create directories");
     let pool = db::open_database(&paths.data_dir.join("codypendent.db"))
@@ -37,8 +58,72 @@ async fn start_server(tmp: &tempfile::TempDir) -> (RuntimePaths, ServerTask, Sql
     let seed_pool = db::open_database(&paths.data_dir.join("codypendent.db"))
         .await
         .expect("open seed pool");
-    let task = tokio::spawn(server::run(pool, paths.clone(), boot));
-    (paths, task, seed_pool)
+    let documents = RecordingDocuments::default();
+    let executor: Arc<dyn RunExecutor> = Arc::new(documents.clone());
+    let task = tokio::spawn(server::run_with_executor(
+        pool,
+        paths.clone(),
+        boot,
+        Some(executor),
+    ));
+    (paths, task, seed_pool, documents)
+}
+
+/// A [`RunExecutor`] whose document seams record every request instead of
+/// performing it — so a test can assert that a refused command reached none.
+#[derive(Clone, Default)]
+struct RecordingDocuments {
+    published: Arc<Mutex<Vec<DocumentId>>>,
+    released: Arc<Mutex<Vec<String>>>,
+}
+
+impl RunExecutor for RecordingDocuments {
+    fn spawn_run(&self, _launch: RunLaunch) {}
+
+    fn document_publisher(&self) -> Option<Arc<dyn DocumentPublisher>> {
+        Some(Arc::new(self.clone()))
+    }
+
+    fn document_leaser(&self) -> Option<Arc<dyn DocumentLeaser>> {
+        Some(Arc::new(self.clone()))
+    }
+}
+
+impl DocumentPublisher for RecordingDocuments {
+    fn publish(&self, request: PublishDocumentRequest) -> PublishDocumentFuture<'_> {
+        self.published
+            .lock()
+            .expect("published lock")
+            .push(request.document_id);
+        Box::pin(async move {
+            Ok(PublishParked {
+                approval_id: ApprovalId::new(),
+                target_description: "repository file docs/attacker-chose-this.md".to_string(),
+                changed_files: vec!["docs/attacker-chose-this.md".to_string()],
+                git_action: "write docs/attacker-chose-this.md in the working tree".to_string(),
+            })
+        })
+    }
+}
+
+impl DocumentLeaser for RecordingDocuments {
+    fn acquire(&self, _request: DocumentLeaseRequest) -> DocumentLeaseFuture<'_> {
+        Box::pin(async move {
+            Err(codypendent_protocol::CodypendentError::new(
+                "document.range-leased",
+                "not used by these tests",
+                false,
+            ))
+        })
+    }
+
+    fn release(&self, request: DocumentLeaseReleaseRequest) -> DocumentReleaseFuture<'_> {
+        self.released
+            .lock()
+            .expect("released lock")
+            .push(request.lease_id);
+        Box::pin(async move { Ok(()) })
+    }
 }
 
 async fn connect(paths: &RuntimePaths) -> UnixStream {
@@ -371,6 +456,222 @@ async fn a_refusal_is_indistinguishable_from_a_missing_session() {
     // The only difference permitted is the id the caller itself supplied.
     assert_eq!(existing.message, format!("no session {existing_id}"));
     assert_eq!(missing.message, format!("no session {missing_id}"));
+
+    task.abort();
+}
+
+/// Seed a document scoped to `session_id`, so its owner is that session's owner.
+/// (A repository- or system-scoped document belongs to the daemon's uid, which
+/// in-process IS this test's uid — the session scope is the only way to build a
+/// document this principal genuinely does not own without a second OS user.)
+async fn seed_foreign_document(pool: &SqlitePool, session_id: SessionId) -> DocumentId {
+    let document_id = DocumentId::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO documents (id, title, scope_json, scope_tier, scope_key, status, \
+         metadata_json, crdt_snapshot, links_json, citations_json, revision, created_at, updated_at) \
+         VALUES (?, 'their runbook', ?, 'session', ?, 'draft', '{}', X'', '[]', '[]', 1, ?, ?)",
+    )
+    .bind(document_id.to_string())
+    .bind(format!(r#"{{"type":"Session","id":"{session_id}"}}"#))
+    .bind(session_id.to_string())
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .expect("seed document");
+    document_id
+}
+
+/// F-19-A, the round-4 finding, reproduced and now refused. `PublishDocument`
+/// checked the role and the transport and then built the publish, so a foreign
+/// principal got the daemon to compile and durably park a Git write — against a
+/// path *it* chose — into the owning user's approval queue. Worse, the reply
+/// told it which document ids exist: a real one answered
+/// `DocumentPublishRequested`, an absent one `document.not-found`.
+#[tokio::test]
+async fn a_stranger_cannot_publish_another_principals_document() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let foreign_uid = our_uid(&tmp) + 1;
+    let (paths, task, pool, documents) = start_server_with_documents(&tmp).await;
+    let (session_id, _, _) = seed_foreign_session(&pool, foreign_uid).await;
+    let theirs = seed_foreign_document(&pool, session_id).await;
+    let never_existed = DocumentId::new();
+
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+    handshake(&mut stream, client_id).await;
+    // Publishing is Controller-only; assert the most privileged role, which must
+    // not help. (This also proves the ownership gate runs BEFORE the role gate:
+    // a Controller is exactly who would otherwise get through.)
+    let _ = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::AttachSession {
+                    session_id: SessionId::new(),
+                    last_seen_sequence: None,
+                    subscriptions: vec![],
+                    requested_role: ClientRole::Controller,
+                    repository: None,
+                },
+                "publish-role-bootstrap",
+            )),
+        ),
+    )
+    .await;
+
+    let mut replies = Vec::new();
+    for (index, document_id) in [theirs, never_existed].into_iter().enumerate() {
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::PublishDocument {
+                        document_id,
+                        target: codypendent_protocol::document::PublishTarget::RepositoryFile {
+                            path: "docs/attacker-chose-this.md".to_string(),
+                        },
+                    },
+                    &format!("publish-foreign-{index}"),
+                )),
+            ),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => replies.push((error, document_id)),
+            Payload::DocumentPublishRequested { git_action, .. } => panic!(
+                "THE REVIEW'S CONFUSED DEPUTY: a stranger parked a publish on another \
+                 principal's document: {git_action}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    // And the two refusals are the same answer: no enumeration oracle.
+    let (existing, existing_id) = &replies[0];
+    let (missing, missing_id) = &replies[1];
+    assert_eq!(existing.code, "document.not-found");
+    assert_eq!(existing.code, missing.code);
+    assert_eq!(existing.retryable, missing.retryable);
+    assert_eq!(existing.message, format!("no document {existing_id}"));
+    assert_eq!(missing.message, format!("no document {missing_id}"));
+
+    // And the publisher — wired, so this is not vacuous — was never reached, so
+    // no plan was compiled and no approval parked in the owner's rail.
+    assert!(
+        documents.published.lock().expect("published").is_empty(),
+        "the publish seam must never see another principal's document"
+    );
+    let (parked,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM approvals WHERE state = 'pending'")
+            .fetch_one(&pool)
+            .await
+            .expect("count approvals");
+    assert_eq!(parked, 1, "only the seeded approval may exist");
+
+    task.abort();
+}
+
+/// F-19-B. `ReleaseDocumentLease` acted on the caller's `lease_id` with no
+/// holder check at all, and the store's UPDATE carried no owner predicate — so
+/// a peer that learned a lease id could drop another writer's single-writer
+/// lock. The refusal has to be the SAME accepted no-op an unknown lease id
+/// already gets, or the reply itself would enumerate live leases.
+#[tokio::test]
+async fn a_stranger_cannot_release_another_principals_document_lease() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let foreign_uid = our_uid(&tmp) + 1;
+    let (paths, task, pool, documents) = start_server_with_documents(&tmp).await;
+    let (session_id, _, _) = seed_foreign_session(&pool, foreign_uid).await;
+    let document_id = seed_foreign_document(&pool, session_id).await;
+
+    let lease_id = "lease-owned-by-someone-else";
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO document_leases \
+         (id, document_id, block_id, holder_json, holder_key, state, acquired_at, expires_at) \
+         VALUES (?, ?, 'p', '{\"type\":\"Human\",\"user\":\"them\"}', 'human:them', 'active', ?, ?)",
+    )
+    .bind(lease_id)
+    .bind(document_id.to_string())
+    .bind(&now)
+    .bind((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339())
+    .execute(&pool)
+    .await
+    .expect("seed lease");
+
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+    handshake(&mut stream, client_id).await;
+    let _ = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::AttachSession {
+                    session_id: SessionId::new(),
+                    last_seen_sequence: None,
+                    subscriptions: vec![],
+                    requested_role: ClientRole::Controller,
+                    repository: None,
+                },
+                "release-role-bootstrap",
+            )),
+        ),
+    )
+    .await;
+
+    let mut replies = Vec::new();
+    for (index, id) in [lease_id, "lease-that-never-existed"]
+        .into_iter()
+        .enumerate()
+    {
+        let reply = send_recv(
+            &mut stream,
+            &Envelope::request(
+                client_id,
+                Payload::Command(command(
+                    CommandBody::ReleaseDocumentLease {
+                        lease_id: id.to_string(),
+                    },
+                    &format!("release-foreign-{index}"),
+                )),
+            ),
+        )
+        .await;
+        // Normalize away the caller's own `command_id`, which it supplied.
+        replies.push(match reply.payload {
+            Payload::CommandAccepted {
+                sequence,
+                created_run,
+                ..
+            } => format!("accepted {sequence:?} {created_run:?}"),
+            other => format!("{other:?}"),
+        });
+    }
+    assert_eq!(
+        replies[0], replies[1],
+        "a foreign lease must answer exactly as an unknown one does"
+    );
+
+    // The refusal has to be real, not merely a different reply: the release seam
+    // — wired here — was never called, so the lease is still held.
+    assert!(
+        documents.released.lock().expect("released").is_empty(),
+        "the release seam must never see a lease over another principal's document"
+    );
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM document_leases WHERE id = ?")
+        .bind(lease_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read lease");
+    assert_eq!(
+        state, "active",
+        "a stranger must not be able to break another writer's lease"
+    );
 
     task.abort();
 }

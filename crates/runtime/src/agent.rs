@@ -100,32 +100,34 @@ use crate::models::ModelRegistry;
 #[cfg(feature = "provider-openai")]
 use crate::models::{classify_provider_message, FailureClass};
 use crate::tools::{
-    council_create_action, council_result_action, council_run_action, docs_proposed_action,
-    graph_proposed_action, new_pull_request, parse_artifact_read, parse_blackboard_post,
-    parse_blackboard_query, parse_council_create, parse_council_result, parse_council_run,
-    parse_create_check_run, parse_create_draft_pull_request, parse_docs_create, parse_docs_edit,
-    parse_docs_read, parse_docs_suggest, parse_edit_file as parse_edit_file_args,
-    parse_get_pull_request, parse_list_check_runs, parse_memory_remember, parse_skills_search,
-    parse_symbol_question, parse_task_create, parse_task_list, parse_task_move, parse_task_update,
-    parse_tests_covering, parse_update_pull_request, parse_web_search, parse_workflow_create,
-    parse_workflow_query, parse_workflow_run, parse_write_file as parse_write_file_args,
-    render_check_runs, render_pull_request, render_registry_search, render_search_outcome,
-    summarize_graph_question, task_read_action, task_write_action, tool_label,
-    workflow_create_action, workflow_run_action, ApplyPatch, ApplyPatchInput, ArtifactRead,
-    ArtifactReadInput, ArtifactReader, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
-    BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CouncilCreateInput,
-    CouncilCreateTool, CouncilResultInput, CouncilResultTool, CouncilRunInput, CouncilRunTool,
-    CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
-    CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool, DocsEditInput, DocsEditTool,
-    DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool, EditFile, EditFileInput,
-    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput,
-    GraphBlastRadius, GraphCallersOf, GraphTestsCovering, ListCheckRuns, ListCheckRunsInput,
-    MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput, RegistrySearch,
-    RegistrySearchRequest, RepositoryTest, Search, SearchInput, Shell, SkillsSearch,
-    SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool,
-    TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput, UpdatePullRequestTool, WebSearch,
-    WebSearchInput, WorkflowCreateInput, WorkflowCreateTool, WorkflowQueryInput, WorkflowQueryTool,
-    WorkflowRunInput, WorkflowRunTool, WriteFile, WriteFileInput,
+    assertable_relation_names, council_create_action, council_result_action, council_run_action,
+    docs_proposed_action, graph_assert_action, graph_proposed_action, new_pull_request,
+    parse_artifact_read, parse_assert_edge, parse_blackboard_post, parse_blackboard_query,
+    parse_council_create, parse_council_result, parse_council_run, parse_create_check_run,
+    parse_create_draft_pull_request, parse_docs_create, parse_docs_edit, parse_docs_read,
+    parse_docs_suggest, parse_edit_file as parse_edit_file_args, parse_get_pull_request,
+    parse_list_check_runs, parse_memory_remember, parse_skills_search, parse_symbol_question,
+    parse_task_create, parse_task_list, parse_task_move, parse_task_update, parse_tests_covering,
+    parse_update_pull_request, parse_web_search, parse_workflow_create, parse_workflow_query,
+    parse_workflow_run, parse_write_file as parse_write_file_args, render_check_runs,
+    render_edge_assertions, render_pull_request, render_registry_search, render_search_outcome,
+    summarize_assertions, summarize_graph_question, task_read_action, task_write_action,
+    tool_label, workflow_create_action, workflow_run_action, ApplyPatch, ApplyPatchInput,
+    ArtifactRead, ArtifactReadInput, ArtifactReader, ArtifactSink, AssertedEdge,
+    BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput, BlackboardQueryTool,
+    CodeGraphAssertions, CommandRequest, CouncilCreateInput, CouncilCreateTool, CouncilResultInput,
+    CouncilResultTool, CouncilRunInput, CouncilRunTool, CreateCheckRunInput, CreateCheckRunSummary,
+    CreateDraftPullRequest, CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool,
+    DocsEditInput, DocsEditTool, DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool,
+    EdgeAssertionOutcome, EdgeAssertionRequest, EditFile, EditFileInput, EnvironmentBinding,
+    GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, GraphAssertEdge, GraphBlastRadius,
+    GraphCallersOf, GraphTestsCovering, ListCheckRuns, ListCheckRunsInput, MemoryRemember,
+    MemoryRememberInput, ReadFile, ReadFileInput, RegistrySearch, RegistrySearchRequest,
+    RepositoryTest, Search, SearchInput, Shell, SkillsSearch, SkillsSearchInput, TaskCreateInput,
+    TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool, TaskUpdateInput, TaskUpdateTool,
+    UpdatePullRequestInput, UpdatePullRequestTool, WebSearch, WebSearchInput, WorkflowCreateInput,
+    WorkflowCreateTool, WorkflowQueryInput, WorkflowQueryTool, WorkflowRunInput, WorkflowRunTool,
+    WriteFile, WriteFileInput, ASSERTABLE_RELATIONS, MAX_ASSERTED_EDGES,
 };
 use crate::workflow_control::{
     WorkflowControlChannel, WorkflowCreateRequest, WorkflowRunRequest, WorkflowRunTarget,
@@ -1104,17 +1106,22 @@ pub struct RunContext {
     /// The mode preset, mapped to a [`ModeOverlay`] for policy enforcement.
     pub mode: AgentMode,
     /// The policy **read/search root** (`$REPOSITORY`) — the tree the agent reads
-    /// and searches. It is the SAME tree as [`worktree`](Self::worktree): the agent
-    /// operates entirely within one directory, so a write and its read-back hit the
-    /// same place (read-your-writes). For an isolated run that tree is the worktree
-    /// (a checkout at HEAD living outside the repository); for a read-only run it is
-    /// the repository root. This is NOT repository *identity* — the code graph,
-    /// curated memories, and GitHub target are attributed to the run's repository by
-    /// the executor, a concern kept distinct from this policy root.
-    pub repository: PathBuf,
+    /// and searches, and NOTHING else. It is the SAME tree as
+    /// [`worktree`](Self::worktree): the agent operates entirely within one
+    /// directory, so a write and its read-back hit the same place
+    /// (read-your-writes). For an isolated run that tree is the worktree (a
+    /// checkout at HEAD living outside the repository, deleted when the run ends);
+    /// for a read-only run it is the repository root.
+    ///
+    /// Deliberately NOT named `repository`: it is a **working directory**, never
+    /// an identity. Anything that reads or writes the knowledge fabric —
+    /// documents, the code graph, the skills registry, memories, the board — must
+    /// key off [`repository_identity`](Self::repository_identity) instead, or its
+    /// rows land under a directory that no longer exists after the run.
+    pub read_root: PathBuf,
     /// The run's writable **worktree** (`$WORKTREE`) — the write root and the
     /// working directory for `shell.run`/`git.apply_patch`/`git.diff`. Equal to
-    /// [`repository`](Self::repository) so reads and writes target one tree.
+    /// [`read_root`](Self::read_root) so reads and writes target one tree.
     pub worktree: PathBuf,
     /// The GitHub repository this run targets (`owner/repo`), if GitHub is
     /// configured. The client handle lives on the runtime; this names the target.
@@ -1128,16 +1135,15 @@ pub struct RunContext {
     /// and server-built author come from here); `None` for a plain single-agent
     /// run, which is never offered them.
     pub workflow: Option<WorkflowContext>,
-    /// The run's repository **identity** — the canonical checkout the task board
-    /// and workflow history are keyed by (rubric 5 / 10), as a string so this
-    /// crate does not have to decide what a repository id is.
+    /// The run's DURABLE repository identity, exactly as the launch declared it —
+    /// a string so this crate does not have to decide what a repository id is.
     ///
-    /// Deliberately NOT [`repository`](Self::repository): that is the policy
-    /// read/search root, which for an isolated run is a throwaway worktree outside
-    /// the checkout. Cards must not scatter across per-run worktrees, so the
-    /// executor sets this from the run's launch repository. `None` (a run with no
-    /// repository) leaves the `task.*` tools unoffered.
-    pub board_repository: Option<String>,
+    /// Private on purpose: every reader goes through
+    /// [`repository_identity`](Self::repository_identity) (the identity to scope
+    /// by) or [`declared_repository`](Self::declared_repository) (the offering
+    /// gate), so no future call site can reach for a working directory by
+    /// accident. `None` means the run named no repository at all.
+    repository_identity: Option<String>,
     /// Optional channel of queued steering text, drained at safe points.
     pub steering: Option<mpsc::UnboundedReceiver<String>>,
     /// The prior conversation transcript this run is seeded with
@@ -1182,7 +1188,7 @@ impl RunContext {
         run_id: RunId,
         objective: impl Into<String>,
         mode: AgentMode,
-        repository: impl Into<PathBuf>,
+        read_root: impl Into<PathBuf>,
         worktree: impl Into<PathBuf>,
     ) -> Self {
         Self {
@@ -1190,12 +1196,12 @@ impl RunContext {
             run_id,
             objective: objective.into(),
             mode,
-            repository: repository.into(),
+            read_root: read_root.into(),
             worktree: worktree.into(),
             github_repo: None,
             ide_dirty_buffers: Vec::new(),
             workflow: None,
-            board_repository: None,
+            repository_identity: None,
             steering: None,
             prior: Vec::new(),
             mcp_advertised: None,
@@ -1218,13 +1224,50 @@ impl RunContext {
         self
     }
 
-    /// Name the run's repository **identity** — the board the `task.*` tools write
-    /// and the history `workflow.query` lists. Distinct from
-    /// [`repository`](Self::repository), which is the policy read root (a worktree
-    /// for an isolated run).
-    pub fn with_board_repository(mut self, repository: impl Into<String>) -> Self {
-        self.board_repository = Some(repository.into());
+    /// Name the run's DURABLE repository identity: the checkout the session was
+    /// opened on. Every construction site must call this — it is what the whole
+    /// knowledge fabric is keyed by, not just the board (see
+    /// [`repository_identity`](Self::repository_identity)).
+    pub fn with_repository_identity(mut self, repository: impl Into<String>) -> Self {
+        self.repository_identity = Some(repository.into());
         self
+    }
+
+    /// **THE** repository identity of this run: the durable checkout the session
+    /// was opened on. This is the ONLY thing anything scoped to a repository may
+    /// key off — documents, the code graph, the skills registry, memories, the
+    /// board, workflow history.
+    ///
+    /// It is deliberately NOT [`read_root`](Self::read_root)/
+    /// [`worktree`](Self::worktree). In the default Build mode the run executes in
+    /// a dedicated LINKED WORKTREE outside the checkout: a different path, so a
+    /// different `RepositoryId` (`git rev-parse --show-toplevel` inside a linked
+    /// worktree returns the worktree), and that worktree is DELETED when the run
+    /// ends. A row written under it is not merely misfiled, it is unreachable
+    /// from any checkout, any later run and any client, forever — and because
+    /// every one of these lookups reports a miss as an empty result ("No
+    /// documents yet.", "no results"), nothing ever reports the disagreement.
+    /// That was one silent-data-loss bug per call site: `docs.*`, `graph.*` and
+    /// `skills.search` each derived it independently.
+    ///
+    /// A run that declared no repository at all (only a context built without
+    /// one — every daemon path declares it) falls back to the read root, which is
+    /// then all the identity there is.
+    #[must_use]
+    pub fn repository_identity(&self) -> &Path {
+        self.repository_identity
+            .as_deref()
+            .map_or(self.read_root.as_path(), Path::new)
+    }
+
+    /// The identity exactly as declared, or `None` when this run named no
+    /// repository — the offering gate for the tools that are meaningless without
+    /// one (`task.*`, `council.*`, `workflow.*`): they are withheld rather than
+    /// pointed at a fallback. Anything that must SCOPE a call uses
+    /// [`repository_identity`](Self::repository_identity) instead.
+    #[must_use]
+    pub fn declared_repository(&self) -> Option<&str> {
+        self.repository_identity.as_deref()
     }
 
     /// Name the GitHub repository this run targets, enabling the `github.*`
@@ -1531,6 +1574,13 @@ pub struct FrameworkAgentRuntime {
     /// `registry`, a process-wide read seam over the daemon's own derived
     /// projection; `None` leaves the three tools unoffered.
     code_graph: Option<Arc<dyn codypendent_knowledge::CodeGraphQueries>>,
+    /// The code-graph WRITE seam `graph.assert_edge` folds agent assertions
+    /// through, if wired. Held separately from `code_graph` because it is a
+    /// separate capability, not a separate connection: an assembly may serve
+    /// graph questions without accepting agent claims about the answers, and
+    /// `None` leaves the tool unoffered exactly as an unwired read seam leaves
+    /// the queries unoffered.
+    code_graph_assertions: Option<Arc<dyn CodeGraphAssertions>>,
     /// The registry the `skills.search` tool queries (rubric 9), if wired.
     /// Process-wide (one knowledge pool), like `github`/`mcp`, so it lives on
     /// the runtime rather than the run context. `None` leaves the tool unoffered
@@ -1601,6 +1651,7 @@ impl FrameworkAgentRuntime {
             mcp_top_k: crate::models::DEFAULT_MCP_TOP_K,
             builtin_top_k: crate::models::DEFAULT_BUILTIN_TOP_K,
             code_graph: None,
+            code_graph_assertions: None,
             registry: None,
             docs: None,
             artifacts: None,
@@ -1707,6 +1758,21 @@ impl FrameworkAgentRuntime {
         self
     }
 
+    /// Bind the code-graph WRITE seam, enabling `graph.assert_edge`: the agent
+    /// lever on graph construction, for the relations a parser cannot see (a
+    /// route handler to the service it dispatches to, a config key to its
+    /// reader, a test to the behaviour it covers).
+    ///
+    /// The assembly binds it over the same pool and the same `repository_id_for`
+    /// as the read seam, so an assertion lands under the id the scan folded the
+    /// graph beneath and the next `graph.callers_of` can see it. Without it the
+    /// tool is neither offered nor advertised.
+    #[must_use]
+    pub fn with_code_graph_assertions(mut self, assertions: Arc<dyn CodeGraphAssertions>) -> Self {
+        self.code_graph_assertions = Some(assertions);
+        self
+    }
+
     /// Bind the document channel the `docs.*` tools author through (rubric #4).
     /// The assembly binds it over the knowledge fabric's `apply_mutation` seam —
     /// the same collaboration-mode gate a human client's `MutateDocument` passes
@@ -1783,18 +1849,19 @@ impl FrameworkAgentRuntime {
     /// chat agent may ask about the repository's runs. It needs a wired channel and
     /// either an ambient workflow run or a known repository identity to scope to.
     fn offers_workflow_query(&self, run: &RunContext) -> bool {
-        self.workflow_query.is_some() && (run.workflow.is_some() || run.board_repository.is_some())
+        self.workflow_query.is_some()
+            && (run.workflow.is_some() || run.declared_repository().is_some())
     }
 
     fn offers_workflow_control(&self, run: &RunContext) -> bool {
-        self.workflow_control.is_some() && run.board_repository.is_some()
+        self.workflow_control.is_some() && run.declared_repository().is_some()
     }
 
     /// Whether the `task.*` tools are offered to `run`: a wired board channel plus
     /// the run's repository identity (the board is keyed by repository, so without
     /// one there is no board to write).
     fn offers_task_board(&self, run: &RunContext) -> bool {
-        self.task_board.is_some() && run.board_repository.is_some()
+        self.task_board.is_some() && run.declared_repository().is_some()
     }
 
     /// The tool names offered to `run` — the workspace/git baseline, the `github.*`
@@ -1892,6 +1959,14 @@ impl FrameworkAgentRuntime {
                 .map(|name| (*name).to_string()),
             );
         }
+        // The agent lever on the graph. Offered on its own seam, and in every
+        // mode: it writes Codypendent's own derived knowledge, not the
+        // repository, so the read-only modes' overlays have nothing to deny —
+        // exactly the `task.*` board reasoning. A Review run that works out
+        // which service a route dispatches to should be able to write that down.
+        if self.code_graph_assertions.is_some() {
+            names.push(GraphAssertEdge::NAME.to_string());
+        }
         if self.offers_blackboard(run) {
             names.extend(
                 [BlackboardPostTool::NAME, BlackboardQueryTool::NAME]
@@ -1942,7 +2017,7 @@ impl FrameworkAgentRuntime {
                 .map(|name| (*name).to_string()),
             );
         }
-        if self.councils.is_some() && run.board_repository.is_some() {
+        if self.councils.is_some() && run.declared_repository().is_some() {
             names.extend(
                 [
                     CouncilCreateTool::NAME,
@@ -3650,7 +3725,7 @@ impl FrameworkAgentRuntime {
                 })
             }
             CouncilCreateTool::NAME
-                if self.councils.is_some() && run.board_repository.is_some() =>
+                if self.councils.is_some() && run.declared_repository().is_some() =>
             {
                 let input = parse_council_create(args)?;
                 Ok(Prepared {
@@ -3658,7 +3733,9 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::CouncilCreate(input),
                 })
             }
-            CouncilRunTool::NAME if self.councils.is_some() && run.board_repository.is_some() => {
+            CouncilRunTool::NAME
+                if self.councils.is_some() && run.declared_repository().is_some() =>
+            {
                 let input = parse_council_run(args)?;
                 Ok(Prepared {
                     action: council_run_action(&input),
@@ -3666,7 +3743,7 @@ impl FrameworkAgentRuntime {
                 })
             }
             CouncilResultTool::NAME
-                if self.councils.is_some() && run.board_repository.is_some() =>
+                if self.councils.is_some() && run.declared_repository().is_some() =>
             {
                 let input = parse_council_result(args)?;
                 Ok(Prepared {
@@ -3703,7 +3780,7 @@ impl FrameworkAgentRuntime {
                 let question = codypendent_knowledge::GraphQuestion::CallersOf { symbol };
                 Ok(Prepared {
                     action: graph_proposed_action(
-                        &run.repository,
+                        run.repository_identity(),
                         summarize_graph_question(&question),
                     ),
                     tool: PreparedTool::CodeGraph(question),
@@ -3714,7 +3791,7 @@ impl FrameworkAgentRuntime {
                 let question = codypendent_knowledge::GraphQuestion::BlastRadius { symbol, depth };
                 Ok(Prepared {
                     action: graph_proposed_action(
-                        &run.repository,
+                        run.repository_identity(),
                         summarize_graph_question(&question),
                     ),
                     tool: PreparedTool::CodeGraph(question),
@@ -3725,10 +3802,28 @@ impl FrameworkAgentRuntime {
                 let question = codypendent_knowledge::GraphQuestion::TestsCovering { path, depth };
                 Ok(Prepared {
                     action: graph_proposed_action(
-                        &run.repository,
+                        run.repository_identity(),
                         summarize_graph_question(&question),
                     ),
                     tool: PreparedTool::CodeGraph(question),
+                })
+            }
+            // The agent lever (`graph.assert_edge`). Match-guarded on the WRITE
+            // seam, so a run whose assembly wired only the read seam falls
+            // through to the unknown-tool refusal the offering already promised.
+            // The repository is server-derived from the run's DURABLE identity,
+            // never the worktree and never an argument: a model cannot redirect
+            // an assertion onto another repository's graph, and an assertion made
+            // in the default Build mode must not land under a worktree id that is
+            // deleted the moment the run ends.
+            GraphAssertEdge::NAME if self.code_graph_assertions.is_some() => {
+                let edges = parse_assert_edge(args)?;
+                Ok(Prepared {
+                    action: graph_assert_action(
+                        run.repository_identity(),
+                        summarize_assertions(&edges),
+                    ),
+                    tool: PreparedTool::CodeGraphAssert(edges),
                 })
             }
             // `artifact.read`: gated on a wired reader exactly as
@@ -4233,23 +4328,10 @@ impl FrameworkAgentRuntime {
                         query: &input.query,
                         open: input.open.as_deref(),
                         // Server-derived, never model-supplied: a search sees
-                        // exactly this run's repository scope.
-                        //
-                        // The run's repository IDENTITY, not its policy read root
-                        // (`run.repository`). In the default Build mode those
-                        // differ: the read root is a dedicated LINKED WORKTREE, and
-                        // `git rev-parse --show-toplevel` inside one returns the
-                        // worktree — so deriving the scope from it produced a
-                        // `RepositoryId` no repository-scoped skill is registered
-                        // under, and every build-mode search reported the run's own
-                        // installed skills as "not among the skills this search
-                        // disclosed" while the context manifest was advertising
-                        // their cards. The board and GitHub wiring already key off
-                        // this identity; only the registry search was missed.
-                        repository: run
-                            .board_repository
-                            .as_deref()
-                            .map_or(run.repository.as_path(), Path::new),
+                        // exactly this run's repository scope — the DURABLE
+                        // identity, never the worktree it happens to run in
+                        // (`RunContext::repository_identity` states why).
+                        repository: run.repository_identity(),
                     };
                     match registry.search(request).await {
                         Ok(outcome) => (
@@ -4279,7 +4361,11 @@ impl FrameworkAgentRuntime {
                         message: "graph.unavailable".to_string(),
                     },
                 ),
-                Some(graph) => match graph.ask(&run.repository, question).await {
+                // The graph is keyed by the checkout the scanner indexed, so the
+                // question is asked of the run's DURABLE identity — asking it of
+                // the worktree answered "no results" for every question in the
+                // default Build mode while the graph was fully populated.
+                Some(graph) => match graph.ask(run.repository_identity(), question).await {
                     Ok(answer) => (answer.render(), None, ToolOutcome::Succeeded),
                     Err(reason) => (
                         format!("code-graph query failed: {reason}"),
@@ -4290,6 +4376,7 @@ impl FrameworkAgentRuntime {
                     ),
                 },
             },
+            PreparedTool::CodeGraphAssert(edges) => self.execute_graph_assert(edges, run).await,
             PreparedTool::Mcp { server, tool, args } => match self.mcp.as_ref() {
                 None => mcp_unavailable(&format!("mcp.{server}.{tool}")),
                 Some(bridge) => match bridge.call_tool(&server, &tool, args).await {
@@ -4353,7 +4440,7 @@ impl FrameworkAgentRuntime {
             return docs_unavailable();
         };
         let author = self.docs_author(run, run_actor);
-        let repository = run.repository.to_string_lossy().into_owned();
+        let repository = run.repository_identity().to_string_lossy();
         let title = input.title.clone();
         match docs
             .create(
@@ -4388,7 +4475,7 @@ impl FrameworkAgentRuntime {
         let Some(docs) = self.docs.as_ref() else {
             return docs_unavailable();
         };
-        let repository = run.repository.to_string_lossy().into_owned();
+        let repository = run.repository_identity().to_string_lossy();
         match docs.read(input.document_id.as_deref(), &repository).await {
             Ok(rendered) => (rendered, None, ToolOutcome::Succeeded),
             Err(error) => docs_failure(&error),
@@ -4409,7 +4496,7 @@ impl FrameworkAgentRuntime {
         };
         let author = self.docs_author(run, run_actor);
         let block_id = input.block_id.clone();
-        let repository = run.repository.to_string_lossy().into_owned();
+        let repository = run.repository_identity().to_string_lossy();
         match docs
             .edit(
                 &author,
@@ -4443,7 +4530,7 @@ impl FrameworkAgentRuntime {
         };
         let author = self.docs_author(run, run_actor);
         let block_id = input.block_id.clone();
-        let repository = run.repository.to_string_lossy().into_owned();
+        let repository = run.repository_identity().to_string_lossy();
         match docs
             .suggest(
                 &author,
@@ -4579,12 +4666,82 @@ impl FrameworkAgentRuntime {
         }
     }
 
+    /// `graph.assert_edge`: fold the model's claims into the repository's code
+    /// graph — the AGENT lever on graph construction, beside the deterministic
+    /// tree-sitter one.
+    ///
+    /// Two properties this method exists to hold:
+    ///
+    /// * the subject is the run's DURABLE repository identity, taken from the run
+    ///   context and never from an argument, so an assertion lands under the id
+    ///   the scan folded the graph beneath rather than under a Build run's
+    ///   throwaway worktree;
+    /// * an edge that was NOT written is reported, per edge, with the reason. The
+    ///   engine's own answer for an endpoint that matched nothing is a *skip*,
+    ///   and a skip the model is not shown is a skip it believes was a success —
+    ///   it walks away holding a graph that does not say what it thinks it says.
+    ///   That is why the seam returns a disposition per edge rather than a count.
+    async fn execute_graph_assert(
+        &self,
+        edges: Vec<AssertedEdge>,
+        run: &RunContext,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let Some(assertions) = self.code_graph_assertions.as_ref() else {
+            return (
+                "the code graph is unavailable (no graph-assertion connection)".to_string(),
+                None,
+                ToolOutcome::Failed {
+                    message: "graph.assert.unavailable".to_string(),
+                },
+            );
+        };
+        let request = EdgeAssertionRequest {
+            repository: run.repository_identity(),
+            session_id: run.session_id,
+            run_id: run.run_id,
+            edges: &edges,
+        };
+        match assertions.assert_edges(request).await {
+            Ok(outcomes) => {
+                let rendered = render_edge_assertions(&edges, &outcomes);
+                let recorded = outcomes.iter().any(EdgeAssertionOutcome::recorded);
+                let unresolved = outcomes.iter().any(|outcome| {
+                    matches!(
+                        outcome,
+                        EdgeAssertionOutcome::Unresolved { .. }
+                            | EdgeAssertionOutcome::Ambiguous { .. }
+                    )
+                });
+                // A batch where nothing landed *because the graph already knew*
+                // is a success — the model asked a reasonable question and got a
+                // reasonable answer. A batch where nothing landed because every
+                // name was wrong is a failed call, so the trace says so and the
+                // model reads a failure rather than a shrug.
+                let outcome = if recorded || !unresolved {
+                    ToolOutcome::Succeeded
+                } else {
+                    ToolOutcome::Failed {
+                        message: "graph.assert.unresolved".to_string(),
+                    }
+                };
+                (rendered, None, outcome)
+            }
+            Err(reason) => (
+                format!("code-graph assertion failed: {reason}"),
+                None,
+                ToolOutcome::Failed {
+                    message: "graph.assert.failed".to_string(),
+                },
+            ),
+        }
+    }
+
     /// The run's board/history subject: its repository **identity**, which
     /// `offers_task_board` already proved is present. A separate accessor (rather
     /// than an `expect` at each call site) so the invariant is stated once.
     fn board_target(&self, run: &RunContext) -> Result<String, String> {
-        run.board_repository
-            .clone()
+        run.declared_repository()
+            .map(str::to_string)
             .ok_or_else(|| "this run has no repository, so it has no task board".to_string())
     }
 
@@ -4630,7 +4787,7 @@ impl FrameworkAgentRuntime {
                 Err(e) => failure(&e),
             },
             None => {
-                let Some(repository) = run.board_repository.as_deref() else {
+                let Some(repository) = run.declared_repository() else {
                     return blackboard_unavailable(WorkflowQueryTool::NAME);
                 };
                 match channel.recent_runs(repository, RECENT_WORKFLOW_RUNS).await {
@@ -4675,10 +4832,9 @@ impl FrameworkAgentRuntime {
         input: WorkflowRunInput,
         run: &RunContext,
     ) -> (String, Option<ArtifactRef>, ToolOutcome) {
-        let (Some(channel), Some(repository)) = (
-            self.workflow_control.as_ref(),
-            run.board_repository.as_deref(),
-        ) else {
+        let (Some(channel), Some(repository)) =
+            (self.workflow_control.as_ref(), run.declared_repository())
+        else {
             return workflow_control_unavailable(WorkflowRunTool::NAME);
         };
         let workflow_id = match &input.target {
@@ -4722,7 +4878,7 @@ impl FrameworkAgentRuntime {
         run: &RunContext,
     ) -> (String, Option<ArtifactRef>, ToolOutcome) {
         let (Some(channel), Some(repository)) =
-            (self.task_board.as_ref(), run.board_repository.as_deref())
+            (self.task_board.as_ref(), run.declared_repository())
         else {
             return blackboard_unavailable(TaskCreateTool::NAME);
         };
@@ -4762,7 +4918,7 @@ impl FrameworkAgentRuntime {
         run: &RunContext,
     ) -> (String, Option<ArtifactRef>, ToolOutcome) {
         let (Some(channel), Some(repository)) =
-            (self.task_board.as_ref(), run.board_repository.as_deref())
+            (self.task_board.as_ref(), run.declared_repository())
         else {
             return blackboard_unavailable(TaskUpdateTool::NAME);
         };
@@ -4802,7 +4958,7 @@ impl FrameworkAgentRuntime {
         run: &RunContext,
     ) -> (String, Option<ArtifactRef>, ToolOutcome) {
         let (Some(channel), Some(repository)) =
-            (self.task_board.as_ref(), run.board_repository.as_deref())
+            (self.task_board.as_ref(), run.declared_repository())
         else {
             return blackboard_unavailable(TaskListTool::NAME);
         };
@@ -4863,8 +5019,7 @@ impl FrameworkAgentRuntime {
         input: CouncilRunInput,
         run: &RunContext,
     ) -> (String, Option<ArtifactRef>, ToolOutcome) {
-        let (Some(service), Some(repository)) =
-            (self.councils.as_ref(), run.board_repository.as_deref())
+        let (Some(service), Some(repository)) = (self.councils.as_ref(), run.declared_repository())
         else {
             return council_unavailable(CouncilRunTool::NAME);
         };
@@ -5002,7 +5157,7 @@ impl FrameworkAgentRuntime {
 
     fn eval_ctx(&self, run: &RunContext) -> EvalContext {
         EvalContext {
-            repository: run.repository.clone(),
+            repository: run.read_root.clone(),
             worktree: run.worktree.clone(),
             mode: mode_overlay(run.mode),
         }
@@ -5112,6 +5267,10 @@ enum PreparedTool {
     /// A `graph.*` call (outcome 5): the typed question, already bounded by its
     /// parser and clamped again by the store.
     CodeGraph(codypendent_knowledge::GraphQuestion),
+    /// A `graph.assert_edge` call: the edges the model claims, already bounded
+    /// in count, endpoint length and rationale length by their parser, and each
+    /// carrying the rationale that becomes the edge's provenance.
+    CodeGraphAssert(Vec<AssertedEdge>),
     DocsCreate(DocsCreateInput),
     DocsRead(DocsReadInput),
     DocsEdit(DocsEditInput),
@@ -6063,6 +6222,13 @@ pub struct FrameworkModelDriver {
     /// via [`Self::new`]) means "unknown", which suppresses the routing-outcome
     /// writeback rather than guessing a key — see [`ModelDriver::endpoint`].
     endpoint: Option<String>,
+    /// The MEASURED blended price per 1K tokens of the model this driver serves,
+    /// when the caller knew one (outcome 20). `None` — the default — means the
+    /// price is UNMEASURED, and the usage this driver reports then keeps
+    /// `cost_micros: None`: an unmeasured price must yield an unmeasured cost,
+    /// never a fabricated free zero. Set it with
+    /// [`with_price_per_1k_usd`](Self::with_price_per_1k_usd).
+    price_per_1k_usd: Option<f64>,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -6080,7 +6246,25 @@ impl FrameworkModelDriver {
             model_id,
             context_tokens: None,
             endpoint: None,
+            price_per_1k_usd: None,
         }
+    }
+
+    /// Give this driver the routed model's MEASURED price per 1K tokens, so the
+    /// usage it reports carries a real `cost_micros` (outcome 20: per-run cost).
+    ///
+    /// Cost is applied HERE, where the tokens are measured, because this is the
+    /// only layer that sees every request of the run — the plain-run path had no
+    /// pricing step at all, so an ordinary `codypendent run` measured its tokens
+    /// honestly and then stored `cost_micros = NULL` forever. The price itself
+    /// cannot be derived here: it comes from the benched profile store behind the
+    /// daemon's routing seam (`RoutingSelection::price_per_1k_usd`), and the
+    /// catalog's published prices are display-only by construction (T1/T7). So a
+    /// caller with no routing decision passes `None` and nothing is charged.
+    #[must_use]
+    pub fn with_price_per_1k_usd(mut self, price_per_1k_usd: Option<f64>) -> Self {
+        self.price_per_1k_usd = price_per_1k_usd;
+        self
     }
 
     /// Build a driver from the registry by resolving `model_id` to a client,
@@ -6113,6 +6297,10 @@ impl FrameworkModelDriver {
             model_id,
             context_tokens,
             endpoint,
+            // The registry knows no price: `ModelConfig` carries none, and the
+            // provider catalog's cost fields are display-only (T1/T7). A caller
+            // holding a routing decision adds it with `with_price_per_1k_usd`.
+            price_per_1k_usd: None,
         })
     }
 }
@@ -6701,6 +6889,64 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path"]
             }),
         ),
+        // The agent lever. A schema entry is not decoration: a tool absent from
+        // this catalog is filtered out of `advertised_tool_definitions` and the
+        // model never learns it exists, however dispatchable it is — the exact
+        // way the `docs.*` family shipped unreachable.
+        decl(
+            GraphAssertEdge::NAME,
+            &format!(
+                "Record a relationship between two symbols that the parser CANNOT see, so the \
+                 code graph knows it too: a route handler and the service it dispatches to, a \
+                 config key and the code that reads it, a test and the behaviour it covers, a \
+                 migration and the model it reshapes. Use it when you have just worked out how \
+                 two parts of this repository are connected and the connection is not a literal \
+                 call in the source. Name both symbols the way they appear in the code \
+                 (`Router::decide`), exactly as for graph.callers_of — both must already exist \
+                 in the graph, since an assertion cannot invent a symbol. Relations: {}. Your \
+                 `rationale` is stored as the edge's provenance and is required. An assertion \
+                 never overwrites a compiler- or LSP-resolved edge.",
+                assertable_relation_names()
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "edges": {
+                        "type": "array",
+                        "maxItems": MAX_ASSERTED_EDGES,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": {
+                                    "type": "string",
+                                    "description": "The source symbol, as it appears in the code."
+                                },
+                                "to": {
+                                    "type": "string",
+                                    "description": "The target symbol, as it appears in the code."
+                                },
+                                "relation": {
+                                    "type": "string",
+                                    "enum": ASSERTABLE_RELATIONS
+                                        .iter()
+                                        .map(|(name, _)| *name)
+                                        .collect::<Vec<_>>()
+                                },
+                                "rationale": {
+                                    "type": "string",
+                                    "description":
+                                        "One sentence on how you know this relation holds \
+                                         (what you read, and where). Stored as the edge's \
+                                         provenance."
+                                }
+                            },
+                            "required": ["from", "to", "relation", "rationale"]
+                        }
+                    }
+                },
+                "required": ["edges"]
+            }),
+        ),
         // The doc-writer (rubric #4). These four were dispatchable and offered
         // from the day they shipped but had no entry here, so the intersection in
         // `advertised_tool_definitions` dropped every one of them and no agent
@@ -6987,7 +7233,7 @@ impl FrameworkModelDriver {
         // for `Say`/`Finish`, whose text already rides the step), and
         // `extra_calls` carries every function call beyond the first.
         assembled.finalize();
-        Ok(chat_response_to_step(&assembled))
+        Ok(chat_response_to_step(&assembled, self.price_per_1k_usd))
     }
 }
 
@@ -7041,9 +7287,9 @@ fn update_text_delta(update: &agent_framework_core::types::ChatResponseUpdate) -
 /// Map a fully-assembled framework
 /// [`ChatResponse`](agent_framework_core::types::ChatResponse) to the loop's
 /// [`StepOutcome`]: a function call becomes [`ModelStep::CallTool`], any other
-/// completed turn becomes [`ModelStep::Finish`] carrying its text. Usage is
-/// MEASURED tokens with an UNMEASURED cost (priced downstream), or `None` when
-/// the provider reported none — never a fabricated zero. `preface` is FIX 3
+/// completed turn becomes [`ModelStep::Finish`] carrying its text. Usage is the
+/// provider's MEASURED tokens priced at `price_per_1k_usd`, or `None` when the
+/// provider reported none — never a fabricated zero. `preface` is FIX 3
 /// (transcript-fidelity, loop-fix Task 1): a turn can carry BOTH text and a
 /// function call, and that text used to be silently dropped when the turn
 /// became a `CallTool` step (only the `Finish` arm ever read
@@ -7057,8 +7303,11 @@ fn update_text_delta(update: &agent_framework_core::types::ChatResponseUpdate) -
 /// order — so the loop executes what the model actually asked for instead of
 /// leaving it to believe N calls ran when one did.
 #[cfg(feature = "provider-openai")]
-fn chat_response_to_step(response: &agent_framework_core::types::ChatResponse) -> StepOutcome {
-    let usage = measured_usage(response.usage_details.as_ref());
+fn chat_response_to_step(
+    response: &agent_framework_core::types::ChatResponse,
+    price_per_1k_usd: Option<f64>,
+) -> StepOutcome {
+    let usage = measured_usage(response.usage_details.as_ref(), price_per_1k_usd);
 
     // Function calls in the assembled turn become tool calls, in order.
     if let Some(message) = response.messages.last() {
@@ -7121,6 +7370,7 @@ fn chat_response_to_step(response: &agent_framework_core::types::ChatResponse) -
 #[cfg_attr(not(test), allow(dead_code))]
 fn updates_to_step(
     updates: Vec<agent_framework_core::types::ChatResponseUpdate>,
+    price_per_1k_usd: Option<f64>,
     mut on_text: impl FnMut(&str),
 ) -> StepOutcome {
     use agent_framework_core::types::ChatResponse;
@@ -7133,30 +7383,55 @@ fn updates_to_step(
         assembled.absorb_update(update);
     }
     assembled.finalize();
-    chat_response_to_step(&assembled)
+    chat_response_to_step(&assembled, price_per_1k_usd)
 }
 
 /// Map the framework chat response's [`UsageDetails`](agent_framework_core::types::UsageDetails)
-/// into a [`ModelUsage`] with MEASURED token counts and an UNMEASURED cost.
+/// into a [`ModelUsage`] with MEASURED token counts, priced at the driver's rate.
 ///
 /// Tokens come straight from the provider (`input_token_count` →
 /// `prompt_tokens`, `output_token_count` → `completion_tokens`); a count the
-/// provider omitted reads `0`. **`cost_micros` is `None`**: tokens are measured
-/// here, but the monetary cost is not, because this layer has no per-token price
-/// (the routed model's price is applied in the daemon's node path). `None` in
-/// (the provider reported no usage object) ⇒ `None` out — honestly unmeasured,
-/// never a fabricated zero.
+/// provider omitted reads `0`. `None` in (the provider reported no usage object)
+/// ⇒ `None` out — honestly unmeasured, never a fabricated zero.
+///
+/// `cost_micros` is the same rule the daemon's node path applies
+/// (`workflow_exec::node_cost_micros`), moved to where the tokens are: a
+/// `Some(price)` × the request's MEASURED total tokens, and `None` — the
+/// unmeasured price of an unrouted run — leaves the cost UNMEASURED rather than
+/// charging a fabricated zero the budget would treat as satisfied spend. This is
+/// outcome 20's missing half: before it, the whole plain-run path hard-coded
+/// `None` here and per-run cost was never computed at all.
 #[cfg(feature = "provider-openai")]
 fn measured_usage(
     usage_details: Option<&agent_framework_core::types::UsageDetails>,
+    price_per_1k_usd: Option<f64>,
 ) -> Option<ModelUsage> {
-    usage_details.map(|details| ModelUsage {
-        prompt_tokens: details.input_token_count.unwrap_or(0),
-        completion_tokens: details.output_token_count.unwrap_or(0),
-        // Measured tokens, UNMEASURED cost — priced downstream where the routed
-        // model's rate is known. Never a fabricated zero.
-        cost_micros: None,
+    usage_details.map(|details| {
+        let prompt_tokens = details.input_token_count.unwrap_or(0);
+        let completion_tokens = details.output_token_count.unwrap_or(0);
+        ModelUsage {
+            prompt_tokens,
+            completion_tokens,
+            cost_micros: price_per_1k_usd.map(|price| {
+                price_to_micros(price, prompt_tokens.saturating_add(completion_tokens))
+            }),
+        }
     })
+}
+
+/// `price_per_1k_usd × total_tokens`, in micro-USD (the unit measured cost is
+/// charged in). Mirrors the daemon's `workflow_exec::price_to_micros` exactly —
+/// the two must agree or a run and its workflow node would report different
+/// money for the same tokens. A non-finite or negative price (a nonsensical
+/// profile) prices `0`; the float→int cast saturates, so a huge figure never
+/// wraps to a spuriously small debit.
+#[cfg(feature = "provider-openai")]
+fn price_to_micros(price_per_1k_usd: f64, total_tokens: u64) -> u64 {
+    if !price_per_1k_usd.is_finite() || price_per_1k_usd <= 0.0 {
+        return 0;
+    }
+    let usd = price_per_1k_usd * (total_tokens as f64) / 1000.0;
+    (usd * 1_000_000.0).round() as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -7676,28 +7951,28 @@ mod tests {
     fn framework_usage_details_map_to_measured_tokens_with_unmeasured_cost() {
         use agent_framework_core::types::UsageDetails;
         // The live driver's seam: the framework chat response's token counts map
-        // straight into `ModelUsage` tokens, and the cost stays UNMEASURED
-        // (`None`) — tokens are measured here, the price is applied downstream.
+        // straight into `ModelUsage` tokens, and with NO price the cost stays
+        // UNMEASURED (`None`) — an unmeasured price must never become a zero.
         let details = UsageDetails {
             input_token_count: Some(120),
             output_token_count: Some(34),
             total_token_count: Some(154),
             ..Default::default()
         };
-        let usage = measured_usage(Some(&details)).expect("present usage maps to Some");
+        let usage = measured_usage(Some(&details), None).expect("present usage maps to Some");
         assert_eq!(usage.prompt_tokens, 120, "input tokens are measured");
         assert_eq!(usage.completion_tokens, 34, "output tokens are measured");
         assert_eq!(
             usage.cost_micros, None,
-            "cost is UNMEASURED at the driver — never a fabricated zero"
+            "no price ⇒ cost UNMEASURED — never a fabricated zero"
         );
 
         // A response with NO usage object is honestly unmeasured (`None`), never a
         // fabricated zero — behaving exactly as before usage was surfaced.
         assert_eq!(
-            measured_usage(None),
+            measured_usage(None, Some(3.0)),
             None,
-            "no provider usage ⇒ unmeasured, not a zero"
+            "no provider usage ⇒ unmeasured, not a zero — even with a price"
         );
 
         // A partial usage object still reports the tokens it has; a missing count
@@ -7706,10 +7981,39 @@ mod tests {
             output_token_count: Some(9),
             ..Default::default()
         };
-        let usage = measured_usage(Some(&partial)).unwrap();
+        let usage = measured_usage(Some(&partial), None).unwrap();
         assert_eq!(usage.prompt_tokens, 0);
         assert_eq!(usage.completion_tokens, 9);
         assert_eq!(usage.cost_micros, None);
+    }
+
+    /// Outcome 20: with a MEASURED price the driver prices its own MEASURED
+    /// tokens, so an ordinary `codypendent run` gets a `cost_micros` instead of
+    /// the hard-coded `None` this seam used to return for every run. The arithmetic
+    /// is the daemon's `node_cost_micros` rule, so a run and a workflow node report
+    /// the same money for the same tokens.
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn a_measured_price_turns_measured_tokens_into_a_measured_cost() {
+        use agent_framework_core::types::UsageDetails;
+        let details = UsageDetails {
+            input_token_count: Some(1_000),
+            output_token_count: Some(500),
+            total_token_count: Some(1_500),
+            ..Default::default()
+        };
+
+        // 1,500 tokens at $0.006 / 1K = $0.009 = 9,000 micro-USD.
+        let usage = measured_usage(Some(&details), Some(0.006)).expect("usage is present");
+        assert_eq!(usage.cost_micros, Some(9_000), "priced measured tokens");
+
+        // A free LOCAL model is a genuine measured zero, distinct from `None`.
+        let free = measured_usage(Some(&details), Some(0.0)).expect("usage is present");
+        assert_eq!(free.cost_micros, Some(0));
+
+        // A nonsensical price never wraps into a spuriously small (or huge) debit.
+        let absurd = measured_usage(Some(&details), Some(f64::NAN)).expect("usage is present");
+        assert_eq!(absurd.cost_micros, Some(0));
     }
 
     #[cfg(feature = "provider-openai")]
@@ -8036,7 +8340,7 @@ context_tokens = 1000000
             repo.path(),
             repo.path(),
         )
-        .with_board_repository("/repo");
+        .with_repository_identity("/repo");
 
         // The tools are advertised to this run — a chat agent can reach them.
         let advertised: Vec<String> = runtime
@@ -8252,6 +8556,345 @@ context_tokens = 1000000
         }
     }
 
+    /// The same advertisement half, for the agent lever: `graph.assert_edge` must
+    /// reach the model's tool array on an objective about how two parts of a
+    /// repository are connected — not merely be dispatchable if the model
+    /// somehow guesses the name.
+    ///
+    /// The retrieval gate is left at its DEFAULT here, deliberately. Turning it
+    /// off would prove only that the catalog has an entry (which the structural
+    /// guard already covers) and would say nothing about the funnel, which is
+    /// where `docs.*` was actually lost: it had a catalog entry from the day it
+    /// shipped and was still never shown.
+    #[test]
+    fn the_edge_assertion_tool_is_advertised_when_the_write_seam_is_wired() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let objective = "work out which service the /charge route dispatches to and record \
+                         that connection on the code graph";
+
+        // Without the write seam: neither offered nor advertised, even though the
+        // READ seam is wired. The two are separate capabilities.
+        let read_only = runtime.with_code_graph(Arc::new(RecordingCodeGraph::default()));
+        let mut bare = RunContext::new(
+            session_id,
+            RunId::new(),
+            objective,
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        bare.tools_advertised = read_only.select_builtin_tools(&bare);
+        assert!(
+            !read_only
+                .offered_tool_names(&bare)
+                .iter()
+                .any(|name| name == GraphAssertEdge::NAME),
+            "no write seam → the assertion tool is not offered"
+        );
+        assert!(
+            !read_only
+                .advertised_tool_definitions(&bare)
+                .iter()
+                .any(|def| def.name == GraphAssertEdge::NAME),
+            "no write seam → the assertion tool is not advertised"
+        );
+
+        let wired =
+            read_only.with_code_graph_assertions(Arc::new(RecordingCodeGraphAssertions::default()));
+        let mut run = RunContext::new(
+            session_id,
+            RunId::new(),
+            objective,
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        run.tools_advertised = wired.select_builtin_tools(&run);
+        let advertised: Vec<String> = wired
+            .advertised_tool_definitions(&run)
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        assert!(
+            advertised.iter().any(|name| name == GraphAssertEdge::NAME),
+            "the model must be SHOWN the assertion tool for a graph objective: {advertised:?}"
+        );
+
+        // …and the schema it is shown must actually describe the call, not just
+        // carry the name: a model handed `{}` for parameters cannot fill it in.
+        let definition = wired
+            .advertised_tool_definitions(&run)
+            .into_iter()
+            .find(|def| def.name == GraphAssertEdge::NAME)
+            .expect("advertised");
+        let items = &definition.parameters["properties"]["edges"]["items"];
+        assert_eq!(
+            items["required"],
+            json!(["from", "to", "relation", "rationale"]),
+            "the rationale is part of the advertised contract, not an afterthought"
+        );
+        let relations = items["properties"]["relation"]["enum"]
+            .as_array()
+            .expect("the assertable relations are enumerated for the model");
+        assert!(relations.iter().any(|value| value == "calls"));
+        assert!(
+            !relations.iter().any(|value| value == "contains"),
+            "the structural relations the parser owns are not offered: {relations:?}"
+        );
+    }
+
+    /// A [`DocsChannel`] that records the repository key every call was scoped
+    /// by — the assertion surface for the repository-identity invariant.
+    #[derive(Default)]
+    struct RecordingDocsChannel {
+        seen: Mutex<Vec<(&'static str, String)>>,
+    }
+
+    impl RecordingDocsChannel {
+        fn record(&self, method: &'static str, repository: &str) {
+            self.seen
+                .lock()
+                .expect("stub lock")
+                .push((method, repository.to_string()));
+        }
+    }
+
+    #[async_trait]
+    impl DocsChannel for RecordingDocsChannel {
+        async fn create(
+            &self,
+            _author: &DocsAuthor,
+            _request: DocsCreate,
+            repository: &str,
+        ) -> Result<String, DocsChannelError> {
+            self.record("create", repository);
+            Ok("doc-1".to_string())
+        }
+        async fn read(
+            &self,
+            _document_id: Option<&str>,
+            repository: &str,
+        ) -> Result<String, DocsChannelError> {
+            self.record("read", repository);
+            Ok(String::new())
+        }
+        async fn edit(
+            &self,
+            _author: &DocsAuthor,
+            repository: &str,
+            _request: DocsEdit,
+        ) -> Result<DocsWriteEffect, DocsChannelError> {
+            self.record("edit", repository);
+            Ok(DocsWriteEffect::Applied { revision: 1 })
+        }
+        async fn suggest(
+            &self,
+            _author: &DocsAuthor,
+            repository: &str,
+            _request: DocsSuggest,
+        ) -> Result<DocsWriteEffect, DocsChannelError> {
+            self.record("suggest", repository);
+            Ok(DocsWriteEffect::Suggested {
+                suggestion_id: "s-1".to_string(),
+            })
+        }
+    }
+
+    /// A code-graph seam that records the repository root each question was
+    /// asked of, and answers emptily (what it answers is irrelevant here).
+    #[derive(Default)]
+    struct RecordingCodeGraph {
+        seen: Mutex<Vec<PathBuf>>,
+    }
+
+    #[async_trait]
+    impl codypendent_knowledge::CodeGraphQueries for RecordingCodeGraph {
+        async fn ask(
+            &self,
+            repository_root: &Path,
+            question: codypendent_knowledge::GraphQuestion,
+        ) -> Result<codypendent_knowledge::GraphAnswer, String> {
+            self.seen
+                .lock()
+                .expect("stub lock")
+                .push(repository_root.to_path_buf());
+            Ok(codypendent_knowledge::GraphAnswer {
+                question: summarize_graph_question(&question),
+                targets: Vec::new(),
+                candidates: Vec::new(),
+                hits: Vec::new(),
+                total: 0,
+            })
+        }
+    }
+
+    /// A code-graph WRITE seam that records the repository root each assertion
+    /// batch was scoped by, and applies everything.
+    #[derive(Default)]
+    struct RecordingCodeGraphAssertions {
+        seen: Mutex<Vec<PathBuf>>,
+    }
+
+    #[async_trait]
+    impl CodeGraphAssertions for RecordingCodeGraphAssertions {
+        async fn assert_edges(
+            &self,
+            request: EdgeAssertionRequest<'_>,
+        ) -> Result<Vec<EdgeAssertionOutcome>, String> {
+            self.seen
+                .lock()
+                .expect("stub lock")
+                .push(request.repository.to_path_buf());
+            Ok(request
+                .edges
+                .iter()
+                .map(|_| EdgeAssertionOutcome::Applied)
+                .collect())
+        }
+    }
+
+    /// THE repository-identity invariant (r4 review §1.1): a run has exactly one
+    /// durable repository identity — the checkout the session was opened on — and
+    /// every knowledge-scoped call is keyed by it, never by the throwaway worktree
+    /// the run is executing in.
+    ///
+    /// This is the whole class in one test, because fixing it per-symptom is what
+    /// failed three times: in the default Build mode the read root is a linked
+    /// worktree with a DIFFERENT `RepositoryId`, deleted when the run ends, so a
+    /// document written under it is unreachable forever and every graph question
+    /// answers "no results" — and both are reported as an empty list, never as an
+    /// error. Add a knowledge-fabric tool, add it here.
+    #[tokio::test]
+    async fn every_knowledge_scoped_tool_is_keyed_by_the_repository_identity() {
+        let checkout = tempfile::tempdir().expect("tempdir");
+        let worktree = tempfile::tempdir().expect("tempdir");
+
+        let docs = Arc::new(RecordingDocsChannel::default());
+        let graph = Arc::new(RecordingCodeGraph::default());
+        let assertions = Arc::new(RecordingCodeGraphAssertions::default());
+        let registry = Arc::new(StubRegistry {
+            seen: Mutex::new(Vec::new()),
+        });
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_docs(docs.clone())
+            .with_code_graph(graph.clone())
+            .with_code_graph_assertions(assertions.clone())
+            .with_registry_search(registry.clone());
+
+        // A default Build run: it READS AND WRITES in the worktree, and its
+        // identity is the checkout the session was opened on.
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "document the charge path and find its callers",
+            AgentMode::Build,
+            worktree.path(),
+            worktree.path(),
+        )
+        .with_repository_identity(checkout.path().to_string_lossy().into_owned());
+        let run_actor = Actor::Agent {
+            agent_id: AgentId::new(),
+            run_id: run.run_id,
+            model: ModelId("test-model".to_string()),
+        };
+
+        for (tool, args) in [
+            (DocsCreateTool::NAME, json!({"title": "Charge path"})),
+            (DocsReadTool::NAME, json!({})),
+            (
+                DocsEditTool::NAME,
+                json!({"document_id": "doc-1", "block_id": "b1", "text": "x"}),
+            ),
+            (
+                DocsSuggestTool::NAME,
+                json!({"document_id": "doc-1", "block_id": "b1",
+                       "range_start": 0, "range_end": 1, "replacement": "y"}),
+            ),
+            (GraphCallersOf::NAME, json!({"symbol": "charge"})),
+            (GraphTestsCovering::NAME, json!({"path": "src/charge.rs"})),
+            (
+                GraphAssertEdge::NAME,
+                json!({"edges": [{"from": "charge", "to": "ChargeService",
+                                  "relation": "calls", "rationale": "the route table dispatches it"}]}),
+            ),
+            (SkillsSearch::NAME, json!({"query": "charge path"})),
+        ] {
+            let prepared = runtime
+                .prepare(tool, &args, &run)
+                .await
+                .unwrap_or_else(|e| panic!("{tool} prepares: {e}"));
+            // The TRACE must name the same repository the query is answered
+            // against, or the ledger disagrees with the store.
+            if let ProposedAction::CodeGraphQuery { repository, .. }
+            | ProposedAction::CodeGraphAssert { repository, .. } = &prepared.action
+            {
+                assert_eq!(
+                    Path::new(repository),
+                    checkout.path(),
+                    "{tool}'s recorded action names the identity, not the worktree"
+                );
+            }
+            let (_, _, outcome) = runtime.execute_prepared(prepared, &run, &run_actor).await;
+            assert!(
+                matches!(outcome, ToolOutcome::Succeeded),
+                "{tool} succeeded"
+            );
+        }
+
+        let scoped_by: Vec<String> = docs
+            .seen
+            .lock()
+            .expect("stub lock")
+            .iter()
+            .map(|(method, repository)| format!("docs.{method}={repository}"))
+            .chain(
+                graph
+                    .seen
+                    .lock()
+                    .expect("stub lock")
+                    .iter()
+                    .map(|root| format!("graph={}", root.display())),
+            )
+            .chain(
+                assertions
+                    .seen
+                    .lock()
+                    .expect("stub lock")
+                    .iter()
+                    .map(|root| format!("graph.assert_edge={}", root.display())),
+            )
+            .chain(
+                registry
+                    .seen
+                    .lock()
+                    .expect("stub lock")
+                    .iter()
+                    .map(|(_, _, root)| format!("skills.search={}", root.display())),
+            )
+            .collect();
+
+        assert_eq!(
+            scoped_by.len(),
+            8,
+            "every one of the eight calls reached its seam: {scoped_by:?}"
+        );
+        let identity = checkout.path().display().to_string();
+        let orphan = worktree.path().display().to_string();
+        for entry in &scoped_by {
+            let (_, scope) = entry.split_once('=').expect("recorded as key=value");
+            assert_eq!(
+                scope, identity,
+                "scoped by the run's repository identity: {scoped_by:?}"
+            );
+            assert_ne!(
+                scope, orphan,
+                "never by the worktree, which is deleted when the run ends: {scoped_by:?}"
+            );
+        }
+    }
+
     /// The structural guard that makes F4.1's class of bug a build failure: every
     /// name a run can be OFFERED must have a schema in the catalog. A tool added
     /// to `offered_tool_names` and to `prepare` but not to
@@ -8270,6 +8913,8 @@ context_tokens = 1000000
                 result: Ok(stub_outcome("x")),
             }))
             .with_task_board(Arc::new(RecordingTaskBoard::default()))
+            .with_code_graph(Arc::new(RecordingCodeGraph::default()))
+            .with_code_graph_assertions(Arc::new(RecordingCodeGraphAssertions::default()))
             .with_builtin_top_k(0);
         let repo = tempfile::tempdir().expect("tempdir");
         let run = RunContext::new(
@@ -8280,7 +8925,7 @@ context_tokens = 1000000
             repo.path(),
             repo.path(),
         )
-        .with_board_repository("/repo");
+        .with_repository_identity("/repo");
 
         let catalog: Vec<String> = static_tool_definitions()
             .into_iter()
@@ -8317,7 +8962,7 @@ context_tokens = 1000000
                 repo.path(),
                 repo.path(),
             )
-            .with_board_repository("/repo");
+            .with_repository_identity("/repo");
             run.tools_advertised = runtime.select_builtin_tools(&run);
             let mut names: Vec<String> = runtime
                 .advertised_tool_definitions(&run)
@@ -8337,7 +8982,7 @@ context_tokens = 1000000
                 repo.path(),
                 repo.path(),
             )
-            .with_board_repository("/repo");
+            .with_repository_identity("/repo");
             runtime.offered_tool_names(&run).len()
         };
 
@@ -8395,7 +9040,7 @@ context_tokens = 1000000
             repo.path(),
             repo.path(),
         )
-        .with_board_repository("/repo");
+        .with_repository_identity("/repo");
         let selected = runtime
             .select_builtin_tools(&run)
             .expect("the offered set is large enough to narrow");
@@ -8436,7 +9081,7 @@ context_tokens = 1000000
             repo.path(),
             repo.path(),
         )
-        .with_board_repository("/repo");
+        .with_repository_identity("/repo");
         run.tools_advertised = runtime.select_builtin_tools(&run);
 
         let advertised: Vec<String> = runtime
@@ -11935,7 +12580,7 @@ context_tokens = 1000000
             usage,
             preface,
             extra_calls,
-        } = updates_to_step(updates, |c| chunks.push(c.to_string()));
+        } = updates_to_step(updates, None, |c| chunks.push(c.to_string()));
 
         assert_eq!(chunks, vec!["Hel".to_string(), "lo".to_string()]);
         assert!(extra_calls.is_empty(), "a text turn carries no tool calls");
@@ -11968,7 +12613,7 @@ context_tokens = 1000000
             usage,
             preface,
             ..
-        } = updates_to_step(updates, |c| chunks.push(c.to_string()));
+        } = updates_to_step(updates, None, |c| chunks.push(c.to_string()));
 
         assert_eq!(chunks, vec!["hi".to_string()]);
         assert!(matches!(step, ModelStep::Finish { .. }));
@@ -12008,7 +12653,7 @@ context_tokens = 1000000
             ..ChatResponse::default()
         };
 
-        let outcome = chat_response_to_step(&response);
+        let outcome = chat_response_to_step(&response, None);
         assert!(
             matches!(&outcome.step, ModelStep::CallTool { tool, .. } if tool == "workspace.read_file"),
             "expected a CallTool step, got {:?}",
@@ -12045,7 +12690,7 @@ context_tokens = 1000000
             ..ChatResponse::default()
         };
 
-        let outcome = chat_response_to_step(&response);
+        let outcome = chat_response_to_step(&response, None);
         assert_eq!(outcome.preface, None);
         assert!(outcome.extra_calls.is_empty());
     }
@@ -12083,7 +12728,7 @@ context_tokens = 1000000
             ..ChatResponse::default()
         };
 
-        let outcome = chat_response_to_step(&response);
+        let outcome = chat_response_to_step(&response, None);
         match &outcome.step {
             ModelStep::CallTool { tool, args } => {
                 assert_eq!(tool, "workspace.read_file");

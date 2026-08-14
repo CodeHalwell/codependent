@@ -679,8 +679,253 @@ pub enum CommandBody {
         /// The stored occurrence's data classification.
         sensitivity: DataClassification,
     },
+    /// Fold the repository's code graph **now**, on demand, and report what the
+    /// fold saw (`codypendent graph build`).
+    ///
+    /// Before this command the graph was built only as a side effect of opening
+    /// a session or starting a run; there was no way to ask for it, and no way
+    /// to find out why it was empty. `index rebuild` rebuilds the *retrieval*
+    /// indexes and explicitly does not touch the graph, which read to users as
+    /// though it did.
+    ///
+    /// Handled at the connection level like `ReadBlackboard` — the code graph
+    /// lives outside the session ledger — through the assembly's code-graph
+    /// seam. Gated to the [`Controller`](crate::handshake::ClientRole::Controller)
+    /// role: a build clears and rewrites the repository's whole graph, which is
+    /// a write, so an Observer may read the graph but never rebuild it.
+    ///
+    /// `repository` is a **path**: the daemon resolves it to the checkout with
+    /// its own single source of truth and derives the repository identity from
+    /// that, exactly as [`InspectMemory`](CommandBody::InspectMemory) does.
+    /// A client cannot name a repository identity directly.
+    /// The fold is unconditional. There is no "skip if already current" flag:
+    /// a command a user reaches for because the graph looks wrong must not
+    /// sometimes decline to do the thing its name promises.
+    BuildCodeGraph {
+        /// The directory to build from; resolved to its enclosing checkout.
+        repository: String,
+    },
+    /// Describe the stored code graph for a repository, with no re-scan
+    /// (`codypendent graph status`): counts, per-language and per-kind
+    /// breakdowns, the revisions the graph is stamped at, and whether it is
+    /// stale relative to the working tree.
+    ///
+    /// A **read** — any handshaken client, an Observer included, may issue it.
+    /// `repository` is resolved exactly as
+    /// [`BuildCodeGraph`](CommandBody::BuildCodeGraph)'s.
+    ReadCodeGraphStatus {
+        repository: String,
+    },
+    /// List the graph's nodes and edges, filtered (`codypendent graph show`),
+    /// so the graph is inspectable from a terminal rather than only through the
+    /// TUI overlay.
+    ///
+    /// A **read**, like [`ReadCodeGraphStatus`](CommandBody::ReadCodeGraphStatus).
+    /// The [`query`](CommandBody::ReadCodeGraph::query) narrows; it never
+    /// widens: the repository gate is applied to every branch of it, including
+    /// [`CodeGraphQuery::node_id`](crate::codegraph::CodeGraphQuery::node_id),
+    /// and an id outside this repository is refused identically to one that
+    /// does not exist.
+    ReadCodeGraph {
+        repository: String,
+        #[serde(default)]
+        query: crate::codegraph::CodeGraphQuery,
+    },
     #[serde(other)]
     Unknown,
+}
+
+/// One resource, already in the daemon's storage, that a [`CommandBody`] names
+/// by id. See [`CommandBody::named_resources`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedResource<'a> {
+    Session(SessionId),
+    Run(RunId),
+    Approval(ApprovalId),
+    Document(DocumentId),
+    /// A document edit lease. A lease owns nothing itself: it is authorized
+    /// through the document it is held over.
+    DocumentLease(&'a str),
+    /// A durable workflow run, or the `board:<repository>` task board that
+    /// shares its id space (see [`board_scope_id`](crate::board_scope_id)).
+    Workflow(std::borrow::Cow<'a, str>),
+    /// A store with no per-row owner — every row in it is daemon-wide, so the
+    /// only principal that can own it is the uid the daemon runs as.
+    DaemonStore(DaemonStore),
+}
+
+/// A daemon-wide store a command addresses. Never on the wire: this is the
+/// daemon's ownership axis for the stores whose rows have no owner of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonStore {
+    /// Curated memories (`InspectMemory`, `ForgetMemoryScope`, …).
+    Memory,
+    /// The evaluation-gated promotion pipeline and its evidence.
+    Promotion,
+    /// Installed Remote UI plugins — an arbitrary-code surface for the worker
+    /// runtime, so it is gated exactly like the other two.
+    UiPlugins,
+    /// The syntax-layer code graph (`BuildCodeGraph`, `ReadCodeGraphStatus`,
+    /// `ReadCodeGraph`). Daemon-wide like the memory store: `code_nodes` rows
+    /// carry a repository, not an owner, so the only principal that can own
+    /// them is the uid the daemon runs as. The *repository* gate is a second,
+    /// independent filter applied inside the seam — this one only decides
+    /// whether the caller may address the store at all.
+    CodeGraph,
+}
+
+impl CommandBody {
+    /// **Every** pre-existing resource this body names, in ONE exhaustive match.
+    ///
+    /// It lives here, in the crate that defines the enum, for one reason: this
+    /// match has no wildcard arm, so a new `CommandBody` variant does not
+    /// compile until somebody says what it names. (`CommandBody` is
+    /// `#[non_exhaustive]`, so the same match in the daemon would need a
+    /// wildcard and a new variant would silently classify as "names nothing" —
+    /// which is precisely the failure this exists to prevent.)
+    ///
+    /// The daemon's socket server feeds this to its single ownership gate. Four
+    /// consecutive reviews found the same defect: ownership was checked per
+    /// command arm, and per-arm discipline leaks one arm at a time. The round-4
+    /// leak was `PublishDocument`, which parked a Git write against another
+    /// uid's document while both of its siblings re-derived ownership — and the
+    /// difference between its success and a `document.not-found` was itself an
+    /// enumeration oracle.
+    ///
+    /// An empty list means "names nothing that already exists": `CreateSession`
+    /// and `CreateDocument` mint their own ids, `StartWorkflow` creates its run,
+    /// `PutArtifact` stores fresh bytes.
+    #[must_use]
+    pub fn named_resources(&self) -> Vec<NamedResource<'_>> {
+        match self {
+            // The Remote UI plugin store is daemon-wide; `EnableUiPlugin` may
+            // additionally scope a plugin to a session, which is a second,
+            // per-row-owned id.
+            Self::InstallUiPlugin { .. }
+            | Self::SmokeTestUiPlugin { .. }
+            | Self::ListUiPlugins
+            | Self::UpdateUiPlugin { .. }
+            | Self::ApproveUiPluginUpdate { .. }
+            | Self::RejectUiPluginUpdate { .. }
+            | Self::RevokeUiPlugin { .. }
+            | Self::RemoveTrustedUiPublisher { .. } => {
+                vec![NamedResource::DaemonStore(DaemonStore::UiPlugins)]
+            }
+            Self::EnableUiPlugin { session_id, .. } => {
+                let mut named = vec![NamedResource::DaemonStore(DaemonStore::UiPlugins)];
+                named.extend(session_id.map(NamedResource::Session));
+                named
+            }
+            // `AttachSession` names a session and is deliberately absent: the
+            // requested role binds to the connection BEFORE the attach is
+            // evaluated (role bootstrap — a one-shot client asserts its role by
+            // attaching to an id it may not own), and a rejected attach answers
+            // `Payload::Error`, not `CommandRejected`. The daemon gates it
+            // inside its attach handler with the same ownership check and the
+            // same `protocol.session-not-found` answer.
+            Self::AttachSession { .. } => Vec::new(),
+            Self::CreateSession { .. }
+            | Self::CreateDocument { .. }
+            | Self::StartWorkflow { .. }
+            | Self::PutArtifact { .. }
+            | Self::Unknown => Vec::new(),
+            Self::StartRun { session_id, .. }
+            | Self::SubmitUserInput { session_id, .. }
+            | Self::UpdateIdeContext { session_id, .. }
+            | Self::ReadSessionEvents { session_id, .. } => {
+                vec![NamedResource::Session(*session_id)]
+            }
+            // The staleness sweep appends a note to whatever session it is
+            // handed, so that session is a resource it names.
+            Self::CheckDocuments { session_id, .. } => {
+                session_id.map(NamedResource::Session).into_iter().collect()
+            }
+            Self::CancelRun { run_id }
+            | Self::PauseRun { run_id }
+            | Self::ResumeRun { run_id }
+            | Self::QueueSteering { run_id, .. } => vec![NamedResource::Run(*run_id)],
+            Self::ResolveApproval { approval_id, .. } => {
+                vec![NamedResource::Approval(*approval_id)]
+            }
+            Self::MutateDocument { document_id, .. }
+            | Self::PublishDocument { document_id, .. } => {
+                vec![NamedResource::Document(*document_id)]
+            }
+            Self::AcquireDocumentLease { lease, .. } => {
+                vec![NamedResource::Document(lease.document_id)]
+            }
+            Self::ReleaseDocumentLease { lease_id } => {
+                vec![NamedResource::DocumentLease(lease_id.as_str())]
+            }
+            Self::PauseWorkflow { workflow_run_id }
+            | Self::ResumeWorkflow { workflow_run_id }
+            | Self::RetryWorkflowNode {
+                workflow_run_id, ..
+            }
+            | Self::CancelWorkflow { workflow_run_id }
+            | Self::ReadWorkflowRun { workflow_run_id } => {
+                vec![NamedResource::Workflow(std::borrow::Cow::Borrowed(
+                    workflow_run_id.as_str(),
+                ))]
+            }
+            // A repository board read re-points at a synthetic board run the
+            // daemon resolves, so what is named is the board when present and
+            // the workflow run otherwise.
+            Self::ReadBlackboard {
+                workflow_run_id,
+                board_repository,
+                ..
+            } => vec![NamedResource::Workflow(board_repository.as_deref().map_or(
+                std::borrow::Cow::Borrowed(workflow_run_id.as_str()),
+                |repository| std::borrow::Cow::Owned(crate::board_scope_id(repository)),
+            ))],
+            // Every board scope, not only `WorkflowRun`: a repository board is
+            // owner-checked too. A scope from a newer client names nothing here
+            // and is rejected structurally where it is lowered.
+            Self::PostBlackboardItem { scope, .. } | Self::UpdateBlackboardItem { scope, .. } => {
+                board_scope_resource(scope).into_iter().collect()
+            }
+            Self::InspectMemory { .. }
+            | Self::CorrectMemory { .. }
+            | Self::ForgetMemory { .. }
+            | Self::ForgetMemoryScope { .. }
+            | Self::OpenMemoryEvidence { .. } => {
+                vec![NamedResource::DaemonStore(DaemonStore::Memory)]
+            }
+            Self::ProposePromotion { .. }
+            | Self::AdvancePromotion { .. }
+            | Self::ApprovePromotion { .. }
+            | Self::RollbackPromotion { .. }
+            | Self::SubmitEvalEvidence { .. } => {
+                vec![NamedResource::DaemonStore(DaemonStore::Promotion)]
+            }
+            // The code graph is addressed by a repository PATH, never by a row
+            // id, so there is no per-row owner to check here. The store gate
+            // below answers "may this principal address the graph at all"; the
+            // repository gate — which is what stops one checkout's query from
+            // reading another's — lives inside the seam, where the rows are
+            // fetched, for both the list and the by-id path.
+            Self::BuildCodeGraph { .. }
+            | Self::ReadCodeGraphStatus { .. }
+            | Self::ReadCodeGraph { .. } => {
+                vec![NamedResource::DaemonStore(DaemonStore::CodeGraph)]
+            }
+        }
+    }
+}
+
+/// The workflow-run id a board scope is authorized against, or `None` for a
+/// scope this daemon does not understand.
+fn board_scope_resource(scope: &BlackboardScope) -> Option<NamedResource<'_>> {
+    match scope {
+        BlackboardScope::WorkflowRun { workflow_run_id } => Some(NamedResource::Workflow(
+            std::borrow::Cow::Borrowed(workflow_run_id.as_str()),
+        )),
+        BlackboardScope::RepositoryBoard { repository } => Some(NamedResource::Workflow(
+            std::borrow::Cow::Owned(crate::board_scope_id(repository)),
+        )),
+        _ => None,
+    }
 }
 
 /// `skip_serializing_if` helpers for the paged-history defaults: a zero is the

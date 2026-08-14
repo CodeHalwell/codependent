@@ -7,41 +7,60 @@ baseline; every earlier one is kept so the score is traceable release over
 release (`git log -p evals/baselines/core.json` reads as the score's own
 history).
 
-**Ships empty (`[]`) — deliberately, not an oversight.** This gate needs a
-real `codypendent` binary built from the current tree, plus
-`evals/ci/stub_model.py` actually running, to produce a real number; nothing
-in this task's environment could produce one that was ACTUALLY measured
-against the tree as merged (see the task report — the shared working tree
-this was built in had multiple other agents mid-edit throughout, so any
-number computed locally would have been measured against a moving,
-sometimes-non-compiling target, not the tree this ships in). Rather than
-write down a guessed or stale figure, `evals/ci/run_gate.sh` bootstraps: the
-first time the `eval-regression` CI job runs against a real, merged,
-compiling tree, it establishes the baseline from that real run and passes;
-every run after that is a genuine comparison. This is a one-time path,
-not a standing escape hatch — see that script's own comment.
+**The current baseline is 13/13** (2026-08-13), and 13/13 is the only honest
+number for this gate: `evals/ci/stub_model.py` replays a *precomputed correct*
+trajectory for every case, so a case that fails means the harness is broken, not
+that the task was hard. The gate fails on any movement away from this — up or
+down — see `evals/README.md`'s "What this gate can and cannot detect".
 
-**A live run WAS captured and then deliberately discarded — worth knowing
-before you assume `[]` means "never tried".** Late in this task, once the
-tree briefly compiled, `evals/ci/run_gate.sh` ran for real and scored
-3/13. It is not committed here because, in the same session, a concurrent,
-unrelated change (`crates/runtime/src/agent.rs`'s "retrieval narrowed this
-run's built-in tool advertisement" — a different outcome's work landing
-mid-session) started narrowing which tools get advertised to the model per
-run, and `stub_model.py`'s scripted trajectories assume every tool it calls
-is always available. Two consecutive runs, seconds apart, produced
-DIFFERENT results for the identical single-case suite (`file-changed`
-true, then false) purely from this — evidence the number was not yet a
-stable baseline, not evidence of a bug in `codypendent_cli::eval::
-run_worktree_root` (the worktree-inspection fix itself checks out
-separately and directly: see `run_worktree_root_matches_the_daemons_own_
-layout` in `crates/cli/src/eval.rs`, which cross-checks the reconstructed
-worktree path against a REAL `WorktreeManager::allocate` call and passed).
-Whoever next runs this gate on a settled tree should expect `stub_model.py`
-may need updating to work with narrowed tool advertisement — check
-`codypendent eval run`'s daemon log for that "narrowed" line before
-assuming a low score means the harness regressed.
+## History
 
-To force a NEW baseline later (after a deliberate, reviewed score change —
-growing the corpus, rescripting `stub_model.py`, an intentional harness
-change): `evals/ci/run_gate.sh --update-baseline "<why the score changed>"`.
+| # | date | score | what changed |
+|---|---|---|---|
+| 1 | 2026-08-13 | 3/13 | bootstrap: the first `eval-regression` run against a real binary |
+| 2 | 2026-08-13 | 13/13 | the stub's step-selection off-by-one fixed; the three absence-only cases given an assertion that requires work |
+
+Entry 1 was **not a difficulty level, it was a bug**, and it is worth
+understanding before trusting any number here. The three cases it recorded as
+passing (`diagnose-failing-test`, `ci-diagnosis`,
+`explain-average-no-network`) were exactly the three whose entire assertion set
+was `file-unchanged` — they passed because nothing happened. Every case that
+required the agent to *do* something scored zero, because `stub_model.py` chose
+its scripted step by counting `[tool result:` markers and the daemon seeds each
+run's context manifest as `[tool result: context.assemble]` before the model has
+called anything: step 0 of every case was skipped, so no write ever happened.
+The gate was green on that number for a day, because the comparator only failed
+on a *drop*.
+
+Both halves are fixed (`scripted_step_index` counts the model's own `[calling
+…]` turns; `compare_baseline.py` fails on any difference in either direction,
+on a changed set of case ids, and on a corpus that shrank). Reverting just the
+step-selection line drops the suite to **0/13** and the gate fails, naming all
+13 cases — verified 2026-08-13.
+
+## Re-baselining
+
+To record a NEW baseline after a deliberate, reviewed change — growing the
+corpus, rescripting `stub_model.py`, an intentional harness change:
+
+```
+evals/ci/run_gate.sh --update-baseline "<why the score changed>"
+```
+
+Do not use it to make a red gate green. A drop with no explanation is the
+regression this file exists to catch; an *increase* with no explanation is the
+one it exists to catch too (a case edited into vacuity and an assertion that
+stopped firing both raise the score).
+
+## One historical caveat worth keeping
+
+While this gate was being built, a concurrent change to
+`crates/runtime/src/agent.rs` began narrowing which built-in tools are
+advertised per run ("retrieval narrowed this run's built-in tool
+advertisement" in the daemon log), and `stub_model.py`'s scripted trajectories
+assume every tool they call is advertised. Two runs seconds apart once produced
+different results for the same single-case suite. That line is still printed on
+every run (`offered=28 advertised=15` at the 13/13 baseline, with every tool
+the corpus calls still advertised). If a future gate run fails on cases that
+call a rarely-advertised tool, check that line in the daemon log before
+concluding the harness regressed.

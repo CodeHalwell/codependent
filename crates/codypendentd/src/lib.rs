@@ -20,10 +20,21 @@
 /// drive the SAME channel the `task.*` tools use, rather than reproducing the
 /// board's write rules in test SQL (which would then drift from them).
 pub mod blackboard;
+/// Daemon-side handlers for `codypendent graph {build,status,show}`: the
+/// on-demand fold, the report that explains an empty graph, and the
+/// repository-scoped reads. Public for the same reason as [`blackboard`] — the
+/// crate's own tests drive the REAL gateway rather than reproducing its
+/// repository scoping in test SQL, which would then drift from it.
+pub mod codegraph_ops;
 pub mod docs_channel;
 mod docs_job;
 pub mod documents;
 mod executor;
+/// The `graph.assert_edge` write seam: the assembly binding that lets a run
+/// assert code-graph edges no parser can see (a route handler to the service it
+/// dispatches to, a config key to its reader). Public so the integration test
+/// drives the SAME binding the executor wires, not a copy of it.
+pub mod graph_assertions;
 mod learning_capture;
 /// Daemon-side handlers for memory inspect/edit/delete and opening a
 /// provenance card's source (2026-08-13 review F3/F4). Public so a future

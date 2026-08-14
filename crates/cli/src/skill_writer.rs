@@ -114,10 +114,17 @@ pub struct SkillDraft {
     pub optional_tools: Vec<String>,
     pub permissions: DraftPermissions,
     pub limits: DraftLimits,
-    /// `"local-user"` (the reserved value granting `TrustTier::FirstParty`)
-    /// unless overridden — a skill authored on this machine, for this
-    /// operator, by definition qualifies.
+    /// `"local-user"` unless overridden — a record of who authored the package,
+    /// not a trust grant. Nothing signs or checks it, so every package loaded
+    /// from disk registers as
+    /// [`codypendent_knowledge::manifest::PACKAGE_TRUST_TIER`] (`Community`)
+    /// whatever this says. `"local-user"` used to be a reserved value that
+    /// self-promoted a package to `FirstParty` — exactly the self-assertion the
+    /// 2026-08-13 review removed.
     pub publisher: String,
+    /// Must stay `false`: [`load_package`](codypendent_knowledge::load_package)
+    /// refuses a manifest that requires a signature, because no skill path
+    /// verifies one. Setting it writes a package this machine cannot install.
     pub signature_required: bool,
     /// The `SKILL.md` body — the procedure a model reading this skill's card
     /// and asking for it follows.

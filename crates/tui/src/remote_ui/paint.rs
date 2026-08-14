@@ -620,7 +620,9 @@ impl Painter<'_> {
 
     fn markdown(&mut self, node: &UiNode, area: Rect) {
         let text = content_text(node);
-        let lines = markdown::parse(&sanitize_terminal_text(&text))
+        // Laid out for the node's own pane: a plugin's markdown table is
+        // clipped by this rect, so a fixed budget would shear it here too.
+        let lines = markdown::parse(&sanitize_terminal_text(&text), usize::from(area.width))
             .into_iter()
             .map(|line| {
                 Line::from(

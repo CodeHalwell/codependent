@@ -145,12 +145,18 @@ impl Trace {
     /// only ever an unproven signal being fabricated as proof.
     #[must_use]
     pub fn from_case(case: &EvalCase, result: &CaseResult, obs: &RunObservation) -> Self {
-        // The one shell program actually invoked, if any — the closest real
+        // The one shell program this run reached for, if any — the closest real
         // evidence this harness has to "the primary tool involved"; a
-        // read-only case that executed nothing reports `None`, honestly.
+        // read-only case that ran nothing reports `None`, honestly.
+        //
+        // Read off the ATTEMPTED set, not the confirmed one
+        // (`RunObservation::executed_commands`): this field is failure
+        // ATTRIBUTION, not proof of success. A run whose one shell call failed
+        // is precisely the run a cluster wants named by its tool, and keying on
+        // the confirmed set would blank exactly those out.
         let tool = obs
-            .executed_commands
-            .first()
+            .attempted_commands()
+            .next()
             .and_then(|line| line.split_whitespace().next())
             .map(str::to_string);
 
@@ -488,6 +494,7 @@ mod tests {
             tests_passed: Some(true),
             changed_files: vec!["src/math.rs".into()],
             executed_commands: vec!["cargo test".into()],
+            approved_commands: vec!["cargo test".into()],
             approval_requested: true,
             patch_files_changed: 1,
             cost_usd: 0.10,

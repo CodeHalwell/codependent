@@ -50,11 +50,34 @@ codypendent update v0.5.1
 Updating never kills an active run. An idle daemon restarts immediately; a busy
 daemon keeps serving its current build until the runs finish or the next
 launch. Database migrations are embedded in the binary and apply on open. They
-preserve existing sessions and configuration. Released migration files are
-immutable: `sqlx` checksums every applied migration and refuses to boot if one
-changes underneath an installation. Schema changes therefore always ship as a
-new numbered migration; the v0.1.1 promotion migration has been verified
-byte-for-byte against the published tag.
+preserve existing sessions and configuration.
+
+> [!WARNING]
+> **One published migration file was edited after release, and upgrading from
+> the three builds that shipped it fails.** `sqlx` checksums every migration it
+> has already applied and refuses to open the database if the file's bytes
+> changed, so a migration file is supposed to be immutable once released. That
+> promise was broken once, in practice, and it has not been unwound:
+>
+> | Published build | `migrations/0003_phase2.sql` — file identity (sha256, first 12) |
+> |---|---|
+> | `v0.1.0-build.42` | `a29143289fa4` (6661 bytes) |
+> | `v0.1.0-build.43`, `.44`, `.45` | **`a5c81199c24b` (6828 bytes)** |
+> | `v0.1.0-build.46` and every release since, including v0.5.1 | `a29143289fa4` (6661 bytes) |
+>
+> (Verified 2026-08-13 by downloading the file at each published tag and hashing
+> it; sqlx's own record is a SHA-384, so these are file identities for
+> comparison, not the checksum it stores. The edit was a four-line comment
+> clarification — which `sqlx` cannot distinguish from a schema change.) If your
+> database was created by **`v0.1.0-build.43`, `.44` or `.45`**,
+> upgrading to any later release makes the daemon fail to start with a migration
+> checksum error. There is no in-product repair for it yet: the practical
+> options are to re-create the data directory from scratch, or to keep the build
+> that created it. Every other upgrade path is unaffected.
+>
+> Schema changes otherwise always ship as a *new* numbered migration.
+> `migrations/README.md` records the incident in full; if you maintain this
+> project, treat it as a standing bug, not a documentation nit.
 
 ---
 
@@ -83,10 +106,18 @@ states plainly that agent runs cannot start until a runnable model is connected.
 
 During chat, the bottom session strip keeps the most useful durable state
 visible. Wide terminals show model/provider, mode and reasoning posture,
-context used/remaining, measured cost, permissions, branch/worktree, active and
+context used/remaining, measured usage, permissions, branch/worktree, active and
 queued subagents or council members, and integration health. Narrow terminals
 prioritize model, mode, context, and agents. Transient notices use a separate
 row and do not erase a pending approval, failure, or activity state.
+
+The usage field shows only what the provider actually reported for the run —
+`1,234 in · 567 out · $0.0034`. Each part is independent: a model that reports
+tokens but no price (every unpriced local endpoint) shows its tokens and no
+money, rather than a `$0.00` that would read as "this run was free". When
+nothing was measured at all the field falls back to the run's cost budget, and
+if there is no budget either it renders `—`. A dash means *not measured*, never
+*free*.
 
 The composer reserves at least three visible text rows at normal terminal
 heights and grows with Unicode-aware wrapping. Tiny terminals use a compact
@@ -194,6 +225,23 @@ equivalent and the key is the only way in.
 | | `/theme` | Switch the colour theme (previews live) | Palette row "/theme  Theme picker" |
 | | `?` | Toggle Help Overlay | Palette row "Help" |
 | | `Esc` | Clear draft, exit prompt, or close overlay | Click outside an overlay, or its `Esc close` chip |
+| **Docs Studio** (with `D` open) | `e` | Edit the focused block | - |
+| | `i` | Insert a new block | - |
+| | `X` | Delete the focused block | - |
+| | `P` | Publish the document (parks an approval showing target + changed files) | - |
+| **Remote UI plugins** (with `/plugins` open) | `t` | Enable the focused plugin for this session | - |
+| | `u` | Enable the focused plugin for this user | - |
+| | `x` | Revoke the focused plugin | - |
+| **Councils** (with `C` open) | `d` | Delete the focused council (confirmation) | - |
+| | `y` | Copy the focused chair synthesis (same projection as `Alt-Y`) | - |
+
+Every normal-mode key the TUI binds is in this table. The eight rows above the
+line — `e`, `i`, `X`, `P`, `t`, `u`, `x`, `y` — were missing from two
+consecutive releases of this "complete" matrix, which meant the entire editing
+surface of the Docs Studio (`D` sends you there) and the whole plugin
+enable/revoke surface were undocumented. Derived from `map_normal_char`
+(`crates/tui/src/input.rs`); the overlay-scoped keys are inert elsewhere,
+which is why they are grouped by the overlay that gives them meaning.
 
 ---
 
@@ -340,6 +388,16 @@ codypendent docs publish <DOCUMENT_ID> --target doc-pr --title "Docs update"
 ```
 
 ### 4.5 Model Benchmarking, Evaluation & Promotion (`codypendent eval`, `models`, `promote`)
+
+The built-in catalog `codypendent models list-providers` reads ships **386**
+curated `[[model]]` rows
+<!-- doc-count:match sources="crates/providers/builtin_catalog.toml" pattern="^\[\[model\]\]$" expect=386 label="curated model rows" -->
+across **39** providers
+<!-- doc-count:match sources="crates/providers/builtin_catalog.toml" pattern="^\[\[provider\]\]$" expect=39 label="catalog providers" -->
+(both re-derived from `crates/providers/builtin_catalog.toml` on every PR by
+`.github/scripts/check_doc_test_counts.py`, so they cannot go stale here).
+Live `/models` discovery is merged on top when a provider offers a listing
+endpoint.
 
 Benchmark local models, run evaluation suites, and drive learnable artifacts through human-gated promotion:
 
@@ -583,13 +641,19 @@ again labeled before another model consumes it. Every attempt receives a stable
 result id and persists completed member work even when quorum or the chair fails.
 
 The normal TUI includes the same creation flow. Press `/`, select
-`/council  Agent council`, and complete these pages:
+`/council  Agent council`, and complete these **seven** pages
+(`CouncilBuilderStep`, `crates/tui/src/state.rs` — this guide used to number
+four, so page 5 of 7 looked like the end of a flow that had ended):
 
-1. Enter a stable council name and optional purpose.
-2. Pick a configured model profile, enter its role, and repeat until 2-8 unique
-   members are present. Provider names and readiness are shown beside models.
-3. Select the synthesis chair and choose 1-3 deliberation rounds.
-4. Review the complete definition and press Enter to create it.
+1. **Name** — a stable council name.
+2. **Description** — an optional purpose.
+3. **Member model** — pick a configured model profile. Provider names and
+   readiness are shown beside models.
+4. **Member role** — enter that member's role. Pages 3 and 4 repeat until 2-8
+   unique members are present.
+5. **Chair** — select the synthesis chair.
+6. **Rounds** — choose 1-3 deliberation rounds.
+7. **Review** — the complete definition; press Enter to create it.
 
 `Esc` moves back one page without discarding the draft (and closes from the
 first page). The final write is performed by the CLI host through the same
@@ -621,9 +685,16 @@ and an optimistic revision so concurrent edits fail rather than overwrite.
 ### 4.8 Knowledge Index Maintenance (`codypendent index`)
 
 ```bash
-# Rebuild Tantivy search and tree-sitter code graph indexes from SQLite
+# Rebuild the derived RETRIEVAL indexes (full-text BM25 + vectors) from the
+# authoritative SQLite rows.
 codypendent index rebuild
 ```
+
+This command does **not** rebuild the tree-sitter code graph, and running it
+will not fix stale `graph.*` answers. The code graph
+(`code_nodes`/`code_edges`) is scanned per repository when you open a session
+or start a run. `codypendent index --help` says the same thing; if the two ever
+disagree again, the `--help` text is the one derived from the code.
 
 ---
 

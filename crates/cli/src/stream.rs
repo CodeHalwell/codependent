@@ -214,6 +214,7 @@ pub async fn stream_until_terminal<W: Write>(
                     if let Some(reason) = disposition_reason(disposition) {
                         eprintln!("codypendent: run {} — {reason}", exit_verb(exit));
                     }
+                    drain_trailing_usage(conn, out, run_id).await?;
                     return Ok(exit);
                 }
             }
@@ -221,6 +222,63 @@ pub async fn stream_until_terminal<W: Write>(
                 pending_exit = RunExit::from_state(*state).or(pending_exit);
             }
             _ => {}
+        }
+    }
+}
+
+/// How long [`drain_trailing_usage`] waits for the run's `RunUsage` after its
+/// terminal event. Generous relative to the gap it covers — the daemon emits
+/// both from the same `finish_run` continuation, microseconds apart — and short
+/// enough that a daemon which never emits one costs a scripted caller a barely
+/// perceptible pause rather than a hang.
+const TRAILING_USAGE_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// After the run's terminal event, keep reading just long enough to forward its
+/// `RunUsage`.
+///
+/// `RunCompleted` is **not** the last thing a run publishes. The executor
+/// journals the terminal state first and records the measured usage after
+/// (`codypendentd/src/executor.rs`), so `RunUsage` lands one sequence later —
+/// and returning on `RunCompleted` closed the connection in that gap. Round 4
+/// added `RunUsage` to [`event_run_id`], an ownership rule this loop could
+/// never consult because it had already returned: across six runs the reviewer
+/// measured `13 RunCompleted / 14 RunUsage / 15 ClientPresenceChanged` in the
+/// ledger and `[1 … 13]` on stdout, with `RunUsage` printed **zero** times. The
+/// number was measured, journaled, given a wire event and a golden vector, and
+/// then dropped one line short of the consumer.
+///
+/// Bounded and best-effort in three ways, because a usage event is not
+/// guaranteed: the daemon emits none when the provider measured nothing (an
+/// all-`None` event would be indistinguishable from a genuinely free run), an
+/// older daemon emits none at all, and the connection may simply end. None of
+/// those may change the run's exit code, so every exit here is `Ok(())`.
+async fn drain_trailing_usage<W: Write>(
+    conn: &mut Connection,
+    out: &mut W,
+    run_id: Option<RunId>,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + TRAILING_USAGE_GRACE;
+    loop {
+        let envelope = match tokio::time::timeout_at(deadline, conn.next_envelope()).await {
+            // Elapsed, or the connection ended: nothing more is coming.
+            Err(_elapsed) => return Ok(()),
+            Ok(Ok(Some(envelope))) => envelope,
+            Ok(Ok(None)) => return Ok(()),
+            // A read error after a completed run must not turn a successful run
+            // into a failed one — the disposition is already decided.
+            Ok(Err(_error)) => return Ok(()),
+        };
+        let Payload::Event(event) = &envelope.payload else {
+            continue;
+        };
+        // Forward whatever arrives in the window, exactly as the main loop
+        // does: the JSONL contract is "every event the daemon sent us", not
+        // "the events this function happens to care about".
+        write_line(out, &envelope)?;
+        if matches!(event.body, EventBody::RunUsage { .. })
+            && matches!(event_run_id(&event.body), Some(rid) if Some(rid) == run_id)
+        {
+            return Ok(());
         }
     }
 }

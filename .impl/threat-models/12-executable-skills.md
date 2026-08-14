@@ -116,7 +116,7 @@ Everything in the directory is attacker-controlled bytes.
 
 | Surface | Controlled? | Notes |
 |---|---|---|
-| `skill.toml` every field | **yes** | including `[permissions]`, `[limits]`, `[trust] publisher`, `[trust] signature_required` |
+| `skill.toml` every field | **yes** | including `[permissions]`, `[limits]`, `[trust] publisher`, `[trust] signature_required`, `scope` and `status`. Nothing in `[trust]` is a decision input — see §8 |
 | The WASM module bytes | **yes** | arbitrary valid or malformed wasm, unbounded loops, huge memories, deep recursion |
 | `scripts/*` bytes and mode bits | **yes** | including the shebang |
 | Module *imports* it declares | **yes** | can request `wasi_snapshot_preview1`, `env.system`, anything |
@@ -205,31 +205,79 @@ A pure-compute guest calls no host function, so a host-side deadline check has
 no natural place to run. The construction:
 
 ```
-fuel_slice = min(total_fuel, FUEL_SLICE)          // ~50M instructions
+fuel_slice = min(total_fuel, FUEL_SLICE)
 deadline   = Instant::now() + limits.wall_clock
 loop {
     match invocation.resume(...) {
-        Finished(v)        => return Ok(v),
+        Finished(v)        => break,                  // then the post-loop check below
         OutOfFuel(next)    => {
             if Instant::now() >= deadline { return Err(WallClockExceeded) }
-            if consumed >= limits.total_fuel { return Err(FuelExhausted) }
-            store.set_fuel(fuel_slice)?;          // refuel and continue
+            if remaining < required     { return Err(FuelExhausted) }
+            store.set_fuel(fuel_slice)?;              // refuel and continue
             invocation = next;
         }
-        HostTrap(_)        => return Err(HostDenied),
+        HostTrap(_)        => return Err(...),        // incl. the host-call refusal below
     }
 }
+if started.elapsed() >= limits.wall_clock { return Err(WallClockExceeded) }
 ```
 
-Overshoot is bounded by one fuel slice, not by guest behaviour: the guest cannot
-extend a slice, cannot refuel itself, and cannot skip the check, because the
-check happens *outside* the guest between two resumptions. `FUEL_SLICE` is
-chosen so a slice is milliseconds on the slowest supported host.
+### 5.1 The slice boundary is not sufficient on its own
 
-Two enforced ceilings therefore exist and neither is advisory: **total fuel**
-(deterministic, instruction-counted) and **wall clock** (checked between
-slices). Both terminate the guest. This is what "enforced, not advisory" means
-for `[limits]`.
+**This section previously claimed "overshoot is bounded by one fuel slice, not
+by guest behaviour: the guest cannot extend a slice, cannot refuel itself, and
+cannot skip the check." That was false, and the 2026-08-13 review falsified it
+by running code.** The guest does not need to skip the check; it needs only to
+never trigger it. Fuel is not consumed while execution is inside a host
+function, so a guest that spends its life in host calls never reaches an
+`OutOfFuel` yield and the check never runs. Measured, with **zero declared
+permissions** and the shipped `DenyAllGate`, calling only the unprivileged
+`codypendent::input` in a loop:
+
+```
+declared wall = 1s
+RESULT Ok: 200000 host calls, fuel_consumed=800198, duration=166.778777417s
+```
+
+167× the declared ceiling, and reported as a **successful completion**.
+`fuel_consumed` below one 2 000 000-fuel slice is the proof: the guest never
+yielded once.
+
+### 5.2 What is enforced now
+
+Three checks, and the guest is inside one of the two bounded regions at all
+times:
+
+1. **At the slice boundary** (`OutOfFuel`) — bounds a pure-compute guest.
+   Overshoot ≤ one fuel slice.
+2. **On entry to every host call** (`wasm.rs::enter_host_call`) — bounds a
+   guest that avoids the slice boundary. Overshoot ≤ one host call. Exceeding
+   the deadline returns a host error, which `wasmi` surfaces as
+   `ResumableCall::HostTrap`; the run **terminates** with
+   `WasmError::WallClockExceeded`. The reason is recorded in the store because
+   every host error has the same shape at the `wasmi` boundary.
+3. **After the guest returns** — a run that overran is a refusal even when the
+   guest completed normally, so a single long host call cannot turn an
+   overshoot into a reported `Ok`.
+
+Each host call is additionally **charged fuel** (a flat entry charge plus one
+unit per 8 bytes copied), so a host-call loop also burns its instruction budget
+and reaches the slice boundary. The charge is a floor, not a measurement of
+host time; check (2) is what actually bounds it.
+
+Measured after the change, same adversary shape: declared wall 500 ms, real
+elapsed **503.4 ms**, `Err(WallClockExceeded)`. Against the unfixed code the
+same fixture ran 6.52 s with `fuel_consumed = 8248` and returned `Ok`.
+Regression test: `crates/sandbox/tests/wasm_adversary_it.rs`.
+
+### 5.3 What is still not bounded
+
+**One host call is the unit of overshoot, and a single host call is not itself
+time-bounded.** `read_capped` refuses anything that is not a regular file (so a
+FIFO, a character device, or a stalled mount cannot hang the invocation) and
+caps the bytes, and the host-read budget bounds the total across calls — but a
+slow disk serving one large granted read is bounded only by that byte budget,
+not by a clock. Named, not fixed.
 
 ## 6. Escapes I am explicitly NOT defending against
 
@@ -264,15 +312,30 @@ Named so nobody mistakes silence for coverage.
    surface, handled by the existing disclosure/sanitization path, not by this
    change.
 
-## 7. Specific pre-existing defects this change closes
+## 7. Specific pre-existing defects — closed, and NOT closed
+
+Closed, verified by running:
 
 | Review finding | Fix |
 |---|---|
 | 12.7(1) `[limits]` parsed and thrown away | `SkillLimits` gains a validated `SkillResourceLimits` with hard ceilings, plumbed into `SandboxProfile` and the WASM store. `maximum_duration_seconds` now sets `wall_seconds`. |
 | 12.7(2) `$REPOSITORY`/`$WORKTREE` never substituted | An explicit substitution pass with an exhaustive placeholder table; an **unresolved placeholder is an error**, not a verbatim path. Fails loudly instead of fails-closed-and-silent. |
-| 12.4 shipped skill structurally unrunnable | Load-time validation refuses a manifest declaring capabilities the active backend cannot enforce, with the reason — so `skill add` says so, not the first run. |
-| 12.6 `CapabilityReport` never rendered | `load_package` and the skill-exec entry point both surface `diagnostic()`. |
-| 12.3 nothing calls the executor | `SkillRunner` in `knowledge/src/skill_exec.rs` is the single production entry point; migration 0026 records every invocation. |
+| 12.4 shipped skill structurally unrunnable | Load-time validation refuses a manifest declaring capabilities the active backend cannot enforce, with the reason — so `skill add` says so, not the first run. Extended: `[trust] signature_required = true` is refused for the same reason (nothing verifies a skill signature). |
+| F4 wall clock not enforced on the host-call path | §5.2. |
+| F5 host-read budget bypassed by a bad destination pointer | The accounting moved **before** the copy into guest memory. The bytes left the disk whether or not the guest's pointer was valid. |
+| F6 a package promotes itself to first-party trust | §8. |
+| F7 the documented guest ABI was not the enforced one | The `wasm.rs` module doc now says `codypendent_run: (i32) -> i32`, and `wasm_adversary_it.rs` pins it in both directions. |
+
+**Not closed. Do not read these rows as mitigations:**
+
+| Claim previously made here | Reality at this commit |
+|---|---|
+| "12.3 nothing calls the executor → `SkillRunner` … is the single production entry point" | **Still open.** `SkillRunner::new`/`::enforcing` are called only from `crates/knowledge/tests/skill_exec_it.rs`. `RunPolicyAdapter` (`crates/daemon/src/policy_gate.rs`) has zero references outside the file that defines it. There is no `skill run` command, no skill-execution RPC, and no skill-invoking tool. **No user can run a skill.** Wiring it is a design decision held by the orchestrator, not an oversight in this file. |
+| "migration 0026 records every invocation" | **False.** `grep -rn skill_executions --include=*.rs crates/` returns nothing. The table is created by migration and written by no code, so there is **no audit trail for skill execution**. |
+| "12.6 `CapabilityReport` never rendered → `load_package` and the skill-exec entry point both surface `diagnostic()`" | **Still open.** `SkillRunner::capability_diagnostic()` and `enforces_exit_criteria()` have no callers; `skill add` prints neither. On a host without `bwrap` the backend is unavailable and every run fails closed, and the CLI says nothing about it. |
+
+The enforcement in §3/§5 is real and adversarially tested; the *reachability*
+is not. Both facts belong in the same document.
 
 ## 8. Fail-closed table (what happens on each hostile input)
 
@@ -280,13 +343,36 @@ Named so nobody mistakes silence for coverage.
 |---|---|
 | module imports `wasi_snapshot_preview1.fd_write` | instantiation fails: unresolved import |
 | module declares 4 GiB memory | `ResourceLimiter` refuses growth past cap; `memory.grow` returns −1 |
-| module loops forever | fuel exhaustion, then wall-clock refusal at the next slice boundary |
+| module loops forever computing | wall-clock refusal at the next slice boundary (or fuel exhaustion first) |
+| module loops forever **on host calls** | wall-clock refusal in the host-call prologue — §5.2. Terminated with an error, never `Ok` |
+| module returns normally but past its deadline | refused after the loop; a completed run past its ceiling is not a success |
+| module passes an out-of-bounds `out_ptr` to `read_file` | the read is metered against `host_read_bytes` before the copy is attempted; the guest gets `-2` and pays for the bytes |
 | module returns 500 MB of output | truncated at `maximum_output_mb`, `output_truncated = true` |
 | module emits ANSI/OSC control sequences | stripped by `sanitize_untrusted`, counted |
+| module exports `codypendent_run: () -> i32` | refused: the ABI is `(i32) -> i32`, and the module doc says so |
 | `skill.toml` declares `filesystem_read = ["/"]` | rejected at load: root grants forbidden |
-| `skill.toml` declares `maximum_duration_seconds = 0` or absurd | clamped to the hard ceiling; zero is rejected |
-| `skill.toml` sets `signature_required = false` and a foreign publisher | trust tier is `Community`, not `FirstParty`; the manifest cannot promote itself |
+| `skill.toml` declares `maximum_duration_seconds = 0` or absurd | zero is rejected; above the hard ceiling is **refused**, not clamped |
+| `skill.toml` sets **any** `[trust] publisher`, `"local-user"` included | trust tier is `Community`. `manifest::PACKAGE_TRUST_TIER` is a constant, not a function of the manifest: no field can move it. `FirstParty` is reachable only by items constructed in code (`knowledge/src/builtin.rs`); `Verified` is unreachable, because no skill path verifies a signature |
+| `skill.toml` sets `signature_required = true` | refused at load — nothing verifies a skill signature, so accepting it would record a protection that does not exist |
 | host call for a path the manifest never declared | refused by the declaration pre-filter, never reaches the run policy |
 | host call for a path the manifest declared but policy denies | refused by `RunPolicyGate` |
 | no `RunPolicyGate` supplied | does not compile |
 | `DenyAllGate` supplied (default in tests/daemon-less callers) | every privileged request denied |
+
+**Why trust is not keyed on the registration scope.** The obvious refinement —
+"repository-scoped packages are `Untrusted`, user-scoped ones `Community`" — is
+not implemented, deliberately. The scope a package installs under is itself
+derived from the manifest's own `scope` field
+(`knowledge/src/skills.rs::declared_scope`), so keying trust on it would hand
+the same self-promotion straight back through a different attacker-controlled
+key. A flat `Community` for everything on disk is defeatable by nothing.
+
+**What is still read from package-supplied metadata, and why it is left.**
+`status` (`draft|active|…`) is package-authored and gates both disclosure and
+execution, so a package can declare itself `active`. That is a lifecycle
+decision belonging to the registry rather than a trust decision, `skill new`
+already forces `draft` by construction, and changing it would make the shipped
+reference package undisclosable — recorded here rather than silently changed.
+`risk` is derived from the package's own `[permissions]`, which understates
+risk for a package that under-declares — but a package that declares nothing
+also *gets* nothing, since the declaration is the enforcement ceiling.

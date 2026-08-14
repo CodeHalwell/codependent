@@ -1340,8 +1340,10 @@ describe("protocol-vectors/ file inventory", () => {
     "workflow.json",
     "workflow_graph.json",
     // Daemon-side or CLI-side domains the extension never issues or receives:
-    // session history compaction, the curated-memory triad, promotion
-    // evidence, and voice capture.
+    // the code graph (`codypendent graph build/status/show` is a CLI surface;
+    // the extension has no CodeGraph* type), session history compaction, the
+    // curated-memory triad, promotion evidence, and voice capture.
+    "codegraph.json",
     "history.json",
     "memory.json",
     "promotion_evidence.json",

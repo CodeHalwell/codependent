@@ -81,14 +81,47 @@ fn board_target_permits_kind(target: &BoardTarget, kind: BlackboardKind) -> bool
 /// spelling was invisible, permanently and silently, from any other. The daemon
 /// is where the filesystem is, so the daemon canonicalizes.
 ///
-/// A path that cannot be canonicalized (it does not exist on this host) keeps
-/// its literal spelling rather than failing the request — unchanged behaviour
-/// for that case, which is a separate question from this one.
-fn repository_board_id(repository: &str) -> String {
-    let canonical = std::fs::canonicalize(repository)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| repository.to_string());
-    board_scope_id(&canonical)
+/// A **relative** path is refused, not resolved. `std::fs::canonicalize` anchors
+/// a relative path to the *daemon's* working directory, which has nothing to do
+/// with the caller's: an ACP client serving a different checkout and sending
+/// `repository="."` had its cards written onto whichever repository the daemon
+/// happened to be started in — a real board belonging to another project — and
+/// `"./repo"` / `"repo"` silently minted junk boards. The daemon cannot resolve
+/// a client's relative path (it does not know the client's cwd, and a session
+/// carries no durable checkout to anchor it to), so it says so instead of
+/// guessing. Every first-party client already sends the canonical absolute root.
+///
+/// A board's identity is the **checkout**, never a subdirectory of it: opening
+/// the TUI from `repo/src` used to read (and write) a second, empty board that
+/// `repo/` never showed again. Plain canonicalization cannot see that — it
+/// resolves symlinks and `..` and has no notion of a repository — so the
+/// toplevel is resolved first, which subsumes canonicalization. Doing it here
+/// protects every client, not only the one that remembers to anchor its path.
+///
+/// An absolute path that is neither a checkout nor canonicalizable (it does not
+/// exist on this host) keeps its literal spelling rather than failing the
+/// request — unchanged behaviour for that case, which is a separate question
+/// from these two.
+fn repository_board_id(repository: &str) -> Result<String, String> {
+    let path = std::path::Path::new(repository);
+    if !path.is_absolute() {
+        return Err(format!(
+            "repository `{repository}` is a relative path; the daemon cannot resolve it \
+             against the caller's working directory — send the absolute checkout root"
+        ));
+    }
+    let canonical = crate::scan::discover_repository_root(path)
+        .or_else(|| std::fs::canonicalize(path).ok())
+        .map_or_else(
+            || repository.to_string(),
+            |path| path.to_string_lossy().into_owned(),
+        );
+    Ok(board_scope_id(&canonical))
+}
+
+/// The wire refusal for a board request the daemon will not resolve.
+fn relative_repository_error(message: String) -> CodypendentError {
+    CodypendentError::new("blackboard.unresolvable-repository", message, false)
 }
 
 /// Project a stored workflow artifact into its wire/runtime view, carrying the run
@@ -251,7 +284,9 @@ impl BlackboardReader for WorkflowBlackboardReader {
             // has no rows, and an empty board is the truthful answer (the store's
             // FK only matters for writes).
             let workflow_run_id = match board_repository.as_deref() {
-                Some(repository) => repository_board_id(repository),
+                Some(repository) => {
+                    repository_board_id(repository).map_err(relative_repository_error)?
+                }
                 None => workflow_run_id,
             };
 
@@ -300,7 +335,9 @@ impl BlackboardReader for WorkflowBlackboardReader {
             // Same board-resolution rule as `read`: a repository-board request
             // re-points at the synthetic run, unchanged otherwise.
             let workflow_run_id = match board_repository.as_deref() {
-                Some(repository) => repository_board_id(repository),
+                Some(repository) => {
+                    repository_board_id(repository).map_err(relative_repository_error)?
+                }
                 None => workflow_run_id,
             };
 
@@ -360,7 +397,8 @@ impl BoardOps {
         match target {
             BoardTarget::WorkflowRun(run) => Ok((run.clone(), None)),
             BoardTarget::Repository(repository) => {
-                let board_id = repository_board_id(repository);
+                let board_id =
+                    repository_board_id(repository).map_err(BlackboardError::BoardUnavailable)?;
                 WorkflowStore::new()
                     .ensure_board_run(&self.pool, &board_id, repository)
                     .await
@@ -498,7 +536,9 @@ impl BoardOps {
     ) -> Result<Vec<BlackboardItemView>, BlackboardError> {
         let run_id = match target {
             BoardTarget::WorkflowRun(run) => run.clone(),
-            BoardTarget::Repository(repository) => repository_board_id(repository),
+            BoardTarget::Repository(repository) => {
+                repository_board_id(repository).map_err(BlackboardError::BoardUnavailable)?
+            }
         };
         let items = self.store.query(&self.pool, &run_id, kind, false).await?;
         Ok(items
@@ -762,6 +802,54 @@ mod tests {
     use super::*;
     use codypendent_protocol::ClientId;
     use serde_json::json;
+
+    /// A relative repository path must be refused, never resolved: canonicalizing
+    /// it would anchor it to the DAEMON's working directory, so an ACP client
+    /// serving a different checkout and sending `"."` wrote its cards onto
+    /// whichever repository the daemon was started in.
+    #[test]
+    fn a_relative_repository_is_refused_not_resolved_against_the_daemons_cwd() {
+        for relative in [".", "..", "./repo", "repo", "../repo"] {
+            let refused = repository_board_id(relative)
+                .expect_err("a relative repository must not resolve to a board");
+            assert!(
+                refused.contains("relative path"),
+                "the refusal must say why: {refused}"
+            );
+        }
+
+        // An absolute root still resolves, and still canonicalizes — the spelling
+        // fix this function exists for is unchanged.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical tempdir");
+        let plain = repository_board_id(&root.to_string_lossy()).expect("absolute root resolves");
+        let dotted =
+            repository_board_id(&root.join(".").to_string_lossy()).expect("`.` suffix resolves");
+        assert_eq!(plain, dotted, "one checkout is one board");
+    }
+
+    /// One checkout is one board from anywhere inside it. Opening the TUI from a
+    /// subdirectory used to read a second, permanently empty board — and a card
+    /// created there was never visible from the repository root again.
+    #[test]
+    fn a_subdirectory_of_a_checkout_resolves_to_the_checkout_s_board() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonical tempdir");
+        let status = std::process::Command::new("git")
+            .current_dir(&root)
+            .args(["init", "--quiet"])
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+        let nested = root.join("src");
+        std::fs::create_dir_all(&nested).expect("create a subdirectory");
+
+        assert_eq!(
+            repository_board_id(&nested.to_string_lossy()).expect("a subdirectory resolves"),
+            repository_board_id(&root.to_string_lossy()).expect("the root resolves"),
+            "a subdirectory must reach the checkout's board, not a board of its own"
+        );
+    }
 
     /// A `task.update` that changes only the title must not blank the
     /// description (and vice versa): the tool sends just the fields it is

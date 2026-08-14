@@ -89,9 +89,14 @@ fn package_parse_round_trip() {
     assert_eq!(item.dependencies.len(), 6);
     assert_eq!(item.dependencies.iter().filter(|d| !d.optional).count(), 3);
 
-    // local-user publisher → first-party trust.
+    // The publisher is recorded as the package's own (unverified) claim, and it
+    // does NOT move the trust tier: a package on disk is Community whatever it
+    // says about itself. `publisher = "local-user"` used to buy FirstParty,
+    // which is the tier `context.rs` renders on a disclosed card — so a cloned
+    // package could label its own author-controlled text as first-party.
     assert_eq!(item.trust.publisher, "local-user");
-    assert_eq!(item.trust.tier, TrustTier::FirstParty);
+    assert_eq!(item.trust.tier, TrustTier::Community);
+    assert_ne!(item.trust.tier, TrustTier::FirstParty);
 
     // STEP 6.4: a script-bearing skill is now executable — its `scripts/` run
     // confined through the OS sandbox (the Phase-2 non-executable restriction is

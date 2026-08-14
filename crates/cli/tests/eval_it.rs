@@ -17,7 +17,8 @@ use codypendent_eval::{Assertion, EvalCase};
 use codypendent_protocol::{
     read_envelope, write_envelope, Actor, ApprovalDecision, ApprovalId, BudgetDimension,
     CommandBody, DaemonInstanceId, Envelope, EventBody, ModelId, Payload, ProposedAction, Risk,
-    RiskLevel, RunDisposition, RunId, ServerHello, SessionEvent, SessionId, PROTOCOL_V1,
+    RiskLevel, RunDisposition, RunId, ServerHello, SessionEvent, SessionId, ToolOutcome,
+    PROTOCOL_V1,
 };
 use tokio::net::{UnixListener, UnixStream};
 
@@ -313,8 +314,57 @@ fn retarget(body: EventBody, run_id: RunId) -> EventBody {
             disposition,
             chronicle,
         },
+        // Both halves of the execution correlation: `ToolProposed` is what links
+        // an approval to its run, and `ToolCompleted` is what says whether the
+        // approved call actually succeeded.
+        EventBody::ToolProposed {
+            approval_id,
+            action,
+            ..
+        } => EventBody::ToolProposed {
+            run_id,
+            approval_id,
+            action,
+        },
+        EventBody::ToolCompleted {
+            tool,
+            outcome,
+            artifact,
+            ..
+        } => EventBody::ToolCompleted {
+            run_id,
+            tool,
+            outcome,
+            artifact,
+        },
         other => other,
     }
+}
+
+/// The agent's `ToolProposed`: the only event naming both an approval and the
+/// run it belongs to.
+fn tool_proposed(sequence: u64, approval_id: ApprovalId, action: ProposedAction) -> SessionEvent {
+    event(
+        sequence,
+        EventBody::ToolProposed {
+            run_id: RunId::new(), // retargeted
+            approval_id,
+            action,
+        },
+    )
+}
+
+/// The completion that says whether an approved tool call actually ran.
+fn tool_completed(sequence: u64, outcome: ToolOutcome) -> SessionEvent {
+    event(
+        sequence,
+        EventBody::ToolCompleted {
+            run_id: RunId::new(), // retargeted
+            tool: "shell.run".to_string(),
+            outcome,
+            artifact: None,
+        },
+    )
 }
 
 fn artifact_ref() -> codypendent_protocol::ArtifactRef {
@@ -470,63 +520,26 @@ async fn a_routed_model_is_pinned_onto_start_run() {
     );
 }
 
-#[tokio::test]
-async fn approved_execute_command_is_recorded_and_a_rejected_one_is_not() {
-    // A finer-grained check on the wire-observation half alone: an approved
-    // ExecuteCommand is recorded as executed; run_case_over_connection is
-    // exercised directly (no repository inspection needed for this assertion
-    // set).
+/// Drive `run_case_over_connection` over a scripted event stream, returning the
+/// wire-observable half of the observation. Split out so the three
+/// approval/execution shapes below share one mock-daemon setup.
+async fn observe(scripted: Vec<SessionEvent>) -> codypendent_eval::RunObservation {
     let (socket, listener) = MockSocket::bind();
     let session_id = SessionId::new();
     let repo = tempfile::tempdir().unwrap();
 
-    let approved_id = ApprovalId::new();
-    let rejected_id = ApprovalId::new();
-    let scripted = vec![
-        approval_requested(
-            3,
-            approved_id,
-            ProposedAction::ExecuteCommand {
-                program: "cargo".to_string(),
-                args: vec!["build".to_string()],
-                environment: vec![],
-                cwd: None,
-            },
-        ),
-        approval_resolved(4, approved_id, ApprovalDecision::Approve),
-        approval_requested(
-            5,
-            rejected_id,
-            ProposedAction::ExecuteCommand {
-                program: "rm".to_string(),
-                args: vec!["-rf".to_string(), "/".to_string()],
-                environment: vec![],
-                cwd: None,
-            },
-        ),
-        approval_resolved(6, rejected_id, ApprovalDecision::Reject),
-        event(
-            7,
-            EventBody::RunCompleted {
-                run_id: RunId::new(),
-                disposition: RunDisposition::Completed { summary: None },
-                chronicle: artifact_ref(),
-            },
-        ),
-    ];
-    let server_events = scripted.clone();
     let server = tokio::spawn(async move {
         let (stream, _addr) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
             .await
             .unwrap()
             .unwrap();
-        mock_daemon(stream, session_id, false, server_events, None).await;
+        mock_daemon(stream, session_id, false, scripted, None).await;
     });
 
     let mut conn = Connection::connect(&socket.path).await.unwrap();
     // `run_case_over_connection` also returns the daemon-assigned `RunId` (so
     // `run_case` can find that run's own isolated worktree — see
-    // `codypendent_cli::eval::run_worktree_root`); this test only cares about
+    // `codypendent_cli::eval::run_worktree_root`); these tests only care about
     // the wire-observable half.
     let (obs, _run_id) = tokio::time::timeout(
         Duration::from_secs(10),
@@ -545,20 +558,123 @@ async fn approved_execute_command_is_recorded_and_a_rejected_one_is_not() {
         .await
         .unwrap()
         .unwrap();
+    obs
+}
+
+fn run_completed(sequence: u64) -> SessionEvent {
+    event(
+        sequence,
+        EventBody::RunCompleted {
+            run_id: RunId::new(), // retargeted
+            disposition: RunDisposition::Completed { summary: None },
+            chronicle: artifact_ref(),
+        },
+    )
+}
+
+fn shell_action(program: &str, args: &[&str]) -> ProposedAction {
+    ProposedAction::ExecuteCommand {
+        program: program.to_string(),
+        args: args.iter().map(|a| (*a).to_string()).collect(),
+        environment: vec![],
+        cwd: None,
+    }
+}
+
+#[tokio::test]
+async fn approved_execute_command_is_recorded_and_a_rejected_one_is_not() {
+    // A finer-grained check on the wire-observation half alone: an approved
+    // ExecuteCommand whose tool call SUCCEEDED is recorded as executed;
+    // run_case_over_connection is exercised directly (no repository inspection
+    // needed for this assertion set).
+    let approved_id = ApprovalId::new();
+    let rejected_id = ApprovalId::new();
+    let obs = observe(vec![
+        approval_requested(3, approved_id, shell_action("cargo", &["build"])),
+        tool_proposed(4, approved_id, shell_action("cargo", &["build"])),
+        approval_resolved(5, approved_id, ApprovalDecision::Approve),
+        tool_completed(6, ToolOutcome::Succeeded),
+        approval_requested(7, rejected_id, shell_action("rm", &["-rf", "/"])),
+        tool_proposed(8, rejected_id, shell_action("rm", &["-rf", "/"])),
+        approval_resolved(9, rejected_id, ApprovalDecision::Reject),
+        run_completed(10),
+    ])
+    .await;
 
     assert!(obs.approval_requested);
     assert!(obs.executed_commands.iter().any(|c| c == "cargo build"));
+    assert!(obs.approved_commands.iter().any(|c| c == "cargo build"));
     assert!(
-        !obs.executed_commands
-            .iter()
-            .any(|c| c.contains("rm -rf") || c.contains("rm -rf /")),
-        "a rejected command must never be recorded as executed: {:?}",
-        obs.executed_commands
+        !obs.attempted_commands().any(|c| c.contains("rm -rf")),
+        "a rejected command must never be recorded as executed or approved: {:?}",
+        obs.approved_commands
     );
     assert!(
         (obs.cost_usd - 0.0).abs() < f64::EPSILON,
         "no BudgetWarning was scripted in this test"
     );
+}
+
+/// The P1 this round's `command-executed` assertion depends on: **approval is
+/// not execution.** The same approved command, with a FAILED `ToolCompleted`
+/// instead of a successful one, must not satisfy `command-executed` — and must
+/// still defeat `command-not-executed`, because a command that was cleared to
+/// run and then failed is not evidence that it did not run.
+#[tokio::test]
+async fn an_approved_command_that_failed_does_not_count_as_executed() {
+    let approval_id = ApprovalId::new();
+    let obs = observe(vec![
+        approval_requested(3, approval_id, shell_action("cat", &["src/math.rs"])),
+        tool_proposed(4, approval_id, shell_action("cat", &["src/math.rs"])),
+        approval_resolved(5, approval_id, ApprovalDecision::Approve),
+        tool_completed(
+            6,
+            ToolOutcome::Failed {
+                message: "cat: src/math.rs: No such file or directory".to_string(),
+            },
+        ),
+        run_completed(7),
+    ])
+    .await;
+
+    assert!(
+        obs.executed_commands.is_empty(),
+        "a command whose tool call failed must not be recorded as executed: {:?}",
+        obs.executed_commands
+    );
+    assert!(obs.approved_commands.iter().any(|c| c == "cat src/math.rs"));
+    assert!(!Assertion::CommandExecuted {
+        contains: "src/math.rs".to_string(),
+    }
+    .check(&obs));
+    assert!(
+        !Assertion::CommandNotExecuted {
+            contains: "src/math.rs".to_string(),
+        }
+        .check(&obs),
+        "the over-broad negative assertion must still see the attempt"
+    );
+}
+
+/// Fail closed: an approval that resolved but whose completion never arrived
+/// (a run cancelled mid-tool) leaves the command unconfirmed.
+#[tokio::test]
+async fn an_approved_command_with_no_completion_is_not_executed() {
+    let approval_id = ApprovalId::new();
+    let obs = observe(vec![
+        approval_requested(3, approval_id, shell_action("cat", &["src/math.rs"])),
+        tool_proposed(4, approval_id, shell_action("cat", &["src/math.rs"])),
+        approval_resolved(5, approval_id, ApprovalDecision::Approve),
+        run_completed(6),
+    ])
+    .await;
+
+    assert!(
+        obs.executed_commands.is_empty(),
+        "an unobserved completion is not a successful one: {:?}",
+        obs.executed_commands
+    );
+    assert!(obs.approved_commands.iter().any(|c| c == "cat src/math.rs"));
 }
 
 #[test]

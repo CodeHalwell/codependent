@@ -50,7 +50,7 @@ use codypendent_protocol::{AgentMode, DocumentId, SessionId};
 struct Cli {
     /// Force a theme for the interactive TUI, overriding automatic terminal
     /// detection (`NO_COLOR`/`COLORTERM`/`TERM`) and any `CODYPENDENT_THEME`
-    /// env var — a manual override always wins (STEP 6.6). Accepts a
+    /// env var — a manual override always wins. Accepts a
     /// built-in variant (`dark`, `light`, `high-contrast`, `color-blind-safe`,
     /// `ansi256`, `ansi16`, `monochrome`) or the id of a theme pack loaded
     /// from `<data-dir>/themes/<id>.toml`. Only meaningful for the bare
@@ -64,7 +64,7 @@ struct Cli {
     #[arg(long, visible_alias = "plain")]
     accessible: bool,
     /// With no subcommand, `codypendent` opens the interactive TUI attached to
-    /// the current repository's session (STEP 1.12).
+    /// the current repository's session.
     #[command(subcommand)]
     command: Option<TopCommand>,
 }
@@ -82,12 +82,14 @@ enum TopCommand {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    /// Start a headless run and stream its events (STEP 1.13).
+    /// Start a headless run and stream its events — the scriptable twin of
+    /// the interactive TUI.
     Run {
         /// What the agent should do.
         #[arg(long)]
         objective: String,
-        /// The mode preset the run starts in (Chapter 20).
+        /// The mode preset the run starts in: how much the agent may change
+        /// without asking.
         #[arg(long, value_enum, default_value = "build")]
         mode: ModeArg,
         /// Repository the run operates in. Defaults to the current directory.
@@ -105,12 +107,12 @@ enum TopCommand {
         #[arg(long)]
         model: Option<String>,
         /// Stream every session event to stdout as JSONL until the run
-        /// terminates. Currently required — interactive attach lands with
-        /// the TUI (STEP 1.12).
+        /// terminates. Currently required: run `codypendent` with no
+        /// subcommand for the interactive view.
         #[arg(long)]
         jsonl: bool,
     },
-    /// Attach to an existing session and stream its events (STEP 1.13).
+    /// Attach to an existing session and stream its events as JSONL.
     Attach {
         /// The session to attach to.
         session_id: SessionId,
@@ -124,13 +126,20 @@ enum TopCommand {
         #[arg(long, value_enum, default_value = "jsonl")]
         events: EventsFormat,
     },
-    /// Maintain the knowledge fabric's derived RETRIEVAL indexes — full-text
-    /// (BM25) + vectors (Phase 2). This is search, NOT the code graph: the
-    /// code-graph nodes/edges are built per-repository when you open a session
-    /// or start a run, not by this command.
+    /// Maintain the derived search indexes over the knowledge fabric —
+    /// full-text (BM25) and vectors. This is SEARCH, not the code graph:
+    /// use `codypendent graph build` for the code graph.
     Index {
         #[command(subcommand)]
         command: IndexCommand,
+    },
+    /// Build and inspect this repository's code graph — the symbol/reference
+    /// map the agent reasons over. `graph build` folds it on demand and reports
+    /// why it came out the size it did; `graph status` describes what is
+    /// stored; `graph show` lists it.
+    Graph {
+        #[command(subcommand)]
+        command: GraphCommand,
     },
     /// Install skill packages into the governed registry, so retrieval can
     /// disclose them to a run.
@@ -138,7 +147,7 @@ enum TopCommand {
         #[command(subcommand)]
         command: SkillCommand,
     },
-    /// Work with declarative workflow manifests (Phase 5).
+    /// Validate, start, and supervise declarative workflow manifests.
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
@@ -146,7 +155,7 @@ enum TopCommand {
     /// Investigate and repair a failed GitHub check on a pull request (`/fix-ci`).
     /// Runs the declarative `repair-github-check` workflow — the supervised
     /// investigator → implementer → independent-reviewer flow — through the
-    /// daemon; every GitHub write parks for approval (Phase 5 STEP 5.1.4).
+    /// daemon. Every GitHub write parks for your approval first.
     FixCi {
         /// The pull-request number whose failing check to repair.
         #[arg(long)]
@@ -156,33 +165,37 @@ enum TopCommand {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Publish a collaborative document to Git (Phase 4 STEP 4.4).
+    /// Write, list, and publish collaborative documents; `docs publish`
+    /// commits one to Git.
     Docs {
         #[command(subcommand)]
         command: DocsCommand,
     },
-    /// Run the evaluation harness against a fixture suite (Phase 7 STEP 7.1).
+    /// Score the agent against a suite of fixture cases and report the result.
     Eval {
         #[command(subcommand)]
         command: EvalCommand,
     },
-    /// Measure and manage model profiles for the router (Phase 7 STEP 7.2).
+    /// Add, list, verify, and benchmark the models this install can run.
     Models {
         #[command(subcommand)]
         command: ModelsCommand,
     },
-    /// Drive a learnable artifact through the evaluation-gated promotion
-    /// pipeline (Phase 7 STEP 7.5) — nothing promotes itself (ADR-010).
+    // ADR-010: promotion is operator-gated by design. Nothing the agent
+    // learns can promote itself, however well it scores.
+    /// Move something the agent learned — a prompt, a skill, a policy — through
+    /// the evaluation gate into general use. Promotion always needs a human.
     Promote {
         #[command(subcommand)]
         command: PromoteCommand,
     },
-    /// Inspect plugin manifests and their permissions (Phase 6).
+    /// Inspect what a plugin declares and which permissions it asks for,
+    /// before you install it.
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
     },
-    /// Inspect the operator-declared MCP servers (PR B — MCP client).
+    /// Inspect the MCP servers you have declared, and the tools they offer.
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
@@ -200,17 +213,16 @@ enum TopCommand {
         #[command(subcommand)]
         command: CouncilCommand,
     },
-    /// Configure live measured routing (Phase 7 STEP 7.2/7.3, outcome 11):
-    /// per-task-node model selection from benched profiles, instead of the
-    /// Phase-1 resolver's first-reachable-candidate-in-file-order. Reads and
-    /// writes `<data_dir>/routing.toml`. Default OFF.
+    /// Choose each task's model from measured benchmarks instead of the
+    /// default order in `models.toml`. Reads and writes
+    /// `<data_dir>/routing.toml`; off unless you turn it on.
     Routing {
         #[command(subcommand)]
         command: RoutingCommand,
     },
-    /// Hand a session off to an IDE (STEP 3.7): print how to attach, and launch
-    /// the editor if it is on `PATH`. The IDE attaches as a contributor to the
-    /// same session — the run keeps going, it never restarts.
+    /// Hand a session off to an IDE: print how to attach, and launch the
+    /// editor if it is on `PATH`. The IDE joins the same session as a
+    /// contributor — the run keeps going, it never restarts.
     Open {
         /// The session to open in the IDE.
         session_id: SessionId,
@@ -318,10 +330,75 @@ impl IdeArg {
 
 #[derive(Subcommand)]
 enum IndexCommand {
-    /// Delete the derived RETRIEVAL indexes (BM25 + vectors) and rebuild them
-    /// from the authoritative rows. Does NOT rebuild the code graph — that is
-    /// built per-repository on session open / first run.
+    /// Delete the derived SEARCH indexes (full-text BM25 + vectors) and rebuild
+    /// them from the authoritative rows. This does NOT build the code graph —
+    /// for that, run `codypendent graph build`.
     Rebuild,
+}
+
+#[derive(Subcommand)]
+enum GraphCommand {
+    /// Fold this repository's code graph now, and report what the fold saw:
+    /// files walked, files folded, nodes and edges written, a per-language
+    /// breakdown, and — the point of the command — every file extension that
+    /// produced nothing, so an empty graph explains itself instead of being a
+    /// silent zero.
+    #[command(visible_alias = "rebuild")]
+    Build {
+        /// Repository to fold. Defaults to the current directory; either way it
+        /// anchors on the enclosing checkout, never on a subdirectory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Emit the report as JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show what the stored code graph holds for this repository — counts,
+    /// per-language and per-kind breakdowns, the revision it was folded at, and
+    /// whether it is stale relative to the working tree. Reads only; never
+    /// re-scans.
+    Status {
+        /// Repository to describe. Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Emit the status as JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the graph's nodes (and optionally their edges), filtered, so the
+    /// graph is inspectable from the terminal rather than only through the TUI
+    /// overlay.
+    Show {
+        /// Repository to read. Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Only nodes whose repo-relative source path starts with this prefix.
+        #[arg(long)]
+        path: Option<String>,
+        /// Only nodes in this language, as stored (`rust`, `python`, …).
+        #[arg(long)]
+        language: Option<String>,
+        /// Only nodes of this kind, as stored (`function`, `type`, `file`, …).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only nodes whose qualified name contains this text.
+        #[arg(long)]
+        name: Option<String>,
+        /// Exactly one node, by the id `graph show` prints. Scoped to this
+        /// repository like every other filter: an id belonging to another
+        /// checkout is refused identically to one that does not exist.
+        #[arg(long = "node")]
+        node_id: Option<String>,
+        /// Also list the edges incident to the selected nodes.
+        #[arg(long)]
+        edges: bool,
+        /// Maximum rows of each kind (server-clamped).
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Emit the page as JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -334,9 +411,9 @@ enum SkillCommand {
         directory: PathBuf,
     },
     /// Author a new skill package and register it as a `draft` — installed and
-    /// inspectable, but never disclosed to a run until a human promotes it
-    /// (outcome 4). Validated and installed through the same pipeline `add`
-    /// runs; nothing here can register an `active` skill.
+    /// inspectable, but never disclosed to a run until a human promotes it.
+    /// Validated and installed through the same pipeline `add` runs; nothing
+    /// here can register an `active` skill.
     New {
         /// The skill's manifest id (also its directory name under
         /// `<data_dir>/skills/`).
@@ -539,9 +616,9 @@ enum WorkflowCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Start a durable workflow run from a manifest (Phase 5 STEP 5.2). Ensures a
-    /// daemon, sends the manifest, and prints the new run id the daemon drives to a
-    /// terminal state in the background.
+    /// Start a durable workflow run from a manifest. Ensures a daemon, sends
+    /// the manifest, and prints the new run id the daemon drives to a terminal
+    /// state in the background.
     Run {
         /// Path to the workflow manifest to run.
         file: PathBuf,
@@ -555,8 +632,8 @@ enum WorkflowCommand {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Pause a running workflow run so its driver stops launching new nodes; resume
-    /// it later with `workflow resume` (Phase 5 STEP 5.2).
+    /// Pause a running workflow run so its driver stops launching new nodes;
+    /// resume it later with `workflow resume`.
     Pause {
         /// The durable workflow-run id (as printed by `workflow run`).
         workflow_run_id: String,
@@ -575,14 +652,14 @@ enum WorkflowCommand {
         #[arg(long)]
         node: String,
     },
-    /// Cancel a workflow run (Phase 5 T9): a cooperative drain — the driver stops
+    /// Cancel a workflow run: a cooperative drain — the driver stops
     /// launching new nodes, any in-flight node's agent run is interrupted, remaining
     /// pending nodes are skipped, and the run lands cancelled (terminal — no resume).
     Cancel {
         /// The durable workflow-run id.
         workflow_run_id: String,
     },
-    /// Watch a workflow run's live node lifecycle (Phase 5 T9): prints the run's
+    /// Watch a workflow run's live node lifecycle: prints the run's
     /// current snapshot (each node's state, cost, and any failure/block reason), then
     /// streams each node transition and run-phase change until the run reaches a
     /// terminal state (or the stream is interrupted).
@@ -617,9 +694,9 @@ enum DocsCommand {
     /// signature changes and disappearances, and file each finding as a
     /// reviewable Maintain-mode suggestion. Prints the finding counts.
     Check,
-    /// Publish a document's current revision to a Git target (Phase 4 STEP
-    /// 4.4). Prints the computed plan (target / changed files / resulting Git
-    /// action) and prompts for confirmation, then sends `PublishDocument`;
+    /// Publish a document's current revision to a Git target. Prints the
+    /// computed plan (target / changed files / resulting Git action) and
+    /// prompts for confirmation, then sends `PublishDocument`;
     /// ensures a daemon, parks a durable approval, and resolves it with the
     /// confirmed decision. Nothing is written until the approval resolves —
     /// on approval, the daemon executes the plan in the background and this
@@ -648,9 +725,9 @@ enum DocsCommand {
     },
 }
 
-/// `codypendent docs publish --target <TARGET>`: which Git target STEP 4.4.2
-/// describes. Mirrors `codypendent_knowledge::PublishTarget`'s three variants
-/// with CLI-friendly names.
+/// `codypendent docs publish --target <TARGET>`: where a published document
+/// lands. Mirrors `codypendent_knowledge::PublishTarget`'s three variants with
+/// CLI-friendly names.
 #[derive(Clone, Copy, ValueEnum)]
 enum PublishTargetArg {
     /// Write the rendered Markdown to a repository file in the working tree.
@@ -674,15 +751,15 @@ impl From<PublishTargetArg> for commands::PublishTargetKind {
 #[derive(Subcommand)]
 enum EvalCommand {
     /// Execute an `evals/tasks/` suite headlessly over the JSONL client and
-    /// write a `SuiteReport` (Phase 7 STEP 7.1). Ensures a daemon; each case
-    /// starts its own run against its pinned fixture repository.
+    /// write a `SuiteReport`. Ensures a daemon; each case starts its own run
+    /// against its pinned fixture repository.
     Run {
         /// The suite directory under `evals/tasks/` (e.g. `core` for
         /// `evals/tasks/core/`), or a path to it directly.
         #[arg(long, default_value = "core")]
         suite: String,
-        /// The routing policy to select each case's model under (Phase 7's
-        /// "routing⇄eval composition"). Resolved via `codypendent-routing`
+        /// The routing policy to select each case's model under. Resolved
+        /// via `codypendent-routing`
         /// over the persisted model profiles, fail-closed: an unknown name or
         /// a case with no eligible model stops `eval run` before any case
         /// executes. The selection is recorded per case in the report
@@ -714,8 +791,10 @@ enum ModelsCommand {
     /// resolution, same atomic write). With no `--key-env`, a key is read
     /// from the provider's documented environment variable at call time.
     Add {
-        /// The catalog provider id (`codypendent models list-providers`
-        /// spellings: `openai`, `nebius`, `azure-openai`, …).
+        /// The catalog provider id, as `codypendent models list-providers`
+        /// spells it: `openai`, `anthropic`, `nebius`, `openrouter`, …. That
+        /// listing marks the providers this command cannot serve; every
+        /// example here is one it can.
         provider: String,
         /// The provider-side model id, as it must be sent on the wire.
         model: String,
@@ -736,7 +815,7 @@ enum ModelsCommand {
         id: String,
     },
     /// Benchmark a local model configured in `models.toml` and persist its
-    /// measured profile (Phase 7 STEP 7.2.2): tokens/sec, time-to-first-token,
+    /// measured profile: tokens/sec, time-to-first-token,
     /// warm-up, memory, context limit, structured-output reliability, tool-call
     /// accuracy, and a small coding-eval score. The router reads these MEASURED
     /// numbers (never vibes). Also caches the first-use capability probe.
@@ -750,8 +829,8 @@ enum ModelsCommand {
         /// up from the built-in provider catalog when the entry names a
         /// known `provider_id` (the same catalog `models add` reads); when
         /// neither is available the model is benched with an unpriced
-        /// profile and stays ineligible for routing (Chapter 09's hard
-        /// filter — a hosted model can never be silently treated as free).
+        /// profile and stays ineligible for routing (a hosted model can
+        /// never be silently treated as free).
         /// A LOCAL model needs no price to route (routing costs it at $0
         /// genuinely, not as the harness's "unmeasured" sentinel), so this
         /// flag is normally only needed for a hosted endpoint the catalog
@@ -780,12 +859,12 @@ enum ModelsCommand {
 
 #[derive(Subcommand)]
 enum RoutingCommand {
-    /// Show whether the routing seam is enabled and what `routing.toml`
-    /// currently declares (outcome 11).
+    /// Show whether measured routing is on, and what `routing.toml`
+    /// currently declares.
     Status,
-    /// Turn on live measured routing: task nodes are sent to
-    /// `codypendent-routing`'s `Router` over benched model profiles instead
-    /// of the Phase-1 resolver's first-reachable-candidate order.
+    /// Turn on measured routing: each task's model is chosen from benched
+    /// profiles instead of the first reachable candidate in `models.toml`
+    /// file order.
     Enable {
         /// The most sensitive data this scope is asserted to handle
         /// (`public`|`internal`|`confidential`|`secret`). Governs which
@@ -794,14 +873,14 @@ enum RoutingCommand {
         #[arg(long)]
         data_classification: Option<String>,
     },
-    /// Turn off live measured routing (the Phase-1 resolver decides again).
+    /// Turn off measured routing; `models.toml` file order decides again.
     Disable,
 }
 
 #[derive(Subcommand)]
 enum PromoteCommand {
-    /// Draft a candidate for the promotion pipeline (Phase 7 STEP 7.5). Prints
-    /// the new candidate id.
+    /// Draft a candidate for the promotion pipeline. Prints the new
+    /// candidate id.
     Propose {
         /// The artifact kind: `retrieval`, `skill`, `prompt`, `router`,
         /// `workflow`, or `model-profile`.
@@ -845,9 +924,11 @@ enum PromoteCommand {
         #[arg(long)]
         baseline_p95_latency_ms: Option<u64>,
     },
-    /// **Approve and promote a candidate** (ADR-010: requires the `Controller`
-    /// role, which this local-first socket maps to a human operator — an
-    /// agent/system-initiated approval is refused structurally).
+    // ADR-010 is enforced here, not merely documented: the `Controller` role
+    // this local-first socket maps to a human operator is required, so an
+    // agent- or system-initiated approval is refused structurally.
+    /// **Approve and promote a candidate.** Requires a human operator; an
+    /// agent cannot approve its own promotion.
     Approve { candidate_id: String },
     /// Manually roll back a promoted candidate to its predecessor version.
     Rollback { candidate_id: String },
@@ -942,14 +1023,14 @@ enum PluginCommand {
     /// Parse a `plugin.toml` and render its identity, the capability list it
     /// requests, its resource caps, and its trust posture (signed? sandbox
     /// profile) — the "evaluate permissions" step a user sees before enabling a
-    /// plugin (Phase 6 STEP 6.1). Manifest parsing only; it does not run anything.
+    /// plugin. Manifest parsing only; it does not run anything.
     Inspect {
         /// Path to the plugin manifest to inspect.
         file: PathBuf,
     },
     /// Compare an installed `plugin.toml` against an update and print the
     /// permission diff, reporting whether the update expands permissions and so
-    /// requires re-approval (Phase 6 STEP 6.1, exit criterion 2).
+    /// requires re-approval.
     Diff {
         /// The currently-installed manifest.
         installed: PathBuf,
@@ -957,7 +1038,7 @@ enum PluginCommand {
         update: PathBuf,
     },
     /// Verify a plugin artifact against its manifest using the trusted-publisher
-    /// key store — the real-keys install gate (Phase 6 STEP 6.2). A signed plugin
+    /// key store — the install gate for real keys. A signed plugin
     /// from an unknown publisher, a bad signature, or an unsigned plugin (unless
     /// `--allow-unsigned`) is refused with a non-zero exit (fails closed).
     Verify {
@@ -969,8 +1050,8 @@ enum PluginCommand {
         #[arg(long)]
         allow_unsigned: bool,
     },
-    /// Manage the trusted-publisher key store (Phase 6 STEP 6.2): the ed25519
-    /// public keys `plugin verify` checks signatures against.
+    /// Manage the trusted-publisher key store: the ed25519 public keys
+    /// `plugin verify` checks signatures against.
     Trust {
         #[command(subcommand)]
         command: TrustCommand,
@@ -1043,8 +1124,33 @@ enum EventsFormat {
     Jsonl,
 }
 
+/// Print a failed command's error the way a person reads it, and exit 1.
+///
+/// Returning `anyhow::Result` from `main` hands the error to Rust's
+/// `Termination` impl, which prints the **Debug** form — and with
+/// `RUST_BACKTRACE` set anywhere in the environment, that is the captured
+/// backtrace. The 2026-08-13 review caught this as 36 frames dumped over the
+/// terminal when the TUI lost its daemon, but the TUI was only where it was
+/// noticed: EVERY command exits through here, so `models add azure-openai
+/// gpt-5.4` printed its (correct, actionable) one-line refusal followed by a
+/// stack trace naming `anyhow/error.rs` and `_start`.
+///
+/// `{error:#}` is anyhow's alternate Display: the whole `.context(...)` chain
+/// on one line, no frames. The `Error:` prefix and the exit status are the
+/// same ones `Termination` produced, so scripts see no change — only the
+/// backtrace goes away.
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // `codypendent __daemon` *is* the daemon (the hidden self-spawn target of
@@ -1116,6 +1222,33 @@ async fn main() -> anyhow::Result<()> {
         TopCommand::Index {
             command: IndexCommand::Rebuild,
         } => commands::index_rebuild(&paths).await,
+        TopCommand::Graph { command } => match command {
+            GraphCommand::Build { repo, json } => commands::graph_build(&paths, repo, json).await,
+            GraphCommand::Status { repo, json } => commands::graph_status(&paths, repo, json).await,
+            GraphCommand::Show {
+                repo,
+                path,
+                language,
+                kind,
+                name,
+                node_id,
+                edges,
+                limit,
+                json,
+            } => {
+                let query = codypendent_protocol::CodeGraphQuery {
+                    path,
+                    language,
+                    kind,
+                    name,
+                    node_id,
+                    include_edges: edges,
+                    include_nodes: true,
+                    limit,
+                };
+                commands::graph_show(&paths, repo, query, json).await
+            }
+        },
         TopCommand::Skill { command } => match command {
             SkillCommand::Add { directory } => commands::skill_add(&paths, &directory).await,
             SkillCommand::New {

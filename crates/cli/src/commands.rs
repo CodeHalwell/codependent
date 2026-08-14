@@ -11,11 +11,10 @@ use base64::Engine as _;
 use codypendent_daemon::policy::{ApprovalAction, MergedPolicy, PolicyEngine};
 use codypendent_integrations::mcp::{load_mcp_config, McpConfig};
 use codypendent_knowledge::{
-    anchor_repository_id, db as knowledge_db, install_package, is_retrievable_status,
-    local_user_scope, plan_publication, publications, register_builtins, retrieve,
-    user_skills_root, DocumentStore, HashingEmbedder, Publication,
-    PublishTarget as KnowledgePublishTarget, Registry, RetrievalConfig, RetrievalIndexes,
-    RetrievalQuery, RiskClass, Scope,
+    db as knowledge_db, install_package, is_retrievable_status, local_user_scope, plan_publication,
+    publications, register_builtins, retrieve, user_skills_root, DocumentStore, HashingEmbedder,
+    Publication, PublishTarget as KnowledgePublishTarget, Registry, RetrievalConfig,
+    RetrievalIndexes, RetrievalQuery, RiskClass, Scope,
 };
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
@@ -621,11 +620,21 @@ pub async fn index_rebuild(paths: &RuntimePaths) -> anyhow::Result<()> {
     let result = retrieve(&items, &indexes, &query, &RetrievalConfig::default())?;
 
     println!(
-        "index rebuild complete: {} registry item(s) re-indexed from authority; \
+        "search index rebuild complete: {} registry item(s) re-indexed from authority; \
          canary \"run the tests\" -> {} tool card(s), {} skill card(s)",
         items.len(),
         result.tools.len(),
         result.skills.len(),
+    );
+    // Said out loud, on the success line, because the old wording actively
+    // misled: "index rebuild complete: 29 registry item(s) re-indexed" reads as
+    // "the index, code graph included, is built" — and that reading is exactly
+    // why an empty code graph went unexplained. Naming the command that DOES
+    // build it turns a dead end into a next step.
+    println!(
+        "This rebuilt the SEARCH indexes (full-text + vectors) only. It does not \
+         build the code graph.\nTo (re)build the code graph for a repository, run \
+         `codypendent graph build`; `codypendent graph status` shows what it holds."
     );
     Ok(())
 }
@@ -639,10 +648,18 @@ pub async fn index_rebuild(paths: &RuntimePaths) -> anyhow::Result<()> {
 /// the same root on its next boot, so an install taken while the daemon is down
 /// is picked up rather than lost.
 ///
-/// A package declaring `scope = "repository"` anchors to the checkout `dir`
-/// lives in (its Git toplevel), derived exactly as the daemon derives a run's
-/// repository identity — a mismatch there would register the skill under an
-/// identity no run ever queries, leaving it silently invisible.
+/// A package declaring `scope = "repository"` anchors to the checkout the
+/// OPERATOR is standing in, exactly as [`skill_new`] does — not to wherever the
+/// package directory happens to sit. `dir` is a source to copy from and carries
+/// no repository identity of its own: the 2026-08-13 review followed the
+/// skill-writer's own printed promotion instruction (`skill add
+/// <data_dir>/skills/<id>`), which anchored the promoted package to
+/// `<data_dir>`'s path, so `draft` landed under the checkout and `active`
+/// landed under an identity no run ever queries — an installed skill that
+/// retrieval never disclosed, reported as nothing at all. Adding a package kept
+/// outside the checkout (the natural place to keep one) failed the same way.
+///
+/// See [`crate::repo_anchor`] for the invariant this is one instance of.
 ///
 /// A non-`active` package installs and registers, but is reported loudly: the
 /// retrieval funnel hard-filters everything but Active, so a draft skill is
@@ -656,7 +673,7 @@ pub async fn skill_add(paths: &RuntimePaths, dir: &std::path::Path) -> anyhow::R
         .with_context(|| format!("opening {}", database_path.display()))?;
 
     let skills_root = user_skills_root(&paths.data_dir);
-    let anchor = anchor_repository_id(dir);
+    let anchor = crate::repo_anchor::anchor_repository_id(&std::env::current_dir()?);
     let (item, installed) = install_package(&pool, dir, &skills_root, anchor)
         .await
         .with_context(|| format!("installing the skill package at {}", dir.display()))?;
@@ -703,9 +720,11 @@ pub async fn skill_new(
     let body = std::fs::read_to_string(procedure)
         .with_context(|| format!("reading the procedure body {}", procedure.display()))?;
 
-    // Derived exactly as `skill_add` derives it: a `repository`-scoped skill
-    // registered under any other identity is invisible to every run.
-    let anchor = anchor_repository_id(&std::env::current_dir()?);
+    // Derived exactly as `skill_add` derives it — through the one accessor, so
+    // authoring and promoting a skill can never disagree about which checkout
+    // it belongs to. A `repository`-scoped skill registered under any other
+    // identity is invisible to every run.
+    let anchor = crate::repo_anchor::anchor_repository_id(&std::env::current_dir()?);
     let scope = match scope {
         "user" => local_user_scope(),
         "repository" => Scope::Repository(anchor),
@@ -860,10 +879,11 @@ pub async fn docs_list(paths: &RuntimePaths) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("opening {}", database_path.display()))?;
 
-    // `anchor_repository_id`, not `stable_repository_id`: the daemon stores rows
-    // under the Git toplevel, so hashing the current directory listed nothing
-    // whenever this was run from a subdirectory of the checkout.
-    let repository = anchor_repository_id(&std::env::current_dir()?);
+    // The checkout, never the current directory: the daemon stores rows under
+    // the Git toplevel, so hashing the directory as-opened listed nothing
+    // whenever this was run from a subdirectory. `crate::repo_anchor` is the
+    // one accessor for that resolution.
+    let repository = crate::repo_anchor::anchor_repository_id(&std::env::current_dir()?);
     let scopes = [Scope::Repository(repository), Scope::System];
     let summaries = DocumentStore::new().list(&pool, &scopes).await?;
     if summaries.is_empty() {
@@ -2703,6 +2723,474 @@ fn render_mcp_list(config: &McpConfig, merged: &MergedPolicy) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// `codypendent graph {build,status,show}`
+// ---------------------------------------------------------------------------
+
+/// Which repository the graph commands act on: the **checkout**, resolved
+/// through [`crate::repo_anchor`], never the directory the operator happens to
+/// be standing in.
+///
+/// Every graph command resolves it here and nowhere else. The alternative —
+/// each command sending its own `current_dir()` — is the shape the 2026-08-13
+/// review found behind "No documents yet." for a document that existed: a
+/// subdirectory hashed to a different identity, the `WHERE` matched nothing,
+/// and the empty list was a perfectly legitimate-looking answer to a
+/// perfectly legitimate question. A code graph queried under the wrong
+/// identity fails exactly the same way, and reporting "0 nodes" for it would
+/// be indistinguishable from the bug this command family exists to fix.
+fn graph_repository(repo: Option<PathBuf>) -> anyhow::Result<String> {
+    let dir = match repo {
+        Some(repo) => repo,
+        None => std::env::current_dir()?,
+    };
+    Ok(crate::repo_anchor::anchor_repository_path(&dir)
+        .display()
+        .to_string())
+}
+
+/// Open a Controller-role connection for a graph command. A build is a write
+/// (it clears and rewrites the repository's graph), so it needs the role; the
+/// reads bind it too, which costs one frame and keeps the three commands'
+/// connection setup identical.
+async fn graph_connection(paths: &RuntimePaths) -> anyhow::Result<Connection> {
+    ensure_daemon(paths).await?;
+    let mut conn = Connection::connect(&paths.socket_path)
+        .await
+        .with_context(|| "connecting to the daemon (is it running?)")?;
+    conn.handshake("codypendent", env!("CARGO_PKG_VERSION"), None)
+        .await?;
+    bind_control_role(&mut conn).await?;
+    Ok(conn)
+}
+
+/// Turn a daemon refusal into a message that says what to do about it. A bare
+/// `graph.not-a-repository` code is exactly as unhelpful as the silence being
+/// fixed.
+fn graph_rejection(verb: &str, error: &codypendent_protocol::CodypendentError) -> anyhow::Error {
+    let hint = match error.code.as_str() {
+        "graph.not-a-repository" => {
+            "\nThe code graph is per-checkout. Run this inside a Git repository, \
+             or pass --repo <PATH>."
+        }
+        "graph.transport-unavailable" => {
+            "\nThis daemon was built without the code-graph transport. \
+             Run `codypendent daemon restart` after updating."
+        }
+        _ => "",
+    };
+    anyhow::anyhow!(
+        "graph {verb} rejected: {} ({}){hint}",
+        error.message,
+        error.code
+    )
+}
+
+/// `codypendent graph build` — fold the repository's code graph now, and say
+/// what the fold saw.
+///
+/// The **report is the feature**. Before this command the graph was built only
+/// as a side effect of opening a session or starting a run, and an empty graph
+/// explained nothing: on a mixed repository, Python and TSX files contributed
+/// zero nodes and no surface said so. `index rebuild` — whose name reads as
+/// "build the index, graph included" — explicitly does not touch the graph, and
+/// its cheerful "29 registry item(s) re-indexed" made the silence worse.
+///
+/// Goes through the daemon rather than folding in-process, because the graph
+/// has exactly one writer gate (`scan::lock_repository`) and it is a
+/// per-process lock. A CLI that cleared and rebuilt the graph beside a running
+/// daemon would reproduce the torn-graph race verbatim (2026-08-13 review, F6).
+pub async fn graph_build(
+    paths: &RuntimePaths,
+    repo: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let repository = graph_repository(repo)?;
+    let mut conn = graph_connection(paths).await?;
+    if !json {
+        println!("Folding the code graph for {repository} …");
+    }
+    let reply = conn
+        .send_command(CommandBody::BuildCodeGraph {
+            repository: repository.clone(),
+        })
+        .await?;
+    match reply.payload {
+        Payload::CodeGraphBuilt { report, .. } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", render_scan_report(&report));
+            }
+            Ok(())
+        }
+        Payload::CommandRejected(error) => Err(graph_rejection("build", &error)),
+        other => anyhow::bail!("unexpected reply to BuildCodeGraph: {other:?}"),
+    }
+}
+
+/// `codypendent graph status` — what the stored graph holds, with no re-scan.
+pub async fn graph_status(
+    paths: &RuntimePaths,
+    repo: Option<PathBuf>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let repository = graph_repository(repo)?;
+    let mut conn = graph_connection(paths).await?;
+    let reply = conn
+        .send_command(CommandBody::ReadCodeGraphStatus { repository })
+        .await?;
+    match reply.payload {
+        Payload::CodeGraphStatus { status, .. } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print!("{}", render_status(&status));
+            }
+            Ok(())
+        }
+        Payload::CommandRejected(error) => Err(graph_rejection("status", &error)),
+        other => anyhow::bail!("unexpected reply to ReadCodeGraphStatus: {other:?}"),
+    }
+}
+
+/// `codypendent graph show` — list the graph's nodes and edges, filtered, so it
+/// is inspectable from a terminal rather than only through the TUI overlay.
+#[allow(clippy::too_many_arguments)]
+pub async fn graph_show(
+    paths: &RuntimePaths,
+    repo: Option<PathBuf>,
+    query: codypendent_protocol::CodeGraphQuery,
+    json: bool,
+) -> anyhow::Result<()> {
+    let repository = graph_repository(repo)?;
+    let mut conn = graph_connection(paths).await?;
+    let reply = conn
+        .send_command(CommandBody::ReadCodeGraph { repository, query })
+        .await?;
+    match reply.payload {
+        Payload::CodeGraphPage { page, .. } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&page)?);
+            } else {
+                print!("{}", render_page(&page));
+            }
+            Ok(())
+        }
+        Payload::CommandRejected(error) => Err(graph_rejection("show", &error)),
+        other => anyhow::bail!("unexpected reply to ReadCodeGraph: {other:?}"),
+    }
+}
+
+/// The grammar roster as one line: `rust (.rs) · python (.py .pyi) · …`. Built
+/// from what the daemon sent, never from a list held here — a client-side copy
+/// of the roster is stale the day a grammar is added.
+fn render_grammars(grammars: &[codypendent_protocol::CodeGraphGrammar]) -> String {
+    grammars
+        .iter()
+        .map(|grammar| {
+            let extensions: Vec<String> = grammar
+                .extensions
+                .iter()
+                .map(|extension| format!(".{extension}"))
+                .collect();
+            format!("{} ({})", grammar.language, extensions.join(" "))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Render a build report.
+///
+/// Pure and returning a `String` rather than printing, so the wording that
+/// explains an empty graph is testable — that wording *is* the feature, and a
+/// feature that only exists inside a `println!` cannot be asserted on.
+fn render_scan_report(report: &codypendent_protocol::CodeGraphScanReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\ncode graph built — {}\n",
+        report.repository_root
+    ));
+    out.push_str(&format!(
+        "  revision      {} ({} ms)\n",
+        report.revision, report.elapsed_ms
+    ));
+    out.push_str(&format!(
+        "  walked        {} file(s); {} matched a grammar\n",
+        report.files_walked, report.files_supported
+    ));
+    out.push_str(&format!(
+        "  folded        {} file(s) -> {} node(s), {} edge(s)\n",
+        report.files_folded, report.nodes, report.edges
+    ));
+    for language in &report.by_language {
+        out.push_str(&format!(
+            "                {:<12} {:>5} file(s) {:>7} node(s) {:>7} edge(s)\n",
+            language.language, language.files, language.nodes, language.edges
+        ));
+    }
+    if report.files_ignored > 0 {
+        out.push_str(&format!(
+            "  ignored       {} file(s) a grammar covers but .gitignore excludes\n",
+            report.files_ignored
+        ));
+    }
+
+    // A file whose extension a grammar covers but which produced nothing is a
+    // different failure from one no grammar covers, and hiding it inside the
+    // unsupported count would misattribute a parse bug to a missing language.
+    //
+    // Ignored files are subtracted first because they are a SUBSET of the
+    // supported ones — the scan only reaches its ignore filter for candidates a
+    // grammar already claimed. Leaving them in reported one phantom parse
+    // failure per `.gitignore`d source file, which is precisely the kind of
+    // confidently-wrong number this command exists to stop producing.
+    let unparsed = report
+        .files_supported
+        .saturating_sub(report.files_folded)
+        .saturating_sub(report.files_ignored);
+    if unparsed > 0 {
+        out.push_str(&format!(
+            "  ! {unparsed} file(s) matched a grammar but produced nothing — unreadable, or\n\
+             \x20   the parser rejected them. See the daemon log for the per-file reason.\n"
+        ));
+    }
+
+    if report.nodes == 0 {
+        out.push_str("\n  The graph is EMPTY.\n");
+        if report.files_walked == 0 {
+            out.push_str(
+                "  This checkout has no files the walk could see. There is nothing to fold.\n",
+            );
+        } else {
+            out.push_str(&format!(
+                "  {} file(s) were walked and not one of them produced a symbol.\n",
+                report.files_walked
+            ));
+        }
+    }
+
+    if report.files_unsupported > 0 {
+        out.push_str(&format!(
+            "\n  {} file(s) are in a language no grammar covers",
+            report.files_unsupported
+        ));
+        if report.not_folded.is_empty() {
+            out.push_str(".\n");
+        } else {
+            out.push_str(":\n");
+            for skipped in &report.not_folded {
+                out.push_str(&format!(
+                    "                .{:<12} {:>6} file(s)\n",
+                    skipped.extension, skipped.files
+                ));
+            }
+        }
+        if !report.grammars.is_empty() {
+            out.push_str(&format!(
+                "  This build folds: {}\n",
+                render_grammars(&report.grammars)
+            ));
+        }
+        out.push_str(
+            "  Those files contribute nothing to the graph. That is a limit of the\n\
+             \x20 extractor, not a fault in your repository.\n",
+        );
+    }
+
+    if report.cap_hit {
+        out.push_str(&format!(
+            "\n  ! The {}-file scan cap was reached. This graph is a TRUNCATION of the\n\
+             \x20   repository, not the repository.\n",
+            report.file_cap
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// Render a status view.
+fn render_status(status: &codypendent_protocol::CodeGraphStatusView) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("\ncode graph — {}\n", status.repository_root));
+    out.push_str(&format!(
+        "  HEAD          {} ({})\n",
+        status.head_revision,
+        if status.working_tree_dirty {
+            "working tree has uncommitted changes"
+        } else {
+            "working tree clean"
+        }
+    ));
+    out.push_str(&format!(
+        "  stored        {} node(s), {} edge(s) across {} file(s)\n",
+        status.nodes, status.edges, status.files
+    ));
+    for language in &status.by_language {
+        out.push_str(&format!(
+            "                {:<12} {:>5} file(s) {:>7} node(s) {:>7} edge(s)\n",
+            language.language, language.files, language.nodes, language.edges
+        ));
+    }
+    if !status.by_kind.is_empty() {
+        out.push_str(&format!(
+            "  kinds         {}\n",
+            render_tallies(&status.by_kind)
+        ));
+    }
+    if !status.revisions.is_empty() {
+        out.push_str(&format!(
+            "  built at      {}\n",
+            render_tallies(&status.revisions)
+        ));
+    }
+    match (&status.stale, &status.stale_reason) {
+        (true, Some(reason)) => out.push_str(&format!("  status        STALE — {reason}\n")),
+        (true, None) => out.push_str("  status        STALE\n"),
+        (false, _) => out.push_str("  status        current\n"),
+    }
+    if status.nodes == 0 {
+        // Deliberately not "nothing has been built yet": a build may well have
+        // run and found nothing to fold, and telling that user to run it again
+        // as though they had not is the same species of confidently-wrong
+        // message as the bare zero. Point at the command that EXPLAINS the
+        // emptiness, whichever of the two cases they are in.
+        out.push_str(
+            "\n  This repository's graph holds nothing. Run `codypendent graph build`:\n\
+             \x20 it folds the graph and reports which files it walked and which\n\
+             \x20 extensions produced nothing, so an empty result explains itself.\n\
+             \x20 (`codypendent index rebuild` does NOT build the code graph.)\n",
+        );
+    } else if status.stale {
+        out.push_str("\n  Run `codypendent graph build` to refold it.\n");
+    }
+    out.push('\n');
+    out
+}
+
+/// `label n · label n · …`, bounded so one long tail cannot fill the terminal.
+fn render_tallies(tallies: &[codypendent_protocol::CodeGraphTally]) -> String {
+    const SHOWN: usize = 8;
+    let mut parts: Vec<String> = tallies
+        .iter()
+        .take(SHOWN)
+        .map(|tally| format!("{} {}", tally.label, tally.count))
+        .collect();
+    if tallies.len() > SHOWN {
+        parts.push(format!("…and {} more", tallies.len() - SHOWN));
+    }
+    parts.join(" · ")
+}
+
+/// Render one page of nodes/edges.
+fn render_page(page: &codypendent_protocol::CodeGraphPage) -> String {
+    let mut out = String::new();
+    if page.nodes.is_empty() && page.edges.is_empty() {
+        out.push_str(
+            "\nNo nodes matched.\n\
+             Run `codypendent graph status` to see whether the graph holds anything at all,\n\
+             and `codypendent graph build` to fold it.\n\n",
+        );
+        return out;
+    }
+    if !page.nodes.is_empty() {
+        out.push_str(&format!(
+            "\nnodes  (showing {} of {})\n",
+            page.nodes.len(),
+            page.total_nodes
+        ));
+        for node in &page.nodes {
+            out.push_str(&format!(
+                "  {:<10} {:<12} {:<28} {}\n",
+                node.language,
+                node.kind,
+                node.source_path.as_deref().unwrap_or("-"),
+                node.qualified_name
+            ));
+            out.push_str(&format!(
+                "             id {}  @{}\n",
+                node.id, node.revision
+            ));
+        }
+    }
+    if !page.edges.is_empty() {
+        out.push_str(&format!(
+            "\nedges  (showing {} of {})\n",
+            page.edges.len(),
+            page.total_edges
+        ));
+        for edge in &page.edges {
+            out.push_str(&format!(
+                "  {:<12} {} -> {}  ({:.2}, {})\n",
+                edge.relation, edge.from_name, edge.to_name, edge.confidence, edge.evidence_kind
+            ));
+            if let Some(assertion) = &edge.asserted_by {
+                out.push_str(&render_edge_assertion(assertion));
+            }
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// The indent every edge continuation line hangs under: two leading spaces plus
+/// the 12-column relation field and its separator, so provenance lines up under
+/// the endpoint names rather than under the relation.
+const EDGE_CONTINUATION_INDENT: &str = "               ";
+
+/// A conservative terminal width — the one every wrapped line here fits inside.
+const EDGE_LINE_WIDTH: usize = 80;
+
+/// The columns a rationale may occupy, derived from the width it must fit and
+/// the indent it hangs under (plus the two columns that set it apart from the
+/// run/session lines) rather than restated, so the two cannot drift.
+const RATIONALE_WIDTH: usize = EDGE_LINE_WIDTH - EDGE_CONTINUATION_INDENT.len() - 2;
+
+/// Render an agent-asserted edge's provenance under its row: the run that
+/// claimed it, and the reason it gave.
+///
+/// `evidence_kind` already told the reader THAT a model wrote this edge. That is
+/// the claim; this is the audit trail, and the audit trail is the whole reason a
+/// model is permitted to write to the graph. So the rationale travels in full
+/// rather than being reduced to "asserted by run <uuid>" — the same choice
+/// `crate::tui::evidence_source` makes for a memory's provenance.
+///
+/// A rationale is free text up to 400 characters, which is five terminal rows,
+/// so it is wrapped at [`RATIONALE_WIDTH`] under a fixed indent instead of being
+/// pushed onto the edge row: an edge table whose rows are sometimes 400 columns
+/// wide is not readable, and truncating would throw away the only part a
+/// reviewer actually needs.
+fn render_edge_assertion(assertion: &codypendent_protocol::CodeGraphEdgeAssertion) -> String {
+    // Run and session on separate lines: two full UUIDs plus the indent is 113
+    // columns, which wraps in every terminal and makes both unselectable.
+    let mut out = format!(
+        "{EDGE_CONTINUATION_INDENT}asserted by run {}\n\
+         {EDGE_CONTINUATION_INDENT}in session {}\n",
+        assertion.run_id, assertion.session_id
+    );
+    for line in wrap_words(assertion.rationale.trim(), RATIONALE_WIDTH) {
+        out.push_str(&format!("{EDGE_CONTINUATION_INDENT}  {line}\n"));
+    }
+    out
+}
+
+/// Greedy word wrap to `width` columns. A single word longer than `width` is
+/// left whole on its own line rather than split — breaking mid-identifier makes
+/// a symbol name unsearchable, which is worse than one long line.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    lines
+}
+
 /// The `[mcp]` disposition as the operator wrote it in `policy.toml`
 /// (kebab-case, matching the serde spelling).
 fn disposition_label(action: ApprovalAction) -> &'static str {
@@ -2711,6 +3199,334 @@ fn disposition_label(action: ApprovalAction) -> &'static str {
         ApprovalAction::Approval => "approval",
         ApprovalAction::AlwaysApproval => "always-approval",
         ApprovalAction::Deny => "deny",
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    use codypendent_protocol::{
+        CodeGraphGrammar, CodeGraphLanguageCount, CodeGraphNodeView, CodeGraphPage,
+        CodeGraphScanReport, CodeGraphSkippedExtension, CodeGraphStatusView, CodeGraphTally,
+    };
+
+    fn empty_report() -> CodeGraphScanReport {
+        CodeGraphScanReport {
+            repository_root: "/home/user/api".to_string(),
+            revision: "9f1c2ab".to_string(),
+            files_walked: 1204,
+            files_supported: 0,
+            files_folded: 0,
+            files_unsupported: 1204,
+            files_ignored: 38,
+            nodes: 0,
+            edges: 0,
+            by_language: Vec::new(),
+            not_folded: vec![CodeGraphSkippedExtension {
+                extension: "go".to_string(),
+                files: 1204,
+            }],
+            grammars: vec![CodeGraphGrammar {
+                language: "python".to_string(),
+                extensions: vec!["py".to_string(), "pyi".to_string()],
+            }],
+            file_cap: 2000,
+            cap_hit: false,
+            elapsed_ms: 41,
+        }
+    }
+
+    /// **The user's report, as a test.** "the DAG isn't being built" was a graph
+    /// that came out empty and said nothing about why. An empty build must name
+    /// the count of files it walked, the extensions that produced nothing, and
+    /// the grammars that would have worked — a bare zero is the bug.
+    #[test]
+    fn an_empty_build_explains_itself_instead_of_printing_a_zero() {
+        let rendered = render_scan_report(&empty_report());
+
+        assert!(rendered.contains("EMPTY"), "{rendered}");
+        assert!(rendered.contains("1204"), "{rendered}");
+        assert!(
+            rendered.contains(".go"),
+            "the extension responsible must be named: {rendered}"
+        );
+        assert!(
+            rendered.contains("python (.py .pyi)"),
+            "the roster that WOULD have folded must be shown: {rendered}"
+        );
+        assert!(
+            rendered.contains("38 file(s)"),
+            "ignored files are accounted for, not silently dropped: {rendered}"
+        );
+    }
+
+    /// A file whose extension a grammar covers but which folded to nothing is a
+    /// different failure from one no grammar covers — a parser problem, not a
+    /// missing language. Rolling it into the unsupported count would send the
+    /// reader looking for a grammar that already exists.
+    #[test]
+    fn a_supported_file_that_folded_nothing_is_reported_separately() {
+        let mut report = empty_report();
+        report.files_supported = 5;
+        report.files_folded = 2;
+        report.files_ignored = 0;
+        report.nodes = 7;
+        let rendered = render_scan_report(&report);
+        assert!(
+            rendered.contains("3 file(s) matched a grammar but produced nothing"),
+            "{rendered}"
+        );
+    }
+
+    /// A `.gitignore`d source file is a supported candidate the scan chose not
+    /// to fold — NOT a parse failure. Counting it as one reported a phantom
+    /// broken file for every ignored `.js` in `node_modules`, observed on a real
+    /// checkout before this subtraction was fixed.
+    #[test]
+    fn an_ignored_source_file_is_not_reported_as_a_parse_failure() {
+        let mut report = empty_report();
+        report.files_walked = 9;
+        report.files_supported = 7;
+        report.files_folded = 6;
+        report.files_ignored = 1;
+        report.files_unsupported = 2;
+        report.nodes = 32;
+        let rendered = render_scan_report(&report);
+        assert!(
+            !rendered.contains("matched a grammar but produced nothing"),
+            "6 folded + 1 ignored accounts for all 7 candidates: {rendered}"
+        );
+        assert!(
+            rendered.contains("1 file(s) a grammar covers but .gitignore excludes"),
+            "{rendered}"
+        );
+    }
+
+    /// The cap is the difference between "this is your repository" and "this is
+    /// part of your repository", so it is stated, loudly, not inferred.
+    #[test]
+    fn hitting_the_scan_cap_says_the_graph_is_a_truncation() {
+        let mut report = empty_report();
+        report.cap_hit = true;
+        report.files_folded = 2000;
+        report.nodes = 40_000;
+        let rendered = render_scan_report(&report);
+        assert!(rendered.contains("TRUNCATION"), "{rendered}");
+        assert!(rendered.contains("2000-file scan cap"), "{rendered}");
+    }
+
+    fn status(nodes: u64, stale: Option<&str>) -> CodeGraphStatusView {
+        CodeGraphStatusView {
+            repository_root: "/home/user/api".to_string(),
+            nodes,
+            edges: nodes / 2,
+            files: 3,
+            by_language: vec![CodeGraphLanguageCount {
+                language: "rust".to_string(),
+                files: 3,
+                nodes,
+                edges: nodes / 2,
+            }],
+            by_kind: vec![CodeGraphTally {
+                label: "function".to_string(),
+                count: nodes,
+            }],
+            revisions: vec![CodeGraphTally {
+                label: "9f1c2ab".to_string(),
+                count: nodes,
+            }],
+            head_revision: "9f1c2ab".to_string(),
+            working_tree_dirty: false,
+            stale: stale.is_some(),
+            stale_reason: stale.map(ToOwned::to_owned),
+        }
+    }
+
+    /// An empty stored graph must point at the command that fills it — and say
+    /// out loud that `index rebuild` is not that command. That confusion is
+    /// half the reported bug: `index rebuild` prints a cheerful success line
+    /// and never touches the graph.
+    #[test]
+    fn an_empty_status_points_at_graph_build_and_disowns_index_rebuild() {
+        let rendered = render_status(&status(0, Some("the graph is empty")));
+        assert!(rendered.contains("codypendent graph build"), "{rendered}");
+        assert!(
+            rendered.contains("index rebuild` does NOT build the code graph"),
+            "{rendered}"
+        );
+    }
+
+    /// A stale graph names its reason. "STALE" alone is as unhelpful as "0".
+    #[test]
+    fn a_stale_status_prints_the_reason_and_the_remedy() {
+        let rendered = render_status(&status(12, Some("folded at old, but HEAD is now 9f1c2ab")));
+        assert!(rendered.contains("STALE — folded at old"), "{rendered}");
+        assert!(rendered.contains("graph build` to refold"), "{rendered}");
+        assert!(!rendered.contains("does NOT build"), "{rendered}");
+    }
+
+    #[test]
+    fn a_current_status_says_current() {
+        let rendered = render_status(&status(12, None));
+        assert!(rendered.contains("status        current"), "{rendered}");
+        assert!(rendered.contains("working tree clean"), "{rendered}");
+    }
+
+    /// An empty page must not read as "your filter matched nothing, move on":
+    /// the far more likely cause is a graph that was never built.
+    #[test]
+    fn an_empty_page_sends_the_reader_to_status_and_build() {
+        let rendered = render_page(&CodeGraphPage {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            total_nodes: 0,
+            total_edges: 0,
+            limit: 50,
+        });
+        assert!(rendered.contains("graph status"), "{rendered}");
+        assert!(rendered.contains("graph build"), "{rendered}");
+    }
+
+    /// A page says how much it is NOT showing, so a limit never reads as the
+    /// whole graph.
+    #[test]
+    fn a_page_states_the_total_it_was_drawn_from() {
+        let rendered = render_page(&CodeGraphPage {
+            nodes: vec![CodeGraphNodeView {
+                id: "n1".to_string(),
+                language: "rust".to_string(),
+                package: None,
+                source_path: Some("src/lib.rs".to_string()),
+                qualified_name: "one".to_string(),
+                kind: "function".to_string(),
+                revision: "9f1c2ab".to_string(),
+            }],
+            edges: Vec::new(),
+            total_nodes: 812,
+            total_edges: 0,
+            limit: 50,
+        });
+        assert!(rendered.contains("showing 1 of 812"), "{rendered}");
+    }
+
+    fn edge_view(
+        evidence_kind: &str,
+        asserted_by: Option<codypendent_protocol::CodeGraphEdgeAssertion>,
+    ) -> codypendent_protocol::CodeGraphEdgeView {
+        codypendent_protocol::CodeGraphEdgeView {
+            from_id: "n1".to_string(),
+            from_name: "routes::handle_charge".to_string(),
+            to_id: "n2".to_string(),
+            to_name: "services::ChargeService::run".to_string(),
+            relation: "calls".to_string(),
+            confidence: 0.6,
+            evidence_kind: evidence_kind.to_string(),
+            revision: "9f1c2ab".to_string(),
+            asserted_by,
+        }
+    }
+
+    fn page_of(edges: Vec<codypendent_protocol::CodeGraphEdgeView>) -> CodeGraphPage {
+        let total_edges = edges.len() as u64;
+        CodeGraphPage {
+            nodes: Vec::new(),
+            edges,
+            total_nodes: 0,
+            total_edges,
+            limit: 50,
+        }
+    }
+
+    /// The audit trail an agent-written edge exists to leave: `graph show
+    /// --edges` must name the run that asserted it and print the reason it
+    /// gave. Before this, the row said `agent_asserted` and stopped — the claim
+    /// without the grounds.
+    #[test]
+    fn an_agent_asserted_edge_prints_its_run_and_rationale() {
+        let session_id = SessionId::new();
+        let run_id = codypendent_protocol::RunId::new();
+        let rendered = render_page(&page_of(vec![edge_view(
+            "agent_asserted",
+            Some(codypendent_protocol::CodeGraphEdgeAssertion {
+                session_id,
+                run_id,
+                rationale: "src/routes.rs dispatches POST /charge to this handler by name"
+                    .to_string(),
+            }),
+        )]));
+        assert!(rendered.contains("agent_asserted"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("asserted by run {run_id}")),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&session_id.to_string()), "{rendered}");
+        assert!(
+            rendered.contains("dispatches POST /charge to this handler by name"),
+            "{rendered}"
+        );
+    }
+
+    /// A parsed edge asserts nothing, so its row must be exactly what it was —
+    /// no blank provenance line, no "asserted by" with nothing after it.
+    #[test]
+    fn a_parsed_edge_gains_no_provenance_line() {
+        let rendered = render_page(&page_of(vec![edge_view("syntax_inferred", None)]));
+        assert!(rendered.contains("syntax_inferred"), "{rendered}");
+        assert!(!rendered.contains("asserted by"), "{rendered}");
+    }
+
+    /// A rationale is free text up to 400 characters. It must wrap under the
+    /// edge row rather than smear one row across 400 columns — the row layout is
+    /// what makes an edge table readable at all.
+    #[test]
+    fn a_long_rationale_wraps_instead_of_running_off_the_row() {
+        let rationale = "the route table maps every path to a handler by name at startup, so \
+                         nothing in the source text links this handler to the service it \
+                         ultimately calls; the link is only visible at runtime, which is exactly \
+                         why a human had to tell the graph about it"
+            .to_string();
+        assert!(rationale.len() > 200, "the fixture must actually be long");
+        let rendered = render_page(&page_of(vec![edge_view(
+            "agent_asserted",
+            Some(codypendent_protocol::CodeGraphEdgeAssertion {
+                session_id: SessionId::new(),
+                run_id: codypendent_protocol::RunId::new(),
+                rationale: rationale.clone(),
+            }),
+        )]));
+
+        // Only the provenance lines are this function's to bound — an edge row
+        // itself is as wide as the two symbol names it must print in full.
+        let provenance: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with(EDGE_CONTINUATION_INDENT))
+            .collect();
+        assert!(
+            provenance.len() > 3,
+            "a 200+ character rationale must occupy several lines: {provenance:?}"
+        );
+        for line in &provenance {
+            assert!(
+                line.chars().count() <= EDGE_LINE_WIDTH,
+                "every provenance line stays inside {EDGE_LINE_WIDTH} columns: {line:?}"
+            );
+        }
+        // Wrapped, not truncated: every word survives.
+        let flattened: String = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+        let wanted: String = rationale.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flattened.contains(&wanted), "{rendered}");
+    }
+
+    #[test]
+    fn wrap_words_never_splits_a_single_long_word() {
+        let long = "a_very_long_identifier_that_exceeds_the_width_on_its_own";
+        assert_eq!(wrap_words(long, 10), vec![long.to_string()]);
+        assert_eq!(
+            wrap_words("one two three", 7),
+            vec!["one two".to_string(), "three".to_string()]
+        );
+        assert!(wrap_words("   ", 10).is_empty());
     }
 }
 
@@ -3054,12 +3870,20 @@ pub fn models_add(
     let provider = catalog
         .get(provider_id)
         .ok_or_else(|| anyhow::anyhow!("provider `{provider_id}` is not in the catalog"))?;
+    // Refuse through the SAME predicate `models list-providers` annotates with,
+    // and say what to do instead. "has no base URL and cannot be added" was
+    // true and useless: it named a fact about the catalog, not an action.
+    if let Some(reason) = crate::tui::provider_unusable_reason(provider) {
+        anyhow::bail!("provider `{provider_id}` cannot be added — {reason}");
+    }
     let base_url = provider
         .base_url
         .as_deref()
         .map(|url| url.trim().trim_end_matches('/').to_string())
         .filter(|url| !url.is_empty())
         .ok_or_else(|| {
+            // Unreachable via the gate above; kept so a future catalog shape
+            // cannot turn a blank URL into a silently malformed entry.
             anyhow::anyhow!("provider `{provider_id}` has no base URL and cannot be added")
         })?;
     let display_id = id
@@ -3323,6 +4147,12 @@ async fn bench_to_store(
 /// curates (F8: the `models add --help` text has always pointed here; this is
 /// what makes that true). Local providers (Ollama, LM Studio, vLLM) are
 /// marked so a user scanning the list can tell which ones need no API key.
+///
+/// Rows `models add` cannot serve carry the reason, from the same
+/// [`crate::tui::provider_unusable_reason`] that refuses them — the review
+/// found this listing printing 6 such providers unmarked, so a user picked one,
+/// hit a bare "has no base URL and cannot be added", and had nothing telling
+/// them which of the 42 rows were real.
 pub fn models_list_providers(paths: &RuntimePaths) -> anyhow::Result<()> {
     let catalog = codypendent_providers::Catalog::load_with_user_overrides(
         &paths.data_dir.join("providers.toml"),
@@ -3347,6 +4177,9 @@ pub fn models_list_providers(paths: &RuntimePaths) -> anyhow::Result<()> {
             curated,
             if provider.local { "  (local)" } else { "" }
         );
+        if let Some(reason) = crate::tui::provider_unusable_reason(provider) {
+            println!("{:20} └─ not addable: {reason}", "");
+        }
     }
     Ok(())
 }

@@ -442,6 +442,95 @@ async fn a_failed_runs_reason_reaches_the_client_not_only_daemon_log() {
     assert_eq!(exit.exit_code(), 2);
 }
 
+/// Outcome 20 (L3): the run's MEASURED usage reaches `--jsonl` stdout.
+///
+/// `RunUsage` is published AFTER the run's terminal state — the executor
+/// journals `RunCompleted`, then records usage and emits it — so returning on
+/// `RunCompleted` closed the connection in the gap. The reviewer measured
+/// `13 RunCompleted / 14 RunUsage` in the ledger against `[1 … 13]` on stdout,
+/// across six runs, with `RunUsage` printed zero times. Revert
+/// `drain_trailing_usage` and this test fails on the line count.
+#[tokio::test]
+async fn measured_usage_published_after_the_terminal_event_still_reaches_stdout() {
+    let run_id = RunId::new();
+    let scripted = vec![
+        run_started(run_id),
+        event(
+            4,
+            EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed {
+                    summary: Some("fixed the parser".to_string()),
+                },
+                chronicle: artifact_ref(),
+            },
+        ),
+        // Exactly the daemon's ordering: usage trails the terminal event.
+        event(
+            5,
+            EventBody::RunUsage {
+                run_id,
+                prompt_tokens: Some(9_000),
+                completion_tokens: Some(1_000),
+                cost_micros: Some(42_000),
+            },
+        ),
+    ];
+
+    let (out, exit) = drive(scripted.clone()).await;
+
+    let envelopes = parse_jsonl(&out);
+    assert_eq!(
+        envelopes.len(),
+        scripted.len(),
+        "the stream must not end at RunCompleted, before RunUsage arrives:\n{}",
+        String::from_utf8_lossy(&out)
+    );
+    let usage_line = std::str::from_utf8(&out)
+        .expect("utf8")
+        .lines()
+        .find(|line| line.contains("RunUsage"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no RunUsage line in the client's own output:\n{}",
+                String::from_utf8_lossy(&out)
+            )
+        });
+    assert!(
+        usage_line.contains("9000") && usage_line.contains("1000"),
+        "the measured token counts must survive to stdout: {usage_line}"
+    );
+    // Draining usage must not change the run's verdict.
+    assert_eq!(exit, RunExit::Completed);
+    assert_eq!(exit.exit_code(), 0);
+}
+
+/// The drain is bounded: a daemon that measured nothing publishes no
+/// `RunUsage` at all (an all-`None` event would be indistinguishable from a
+/// genuinely free run), and an older daemon never publishes one. Neither may
+/// hang `run --jsonl` or change its exit code — the `drive` helper's own 5s
+/// timeout is the assertion that it returns.
+#[tokio::test]
+async fn a_run_that_publishes_no_usage_still_exits_promptly() {
+    let run_id = RunId::new();
+    let scripted = vec![
+        run_started(run_id),
+        event(
+            4,
+            EventBody::RunCompleted {
+                run_id,
+                disposition: RunDisposition::Completed { summary: None },
+                chronicle: artifact_ref(),
+            },
+        ),
+    ];
+
+    let (out, exit) = drive(scripted.clone()).await;
+
+    assert_eq!(parse_jsonl(&out).len(), scripted.len());
+    assert_eq!(exit, RunExit::Completed);
+}
+
 // Sanity-check `ClientCapabilities::default()` stays wired through the
 // handshake this test suite relies on (a change here would silently break
 // every test above via a bad `ClientHello`).

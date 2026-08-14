@@ -83,6 +83,79 @@ async fn client_pool(paths: &RuntimePaths) -> SqlitePool {
         .expect("open db (client)")
 }
 
+/// Seed a repository-scoped document straight into the daemon's store.
+///
+/// Ownership is the OUTER gate now (outcome 19): every command that names a
+/// resource id is refused `not-found` before its role and transport checks are
+/// reached, so a test that wants to exercise those checks has to name a resource
+/// that really exists and really belongs to this principal.
+async fn seed_document(pool: &SqlitePool) -> codypendent_protocol::DocumentId {
+    let document_id = codypendent_protocol::DocumentId::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO documents (id, title, scope_json, scope_tier, scope_key, status, \
+         metadata_json, crdt_snapshot, links_json, citations_json, revision, created_at, updated_at) \
+         VALUES (?, 'seeded', '{\"type\":\"Repository\"}', 'repository', NULL, 'draft', '{}', \
+         X'', '[]', '[]', 1, ?, ?)",
+    )
+    .bind(document_id.to_string())
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .expect("seed document");
+    document_id
+}
+
+/// Seed an active edit lease on `document_id`, so a release command reaches the
+/// arm's transport check instead of the ownership gate's idempotent no-op.
+async fn seed_lease(
+    pool: &SqlitePool,
+    lease_id: &str,
+    document_id: codypendent_protocol::DocumentId,
+) {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO document_leases \
+         (id, document_id, block_id, holder_json, holder_key, state, acquired_at, expires_at) \
+         VALUES (?, ?, NULL, '{\"type\":\"Human\",\"user\":\"me\"}', 'human:me', 'active', ?, ?)",
+    )
+    .bind(lease_id)
+    .bind(document_id.to_string())
+    .bind(&now)
+    .bind((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339())
+    .execute(pool)
+    .await
+    .expect("seed lease");
+}
+
+/// Seed a durable workflow run owned by this process's uid — the same principal
+/// the daemon under test runs as, so its lifecycle commands reach the role and
+/// transport gates instead of the ownership one.
+async fn seed_owned_workflow_run(pool: &SqlitePool, id: &str, owner_uid: u32) {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO workflow_runs (id, workflow_id, workflow_version, graph_signature, run_id, \
+         inputs_json, state, created_at, updated_at, owner_uid) \
+         VALUES (?, 'wf', 1, 'sig', NULL, '{}', 'running', ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(&now)
+    .bind(&now)
+    .bind(i64::from(owner_uid))
+    .execute(pool)
+    .await
+    .expect("seed workflow run");
+}
+
+/// This process's uid, taken from a file it creates (no `libc` dependency).
+fn our_uid(tmp: &tempfile::TempDir) -> u32 {
+    use std::os::unix::fs::MetadataExt as _;
+    let probe = tmp.path().join(".uid-probe");
+    std::fs::write(&probe, b"x").expect("write probe");
+    std::fs::metadata(&probe).expect("stat probe").uid()
+}
+
 async fn connect(paths: &RuntimePaths) -> UnixStream {
     loop {
         match UnixStream::connect(&paths.socket_path).await {
@@ -1173,9 +1246,13 @@ async fn observer_start_run_is_role_denied() {
 #[tokio::test]
 async fn observer_cannot_acquire_a_document_lease() {
     // A lease is a precursor to writing, so — like StartRun — an Observer is denied
-    // before the daemon even checks whether document transport is wired.
+    // before the daemon checks whether document transport is wired. Ownership is
+    // the outer gate ahead of both, so the document has to exist and be this
+    // principal's for the role gate to be what answers.
     let tmp = tempfile::tempdir().unwrap();
     let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let document_id = seed_document(&pool).await;
 
     let client_id = ClientId::new();
     let mut stream = connect(&paths).await;
@@ -1195,7 +1272,7 @@ async fn observer_cannot_acquire_a_document_lease() {
             Payload::Command(command(
                 CommandBody::AcquireDocumentLease {
                     lease: codypendent_protocol::DocumentEditLease {
-                        document_id: codypendent_protocol::DocumentId::new(),
+                        document_id,
                         block_id: Some("p".to_string()),
                     },
                     ttl_seconds: None,
@@ -1210,6 +1287,31 @@ async fn observer_cannot_acquire_a_document_lease() {
         other => panic!("expected CommandRejected, got {other:?}"),
     }
 
+    // The other half of the ordering: a document id that names nothing is
+    // refused as missing, never as `role-denied` — so a probe cannot use the
+    // role refusal to confirm which document ids exist.
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::AcquireDocumentLease {
+                    lease: codypendent_protocol::DocumentEditLease {
+                        document_id: codypendent_protocol::DocumentId::new(),
+                        block_id: Some("p".to_string()),
+                    },
+                    ttl_seconds: None,
+                },
+                "lease-unowned",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => assert_eq!(error.code, "document.not-found"),
+        other => panic!("expected CommandRejected, got {other:?}"),
+    }
+
     shutdown(stream, task).await;
 }
 
@@ -1220,6 +1322,8 @@ async fn lease_commands_are_rejected_when_transport_is_unwired() {
     // connection — mirroring `MutateDocument` without a mutator.
     let tmp = tempfile::tempdir().unwrap();
     let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    let document_id = seed_document(&pool).await;
 
     let client_id = ClientId::new();
     let mut stream = connect(&paths).await;
@@ -1232,7 +1336,8 @@ async fn lease_commands_are_rejected_when_transport_is_unwired() {
     )
     .await;
 
-    // Acquire → transport-unavailable.
+    // Acquire (on a document this principal owns, so the ownership gate is not
+    // what answers) → transport-unavailable.
     let reply = send_recv(
         &mut stream,
         &Envelope::request(
@@ -1240,7 +1345,7 @@ async fn lease_commands_are_rejected_when_transport_is_unwired() {
             Payload::Command(command(
                 CommandBody::AcquireDocumentLease {
                     lease: codypendent_protocol::DocumentEditLease {
-                        document_id: codypendent_protocol::DocumentId::new(),
+                        document_id,
                         block_id: None,
                     },
                     ttl_seconds: Some(60),
@@ -1258,6 +1363,11 @@ async fn lease_commands_are_rejected_when_transport_is_unwired() {
     }
 
     // Release → same structural rejection (and the connection survives both).
+    // The lease has to exist and hang off a document this principal owns: a
+    // release naming no live lease of its own is the documented idempotent
+    // no-op, answered by the ownership gate before transport is consulted, so
+    // that "not yours" and "not there" cannot be told apart.
+    seed_lease(&pool, "lease-x", document_id).await;
     let reply = send_recv(
         &mut stream,
         &Envelope::request(
@@ -1291,6 +1401,10 @@ async fn publish_document_requires_controller_then_transport_unavailable() {
     // the command is rejected structurally rather than crashing the connection.
     let tmp = tempfile::tempdir().unwrap();
     let (paths, task) = start_server(&tmp).await;
+    let pool = client_pool(&paths).await;
+    // Ownership is the outer gate, so publish against a document that exists and
+    // belongs to this principal; an unowned one is covered by `multi_user_it`.
+    let document_id = seed_document(&pool).await;
 
     let target = codypendent_protocol::document::PublishTarget::RepositoryFile {
         path: "docs/architecture.md".to_string(),
@@ -1313,7 +1427,7 @@ async fn publish_document_requires_controller_then_transport_unavailable() {
             contributor,
             Payload::Command(command(
                 CommandBody::PublishDocument {
-                    document_id: codypendent_protocol::DocumentId::new(),
+                    document_id,
                     target: target.clone(),
                 },
                 "publish-contributor",
@@ -1343,7 +1457,7 @@ async fn publish_document_requires_controller_then_transport_unavailable() {
             controller,
             Payload::Command(command(
                 CommandBody::PublishDocument {
-                    document_id: codypendent_protocol::DocumentId::new(),
+                    document_id,
                     target,
                 },
                 "publish-controller",
@@ -1455,7 +1569,12 @@ async fn workflow_lifecycle_requires_controller_then_transport_unavailable() {
     // command is rejected `workflow.transport-unavailable` rather than crashing the
     // connection. An Observer is denied cancel too (role checked before the seam).
     let tmp = tempfile::tempdir().unwrap();
+    let uid = our_uid(&tmp);
     let (paths, task) = start_server(&tmp).await;
+    // Ownership is the outer gate ahead of role and transport, so the run has to
+    // exist and belong to this principal for those two to be what answer.
+    let pool = client_pool(&paths).await;
+    seed_owned_workflow_run(&pool, "wfrun-1", uid).await;
 
     // A Contributor may start a workflow but not control one → role-denied.
     let contributor = ClientId::new();
@@ -2080,4 +2199,109 @@ async fn read_session_events_pages_the_ledger_forward() {
     }
 
     shutdown(s1, task).await;
+}
+
+#[tokio::test]
+async fn code_graph_commands_are_role_gated_then_transport_unavailable() {
+    // `codypendent graph {build,status,show}` is intercepted at the connection
+    // level like the memory and blackboard commands (the graph lives outside the
+    // session ledger). A BUILD clears and rewrites the repository's whole graph,
+    // so it is `Controller`-only; the two READS are open to any handshaken
+    // client, an Observer included. The daemon's own test server injects no
+    // code-graph seam, so a command that gets past the role gate is refused
+    // `graph.transport-unavailable` rather than tearing the connection down.
+    //
+    // The reads must NOT be role-gated: a graph you cannot look at is the same
+    // silence this command family exists to end. That is the half a "reads are
+    // free" claim in a doc comment cannot enforce, so it is asserted here.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    // An Observer may read the graph, but never rebuild it.
+    let observer = ClientId::new();
+    let mut obs = connect(&paths).await;
+    handshake(&mut obs, observer).await;
+    bind_role(&mut obs, observer, ClientRole::Observer, "obs-graph-att").await;
+
+    let reply = send_recv(
+        &mut obs,
+        &Envelope::request(
+            observer,
+            Payload::Command(command(
+                CommandBody::BuildCodeGraph {
+                    repository: "/tmp/whatever".to_string(),
+                },
+                "graph-build-observer",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.role-denied"),
+        other => panic!("expected role-denied for an Observer build, got {other:?}"),
+    }
+
+    for (body, key) in [
+        (
+            CommandBody::ReadCodeGraphStatus {
+                repository: "/tmp/whatever".to_string(),
+            },
+            "graph-status-observer",
+        ),
+        (
+            CommandBody::ReadCodeGraph {
+                repository: "/tmp/whatever".to_string(),
+                query: codypendent_protocol::CodeGraphQuery::default(),
+            },
+            "graph-show-observer",
+        ),
+    ] {
+        let reply = send_recv(
+            &mut obs,
+            &Envelope::request(observer, Payload::Command(command(body, key))),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => {
+                assert_eq!(
+                    error.code, "graph.transport-unavailable",
+                    "an Observer read must reach the seam, not the role gate ({key})"
+                );
+            }
+            other => panic!("expected transport-unavailable for {key}, got {other:?}"),
+        }
+    }
+
+    // A Controller gets past the role gate and reaches the unwired seam.
+    let controller = ClientId::new();
+    let mut ctrl = connect(&paths).await;
+    handshake(&mut ctrl, controller).await;
+    bind_role(
+        &mut ctrl,
+        controller,
+        ClientRole::Controller,
+        "ctrl-graph-att",
+    )
+    .await;
+    let reply = send_recv(
+        &mut ctrl,
+        &Envelope::request(
+            controller,
+            Payload::Command(command(
+                CommandBody::BuildCodeGraph {
+                    repository: "/tmp/whatever".to_string(),
+                },
+                "graph-build-controller",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => {
+            assert_eq!(error.code, "graph.transport-unavailable");
+        }
+        other => panic!("expected transport-unavailable, got {other:?}"),
+    }
+
+    shutdown(ctrl, task).await;
 }

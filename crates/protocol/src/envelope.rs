@@ -282,6 +282,26 @@ pub enum Payload {
     /// authoritative replica advances (Phase 4 STEP 4.3). Opaque CRDT bytes ride
     /// in [`DocumentSync::update`]; a receiver merges them into its local replica.
     DocumentSync(DocumentSync),
+    /// A `BuildCodeGraph` reply: what the on-demand fold actually saw. A
+    /// distinct reply from `CommandAccepted` because the report *is* the
+    /// feature — a build that only acknowledged itself would leave an empty
+    /// graph exactly as unexplained as it was before the command existed.
+    CodeGraphBuilt {
+        command_id: CommandId,
+        report: Box<crate::codegraph::CodeGraphScanReport>,
+    },
+    /// A `ReadCodeGraphStatus` reply: what the stored graph holds right now,
+    /// and whether it still describes the working tree.
+    CodeGraphStatus {
+        command_id: CommandId,
+        status: Box<crate::codegraph::CodeGraphStatusView>,
+    },
+    /// A `ReadCodeGraph` reply: one filtered page of nodes and edges.
+    CodeGraphPage {
+        command_id: CommandId,
+        page: Box<crate::codegraph::CodeGraphPage>,
+    },
+
     /// Attach-time catch-up (missed events or a snapshot). Wrapped in a named
     /// field so its internal `type` tag never collides with the payload tag.
     Catchup {

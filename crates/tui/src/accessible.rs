@@ -75,6 +75,14 @@ pub fn accessible_snapshot(state: &AppState) -> String {
             if let Some(model) = &run.model {
                 lines.push(format!("Model: {}", clean(&model.0)));
             }
+            // The run's MEASURED usage. This client used to print
+            // "Unsupported event: unsupported event" here instead — the
+            // `RunUsage` event with no reducer arm. Only measured dimensions
+            // are announced: an absent one means the provider reported none,
+            // never zero.
+            if let Some(usage) = usage_sentence(run) {
+                lines.push(format!("Usage: {usage}"));
+            }
             match &run.activity {
                 RunActivity::Idle => {}
                 RunActivity::Thinking => lines.push("Activity: thinking".to_owned()),
@@ -141,6 +149,26 @@ fn refresh_remote_ui_render_cache(state: &AppState) {
         );
         cache.insert(document.document_id.clone(), output);
     }
+}
+
+/// A run's measured usage as a spoken sentence, or `None` when the provider
+/// measured nothing. Words rather than glyphs — this projection is read aloud.
+fn usage_sentence(run: &crate::state::RunView) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(tokens) = run.prompt_tokens {
+        parts.push(format!("{tokens} prompt tokens"));
+    }
+    if let Some(tokens) = run.completion_tokens {
+        parts.push(format!("{tokens} completion tokens"));
+    }
+    if let Some(micros) = run.cost_micros {
+        parts.push(format!(
+            "cost {}.{:04} US dollars",
+            micros / 1_000_000,
+            (micros % 1_000_000) / 100
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 fn append_transcript(
@@ -1739,5 +1767,53 @@ mod tests {
         let output = accessible_snapshot(&state);
         assert!(output.is_ascii(), "help chrome was not ASCII: {output}");
         assert!(output.contains("F6 / Shift-F6 / Esc"));
+    }
+
+    /// The accessible client announced "Unsupported event: unsupported event"
+    /// once per run — the `RunUsage` measurement, read aloud as an error.
+    #[test]
+    fn a_measured_run_is_announced_in_words_not_as_an_unsupported_event() {
+        let mut state = AppState::new();
+        let run_id = RunId::new();
+        let event = |body| {
+            Action::daemon_event(SessionEvent {
+                sequence: 1,
+                occurred_at: chrono::Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body,
+            })
+        };
+        crate::reduce(
+            &mut state,
+            event(EventBody::RunStarted {
+                run_id,
+                objective: "summarise".to_owned(),
+                mode: codypendent_protocol::AgentMode::Build,
+            }),
+        );
+        crate::reduce(
+            &mut state,
+            event(EventBody::RunUsage {
+                run_id,
+                prompt_tokens: Some(10_000),
+                completion_tokens: Some(642),
+                cost_micros: Some(3_400),
+            }),
+        );
+        let snapshot = accessible_snapshot(&state);
+        assert!(
+            !snapshot.contains("Unsupported event"),
+            "an event this build produces is never announced as unsupported:\n{snapshot}"
+        );
+        assert!(
+            snapshot.contains("Usage: 10000 prompt tokens; 642 completion tokens"),
+            "the measurement is announced in words:\n{snapshot}"
+        );
+        assert!(
+            snapshot.contains("cost 0.0034 US dollars"),
+            "a measured cost is announced too:\n{snapshot}"
+        );
     }
 }

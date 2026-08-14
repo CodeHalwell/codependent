@@ -57,40 +57,46 @@ Codypendent adds the product and operating-system layer around that framework:
 - collaborative docs;
 - trace-based evaluation and controlled learning.
 
-## Suggested repository shape
+## Repository shape
+
+As it actually is at v0.5.1 — **17** workspace members
+(<!-- doc-count:match sources="Cargo.toml" pattern="^\s*\"crates/[a-z-]+\",?$" expect=17 label="workspace members" -->
+re-derived from `Cargo.toml`'s `workspace.members` on every PR):
 
 ```text
 codypendent/
 ├── Cargo.toml
 ├── crates/
-│   ├── protocol/
-│   ├── daemon/
-│   ├── runtime/
-│   ├── knowledge/
-│   ├── integrations/
-│   ├── sandbox/
-│   ├── tui/
-│   ├── cli/
-│   └── test-support/
+│   ├── protocol/     ├── daemon/      ├── codypendentd/  ├── cli/
+│   ├── council/      ├── tui/         ├── runtime/       ├── knowledge/
+│   ├── integrations/ ├── workflow/    ├── sandbox/       ├── routing/
+│   ├── providers/    ├── eval/        ├── test-support/  ├── ui-host/
+│   └── ui-worker-launcher/
 ├── extensions/
-│   ├── vscode/
-│   ├── jetbrains/
-│   └── zed/
+│   └── vscode/            # the only editor extension that exists; Zed is
+│                          # served over ACP and needs none, JetBrains is unbuilt
+├── sdk/ui/                # the shared TypeScript UI SDK the extension builds on
 ├── docs/
-├── specs/
+├── evals/
 ├── migrations/
-├── tests/
+├── benches/  examples/  protocol-vectors/
 └── .github/workflows/
 ```
 
-The initial workspace deliberately avoids turning every subsystem into its own crate. Modules should become crates only when they require a security boundary, separate distribution, optional heavy dependencies, or independent versioning.
+The workspace deliberately avoids turning every subsystem into its own crate. Modules become crates only when they require a security boundary, separate distribution, optional heavy dependencies, or independent versioning.
 
 ## Documentation status
 
 - Product name: **Codypendent**
-- Document version: **0.3**
+- Document version: **0.5.1** — tracks the product version, so the two cannot
+  drift apart again; `docs/MANIFEST.json` carries the same string and its file
+  list is gated by `.github/scripts/check_docs_manifest.py` on every PR
 - Status: **Architecture and implementation draft**
-- Date: **15 July 2026**
+- Date: **2026-08-14**
+
+(This block said "0.3 / 15 July 2026" while `MANIFEST.json` said "0.4" and the
+product shipped 0.5.1 — three answers to one question, which is what the gate
+above exists to stop.)
 
 
 ## Newly incorporated design patterns

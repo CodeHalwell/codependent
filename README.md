@@ -99,9 +99,13 @@ skills/fix-rust-ci/
 
 Common bridge contract supports workspace state, open docs, selection, diagnostics, symbols, edits, reveal, and diff.
 
-- VS Code/Cursor: shared TypeScript extension base
-- Zed: ACP-first + thin extension for ACP gaps
-- JetBrains: Kotlin IntelliJ platform plugin
+- VS Code/Cursor: shared TypeScript extension base — **shipped**
+  (`extensions/vscode`, built on `sdk/ui`)
+- Zed: ACP-first — **works today** through `codypendent acp serve`, with no
+  extension to install; a thin extension for the remaining ACP gaps is planned
+- JetBrains: a Kotlin IntelliJ platform plugin is **planned, not built**. There
+  is no JetBrains plugin in this repository in any form — verified 2026-08-13:
+  zero `.kt` files and no `extensions/jetbrains/` directory
 - session handoff is backend-owned, not UI-owned
 
 ## Multi-Agent Orchestration

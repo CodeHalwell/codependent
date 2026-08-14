@@ -1,7 +1,7 @@
 //! The regression suite (STEP 7.4/7.5): fixed failures never come back.
 //!
 //! Every historical failure that gets fixed adds a guard case to the regression
-//! suite (`evals/regressions/`), re-run in CI
+//! suite (`evals/tasks/regressions/`), re-run in CI
 //! ([Chapter 13](../../docs/docs/13-observability-evaluation-learning.md), exit
 //! criterion 3 — the suite grows over time). It is also the **offline regression
 //! gate** the promotion pipeline runs first: a candidate that regresses any guard

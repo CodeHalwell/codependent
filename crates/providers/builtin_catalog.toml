@@ -216,14 +216,17 @@ base_url = "https://inference.baseten.co/v1"
 kind = "api_key"
 env = ["BASETEN_API_KEY"]
 
-[[provider]]
-id = "lambda"
-name = "Lambda Inference"
-protocol = "openai-chat"
-base_url = "https://api.lambda.ai/v1"
-[[provider.auth]]
-kind = "api_key"
-env = ["LAMBDA_API_KEY"]
+# Removed 2026-08-13, verified dead upstream — do not re-add without a live probe:
+#   ai21          https://api.ai21.com/studio/v1/models  -> HTTP 410 "This API has
+#                 been retired. The AI21 Gateway is available at app.ai21.com"
+#   github-models https://models.github.ai/inference/models -> HTTP 410
+#                 "github_models_retirement_brownout"
+#   lambda        https://api.lambda.ai/v1/models -> host does not resolve
+# All three curated zero models, so the add flow depended entirely on that live
+# `/models` call: a user who picked one got a network/auth failure instead of
+# "this API was retired". `hyperbolic` deliberately KEEPS its `.xyz` base_url —
+# `.xyz` answers 401 (live, key required) and `.ai` does not resolve, so the
+# prior round's advice to move it was wrong.
 
 [[provider]]
 id = "featherless"
@@ -280,15 +283,6 @@ kind = "api_key"
 env = ["PERPLEXITY_API_KEY"]
 
 [[provider]]
-id = "ai21"
-name = "AI21 (Jamba)"
-protocol = "openai-chat"
-base_url = "https://api.ai21.com/studio/v1"
-[[provider.auth]]
-kind = "api_key"
-env = ["AI21_API_KEY"]
-
-[[provider]]
 id = "cohere"
 name = "Cohere (compat)"
 protocol = "openai-chat"
@@ -296,16 +290,6 @@ base_url = "https://api.cohere.ai/compatibility/v1"
 [[provider.auth]]
 kind = "api_key"
 env = ["CO_API_KEY", "COHERE_API_KEY"]
-
-[[provider]]
-id = "github-models"
-name = "GitHub Models"
-protocol = "openai-chat"
-base_url = "https://models.github.ai/inference"
-extra_headers = { "X-GitHub-Api-Version" = "2022-11-28" }
-[[provider.auth]]
-kind = "api_key"
-env = ["GITHUB_TOKEN"]
 
 [[provider]]
 id = "opencode-zen"
@@ -1783,8 +1767,11 @@ provider_id = "opencode-zen"
 # --- Prefill completion pass: every remaining provider (2026-08-11) ---
 # Same sourcing rules as above; comments flag lower-confidence rows. Providers
 # intentionally left without rows: lm Studio / vLLM (model ids are arbitrary
-# local paths — live /models reflects reality), Lambda (Inference API winding
-# down per lambda.ai/inference), AI21 + GitHub Models (APIs retired Aug 2026).
+# local paths — live /models reflects reality). Lambda, AI21 and GitHub Models
+# were listed here as "no rows, API retired/winding down"; the providers
+# themselves are now gone (see the removal note above `featherless`), because a
+# provider a user can select and can never reach is worse than one that is
+# absent.
 
 # OpenAI — still-served legacy + speech/realtime (prices omitted where unverified)
 [[model]]
@@ -1846,11 +1833,19 @@ name = "GPT Realtime 2.1 (speech-to-speech; text rate shown)"
 cost_per_1m_input_usd = 4.0
 cost_per_1m_output_usd = 24.0
 
-# Anthropic — still-active legacy
+# Anthropic — still-active legacy.
+# `claude-opus-4-5` is 200k, NOT the 1M its 4.6+ successors carry — Anthropic's
+# legacy-model table, corroborated by OpenRouter's `anthropic/claude-opus-4.5`
+# (ctx=200000). It read 1000000 here until the 2026-08-13 review: the context
+# footer divides by this number, so a session sitting at 190k tokens — one turn
+# from a hard API error — displayed as 19% used, and `clamp_context_tokens`
+# cannot catch it (its ceiling is 2_000_000, for a hostile value, not a wrong
+# curated one). Do NOT "fix" the 1M rows around it: 4.6/4.7/4.8/Opus 5/Sonnet 5
+# and Fable 5 really are 1M.
 [[model]]
 id = "claude-opus-4-5"
 provider_id = "anthropic"
-context_tokens = 1000000
+context_tokens = 200000
 cost_per_1m_input_usd = 5.0
 cost_per_1m_output_usd = 25.0
 

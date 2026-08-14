@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, Utc};
 use codypendent_protocol::{
-    ArtifactRef, BranchId, DataClassification, OrganizationId, RegistryItemId, RepositoryId,
+    ArtifactRef, BranchId, DataClassification, OrganizationId, RegistryItemId, RepositoryId, RunId,
     SessionId, TaskId, UserId, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
@@ -401,6 +401,18 @@ pub enum EvidenceRef {
         artifact: ArtifactRef,
         source_path: Option<String>,
     },
+    /// A claim an agent made during a run, with the reason it gave.
+    ///
+    /// The other two variants point at bytes a machine produced; this one points
+    /// at a judgement, so the judgement itself has to travel — an
+    /// [`EvidenceKind::AgentAsserted`] edge whose provenance is only "some run"
+    /// cannot be reviewed by the user it was asserted for. The session/run pair
+    /// is the audit trail: that run's ledger holds the turn that said it.
+    AgentAssertion {
+        session_id: SessionId,
+        run_id: RunId,
+        rationale: String,
+    },
 }
 
 /// A curated memory (Chapter 06 `MemoryRecord`). A newer contradicting fact
@@ -495,6 +507,11 @@ pub enum CodeRelation {
 pub enum EvidenceKind {
     /// Tree-sitter, as-written (Phase 2). Confidence ~0.45 for calls.
     SyntaxInferred,
+    /// Asserted by the agent for a relation no parser can see — a route handler
+    /// to the service it dispatches to, a config key to its reader. ~0.40:
+    /// deliberately below *every* mechanical layer, tree-sitter included, so a
+    /// model's claim can never displace something a machine actually observed.
+    AgentAsserted,
     /// LSP / SCIP resolved (Phase 4). ~0.90.
     LspResolved,
     /// Compiler/indexer resolution. ~0.98.
@@ -503,8 +520,36 @@ pub enum EvidenceKind {
     RuntimeObserved,
 }
 
+impl EvidenceKind {
+    /// The Chapter 07 confidence for this evidence layer. The *ordering* is the
+    /// contract the supersession rule enforces (an edge replaces only a strictly
+    /// less-confident one), so a caller that invents its own number for a kind
+    /// can invert the hierarchy — take it from here.
+    #[must_use]
+    pub fn default_confidence(self) -> f32 {
+        match self {
+            EvidenceKind::SyntaxInferred => SYNTAX_CALL_CONFIDENCE,
+            EvidenceKind::AgentAsserted => AGENT_ASSERTED_CONFIDENCE,
+            EvidenceKind::LspResolved => LSP_RESOLVED_CONFIDENCE,
+            EvidenceKind::CompilerResolved => COMPILER_RESOLVED_CONFIDENCE,
+            EvidenceKind::RuntimeObserved => RUNTIME_OBSERVED_CONFIDENCE,
+        }
+    }
+}
+
 /// Confidence for a syntax-inferred call edge (Chapter 07 table).
 pub const SYNTAX_CALL_CONFIDENCE: f32 = 0.45;
+
+/// Confidence for an edge the agent asserted. Deliberately **below**
+/// [`SYNTAX_CALL_CONFIDENCE`], not merely below the LSP tier.
+///
+/// An assertion earns its keep on triples no parser can produce — a route
+/// handler to the service it dispatches to, a config key to its reader. On a
+/// triple the parser *did* produce, the parser is the better witness. Placing
+/// the number under every mechanical layer makes "a model's reading never
+/// displaces a machine's" a property of the ordering rather than of somebody
+/// remembering to special-case it at each write site.
+pub const AGENT_ASSERTED_CONFIDENCE: f32 = 0.40;
 
 /// Confidence for an LSP-resolved reference/definition edge (Chapter 07 table).
 /// A semantic edge at this confidence supersedes its syntax-inferred counterpart.
@@ -512,6 +557,9 @@ pub const LSP_RESOLVED_CONFIDENCE: f32 = 0.90;
 
 /// Confidence for a compiler/indexer-resolved edge (Chapter 07 table).
 pub const COMPILER_RESOLVED_CONFIDENCE: f32 = 0.98;
+
+/// Confidence for an edge observed in a real execution (Chapter 07 table).
+pub const RUNTIME_OBSERVED_CONFIDENCE: f32 = 1.00;
 
 /// The stable identity of a symbol (Chapter 07 `SymbolKey`) — survives line
 /// movement within its file because it is derived from name + kind + signature,
