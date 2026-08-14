@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use codypendent_knowledge::codegraph::{Language, ScanSummary};
 use codypendent_knowledge::{codegraph, GitRevision};
 use codypendent_protocol::RepositoryId;
 use sha2::{Digest, Sha256};
@@ -58,15 +59,22 @@ pub async fn lock_repository(repository: RepositoryId) -> OwnedMutexGuard<()> {
     lock.lock_owned().await
 }
 
-/// Fold up to [`SCAN_FILE_CAP`] of `root`'s `*.rs` files into the code graph for
-/// `repository`, so the repository map is populated. Best-effort: a per-file
-/// parse/read failure is logged and skipped, never propagated — a warm-up must
-/// not block or fail its caller.
+/// Fold up to [`SCAN_FILE_CAP`] of `root`'s source files into the code graph for
+/// `repository`, so the repository map is populated. Which files those are is
+/// [`codegraph::language_for`]'s decision, never this module's. Best-effort: a
+/// per-file parse/read failure is logged and skipped, never propagated — a
+/// warm-up must not block or fail its caller.
 ///
 /// The repository's prior graph is cleared first so symbols removed since the
 /// last scan (files deleted outright, which a per-file reparse never revisits)
 /// do not linger. The code graph is derived and regenerable, so wiping and
 /// rebuilding is safe.
+///
+/// Returns a [`ScanSummary`] — files seen, folded per language, skipped as
+/// unsupported, and whether the cap truncated the walk. It used to return `()`,
+/// which meant a repository in a language the graph could not parse walked
+/// thousands of files, folded none, reported success, and left an empty graph
+/// with nothing anywhere saying why.
 ///
 /// **The caller must hold [`lock_repository`] for `repository`.** This function
 /// does not take it itself: the executor's warm-up re-checks its revision guard
@@ -75,7 +83,7 @@ pub async fn scan_repository(
     pool: &SqlitePool,
     repository: RepositoryId,
     root: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ScanSummary> {
     let Some(root) = discover_repository_root(root) else {
         anyhow::bail!("cannot scan {}: not a git repository", root.display());
     };
@@ -84,36 +92,46 @@ pub async fn scan_repository(
     // The walk is blocking std::fs work — off the async runtime so a large tree
     // does not stall this worker's other tasks.
     let walk_root = root;
-    let files =
-        tokio::task::spawn_blocking(move || collect_rust_sources(&walk_root, SCAN_FILE_CAP))
+    let (files, mut summary) =
+        tokio::task::spawn_blocking(move || collect_sources(&walk_root, SCAN_FILE_CAP))
             .await
             .map_err(|error| anyhow::anyhow!("code-graph walker failed: {error}"))??;
-    for (relative, source) in &files {
+    for (relative, source, _) in &files {
         codegraph::validate_file_graph(repository, relative, source)?;
     }
     // Destructive replacement begins only after the entire filesystem walk and
     // parse preflight succeeded. Any later database failure is returned so the
     // caller removes its in-process success marker and retries.
     codegraph::clear_repository(pool, repository).await?;
-    let mut scanned = 0usize;
-    let mut nodes = 0usize;
-    for (relative, source) in files {
+    for (relative, source, language) in files {
         match codegraph::upsert_file_graph(pool, repository, &revision, &relative, &source).await {
             Ok(delta) => {
-                scanned += 1;
-                nodes += delta.nodes.len();
+                summary.record_folded(language);
+                summary.nodes += delta.nodes.len();
+                summary.edges += delta.edges.len();
             }
             Err(error) => return Err(error.into()),
         }
     }
-    info!(
-        repository = %repository,
-        revision = %revision.0,
-        files = scanned,
-        nodes,
-        "code-graph scan complete"
-    );
-    Ok(())
+
+    // A scan that folded nothing is the failure this summary exists to expose —
+    // it must not look like a successful scan of an empty repository.
+    if summary.found_nothing_to_fold() || summary.truncated_by_cap {
+        warn!(
+            repository = %repository,
+            revision = %revision.0,
+            summary = %summary.headline(),
+            "code-graph scan produced an incomplete graph"
+        );
+    } else {
+        info!(
+            repository = %repository,
+            revision = %revision.0,
+            summary = %summary.headline(),
+            "code-graph scan complete"
+        );
+    }
+    Ok(summary)
 }
 
 /// Resolve `root` to the checkout's top-level directory. An ordinary directory
@@ -164,45 +182,71 @@ pub fn head_revision(root: &Path) -> GitRevision {
     GitRevision(head.unwrap_or_else(|| "workdir".to_string()))
 }
 
-/// Collect up to `cap` `(repo-relative-path, source)` pairs for the `*.rs` files
-/// under `root`, skipping `target/`, hidden (dot-prefixed) directories, and
-/// anything the checkout's `.gitignore` rules exclude. A plain iterative walk (no
-/// `walkdir` dependency); unreadable entries are skipped. The traversal is
-/// **sorted** (per-directory, names ascending) so the cap — if it ever bites —
-/// truncates the same files on every boot instead of rebuilding a different
-/// graph per `read_dir` ordering.
+/// Collect up to `cap` `(repo-relative-path, source, language)` triples for the
+/// source files under `root`, skipping `target/`, hidden (dot-prefixed)
+/// directories, and anything the checkout's `.gitignore` rules exclude. A plain
+/// iterative walk (no `walkdir` dependency); unreadable entries are skipped. The
+/// traversal is **sorted** (per-directory, names ascending) so the cap — if it
+/// ever bites — truncates the same files on every boot instead of rebuilding a
+/// different graph per `read_dir` ordering.
 ///
 /// Paths are collected first and read only after the ignore filter, so a tree
-/// full of generated `.rs` output is not read into memory just to be discarded.
+/// full of generated output is not read into memory just to be discarded.
 /// The cap is applied to *candidates*, before the filter: a repository whose
 /// first `SCAN_FILE_CAP` sorted paths are all ignored yields fewer files than
 /// the cap, which is the conservative direction (never more work than the cap).
-fn collect_rust_sources(root: &Path, cap: usize) -> std::io::Result<Vec<(String, String)>> {
-    let candidates = collect_rust_paths(root, cap)?;
-    let ignored = ignored_paths(root, &candidates);
+///
+/// Returns the [`ScanSummary`] fields the walk itself knows (seen, supported,
+/// unsupported, ignored, cap); the caller fills in what the fold produced.
+#[allow(clippy::type_complexity)]
+fn collect_sources(
+    root: &Path,
+    cap: usize,
+) -> std::io::Result<(Vec<(String, String, Language)>, ScanSummary)> {
+    let (candidates, mut summary) = collect_source_paths(root, cap)?;
+    let paths: Vec<String> = candidates.iter().map(|(path, _)| path.clone()).collect();
+    let ignored = ignored_paths(root, &paths);
     let mut out = Vec::with_capacity(candidates.len());
-    for relative in candidates {
+    for (relative, language) in candidates {
         if ignored.contains(&relative) {
+            summary.files_skipped_ignored += 1;
             continue;
         }
         // A file that vanished between the walk and the read is not an error —
         // the tree is live. Only a genuine read failure of a present file is.
         match std::fs::read_to_string(root.join(&relative)) {
-            Ok(source) => out.push((relative, source)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Ok(source) => out.push((relative, source, language)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                summary.files_skipped_unreadable += 1;
+                continue;
+            }
             Err(error) => return Err(error),
         }
     }
-    Ok(out)
+    Ok((out, summary))
 }
 
-/// The repo-relative `*.rs` paths under `root`, sorted and capped. Split out of
-/// [`collect_rust_sources`] so the ignore filter runs on paths alone.
-fn collect_rust_paths(root: &Path, cap: usize) -> std::io::Result<Vec<String>> {
+/// The repo-relative source paths under `root`, sorted and capped, each with the
+/// language [`codegraph::language_for`] selected for it. Split out of
+/// [`collect_sources`] so the ignore filter runs on paths alone.
+///
+/// **The extension test is `codegraph::language_for` and nothing else.** It was
+/// `ext == "rs"` here and again in [`is_candidate_path`], two lists that agreed
+/// with the parser only by coincidence; when the parser grew Python and
+/// TypeScript they would have kept rejecting both.
+fn collect_source_paths(
+    root: &Path,
+    cap: usize,
+) -> std::io::Result<(Vec<(String, Language)>, ScanSummary)> {
     let mut out = Vec::new();
+    let mut summary = ScanSummary {
+        file_cap: cap,
+        ..ScanSummary::default()
+    };
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         if out.len() >= cap {
+            summary.truncated_by_cap = true;
             break;
         }
         let entries = std::fs::read_dir(&dir)?;
@@ -220,24 +264,35 @@ fn collect_rust_paths(root: &Path, cap: usize) -> std::io::Result<Vec<String>> {
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
                 subdirs.push(path);
-            } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
-                if out.len() >= cap {
-                    break;
-                }
-                out.push(
-                    path.strip_prefix(root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+                continue;
             }
+            if !file_type.is_file() {
+                continue;
+            }
+            summary.files_seen += 1;
+            let Some(language) = codegraph::language_for(&path) else {
+                summary.record_unsupported(&path);
+                continue;
+            };
+            summary.files_supported += 1;
+            if out.len() >= cap {
+                summary.truncated_by_cap = true;
+                break;
+            }
+            out.push((
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned(),
+                language,
+            ));
         }
         // LIFO stack: push in reverse so subdirectories pop in ascending order.
         for subdir in subdirs.into_iter().rev() {
             stack.push(subdir);
         }
     }
-    Ok(out)
+    Ok((out, summary))
 }
 
 /// Which of `relative` the checkout's ignore rules exclude, asked of Git itself.
@@ -351,8 +406,8 @@ impl Drop for RepositoryWatcher {
 ///   top-level directory are never WATCHED at all — one `inotify` watch is
 ///   taken per directory, so filtering their events afterwards would still
 ///   register thousands of kernel watches for build output;
-/// * of what is watched, only `*.rs` files reach the channel (filtered in the
-///   notify callback, before the queue);
+/// * of what is watched, only files [`codegraph::language_for`] recognises reach
+///   the channel (filtered in the notify callback, before the queue);
 /// * `.gitignore` is applied per batch, by asking Git (see [`ignored_paths`]);
 /// * events are debounced by [`WATCH_DEBOUNCE`] and capped at [`WATCH_MAX_WINDOW`];
 /// * a batch over [`WATCH_BATCH_CAP`] files (a branch switch) collapses to ONE
@@ -396,10 +451,15 @@ pub fn arm_watcher(
     Ok(RepositoryWatcher { repository, task })
 }
 
-/// True for a path the code graph could possibly hold: a `*.rs` file that is not
-/// inside `target/`, `.git/`, or any other dot-directory **within the checkout**.
-/// Cheap — it runs on notify's thread for every raw event, including the
-/// thousands a `cargo build` produces.
+/// True for a path the code graph could possibly hold: a file in a language
+/// [`codegraph::language_for`] recognises that is not inside `target/`, `.git/`,
+/// or any other dot-directory **within the checkout**. Cheap — it runs on
+/// notify's thread for every raw event, including the thousands a build produces.
+///
+/// The language test goes through `language_for` for the same reason
+/// [`collect_source_paths`] does: the watcher's idea of "worth folding" and the
+/// parser's idea of "can parse" must be one question. They were two, and the
+/// watcher's answer was `*.rs`.
 ///
 /// The scan is deliberately relative to `root`: the checkout's own ancestors are
 /// none of this filter's business. Testing the absolute path instead rejected
@@ -408,7 +468,7 @@ pub fn arm_watcher(
 /// inside a dot-prefixed workspace directory — and the watcher then silently
 /// folded nothing at all.
 fn is_candidate_path(root: &Path, path: &Path) -> bool {
-    if path.extension().is_none_or(|ext| ext != "rs") {
+    if codegraph::language_for(path).is_none() {
         return false;
     }
     let relative = path.strip_prefix(root).unwrap_or(path);
@@ -521,7 +581,7 @@ async fn watch_loop(
                 "code-graph watcher: bulk change, rebuilding"
             );
             match scan_repository(&pool, repository, &root).await {
-                Ok(()) => {
+                Ok(_summary) => {
                     last_full_rescan = Instant::now();
                     true
                 }
@@ -569,7 +629,7 @@ async fn watch_loop(
             }
             let guard = lock_repository(repository).await;
             match scan_repository(&pool, repository, &root).await {
-                Ok(()) => {
+                Ok(_summary) => {
                     last_full_rescan = Instant::now();
                     info!(%repository, "code-graph watcher: completed deferred rebuild");
                 }
@@ -798,8 +858,262 @@ mod tests {
         ));
         assert!(!is_candidate_path(root, &root.join(".git/hooks/x.rs")));
         assert!(!is_candidate_path(root, &root.join(".cargo/config.rs")));
-        assert!(!is_candidate_path(root, &root.join("src/lib.py")));
         assert!(!is_candidate_path(root, &root.join("src/nested")));
+        assert!(!is_candidate_path(root, &root.join("README.md")));
+    }
+
+    #[test]
+    fn the_watcher_accepts_every_language_the_parser_handles() {
+        // The watcher's filter and the parser's grammar table must be ONE list.
+        // This test is that equality, written so it fails the day a language is
+        // added to `language_for` and not to the watcher — which cannot happen
+        // while `is_candidate_path` calls it, and is exactly what happened when
+        // the two were maintained separately.
+        let root = Path::new("/tmp/.tmpXk9/repo");
+        for extension in codegraph::supported_extensions() {
+            let path = root.join(format!("src/thing.{extension}"));
+            assert!(
+                is_candidate_path(root, &path),
+                "the watcher rejects .{extension}, which the parser handles"
+            );
+        }
+        // And a language nothing parses is still rejected, cheaply, before the
+        // path even reaches the queue.
+        for extension in ["md", "go", "java", "lock", "json"] {
+            assert!(
+                !is_candidate_path(root, &root.join(format!("src/thing.{extension}"))),
+                ".{extension} must not reach the fold queue"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_edit_to_a_python_file_reaches_the_graph() {
+        // Outcome 14 for the languages the user actually writes in. The filter
+        // test above proves the gate; this drives the whole live path — notify
+        // callback, debounce, `apply_batch`, `upsert_file_graph` — against an
+        // uncommitted `.py` edit, which before the widening never reached the
+        // channel at all.
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/api.py"), "def handler():\n    return 1\n").unwrap();
+        init_repo(&root);
+
+        let data = tempfile::tempdir().unwrap();
+        let pool = codypendent_knowledge::db::open(&data.path().join("graph.db"))
+            .await
+            .unwrap();
+        let repository = repository_id_for(&root);
+        {
+            let _guard = lock_repository(repository).await;
+            scan_repository(&pool, repository, &root).await.unwrap();
+        }
+        assert!(
+            codegraph::find_symbols(&pool, repository, "uncommitted_python_symbol", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let _watcher = arm_watcher(pool.clone(), repository, &root).expect("arm the watcher");
+        std::fs::write(
+            root.join("src/api.py"),
+            "def handler():\n    return 1\n\n\ndef uncommitted_python_symbol():\n    return handler()\n",
+        )
+        .unwrap();
+
+        // Generous against WATCH_DEBOUNCE (400 ms) so a loaded box does not
+        // flake; the assertion fails on timeout rather than passing silently.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let found = !codegraph::find_symbols(&pool, repository, "uncommitted_python_symbol", 5)
+                .await
+                .unwrap()
+                .is_empty();
+            if found {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the watcher never folded the edited Python file"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[test]
+    fn the_walk_offers_every_language_the_parser_handles_and_counts_the_rest() {
+        // The full-scan gate, the other half of the same class. Before this it
+        // was `ext == "rs"`, so a Python/TypeScript repository walked its whole
+        // tree and offered the parser nothing.
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for extension in codegraph::supported_extensions() {
+            std::fs::write(root.join(format!("src/thing.{extension}")), "").unwrap();
+        }
+        std::fs::write(root.join("src/notes.md"), "").unwrap();
+        std::fs::write(root.join("go.mod"), "").unwrap();
+        std::fs::write(root.join("src/main.go"), "").unwrap();
+
+        let (paths, summary) = collect_source_paths(root, SCAN_FILE_CAP).unwrap();
+        let found: HashSet<String> = paths.iter().map(|(path, _)| path.clone()).collect();
+        for extension in codegraph::supported_extensions() {
+            let expected = format!("src/thing.{extension}");
+            assert!(
+                found.contains(&expected),
+                "the walk skipped {expected}; found {found:?}"
+            );
+        }
+        assert_eq!(
+            summary.files_supported,
+            codegraph::supported_extensions().len()
+        );
+        // Everything else is COUNTED, not silently dropped: that count is the
+        // only thing that can explain an empty graph to a user.
+        assert_eq!(summary.files_skipped_unsupported, 3);
+        assert_eq!(summary.unsupported_by_extension.get("go"), Some(&1));
+        assert_eq!(summary.unsupported_by_extension.get("mod"), Some(&1));
+        assert_eq!(summary.unsupported_by_extension.get("md"), Some(&1));
+        assert!(!summary.truncated_by_cap);
+    }
+
+    #[test]
+    fn a_truncated_walk_says_so() {
+        // `SCAN_FILE_CAP` used to truncate in silence, so a repository larger
+        // than the cap got a partial graph presented as a complete one.
+        let repo = tempfile::tempdir().unwrap();
+        for index in 0..6 {
+            std::fs::write(repo.path().join(format!("f{index}.rs")), "").unwrap();
+        }
+        let (paths, summary) = collect_source_paths(repo.path(), 3).unwrap();
+        assert_eq!(paths.len(), 3);
+        assert!(summary.truncated_by_cap);
+        assert_eq!(summary.file_cap, 3);
+        assert!(
+            summary.headline().contains("TRUNCATED"),
+            "{}",
+            summary.headline()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_language_repository_folds_every_language_not_only_rust() {
+        // The user-visible bug, end to end through the production scan: a repo
+        // with a Python file, a TSX file and a Rust file produced ONE row —
+        // `('src/lib.rs', 2)` — and an empty graph plus silence for a project
+        // with no Rust in it at all.
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        seed_mixed_repository(&root);
+
+        let data = tempfile::tempdir().unwrap();
+        let pool = codypendent_knowledge::db::open(&data.path().join("graph.db"))
+            .await
+            .unwrap();
+        let repository = repository_id_for(&root);
+        let _guard = lock_repository(repository).await;
+        let summary = scan_repository(&pool, repository, &root).await.unwrap();
+
+        // Grouped exactly the way the live check reads the database back.
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT source_path, language, count(*) FROM code_nodes \
+             GROUP BY source_path, language ORDER BY source_path",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        println!("code_nodes by source_path: {rows:#?}");
+        println!("summary: {}", summary.headline());
+
+        let paths: Vec<&str> = rows.iter().map(|(path, _, _)| path.as_str()).collect();
+        assert_eq!(paths, ["src/app.tsx", "src/lib.rs", "src/main.py"]);
+        for (path, language, count) in &rows {
+            assert!(*count > 1, "{path} folded to {count} node(s) — file only");
+            let expected = match path.as_str() {
+                "src/app.tsx" => "tsx",
+                "src/lib.rs" => "rust",
+                _ => "python",
+            };
+            assert_eq!(language, expected, "{path}");
+        }
+
+        assert_eq!(summary.files_folded, 3);
+        assert_eq!(summary.folded_by_language.get("python"), Some(&1));
+        assert_eq!(summary.folded_by_language.get("tsx"), Some(&1));
+        assert_eq!(summary.folded_by_language.get("rust"), Some(&1));
+        assert!(!summary.found_nothing_to_fold());
+
+        // Every language contributes real relations, not just a File node.
+        let calls: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM code_edges e JOIN code_nodes n ON e.from_node = n.id \
+             WHERE e.relation = 'calls' AND n.source_path = ?",
+        )
+        .bind("src/main.py")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(calls > 0, "python produced no Calls edges");
+    }
+
+    #[tokio::test]
+    async fn a_repository_with_no_parsable_source_reports_why() {
+        // The silence is as much the bug as the missing grammars: an all-Go
+        // repository must come back saying "1 file seen, none parsable", not
+        // "scan complete".
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::write(root.join("main.go"), "package main\n").unwrap();
+        std::fs::write(root.join("README.md"), "# hi\n").unwrap();
+        init_repo(&root);
+
+        let data = tempfile::tempdir().unwrap();
+        let pool = codypendent_knowledge::db::open(&data.path().join("graph.db"))
+            .await
+            .unwrap();
+        let repository = repository_id_for(&root);
+        let _guard = lock_repository(repository).await;
+        let summary = scan_repository(&pool, repository, &root).await.unwrap();
+
+        assert!(summary.found_nothing_to_fold());
+        assert_eq!(summary.files_folded, 0);
+        assert_eq!(summary.files_seen, 2);
+        assert_eq!(summary.files_skipped_unsupported, 2);
+        let headline = summary.headline();
+        println!("headline: {headline}");
+        assert!(headline.contains("NO supported source found"), "{headline}");
+        assert!(headline.contains(".go 1"), "{headline}");
+    }
+
+    /// A committed repository holding one Python, one TSX and one Rust file,
+    /// each defining a function that calls another.
+    fn seed_mixed_repository(root: &Path) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/main.py"),
+            "from .service import dispatch\n\n\n\
+             def handler(request):\n    return route(request)\n\n\n\
+             def route(request):\n    return dispatch(request)\n\n\n\
+             class Router:\n    def decide(self, request):\n        return handler(request)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/app.tsx"),
+            "import { useState } from \"react\";\n\n\
+             export function greet(name: string): string {\n  return format(name);\n}\n\n\
+             function format(name: string): string {\n  return `hi ${name}`;\n}\n\n\
+             export interface Props { name: string }\n\n\
+             export const App = (props: Props) => {\n\
+             \x20 const [n] = useState(props.name);\n  return <div>{greet(n)}</div>;\n};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn boot() -> u32 {\n    classify()\n}\n\npub fn classify() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        init_repo(root);
     }
 
     #[test]

@@ -336,7 +336,13 @@ impl PolicyEngine {
             // Outcome 5: a code-graph query reads only the derived projection of
             // this repository that the daemon itself parsed — the same "internal
             // state, no external effect" reasoning as the reads above.
-            | ProposedAction::CodeGraphQuery { .. } => self.eval_blackboard(),
+            | ProposedAction::CodeGraphQuery { .. }
+            // An agent edge assertion WRITES that same derived projection, and is
+            // allowed on the same reasoning as a task-board write: it touches no
+            // file, command, network or remote, it cannot create a node (both
+            // endpoints must already exist), and it cannot overwrite a
+            // higher-confidence fact — the store enforces that, not this gate.
+            | ProposedAction::CodeGraphAssert { .. } => self.eval_blackboard(),
             // Council creation changes durable configuration, and running one
             // fans out model requests with potentially material cost. Both are
             // deliberately fresh approvals; the ProposedAction is the preview.

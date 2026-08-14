@@ -1,10 +1,15 @@
 //! The syntax-layer code graph (Chapter 07, STEP 2.5).
 //!
-//! Tree-sitter parses a Rust source file into the durable graph: the important
+//! Tree-sitter parses a source file into the durable graph: the important
 //! symbols (files, modules, types, traits, functions, methods, constants, and
 //! tests — never local variables) as [`CodeNode`]s keyed by a position-stable
 //! [`SymbolKey`], and the `Contains` / `Defines` / `Imports` / `Calls`-as-written
 //! relations between them as evidence-backed [`CodeEdge`]s.
+//!
+//! Which files those are is decided in exactly one place — [`language_for`] —
+//! consulted both by the parser here and by the daemon's scanner. When they were
+//! two independent lists the scanner's was `*.rs` only, so every Python or
+//! TypeScript repository produced an empty graph and nothing said so.
 //!
 //! Only the *syntax* layer lives here (semantic/LSP resolution is Phase 4), so a
 //! call edge is recorded "as written" — resolved to a local definition when the
@@ -18,7 +23,7 @@
 //! `pool.begin()` transaction that also appends the index-outbox rows so the
 //! authoritative write and its `SymbolChanged` events are atomic.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -32,11 +37,131 @@ use uuid::Uuid;
 use crate::outbox::{self, KnowledgeIndexEvent};
 use crate::types::{
     CodeEdge, CodeNode, CodeNodeKind, CodeRelation, ContentHash, EvidenceKind, EvidenceRef,
-    GitRevision, LanguageId, SymbolKey, SYNTAX_CALL_CONFIDENCE,
+    GitRevision, LanguageId, SymbolKey, AGENT_ASSERTED_CONFIDENCE, SYNTAX_CALL_CONFIDENCE,
 };
 
-/// The IANA media type recorded on a file's descriptive evidence artifact.
-const RUST_MEDIA_TYPE: &str = "text/x-rust";
+// --------------------------------------------------------------------------
+// Language dispatch — the single definition of "a file the graph can hold"
+// --------------------------------------------------------------------------
+
+/// A source language the syntax layer can parse into the graph.
+///
+/// **This enum, and [`language_for`], are the only place the supported set is
+/// written down.** The daemon's warm-up walk, its filesystem watcher, and
+/// [`build_file_graph`] all ask here; a second list would drift, and drift is
+/// exactly how a mixed repository came to fold only its `.rs` files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Language {
+    Rust,
+    Python,
+    TypeScript,
+    /// TypeScript with JSX. A separate grammar, not a TypeScript variant: the
+    /// TypeScript grammar cannot parse `<div/>` and silently yields an error
+    /// tree, which would look exactly like an empty file.
+    Tsx,
+    JavaScript,
+}
+
+impl Language {
+    /// Every supported language, in a stable order (rendering, `--help` text).
+    pub const ALL: [Language; 5] = [
+        Language::Rust,
+        Language::Python,
+        Language::TypeScript,
+        Language::Tsx,
+        Language::JavaScript,
+    ];
+
+    /// The stable identifier stored in `code_nodes.language`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Language::Rust => "rust",
+            Language::Python => "python",
+            Language::TypeScript => "typescript",
+            Language::Tsx => "tsx",
+            Language::JavaScript => "javascript",
+        }
+    }
+
+    #[must_use]
+    pub fn id(self) -> LanguageId {
+        LanguageId(self.as_str().to_owned())
+    }
+
+    /// The file extensions (no leading dot, lower case) that select this
+    /// language. Matched case-insensitively by [`language_for`].
+    #[must_use]
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            Language::Rust => &["rs"],
+            Language::Python => &["py", "pyi"],
+            Language::TypeScript => &["ts", "mts", "cts"],
+            Language::Tsx => &["tsx"],
+            Language::JavaScript => &["js", "jsx", "mjs", "cjs"],
+        }
+    }
+
+    /// The media type recorded on a file's descriptive evidence artifact.
+    #[must_use]
+    pub fn media_type(self) -> &'static str {
+        match self {
+            Language::Rust => "text/x-rust",
+            Language::Python => "text/x-python",
+            Language::TypeScript => "text/x-typescript",
+            Language::Tsx => "text/x-tsx",
+            Language::JavaScript => "text/javascript",
+        }
+    }
+
+    /// The separator this language's qualified names are built with. Rust nests
+    /// with `::`, everything else here with `.`; the two never occur together in
+    /// one name, which is what lets [`last_segment`]/[`module_of`] accept both
+    /// without being told the language.
+    #[must_use]
+    pub fn separator(self) -> &'static str {
+        match self {
+            Language::Rust => "::",
+            _ => ".",
+        }
+    }
+
+    fn grammar(self) -> tree_sitter::Language {
+        match self {
+            Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Language::Python => tree_sitter_python::LANGUAGE.into(),
+            Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        }
+    }
+}
+
+/// The language `path`'s extension selects, or `None` when no grammar handles it.
+///
+/// The one gate. A caller that wants "is this file worth reading" and a caller
+/// that wants "can I parse this" must be the same question, or the first will
+/// happily hand the second a file it drops on the floor.
+#[must_use]
+pub fn language_for(path: &Path) -> Option<Language> {
+    let extension = path.extension()?.to_str()?;
+    Language::ALL.into_iter().find(|language| {
+        language
+            .extensions()
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    })
+}
+
+/// Every supported extension, for an error message or a `--help` line.
+#[must_use]
+pub fn supported_extensions() -> Vec<&'static str> {
+    Language::ALL
+        .into_iter()
+        .flat_map(Language::extensions)
+        .copied()
+        .collect()
+}
 
 /// Derive a **stable** [`RepositoryId`] from a repository's canonical path.
 ///
@@ -99,6 +224,11 @@ pub enum CodeGraphError {
     /// The tree-sitter parser could not be configured or produced no tree.
     #[error("parse error: {0}")]
     Parse(String),
+    /// No grammar handles this file's extension. Explicit rather than a silent
+    /// empty graph: a caller that reaches here has a filter that disagrees with
+    /// [`language_for`], which is the bug this variant exists to expose.
+    #[error("unsupported language for {path} (supported extensions: {supported})", supported = supported_extensions().join(", "))]
+    UnsupportedLanguage { path: String },
     /// A filesystem watcher could not be created or armed.
     #[error("watch error: {0}")]
     Watch(#[from] notify::Error),
@@ -124,6 +254,138 @@ pub struct GraphDelta {
     pub created_node_ids: Vec<CodeNodeId>,
     /// How many stale edges from the previous parse of this file were removed.
     pub removed_edges: u64,
+}
+
+// --------------------------------------------------------------------------
+// Scan reporting — what a warm-up actually did, so a caller can say so
+// --------------------------------------------------------------------------
+
+/// What one repository scan saw and folded.
+///
+/// A scan used to return `()`. On a repository in a language the graph could not
+/// parse it walked thousands of files, folded none, and reported success — the
+/// graph was empty and *nothing said so*. Every field here exists so a caller
+/// (`codypendent graph status`, a daemon log line) can explain the size of the
+/// graph instead of presenting an empty one as a finished one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScanSummary {
+    /// Every regular file the walk visited, before any filter. The denominator.
+    pub files_seen: usize,
+    /// Of those, the ones [`language_for`] recognises — the fold candidates.
+    pub files_supported: usize,
+    /// Of those, the ones actually folded into the graph.
+    pub files_folded: usize,
+    /// Candidates dropped by `.gitignore`.
+    pub files_skipped_ignored: usize,
+    /// Candidates that vanished between the walk and the read. Counted apart from
+    /// `files_skipped_ignored` because "the tree moved under us" and "policy
+    /// excluded it" are different answers to "why is this file not in the graph".
+    pub files_skipped_unreadable: usize,
+    /// Files no grammar handles. The number that explains an empty graph.
+    pub files_skipped_unsupported: usize,
+    /// Folded file count per [`Language::as_str`], ordered for stable rendering.
+    pub folded_by_language: BTreeMap<String, usize>,
+    /// Unsupported extensions actually seen, with counts (`{"go": 1204}`), so a
+    /// report can name what it skipped. Bounded to
+    /// [`Self::MAX_TRACKED_EXTENSIONS`] distinct keys — a hostile or generated
+    /// tree can contain unboundedly many distinct extensions, and this map is
+    /// held in memory and rendered.
+    pub unsupported_by_extension: BTreeMap<String, usize>,
+    /// Nodes and edges written by this scan.
+    pub nodes: usize,
+    pub edges: usize,
+    /// The walk stopped at [`Self::file_cap`]: this graph is a *truncation* of
+    /// the repository, not the repository.
+    pub truncated_by_cap: bool,
+    /// The cap that was in force.
+    pub file_cap: usize,
+}
+
+impl ScanSummary {
+    /// How many distinct unsupported extensions are tracked by name.
+    pub const MAX_TRACKED_EXTENSIONS: usize = 32;
+
+    /// Count one unsupported file, tracking its extension while there is room.
+    pub fn record_unsupported(&mut self, path: &Path) {
+        self.files_skipped_unsupported += 1;
+        let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+            return;
+        };
+        let extension = extension.to_ascii_lowercase();
+        if self.unsupported_by_extension.len() < Self::MAX_TRACKED_EXTENSIONS
+            || self.unsupported_by_extension.contains_key(&extension)
+        {
+            *self.unsupported_by_extension.entry(extension).or_default() += 1;
+        }
+    }
+
+    /// Count one folded file against its language.
+    pub fn record_folded(&mut self, language: Language) {
+        self.files_folded += 1;
+        *self
+            .folded_by_language
+            .entry(language.as_str().to_owned())
+            .or_default() += 1;
+    }
+
+    /// The walk found files and folded none of them — the failure this whole
+    /// type exists to make loud. A caller should warn, not print a zero.
+    #[must_use]
+    pub fn found_nothing_to_fold(&self) -> bool {
+        self.files_folded == 0 && self.files_seen > 0
+    }
+
+    /// One line a CLI or a log can print verbatim.
+    #[must_use]
+    pub fn headline(&self) -> String {
+        let mut line = format!(
+            "folded {} of {} files seen ({} nodes, {} edges)",
+            self.files_folded, self.files_seen, self.nodes, self.edges
+        );
+        if !self.folded_by_language.is_empty() {
+            let langs: Vec<String> = self
+                .folded_by_language
+                .iter()
+                .map(|(name, count)| format!("{name} {count}"))
+                .collect();
+            line.push_str(&format!(" [{}]", langs.join(", ")));
+        }
+        if self.files_skipped_unsupported > 0 {
+            let extensions: Vec<String> = self
+                .unsupported_by_extension
+                .iter()
+                .map(|(extension, count)| format!(".{extension} {count}"))
+                .collect();
+            line.push_str(&format!(
+                "; {} unsupported ({})",
+                self.files_skipped_unsupported,
+                if extensions.is_empty() {
+                    "no extension".to_owned()
+                } else {
+                    extensions.join(", ")
+                }
+            ));
+        }
+        if self.files_skipped_ignored > 0 {
+            line.push_str(&format!("; {} ignored", self.files_skipped_ignored));
+        }
+        if self.files_skipped_unreadable > 0 {
+            line.push_str(&format!("; {} unreadable", self.files_skipped_unreadable));
+        }
+        if self.truncated_by_cap {
+            line.push_str(&format!(
+                "; TRUNCATED at the {}-file cap — this graph is incomplete",
+                self.file_cap
+            ));
+        }
+        if self.found_nothing_to_fold() {
+            line.push_str(&format!(
+                "; NO supported source found — the graph is empty (supported: {})",
+                supported_extensions().join(", ")
+            ));
+        }
+        line
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -214,15 +476,23 @@ pub async fn upsert_file_graph(
         }
     }
 
-    // 2. Replace this file's edges. Every edge produced by parsing a file has a
-    //    `from_node` that is one of the file's own nodes (they all carry this
-    //    `source_path`), so deleting by that set removes exactly the previous
-    //    parse's edges — including edges out of a symbol this reparse drops — and
-    //    nothing from any other file.
+    // 2. Replace this file's SYNTAX edges. Every edge produced by parsing a file
+    //    has a `from_node` that is one of the file's own nodes (they all carry
+    //    this `source_path`), so deleting by that set removes exactly the
+    //    previous parse's edges — including edges out of a symbol this reparse
+    //    drops — and nothing from any other file.
+    //
+    //    Scoped to `syntax_inferred` because a reparse is only authoritative
+    //    over the layer it produces. Unscoped, it also deleted every
+    //    LSP-, compiler- and agent-asserted edge out of the file: with the live
+    //    watcher armed, an agent asserts a route→service edge and the next save
+    //    of that file erases it. Higher layers are retired by node retirement
+    //    (2b) when their endpoint genuinely disappears, not by every save.
     let removed = sqlx::query(
-        "DELETE FROM code_edges WHERE from_node IN \
+        "DELETE FROM code_edges WHERE evidence_kind = ? AND from_node IN \
          (SELECT id FROM code_nodes WHERE repository = ? AND source_path = ?)",
     )
+    .bind(scalar(&EvidenceKind::SyntaxInferred))
     .bind(repository.to_string())
     .bind(path)
     .execute(&mut *tx)
@@ -442,58 +712,274 @@ pub fn parse_symbols(path: &str, source: &str) -> Result<Vec<ParsedSymbol>, Code
 // Semantic layer — LSP/compiler edge supersession (STEP 4.5)
 // --------------------------------------------------------------------------
 
-/// A semantic (LSP- or compiler-resolved) edge to fold into the graph. Its
-/// endpoints are named by the stable [`SymbolKey::stable_key`] rather than a node
-/// id, so an adapter that resolves references does not need to know the graph's
-/// internal ids.
+/// A semantic (LSP-, compiler-, or agent-asserted) edge to fold into the graph.
+/// Its endpoints are named by the stable [`SymbolKey::stable_key`] rather than a
+/// node id, so an adapter that resolves references does not need to know the
+/// graph's internal ids. A model-callable caller wants [`assert_agent_edges`]
+/// instead — it names endpoints the way the source does.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticEdge {
     pub from_symbol_key: String,
     pub to_symbol_key: String,
     pub relation: CodeRelation,
-    /// Must be [`EvidenceKind::LspResolved`] or [`EvidenceKind::CompilerResolved`]
-    /// — a semantic edge supersedes its syntax-inferred counterpart.
+    /// [`EvidenceKind::LspResolved`], [`EvidenceKind::CompilerResolved`], or
+    /// [`EvidenceKind::AgentAsserted`]. What it may supersede follows from its
+    /// `confidence`, never from the kind itself.
     pub evidence_kind: EvidenceKind,
     pub confidence: f32,
     pub evidence: Option<EvidenceRef>,
 }
 
-/// Fold semantic edges into the graph, **superseding** any existing edge for the
-/// same `(from, to, relation)` rather than duplicating it (Chapter 07): a
-/// resolved LSP/compiler edge replaces the lower-confidence syntax-inferred one.
+/// What an [`upsert_semantic_edges`] / [`assert_agent_edges`] call did. Every
+/// input edge lands in exactly one bucket, so the three sum to the input length.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SemanticUpsertOutcome {
+    /// Written (superseding a strictly less-confident edge if one existed).
+    pub applied: u64,
+    /// An endpoint is not in the graph, or (for [`assert_agent_edges`]) the name
+    /// matched several symbols. Never invented: an assertion cannot create nodes.
+    pub skipped_unresolved: u64,
+    /// An edge for that `(from, to, relation)` already exists at **equal or
+    /// higher** confidence, so this one did not overwrite it.
+    pub skipped_outranked: u64,
+}
+
+/// One edge the agent claims exists that no parser can see — a route handler to
+/// the service it dispatches to, a config key to its reader. Endpoints are named
+/// the way they appear in the source, not by the `symbol_key` composite.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentEdgeAssertion {
+    pub from_symbol: String,
+    pub to_symbol: String,
+    pub relation: CodeRelation,
+    /// Why the agent believes this edge holds, and which run said so — an
+    /// [`EvidenceRef::AgentAssertion`]. Carried onto the edge so a user reviewing
+    /// the graph can see the reason, not just the claim.
+    pub evidence: Option<EvidenceRef>,
+}
+
+/// What one assertion did. Returned **per input assertion, in input order**: a
+/// bare count cannot tell the model *which* name it got wrong, so it can only
+/// resend everything and hope.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AssertionResult {
+    /// Written; nothing was displaced.
+    Applied,
+    /// Written; it replaced a strictly less-confident edge for the same triple.
+    Superseded {
+        previous: EvidenceKind,
+        previous_confidence: f32,
+    },
+    /// **Not** written: an edge for this triple is at least as confident. Not an
+    /// error — the graph already knows, from a better witness.
+    Outranked {
+        existing: EvidenceKind,
+        existing_confidence: f32,
+    },
+    /// **Not** written: the name matched no symbol. `symbol` is the endpoint as
+    /// the agent wrote it, so a caller can quote it back; `candidates` are near
+    /// names, so a dead end becomes a correction.
+    Unresolved {
+        symbol: String,
+        candidates: Vec<String>,
+    },
+    /// **Not** written: the name matched several symbols. A different next move
+    /// from `Unresolved` — the agent must say which, not invent a new name.
+    Ambiguous {
+        symbol: String,
+        candidates: Vec<String>,
+    },
+}
+
+/// Fold agent-asserted edges into the graph at [`AGENT_ASSERTED_CONFIDENCE`].
+///
+/// Endpoints are resolved with [`find_symbols`] — the same three-tier lookup
+/// `graph.callers_of` uses — so the agent names symbols as it read them. A name
+/// that matches nothing, or matches more than one symbol, is refused rather than
+/// guessed at, and **no node is ever created**: an assertion is a claim about
+/// the graph, never an addition to it.
+///
+/// An assertion is refused against every mechanical layer, tree-sitter included
+/// (see [`AGENT_ASSERTED_CONFIDENCE`] and [`upsert_semantic_edges`] for the rule).
+pub async fn assert_agent_edges(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    revision: &GitRevision,
+    assertions: &[AgentEdgeAssertion],
+) -> Result<Vec<AssertionResult>, CodeGraphError> {
+    // Resolve first, so a name failure is reported against ITS assertion rather
+    // than collapsing into an aggregate count.
+    let mut results: Vec<Option<AssertionResult>> = Vec::with_capacity(assertions.len());
+    let mut resolved: Vec<(usize, SemanticEdge)> = Vec::new();
+    for assertion in assertions {
+        let from = resolve_asserted_endpoint(pool, repository, &assertion.from_symbol).await?;
+        let to = resolve_asserted_endpoint(pool, repository, &assertion.to_symbol).await?;
+        match (from, to) {
+            (Ok(from), Ok(to)) => {
+                resolved.push((
+                    results.len(),
+                    SemanticEdge {
+                        from_symbol_key: from,
+                        to_symbol_key: to,
+                        relation: assertion.relation,
+                        evidence_kind: EvidenceKind::AgentAsserted,
+                        confidence: AGENT_ASSERTED_CONFIDENCE,
+                        evidence: assertion.evidence.clone(),
+                    },
+                ));
+                results.push(None);
+            }
+            // The `from` failure is reported first: it is the one the agent named
+            // first, and reporting both would double-count the assertion.
+            (Err(failure), _) | (Ok(_), Err(failure)) => results.push(Some(failure)),
+        }
+    }
+
+    let edges: Vec<SemanticEdge> = resolved.iter().map(|(_, edge)| edge.clone()).collect();
+    let applied = apply_semantic_edges(pool, repository, revision, &edges).await?;
+    for ((slot, _), result) in resolved.into_iter().zip(applied) {
+        results[slot] = Some(result);
+    }
+    Ok(results
+        .into_iter()
+        .map(|result| result.unwrap_or(AssertionResult::Applied))
+        .collect())
+}
+
+/// Resolve one endpoint name to its `symbol_key`, or to the refusal to report.
+///
+/// Ambiguity is a refusal, not a coin toss: an agent asserting `create` in a
+/// repository with four `create`s must be told which four.
+#[allow(clippy::type_complexity)]
+async fn resolve_asserted_endpoint(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    name: &str,
+) -> Result<Result<String, AssertionResult>, CodeGraphError> {
+    let matches = find_symbols(pool, repository, name, GRAPH_CANDIDATE_LIMIT).await?;
+    match matches.as_slice() {
+        [only] => Ok(Ok(only.key.stable_key())),
+        [] => Ok(Err(AssertionResult::Unresolved {
+            symbol: name.to_owned(),
+            candidates: nearby_symbols(pool, repository, name).await?,
+        })),
+        several => Ok(Err(AssertionResult::Ambiguous {
+            symbol: name.to_owned(),
+            candidates: several
+                .iter()
+                .map(|node| node.key.qualified_name.clone())
+                .collect(),
+        })),
+    }
+}
+
+/// Fold semantic edges into the graph, **superseding only an edge of strictly
+/// lower confidence** for the same `(from, to, relation)`.
+///
+/// This used to be an unconditional `DELETE` before the insert, which was safe
+/// only while every writer was an LSP or a compiler. It is not safe now:
+/// [`EvidenceKind::AgentAsserted`] lets the model assert edges, and a blanket
+/// delete would let a 0.60 guess erase a 0.98 compiler-resolved fact. The rule
+/// is therefore about *confidence*, not about who is writing —
+///
+/// * lower-confidence incumbent → deleted, the new edge is written;
+/// * equal-or-higher incumbent → kept, the new edge is **not** written
+///   (`skipped_outranked`), so re-asserting is idempotent rather than duplicating.
 ///
 /// Endpoints are resolved by `symbol_key`; an edge whose endpoints are not both
-/// present in the graph is skipped (returned in the count of skipped edges).
-/// Returns `(applied, skipped)`. Each applied edge enqueues a `SymbolChanged`
-/// event for its `from` node, in the same transaction as the writes.
+/// present is skipped. Each applied edge enqueues a `SymbolChanged` event for its
+/// `from` node, in the same transaction as the writes.
 pub async fn upsert_semantic_edges(
     pool: &SqlitePool,
     repository: RepositoryId,
     revision: &GitRevision,
     edges: &[SemanticEdge],
-) -> Result<(u64, u64), CodeGraphError> {
+) -> Result<SemanticUpsertOutcome, CodeGraphError> {
+    let results = apply_semantic_edges(pool, repository, revision, edges).await?;
+    let mut outcome = SemanticUpsertOutcome::default();
+    for result in results {
+        match result {
+            AssertionResult::Applied | AssertionResult::Superseded { .. } => outcome.applied += 1,
+            AssertionResult::Outranked { .. } => outcome.skipped_outranked += 1,
+            AssertionResult::Unresolved { .. } | AssertionResult::Ambiguous { .. } => {
+                outcome.skipped_unresolved += 1;
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// The shared write core: one [`AssertionResult`] per input edge, in input order.
+/// All of it in one transaction, as before.
+async fn apply_semantic_edges(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+    revision: &GitRevision,
+    edges: &[SemanticEdge],
+) -> Result<Vec<AssertionResult>, CodeGraphError> {
     let now = Utc::now();
     let created_at = now.to_rfc3339();
-    let mut applied = 0;
-    let mut skipped = 0;
+    let mut results = Vec::with_capacity(edges.len());
 
     let mut tx = pool.begin().await?;
     for edge in edges {
         let from = resolve_node_id(&mut *tx, repository, &edge.from_symbol_key).await?;
         let to = resolve_node_id(&mut *tx, repository, &edge.to_symbol_key).await?;
         let (Some(from), Some(to)) = (from, to) else {
-            skipped += 1;
+            let missing = if from.is_none() {
+                &edge.from_symbol_key
+            } else {
+                &edge.to_symbol_key
+            };
+            results.push(AssertionResult::Unresolved {
+                symbol: missing.clone(),
+                candidates: Vec::new(),
+            });
             continue;
         };
 
-        // Supersede: drop any existing edge for this (from, to, relation) — the
-        // syntax-inferred one is replaced, not shadowed by a duplicate.
-        sqlx::query("DELETE FROM code_edges WHERE from_node = ? AND to_node = ? AND relation = ?")
-            .bind(from.to_string())
-            .bind(to.to_string())
-            .bind(scalar(&edge.relation))
-            .execute(&mut *tx)
-            .await?;
+        // Read the incumbent before touching it: its kind and confidence are what
+        // a caller needs to explain either outcome.
+        let incumbent: Option<(String, f64)> = sqlx::query_as(
+            "SELECT evidence_kind, confidence FROM code_edges \
+             WHERE from_node = ? AND to_node = ? AND relation = ? \
+             ORDER BY confidence DESC LIMIT 1",
+        )
+        .bind(from.to_string())
+        .bind(to.to_string())
+        .bind(scalar(&edge.relation))
+        .fetch_optional(&mut *tx)
+        .await?;
+        let incumbent = incumbent
+            .map(|(kind, confidence)| {
+                from_scalar::<EvidenceKind>(&kind).map(|kind| (kind, confidence as f32))
+            })
+            .transpose()?;
+
+        // An incumbent at least as confident keeps the triple. Inserting beside
+        // it would shadow a stronger fact with a weaker duplicate; deleting it —
+        // which this did unconditionally — would let a 0.40 agent guess erase a
+        // 0.98 compiler-resolved fact.
+        if let Some((existing, existing_confidence)) = incumbent {
+            if existing_confidence >= edge.confidence {
+                results.push(AssertionResult::Outranked {
+                    existing,
+                    existing_confidence,
+                });
+                continue;
+            }
+        }
+
+        let removed = sqlx::query(
+            "DELETE FROM code_edges \
+             WHERE from_node = ? AND to_node = ? AND relation = ? AND confidence < ?",
+        )
+        .bind(from.to_string())
+        .bind(to.to_string())
+        .bind(scalar(&edge.relation))
+        .bind(f64::from(edge.confidence))
+        .execute(&mut *tx)
+        .await?;
 
         let evidence_json = match &edge.evidence {
             Some(e) => Some(serde_json::to_string(e)?),
@@ -518,10 +1004,16 @@ pub async fn upsert_semantic_edges(
         .await?;
 
         outbox::enqueue(&mut *tx, &KnowledgeIndexEvent::SymbolChanged(from), now).await?;
-        applied += 1;
+        results.push(match incumbent.filter(|_| removed.rows_affected() > 0) {
+            Some((previous, previous_confidence)) => AssertionResult::Superseded {
+                previous,
+                previous_confidence,
+            },
+            None => AssertionResult::Applied,
+        });
     }
     tx.commit().await?;
-    Ok((applied, skipped))
+    Ok(results)
 }
 
 // --------------------------------------------------------------------------
@@ -957,30 +1449,33 @@ pub async fn find_symbols(
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
-    let tiers = [
-        ("qualified_name = ?".to_string(), name.to_string()),
+    // The last-segment tier tries BOTH separators the graph stores: `Engine::tick`
+    // for Rust and `Engine.tick` for Python/TypeScript. With only `::` a Python
+    // repository answered every `graph.*` question from the substring tier or not
+    // at all.
+    let tiers: [(&str, Vec<String>); 3] = [
+        ("qualified_name = ?", vec![name.to_string()]),
         (
-            "qualified_name LIKE ? ESCAPE '\\'".to_string(),
-            format!("%::{escaped}"),
+            "(qualified_name LIKE ? ESCAPE '\\' OR qualified_name LIKE ? ESCAPE '\\')",
+            vec![format!("%::{escaped}"), format!("%.{escaped}")],
         ),
         (
-            "qualified_name LIKE ? ESCAPE '\\'".to_string(),
-            format!("%{escaped}%"),
+            "qualified_name LIKE ? ESCAPE '\\'",
+            vec![format!("%{escaped}%")],
         ),
     ];
-    for (predicate, pattern) in tiers {
+    for (predicate, patterns) in tiers {
         let sql = format!(
             "SELECT id, language, package, source_path, qualified_name, kind, signature_hash, \
                     revision \
              FROM code_nodes WHERE repository = ? AND {predicate} \
              ORDER BY created_at ASC, id ASC LIMIT ?"
         );
-        let rows: Vec<NodeRow> = sqlx::query_as(&sql)
-            .bind(repository.to_string())
-            .bind(&pattern)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await?;
+        let mut query = sqlx::query_as::<_, NodeRow>(&sql).bind(repository.to_string());
+        for pattern in &patterns {
+            query = query.bind(pattern);
+        }
+        let rows: Vec<NodeRow> = query.bind(limit as i64).fetch_all(pool).await?;
         if !rows.is_empty() {
             return rows
                 .into_iter()
@@ -1469,10 +1964,17 @@ struct Ctx {
 
 struct Builder<'a> {
     repository: RepositoryId,
+    /// Which grammar produced the tree, and therefore which node kinds the
+    /// visitors match and which separator qualified names are built with.
+    language: Language,
     /// The repo-relative path being parsed; stamped onto every node's key so a
     /// file's symbols are identified independently of any other file's.
     path: &'a str,
     source: &'a str,
+    /// Whether `path` names a test file, by each ecosystem's own convention.
+    /// Rust marks tests with an attribute; Python and JavaScript mark them by
+    /// file name, so the path is the only signal available at the syntax layer.
+    test_file: bool,
     nodes: Vec<BuiltNode>,
     edges: Vec<BuiltEdge>,
     pending_calls: Vec<PendingCall>,
@@ -1482,15 +1984,25 @@ struct Builder<'a> {
 
 /// Parse `source` into a [`BuiltGraph`]. Deterministic: identical bytes always
 /// produce identical nodes, edges, and evidence.
+///
+/// The grammar is chosen by [`language_for`]; a path no grammar handles is an
+/// explicit [`CodeGraphError::UnsupportedLanguage`], never a silently empty
+/// graph. Parsing a Python file with the Rust grammar (which is what a single
+/// hardcoded grammar amounts to once the scanner offers more than `.rs`) yields
+/// an error tree that looks exactly like an empty file.
 fn build_file_graph(
     repository: RepositoryId,
     path: &str,
     source: &str,
 ) -> Result<BuiltGraph, CodeGraphError> {
+    let language =
+        language_for(Path::new(path)).ok_or_else(|| CodeGraphError::UnsupportedLanguage {
+            path: path.to_owned(),
+        })?;
     let digest = Sha256::digest(source.as_bytes());
     let file_artifact = ArtifactRef {
         id: ArtifactId(Uuid::from_slice(&digest[..16])?),
-        media_type: RUST_MEDIA_TYPE.to_owned(),
+        media_type: language.media_type().to_owned(),
         byte_length: source.len() as u64,
         sha256: hex::encode(digest),
         sensitivity: DataClassification::Internal,
@@ -1498,7 +2010,7 @@ fn build_file_graph(
 
     let mut parser = Parser::new();
     parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .set_language(&language.grammar())
         .map_err(|e| CodeGraphError::Parse(e.to_string()))?;
     let tree = parser
         .parse(source.as_bytes(), None)
@@ -1506,8 +2018,10 @@ fn build_file_graph(
 
     let mut builder = Builder {
         repository,
+        language,
         path,
         source,
+        test_file: is_test_path(language, path),
         nodes: Vec::new(),
         edges: Vec::new(),
         pending_calls: Vec::new(),
@@ -1531,7 +2045,7 @@ fn build_file_graph(
         associated: false,
         in_test: false,
     };
-    builder.visit_item_list(tree.root_node(), &root_ctx);
+    builder.visit_items(tree.root_node(), &root_ctx);
     builder.resolve_calls();
 
     Ok(BuiltGraph {
@@ -1550,12 +2064,33 @@ impl Builder<'_> {
     ) -> SymbolKey {
         SymbolKey {
             repository: self.repository,
-            language: LanguageId("rust".to_owned()),
+            language: self.language.id(),
             package: None,
             source_path: self.path.to_owned(),
             qualified_name,
             kind,
             signature_hash,
+        }
+    }
+
+    /// `scope::name` / `scope.name`, in this file's language.
+    fn qualify(&self, scope: &[String], name: &str) -> String {
+        join_qualified(&scope.join(self.language.separator()), self.language, name)
+    }
+
+    /// Dispatch an item list to the visitor for this file's grammar. Every
+    /// language walks the same `Ctx` and produces the same node kinds and the
+    /// same four relations; only the tree-sitter node names differ.
+    fn visit_items(&mut self, list: Node, ctx: &Ctx) {
+        if ctx.depth >= MAX_PARSE_DEPTH {
+            return; // graceful truncation, never a stack overflow (see the const)
+        }
+        match self.language {
+            Language::Rust => self.visit_rust_items(list, ctx),
+            Language::Python => self.visit_python_items(list, ctx),
+            Language::TypeScript | Language::Tsx | Language::JavaScript => {
+                self.visit_ecma_items(list, ctx);
+            }
         }
     }
 
@@ -1591,13 +2126,10 @@ impl Builder<'_> {
             .to_owned()
     }
 
-    /// Iterate the named children of an item list (`source_file` /
+    /// Iterate the named children of a Rust item list (`source_file` /
     /// `declaration_list`), attaching each pending attribute run to the item that
     /// follows it, and dispatch each item to its handler.
-    fn visit_item_list(&mut self, list: Node, ctx: &Ctx) {
-        if ctx.depth >= MAX_PARSE_DEPTH {
-            return; // graceful truncation, never a stack overflow (see the const)
-        }
+    fn visit_rust_items(&mut self, list: Node, ctx: &Ctx) {
         let children: Vec<Node> = list.named_children(&mut list.walk()).collect();
         let mut pending: Vec<String> = Vec::new();
         for child in children {
@@ -1641,7 +2173,7 @@ impl Builder<'_> {
         let Some(name) = node.child_by_field_name("name").map(|n| self.text(n)) else {
             return;
         };
-        let qualified = join_scope(&ctx.scope_path, &name);
+        let qualified = self.qualify(&ctx.scope_path, &name);
         let is_test = ctx.in_test || attrs.iter().any(|a| is_test_attr(a));
         let kind = if is_test {
             CodeNodeKind::Test
@@ -1667,7 +2199,7 @@ impl Builder<'_> {
         let Some(name) = node.child_by_field_name("name").map(|n| self.text(n)) else {
             return;
         };
-        let qualified = join_scope(&ctx.scope_path, &name);
+        let qualified = self.qualify(&ctx.scope_path, &name);
         let idx = self.add_node(self.make_key(qualified, CodeNodeKind::Module, None), true);
         let span = (node.start_byte(), node.end_byte());
         self.add_edge(ctx.container, idx, CodeRelation::Contains, span);
@@ -1686,7 +2218,7 @@ impl Builder<'_> {
                 associated: false,
                 in_test: ctx.in_test || is_cfg_test,
             };
-            self.visit_item_list(body, &mod_ctx);
+            self.visit_items(body, &mod_ctx);
         }
     }
 
@@ -1694,7 +2226,7 @@ impl Builder<'_> {
         let Some(name) = node.child_by_field_name("name").map(|n| self.text(n)) else {
             return;
         };
-        let qualified = join_scope(&ctx.scope_path, &name);
+        let qualified = self.qualify(&ctx.scope_path, &name);
         let idx = self.add_node(self.make_key(qualified, CodeNodeKind::Type, None), true);
         let span = (node.start_byte(), node.end_byte());
         self.add_edge(ctx.container, idx, CodeRelation::Contains, span);
@@ -1705,7 +2237,7 @@ impl Builder<'_> {
         let Some(name) = node.child_by_field_name("name").map(|n| self.text(n)) else {
             return;
         };
-        let qualified = join_scope(&ctx.scope_path, &name);
+        let qualified = self.qualify(&ctx.scope_path, &name);
         let idx = self.add_node(
             self.make_key(qualified, CodeNodeKind::TraitOrInterface, None),
             true,
@@ -1726,7 +2258,7 @@ impl Builder<'_> {
                 associated: true,
                 in_test: ctx.in_test,
             };
-            self.visit_item_list(body, &trait_ctx);
+            self.visit_items(body, &trait_ctx);
         }
     }
 
@@ -1752,7 +2284,7 @@ impl Builder<'_> {
                 associated: true,
                 in_test: ctx.in_test,
             };
-            self.visit_item_list(body, &impl_ctx);
+            self.visit_items(body, &impl_ctx);
         }
     }
 
@@ -1760,7 +2292,7 @@ impl Builder<'_> {
         let Some(name) = node.child_by_field_name("name").map(|n| self.text(n)) else {
             return;
         };
-        let qualified = join_scope(&ctx.scope_path, &name);
+        let qualified = self.qualify(&ctx.scope_path, &name);
         let idx = self.add_node(self.make_key(qualified, CodeNodeKind::Constant, None), true);
         let span = (node.start_byte(), node.end_byte());
         self.add_edge(ctx.container, idx, CodeRelation::Contains, span);
@@ -1775,11 +2307,7 @@ impl Builder<'_> {
         self.expand_use(argument, "", &mut paths);
         let span = (node.start_byte(), node.end_byte());
         for path in paths {
-            let idx = self.add_node(
-                self.make_key(path, CodeNodeKind::ExternalDependency, None),
-                false,
-            );
-            self.add_edge(ctx.container, idx, CodeRelation::Imports, span);
+            self.add_import(path, ctx.container, span);
         }
     }
 
@@ -1792,7 +2320,7 @@ impl Builder<'_> {
                     .child_by_field_name("path")
                     .map(|n| self.text(n))
                     .unwrap_or_default();
-                let next = join_path(prefix, &path);
+                let next = join_qualified(prefix, self.language, &path);
                 if let Some(list) = node.child_by_field_name("list") {
                     for child in list.named_children(&mut list.walk()) {
                         self.expand_use(child, &next, out);
@@ -1809,25 +2337,46 @@ impl Builder<'_> {
                     .child_by_field_name("path")
                     .map(|n| self.text(n))
                     .unwrap_or_default();
-                out.push(join_path(prefix, &path));
+                out.push(join_qualified(prefix, self.language, &path));
             }
-            _ => out.push(join_path(prefix, &self.text(node))),
+            _ => out.push(join_qualified(prefix, self.language, &self.text(node))),
         }
     }
 
-    /// Descend a function body recording every call expression against the
-    /// enclosing function. Nested `function_item`s are skipped (their calls
-    /// belong to them, not the outer fn); closures are descended into.
+    /// Descend a function body recording every call against the enclosing
+    /// function. Nested item declarations are skipped (their calls belong to
+    /// them, not the outer fn); closures and arrow bodies are descended into.
     fn collect_calls(&mut self, node: Node, ctx: &Ctx, depth: usize) {
         if depth >= MAX_PARSE_DEPTH {
             return; // graceful truncation, never a stack overflow (see the const)
         }
+        let (call_kind, nested_items) = match self.language {
+            Language::Rust => ("call_expression", &["function_item"][..]),
+            Language::Python => (
+                "call",
+                &[
+                    "function_definition",
+                    "class_definition",
+                    "decorated_definition",
+                ][..],
+            ),
+            Language::TypeScript | Language::Tsx | Language::JavaScript => (
+                "call_expression",
+                &[
+                    "function_declaration",
+                    "generator_function_declaration",
+                    "class_declaration",
+                    "abstract_class_declaration",
+                    "method_definition",
+                ][..],
+            ),
+        };
         let children: Vec<Node> = node.named_children(&mut node.walk()).collect();
         for child in children {
-            if child.kind() == "function_item" {
+            if nested_items.contains(&child.kind()) {
                 continue;
             }
-            if child.kind() == "call_expression" {
+            if child.kind() == call_kind {
                 if let Some(function) = child.child_by_field_name("function") {
                     if let (Some(from), Some((simple, written, is_method))) =
                         (ctx.current_fn, self.callee_name(function))
@@ -1848,8 +2397,18 @@ impl Builder<'_> {
     }
 
     /// The `(simple_name, written_path, is_method)` of a call's callee, or `None`
-    /// when the callee is not a plain name/path/method (e.g. a call on a call).
+    /// when the callee is not a plain name/path/member (e.g. a call on a call).
     fn callee_name(&self, function: Node) -> Option<(String, String, bool)> {
+        match self.language {
+            Language::Rust => self.rust_callee_name(function),
+            Language::Python => self.python_callee_name(function),
+            Language::TypeScript | Language::Tsx | Language::JavaScript => {
+                self.ecma_callee_name(function)
+            }
+        }
+    }
+
+    fn rust_callee_name(&self, function: Node) -> Option<(String, String, bool)> {
         match function.kind() {
             "identifier" => {
                 let name = self.text(function);
@@ -1873,10 +2432,497 @@ impl Builder<'_> {
             }
             "generic_function" => {
                 let inner = function.child_by_field_name("function")?;
-                self.callee_name(inner)
+                self.rust_callee_name(inner)
             }
             _ => None,
         }
+    }
+
+    /// Python: `f()` is an identifier, `obj.f()` / `mod.f()` an `attribute`. The
+    /// receiver's type is unknown at the syntax layer, so `attribute` is reported
+    /// as a method call and resolves only against an unambiguous local method.
+    fn python_callee_name(&self, function: Node) -> Option<(String, String, bool)> {
+        match function.kind() {
+            "identifier" => {
+                let name = self.text(function);
+                Some((name.clone(), name, false))
+            }
+            "attribute" => {
+                let attribute = function.child_by_field_name("attribute")?;
+                Some((self.text(attribute), self.text(function), true))
+            }
+            _ => None,
+        }
+    }
+
+    /// TypeScript/JavaScript: `f()` is an identifier, `obj.f()` a
+    /// `member_expression`. `obj?.f()` is the same node with an optional chain.
+    fn ecma_callee_name(&self, function: Node) -> Option<(String, String, bool)> {
+        match function.kind() {
+            "identifier" => {
+                let name = self.text(function);
+                Some((name.clone(), name, false))
+            }
+            "member_expression" => {
+                let property = function.child_by_field_name("property")?;
+                if property.kind() != "property_identifier" {
+                    return None; // a computed member `obj[expr]()`, not a name
+                }
+                Some((self.text(property), self.text(function), true))
+            }
+            "parenthesized_expression" => {
+                let inner = function.named_child(0)?;
+                self.ecma_callee_name(inner)
+            }
+            _ => None,
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Python
+    // ----------------------------------------------------------------------
+
+    /// Iterate a Python `module` or `block`, dispatching each statement. Class
+    /// bodies come through here too, with `associated` set, so a `def` inside a
+    /// class becomes a [`CodeNodeKind::Method`] exactly as a Rust `impl` fn does.
+    fn visit_python_items(&mut self, list: Node, ctx: &Ctx) {
+        let children: Vec<Node> = list.named_children(&mut list.walk()).collect();
+        for child in children {
+            match child.kind() {
+                "function_definition" => self.handle_python_fn(child, ctx),
+                "class_definition" => self.handle_python_class(child, ctx),
+                // `@decorator def f(): …` — the decorators are not nodes; the
+                // definition they wrap is.
+                "decorated_definition" => {
+                    if let Some(inner) = child.child_by_field_name("definition") {
+                        match inner.kind() {
+                            "function_definition" => self.handle_python_fn(inner, ctx),
+                            "class_definition" => self.handle_python_class(inner, ctx),
+                            _ => {}
+                        }
+                    }
+                }
+                "import_statement" | "future_import_statement" => {
+                    self.handle_python_import(child, ctx);
+                }
+                "import_from_statement" => self.handle_python_from_import(child, ctx),
+                // A module-level `NAME = …` is the Python analogue of a Rust
+                // `const`. Inside a class it is a field, which the Rust walk does
+                // not record either, so it is skipped for the same reason.
+                "expression_statement" if !ctx.associated => {
+                    self.handle_python_assignment(child, ctx);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_python_fn(&mut self, node: Node, ctx: &Ctx) {
+        let Some(name) = node.child_by_field_name("name").map(|n| self.text(n)) else {
+            return;
+        };
+        let qualified = self.qualify(&ctx.scope_path, &name);
+        let kind = if self.test_file && name.starts_with("test") {
+            CodeNodeKind::Test
+        } else if ctx.associated {
+            CodeNodeKind::Method
+        } else {
+            CodeNodeKind::Function
+        };
+        let signature = self.signature_hash(node);
+        let idx = self.add_node(self.make_key(qualified, kind, Some(signature)), true);
+        let span = (node.start_byte(), node.end_byte());
+        self.add_edge(ctx.container, idx, CodeRelation::Contains, span);
+        self.add_edge(ctx.definer, idx, CodeRelation::Defines, span);
+
+        if let Some(body) = node.child_by_field_name("body") {
+            let mut body_ctx = ctx.clone();
+            body_ctx.current_fn = Some(idx);
+            self.collect_calls(body, &body_ctx, 0);
+        }
+    }
+
+    fn handle_python_class(&mut self, node: Node, ctx: &Ctx) {
+        let Some(name) = node.child_by_field_name("name").map(|n| self.text(n)) else {
+            return;
+        };
+        let qualified = self.qualify(&ctx.scope_path, &name);
+        let idx = self.add_node(self.make_key(qualified, CodeNodeKind::Type, None), true);
+        let span = (node.start_byte(), node.end_byte());
+        self.add_edge(ctx.container, idx, CodeRelation::Contains, span);
+        self.add_edge(ctx.definer, idx, CodeRelation::Defines, span);
+
+        if let Some(body) = node.child_by_field_name("body") {
+            let mut child_scope = ctx.scope_path.clone();
+            child_scope.push(name);
+            let class_ctx = Ctx {
+                depth: ctx.depth + 1,
+                scope_path: child_scope,
+                container: idx,
+                definer: idx,
+                current_fn: None,
+                associated: true,
+                in_test: ctx.in_test,
+            };
+            self.visit_items(body, &class_ctx);
+        }
+    }
+
+    /// `import a.b`, `import a.b as c` — one reference per imported module.
+    fn handle_python_import(&mut self, node: Node, ctx: &Ctx) {
+        let span = (node.start_byte(), node.end_byte());
+        let children: Vec<Node> = node.named_children(&mut node.walk()).collect();
+        for child in children {
+            let written = match child.kind() {
+                "dotted_name" => self.text(child),
+                "aliased_import" => match child.child_by_field_name("name") {
+                    Some(name) => self.text(name),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            self.add_import(written, ctx.container, span);
+        }
+    }
+
+    /// `from a.b import C, D` → `a.b.C`, `a.b.D`; `from . import x` → `.x`;
+    /// `from a import *` → `a`. Mirrors the Rust `use`-tree flattening: one
+    /// reference node per imported leaf, named by its full written path.
+    fn handle_python_from_import(&mut self, node: Node, ctx: &Ctx) {
+        let span = (node.start_byte(), node.end_byte());
+        let module = node
+            .child_by_field_name("module_name")
+            .map(|n| self.text(n))
+            .unwrap_or_default();
+        let leaves: Vec<String> = node
+            .children_by_field_name("name", &mut node.walk())
+            .map(|leaf| match leaf.kind() {
+                "aliased_import" => leaf
+                    .child_by_field_name("name")
+                    .map_or_else(|| self.text(leaf), |n| self.text(n)),
+                _ => self.text(leaf),
+            })
+            .collect();
+        if leaves.is_empty() {
+            // `from a import *`: the module itself is the whole import.
+            if !module.is_empty() {
+                self.add_import(module, ctx.container, span);
+            }
+            return;
+        }
+        for leaf in leaves {
+            let written = join_qualified(&module, self.language, &leaf);
+            self.add_import(written, ctx.container, span);
+        }
+    }
+
+    /// A module-level `NAME = …`, recorded as a [`CodeNodeKind::Constant`] the
+    /// way a Rust `const`/`static` is. Only a plain `identifier` target: a tuple
+    /// unpack or a subscript assignment names no single durable symbol.
+    fn handle_python_assignment(&mut self, node: Node, ctx: &Ctx) {
+        let Some(assignment) = node.named_child(0).filter(|n| n.kind() == "assignment") else {
+            return;
+        };
+        let Some(left) = assignment
+            .child_by_field_name("left")
+            .filter(|n| n.kind() == "identifier")
+        else {
+            return;
+        };
+        let name = self.text(left);
+        let qualified = self.qualify(&ctx.scope_path, &name);
+        let idx = self.add_node(self.make_key(qualified, CodeNodeKind::Constant, None), true);
+        let span = (node.start_byte(), node.end_byte());
+        self.add_edge(ctx.container, idx, CodeRelation::Contains, span);
+        self.add_edge(ctx.definer, idx, CodeRelation::Defines, span);
+    }
+
+    // ----------------------------------------------------------------------
+    // TypeScript / TSX / JavaScript
+    // ----------------------------------------------------------------------
+
+    /// Iterate an ECMAScript `program`, `statement_block`, `class_body`,
+    /// `interface_body` or namespace body. One visitor for all three grammars:
+    /// the TypeScript-only kinds (`interface_declaration`, `enum_declaration`, …)
+    /// simply never appear in a JavaScript tree.
+    fn visit_ecma_items(&mut self, list: Node, ctx: &Ctx) {
+        let children: Vec<Node> = list.named_children(&mut list.walk()).collect();
+        for child in children {
+            self.visit_ecma_item(child, ctx);
+        }
+    }
+
+    fn visit_ecma_item(&mut self, node: Node, ctx: &Ctx) {
+        match node.kind() {
+            // `export …` / `declare …` wrap the declaration that matters. A bare
+            // `export { a }` or `export … from "x"` carries no declaration.
+            "export_statement" | "ambient_declaration" => {
+                if let Some(declaration) = node.child_by_field_name("declaration") {
+                    let mut inner = ctx.clone();
+                    inner.depth += 1;
+                    self.visit_ecma_item(declaration, &inner);
+                } else if node.child_by_field_name("source").is_some() {
+                    self.handle_ecma_import(node, ctx);
+                }
+            }
+            "function_declaration" | "generator_function_declaration" | "function_signature" => {
+                self.handle_ecma_fn(node, ctx, None);
+            }
+            "class_declaration" | "abstract_class_declaration" => {
+                self.handle_ecma_class(node, ctx, CodeNodeKind::Type);
+            }
+            "interface_declaration" => {
+                self.handle_ecma_class(node, ctx, CodeNodeKind::TraitOrInterface);
+            }
+            "enum_declaration" => self.handle_ecma_class(node, ctx, CodeNodeKind::Type),
+            "type_alias_declaration" => self.handle_ecma_type_alias(node, ctx),
+            // `namespace X { … }` / `module X { … }`.
+            "internal_module" | "module" => self.handle_ecma_namespace(node, ctx),
+            "lexical_declaration" | "variable_declaration" => {
+                self.handle_ecma_variables(node, ctx);
+            }
+            // Class members.
+            "method_definition" => self.handle_ecma_fn(node, ctx, None),
+            "public_field_definition" | "field_definition" => {
+                self.handle_ecma_field(node, ctx);
+            }
+            // Interface members.
+            "method_signature" | "abstract_method_signature" => {
+                self.handle_ecma_fn(node, ctx, None);
+            }
+            "import_statement" => self.handle_ecma_import(node, ctx),
+            _ => {}
+        }
+    }
+
+    /// A function/method declaration. `body_start` overrides where the signature
+    /// ends, for an arrow function whose body belongs to the arrow rather than to
+    /// the declarator the signature is read from.
+    fn handle_ecma_fn(&mut self, node: Node, ctx: &Ctx, body: Option<Node>) {
+        let Some(name) = node.child_by_field_name("name").map(|n| self.text(n)) else {
+            return;
+        };
+        let qualified = self.qualify(&ctx.scope_path, &name);
+        let kind = if self.test_file {
+            // Jest/Vitest cases are anonymous callbacks to `it`/`test`, so no
+            // declaration is ever the test. Everything declared in a test file is
+            // test scaffolding, which is what `tests_covering` should surface.
+            CodeNodeKind::Test
+        } else if ctx.associated {
+            CodeNodeKind::Method
+        } else {
+            CodeNodeKind::Function
+        };
+        let body = body.or_else(|| node.child_by_field_name("body"));
+        let signature = self.signature_hash_between(
+            node.start_byte(),
+            body.map_or_else(|| node.end_byte(), |b| b.start_byte()),
+        );
+        let idx = self.add_node(self.make_key(qualified, kind, Some(signature)), true);
+        let span = (node.start_byte(), node.end_byte());
+        self.add_edge(ctx.container, idx, CodeRelation::Contains, span);
+        self.add_edge(ctx.definer, idx, CodeRelation::Defines, span);
+
+        if let Some(body) = body {
+            let mut body_ctx = ctx.clone();
+            body_ctx.current_fn = Some(idx);
+            self.collect_calls(body, &body_ctx, 0);
+        }
+    }
+
+    /// A class, interface or enum, plus its members.
+    fn handle_ecma_class(&mut self, node: Node, ctx: &Ctx, kind: CodeNodeKind) {
+        let Some(name) = node.child_by_field_name("name").map(|n| self.text(n)) else {
+            return;
+        };
+        let qualified = self.qualify(&ctx.scope_path, &name);
+        let idx = self.add_node(self.make_key(qualified, kind, None), true);
+        let span = (node.start_byte(), node.end_byte());
+        self.add_edge(ctx.container, idx, CodeRelation::Contains, span);
+        self.add_edge(ctx.definer, idx, CodeRelation::Defines, span);
+
+        if let Some(body) = node.child_by_field_name("body") {
+            let mut child_scope = ctx.scope_path.clone();
+            child_scope.push(name);
+            let member_ctx = Ctx {
+                depth: ctx.depth + 1,
+                scope_path: child_scope,
+                container: idx,
+                definer: idx,
+                current_fn: None,
+                associated: true,
+                in_test: ctx.in_test,
+            };
+            self.visit_items(body, &member_ctx);
+        }
+    }
+
+    fn handle_ecma_type_alias(&mut self, node: Node, ctx: &Ctx) {
+        let Some(name) = node.child_by_field_name("name").map(|n| self.text(n)) else {
+            return;
+        };
+        let qualified = self.qualify(&ctx.scope_path, &name);
+        let idx = self.add_node(self.make_key(qualified, CodeNodeKind::Type, None), true);
+        let span = (node.start_byte(), node.end_byte());
+        self.add_edge(ctx.container, idx, CodeRelation::Contains, span);
+        self.add_edge(ctx.definer, idx, CodeRelation::Defines, span);
+    }
+
+    fn handle_ecma_namespace(&mut self, node: Node, ctx: &Ctx) {
+        let Some(name) = node.child_by_field_name("name").map(|n| self.text(n)) else {
+            return;
+        };
+        let qualified = self.qualify(&ctx.scope_path, &name);
+        let idx = self.add_node(
+            self.make_key(qualified, CodeNodeKind::Namespace, None),
+            true,
+        );
+        let span = (node.start_byte(), node.end_byte());
+        self.add_edge(ctx.container, idx, CodeRelation::Contains, span);
+        self.add_edge(ctx.definer, idx, CodeRelation::Defines, span);
+
+        if let Some(body) = node.child_by_field_name("body") {
+            let mut child_scope = ctx.scope_path.clone();
+            child_scope.push(name);
+            let namespace_ctx = Ctx {
+                depth: ctx.depth + 1,
+                scope_path: child_scope,
+                container: idx,
+                definer: idx,
+                current_fn: None,
+                associated: false,
+                in_test: ctx.in_test,
+            };
+            self.visit_items(body, &namespace_ctx);
+        }
+    }
+
+    /// `const f = () => …` / `const f = function () {…}` is a function
+    /// declaration in every way that matters — and the dominant style in React
+    /// code, so treating it as an opaque binding would lose most of a TSX file.
+    /// Any other declarator is a module-level `Constant` (`const`) or `Global`
+    /// (`let`/`var`), the ECMAScript analogue of Rust's `const`/`static`.
+    fn handle_ecma_variables(&mut self, node: Node, ctx: &Ctx) {
+        let is_const = self
+            .source
+            .get(node.start_byte()..node.end_byte())
+            .is_some_and(|text| text.trim_start().starts_with("const"));
+        let declarators: Vec<Node> = node
+            .named_children(&mut node.walk())
+            .filter(|child| child.kind() == "variable_declarator")
+            .collect();
+        for declarator in declarators {
+            let Some(name) = declarator.child_by_field_name("name") else {
+                continue;
+            };
+            if name.kind() != "identifier" {
+                continue; // a destructuring pattern names no single symbol
+            }
+            let value = declarator.child_by_field_name("value");
+            let function_body = value.filter(|v| {
+                matches!(
+                    v.kind(),
+                    "arrow_function" | "function_expression" | "function" | "generator_function"
+                )
+            });
+            match function_body {
+                Some(function) => {
+                    self.handle_ecma_fn(declarator, ctx, function.child_by_field_name("body"));
+                }
+                None => {
+                    let qualified = self.qualify(&ctx.scope_path, &self.text(name));
+                    let kind = if is_const {
+                        CodeNodeKind::Constant
+                    } else {
+                        CodeNodeKind::Global
+                    };
+                    let idx = self.add_node(self.make_key(qualified, kind, None), true);
+                    let span = (declarator.start_byte(), declarator.end_byte());
+                    self.add_edge(ctx.container, idx, CodeRelation::Contains, span);
+                    self.add_edge(ctx.definer, idx, CodeRelation::Defines, span);
+                }
+            }
+        }
+    }
+
+    /// A class field holding an arrow function (`handle = () => …`) is a method;
+    /// a plain data field is not recorded, matching the Rust walk's treatment of
+    /// struct fields.
+    fn handle_ecma_field(&mut self, node: Node, ctx: &Ctx) {
+        let Some(value) = node.child_by_field_name("value") else {
+            return;
+        };
+        if !matches!(
+            value.kind(),
+            "arrow_function" | "function_expression" | "function" | "generator_function"
+        ) {
+            return;
+        }
+        self.handle_ecma_fn(node, ctx, value.child_by_field_name("body"));
+    }
+
+    /// `import { a, b as c } from "./m"` → `./m.a`, `./m.c`;
+    /// `import D from "./m"` → `./m.D`; `import "./m"` → `./m`. One reference
+    /// node per imported binding, named by module + binding, mirroring the Rust
+    /// `use`-tree flattening.
+    fn handle_ecma_import(&mut self, node: Node, ctx: &Ctx) {
+        let Some(source) = node.child_by_field_name("source") else {
+            return;
+        };
+        let module = self.text(source);
+        let module = module.trim_matches(['"', '\'', '`']).to_owned();
+        if module.is_empty() {
+            return;
+        }
+        let span = (node.start_byte(), node.end_byte());
+        let mut bindings = Vec::new();
+        self.collect_ecma_bindings(node, &mut bindings);
+        if bindings.is_empty() {
+            self.add_import(module, ctx.container, span);
+            return;
+        }
+        for binding in bindings {
+            let written = join_qualified(&module, self.language, &binding);
+            self.add_import(written, ctx.container, span);
+        }
+    }
+
+    /// The local names an import/re-export clause introduces. Descends the clause
+    /// only — the module `source` is handled by the caller.
+    fn collect_ecma_bindings(&self, node: Node, out: &mut Vec<String>) {
+        let children: Vec<Node> = node.named_children(&mut node.walk()).collect();
+        for child in children {
+            match child.kind() {
+                "import_clause" | "named_imports" | "export_clause" => {
+                    self.collect_ecma_bindings(child, out);
+                }
+                "import_specifier" | "export_specifier" => {
+                    let named = child
+                        .child_by_field_name("alias")
+                        .or_else(|| child.child_by_field_name("name"));
+                    if let Some(named) = named {
+                        out.push(self.text(named));
+                    }
+                }
+                // `import D from "m"` (default) and `import * as N from "m"`.
+                "identifier" => out.push(self.text(child)),
+                "namespace_import" => {
+                    if let Some(name) = child.named_child(0) {
+                        out.push(self.text(name));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Add an `Imports` edge to a synthesized reference node for `written`.
+    fn add_import(&mut self, written: String, container: usize, span: (usize, usize)) {
+        let idx = self.add_node(
+            self.make_key(written, CodeNodeKind::ExternalDependency, None),
+            false,
+        );
+        self.add_edge(container, idx, CodeRelation::Imports, span);
     }
 
     /// Resolve every pending call to a target node and emit its `Calls` edge.
@@ -1936,8 +2982,27 @@ impl Builder<'_> {
         let end = node
             .child_by_field_name("body")
             .map_or_else(|| node.end_byte(), |b| b.start_byte());
-        let raw = self.source.get(node.start_byte()..end).unwrap_or("");
-        let cleaned = raw.trim().trim_end_matches([';', '{']).trim();
+        self.signature_hash_between(node.start_byte(), end)
+    }
+
+    /// The same hash over an explicit byte range, for a declaration whose body is
+    /// not its own `body` field — a TypeScript `const f = () => …`, where the
+    /// signature spans the declarator and the body belongs to the arrow.
+    fn signature_hash_between(&self, start: usize, end: usize) -> ContentHash {
+        let raw = self.source.get(start..end).unwrap_or("");
+        // Trim whatever opens the body in this language: `{` (Rust/ECMA), `;` (a
+        // signature-only item), `:` (Python), `=>` (an arrow function).
+        let mut cleaned = raw.trim();
+        loop {
+            let trimmed = cleaned
+                .strip_suffix("=>")
+                .or_else(|| cleaned.strip_suffix(['{', ';', ':']))
+                .map(str::trim_end);
+            match trimmed {
+                Some(next) if next.len() < cleaned.len() => cleaned = next,
+                _ => break,
+            }
+        }
         let normalized = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
         ContentHash(hex::encode(Sha256::digest(normalized.as_bytes())))
     }
@@ -1982,31 +3047,83 @@ fn resolve_target(
 // Small pure helpers
 // --------------------------------------------------------------------------
 
-fn join_scope(scope: &[String], name: &str) -> String {
-    if scope.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{}::{}", scope.join("::"), name)
-    }
-}
-
-fn join_path(prefix: &str, segment: &str) -> String {
+/// `prefix<sep>segment` in `language`'s separator; `segment` alone when there is
+/// no prefix. A prefix that already ends in the separator (a Python relative
+/// import — `from . import x`) is concatenated rather than doubled.
+fn join_qualified(prefix: &str, language: Language, segment: &str) -> String {
+    let separator = language.separator();
     if prefix.is_empty() {
         segment.to_owned()
+    } else if prefix.ends_with(separator) {
+        format!("{prefix}{segment}")
     } else {
-        format!("{prefix}::{segment}")
+        format!("{prefix}{separator}{segment}")
     }
 }
 
-/// The last `::`-segment of a qualified name (its simple name).
+/// Split a qualified name into `(module_prefix, simple_name)`, accepting either
+/// separator the graph stores — `::` (Rust) or `.` (Python/TypeScript).
+///
+/// No language parameter, because no language's names contain both. The one
+/// ambiguity is a **file** node, whose qualified name is a path (`src/main.py`),
+/// where the trailing `.py` is an extension and not a symbol; a name carrying a
+/// path separator is therefore never split. Callers pass symbol names — both
+/// `repomap` sites filter to Type/Trait/Function/Method/Constant/Test/Module
+/// first — so this guard is belt and braces.
+fn split_qualified(qualified: &str) -> Option<(&str, &str)> {
+    if let Some(at) = qualified.rfind("::") {
+        return Some((&qualified[..at], &qualified[at + 2..]));
+    }
+    if qualified.contains('/') || qualified.contains('\\') {
+        return None;
+    }
+    let at = qualified.rfind('.')?;
+    let (prefix, tail) = (&qualified[..at], &qualified[at + 1..]);
+    let tail_is_identifier = tail
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_');
+    (!prefix.is_empty() && tail_is_identifier).then_some((prefix, tail))
+}
+
+/// The last segment of a qualified name (its simple name).
 pub(crate) fn last_segment(qualified: &str) -> &str {
-    qualified.rsplit("::").next().unwrap_or(qualified)
+    split_qualified(qualified).map_or(qualified, |(_, simple)| simple)
 }
 
 /// The module prefix of a qualified name (everything before the last segment);
-/// the empty string for a crate-root symbol.
+/// the empty string for a root-level symbol.
 pub(crate) fn module_of(qualified: &str) -> &str {
-    qualified.rsplit_once("::").map_or("", |(prefix, _)| prefix)
+    split_qualified(qualified).map_or("", |(prefix, _)| prefix)
+}
+
+/// Whether `path` is a test file by its ecosystem's naming convention.
+///
+/// Rust marks a test with `#[test]`, which the walk can read. Python and
+/// JavaScript do not mark the *declaration* at all — pytest collects `test_*`
+/// from `test_*.py`, and Jest/Vitest collect from `*.test.*` / `*.spec.*` — so
+/// the file name is the only syntax-layer signal there is. Without it
+/// `graph.tests_covering` can only ever answer for Rust.
+fn is_test_path(language: Language, path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let file = normalized.rsplit('/').next().unwrap_or(&normalized);
+    match language {
+        // `#[test]`/`#[cfg(test)]` is authoritative for Rust; the path adds nothing.
+        Language::Rust => false,
+        Language::Python => {
+            file.starts_with("test_")
+                || file.ends_with("_test.py")
+                || file.ends_with("_test.pyi")
+                || normalized.split('/').any(|part| part == "tests")
+        }
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            file.contains(".test.")
+                || file.contains(".spec.")
+                || normalized
+                    .split('/')
+                    .any(|part| part == "__tests__" || part == "__mocks__")
+        }
+    }
 }
 
 /// The bare type name of an `impl` self type (`Foo<T>` → `Foo`, `a::Bar` → `Bar`).

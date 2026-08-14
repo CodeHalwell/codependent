@@ -127,6 +127,7 @@ pub async fn run(paths: &RuntimePaths, json: bool, deep: bool) -> anyhow::Result
     check_daemon(&mut report, paths).await;
     check_paths(&mut report, paths);
     check_models_and_providers(&mut report, paths, deep).await;
+    check_code_graph(&mut report, paths).await;
     check_voice(&mut report, paths);
 
     if json {
@@ -374,6 +375,83 @@ async fn check_models_and_providers(report: &mut Report, paths: &RuntimePaths, d
 /// table, a key that resolves nowhere, a missing recorder/player — having no
 /// other diagnostic anywhere in the product; a user whose voice stopped
 /// working had no supported way to find out why short of reading
+/// Whether this checkout has a code graph at all, and how big it is.
+///
+/// `doctor` is the command a user reaches for when something the agent depends
+/// on "isn't being built", and the code graph was invisible to it: the graph was
+/// folded only as a side effect of opening a session or starting a run, and
+/// nothing anywhere reported whether that had happened. An empty graph is a
+/// WARN, never a FAIL — a fresh checkout legitimately has none, and a repository
+/// in a language no grammar covers legitimately never will — but it always names
+/// the command that builds it, which is the step that was missing.
+///
+/// Read-only and daemon-free, like the rest of `doctor`: it opens the daemon's
+/// database only if the file already exists, and never creates one.
+async fn check_code_graph(report: &mut Report, paths: &RuntimePaths) {
+    let database_path = paths.data_dir.join("codypendent.db");
+    if !database_path.exists() {
+        report.ok(
+            "code graph",
+            "no database yet — the graph is built on first use, or on `codypendent graph build`",
+        );
+        return;
+    }
+    let Ok(dir) = std::env::current_dir() else {
+        report.warn(
+            "code graph",
+            "could not resolve the current directory, so no repository to check",
+            "run `codypendent doctor` from inside a checkout",
+        );
+        return;
+    };
+    // The checkout, never the directory as-opened — the daemon stores nodes
+    // under the Git toplevel, so hashing a subdirectory would report "empty"
+    // for a graph that is in fact populated. `crate::repo_anchor` is the one
+    // accessor for that resolution (the same trap that emptied the document
+    // list in the 2026-08-13 review).
+    let repository = crate::repo_anchor::anchor_repository_id(&dir);
+    let pool = match codypendent_knowledge::db::open(&database_path).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            report.warn(
+                "code graph",
+                format!("could not open {}: {error}", database_path.display()),
+                "check the daemon's data directory is readable",
+            );
+            return;
+        }
+    };
+    let counted: Result<(i64, i64), sqlx::Error> = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(DISTINCT source_path) FROM code_nodes WHERE repository = ?",
+    )
+    .bind(repository.to_string())
+    .fetch_one(&pool)
+    .await;
+    match counted {
+        Ok((0, _)) => report.warn(
+            "code graph",
+            format!(
+                "empty for {} — the agent has no symbol map for it",
+                dir.display()
+            ),
+            "run `codypendent graph build`: it folds the graph and reports which files were \
+             walked and which extensions produced nothing. (`codypendent index rebuild` \
+             rebuilds the SEARCH indexes and does NOT touch the code graph.)",
+        ),
+        Ok((nodes, files)) => report.ok(
+            "code graph",
+            format!(
+                "{nodes} node(s) across {files} file(s); `codypendent graph status` for detail"
+            ),
+        ),
+        Err(error) => report.warn(
+            "code graph",
+            format!("could not read the graph: {error}"),
+            "run `codypendent graph status` for the full error",
+        ),
+    }
+}
+
 /// `models.toml` by hand.
 fn check_voice(report: &mut Report, paths: &RuntimePaths) {
     let models_path = paths.data_dir.join("models.toml");

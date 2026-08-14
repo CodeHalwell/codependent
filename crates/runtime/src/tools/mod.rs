@@ -88,8 +88,11 @@ pub use github::{
     ListCheckRunsInput, UpdatePullRequestInput, UpdatePullRequestTool,
 };
 pub use graph::{
-    graph_proposed_action, parse_symbol_question, parse_tests_covering, summarize_graph_question,
-    GraphBlastRadius, GraphCallersOf, GraphTestsCovering,
+    assertable_relation_names, graph_assert_action, graph_proposed_action, parse_assert_edge,
+    parse_symbol_question, parse_tests_covering, relation_name, render_edge_assertions,
+    summarize_assertions, summarize_graph_question, AssertedEdge, CodeGraphAssertions,
+    EdgeAssertionOutcome, EdgeAssertionRequest, GraphAssertEdge, GraphBlastRadius, GraphCallersOf,
+    GraphTestsCovering, ASSERTABLE_RELATIONS, MAX_ASSERTED_EDGES,
 };
 pub use label::tool_label;
 pub use memory::{parse_memory_remember, MemoryRemember, MemoryRememberInput};

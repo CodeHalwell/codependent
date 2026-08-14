@@ -745,3 +745,242 @@ async fn blast_radius_does_not_traverse_through_another_repository() {
     );
     assert_eq!(answer.total, 0, "hits: {:?}", answer.hits);
 }
+
+// --------------------------------------------------------------------------
+// Multi-language extraction (the mixed-repository bug)
+// --------------------------------------------------------------------------
+
+const PYTHON_FIXTURE: &str = r#"
+import json
+from .service import dispatch, Client as C
+
+MAX_RETRIES = 3
+
+
+async def handler(request):
+    return route(request)
+
+
+def route(request):
+    return dispatch(request)
+
+
+class Router:
+    def decide(self, request):
+        return handler(request)
+"#;
+
+const TSX_FIXTURE: &str = r#"
+import { useState } from "react";
+import Panel from "./panel";
+
+export function greet(name: string): string {
+  return format(name);
+}
+
+function format(name: string): string {
+  return `hi ${name}`;
+}
+
+export interface Props { name: string }
+
+export type Id = string;
+
+export const App = (props: Props) => {
+  const [n] = useState(props.name);
+  return <div>{greet(n)}</div>;
+};
+
+export class Board {
+  render(): string {
+    return greet("board");
+  }
+}
+"#;
+
+#[tokio::test]
+async fn python_defines_symbols_calls_and_imports() {
+    // Before the language dispatch this file was parsed with the RUST grammar,
+    // which yields an error tree indistinguishable from an empty file: one File
+    // node, no symbols, no edges — and no error anywhere.
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    codegraph::upsert_file_graph(&pool, repo, &rev(), "src/main.py", PYTHON_FIXTURE)
+        .await
+        .unwrap();
+    let nodes = codegraph::nodes(&pool, repo).await.unwrap();
+    let edges = codegraph::edges(&pool, repo).await.unwrap();
+    let triples = edge_triples(&nodes, &edges);
+
+    assert!(has_node(&nodes, "src/main.py", CodeNodeKind::File));
+    // `async def` — which the old line scanner could not see at all.
+    assert!(has_node(&nodes, "handler", CodeNodeKind::Function));
+    assert!(has_node(&nodes, "route", CodeNodeKind::Function));
+    assert!(has_node(&nodes, "Router", CodeNodeKind::Type));
+    // A method: every indented line was skipped before, so ALL methods were lost.
+    assert!(has_node(&nodes, "Router.decide", CodeNodeKind::Method));
+    assert!(has_node(&nodes, "MAX_RETRIES", CodeNodeKind::Constant));
+
+    // Every language must produce the same four relations the Rust path does.
+    assert!(has_edge(
+        &triples,
+        "src/main.py",
+        CodeRelation::Contains,
+        "handler"
+    ));
+    assert!(has_edge(
+        &triples,
+        "Router",
+        CodeRelation::Defines,
+        "Router.decide"
+    ));
+    assert!(has_edge(&triples, "handler", CodeRelation::Calls, "route"));
+    assert!(has_edge(&triples, "route", CodeRelation::Calls, "dispatch"));
+    assert!(has_edge(
+        &triples,
+        "Router.decide",
+        CodeRelation::Calls,
+        "handler"
+    ));
+    assert!(has_edge(
+        &triples,
+        "src/main.py",
+        CodeRelation::Imports,
+        "json"
+    ));
+    assert!(has_edge(
+        &triples,
+        "src/main.py",
+        CodeRelation::Imports,
+        ".service.dispatch"
+    ));
+
+    // The language is recorded, so a report can break the graph down by it.
+    assert!(
+        nodes.iter().all(|n| n.key.language.0 == "python"),
+        "{nodes:?}"
+    );
+    // A syntax-inferred call keeps its Chapter 07 confidence in every language.
+    let call = edges
+        .iter()
+        .find(|e| e.relation == CodeRelation::Calls)
+        .expect("a call edge");
+    assert_eq!(call.evidence_kind, EvidenceKind::SyntaxInferred);
+    assert!((call.confidence - codypendent_knowledge::SYNTAX_CALL_CONFIDENCE).abs() < f32::EPSILON);
+}
+
+#[tokio::test]
+async fn tsx_defines_symbols_calls_and_imports() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    codegraph::upsert_file_graph(&pool, repo, &rev(), "src/app.tsx", TSX_FIXTURE)
+        .await
+        .unwrap();
+    let nodes = codegraph::nodes(&pool, repo).await.unwrap();
+    let edges = codegraph::edges(&pool, repo).await.unwrap();
+    let triples = edge_triples(&nodes, &edges);
+
+    assert!(has_node(&nodes, "greet", CodeNodeKind::Function));
+    assert!(has_node(&nodes, "format", CodeNodeKind::Function));
+    assert!(has_node(&nodes, "Props", CodeNodeKind::TraitOrInterface));
+    assert!(has_node(&nodes, "Id", CodeNodeKind::Type));
+    assert!(has_node(&nodes, "Board", CodeNodeKind::Type));
+    assert!(has_node(&nodes, "Board.render", CodeNodeKind::Method));
+    // The arrow-function `const` — the dominant React declaration form, and
+    // invisible to anything that only matches the `function` keyword.
+    assert!(
+        has_node(&nodes, "App", CodeNodeKind::Function),
+        "{nodes:#?}"
+    );
+
+    assert!(has_edge(&triples, "greet", CodeRelation::Calls, "format"));
+    assert!(has_edge(&triples, "App", CodeRelation::Calls, "greet"));
+    assert!(has_edge(&triples, "App", CodeRelation::Calls, "useState"));
+    assert!(has_edge(
+        &triples,
+        "Board.render",
+        CodeRelation::Calls,
+        "greet"
+    ));
+    assert!(has_edge(
+        &triples,
+        "src/app.tsx",
+        CodeRelation::Imports,
+        "react.useState"
+    ));
+    assert!(has_edge(
+        &triples,
+        "src/app.tsx",
+        CodeRelation::Imports,
+        "./panel.Panel"
+    ));
+    assert!(nodes.iter().all(|n| n.key.language.0 == "tsx"), "{nodes:?}");
+}
+
+#[tokio::test]
+async fn every_supported_extension_parses_and_nothing_else_does() {
+    // The gate itself. `language_for` is the ONE list; a file it accepts must
+    // parse, and a file it rejects must fail LOUDLY rather than fold to an empty
+    // graph the caller reads as "this file defines nothing".
+    for extension in codegraph::supported_extensions() {
+        let path = format!("src/probe.{extension}");
+        let language = codegraph::language_for(std::path::Path::new(&path));
+        assert!(language.is_some(), "language_for rejects .{extension}");
+        codegraph::validate_file_graph(RepositoryId::new(), &path, "")
+            .unwrap_or_else(|e| panic!("empty .{extension} file failed to parse: {e}"));
+    }
+
+    let error = codegraph::validate_file_graph(RepositoryId::new(), "main.go", "package main\n")
+        .expect_err("an unsupported extension must be an error, not an empty graph");
+    assert!(
+        matches!(error, CodeGraphError::UnsupportedLanguage { .. }),
+        "{error:?}"
+    );
+    // The error names what IS supported, so the message is a next step.
+    assert!(error.to_string().contains("tsx"), "{error}");
+}
+
+#[tokio::test]
+async fn a_python_symbol_is_findable_by_its_simple_name() {
+    // `find_symbols`' last-segment tier matched `%::name` only, so a
+    // `.`-separated language could only ever be found by the substring tier.
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    codegraph::upsert_file_graph(&pool, repo, &rev(), "src/main.py", PYTHON_FIXTURE)
+        .await
+        .unwrap();
+    // `predecide` CONTAINS "decide", so the substring tier (the last resort)
+    // would return both. Only a real last-segment match on the `.` separator
+    // narrows it to one — which is what makes this assertion discriminating
+    // rather than accidentally satisfied by the substring fallback.
+    codegraph::upsert_file_graph(
+        &pool,
+        repo,
+        &rev(),
+        "src/util.py",
+        "def predecide():\n    return 1\n",
+    )
+    .await
+    .unwrap();
+    let hits = codegraph::find_symbols(&pool, repo, "decide", 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|n| n.key.qualified_name.as_str())
+            .collect::<Vec<_>>(),
+        ["Router.decide"]
+    );
+
+    let answer = codegraph::answer(
+        &pool,
+        repo,
+        &codegraph::GraphQuestion::CallersOf {
+            symbol: "Router.decide".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer.total, 0, "nothing calls it: {:?}", answer.hits);
+    assert!(!answer.targets.is_empty(), "but it resolved: {answer:?}");
+}

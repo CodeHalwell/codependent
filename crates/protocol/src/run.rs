@@ -308,6 +308,28 @@ pub enum ProposedAction {
         /// Router::decide`), for the trace.
         summary: String,
     },
+    /// Assert an edge onto the repository's derived code graph (the
+    /// `graph.assert_edge` runtime tool) — a relation the parser cannot see, such
+    /// as a route handler to the service it dispatches to.
+    ///
+    /// A WRITE, and deliberately its own variant rather than a
+    /// [`Self::CodeGraphQuery`]: recording it as a query would make the audit
+    /// ledger say the agent read the graph when it changed it. What it writes is
+    /// Codypendent's OWN derived projection — no filesystem, command, network or
+    /// remote effect — and it cannot invent a node: both endpoints must already
+    /// match stored `code_nodes` rows, which are never opened as paths. So it is
+    /// allowed without an approval gate on the same reasoning as
+    /// [`Self::TaskWrite`], and recorded so every assertion is traced and
+    /// attributable. Never serialized into a `ToolProposed`, so it needs no
+    /// golden wire vector.
+    CodeGraphAssert {
+        /// The canonical repository whose graph is written (server-derived from
+        /// the run context, never model-supplied).
+        repository: String,
+        /// A short human rendering of the assertion (e.g. `assert handle_charge
+        /// calls ChargeService::run`), for the trace.
+        summary: String,
+    },
     #[serde(other)]
     Unknown,
 }

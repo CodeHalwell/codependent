@@ -200,7 +200,32 @@ pub async fn open_evidence(
                 bytes,
             })
         }
+        // An agent assertion carries its own content — the rationale IS the
+        // evidence, and the run that gave it is named right here. Opening it
+        // resolves to that run's turn in the session ledger, so "open source"
+        // lands on the transcript where the claim was made rather than on an
+        // opaque id.
+        EvidenceRef::AgentAssertion {
+            session_id, run_id, ..
+        } => {
+            let events = ledger::load_events(pool, *session_id).await?;
+            Ok(EvidenceContent::Events(
+                events
+                    .into_iter()
+                    .filter(|event| event_names_run(event, *run_id))
+                    .collect(),
+            ))
+        }
     }
+}
+
+/// Whether a ledger event belongs to `run` — the filter that turns "the session
+/// that asserted this" into "the turns that asserted it". Matched on the
+/// serialized body rather than on an exhaustive walk of every `EventBody`
+/// variant that carries a run id, because that list grows and a missed variant
+/// here silently narrows the evidence a user is shown.
+fn event_names_run(event: &SessionEvent, run: codypendent_protocol::RunId) -> bool {
+    serde_json::to_string(&event.body).is_ok_and(|body| body.contains(&run.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +316,12 @@ fn evidence_label(evidence: &EvidenceRef) -> String {
             Some(path) => format!("artifact {} ({path})", artifact.id),
             None => format!("artifact {}", artifact.id),
         },
+        // The rationale is the label here: it is short by construction (the
+        // asserting tool caps it) and it is the ONLY thing that distinguishes
+        // one agent assertion from another, which is the whole point of a label.
+        EvidenceRef::AgentAssertion {
+            run_id, rationale, ..
+        } => format!("asserted by run {run_id}: {rationale}"),
     }
 }
 

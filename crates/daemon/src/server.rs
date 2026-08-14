@@ -258,6 +258,13 @@ pub struct ServerState {
     /// rejected `memory.transport-unavailable`); the assembly injects a
     /// `codypendent-knowledge`-backed implementation over the pool.
     pub memory: Option<Arc<dyn crate::memory::MemoryGateway>>,
+    /// Backs `BuildCodeGraph`/`ReadCodeGraphStatus`/`ReadCodeGraph` — the
+    /// on-demand code-graph build and its inspection commands. `None` in a
+    /// lib-only / test embedding (every graph command is then rejected
+    /// `graph.transport-unavailable`); the assembly injects a
+    /// `codypendent-knowledge`-backed implementation over the pool, because only
+    /// it can name the scan walk and the graph tables.
+    pub code_graph: Option<Arc<dyn crate::codegraph::CodeGraphGateway>>,
     /// Turns a `SubmitUserInput`'s stored audio into text (voice v1, rubric 8).
     /// `None` in a lib-only / test embedding (an un-transcribed audio envelope is
     /// then rejected `voice.transport-unavailable`); the assembly injects an
@@ -410,6 +417,13 @@ pub async fn run_with_executor_on_and_health(
     let lifecycle = executor.as_ref().and_then(|e| e.workflow_lifecycle());
     let promotion = executor.as_ref().and_then(|e| e.promotion_gateway());
     let memory = executor.as_ref().and_then(|e| e.memory_gateway());
+    // The code-graph seam, bundled with the executor for the same reason as the
+    // memory gateway: it names `codypendent-knowledge`, the scan walk, and the
+    // pool, none of which this crate can. Absent, `codypendent graph …` is
+    // rejected `graph.transport-unavailable` rather than silently answering
+    // "empty" — an empty answer for a missing transport is exactly the class of
+    // silence this command family exists to end.
+    let code_graph = executor.as_ref().and_then(|e| e.code_graph_gateway());
     let documents = DocumentHub::new();
     // The blackboard read seam, bundled with the executor by the assembly. Unlike
     // the document hub, the per-run blackboard fan-out is REUSED from the executor
@@ -571,6 +585,7 @@ pub async fn run_with_executor_on_and_health(
         publisher,
         promotion,
         memory,
+        code_graph,
         blackboards,
         blackboard_reader,
         blackboard_writer,
@@ -2699,6 +2714,86 @@ async fn handle_request(
                     .await;
                     send(writer, &Envelope::reply_to(&request, reply)).await?;
                 }
+                // The code graph lives outside the session ledger (it is a
+                // derived projection of a checkout, keyed by repository), so its
+                // three commands are intercepted here like the memory and board
+                // ones rather than flowing through the event write path.
+                //
+                // A build is a WRITE — it clears and rewrites the repository's
+                // whole graph — so it is `Controller`-only; the two reads are
+                // open to any handshaken client, an Observer included. Which
+                // repository is in view is decided inside the seam from the
+                // path, never here and never by the client.
+                CommandBody::BuildCodeGraph { repository } => {
+                    let Some(seam) =
+                        code_graph_seam(state, conn, writer, &request, true, "rebuild").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match seam
+                        .build(crate::codegraph::BuildCodeGraphRequest {
+                            repository: repository.clone(),
+                        })
+                        .await
+                    {
+                        Ok(report) => Envelope::reply_to(
+                            &request,
+                            Payload::CodeGraphBuilt {
+                                command_id: command.command_id,
+                                report: Box::new(report),
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::ReadCodeGraphStatus { repository } => {
+                    let Some(seam) =
+                        code_graph_seam(state, conn, writer, &request, false, "read").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match seam
+                        .status(crate::codegraph::CodeGraphStatusRequest {
+                            repository: repository.clone(),
+                        })
+                        .await
+                    {
+                        Ok(status) => Envelope::reply_to(
+                            &request,
+                            Payload::CodeGraphStatus {
+                                command_id: command.command_id,
+                                status: Box::new(status),
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
+                CommandBody::ReadCodeGraph { repository, query } => {
+                    let Some(seam) =
+                        code_graph_seam(state, conn, writer, &request, false, "read").await?
+                    else {
+                        return Ok(false);
+                    };
+                    let reply = match seam
+                        .read(crate::codegraph::CodeGraphReadRequest {
+                            repository: repository.clone(),
+                            query: query.clone(),
+                        })
+                        .await
+                    {
+                        Ok(page) => Envelope::reply_to(
+                            &request,
+                            Payload::CodeGraphPage {
+                                command_id: command.command_id,
+                                page: Box::new(page),
+                            },
+                        ),
+                        Err(error) => Envelope::reply_to(&request, Payload::CommandRejected(error)),
+                    };
+                    send(writer, &reply).await?;
+                }
                 // Every other command flows through the crash-consistent write
                 // path under the role recorded at attach (role enforcement is
                 // inherited from the pipeline).
@@ -4343,6 +4438,7 @@ fn daemon_store_unavailable(
             "the enforcing Remote UI worker runtime is unavailable; plugin management fails closed",
             true,
         ),
+        codypendent_protocol::DaemonStore::CodeGraph => code_graph_unavailable(),
     }
 }
 
@@ -5478,6 +5574,60 @@ async fn memory_seam<'a>(
         return Ok(None);
     };
     Ok(Some(memory))
+}
+
+/// The shared gate for a code-graph command: the assembly's
+/// [`CodeGraphGateway`](crate::codegraph::CodeGraphGateway) must be wired, and a
+/// *mutating* verb (a rebuild, which clears and rewrites the whole graph)
+/// additionally requires the `Controller` role — an Observer may inspect the
+/// graph, never rebuild it.
+///
+/// The repository check is deliberately NOT here: it belongs where the rows are
+/// fetched, inside the seam, so a node in another checkout and a node that does
+/// not exist collapse to the one [`node_not_found`](crate::codegraph::node_not_found)
+/// answer instead of two distinguishable ones.
+async fn code_graph_seam<'a>(
+    state: &'a Arc<ServerState>,
+    conn: &ConnState,
+    writer: &SharedWriter,
+    request: &Envelope,
+    mutating: bool,
+    verb: &str,
+) -> anyhow::Result<Option<&'a Arc<dyn crate::codegraph::CodeGraphGateway>>> {
+    // Ownership is NOT checked here: `code_nodes` rows carry a repository, not
+    // an owner, so `authorize_command` classifies every graph verb as
+    // `NamedResource::DaemonStore(CodeGraph)` and has already refused a foreign
+    // principal with the same `graph.transport-unavailable` this returns for a
+    // daemon with no seam. The role check below is not a substitute for that —
+    // `ClientRole` is requested by the client.
+    if mutating && conn.role != ClientRole::Controller {
+        let reply = Envelope::reply_to(
+            request,
+            Payload::CommandRejected(codypendent_protocol::CodypendentError::new(
+                "protocol.role-denied",
+                format!("only a Controller may {verb} the code graph"),
+                false,
+            )),
+        );
+        send(writer, &reply).await?;
+        return Ok(None);
+    }
+    let Some(seam) = state.code_graph.as_ref() else {
+        let reply = Envelope::reply_to(request, Payload::CommandRejected(code_graph_unavailable()));
+        send(writer, &reply).await?;
+        return Ok(None);
+    };
+    Ok(Some(seam))
+}
+
+/// "This daemon has no code-graph transport" — reused verbatim as the
+/// foreign-principal refusal, so the two are indistinguishable.
+fn code_graph_unavailable() -> codypendent_protocol::CodypendentError {
+    codypendent_protocol::CodypendentError::new(
+        "graph.transport-unavailable",
+        "the code graph is not enabled on this daemon".to_string(),
+        false,
+    )
 }
 
 /// Lower a wire [`BlackboardScope`] to the daemon's [`BoardTarget`], or `None`

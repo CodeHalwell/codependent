@@ -239,7 +239,9 @@ impl LanguageAdapter for RustAdapter {
         let root = workspace.root.clone();
         let files = tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
-            for file in collect_sources(&root, &["rs"]) {
+            // From the roster, not a local literal: the extensions a language
+            // owns are `codegraph::Language`'s to say, here as everywhere.
+            for file in collect_sources(&root, codegraph::Language::Rust.extensions()) {
                 let Ok(source) = std::fs::read_to_string(&file) else {
                     continue;
                 };
@@ -391,33 +393,46 @@ fn parse_cargo_diagnostics(stdout: &[u8]) -> Vec<Diagnostic> {
 #[derive(Debug, Clone)]
 pub struct ScriptAdapter {
     language: LanguageId,
-    extensions: Vec<String>,
+    /// Which code-graph languages this adapter covers. The extensions come from
+    /// [`codegraph::Language::extensions`] — the adapter never keeps its own
+    /// list, because a list that disagrees with the parser's is how a file gets
+    /// offered to a grammar that cannot read it.
+    languages: Vec<codegraph::Language>,
     language_server: String,
-    scan: fn(&str) -> Vec<ParsedSymbol>,
 }
 
 impl ScriptAdapter {
-    /// The Python adapter (`def`/`class` at module scope; pyright when present).
+    /// The Python adapter (pyright when present).
     #[must_use]
     pub fn python() -> Self {
         Self {
-            language: LanguageId("python".into()),
-            extensions: vec!["py".into()],
+            language: codegraph::Language::Python.id(),
+            languages: vec![codegraph::Language::Python],
             language_server: "pyright".into(),
-            scan: scan_python,
         }
     }
 
-    /// The TypeScript/JavaScript adapter (`function`/`class`/`export`;
-    /// typescript-language-server when present).
+    /// The TypeScript/TSX/JavaScript adapter (typescript-language-server when
+    /// present).
     #[must_use]
     pub fn typescript() -> Self {
         Self {
-            language: LanguageId("typescript".into()),
-            extensions: vec!["ts".into(), "tsx".into(), "js".into(), "jsx".into()],
+            language: codegraph::Language::TypeScript.id(),
+            languages: vec![
+                codegraph::Language::TypeScript,
+                codegraph::Language::Tsx,
+                codegraph::Language::JavaScript,
+            ],
             language_server: "typescript-language-server".into(),
-            scan: scan_typescript,
         }
+    }
+
+    fn extensions(&self) -> Vec<&'static str> {
+        self.languages
+            .iter()
+            .flat_map(|language| language.extensions())
+            .copied()
+            .collect()
     }
 }
 
@@ -436,24 +451,31 @@ impl LanguageAdapter for ScriptAdapter {
     }
 
     async fn parse(&self, input: ParseInput) -> Result<ParseOutput, AdapterError> {
+        // The same tree-sitter walk the graph persists, not a second line-based
+        // scanner: the old one skipped every indented line (so every method),
+        // missed `async def`, `interface`, `type`, `enum` and arrow functions,
+        // and returned `signature_hash: None` for everything — so a signature
+        // change in a Python or TypeScript symbol could never be detected.
+        let symbols = codegraph::parse_symbols(&input.path, &input.source)?;
         Ok(ParseOutput {
             language: self.language(),
-            symbols: (self.scan)(&input.source),
+            symbols,
         })
     }
 
     async fn symbols(&self, workspace: &Workspace) -> Result<SymbolIndex, AdapterError> {
         let root = workspace.root.clone();
-        let exts: Vec<String> = self.extensions.clone();
-        let scan = self.scan;
+        let exts: Vec<&'static str> = self.extensions();
         let files = tokio::task::spawn_blocking(move || {
-            let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
             let mut out = Vec::new();
-            for file in collect_sources(&root, &ext_refs) {
+            for file in collect_sources(&root, &exts) {
                 let Ok(source) = std::fs::read_to_string(&file) else {
                     continue;
                 };
-                out.push((rel_path(&root, &file), scan(&source)));
+                let rel = rel_path(&root, &file);
+                if let Ok(symbols) = codegraph::parse_symbols(&rel, &source) {
+                    out.push((rel, symbols));
+                }
             }
             out
         })
@@ -475,77 +497,5 @@ impl LanguageAdapter for ScriptAdapter {
 
     async fn build_metadata(&self, _workspace: &Workspace) -> Result<BuildMetadata, AdapterError> {
         Ok(BuildMetadata::default())
-    }
-}
-
-/// Scan Python top-level `def`/`class` declarations (module scope: no indent).
-fn scan_python(source: &str) -> Vec<ParsedSymbol> {
-    use crate::types::CodeNodeKind;
-    let mut out = Vec::new();
-    for line in source.lines() {
-        if line.starts_with(char::is_whitespace) {
-            continue;
-        }
-        let trimmed = line.trim_end();
-        if let Some(rest) = trimmed.strip_prefix("def ") {
-            if let Some(name) = ident(rest) {
-                out.push(ParsedSymbol {
-                    qualified_name: name,
-                    kind: CodeNodeKind::Function,
-                    signature_hash: None,
-                });
-            }
-        } else if let Some(rest) = trimmed.strip_prefix("class ") {
-            if let Some(name) = ident(rest) {
-                out.push(ParsedSymbol {
-                    qualified_name: name,
-                    kind: CodeNodeKind::Type,
-                    signature_hash: None,
-                });
-            }
-        }
-    }
-    out
-}
-
-/// Scan TypeScript/JavaScript top-level `function`/`class` declarations.
-fn scan_typescript(source: &str) -> Vec<ParsedSymbol> {
-    use crate::types::CodeNodeKind;
-    let mut out = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        let body = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-        let body = body.strip_prefix("default ").unwrap_or(body);
-        if let Some(rest) = body.strip_prefix("function ") {
-            if let Some(name) = ident(rest.trim_start_matches('*').trim_start()) {
-                out.push(ParsedSymbol {
-                    qualified_name: name,
-                    kind: CodeNodeKind::Function,
-                    signature_hash: None,
-                });
-            }
-        } else if let Some(rest) = body.strip_prefix("class ") {
-            if let Some(name) = ident(rest) {
-                out.push(ParsedSymbol {
-                    qualified_name: name,
-                    kind: CodeNodeKind::Type,
-                    signature_hash: None,
-                });
-            }
-        }
-    }
-    out
-}
-
-/// The leading identifier of `s` (letters, digits, `_`), or `None`.
-fn ident(s: &str) -> Option<String> {
-    let name: String = s
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
     }
 }

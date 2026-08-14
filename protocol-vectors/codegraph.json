@@ -1,0 +1,128 @@
+{
+  "CommandBody_BuildCodeGraph": {
+    "repository": "/home/user/project",
+    "type": "BuildCodeGraph"
+  },
+  "CommandBody_ReadCodeGraph": {
+    "query": {},
+    "repository": "/home/user/project",
+    "type": "ReadCodeGraph"
+  },
+  "CommandBody_ReadCodeGraphStatus": {
+    "repository": "/home/user/project",
+    "type": "ReadCodeGraphStatus"
+  },
+  "CommandBody_ReadCodeGraph_filtered": {
+    "query": {
+      "include_edges": true,
+      "include_nodes": true,
+      "kind": "function",
+      "language": "rust",
+      "limit": 50,
+      "name": "graph",
+      "node_id": "90000000-0000-0000-0000-000000000001",
+      "path": "crates/cli/"
+    },
+    "repository": "/home/user/project",
+    "type": "ReadCodeGraph"
+  },
+  "Payload_CodeGraphBuilt": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "report": {
+      "by_language": [],
+      "cap_hit": false,
+      "edges": 0,
+      "elapsed_ms": 41,
+      "file_cap": 2000,
+      "files_folded": 0,
+      "files_ignored": 38,
+      "files_supported": 0,
+      "files_unsupported": 1204,
+      "files_walked": 1204,
+      "grammars": [
+        {
+          "extensions": [
+            "rs"
+          ],
+          "language": "rust"
+        }
+      ],
+      "nodes": 0,
+      "not_folded": [
+        {
+          "extension": "go",
+          "files": 1204
+        }
+      ],
+      "repository_root": "/home/user/project",
+      "revision": "9f1c2ab"
+    },
+    "type": "CodeGraphBuilt"
+  },
+  "Payload_CodeGraphPage": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "page": {
+      "edges": [
+        {
+          "confidence": 0.44999998807907104,
+          "evidence_kind": "syntax_inferred",
+          "from_id": "90000000-0000-0000-0000-000000000001",
+          "from_name": "commands::graph_build",
+          "relation": "calls",
+          "revision": "9f1c2ab",
+          "to_id": "90000000-0000-0000-0000-000000000002",
+          "to_name": "commands::graph_repository"
+        }
+      ],
+      "limit": 50,
+      "nodes": [
+        {
+          "id": "90000000-0000-0000-0000-000000000001",
+          "kind": "function",
+          "language": "rust",
+          "package": "codypendent-cli",
+          "qualified_name": "commands::graph_build",
+          "revision": "9f1c2ab",
+          "source_path": "crates/cli/src/lib.rs"
+        }
+      ],
+      "total_edges": 1904,
+      "total_nodes": 812
+    },
+    "type": "CodeGraphPage"
+  },
+  "Payload_CodeGraphStatus": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "status": {
+      "by_kind": [
+        {
+          "count": 9,
+          "label": "function"
+        }
+      ],
+      "by_language": [
+        {
+          "edges": 4,
+          "files": 3,
+          "language": "rust",
+          "nodes": 12
+        }
+      ],
+      "edges": 4,
+      "files": 3,
+      "head_revision": "9f1c2ab",
+      "nodes": 12,
+      "repository_root": "/home/user/project",
+      "revisions": [
+        {
+          "count": 12,
+          "label": "9f1c2ab"
+        }
+      ],
+      "stale": true,
+      "stale_reason": "the working tree has uncommitted changes",
+      "working_tree_dirty": true
+    },
+    "type": "CodeGraphStatus"
+  }
+}

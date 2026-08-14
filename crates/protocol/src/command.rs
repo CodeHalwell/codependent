@@ -679,6 +679,58 @@ pub enum CommandBody {
         /// The stored occurrence's data classification.
         sensitivity: DataClassification,
     },
+    /// Fold the repository's code graph **now**, on demand, and report what the
+    /// fold saw (`codypendent graph build`).
+    ///
+    /// Before this command the graph was built only as a side effect of opening
+    /// a session or starting a run; there was no way to ask for it, and no way
+    /// to find out why it was empty. `index rebuild` rebuilds the *retrieval*
+    /// indexes and explicitly does not touch the graph, which read to users as
+    /// though it did.
+    ///
+    /// Handled at the connection level like `ReadBlackboard` — the code graph
+    /// lives outside the session ledger — through the assembly's code-graph
+    /// seam. Gated to the [`Controller`](crate::handshake::ClientRole::Controller)
+    /// role: a build clears and rewrites the repository's whole graph, which is
+    /// a write, so an Observer may read the graph but never rebuild it.
+    ///
+    /// `repository` is a **path**: the daemon resolves it to the checkout with
+    /// its own single source of truth and derives the repository identity from
+    /// that, exactly as [`InspectMemory`](CommandBody::InspectMemory) does.
+    /// A client cannot name a repository identity directly.
+    /// The fold is unconditional. There is no "skip if already current" flag:
+    /// a command a user reaches for because the graph looks wrong must not
+    /// sometimes decline to do the thing its name promises.
+    BuildCodeGraph {
+        /// The directory to build from; resolved to its enclosing checkout.
+        repository: String,
+    },
+    /// Describe the stored code graph for a repository, with no re-scan
+    /// (`codypendent graph status`): counts, per-language and per-kind
+    /// breakdowns, the revisions the graph is stamped at, and whether it is
+    /// stale relative to the working tree.
+    ///
+    /// A **read** — any handshaken client, an Observer included, may issue it.
+    /// `repository` is resolved exactly as
+    /// [`BuildCodeGraph`](CommandBody::BuildCodeGraph)'s.
+    ReadCodeGraphStatus {
+        repository: String,
+    },
+    /// List the graph's nodes and edges, filtered (`codypendent graph show`),
+    /// so the graph is inspectable from a terminal rather than only through the
+    /// TUI overlay.
+    ///
+    /// A **read**, like [`ReadCodeGraphStatus`](CommandBody::ReadCodeGraphStatus).
+    /// The [`query`](CommandBody::ReadCodeGraph::query) narrows; it never
+    /// widens: the repository gate is applied to every branch of it, including
+    /// [`CodeGraphQuery::node_id`](crate::codegraph::CodeGraphQuery::node_id),
+    /// and an id outside this repository is refused identically to one that
+    /// does not exist.
+    ReadCodeGraph {
+        repository: String,
+        #[serde(default)]
+        query: crate::codegraph::CodeGraphQuery,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -713,6 +765,13 @@ pub enum DaemonStore {
     /// Installed Remote UI plugins — an arbitrary-code surface for the worker
     /// runtime, so it is gated exactly like the other two.
     UiPlugins,
+    /// The syntax-layer code graph (`BuildCodeGraph`, `ReadCodeGraphStatus`,
+    /// `ReadCodeGraph`). Daemon-wide like the memory store: `code_nodes` rows
+    /// carry a repository, not an owner, so the only principal that can own
+    /// them is the uid the daemon runs as. The *repository* gate is a second,
+    /// independent filter applied inside the seam — this one only decides
+    /// whether the caller may address the store at all.
+    CodeGraph,
 }
 
 impl CommandBody {
@@ -839,6 +898,17 @@ impl CommandBody {
             | Self::RollbackPromotion { .. }
             | Self::SubmitEvalEvidence { .. } => {
                 vec![NamedResource::DaemonStore(DaemonStore::Promotion)]
+            }
+            // The code graph is addressed by a repository PATH, never by a row
+            // id, so there is no per-row owner to check here. The store gate
+            // below answers "may this principal address the graph at all"; the
+            // repository gate — which is what stops one checkout's query from
+            // reading another's — lives inside the seam, where the rows are
+            // fetched, for both the list and the by-id path.
+            Self::BuildCodeGraph { .. }
+            | Self::ReadCodeGraphStatus { .. }
+            | Self::ReadCodeGraph { .. } => {
+                vec![NamedResource::DaemonStore(DaemonStore::CodeGraph)]
             }
         }
     }

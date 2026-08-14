@@ -545,7 +545,9 @@ impl RuntimeExecutor {
             return;
         }
         match scan::scan_repository(&self.pool, repository, root).await {
-            Ok(()) => {
+            // The scan now reports what it saw (`ScanSummary`); it already logs
+            // its own headline, including a warning when it folded nothing.
+            Ok(_summary) => {
                 self.scanned
                     .lock()
                     .expect("scanned map lock")
@@ -882,6 +884,15 @@ impl RuntimeExecutor {
             // the registry search above; a repository with no folded graph
             // simply answers "no results".
             .with_code_graph(Arc::new(crate::scan::PoolCodeGraph::new(self.pool.clone())))
+            // The agent lever on the same graph (`graph.assert_edge`): a run can
+            // record a relation the parser cannot see. Wired beside the read
+            // seam and over the same pool, so an assertion lands under the id
+            // the scan folded and the next `graph.callers_of` can see it. The
+            // store refuses to let it displace a resolved fact; nothing here
+            // needs to.
+            .with_code_graph_assertions(Arc::new(
+                crate::graph_assertions::PoolCodeGraphAssertions::new(self.pool.clone()),
+            ))
             // Outcome 11: the writeback that fills `performance.task_class_success`.
             // Unconditional like the reads above — the store no-ops for a model
             // with no benched profile, so an unbenched deployment is unaffected.
@@ -2655,6 +2666,21 @@ impl RunExecutor for RuntimeExecutor {
         Some(Arc::new(crate::memory_ops::MemoryStoreGateway::new(
             self.pool.clone(),
             self.artifacts(),
+        )))
+    }
+
+    fn code_graph_gateway(
+        &self,
+    ) -> Option<Arc<dyn codypendent_daemon::codegraph::CodeGraphGateway>> {
+        // `codypendent graph {build,status,show}`. Shares this executor's
+        // `scanned` and `watchers` registries by `Arc`, not a copy: an on-demand
+        // build must count as THE fold for the checkout's current revision (so
+        // the next run reuses it instead of re-scanning) and must arm the same
+        // single live watcher a session-opened fold arms.
+        Some(Arc::new(crate::codegraph_ops::CodeGraphOps::new(
+            self.pool.clone(),
+            Arc::clone(&self.scanned),
+            Arc::clone(&self.watchers),
         )))
     }
 

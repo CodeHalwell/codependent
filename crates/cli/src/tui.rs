@@ -3057,6 +3057,21 @@ async fn event_loop<P: Presentation>(
                     let mut warnings = Vec::new();
                     let (edges, total, page) =
                         load_edge_page(pool, repository_id, query, *page, &mut warnings).await;
+                    // An unfiltered read that finds nothing means the graph was
+                    // never folded for this checkout, which the overlay renders
+                    // as the bare line "no edges in this repository" — a
+                    // statement of fact that reads as a verdict and offers no
+                    // next step. Say which command builds it. (The filtered case
+                    // is left alone: there, zero really does mean "your query
+                    // matched nothing".)
+                    if total == 0 && query.trim().is_empty() {
+                        warnings.push(
+                            "this repository's code graph is empty — run `codypendent graph build` \
+                             to fold it (it reports which files were walked and which produced \
+                             nothing)"
+                                .to_string(),
+                        );
+                    }
                     reduce(
                         state,
                         Action::EdgesLoaded {
@@ -7251,6 +7266,14 @@ fn evidence_source(evidence: &EvidenceRef) -> String {
             Some(path) => format!("artifact {} ({path})", artifact.id),
             None => format!("artifact {}", artifact.id),
         },
+        // An agent's claim: the rationale IS the evidence, so it travels here
+        // rather than being reduced to "run <uuid>". A reviewer needs to read
+        // what was asserted, not be told that something was.
+        EvidenceRef::AgentAssertion {
+            session_id,
+            run_id,
+            rationale,
+        } => format!("asserted by run {run_id} (session {session_id}): {rationale}"),
     }
 }
 

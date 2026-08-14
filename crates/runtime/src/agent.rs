@@ -100,32 +100,34 @@ use crate::models::ModelRegistry;
 #[cfg(feature = "provider-openai")]
 use crate::models::{classify_provider_message, FailureClass};
 use crate::tools::{
-    council_create_action, council_result_action, council_run_action, docs_proposed_action,
-    graph_proposed_action, new_pull_request, parse_artifact_read, parse_blackboard_post,
-    parse_blackboard_query, parse_council_create, parse_council_result, parse_council_run,
-    parse_create_check_run, parse_create_draft_pull_request, parse_docs_create, parse_docs_edit,
-    parse_docs_read, parse_docs_suggest, parse_edit_file as parse_edit_file_args,
-    parse_get_pull_request, parse_list_check_runs, parse_memory_remember, parse_skills_search,
-    parse_symbol_question, parse_task_create, parse_task_list, parse_task_move, parse_task_update,
-    parse_tests_covering, parse_update_pull_request, parse_web_search, parse_workflow_create,
-    parse_workflow_query, parse_workflow_run, parse_write_file as parse_write_file_args,
-    render_check_runs, render_pull_request, render_registry_search, render_search_outcome,
-    summarize_graph_question, task_read_action, task_write_action, tool_label,
-    workflow_create_action, workflow_run_action, ApplyPatch, ApplyPatchInput, ArtifactRead,
-    ArtifactReadInput, ArtifactReader, ArtifactSink, BlackboardPostInput, BlackboardPostTool,
-    BlackboardQueryInput, BlackboardQueryTool, CommandRequest, CouncilCreateInput,
-    CouncilCreateTool, CouncilResultInput, CouncilResultTool, CouncilRunInput, CouncilRunTool,
-    CreateCheckRunInput, CreateCheckRunSummary, CreateDraftPullRequest,
-    CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool, DocsEditInput, DocsEditTool,
-    DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool, EditFile, EditFileInput,
-    EnvironmentBinding, GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput,
-    GraphBlastRadius, GraphCallersOf, GraphTestsCovering, ListCheckRuns, ListCheckRunsInput,
-    MemoryRemember, MemoryRememberInput, ReadFile, ReadFileInput, RegistrySearch,
-    RegistrySearchRequest, RepositoryTest, Search, SearchInput, Shell, SkillsSearch,
-    SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool,
-    TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput, UpdatePullRequestTool, WebSearch,
-    WebSearchInput, WorkflowCreateInput, WorkflowCreateTool, WorkflowQueryInput, WorkflowQueryTool,
-    WorkflowRunInput, WorkflowRunTool, WriteFile, WriteFileInput,
+    assertable_relation_names, council_create_action, council_result_action, council_run_action,
+    docs_proposed_action, graph_assert_action, graph_proposed_action, new_pull_request,
+    parse_artifact_read, parse_assert_edge, parse_blackboard_post, parse_blackboard_query,
+    parse_council_create, parse_council_result, parse_council_run, parse_create_check_run,
+    parse_create_draft_pull_request, parse_docs_create, parse_docs_edit, parse_docs_read,
+    parse_docs_suggest, parse_edit_file as parse_edit_file_args, parse_get_pull_request,
+    parse_list_check_runs, parse_memory_remember, parse_skills_search, parse_symbol_question,
+    parse_task_create, parse_task_list, parse_task_move, parse_task_update, parse_tests_covering,
+    parse_update_pull_request, parse_web_search, parse_workflow_create, parse_workflow_query,
+    parse_workflow_run, parse_write_file as parse_write_file_args, render_check_runs,
+    render_edge_assertions, render_pull_request, render_registry_search, render_search_outcome,
+    summarize_assertions, summarize_graph_question, task_read_action, task_write_action,
+    tool_label, workflow_create_action, workflow_run_action, ApplyPatch, ApplyPatchInput,
+    ArtifactRead, ArtifactReadInput, ArtifactReader, ArtifactSink, AssertedEdge,
+    BlackboardPostInput, BlackboardPostTool, BlackboardQueryInput, BlackboardQueryTool,
+    CodeGraphAssertions, CommandRequest, CouncilCreateInput, CouncilCreateTool, CouncilResultInput,
+    CouncilResultTool, CouncilRunInput, CouncilRunTool, CreateCheckRunInput, CreateCheckRunSummary,
+    CreateDraftPullRequest, CreateDraftPullRequestInput, DocsCreateInput, DocsCreateTool,
+    DocsEditInput, DocsEditTool, DocsReadInput, DocsReadTool, DocsSuggestInput, DocsSuggestTool,
+    EdgeAssertionOutcome, EdgeAssertionRequest, EditFile, EditFileInput, EnvironmentBinding,
+    GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, GraphAssertEdge, GraphBlastRadius,
+    GraphCallersOf, GraphTestsCovering, ListCheckRuns, ListCheckRunsInput, MemoryRemember,
+    MemoryRememberInput, ReadFile, ReadFileInput, RegistrySearch, RegistrySearchRequest,
+    RepositoryTest, Search, SearchInput, Shell, SkillsSearch, SkillsSearchInput, TaskCreateInput,
+    TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool, TaskUpdateInput, TaskUpdateTool,
+    UpdatePullRequestInput, UpdatePullRequestTool, WebSearch, WebSearchInput, WorkflowCreateInput,
+    WorkflowCreateTool, WorkflowQueryInput, WorkflowQueryTool, WorkflowRunInput, WorkflowRunTool,
+    WriteFile, WriteFileInput, ASSERTABLE_RELATIONS, MAX_ASSERTED_EDGES,
 };
 use crate::workflow_control::{
     WorkflowControlChannel, WorkflowCreateRequest, WorkflowRunRequest, WorkflowRunTarget,
@@ -1572,6 +1574,13 @@ pub struct FrameworkAgentRuntime {
     /// `registry`, a process-wide read seam over the daemon's own derived
     /// projection; `None` leaves the three tools unoffered.
     code_graph: Option<Arc<dyn codypendent_knowledge::CodeGraphQueries>>,
+    /// The code-graph WRITE seam `graph.assert_edge` folds agent assertions
+    /// through, if wired. Held separately from `code_graph` because it is a
+    /// separate capability, not a separate connection: an assembly may serve
+    /// graph questions without accepting agent claims about the answers, and
+    /// `None` leaves the tool unoffered exactly as an unwired read seam leaves
+    /// the queries unoffered.
+    code_graph_assertions: Option<Arc<dyn CodeGraphAssertions>>,
     /// The registry the `skills.search` tool queries (rubric 9), if wired.
     /// Process-wide (one knowledge pool), like `github`/`mcp`, so it lives on
     /// the runtime rather than the run context. `None` leaves the tool unoffered
@@ -1642,6 +1651,7 @@ impl FrameworkAgentRuntime {
             mcp_top_k: crate::models::DEFAULT_MCP_TOP_K,
             builtin_top_k: crate::models::DEFAULT_BUILTIN_TOP_K,
             code_graph: None,
+            code_graph_assertions: None,
             registry: None,
             docs: None,
             artifacts: None,
@@ -1745,6 +1755,21 @@ impl FrameworkAgentRuntime {
         code_graph: Arc<dyn codypendent_knowledge::CodeGraphQueries>,
     ) -> Self {
         self.code_graph = Some(code_graph);
+        self
+    }
+
+    /// Bind the code-graph WRITE seam, enabling `graph.assert_edge`: the agent
+    /// lever on graph construction, for the relations a parser cannot see (a
+    /// route handler to the service it dispatches to, a config key to its
+    /// reader, a test to the behaviour it covers).
+    ///
+    /// The assembly binds it over the same pool and the same `repository_id_for`
+    /// as the read seam, so an assertion lands under the id the scan folded the
+    /// graph beneath and the next `graph.callers_of` can see it. Without it the
+    /// tool is neither offered nor advertised.
+    #[must_use]
+    pub fn with_code_graph_assertions(mut self, assertions: Arc<dyn CodeGraphAssertions>) -> Self {
+        self.code_graph_assertions = Some(assertions);
         self
     }
 
@@ -1933,6 +1958,14 @@ impl FrameworkAgentRuntime {
                 .iter()
                 .map(|name| (*name).to_string()),
             );
+        }
+        // The agent lever on the graph. Offered on its own seam, and in every
+        // mode: it writes Codypendent's own derived knowledge, not the
+        // repository, so the read-only modes' overlays have nothing to deny —
+        // exactly the `task.*` board reasoning. A Review run that works out
+        // which service a route dispatches to should be able to write that down.
+        if self.code_graph_assertions.is_some() {
+            names.push(GraphAssertEdge::NAME.to_string());
         }
         if self.offers_blackboard(run) {
             names.extend(
@@ -3775,6 +3808,24 @@ impl FrameworkAgentRuntime {
                     tool: PreparedTool::CodeGraph(question),
                 })
             }
+            // The agent lever (`graph.assert_edge`). Match-guarded on the WRITE
+            // seam, so a run whose assembly wired only the read seam falls
+            // through to the unknown-tool refusal the offering already promised.
+            // The repository is server-derived from the run's DURABLE identity,
+            // never the worktree and never an argument: a model cannot redirect
+            // an assertion onto another repository's graph, and an assertion made
+            // in the default Build mode must not land under a worktree id that is
+            // deleted the moment the run ends.
+            GraphAssertEdge::NAME if self.code_graph_assertions.is_some() => {
+                let edges = parse_assert_edge(args)?;
+                Ok(Prepared {
+                    action: graph_assert_action(
+                        run.repository_identity(),
+                        summarize_assertions(&edges),
+                    ),
+                    tool: PreparedTool::CodeGraphAssert(edges),
+                })
+            }
             // `artifact.read`: gated on a wired reader exactly as
             // `offered_tool_names` gates the offer (the blackboard match-guard
             // idiom) — a call with no reader falls through to the unknown-tool
@@ -4325,6 +4376,7 @@ impl FrameworkAgentRuntime {
                     ),
                 },
             },
+            PreparedTool::CodeGraphAssert(edges) => self.execute_graph_assert(edges, run).await,
             PreparedTool::Mcp { server, tool, args } => match self.mcp.as_ref() {
                 None => mcp_unavailable(&format!("mcp.{server}.{tool}")),
                 Some(bridge) => match bridge.call_tool(&server, &tool, args).await {
@@ -4609,6 +4661,76 @@ impl FrameworkAgentRuntime {
                 None,
                 ToolOutcome::Failed {
                     message: e.code().to_string(),
+                },
+            ),
+        }
+    }
+
+    /// `graph.assert_edge`: fold the model's claims into the repository's code
+    /// graph — the AGENT lever on graph construction, beside the deterministic
+    /// tree-sitter one.
+    ///
+    /// Two properties this method exists to hold:
+    ///
+    /// * the subject is the run's DURABLE repository identity, taken from the run
+    ///   context and never from an argument, so an assertion lands under the id
+    ///   the scan folded the graph beneath rather than under a Build run's
+    ///   throwaway worktree;
+    /// * an edge that was NOT written is reported, per edge, with the reason. The
+    ///   engine's own answer for an endpoint that matched nothing is a *skip*,
+    ///   and a skip the model is not shown is a skip it believes was a success —
+    ///   it walks away holding a graph that does not say what it thinks it says.
+    ///   That is why the seam returns a disposition per edge rather than a count.
+    async fn execute_graph_assert(
+        &self,
+        edges: Vec<AssertedEdge>,
+        run: &RunContext,
+    ) -> (String, Option<ArtifactRef>, ToolOutcome) {
+        let Some(assertions) = self.code_graph_assertions.as_ref() else {
+            return (
+                "the code graph is unavailable (no graph-assertion connection)".to_string(),
+                None,
+                ToolOutcome::Failed {
+                    message: "graph.assert.unavailable".to_string(),
+                },
+            );
+        };
+        let request = EdgeAssertionRequest {
+            repository: run.repository_identity(),
+            session_id: run.session_id,
+            run_id: run.run_id,
+            edges: &edges,
+        };
+        match assertions.assert_edges(request).await {
+            Ok(outcomes) => {
+                let rendered = render_edge_assertions(&edges, &outcomes);
+                let recorded = outcomes.iter().any(EdgeAssertionOutcome::recorded);
+                let unresolved = outcomes.iter().any(|outcome| {
+                    matches!(
+                        outcome,
+                        EdgeAssertionOutcome::Unresolved { .. }
+                            | EdgeAssertionOutcome::Ambiguous { .. }
+                    )
+                });
+                // A batch where nothing landed *because the graph already knew*
+                // is a success — the model asked a reasonable question and got a
+                // reasonable answer. A batch where nothing landed because every
+                // name was wrong is a failed call, so the trace says so and the
+                // model reads a failure rather than a shrug.
+                let outcome = if recorded || !unresolved {
+                    ToolOutcome::Succeeded
+                } else {
+                    ToolOutcome::Failed {
+                        message: "graph.assert.unresolved".to_string(),
+                    }
+                };
+                (rendered, None, outcome)
+            }
+            Err(reason) => (
+                format!("code-graph assertion failed: {reason}"),
+                None,
+                ToolOutcome::Failed {
+                    message: "graph.assert.failed".to_string(),
                 },
             ),
         }
@@ -5145,6 +5267,10 @@ enum PreparedTool {
     /// A `graph.*` call (outcome 5): the typed question, already bounded by its
     /// parser and clamped again by the store.
     CodeGraph(codypendent_knowledge::GraphQuestion),
+    /// A `graph.assert_edge` call: the edges the model claims, already bounded
+    /// in count, endpoint length and rationale length by their parser, and each
+    /// carrying the rationale that becomes the edge's provenance.
+    CodeGraphAssert(Vec<AssertedEdge>),
     DocsCreate(DocsCreateInput),
     DocsRead(DocsReadInput),
     DocsEdit(DocsEditInput),
@@ -6763,6 +6889,64 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path"]
             }),
         ),
+        // The agent lever. A schema entry is not decoration: a tool absent from
+        // this catalog is filtered out of `advertised_tool_definitions` and the
+        // model never learns it exists, however dispatchable it is — the exact
+        // way the `docs.*` family shipped unreachable.
+        decl(
+            GraphAssertEdge::NAME,
+            &format!(
+                "Record a relationship between two symbols that the parser CANNOT see, so the \
+                 code graph knows it too: a route handler and the service it dispatches to, a \
+                 config key and the code that reads it, a test and the behaviour it covers, a \
+                 migration and the model it reshapes. Use it when you have just worked out how \
+                 two parts of this repository are connected and the connection is not a literal \
+                 call in the source. Name both symbols the way they appear in the code \
+                 (`Router::decide`), exactly as for graph.callers_of — both must already exist \
+                 in the graph, since an assertion cannot invent a symbol. Relations: {}. Your \
+                 `rationale` is stored as the edge's provenance and is required. An assertion \
+                 never overwrites a compiler- or LSP-resolved edge.",
+                assertable_relation_names()
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "edges": {
+                        "type": "array",
+                        "maxItems": MAX_ASSERTED_EDGES,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "from": {
+                                    "type": "string",
+                                    "description": "The source symbol, as it appears in the code."
+                                },
+                                "to": {
+                                    "type": "string",
+                                    "description": "The target symbol, as it appears in the code."
+                                },
+                                "relation": {
+                                    "type": "string",
+                                    "enum": ASSERTABLE_RELATIONS
+                                        .iter()
+                                        .map(|(name, _)| *name)
+                                        .collect::<Vec<_>>()
+                                },
+                                "rationale": {
+                                    "type": "string",
+                                    "description":
+                                        "One sentence on how you know this relation holds \
+                                         (what you read, and where). Stored as the edge's \
+                                         provenance."
+                                }
+                            },
+                            "required": ["from", "to", "relation", "rationale"]
+                        }
+                    }
+                },
+                "required": ["edges"]
+            }),
+        ),
         // The doc-writer (rubric #4). These four were dispatchable and offered
         // from the day they shipped but had no entry here, so the intersection in
         // `advertised_tool_definitions` dropped every one of them and no agent
@@ -8372,6 +8556,94 @@ context_tokens = 1000000
         }
     }
 
+    /// The same advertisement half, for the agent lever: `graph.assert_edge` must
+    /// reach the model's tool array on an objective about how two parts of a
+    /// repository are connected — not merely be dispatchable if the model
+    /// somehow guesses the name.
+    ///
+    /// The retrieval gate is left at its DEFAULT here, deliberately. Turning it
+    /// off would prove only that the catalog has an entry (which the structural
+    /// guard already covers) and would say nothing about the funnel, which is
+    /// where `docs.*` was actually lost: it had a catalog entry from the day it
+    /// shipped and was still never shown.
+    #[test]
+    fn the_edge_assertion_tool_is_advertised_when_the_write_seam_is_wired() {
+        let (runtime, _events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let objective = "work out which service the /charge route dispatches to and record \
+                         that connection on the code graph";
+
+        // Without the write seam: neither offered nor advertised, even though the
+        // READ seam is wired. The two are separate capabilities.
+        let read_only = runtime.with_code_graph(Arc::new(RecordingCodeGraph::default()));
+        let mut bare = RunContext::new(
+            session_id,
+            RunId::new(),
+            objective,
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        bare.tools_advertised = read_only.select_builtin_tools(&bare);
+        assert!(
+            !read_only
+                .offered_tool_names(&bare)
+                .iter()
+                .any(|name| name == GraphAssertEdge::NAME),
+            "no write seam → the assertion tool is not offered"
+        );
+        assert!(
+            !read_only
+                .advertised_tool_definitions(&bare)
+                .iter()
+                .any(|def| def.name == GraphAssertEdge::NAME),
+            "no write seam → the assertion tool is not advertised"
+        );
+
+        let wired =
+            read_only.with_code_graph_assertions(Arc::new(RecordingCodeGraphAssertions::default()));
+        let mut run = RunContext::new(
+            session_id,
+            RunId::new(),
+            objective,
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        run.tools_advertised = wired.select_builtin_tools(&run);
+        let advertised: Vec<String> = wired
+            .advertised_tool_definitions(&run)
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        assert!(
+            advertised.iter().any(|name| name == GraphAssertEdge::NAME),
+            "the model must be SHOWN the assertion tool for a graph objective: {advertised:?}"
+        );
+
+        // …and the schema it is shown must actually describe the call, not just
+        // carry the name: a model handed `{}` for parameters cannot fill it in.
+        let definition = wired
+            .advertised_tool_definitions(&run)
+            .into_iter()
+            .find(|def| def.name == GraphAssertEdge::NAME)
+            .expect("advertised");
+        let items = &definition.parameters["properties"]["edges"]["items"];
+        assert_eq!(
+            items["required"],
+            json!(["from", "to", "relation", "rationale"]),
+            "the rationale is part of the advertised contract, not an afterthought"
+        );
+        let relations = items["properties"]["relation"]["enum"]
+            .as_array()
+            .expect("the assertable relations are enumerated for the model");
+        assert!(relations.iter().any(|value| value == "calls"));
+        assert!(
+            !relations.iter().any(|value| value == "contains"),
+            "the structural relations the parser owns are not offered: {relations:?}"
+        );
+    }
+
     /// A [`DocsChannel`] that records the repository key every call was scoped
     /// by — the assertion surface for the repository-identity invariant.
     #[derive(Default)]
@@ -8457,6 +8729,31 @@ context_tokens = 1000000
         }
     }
 
+    /// A code-graph WRITE seam that records the repository root each assertion
+    /// batch was scoped by, and applies everything.
+    #[derive(Default)]
+    struct RecordingCodeGraphAssertions {
+        seen: Mutex<Vec<PathBuf>>,
+    }
+
+    #[async_trait]
+    impl CodeGraphAssertions for RecordingCodeGraphAssertions {
+        async fn assert_edges(
+            &self,
+            request: EdgeAssertionRequest<'_>,
+        ) -> Result<Vec<EdgeAssertionOutcome>, String> {
+            self.seen
+                .lock()
+                .expect("stub lock")
+                .push(request.repository.to_path_buf());
+            Ok(request
+                .edges
+                .iter()
+                .map(|_| EdgeAssertionOutcome::Applied)
+                .collect())
+        }
+    }
+
     /// THE repository-identity invariant (r4 review §1.1): a run has exactly one
     /// durable repository identity — the checkout the session was opened on — and
     /// every knowledge-scoped call is keyed by it, never by the throwaway worktree
@@ -8475,6 +8772,7 @@ context_tokens = 1000000
 
         let docs = Arc::new(RecordingDocsChannel::default());
         let graph = Arc::new(RecordingCodeGraph::default());
+        let assertions = Arc::new(RecordingCodeGraphAssertions::default());
         let registry = Arc::new(StubRegistry {
             seen: Mutex::new(Vec::new()),
         });
@@ -8482,6 +8780,7 @@ context_tokens = 1000000
         let runtime = runtime
             .with_docs(docs.clone())
             .with_code_graph(graph.clone())
+            .with_code_graph_assertions(assertions.clone())
             .with_registry_search(registry.clone());
 
         // A default Build run: it READS AND WRITES in the worktree, and its
@@ -8515,6 +8814,11 @@ context_tokens = 1000000
             ),
             (GraphCallersOf::NAME, json!({"symbol": "charge"})),
             (GraphTestsCovering::NAME, json!({"path": "src/charge.rs"})),
+            (
+                GraphAssertEdge::NAME,
+                json!({"edges": [{"from": "charge", "to": "ChargeService",
+                                  "relation": "calls", "rationale": "the route table dispatches it"}]}),
+            ),
             (SkillsSearch::NAME, json!({"query": "charge path"})),
         ] {
             let prepared = runtime
@@ -8523,7 +8827,9 @@ context_tokens = 1000000
                 .unwrap_or_else(|e| panic!("{tool} prepares: {e}"));
             // The TRACE must name the same repository the query is answered
             // against, or the ledger disagrees with the store.
-            if let ProposedAction::CodeGraphQuery { repository, .. } = &prepared.action {
+            if let ProposedAction::CodeGraphQuery { repository, .. }
+            | ProposedAction::CodeGraphAssert { repository, .. } = &prepared.action
+            {
                 assert_eq!(
                     Path::new(repository),
                     checkout.path(),
@@ -8552,6 +8858,14 @@ context_tokens = 1000000
                     .map(|root| format!("graph={}", root.display())),
             )
             .chain(
+                assertions
+                    .seen
+                    .lock()
+                    .expect("stub lock")
+                    .iter()
+                    .map(|root| format!("graph.assert_edge={}", root.display())),
+            )
+            .chain(
                 registry
                     .seen
                     .lock()
@@ -8563,8 +8877,8 @@ context_tokens = 1000000
 
         assert_eq!(
             scoped_by.len(),
-            7,
-            "every one of the seven calls reached its seam: {scoped_by:?}"
+            8,
+            "every one of the eight calls reached its seam: {scoped_by:?}"
         );
         let identity = checkout.path().display().to_string();
         let orphan = worktree.path().display().to_string();
@@ -8599,6 +8913,8 @@ context_tokens = 1000000
                 result: Ok(stub_outcome("x")),
             }))
             .with_task_board(Arc::new(RecordingTaskBoard::default()))
+            .with_code_graph(Arc::new(RecordingCodeGraph::default()))
+            .with_code_graph_assertions(Arc::new(RecordingCodeGraphAssertions::default()))
             .with_builtin_top_k(0);
         let repo = tempfile::tempdir().expect("tempdir");
         let run = RunContext::new(

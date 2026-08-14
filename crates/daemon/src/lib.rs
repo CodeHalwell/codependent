@@ -17,6 +17,9 @@ pub mod server;
 pub mod approvals;
 pub mod artifacts;
 pub mod blackboard;
+// The on-demand code-graph build/status/show seam, filled by the assembly
+// (only it can name `codypendent-knowledge` and the scan walk).
+pub mod codegraph;
 pub mod commands;
 pub mod documents;
 pub mod executor;

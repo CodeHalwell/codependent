@@ -2200,3 +2200,108 @@ async fn read_session_events_pages_the_ledger_forward() {
 
     shutdown(s1, task).await;
 }
+
+#[tokio::test]
+async fn code_graph_commands_are_role_gated_then_transport_unavailable() {
+    // `codypendent graph {build,status,show}` is intercepted at the connection
+    // level like the memory and blackboard commands (the graph lives outside the
+    // session ledger). A BUILD clears and rewrites the repository's whole graph,
+    // so it is `Controller`-only; the two READS are open to any handshaken
+    // client, an Observer included. The daemon's own test server injects no
+    // code-graph seam, so a command that gets past the role gate is refused
+    // `graph.transport-unavailable` rather than tearing the connection down.
+    //
+    // The reads must NOT be role-gated: a graph you cannot look at is the same
+    // silence this command family exists to end. That is the half a "reads are
+    // free" claim in a doc comment cannot enforce, so it is asserted here.
+    let tmp = tempfile::tempdir().unwrap();
+    let (paths, task) = start_server(&tmp).await;
+
+    // An Observer may read the graph, but never rebuild it.
+    let observer = ClientId::new();
+    let mut obs = connect(&paths).await;
+    handshake(&mut obs, observer).await;
+    bind_role(&mut obs, observer, ClientRole::Observer, "obs-graph-att").await;
+
+    let reply = send_recv(
+        &mut obs,
+        &Envelope::request(
+            observer,
+            Payload::Command(command(
+                CommandBody::BuildCodeGraph {
+                    repository: "/tmp/whatever".to_string(),
+                },
+                "graph-build-observer",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => assert_eq!(error.code, "protocol.role-denied"),
+        other => panic!("expected role-denied for an Observer build, got {other:?}"),
+    }
+
+    for (body, key) in [
+        (
+            CommandBody::ReadCodeGraphStatus {
+                repository: "/tmp/whatever".to_string(),
+            },
+            "graph-status-observer",
+        ),
+        (
+            CommandBody::ReadCodeGraph {
+                repository: "/tmp/whatever".to_string(),
+                query: codypendent_protocol::CodeGraphQuery::default(),
+            },
+            "graph-show-observer",
+        ),
+    ] {
+        let reply = send_recv(
+            &mut obs,
+            &Envelope::request(observer, Payload::Command(command(body, key))),
+        )
+        .await;
+        match reply.payload {
+            Payload::CommandRejected(error) => {
+                assert_eq!(
+                    error.code, "graph.transport-unavailable",
+                    "an Observer read must reach the seam, not the role gate ({key})"
+                );
+            }
+            other => panic!("expected transport-unavailable for {key}, got {other:?}"),
+        }
+    }
+
+    // A Controller gets past the role gate and reaches the unwired seam.
+    let controller = ClientId::new();
+    let mut ctrl = connect(&paths).await;
+    handshake(&mut ctrl, controller).await;
+    bind_role(
+        &mut ctrl,
+        controller,
+        ClientRole::Controller,
+        "ctrl-graph-att",
+    )
+    .await;
+    let reply = send_recv(
+        &mut ctrl,
+        &Envelope::request(
+            controller,
+            Payload::Command(command(
+                CommandBody::BuildCodeGraph {
+                    repository: "/tmp/whatever".to_string(),
+                },
+                "graph-build-controller",
+            )),
+        ),
+    )
+    .await;
+    match reply.payload {
+        Payload::CommandRejected(error) => {
+            assert_eq!(error.code, "graph.transport-unavailable");
+        }
+        other => panic!("expected transport-unavailable, got {other:?}"),
+    }
+
+    shutdown(ctrl, task).await;
+}

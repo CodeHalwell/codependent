@@ -252,6 +252,16 @@ pub trait RunExecutor: Send + Sync {
         None
     }
 
+    /// The assembly-provided [`CodeGraphGateway`](crate::codegraph::CodeGraphGateway)
+    /// backing `codypendent graph {build,status,show}`. Bundled with the
+    /// executor for the same reason as the memory gateway: it names
+    /// `codypendent-knowledge` and the scan walk, which only the assembly can.
+    /// The default `None` leaves the graph commands unwired — the executor-less
+    /// server rejects them `graph.transport-unavailable`.
+    fn code_graph_gateway(&self) -> Option<std::sync::Arc<dyn crate::codegraph::CodeGraphGateway>> {
+        None
+    }
+
     /// The assembly-provided [`BlackboardReader`](crate::blackboard::BlackboardReader)
     /// that projects a workflow run's board for an accepted `ReadBlackboard` command
     /// (Phase 5 STEP 5.3). Bundled with the executor like the workflow seams — it

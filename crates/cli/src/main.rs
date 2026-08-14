@@ -127,12 +127,19 @@ enum TopCommand {
         events: EventsFormat,
     },
     /// Maintain the derived search indexes over the knowledge fabric —
-    /// full-text (BM25) and vectors. This is SEARCH, not the code graph: the
-    /// code graph is built per repository when you open a session or start a
-    /// run, never by this command.
+    /// full-text (BM25) and vectors. This is SEARCH, not the code graph:
+    /// use `codypendent graph build` for the code graph.
     Index {
         #[command(subcommand)]
         command: IndexCommand,
+    },
+    /// Build and inspect this repository's code graph — the symbol/reference
+    /// map the agent reasons over. `graph build` folds it on demand and reports
+    /// why it came out the size it did; `graph status` describes what is
+    /// stored; `graph show` lists it.
+    Graph {
+        #[command(subcommand)]
+        command: GraphCommand,
     },
     /// Install skill packages into the governed registry, so retrieval can
     /// disclose them to a run.
@@ -323,10 +330,75 @@ impl IdeArg {
 
 #[derive(Subcommand)]
 enum IndexCommand {
-    /// Delete the derived RETRIEVAL indexes (BM25 + vectors) and rebuild them
-    /// from the authoritative rows. Does NOT rebuild the code graph — that is
-    /// built per-repository on session open / first run.
+    /// Delete the derived SEARCH indexes (full-text BM25 + vectors) and rebuild
+    /// them from the authoritative rows. This does NOT build the code graph —
+    /// for that, run `codypendent graph build`.
     Rebuild,
+}
+
+#[derive(Subcommand)]
+enum GraphCommand {
+    /// Fold this repository's code graph now, and report what the fold saw:
+    /// files walked, files folded, nodes and edges written, a per-language
+    /// breakdown, and — the point of the command — every file extension that
+    /// produced nothing, so an empty graph explains itself instead of being a
+    /// silent zero.
+    #[command(visible_alias = "rebuild")]
+    Build {
+        /// Repository to fold. Defaults to the current directory; either way it
+        /// anchors on the enclosing checkout, never on a subdirectory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Emit the report as JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show what the stored code graph holds for this repository — counts,
+    /// per-language and per-kind breakdowns, the revision it was folded at, and
+    /// whether it is stale relative to the working tree. Reads only; never
+    /// re-scans.
+    Status {
+        /// Repository to describe. Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Emit the status as JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the graph's nodes (and optionally their edges), filtered, so the
+    /// graph is inspectable from the terminal rather than only through the TUI
+    /// overlay.
+    Show {
+        /// Repository to read. Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Only nodes whose repo-relative source path starts with this prefix.
+        #[arg(long)]
+        path: Option<String>,
+        /// Only nodes in this language, as stored (`rust`, `python`, …).
+        #[arg(long)]
+        language: Option<String>,
+        /// Only nodes of this kind, as stored (`function`, `type`, `file`, …).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Only nodes whose qualified name contains this text.
+        #[arg(long)]
+        name: Option<String>,
+        /// Exactly one node, by the id `graph show` prints. Scoped to this
+        /// repository like every other filter: an id belonging to another
+        /// checkout is refused identically to one that does not exist.
+        #[arg(long = "node")]
+        node_id: Option<String>,
+        /// Also list the edges incident to the selected nodes.
+        #[arg(long)]
+        edges: bool,
+        /// Maximum rows of each kind (server-clamped).
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Emit the page as JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1150,6 +1222,33 @@ async fn run() -> anyhow::Result<()> {
         TopCommand::Index {
             command: IndexCommand::Rebuild,
         } => commands::index_rebuild(&paths).await,
+        TopCommand::Graph { command } => match command {
+            GraphCommand::Build { repo, json } => commands::graph_build(&paths, repo, json).await,
+            GraphCommand::Status { repo, json } => commands::graph_status(&paths, repo, json).await,
+            GraphCommand::Show {
+                repo,
+                path,
+                language,
+                kind,
+                name,
+                node_id,
+                edges,
+                limit,
+                json,
+            } => {
+                let query = codypendent_protocol::CodeGraphQuery {
+                    path,
+                    language,
+                    kind,
+                    name,
+                    node_id,
+                    include_edges: edges,
+                    include_nodes: true,
+                    limit,
+                };
+                commands::graph_show(&paths, repo, query, json).await
+            }
+        },
         TopCommand::Skill { command } => match command {
             SkillCommand::Add { directory } => commands::skill_add(&paths, &directory).await,
             SkillCommand::New {

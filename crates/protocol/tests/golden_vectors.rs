@@ -2267,6 +2267,157 @@ fn memory_vectors() -> Vec<Vector> {
 }
 
 // ---------------------------------------------------------------------------
+// codegraph.json: `codypendent graph {build,status,show}` — the on-demand
+// code-graph build and its two read commands. Its own file, like every other
+// addition in this wave, so `command.json`/`envelope.json` stay byte-identical
+// and the VS Code extension's drift guard is untouched until its maintainers
+// choose to model these.
+// ---------------------------------------------------------------------------
+
+fn codegraph_vectors() -> Vec<Vector> {
+    use codypendent_protocol::codegraph::{
+        CodeGraphEdgeView, CodeGraphGrammar, CodeGraphLanguageCount, CodeGraphNodeView,
+        CodeGraphPage, CodeGraphQuery, CodeGraphScanReport, CodeGraphSkippedExtension,
+        CodeGraphStatusView, CodeGraphTally,
+    };
+
+    // The reported case: a repository walked in full, folded not at all.
+    let report = CodeGraphScanReport {
+        repository_root: "/home/user/project".to_string(),
+        revision: "9f1c2ab".to_string(),
+        files_walked: 1204,
+        files_supported: 0,
+        files_folded: 0,
+        files_unsupported: 1204,
+        files_ignored: 38,
+        nodes: 0,
+        edges: 0,
+        by_language: Vec::new(),
+        not_folded: vec![CodeGraphSkippedExtension {
+            extension: "go".to_string(),
+            files: 1204,
+        }],
+        grammars: vec![CodeGraphGrammar {
+            language: "rust".to_string(),
+            extensions: vec!["rs".to_string()],
+        }],
+        file_cap: 2000,
+        cap_hit: false,
+        elapsed_ms: 41,
+    };
+    let status = CodeGraphStatusView {
+        repository_root: "/home/user/project".to_string(),
+        nodes: 12,
+        edges: 4,
+        files: 3,
+        by_language: vec![CodeGraphLanguageCount {
+            language: "rust".to_string(),
+            files: 3,
+            nodes: 12,
+            edges: 4,
+        }],
+        by_kind: vec![CodeGraphTally {
+            label: "function".to_string(),
+            count: 9,
+        }],
+        revisions: vec![CodeGraphTally {
+            label: "9f1c2ab".to_string(),
+            count: 12,
+        }],
+        head_revision: "9f1c2ab".to_string(),
+        working_tree_dirty: true,
+        stale: true,
+        stale_reason: Some("the working tree has uncommitted changes".to_string()),
+    };
+    let page = CodeGraphPage {
+        nodes: vec![CodeGraphNodeView {
+            id: "90000000-0000-0000-0000-000000000001".to_string(),
+            language: "rust".to_string(),
+            package: Some("codypendent-cli".to_string()),
+            source_path: Some("crates/cli/src/lib.rs".to_string()),
+            qualified_name: "commands::graph_build".to_string(),
+            kind: "function".to_string(),
+            revision: "9f1c2ab".to_string(),
+        }],
+        edges: vec![CodeGraphEdgeView {
+            from_id: "90000000-0000-0000-0000-000000000001".to_string(),
+            from_name: "commands::graph_build".to_string(),
+            to_id: "90000000-0000-0000-0000-000000000002".to_string(),
+            to_name: "commands::graph_repository".to_string(),
+            relation: "calls".to_string(),
+            confidence: 0.45,
+            evidence_kind: "syntax_inferred".to_string(),
+            revision: "9f1c2ab".to_string(),
+        }],
+        total_nodes: 812,
+        total_edges: 1904,
+        limit: 50,
+    };
+
+    vec![
+        vec_of(
+            "CommandBody_BuildCodeGraph",
+            CommandBody::BuildCodeGraph {
+                repository: "/home/user/project".to_string(),
+            },
+        ),
+        vec_of(
+            "CommandBody_ReadCodeGraphStatus",
+            CommandBody::ReadCodeGraphStatus {
+                repository: "/home/user/project".to_string(),
+            },
+        ),
+        // The unfiltered read: `query` serializes to `{}`, which pins that an
+        // absent filter never means "match everything except the repository
+        // scope" on a future daemon.
+        vec_of(
+            "CommandBody_ReadCodeGraph",
+            CommandBody::ReadCodeGraph {
+                repository: "/home/user/project".to_string(),
+                query: CodeGraphQuery::default(),
+            },
+        ),
+        vec_of(
+            "CommandBody_ReadCodeGraph_filtered",
+            CommandBody::ReadCodeGraph {
+                repository: "/home/user/project".to_string(),
+                query: CodeGraphQuery {
+                    path: Some("crates/cli/".to_string()),
+                    language: Some("rust".to_string()),
+                    kind: Some("function".to_string()),
+                    name: Some("graph".to_string()),
+                    node_id: Some("90000000-0000-0000-0000-000000000001".to_string()),
+                    include_edges: true,
+                    include_nodes: true,
+                    limit: 50,
+                },
+            },
+        ),
+        vec_of(
+            "Payload_CodeGraphBuilt",
+            Payload::CodeGraphBuilt {
+                command_id: command_id(),
+                report: Box::new(report),
+            },
+        ),
+        vec_of(
+            "Payload_CodeGraphStatus",
+            Payload::CodeGraphStatus {
+                command_id: command_id(),
+                status: Box::new(status),
+            },
+        ),
+        vec_of(
+            "Payload_CodeGraphPage",
+            Payload::CodeGraphPage {
+                command_id: command_id(),
+                page: Box::new(page),
+            },
+        ),
+    ]
+}
+
+// ---------------------------------------------------------------------------
 // promotion_evidence.json: the socket command that replaced a client writing
 // the daemon's `eval_suite_reports` table itself.
 // ---------------------------------------------------------------------------
@@ -2322,6 +2473,7 @@ fn all_files() -> Vec<(&'static str, Vec<Vector>)> {
         ("usage.json", usage_vectors()),
         ("memory.json", memory_vectors()),
         ("promotion_evidence.json", promotion_evidence_vectors()),
+        ("codegraph.json", codegraph_vectors()),
     ]
 }
 
