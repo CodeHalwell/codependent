@@ -1794,8 +1794,6 @@ steps:
         }
     }
 
-    /// Poll until `node_id`'s store row reaches `target`, or panic — mirrors
-    /// [`wait_for_state`] but at node granularity.
     /// Await the next `RunPhaseChanged` on a live subscription, skipping node
     /// transitions.
     ///
@@ -1824,6 +1822,8 @@ steps:
         panic!("no RunPhaseChanged({target:?}) within 16 events");
     }
 
+    /// Poll until `node_id`'s store row reaches `target`, or panic — mirrors
+    /// [`wait_for_state`] but at node granularity.
     async fn wait_for_node_state(
         pool: &SqlitePool,
         run_id: &str,

@@ -1231,14 +1231,6 @@ impl RunContext {
         self
     }
 
-    /// The name [`with_repository_identity`](Self::with_repository_identity) had
-    /// while it was believed to configure only the task board. Kept so the
-    /// daemon's two construction sites keep compiling; they should move to the
-    /// new name and this should then go (`.impl/r4-proposals/E-daemon-from-A-runtime.md`).
-    pub fn with_board_repository(self, repository: impl Into<String>) -> Self {
-        self.with_repository_identity(repository)
-    }
-
     /// **THE** repository identity of this run: the durable checkout the session
     /// was opened on. This is the ONLY thing anything scoped to a repository may
     /// key off — documents, the code graph, the skills registry, memories, the

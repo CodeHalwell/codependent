@@ -497,11 +497,15 @@ pub async fn run_case_with_trace(
 /// [`codypendent_eval::RegressionSuite::evaluate`] needs to tell "failed"
 /// apart from "never observed".
 ///
-/// Intended for `evals/regressions/` (see that directory's own `README.md`):
-/// guard cases for historical failures that must never silently come back.
+/// Intended for `evals/tasks/regressions/` (see that directory's own
+/// `README.md`): guard cases for historical failures that must never silently
+/// come back. It sits under `evals/tasks/` — not at `evals/regressions/`, where
+/// it used to live — because [`fixture_root`] resolves a suite's bundle at
+/// `<suite_dir>/../../fixtures/`, so a suite one level shallower loaded its
+/// cases and then died looking for `<repo>/fixtures/`.
 /// No named CLI flag drives this yet — see `.impl/proposals/
 /// agent-models-from-agent-evals.md` for the follow-up wiring a `codypendent
-/// eval run --suite evals/regressions --regression` flag would need in
+/// eval run --suite evals/tasks/regressions --regression` flag would need in
 /// `commands.rs` (not owned by this crate module).
 pub async fn run_regression_suite(
     paths: &codypendent_protocol::discovery::RuntimePaths,
