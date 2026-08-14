@@ -459,10 +459,11 @@ async fn tallies(
 /// Decide whether the stored graph still describes the working tree, and say why
 /// in one sentence when it does not.
 ///
-/// Three ways a graph goes stale, in the order a user cares about them:
-/// it is empty; it was folded at a commit that is no longer `HEAD`; or the tree
-/// has uncommitted edits and nothing in the graph carries the `+workdir` stamp
-/// the live watcher writes for an uncommitted fold.
+/// Four ways a graph goes stale, in the order a user cares about them: it is
+/// empty; it was folded at a commit that is no longer `HEAD`; it holds rows
+/// folded from uncommitted bytes (`<HEAD>+workdir`) that the tree no longer
+/// has; or the tree has uncommitted edits and nothing in the graph carries the
+/// `+workdir` stamp the live watcher writes for an uncommitted fold.
 fn staleness(
     nodes: u64,
     revisions: &[CodeGraphTally],
@@ -489,6 +490,32 @@ fn staleness(
                 "folded at {revision}, but HEAD is now {head} — run `codypendent graph build`"
             )),
         );
+    }
+    // The mirror image, and the half that was missing: a `+workdir` stamp says
+    // "these rows describe bytes that were never committed". Revert those edits
+    // and the bytes are gone, but `HEAD` never moved — so the filter above still
+    // accepts the stamp and the dirty-tree check below is skipped, leaving
+    // `graph status` reporting a graph of vanished source as `current`. Rows
+    // refolded at a bare `HEAD` since then carry `HEAD`, not the stamp, so a
+    // surviving `+workdir` tally is exactly the set that has not been refolded.
+    //
+    // Reachable in ordinary use, not only in tests: `build` treats a failure to
+    // arm the live watcher as a successful build, so nothing is guaranteed to
+    // refold the file when the edit is reverted.
+    if !working_tree_dirty {
+        if let Some(tally) = revisions
+            .iter()
+            .find(|tally| tally.label.ends_with("+workdir"))
+        {
+            return (
+                true,
+                Some(format!(
+                    "{} symbol(s) were folded from uncommitted edits ({}) that the working tree \
+                     no longer has — run `codypendent graph build`",
+                    tally.count, tally.label
+                )),
+            );
+        }
     }
     if working_tree_dirty
         && !revisions
@@ -822,7 +849,7 @@ mod tests {
     /// Staleness has to name the reason, because "stale: true" is the same
     /// unhelpful silence as "0 nodes".
     #[test]
-    fn staleness_explains_each_of_its_three_causes() {
+    fn staleness_explains_each_of_its_four_causes() {
         let empty = staleness(0, &[], "abc", false);
         assert!(empty.0 && empty.1.expect("reason").contains("empty"));
 
@@ -863,6 +890,36 @@ mod tests {
         );
         assert!(!folded_dirty.0, "{folded_dirty:?}");
         assert!(folded_dirty.1.is_none());
+
+        // And the fourth: the SAME stamp against a tree that is now clean. The
+        // rows describe uncommitted bytes; the tree no longer has them. `HEAD`
+        // never moved, so nothing else in this function notices.
+        let reverted = staleness(
+            5,
+            &[CodeGraphTally {
+                label: "abc+workdir".to_string(),
+                count: 5,
+            }],
+            "abc",
+            false,
+        );
+        assert!(reverted.0, "{reverted:?}");
+        let reason = reverted.1.expect("reason");
+        assert!(reason.contains("uncommitted"), "{reason}");
+        assert!(reason.contains("no longer has"), "{reason}");
+
+        // Refolding at the bare commit clears it: the rows now carry `HEAD`, so
+        // there is no `+workdir` tally left to be stale.
+        let refolded = staleness(
+            5,
+            &[CodeGraphTally {
+                label: "abc".to_string(),
+                count: 5,
+            }],
+            "abc",
+            false,
+        );
+        assert!(!refolded.0, "{refolded:?}");
     }
 
     /// A directory outside a checkout is refused rather than answered "empty".
@@ -1329,6 +1386,66 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![format!("{}+workdir", status.head_revision).as_str()],
         );
+    }
+
+    /// **Reverting the edits a graph was built from makes it stale.**
+    ///
+    /// A build of a dirty tree stamps `<HEAD>+workdir` — rows folded from bytes
+    /// that were never committed. Revert the edits and those bytes are gone, but
+    /// `HEAD` never moved, so the staleness filter still accepted the stamp as
+    /// "current" and the dirty-tree clause below it never ran: `graph status`
+    /// reported a graph of vanished source as current, and the model's symbol
+    /// map named functions the file no longer contains.
+    ///
+    /// Reachable without any test scaffolding: `build` treats a failure to arm
+    /// the live watcher as a successful build, so nothing is guaranteed to
+    /// refold the file when the edit goes away.
+    #[tokio::test]
+    async fn reverting_the_edits_a_graph_was_built_from_makes_it_stale() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_repo(repo.path());
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir");
+        let file = repo.path().join("src/lib.rs");
+        std::fs::write(&file, "pub fn committed() {}\n").expect("write");
+        for args in [vec!["add", "."], vec!["commit", "-qm", "seed"]] {
+            assert!(Command::new("git")
+                .current_dir(repo.path())
+                .args(&args)
+                .status()
+                .expect("run git")
+                .success());
+        }
+        std::fs::write(&file, "pub fn committed() {}\npub fn scratch_symbol() {}\n")
+            .expect("write");
+
+        let data = tempfile::tempdir().expect("tempdir");
+        let ops = ops(pool(&data).await);
+        let report = ops
+            .build(BuildCodeGraphRequest {
+                repository: repo.path().display().to_string(),
+            })
+            .await
+            .expect("build");
+        assert!(report.revision.ends_with("+workdir"), "{}", report.revision);
+
+        // The user throws the experiment away. Same commit, clean tree — and a
+        // graph still describing `scratch_symbol`, which no file now defines.
+        std::fs::write(&file, "pub fn committed() {}\n").expect("revert");
+
+        let status = ops
+            .status(CodeGraphStatusRequest {
+                repository: repo.path().display().to_string(),
+            })
+            .await
+            .expect("status");
+        assert!(!status.working_tree_dirty, "{status:?}");
+        assert!(
+            status.stale,
+            "a graph folded from reverted bytes is not current: {status:?}"
+        );
+        let reason = status.stale_reason.clone().expect("a reason");
+        assert!(reason.contains("uncommitted"), "{reason}");
+        assert!(reason.contains("graph build"), "{reason}");
     }
 
     /// The other half: a CLEAN tree is stamped with the bare commit, so the

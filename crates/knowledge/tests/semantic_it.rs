@@ -960,3 +960,129 @@ async fn retiring_a_symbol_with_an_asserted_out_edge_succeeds() {
         .await
         .expect("the rebuild must not fail either");
 }
+
+// --------------------------------------------------------------------------
+// A reparse folds through the SAME confidence rule as everything else
+// --------------------------------------------------------------------------
+
+/// `tick` before and after it starts calling `compute`. The signature is byte
+/// identical across the pair, so `tick` keeps its `symbol_key` and its node id
+/// across the reparse — the case a real edit-then-save hits, and the only one in
+/// which an edge asserted against the old node is still there to be duplicated.
+const NO_CALL: &str = r#"
+pub fn compute(x: u32) -> u32 { x + 1 }
+pub fn tick() -> u32 { 0 }
+"#;
+const WITH_CALL: &str = r#"
+pub fn compute(x: u32) -> u32 { x + 1 }
+pub fn tick() -> u32 { compute(1) }
+"#;
+
+/// **A reparse must supersede a weaker incumbent, not insert beside it.**
+///
+/// The reparse delete is scoped to `evidence_kind = 'syntax_inferred'` — a save
+/// must not erase what an agent or an LSP asserted — so an incumbent from any
+/// other layer survives it. The matching insert was unconditional, so the moment
+/// an edit made the parser emit a triple an agent had already asserted, the
+/// graph held TWO rows for it: `graph show --edges` listed the edge twice and
+/// `graph.callers_of` returned the same caller twice.
+#[tokio::test]
+async fn a_reparse_supersedes_an_agent_edge_instead_of_duplicating_it() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let rev = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev, "src/lib.rs", NO_CALL)
+        .await
+        .unwrap();
+    let nodes = codegraph::nodes(&pool, repo).await.unwrap();
+    let tick = key_of(&nodes, "tick").clone();
+    let compute = key_of(&nodes, "compute").clone();
+
+    // The agent asserts the call the parser cannot yet see: one 0.40 edge.
+    let asserted = codegraph::assert_agent_edges(
+        &pool,
+        repo,
+        &rev,
+        &[codegraph::AgentEdgeAssertion {
+            from_symbol: "tick".to_owned(),
+            to_symbol: "compute".to_owned(),
+            relation: CodeRelation::Calls,
+            evidence: None,
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(asserted, vec![codegraph::AssertionResult::Applied]);
+    assert_eq!(edges_between(&pool, repo, &tick, &compute).await.len(), 1);
+
+    // The user writes the call and saves. The parser now emits the same triple
+    // at 0.45, which is STRICTLY more confident than the 0.40 incumbent.
+    codegraph::upsert_file_graph(&pool, repo, &rev, "src/lib.rs", WITH_CALL)
+        .await
+        .unwrap();
+
+    let after = edges_between(&pool, repo, &tick, &compute).await;
+    assert_eq!(after.len(), 1, "one triple, one edge: {after:?}");
+    assert_eq!(after[0].evidence_kind, EvidenceKind::SyntaxInferred);
+
+    // And the query surface the duplicate was visible through.
+    let callers = callers_of(&pool, repo, &compute.key.stable_key())
+        .await
+        .unwrap();
+    assert_eq!(callers.len(), 1, "{callers:?}");
+    assert_eq!(callers[0].key.qualified_name, "tick");
+}
+
+/// The other direction, from the same rule: a reparse must not shadow a
+/// STRONGER incumbent either. An LSP-resolved edge at 0.90 outranks the 0.45
+/// the parser re-emits on every save, so the row stays LSP-resolved and stays
+/// alone — the ordering does not depend on who wrote last.
+#[tokio::test]
+async fn a_reparse_yields_to_an_lsp_edge_instead_of_duplicating_it() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let rev = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev, "src/lib.rs", WITH_CALL)
+        .await
+        .unwrap();
+    let nodes = codegraph::nodes(&pool, repo).await.unwrap();
+    let tick = key_of(&nodes, "tick").clone();
+    let compute = key_of(&nodes, "compute").clone();
+
+    codegraph::upsert_semantic_edges(
+        &pool,
+        repo,
+        &rev,
+        &[SemanticEdge {
+            from_symbol_key: tick.key.stable_key(),
+            to_symbol_key: compute.key.stable_key(),
+            relation: CodeRelation::Calls,
+            evidence_kind: EvidenceKind::LspResolved,
+            confidence: LSP_RESOLVED_CONFIDENCE,
+            evidence: None,
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(edges_between(&pool, repo, &tick, &compute).await.len(), 1);
+
+    // A save that changes nothing about the call still reparses the file.
+    codegraph::upsert_file_graph(&pool, repo, &rev, "src/lib.rs", WITH_CALL)
+        .await
+        .unwrap();
+
+    let after = edges_between(&pool, repo, &tick, &compute).await;
+    assert_eq!(after.len(), 1, "one triple, one edge: {after:?}");
+    assert_eq!(
+        after[0].evidence_kind,
+        EvidenceKind::LspResolved,
+        "a 0.45 reparse must not displace a 0.90 resolution: {after:?}"
+    );
+    assert_eq!(
+        callers_of(&pool, repo, &compute.key.stable_key())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}

@@ -58,6 +58,23 @@ pub fn anchor_repository_id(dir: &Path) -> RepositoryId {
     codypendent_knowledge::anchor_repository_id(dir)
 }
 
+/// The checkout `dir` belongs to, or `None` when `dir` is not inside one.
+///
+/// The two accessors above deliberately fall back to `dir` itself, which is
+/// right for *scoping* a resource: a note taken outside a checkout still needs
+/// somewhere to live. It is wrong for *diagnosing* one. A caller that must tell
+/// "this directory is a checkout" from "there is no repository here" — because
+/// the remedy it would otherwise print (`codypendent graph build`) refuses a
+/// non-checkout with `graph.not-a-repository` — asks here and gets the
+/// un-fallen-back answer instead of the hash of an arbitrary directory.
+///
+/// Same resolver as the rest of this module, so client and server cannot
+/// disagree about where a checkout starts.
+#[must_use]
+pub fn checkout_root(dir: &Path) -> Option<PathBuf> {
+    codypendent_codypendentd::scan::discover_repository_root(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

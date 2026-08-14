@@ -751,42 +751,33 @@ pub async fn upsert_file_graph(
         query.execute(&mut *tx).await?;
     }
 
-    // 3. Insert the fresh edges, each carrying its descriptive evidence ref.
+    // 3. Fold the fresh edges in, each carrying its descriptive evidence ref.
+    //
+    //    Through [`fold_edge`], the SAME confidence rule the semantic path uses
+    //    — not a bare INSERT. Step 2 above deletes only the `syntax_inferred`
+    //    layer, so an agent-asserted (0.40) or LSP (0.90) edge for a triple this
+    //    reparse also emits survives that delete; inserting beside it produced a
+    //    literal duplicate row, which `graph show` listed twice and
+    //    `graph.callers_of` returned twice. A reparsed syntax edge supersedes a
+    //    strictly weaker incumbent and yields to a stronger one, exactly as an
+    //    asserted or LSP edge does.
     let mut edge_records = Vec::with_capacity(built.edges.len());
     for edge in &built.edges {
-        let from = ids[edge.from];
-        let to = ids[edge.to];
-        let evidence = EvidenceRef::Artifact {
-            artifact: built.file_artifact.clone(),
-            source_path: Some(format!("{path}#{}-{}", edge.site_start, edge.site_end)),
-        };
-        let evidence_json = serde_json::to_string(&evidence)?;
-        sqlx::query(
-            "INSERT INTO code_edges \
-             (id, from_node, to_node, relation, confidence, evidence_kind, evidence_artifact, \
-              revision, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(Uuid::now_v7().to_string())
-        .bind(from.to_string())
-        .bind(to.to_string())
-        .bind(scalar(&edge.relation))
-        .bind(f64::from(edge.confidence))
-        .bind(scalar(&edge.evidence_kind))
-        .bind(&evidence_json)
-        .bind(&revision.0)
-        .bind(&created_at)
-        .execute(&mut *tx)
-        .await?;
-        edge_records.push(CodeEdge {
-            from,
-            to,
+        let record = CodeEdge {
+            from: ids[edge.from],
+            to: ids[edge.to],
             relation: edge.relation,
             confidence: edge.confidence,
             evidence_kind: edge.evidence_kind,
-            evidence: Some(evidence),
+            evidence: Some(EvidenceRef::Artifact {
+                artifact: built.file_artifact.clone(),
+                source_path: Some(format!("{path}#{}-{}", edge.site_start, edge.site_end)),
+            }),
             revision: revision.clone(),
-        });
+        };
+        if let EdgeFold::Written { .. } = fold_edge(&mut tx, &record, &created_at).await? {
+            edge_records.push(record);
+        }
     }
 
     // 4. One SymbolChanged event per durable node, in the SAME transaction.
@@ -1153,82 +1144,147 @@ async fn apply_semantic_edges(
             continue;
         };
 
-        // Read the incumbent before touching it: its kind and confidence are what
-        // a caller needs to explain either outcome.
-        let incumbent: Option<(String, f64)> = sqlx::query_as(
-            "SELECT evidence_kind, confidence FROM code_edges \
-             WHERE from_node = ? AND to_node = ? AND relation = ? \
-             ORDER BY confidence DESC LIMIT 1",
-        )
-        .bind(from.to_string())
-        .bind(to.to_string())
-        .bind(scalar(&edge.relation))
-        .fetch_optional(&mut *tx)
-        .await?;
-        let incumbent = incumbent
-            .map(|(kind, confidence)| {
-                from_scalar::<EvidenceKind>(&kind).map(|kind| (kind, confidence as f32))
-            })
-            .transpose()?;
-
-        // An incumbent at least as confident keeps the triple. Inserting beside
-        // it would shadow a stronger fact with a weaker duplicate; deleting it —
-        // which this did unconditionally — would let a 0.40 agent guess erase a
-        // 0.98 compiler-resolved fact.
-        if let Some((existing, existing_confidence)) = incumbent {
-            if existing_confidence >= edge.confidence {
-                results.push(AssertionResult::Outranked {
-                    existing,
-                    existing_confidence,
-                });
-                continue;
-            }
-        }
-
-        let removed = sqlx::query(
-            "DELETE FROM code_edges \
-             WHERE from_node = ? AND to_node = ? AND relation = ? AND confidence < ?",
-        )
-        .bind(from.to_string())
-        .bind(to.to_string())
-        .bind(scalar(&edge.relation))
-        .bind(f64::from(edge.confidence))
-        .execute(&mut *tx)
-        .await?;
-
-        let evidence_json = match &edge.evidence {
-            Some(e) => Some(serde_json::to_string(e)?),
-            None => None,
+        let record = CodeEdge {
+            from,
+            to,
+            relation: edge.relation,
+            confidence: edge.confidence,
+            evidence_kind: edge.evidence_kind,
+            evidence: edge.evidence.clone(),
+            revision: revision.clone(),
         };
-        sqlx::query(
-            "INSERT INTO code_edges \
-             (id, from_node, to_node, relation, confidence, evidence_kind, evidence_artifact, \
-              revision, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(Uuid::now_v7().to_string())
-        .bind(from.to_string())
-        .bind(to.to_string())
-        .bind(scalar(&edge.relation))
-        .bind(f64::from(edge.confidence))
-        .bind(scalar(&edge.evidence_kind))
-        .bind(evidence_json)
-        .bind(&revision.0)
-        .bind(&created_at)
-        .execute(&mut *tx)
-        .await?;
-
-        outbox::enqueue(&mut *tx, &KnowledgeIndexEvent::SymbolChanged(from), now).await?;
-        results.push(match incumbent.filter(|_| removed.rows_affected() > 0) {
-            Some((previous, previous_confidence)) => AssertionResult::Superseded {
-                previous,
-                previous_confidence,
+        results.push(match fold_edge(&mut tx, &record, &created_at).await? {
+            EdgeFold::Written { superseded } => {
+                outbox::enqueue(&mut *tx, &KnowledgeIndexEvent::SymbolChanged(from), now).await?;
+                match superseded {
+                    Some((previous, previous_confidence)) => AssertionResult::Superseded {
+                        previous,
+                        previous_confidence,
+                    },
+                    None => AssertionResult::Applied,
+                }
+            }
+            EdgeFold::Outranked {
+                existing,
+                existing_confidence,
+            } => AssertionResult::Outranked {
+                existing,
+                existing_confidence,
             },
-            None => AssertionResult::Applied,
         });
     }
     tx.commit().await?;
     Ok(results)
+}
+
+/// What folding one edge did to the incumbent holding its `(from, to, relation)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EdgeFold {
+    /// The edge was written. `superseded` names the strictly less-confident
+    /// incumbent it replaced, when there was one.
+    Written {
+        superseded: Option<(EvidenceKind, f32)>,
+    },
+    /// The edge was **not** written: an incumbent of equal or greater confidence
+    /// already holds the triple.
+    Outranked {
+        existing: EvidenceKind,
+        existing_confidence: f32,
+    },
+}
+
+/// Fold ONE edge into `code_edges` under the confidence rule, inside `tx`.
+///
+/// **The single spelling of the ordering.** Every writer goes through here — the
+/// agent-assertion path, the LSP/compiler path, and the tree-sitter reparse in
+/// [`upsert_file_graph`] — because a `(from, to, relation)` triple holds at most
+/// one edge and which one it holds must not depend on who wrote last:
+///
+/// * incumbent strictly less confident → deleted, this edge written
+///   ([`EdgeFold::Written`] naming it);
+/// * incumbent equal or more confident → kept, this edge **not** written, so
+///   re-asserting and re-parsing are both idempotent rather than duplicating.
+///
+/// The reparse path used to bare-`INSERT` here instead. Its own delete is scoped
+/// to `syntax_inferred` (a save must not erase an agent's or an LSP's work), so
+/// an incumbent from any other layer survived it and the insert landed *beside*
+/// it: two rows for one triple, listed twice by `graph show` and returned twice
+/// by `graph.callers_of`.
+///
+/// The caller owns the transaction and any outbox event, because the two paths
+/// enqueue differently (per applied edge vs. per durable node).
+async fn fold_edge(
+    tx: &mut sqlx::SqliteConnection,
+    edge: &CodeEdge,
+    created_at: &str,
+) -> Result<EdgeFold, CodeGraphError> {
+    // Read the incumbent before touching it: its kind and confidence are what
+    // a caller needs to explain either outcome.
+    let incumbent: Option<(String, f64)> = sqlx::query_as(
+        "SELECT evidence_kind, confidence FROM code_edges \
+         WHERE from_node = ? AND to_node = ? AND relation = ? \
+         ORDER BY confidence DESC LIMIT 1",
+    )
+    .bind(edge.from.to_string())
+    .bind(edge.to.to_string())
+    .bind(scalar(&edge.relation))
+    .fetch_optional(&mut *tx)
+    .await?;
+    let incumbent = incumbent
+        .map(|(kind, confidence)| {
+            from_scalar::<EvidenceKind>(&kind).map(|kind| (kind, confidence as f32))
+        })
+        .transpose()?;
+
+    // An incumbent at least as confident keeps the triple. Inserting beside
+    // it would shadow a stronger fact with a weaker duplicate; deleting it —
+    // which the semantic path did unconditionally — would let a 0.40 agent
+    // guess erase a 0.98 compiler-resolved fact.
+    if let Some((existing, existing_confidence)) = incumbent {
+        if existing_confidence >= edge.confidence {
+            return Ok(EdgeFold::Outranked {
+                existing,
+                existing_confidence,
+            });
+        }
+    }
+
+    let removed = sqlx::query(
+        "DELETE FROM code_edges \
+         WHERE from_node = ? AND to_node = ? AND relation = ? AND confidence < ?",
+    )
+    .bind(edge.from.to_string())
+    .bind(edge.to.to_string())
+    .bind(scalar(&edge.relation))
+    .bind(f64::from(edge.confidence))
+    .execute(&mut *tx)
+    .await?;
+
+    let evidence_json = match &edge.evidence {
+        Some(evidence) => Some(serde_json::to_string(evidence)?),
+        None => None,
+    };
+    sqlx::query(
+        "INSERT INTO code_edges \
+         (id, from_node, to_node, relation, confidence, evidence_kind, evidence_artifact, \
+          revision, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(edge.from.to_string())
+    .bind(edge.to.to_string())
+    .bind(scalar(&edge.relation))
+    .bind(f64::from(edge.confidence))
+    .bind(scalar(&edge.evidence_kind))
+    .bind(evidence_json)
+    .bind(&edge.revision.0)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await?;
+
+    Ok(EdgeFold::Written {
+        superseded: incumbent.filter(|_| removed.rows_affected() > 0),
+    })
 }
 
 // --------------------------------------------------------------------------

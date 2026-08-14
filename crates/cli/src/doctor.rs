@@ -368,13 +368,6 @@ async fn check_models_and_providers(report: &mut Report, paths: &RuntimePaths, d
     }
 }
 
-/// Voice readiness (outcome 8 / voice v1 rubric 8, 2026-08-13 review F6):
-/// whether push-to-talk input and spoken replies are configured and
-/// reachable. Before this, `doctor` had ZERO voice checks despite three of
-/// this feature's own failure modes — a destroyed `[transcription]`/`[speech]`
-/// table, a key that resolves nowhere, a missing recorder/player — having no
-/// other diagnostic anywhere in the product; a user whose voice stopped
-/// working had no supported way to find out why short of reading
 /// Whether this checkout has a code graph at all, and how big it is.
 ///
 /// `doctor` is the command a user reaches for when something the agent depends
@@ -386,16 +379,10 @@ async fn check_models_and_providers(report: &mut Report, paths: &RuntimePaths, d
 /// the command that builds it, which is the step that was missing.
 ///
 /// Read-only and daemon-free, like the rest of `doctor`: it opens the daemon's
-/// database only if the file already exists, and never creates one.
+/// database only if the file already exists, opens it through
+/// [`db::open_read_only`](codypendent_knowledge::db::open_read_only), and never
+/// creates, migrates or otherwise writes one.
 async fn check_code_graph(report: &mut Report, paths: &RuntimePaths) {
-    let database_path = paths.data_dir.join("codypendent.db");
-    if !database_path.exists() {
-        report.ok(
-            "code graph",
-            "no database yet — the graph is built on first use, or on `codypendent graph build`",
-        );
-        return;
-    }
     let Ok(dir) = std::env::current_dir() else {
         report.warn(
             "code graph",
@@ -404,13 +391,55 @@ async fn check_code_graph(report: &mut Report, paths: &RuntimePaths) {
         );
         return;
     };
+    check_code_graph_in(report, paths, &dir).await;
+}
+
+/// [`check_code_graph`] against an explicit directory. Split out so the two
+/// cases that used to be wrong — a directory outside any checkout, and a
+/// database this must not touch — are testable without a test setting the
+/// process-wide working directory out from under its siblings.
+async fn check_code_graph_in(report: &mut Report, paths: &RuntimePaths, dir: &std::path::Path) {
+    // Whether there is a repository at all is asked FIRST, because every answer
+    // below is about one. `anchor_repository_id` falls back to hashing whatever
+    // directory it is given, so outside a checkout it produced the id of an
+    // arbitrary directory: the count came back zero and this check warned "the
+    // graph is empty — run `codypendent graph build`", a command that refuses
+    // that very directory with `graph.not-a-repository`. A remedy the product
+    // will not accept is worse than no remedy.
+    let Some(root) = crate::repo_anchor::checkout_root(dir) else {
+        report.push(
+            "code graph",
+            Status::Ok,
+            format!(
+                "not applicable — {} is not inside a Git checkout",
+                dir.display()
+            ),
+            Some(
+                "the code graph is folded per repository; run `codypendent doctor` from inside a \
+                 checkout to check that repository's graph",
+            ),
+        );
+        return;
+    };
+    let database_path = paths.data_dir.join("codypendent.db");
+    if !database_path.exists() {
+        report.ok(
+            "code graph",
+            "no database yet — the graph is built on first use, or on `codypendent graph build`",
+        );
+        return;
+    }
     // The checkout, never the directory as-opened — the daemon stores nodes
     // under the Git toplevel, so hashing a subdirectory would report "empty"
     // for a graph that is in fact populated. `crate::repo_anchor` is the one
     // accessor for that resolution (the same trap that emptied the document
     // list in the 2026-08-13 review).
-    let repository = crate::repo_anchor::anchor_repository_id(&dir);
-    let pool = match codypendent_knowledge::db::open(&database_path).await {
+    let repository = crate::repo_anchor::anchor_repository_id(&root);
+    // READ-ONLY. `db::open` creates the file, switches it to WAL and runs every
+    // migration; a command documented as read-only must not migrate a user's
+    // daemon database to run a `COUNT`, nor call a database it merely lacks
+    // write permission on unreadable.
+    let pool = match codypendent_knowledge::db::open_read_only(&database_path).await {
         Ok(pool) => pool,
         Err(error) => {
             report.warn(
@@ -432,7 +461,7 @@ async fn check_code_graph(report: &mut Report, paths: &RuntimePaths) {
             "code graph",
             format!(
                 "empty for {} — the agent has no symbol map for it",
-                dir.display()
+                root.display()
             ),
             "run `codypendent graph build`: it folds the graph and reports which files were \
              walked and which extensions produced nothing. (`codypendent index rebuild` \
@@ -452,6 +481,13 @@ async fn check_code_graph(report: &mut Report, paths: &RuntimePaths) {
     }
 }
 
+/// Voice readiness (outcome 8 / voice v1 rubric 8, 2026-08-13 review F6):
+/// whether push-to-talk input and spoken replies are configured and
+/// reachable. Before this, `doctor` had ZERO voice checks despite three of
+/// this feature's own failure modes — a destroyed `[transcription]`/`[speech]`
+/// table, a key that resolves nowhere, a missing recorder/player — having no
+/// other diagnostic anywhere in the product; a user whose voice stopped
+/// working had no supported way to find out why short of reading
 /// `models.toml` by hand.
 fn check_voice(report: &mut Report, paths: &RuntimePaths) {
     let models_path = paths.data_dir.join("models.toml");
@@ -834,5 +870,94 @@ mod tests {
             .expect("a playback row");
         assert_eq!(row.status, Status::Warn, "{row:?}");
         assert!(row.message.contains("play_command"));
+    }
+
+    // -----------------------------------------------------------------
+    // The code-graph check is a DIAGNOSTIC: it neither writes the database
+    // it inspects nor prescribes a command the product would refuse.
+    // -----------------------------------------------------------------
+
+    fn init_repo(path: &std::path::Path) {
+        let status = std::process::Command::new("git")
+            .current_dir(path)
+            .args(["init", "--quiet"])
+            .status()
+            .expect("git init");
+        assert!(status.success(), "git init failed in {}", path.display());
+    }
+
+    fn graph_row(report: &Report) -> &Check {
+        report
+            .items
+            .iter()
+            .find(|c| c.name == "code graph")
+            .expect("a code graph row")
+    }
+
+    /// Outside a checkout there is no repository to have a graph, and saying
+    /// "empty — run `codypendent graph build`" is a lie twice over: the count
+    /// was taken against the hash of an arbitrary directory, and `graph build`
+    /// refuses that same directory with `graph.not-a-repository`.
+    #[tokio::test]
+    async fn a_directory_outside_a_checkout_is_not_applicable_not_an_empty_graph() {
+        let outside = tempfile::tempdir().expect("tempdir");
+        let data = tempfile::tempdir().expect("tempdir");
+        let paths = paths_for(data.path());
+        std::fs::write(paths.data_dir.join("codypendent.db"), []).expect("db file");
+
+        let mut report = Report::default();
+        check_code_graph_in(&mut report, &paths, outside.path()).await;
+
+        let row = graph_row(&report);
+        assert_eq!(row.status, Status::Ok, "{row:?}");
+        assert!(row.message.contains("not applicable"), "{row:?}");
+        assert!(
+            !row.message.contains("empty"),
+            "a non-checkout has no graph to be empty: {row:?}"
+        );
+        let hint = row.hint.clone().unwrap_or_default();
+        assert!(
+            !row.message.contains("graph build") && !hint.contains("graph build"),
+            "never recommend a command that refuses this directory: {row:?}"
+        );
+    }
+
+    /// **`doctor` must not write the database it is diagnosing.** It called
+    /// `db::open`, which creates the file, switches it to WAL and runs every
+    /// migration — so diagnosing a daemon migrated its live database, and
+    /// diagnosing a missing one created it. A zero-byte file is a valid empty
+    /// SQLite database: after the check it must still be zero bytes, with no
+    /// `-wal`/`-shm` beside it and no schema inside.
+    #[tokio::test]
+    async fn diagnosing_a_database_neither_creates_nor_migrates_it() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_repo(repo.path());
+        let data = tempfile::tempdir().expect("tempdir");
+        let paths = paths_for(data.path());
+        let database = paths.data_dir.join("codypendent.db");
+        std::fs::File::create(&database).expect("empty database file");
+
+        let mut report = Report::default();
+        check_code_graph_in(&mut report, &paths, repo.path()).await;
+
+        // An unmigrated database has no `code_nodes`, which is a WARN with the
+        // error — never a silent migration to make the query work.
+        let row = graph_row(&report);
+        assert_eq!(row.status, Status::Warn, "{row:?}");
+        assert!(row.message.contains("code_nodes"), "{row:?}");
+
+        assert_eq!(
+            std::fs::metadata(&database).expect("still there").len(),
+            0,
+            "the diagnostic wrote to the database it was asked to inspect"
+        );
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = paths.data_dir.join(format!("codypendent.db{suffix}"));
+            assert!(
+                !sidecar.exists(),
+                "a read-only check left {} behind",
+                sidecar.display()
+            );
+        }
     }
 }
