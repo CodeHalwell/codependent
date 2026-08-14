@@ -795,9 +795,15 @@ async fn a_full_rebuild_keeps_every_agent_assertion() {
     );
 
     // The full rebuild — exactly what `codypendent graph build` runs.
-    let rebuild = codegraph::rebuild_repository(&pool, repo, &rev, [("src/api.rs", DISPATCH)])
-        .await
-        .unwrap();
+    let rebuild = codegraph::rebuild_repository(
+        &pool,
+        repo,
+        &rev,
+        [("src/api.rs", DISPATCH)],
+        codegraph::ScanCoverage::Complete,
+    )
+    .await
+    .unwrap();
     assert_eq!(rebuild.retired, codegraph::RetiredFiles::default());
     assert_eq!(rebuild.edges.before, 1);
     assert_eq!(rebuild.edges.after, 1, "the rebuild dropped the assertion");
@@ -854,9 +860,15 @@ async fn a_rebuild_retires_only_the_paths_it_no_longer_sees() {
 
     // `src/chain.rs` was deleted from the working tree, so the walk no longer
     // offers it.
-    let rebuild = codegraph::rebuild_repository(&pool, repo, &rev, [("src/api.rs", DISPATCH)])
-        .await
-        .unwrap();
+    let rebuild = codegraph::rebuild_repository(
+        &pool,
+        repo,
+        &rev,
+        [("src/api.rs", DISPATCH)],
+        codegraph::ScanCoverage::Complete,
+    )
+    .await
+    .unwrap();
     assert_eq!(rebuild.retired.files, 1, "{:?}", rebuild.retired);
     assert!(rebuild.retired.nodes > 0, "{:?}", rebuild.retired);
     assert_eq!(rebuild.edges.before, 1);
@@ -907,6 +919,7 @@ async fn a_rebuild_preserves_node_identity() {
         repo,
         &GitRevision("rev2".into()),
         [("src/lib.rs", CHAIN)],
+        codegraph::ScanCoverage::Complete,
     )
     .await
     .unwrap();
@@ -956,9 +969,15 @@ async fn retiring_a_symbol_with_an_asserted_out_edge_succeeds() {
         .expect("retiring a symbol with an asserted out-edge must not fail");
 
     // A full rebuild over the edited file is the same question one level up.
-    codegraph::rebuild_repository(&pool, repo, &rev, [("src/api.rs", edited.as_str())])
-        .await
-        .expect("the rebuild must not fail either");
+    codegraph::rebuild_repository(
+        &pool,
+        repo,
+        &rev,
+        [("src/api.rs", edited.as_str())],
+        codegraph::ScanCoverage::Complete,
+    )
+    .await
+    .expect("the rebuild must not fail either");
 }
 
 // --------------------------------------------------------------------------

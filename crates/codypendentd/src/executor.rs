@@ -3311,6 +3311,9 @@ mod tests {
             repository,
             &first_revision,
             std::iter::empty::<(&str, &str)>(),
+            // A COMPLETE scan that saw no files: the retire pass is what empties
+            // the graph here. Truncated coverage would keep every row instead.
+            codypendent_knowledge::codegraph::ScanCoverage::Complete,
         )
         .await
         .expect("clear graph");

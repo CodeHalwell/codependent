@@ -23,10 +23,15 @@ use tracing::{debug, info, warn};
 /// The upper bound on files folded into the code graph in one scan. The scan is
 /// capped so a very large tree never delays the socket opening (startup) or a
 /// run's first note — but the cap must comfortably cover a real workspace: the
-/// `code_nodes` table is rebuilt from this scan on every boot — and every path
-/// the walk does NOT reach is retired — so a cap smaller than the repository
-/// silently truncates the *authoritative* graph (and, with an unsorted walk,
-/// truncates it differently on every boot).
+/// `code_nodes` table is rebuilt from this scan on every boot, so a cap smaller
+/// than the repository truncates the *authoritative* graph (and, with an unsorted
+/// walk, truncates it differently on every boot).
+///
+/// Only files the ignore rules ACCEPT are counted against it — see
+/// [`collect_source_paths`], where an excluded tree is pruned before anything it
+/// holds can spend the budget. And hitting it now suppresses the retire pass
+/// ([`codegraph::ScanCoverage`]) rather than deleting everything the walk did not
+/// get to.
 pub const SCAN_FILE_CAP: usize = 2000;
 
 /// Serialize every mutation of one repository's code graph.
@@ -72,6 +77,11 @@ pub async fn lock_repository(repository: RepositoryId) -> OwnedMutexGuard<()> {
 /// It deliberately does **not** wipe the repository first: that discarded every
 /// agent-asserted edge on every build and left the graph empty for the length of
 /// the scan, in full view of readers that take no lock.
+///
+/// A walk stopped by [`SCAN_FILE_CAP`] hands the fold
+/// [`codegraph::ScanCoverage::Truncated`], which suppresses that retire pass
+/// entirely: an unfinished walk has not looked at the paths it did not reach, so
+/// it cannot testify that they are gone.
 ///
 /// Returns a [`ScanSummary`] — files seen, folded per language, skipped as
 /// unsupported, and whether the cap truncated the walk. It used to return `()`,
@@ -120,6 +130,11 @@ pub async fn scan_repository(
         files
             .iter()
             .map(|(relative, source, _)| (relative.as_str(), source.as_str())),
+        if summary.truncated_by_cap {
+            codegraph::ScanCoverage::Truncated
+        } else {
+            codegraph::ScanCoverage::Complete
+        },
     )
     .await?;
     summary.revision = revision.0.clone();
@@ -200,35 +215,19 @@ pub fn head_revision(root: &Path) -> GitRevision {
 }
 
 /// Collect up to `cap` `(repo-relative-path, source, language)` triples for the
-/// source files under `root`, skipping `target/`, hidden (dot-prefixed)
-/// directories, and anything the checkout's `.gitignore` rules exclude. A plain
-/// iterative walk (no `walkdir` dependency); unreadable entries are skipped. The
-/// traversal is **sorted** (per-directory, names ascending) so the cap — if it
-/// ever bites — truncates the same files on every boot instead of rebuilding a
-/// different graph per `read_dir` ordering.
-///
-/// Paths are collected first and read only after the ignore filter, so a tree
-/// full of generated output is not read into memory just to be discarded.
-/// The cap is applied to *candidates*, before the filter: a repository whose
-/// first `SCAN_FILE_CAP` sorted paths are all ignored yields fewer files than
-/// the cap, which is the conservative direction (never more work than the cap).
+/// source files under `root`. Which files those are is decided **once**, by
+/// [`collect_source_paths`]; this only reads them.
 ///
 /// Returns the [`ScanSummary`] fields the walk itself knows (seen, supported,
-/// unsupported, ignored, cap); the caller fills in what the fold produced.
+/// unsupported, ignored, pruned, cap); the caller fills in what the fold produced.
 #[allow(clippy::type_complexity)]
 fn collect_sources(
     root: &Path,
     cap: usize,
 ) -> std::io::Result<(Vec<(String, String, Language)>, ScanSummary)> {
     let (candidates, mut summary) = collect_source_paths(root, cap)?;
-    let paths: Vec<String> = candidates.iter().map(|(path, _)| path.clone()).collect();
-    let ignored = ignored_paths(root, &paths);
     let mut out = Vec::with_capacity(candidates.len());
     for (relative, language) in candidates {
-        if ignored.contains(&relative) {
-            summary.files_skipped_ignored += 1;
-            continue;
-        }
         // A file that vanished between the walk and the read is not an error —
         // the tree is live. Only a genuine read failure of a present file is.
         match std::fs::read_to_string(root.join(&relative)) {
@@ -243,73 +242,206 @@ fn collect_sources(
     Ok((out, summary))
 }
 
+/// How many paths one `git check-ignore` probe carries. The walk asks in chunks
+/// so a single enormous directory cannot build an unbounded argument payload,
+/// and so a level wider than this still costs a bounded amount of memory.
+const IGNORE_PROBE_CHUNK: usize = 4096;
+
 /// The repo-relative source paths under `root`, sorted and capped, each with the
-/// language [`codegraph::language_for`] selected for it. Split out of
-/// [`collect_sources`] so the ignore filter runs on paths alone.
+/// language [`codegraph::language_for`] selected for it.
 ///
 /// **The extension test is `codegraph::language_for` and nothing else.** It was
 /// `ext == "rs"` here and again in [`is_candidate_path`], two lists that agreed
 /// with the parser only by coincidence; when the parser grew Python and
 /// TypeScript they would have kept rejecting both.
+///
+/// # The ignore rules run DURING the walk, not after it
+///
+/// They used to run after: the walk filled `cap` candidates and the filter then
+/// removed the ignored ones. Adding the JavaScript and TypeScript grammars made
+/// that fatal. `node_modules/` sorts before `src/`, `web/` and `app/`, and holds
+/// far more than [`SCAN_FILE_CAP`] `.js` files, so a React checkout spent its
+/// entire budget on dependency code, reached none of the application, and
+/// [`codegraph::rebuild_repository`] then retired every real path as vanished —
+/// an explicit `graph build` replacing a good graph with an empty one.
+///
+/// So an excluded path is now rejected before anything counts toward the cap,
+/// and an excluded DIRECTORY is never descended into at all. The rules are the
+/// checkout's own, asked of Git ([`ignored_paths`]) — never a reimplementation
+/// of `.gitignore`, and never a second opinion about what is in scope.
+///
+/// # Why the walk is breadth-first
+///
+/// Asking Git once per directory would be a process spawn per directory: seconds
+/// of subprocess on a monorepo, in a warm-up whose whole point is to be quick.
+/// Level order lets one probe cover a whole level (in [`IGNORE_PROBE_CHUNK`]
+/// chunks), so the cost is a spawn per level of depth — a handful. The order is
+/// still fully deterministic (entries sorted per directory, directories walked in
+/// discovery order), which is what the cap needs: it must truncate the same files
+/// on every boot rather than rebuilding a different graph per `read_dir` order.
+/// Breadth-first also makes a truncated graph a better cross-section of the
+/// repository than one deep subtree.
 fn collect_source_paths(
     root: &Path,
     cap: usize,
 ) -> std::io::Result<(Vec<(String, Language)>, ScanSummary)> {
-    let mut out = Vec::new();
-    let mut summary = ScanSummary {
-        file_cap: cap,
-        ..ScanSummary::default()
-    };
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        if out.len() >= cap {
-            summary.truncated_by_cap = true;
+    let mut walk = Walk::new(root, cap);
+    let mut level = vec![root.to_path_buf()];
+    while !level.is_empty() {
+        if walk.files.len() >= cap {
+            // Directories still unwalked with the budget already spent: this
+            // graph is a truncation of the repository, and must say so.
+            walk.summary.truncated_by_cap = true;
             break;
         }
-        let entries = std::fs::read_dir(&dir)?;
-        let mut entries: Vec<_> = entries.collect::<Result<_, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        let mut subdirs = Vec::new();
-        for entry in entries {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            // Skip hidden dirs/files and the build output tree.
-            if name.starts_with('.') || name == "target" {
-                continue;
-            }
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                subdirs.push(path);
-                continue;
-            }
-            if !file_type.is_file() {
-                continue;
-            }
-            summary.files_seen += 1;
-            let Some(language) = codegraph::language_for(&path) else {
-                summary.record_unsupported(&path);
-                continue;
-            };
-            summary.files_supported += 1;
-            if out.len() >= cap {
-                summary.truncated_by_cap = true;
+        for dir in level {
+            if walk.summary.truncated_by_cap {
                 break;
             }
-            out.push((
-                path.strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .into_owned(),
-                language,
-            ));
+            let mut entries: Vec<_> = std::fs::read_dir(&dir)?.collect::<Result<_, _>>()?;
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    if is_excluded_name(&name) {
+                        walk.summary.dirs_pruned += 1;
+                        continue;
+                    }
+                    walk.queue_dir(path);
+                    continue;
+                }
+                if !file_type.is_file() || is_excluded_name(&name) {
+                    continue;
+                }
+                walk.queue_file(&path);
+            }
+            if walk.queued() >= IGNORE_PROBE_CHUNK {
+                walk.flush();
+            }
         }
-        // LIFO stack: push in reverse so subdirectories pop in ascending order.
-        for subdir in subdirs.into_iter().rev() {
-            stack.push(subdir);
+        walk.flush();
+        level = std::mem::take(&mut walk.next_level);
+    }
+    Ok((walk.files, walk.summary))
+}
+
+/// Directory (and dot-file) names the code graph never walks, watches or folds,
+/// whatever the ignore rules say.
+///
+/// The ignore rules are the authority on scope and this is not a second one: it
+/// is a floor under them. [`ignored_paths`] is best-effort by design — no Git, a
+/// broken index, any spawn failure and it excludes *nothing* — and in exactly
+/// that degraded state the defect this list guards against comes straight back.
+/// `node_modules` earns its place because it is the one directory name that is
+/// never hand-written source in any project, and because it is the tree that
+/// actually ate the cap. `target` and the dot-directories were already here.
+/// Nothing else is added: `dist`, `build` and `vendor` are all real source
+/// directories in some checkout, and a name list that guesses is how the walk
+/// and the parser came to disagree in the first place. (The workspace parse in
+/// `codypendent_knowledge::adapter` already excludes `node_modules` by name, so
+/// this is the codebase's existing opinion rather than a new one.)
+fn is_excluded_name(name: &str) -> bool {
+    name.starts_with('.') || name == "target" || name == "node_modules"
+}
+
+/// The walk's mutable state.
+///
+/// A struct rather than locals because the ignore probe is flushed from two
+/// places — a full chunk and the end of a level — and both must apply the same
+/// filter, count the same way, and spend the cap in the same place. That "same
+/// place" is [`Walk::flush`] and only there: a file counts toward the cap after
+/// the ignore rules have accepted it, never before.
+struct Walk {
+    root: PathBuf,
+    cap: usize,
+    /// Accepted source files, in walk order. Never longer than `cap`.
+    files: Vec<(String, Language)>,
+    /// Accepted directories, forming the next level.
+    next_level: Vec<PathBuf>,
+    /// Discovered but not yet asked about.
+    probe_dirs: Vec<(String, PathBuf)>,
+    probe_files: Vec<(String, Language)>,
+    summary: ScanSummary,
+}
+
+impl Walk {
+    fn new(root: &Path, cap: usize) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            cap,
+            files: Vec::new(),
+            next_level: Vec::new(),
+            probe_dirs: Vec::new(),
+            probe_files: Vec::new(),
+            summary: ScanSummary {
+                file_cap: cap,
+                ..ScanSummary::default()
+            },
         }
     }
-    Ok((out, summary))
+
+    fn relative(&self, path: &Path) -> String {
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn queue_dir(&mut self, path: PathBuf) {
+        let relative = self.relative(&path);
+        self.probe_dirs.push((relative, path));
+    }
+
+    fn queue_file(&mut self, path: &Path) {
+        self.summary.files_seen += 1;
+        let Some(language) = codegraph::language_for(path) else {
+            self.summary.record_unsupported(path);
+            return;
+        };
+        self.summary.files_supported += 1;
+        self.probe_files.push((self.relative(path), language));
+    }
+
+    fn queued(&self) -> usize {
+        self.probe_dirs.len() + self.probe_files.len()
+    }
+
+    /// Ask the checkout's ignore rules about everything queued, then accept what
+    /// survives — one `git check-ignore` for the whole chunk.
+    fn flush(&mut self) {
+        if self.queued() == 0 {
+            return;
+        }
+        let dirs = std::mem::take(&mut self.probe_dirs);
+        let files = std::mem::take(&mut self.probe_files);
+        let probe: Vec<String> = dirs
+            .iter()
+            .map(|(relative, _)| relative.clone())
+            .chain(files.iter().map(|(relative, _)| relative.clone()))
+            .collect();
+        let ignored = ignored_paths(&self.root, &probe);
+        for (relative, language) in files {
+            if ignored.contains(&relative) {
+                self.summary.files_skipped_ignored += 1;
+                continue;
+            }
+            if self.files.len() >= self.cap {
+                self.summary.truncated_by_cap = true;
+                break;
+            }
+            self.files.push((relative, language));
+        }
+        for (relative, path) in dirs {
+            if ignored.contains(&relative) {
+                self.summary.dirs_pruned += 1;
+                continue;
+            }
+            self.next_level.push(path);
+        }
+    }
 }
 
 /// Which of `relative` the checkout's ignore rules exclude, asked of Git itself.
@@ -425,9 +557,11 @@ impl Drop for RepositoryWatcher {
 ///   register thousands of kernel watches for build output;
 /// * of what is watched, only files [`codegraph::language_for`] recognises —
 ///   plus a newly created top-level DIRECTORY, which nothing else can report
-///   (see [`is_new_top_level_directory`]) — reach the channel, filtered in the
-///   notify callback, before the queue;
-/// * `.gitignore` is applied per batch, by asking Git (see [`ignored_paths`]);
+///   (see [`is_new_top_level_directory`]), plus `.gitignore` itself, whose edit
+///   re-scopes files that emit no event (see [`is_ignore_rules_file`]) — reach
+///   the channel, filtered in the notify callback, before the queue;
+/// * `.gitignore` is applied per batch, by asking Git (see [`ignored_paths`]),
+///   and a change to it schedules a full rescan;
 /// * events are debounced by [`WATCH_DEBOUNCE`] and capped at [`WATCH_MAX_WINDOW`];
 /// * a batch over [`WATCH_BATCH_CAP`] files (a branch switch), or one that armed
 ///   a new subtree, collapses to ONE full rescan, rate-limited by
@@ -455,15 +589,19 @@ pub fn arm_watcher(
     let dropped_by_notify = Arc::clone(&dropped);
     let mut watcher = codegraph::watcher(move |paths: Vec<PathBuf>| {
         for path in paths {
-            // Two things must reach the debouncer: a file the graph could hold,
-            // and a NEW top-level directory — which holds no extension, so the
+            // Three things must reach the debouncer: a file the graph could
+            // hold; a NEW top-level directory — which holds no extension, so the
             // language filter discards it, and the debounce loop is the only
-            // caller of `arm_source_subtrees` (2026-08-13 review, codegraph F8).
+            // caller of `arm_source_subtrees` (2026-08-13 review, codegraph F8);
+            // and a change to the ignore RULES, which changes the answer to
+            // "what belongs in the graph" for files that emit no event of their
+            // own (see [`is_ignore_rules_file`]).
             // Everything else is still rejected here, before the bounded queue,
             // because a full queue drops paths and escalates the batch to a full
             // rescan.
             if !is_candidate_path(&filter_root, &path)
                 && !is_new_top_level_directory(&filter_root, &path)
+                && !is_ignore_rules_file(&filter_root, &path)
             {
                 continue;
             }
@@ -504,11 +642,60 @@ fn is_candidate_path(root: &Path, path: &Path) -> bool {
     if codegraph::language_for(path).is_none() {
         return false;
     }
+    within_walked_tree(root, path)
+}
+
+/// True when every component of `path` below `root` is one the walk accepts —
+/// the same [`is_excluded_name`] test the full scan applies to each entry, so the
+/// watcher and the scan cannot disagree about which paths exist. They must not:
+/// a file only the watcher accepts is folded by a batch and retired by the very
+/// next full scan, forever.
+///
+/// Callers pass the file itself; [`is_ignore_rules_file`] passes the parent
+/// directory instead, because `.gitignore` is dot-prefixed and would fail its own
+/// name test.
+///
+/// Deliberately relative to `root`: the checkout's own ancestors are none of this
+/// filter's business. Testing the absolute path instead rejected every file in a
+/// repository whose path happened to contain a dot-directory —
+/// `/tmp/.tmpXk9/src/lib.rs`, or anything under `~/.local/share`, or a checkout
+/// inside a dot-prefixed workspace directory — and the watcher then silently
+/// folded nothing at all.
+fn within_walked_tree(root: &Path, path: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
     !relative.components().any(|component| {
         let name = component.as_os_str().to_string_lossy();
-        name == "target" || (name.starts_with('.') && name != "." && name != "..")
+        name != "." && name != ".." && is_excluded_name(&name)
     })
+}
+
+/// The file whose CONTENT is the checkout's ignore rules.
+///
+/// Its own event must reach the debouncer, because a `.gitignore` edit changes
+/// which files belong in the graph without touching one of them: a file that has
+/// just become ignored emits no event of its own, ever. Without this the graph
+/// kept serving excluded code indefinitely — a later source event could not
+/// repair it either, since [`apply_batch`] *skips* an ignored path rather than
+/// retiring what it already stored for it. Only a full rescan can, and the
+/// debounce loop schedules one when this predicate matches.
+///
+/// Exactly one file name, not a pattern: this is the one gap in the notify
+/// filter, and everything else — including any other dot-file — is still
+/// rejected before the bounded queue. `.git/info/exclude` and
+/// `core.excludesFile` change the same rules but live outside every watch, so no
+/// event for them exists to admit.
+fn is_ignore_rules_file(root: &Path, path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some(".gitignore") {
+        return false;
+    }
+    // The DIRECTORY is what gets scope-tested: `.gitignore` is itself dot-
+    // prefixed, so testing the file's own name against the exclusion rule would
+    // reject every one of them. A `.gitignore` inside `target/` or under a
+    // dot-directory is still not this repository's ignore rules.
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    within_walked_tree(root, parent)
 }
 
 /// True for a directory that is an **immediate child of the checkout root** and
@@ -535,8 +722,7 @@ fn is_new_top_level_directory(root: &Path, path: &Path) -> bool {
     let Some(name) = path.file_name() else {
         return false;
     };
-    let name = name.to_string_lossy();
-    if name == "target" || name.starts_with('.') {
+    if is_excluded_name(&name.to_string_lossy()) {
         return false;
     }
     path.is_dir()
@@ -575,7 +761,7 @@ fn arm_source_subtrees(
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with('.') || name == "target" {
+        if is_excluded_name(&name) {
             continue;
         }
         if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
@@ -642,13 +828,21 @@ async fn watch_loop(
         // only thing that can see them.
         let armed = arm_source_subtrees(&mut watcher, &root, &mut watched);
 
-        // Three reasons to prefer one full rebuild over per-file folds: a batch
+        // Four reasons to prefer one full rebuild over per-file folds: a batch
         // this large is a branch switch or a rebase (rebuilding is both cheaper
         // and retires files the switch deleted); the notify queue overran and
-        // this batch is missing paths it will never see again; or a subtree was
-        // just armed, whose existing contents no event ever announced.
+        // this batch is missing paths it will never see again; a subtree was
+        // just armed, whose existing contents no event ever announced; or the
+        // ignore RULES changed, which silently re-scopes files that emit no
+        // event of their own — a per-file fold cannot see either direction of
+        // that change, because `apply_batch` skips an ignored path rather than
+        // retiring what the graph already holds for it.
         let lost = dropped.swap(0, Ordering::Relaxed);
-        let wants_rebuild = lost > 0 || pending.len() > WATCH_BATCH_CAP || !armed.is_empty();
+        let ignore_rules_changed = pending.iter().any(|path| is_ignore_rules_file(&root, path));
+        let wants_rebuild = lost > 0
+            || pending.len() > WATCH_BATCH_CAP
+            || !armed.is_empty()
+            || ignore_rules_changed;
 
         // One writer at a time: the same gate a full warm-up holds, so a batch
         // can never interleave with a clear-and-rebuild (F6).
@@ -659,6 +853,7 @@ async fn watch_loop(
                 changed = pending.len(),
                 dropped_events = lost,
                 newly_watched = armed.len(),
+                ignore_rules_changed,
                 "code-graph watcher: bulk change, rebuilding"
             );
             match scan_repository(&pool, repository, &root).await {
@@ -685,6 +880,7 @@ async fn watch_loop(
                     changed = pending.len(),
                     dropped_events = lost,
                     newly_watched = armed.len(),
+                    ignore_rules_changed,
                     "code-graph watcher: rebuild deferred by the cooldown; folding this batch incrementally"
                 );
             }
@@ -731,10 +927,13 @@ async fn watch_loop(
 
 /// Reparse (or retire) each changed path, incrementally.
 ///
-/// A batch can also carry a directory — the new-top-level-directory event
-/// [`is_new_top_level_directory`] admits so the sweep runs. It is not readable as
-/// a file and falls out at the `read_to_string` below, which is why that arm logs
-/// rather than treating an unreadable path as a deletion.
+/// A batch also carries the two paths the notify filter admits for their *side
+/// effects* rather than their content: a new top-level directory (so
+/// `arm_source_subtrees` runs) and `.gitignore` (so the batch escalates to a full
+/// rescan). Both have already done their job by the time the batch reaches here,
+/// so neither is offered to the parser — the same [`codegraph::language_for`]
+/// question the walk and the watcher both ask decides it, rather than a third
+/// rule, an `is_dir` stat, or a failed read.
 async fn apply_batch(
     pool: &SqlitePool,
     repository: RepositoryId,
@@ -744,6 +943,7 @@ async fn apply_batch(
 ) {
     let mut relative: Vec<String> = pending
         .iter()
+        .filter(|path| codegraph::language_for(path).is_some())
         .filter_map(|path| repo_relative(root, path))
         .collect();
     relative.sort();
@@ -1195,6 +1395,298 @@ mod tests {
             summary.headline().contains("TRUNCATED"),
             "{}",
             summary.headline()
+        );
+    }
+
+    /// A checkout shaped like the reported one: an ignored dependency tree whose
+    /// name sorts before the application's, holding `count` `.js` files, and a
+    /// three-file `src/`. `ignored_dir` is excluded by `.gitignore` alone — the
+    /// name guard must not be what saves this test.
+    ///
+    /// The dependency files sit at the SAME depth as `src/`'s, so what this
+    /// measures is the ignore filter and not the traversal order: a walk that
+    /// merely visited the tree in a different sequence would still spend its
+    /// whole budget here, which is the property under test.
+    fn seed_dependency_heavy_repository(root: &Path, ignored_dir: &str, count: usize) {
+        init_repo(root);
+        std::fs::write(root.join(".gitignore"), format!("{ignored_dir}/\n")).unwrap();
+        let deps = root.join(ignored_dir);
+        std::fs::create_dir_all(&deps).unwrap();
+        for index in 0..count {
+            std::fs::write(
+                deps.join(format!("chunk{index:05}.js")),
+                format!("export function vendored{index}() {{ return {index}; }}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            "export function renderApp() { return boot(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/boot.ts"),
+            "export function boot(): number { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn native_helper() -> u32 { 1 }\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_ignored_tree_cannot_spend_the_file_cap() {
+        // The reported defect, as a unit. The ignore filter used to run AFTER the
+        // walk had already spent its budget, so a `node_modules`-shaped tree —
+        // sorting before `src/`, and full of files the new JavaScript and
+        // TypeScript grammars now recognise — consumed the cap and the
+        // application was never reached at all.
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        // `deps` is ignored by the checkout's own rules and by nothing else, so
+        // this measures the ignore rules, not the dependency-name guard.
+        seed_dependency_heavy_repository(&root, "deps", 40);
+
+        let (paths, summary) = collect_source_paths(&root, 6).unwrap();
+        let found: Vec<&str> = paths.iter().map(|(path, _)| path.as_str()).collect();
+        println!("collected: {found:?}");
+        println!("summary: {}", summary.headline());
+
+        assert_eq!(found, ["src/app.js", "src/boot.ts", "src/lib.rs"]);
+        assert!(
+            !summary.truncated_by_cap,
+            "40 ignored files exhausted a 6-file cap: {}",
+            summary.headline()
+        );
+        // The walk never went in, so those files are in no count here — which is
+        // exactly what `dirs_pruned` exists to say out loud.
+        assert_eq!(summary.files_seen, 3);
+        assert_eq!(summary.files_skipped_ignored, 0);
+        assert!(summary.dirs_pruned >= 1, "{}", summary.headline());
+        assert!(
+            summary.headline().contains("director(ies) not walked"),
+            "{}",
+            summary.headline()
+        );
+    }
+
+    #[test]
+    fn an_individually_ignored_file_is_counted_not_pruned() {
+        // The other half of the same filter: a rule that names FILES still has to
+        // report them, or `graph build` cannot explain a smaller graph.
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        init_repo(&root);
+        std::fs::write(root.join(".gitignore"), "*.min.js\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.js"), "export function a() {}\n").unwrap();
+        std::fs::write(root.join("src/bundle.min.js"), "export function b() {}\n").unwrap();
+
+        let (paths, summary) = collect_source_paths(&root, SCAN_FILE_CAP).unwrap();
+        assert_eq!(
+            paths.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            ["src/app.js"]
+        );
+        assert_eq!(summary.files_seen, 2);
+        assert_eq!(summary.files_supported, 2);
+        assert_eq!(summary.files_skipped_ignored, 1);
+        assert!(
+            summary.headline().contains("1 ignored"),
+            "{}",
+            summary.headline()
+        );
+    }
+
+    #[test]
+    fn a_dependency_tree_is_pruned_even_when_git_cannot_answer() {
+        // `ignored_paths` is best-effort: no Git, a broken repository, any spawn
+        // failure and it excludes NOTHING. The name guard is the floor under that
+        // — without it the degraded case is the original defect verbatim, since a
+        // vendored `node_modules` is exactly the tree that ate the cap.
+        let plain = tempfile::tempdir().unwrap();
+        let root = plain.path().canonicalize().unwrap();
+        // Deliberately NOT a git repository: `git check-ignore` cannot answer.
+        std::fs::create_dir_all(root.join("node_modules/react")).unwrap();
+        for index in 0..40 {
+            std::fs::write(
+                root.join(format!("node_modules/react/chunk{index:05}.js")),
+                "export function vendored() {}\n",
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.js"), "export function renderApp() {}\n").unwrap();
+
+        let (paths, summary) = collect_source_paths(&root, 6).unwrap();
+        assert!(ignored_paths(&root, &["node_modules".to_string()]).is_empty());
+        assert_eq!(
+            paths.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            ["src/app.js"]
+        );
+        assert!(!summary.truncated_by_cap, "{}", summary.headline());
+    }
+
+    #[tokio::test]
+    async fn a_second_build_does_not_replace_a_good_graph_with_an_empty_one() {
+        // The whole finding, end to end through the production scan, at the real
+        // `SCAN_FILE_CAP`: build once to establish a graph, build again, and the
+        // second build must not retire the repository. Before the fix the ignored
+        // tree spent the cap, the walk never reached `src/`, and
+        // `rebuild_repository` retired every path it had not seen — an explicit
+        // `graph build` wiping a valid graph and reporting a near-empty one.
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        seed_dependency_heavy_repository(&root, "deps", SCAN_FILE_CAP + 1);
+
+        let data = tempfile::tempdir().unwrap();
+        let pool = codypendent_knowledge::db::open(&data.path().join("graph.db"))
+            .await
+            .unwrap();
+        let repository = repository_id_for(&root);
+        let _guard = lock_repository(repository).await;
+
+        let first = scan_repository(&pool, repository, &root).await.unwrap();
+        let nodes_after_first: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM code_nodes WHERE repository = ?")
+                .bind(repository.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        println!("first: {} → {nodes_after_first} nodes", first.headline());
+        assert_eq!(first.files_folded, 3, "{}", first.headline());
+        assert!(nodes_after_first > 3);
+
+        let second = scan_repository(&pool, repository, &root).await.unwrap();
+        let nodes_after_second: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM code_nodes WHERE repository = ?")
+                .bind(repository.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        println!("second: {} → {nodes_after_second} nodes", second.headline());
+
+        assert_eq!(second.files_folded, 3, "{}", second.headline());
+        assert_eq!(
+            second.retired,
+            codegraph::RetiredFiles::default(),
+            "the second build retired live files: {}",
+            second.headline()
+        );
+        assert_eq!(
+            nodes_after_second, nodes_after_first,
+            "a second `graph build` changed the graph it should have reproduced"
+        );
+        let paths: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT source_path FROM code_nodes WHERE repository = ? ORDER BY 1",
+        )
+        .bind(repository.to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(paths, ["src/app.js", "src/boot.ts", "src/lib.rs"]);
+    }
+
+    #[test]
+    fn the_ignore_rules_file_is_the_only_non_source_file_the_watcher_admits() {
+        // Fix 2's gate, as a predicate. A `.gitignore` edit re-scopes files that
+        // emit no event of their own, so its own event has to reach the
+        // debouncer — and nothing else may ride in with it, because the queue it
+        // feeds is bounded and a full queue escalates the whole batch.
+        let root = Path::new("/tmp/.tmpXk9/repo");
+        assert!(is_ignore_rules_file(root, &root.join(".gitignore")));
+        assert!(is_ignore_rules_file(
+            root,
+            &root.join("crates/a/.gitignore")
+        ));
+
+        // Not this repository's rules, and not rules at all.
+        assert!(!is_ignore_rules_file(root, &root.join(".git/info/exclude")));
+        assert!(!is_ignore_rules_file(
+            root,
+            &root.join(".git/modules/x/.gitignore")
+        ));
+        assert!(!is_ignore_rules_file(
+            root,
+            &root.join("target/debug/.gitignore")
+        ));
+        assert!(!is_ignore_rules_file(root, &root.join(".gitattributes")));
+        assert!(!is_ignore_rules_file(root, &root.join(".env")));
+        assert!(!is_ignore_rules_file(root, &root.join("src/lib.rs")));
+        assert!(!is_ignore_rules_file(root, &root.join("gitignore")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gitignore_edit_removes_the_newly_excluded_file_from_the_graph() {
+        // Fix 2 end to end. A `.gitignore` edit is neither a supported source
+        // path nor a new top-level directory, so its event was discarded: a file
+        // that had just become ignored stayed in the graph indefinitely, and a
+        // later source event could not repair it either, because `apply_batch`
+        // SKIPS an ignored path rather than retiring what is stored for it. So
+        // `graph show` kept serving excluded code until someone ran a manual
+        // build.
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn kept_symbol() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("generated")).unwrap();
+        std::fs::write(
+            root.join("generated/schema.rs"),
+            "pub fn folded_then_excluded() -> u32 { 2 }\n",
+        )
+        .unwrap();
+        init_repo(&root);
+
+        let data = tempfile::tempdir().unwrap();
+        let pool = codypendent_knowledge::db::open(&data.path().join("graph.db"))
+            .await
+            .unwrap();
+        let repository = repository_id_for(&root);
+        {
+            let _guard = lock_repository(repository).await;
+            scan_repository(&pool, repository, &root).await.unwrap();
+        }
+        assert!(
+            !codegraph::find_symbols(&pool, repository, "folded_then_excluded", 5)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the generated file must be in the graph before it is excluded"
+        );
+
+        let _watcher = arm_watcher(pool.clone(), repository, &root).expect("arm the watcher");
+        // The whole move: edit the ignore rules, touch nothing else.
+        std::fs::write(root.join(".gitignore"), "generated/\n").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let still_there =
+                !codegraph::find_symbols(&pool, repository, "folded_then_excluded", 5)
+                    .await
+                    .unwrap()
+                    .is_empty();
+            if !still_there {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a `.gitignore` edit never removed the excluded file from the graph"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // …and the rescan it scheduled kept everything the rules still allow.
+        assert!(
+            !codegraph::find_symbols(&pool, repository, "kept_symbol", 5)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the rescan dropped a file the rules still allow"
         );
     }
 

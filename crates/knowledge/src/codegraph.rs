@@ -213,6 +213,32 @@ pub struct CarriedEdges {
     pub after: u64,
 }
 
+/// Whether the file list handed to [`rebuild_repository`] is the WHOLE
+/// repository, or only as much of it as a bounded walk reached.
+///
+/// The retire pass answers "which stored paths did this scan not see?" with
+/// "delete them". That inference is only sound when the scan *finished*: a walk
+/// stopped by its file cap has proven nothing about the paths it never reached,
+/// and retiring them turns one truncated scan into a wiped graph. That is not
+/// hypothetical — it is the reported defect: with JavaScript and TypeScript
+/// folded, a `node_modules/` sorting before `src/` spent the entire cap, and the
+/// build that followed retired every real file in the repository.
+///
+/// So the caller must state which it has, and only [`Self::Complete`] retires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanCoverage {
+    /// The walk reached every in-scope path. A stored path this scan did not
+    /// fold is genuinely gone, and is retired.
+    Complete,
+    /// The walk stopped early. Files it did reach are folded; nothing is
+    /// retired, so a graph built from a complete earlier scan keeps the entries
+    /// this one could not confirm. The cost is a file deleted from an
+    /// over-cap repository lingering until a complete scan runs — strictly
+    /// better than deleting a valid graph on the strength of a walk that never
+    /// looked.
+    Truncated,
+}
+
 /// What [`rebuild_repository`] wrote.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepositoryRebuild {
@@ -258,6 +284,8 @@ pub struct RepositoryRebuild {
 /// in the repository map, which reads every node for the repository). That is a
 /// bounded, targeted pass here — [`remove_file_graph`] for each stored
 /// `source_path` this scan did not fold — instead of a repository-wide wipe.
+/// It runs only for a [`ScanCoverage::Complete`] scan: "I did not see it" means
+/// "it is gone" only when the walk actually finished.
 ///
 /// The residual inconsistency is now a reader seeing *some* files at the new
 /// revision and the rest at the previous one, never a truncated graph. Making the
@@ -271,6 +299,7 @@ pub async fn rebuild_repository<'a, I>(
     repository: RepositoryId,
     revision: &GitRevision,
     files: I,
+    coverage: ScanCoverage,
 ) -> Result<RepositoryRebuild, CodeGraphError>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -294,8 +323,17 @@ where
 
     // 2. Retire the paths the scan did not see. This is the only job the wipe
     //    was ever doing that a per-file fold cannot: nothing reparses a file that
-    //    is no longer there.
+    //    is no longer there. Skipped outright for a truncated walk, which did not
+    //    look at those paths and therefore cannot say they are gone.
     let mut retired = RetiredFiles::default();
+    if coverage == ScanCoverage::Truncated {
+        let after = non_syntax_edge_count(pool, repository).await?;
+        return Ok(RepositoryRebuild {
+            folded,
+            retired,
+            edges: CarriedEdges { before, after },
+        });
+    }
     for path in stored_source_paths(pool, repository).await? {
         match path {
             Some(path) if scanned.contains(path.as_str()) => {}
@@ -442,7 +480,13 @@ pub struct GraphDelta {
 /// graph instead of presenting an empty one as a finished one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ScanSummary {
-    /// Every regular file the walk visited, before any filter. The denominator.
+    /// Every regular file the walk actually visited, before any per-file filter.
+    /// The denominator.
+    ///
+    /// A file inside a pruned directory is **not** counted here, because the
+    /// walk never went in — see [`Self::dirs_pruned`]. That is the point of
+    /// pruning: an excluded dependency tree must cost the scan nothing, neither
+    /// a `read_dir` nor a slot under the file cap.
     pub files_seen: usize,
     /// Of those, the ones [`language_for`] recognises — the fold candidates.
     pub files_supported: usize,
@@ -450,6 +494,10 @@ pub struct ScanSummary {
     pub files_folded: usize,
     /// Candidates dropped by `.gitignore`.
     pub files_skipped_ignored: usize,
+    /// Directories the walk refused to descend into: the checkout's ignore rules
+    /// excluded them, or they are the build/VCS/dependency trees no walk enters.
+    /// Their contents are absent from every other count here.
+    pub dirs_pruned: usize,
     /// Candidates that vanished between the walk and the read. Counted apart from
     /// `files_skipped_ignored` because "the tree moved under us" and "policy
     /// excluded it" are different answers to "why is this file not in the graph".
@@ -555,6 +603,13 @@ impl ScanSummary {
         if self.files_skipped_ignored > 0 {
             line.push_str(&format!("; {} ignored", self.files_skipped_ignored));
         }
+        // Reported apart from `files_skipped_ignored`, and never folded into it:
+        // a pruned directory stands for an unknown (often enormous) number of
+        // files the walk deliberately never counted, and printing it as "1
+        // ignored" would understate a `node_modules` by four orders of magnitude.
+        if self.dirs_pruned > 0 {
+            line.push_str(&format!("; {} director(ies) not walked", self.dirs_pruned));
+        }
         if self.retired.files > 0 {
             line.push_str(&format!(
                 "; retired {} vanished file(s) ({} symbols)",
@@ -582,7 +637,8 @@ impl ScanSummary {
         }
         if self.truncated_by_cap {
             line.push_str(&format!(
-                "; TRUNCATED at the {}-file cap — this graph is incomplete",
+                "; TRUNCATED at the {}-file cap — this graph is incomplete, \
+                 and nothing was retired (an unfinished walk proves no file gone)",
                 self.file_cap
             ));
         }

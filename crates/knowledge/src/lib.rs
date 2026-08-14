@@ -81,7 +81,7 @@ pub use codegraph::{
     assert_agent_edges, changed_between, language_for, rebuild_repository, stable_repository_id,
     supported_extensions, AgentEdgeAssertion, AssertionResult, CarriedEdges, CodeGraphError,
     CodeGraphQueries, FoldedFile, GraphAnswer, GraphDelta, GraphHit, GraphQuestion, Language,
-    ParsedSymbol, RepositoryRebuild, RetiredFiles, ScanSummary, SemanticEdge,
+    ParsedSymbol, RepositoryRebuild, RetiredFiles, ScanCoverage, ScanSummary, SemanticEdge,
     SemanticUpsertOutcome, SymbolDelta, SymbolSnapshot, GRAPH_ANSWER_LIMIT, GRAPH_MAX_DEPTH,
 };
 pub use repomap::{

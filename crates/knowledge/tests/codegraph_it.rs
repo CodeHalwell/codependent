@@ -984,3 +984,75 @@ async fn a_python_symbol_is_findable_by_its_simple_name() {
     assert_eq!(answer.total, 0, "nothing calls it: {:?}", answer.hits);
     assert!(!answer.targets.is_empty(), "but it resolved: {answer:?}");
 }
+
+// --------------------------------------------------------------------------
+// A rebuild retires what a scan did not see — but only if the scan FINISHED
+// --------------------------------------------------------------------------
+
+/// A complete scan is what licenses the retire pass, and a truncated one is not.
+///
+/// The retire pass reasons "this stored path was not in the scan, therefore it
+/// is gone". That holds only when the walk reached everything. A walk stopped by
+/// its file cap reached an arbitrary prefix of the repository, and retiring the
+/// rest turns one truncated scan into a wiped graph — which is precisely what a
+/// `node_modules/` sorting before `src/` produced once JavaScript and TypeScript
+/// became foldable: the cap was spent on ignored dependency code and `graph
+/// build` retired the entire application.
+#[tokio::test]
+async fn a_truncated_rebuild_retires_nothing_and_a_complete_one_still_does() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    for path in ["src/a.rs", "src/b.rs"] {
+        codegraph::upsert_file_graph(&pool, repo, &rev(), path, "pub fn kept() {}\n")
+            .await
+            .unwrap();
+    }
+
+    // A scan that reached only `src/a.rs` because it ran out of budget says
+    // nothing whatever about `src/b.rs`.
+    let truncated = codegraph::rebuild_repository(
+        &pool,
+        repo,
+        &rev(),
+        [("src/a.rs", "pub fn kept() {}\n")],
+        codegraph::ScanCoverage::Truncated,
+    )
+    .await
+    .unwrap();
+    assert_eq!(truncated.retired, codegraph::RetiredFiles::default());
+    let paths: Vec<String> = codegraph::nodes(&pool, repo)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|node| node.key.source_path)
+        .collect();
+    assert!(
+        paths.iter().any(|path| path == "src/b.rs"),
+        "a truncated rebuild retired a path it never looked at: {paths:?}"
+    );
+
+    // The same file list from a scan that FINISHED is evidence, and the deleted
+    // file is retired exactly as before — suppressing retirement on truncation
+    // must not cost the ordinary deletion case.
+    let complete = codegraph::rebuild_repository(
+        &pool,
+        repo,
+        &rev(),
+        [("src/a.rs", "pub fn kept() {}\n")],
+        codegraph::ScanCoverage::Complete,
+    )
+    .await
+    .unwrap();
+    assert_eq!(complete.retired.files, 1, "{complete:?}");
+    assert!(complete.retired.nodes > 0, "{complete:?}");
+    let paths: Vec<String> = codegraph::nodes(&pool, repo)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|node| node.key.source_path)
+        .collect();
+    assert!(
+        !paths.iter().any(|path| path == "src/b.rs"),
+        "a complete rebuild left a genuinely deleted file behind: {paths:?}"
+    );
+}
