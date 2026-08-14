@@ -1146,14 +1146,61 @@ fn composer_rendered_rows(composer: &str, width: u16) -> u16 {
         .max(1)
 }
 
-/// One grapheme's wrap-relevant facts: the columns it occupies, and whether a
-/// row may end just after it.
+/// One grapheme's wrap-relevant facts: the columns it occupies, whether a row
+/// may end just after it, and whether it could be part of a leading rail.
 #[derive(Clone, Copy)]
 struct WrapCell {
     width: usize,
     /// A space — the only break opportunity. Breaking after it means the space
     /// itself is dropped rather than left dangling at the row edge.
     breakable: bool,
+    /// A lone non-alphanumeric glyph: `▌`, `▏`, `•`, `❯`. Only counts toward the
+    /// rail when a space follows it, so `main.py` is text and `• ` is a marker.
+    marker: bool,
+}
+
+impl WrapCell {
+    fn of(grapheme: &str) -> Self {
+        let mut chars = grapheme.chars();
+        let first = chars.next();
+        Self {
+            width: UnicodeWidthStr::width(grapheme),
+            breakable: grapheme == " ",
+            marker: chars.next().is_none()
+                && first.is_some_and(|c| !c.is_alphanumeric() && !c.is_whitespace()),
+        }
+    }
+}
+
+/// Columns a continuation row is indented by, so wrapped prose lines up under
+/// the text rather than under the rail: `▌ Codypendent isolates …` continues at
+/// the `C`, not two columns to its left.
+///
+/// Derived from the line's OWN leading rail, which is what keeps this safe: the
+/// measure pass and the draw pass see the same graphemes, so they cannot
+/// disagree about the indent. Capped at half the row so a continuation always
+/// has somewhere to go.
+fn continuation_indent(cells: &[WrapCell], width: usize) -> usize {
+    let mut cols = 0;
+    let mut i = 0;
+    while let Some(cell) = cells.get(i) {
+        let rail =
+            cell.breakable || (cell.marker && cells.get(i + 1).is_some_and(|next| next.breakable));
+        if !rail {
+            break;
+        }
+        cols += cell.width;
+        i += 1;
+    }
+    let cols = cols.min(width / 2);
+    // A grapheme too wide for what the indent leaves would be force-placed and
+    // then overflow the row. On a viewport that narrow, alignment is the thing
+    // to give up.
+    let widest = cells.iter().map(|c| c.width).max().unwrap_or(0);
+    if width.saturating_sub(cols) < widest {
+        return 0;
+    }
+    cols
 }
 
 /// The one wrapping rule the transcript's measure pass and its draw pass share:
@@ -1170,6 +1217,9 @@ struct WrapCell {
 /// two in step but broke mid-word — `so i` / `t needs one`.
 fn wrap_ranges(cells: &[WrapCell], width: u16) -> Vec<std::ops::Range<usize>> {
     let width = usize::from(width).max(1);
+    // Continuation rows are drawn indented, so they have that much less room.
+    let indent = continuation_indent(cells, width);
+    let avail = |row: usize| if row == 0 { width } else { width - indent };
     let mut rows: Vec<std::ops::Range<usize>> = Vec::new();
     let mut start = 0usize;
     let mut col = 0usize;
@@ -1183,7 +1233,7 @@ fn wrap_ranges(cells: &[WrapCell], width: u16) -> Vec<std::ops::Range<usize>> {
             i += 1;
             continue;
         }
-        if col + cell.width > width && col > 0 {
+        if col + cell.width > avail(rows.len()) && col > 0 {
             // Prefer the last space in this row; fall back to a hard break for
             // a word that cannot fit a row on its own.
             // `s > start`, not `>=`: breaking at a space that is itself the
@@ -1214,12 +1264,7 @@ fn wrap_ranges(cells: &[WrapCell], width: u16) -> Vec<std::ops::Range<usize>> {
 /// [`wrap_ranges`].
 fn cell_wrap_rows<'x>(texts: impl Iterator<Item = &'x str>, width: u16) -> u16 {
     let cells: Vec<WrapCell> = texts
-        .flat_map(|text| {
-            UnicodeSegmentation::graphemes(text, true).map(|g| WrapCell {
-                width: UnicodeWidthStr::width(g),
-                breakable: g == " ",
-            })
-        })
+        .flat_map(|text| UnicodeSegmentation::graphemes(text, true).map(WrapCell::of))
         .collect();
     u16::try_from(wrap_ranges(&cells, width).len()).unwrap_or(u16::MAX)
 }
@@ -1233,17 +1278,21 @@ fn split_line_cells(line: &Line<'_>, width: u16) -> Vec<Line<'static>> {
     let mut graphemes: Vec<(&str, Style)> = Vec::new();
     for span in &line.spans {
         for grapheme in UnicodeSegmentation::graphemes(span.content.as_ref(), true) {
-            cells.push(WrapCell {
-                width: UnicodeWidthStr::width(grapheme),
-                breakable: grapheme == " ",
-            });
+            cells.push(WrapCell::of(grapheme));
             graphemes.push((grapheme, span.style));
         }
     }
+    let indent = continuation_indent(&cells, usize::from(width).max(1));
 
     let mut out: Vec<Line<'static>> = Vec::new();
     for range in wrap_ranges(&cells, width) {
         let mut row: Vec<Span<'static>> = Vec::new();
+        // Every row but the first opens with the rail's worth of blanks, so the
+        // paragraph keeps one left edge. Unstyled, so the row's own style (a
+        // selection background, say) still paints through it.
+        if !out.is_empty() && indent > 0 {
+            row.push(Span::raw(" ".repeat(indent)));
+        }
         let mut fragment = String::new();
         let mut fragment_style = Style::default();
         for &(grapheme, style) in &graphemes[range] {
@@ -15295,11 +15344,20 @@ mod tests {
                     without_spaces(&original),
                     "content lost at width {width} for {case:?}"
                 );
-                let dropped = original.chars().count() - rejoined.chars().count();
+                // Spaces are the only thing that may move: one may be consumed
+                // per break, and each continuation row is opened with the
+                // rail's indent (capped at half the row). Bound both ways so a
+                // runaway indent or a swallowed run of text cannot hide here.
+                let breaks = split.len() - 1;
+                let cap = usize::from(width) / 2;
                 assert!(
-                    dropped < split.len(),
-                    "dropped {dropped} chars across {} row(s) at width {width} for {case:?}",
-                    split.len()
+                    rejoined.chars().count() + breaks
+                        >= original.chars().count().saturating_sub(breaks),
+                    "too much lost at width {width} for {case:?}: {split:?}"
+                );
+                assert!(
+                    rejoined.chars().count() <= original.chars().count() + cap * breaks,
+                    "indent runaway at width {width} for {case:?}: {split:?}"
                 );
                 // A wrapped row never ends or starts on the space it broke at.
                 for visual in &split {
@@ -15344,6 +15402,48 @@ mod tests {
                 .map(str::to_owned)
                 .collect();
             assert_eq!(rejoined, words, "word order changed at width {width}");
+        }
+    }
+
+    /// A wrapped paragraph keeps ONE left edge. The rail (`▌ `, `• `, `▏ `) is
+    /// two or four columns the continuation rows used not to reproduce, so a
+    /// wrapped message sat ragged — its second row starting left of its first.
+    #[test]
+    fn a_wrapped_paragraph_keeps_one_left_edge() {
+        let prose = "isolates each Build run in a git worktree so it needs one \
+                     open Codypendent inside a git repository";
+        for (rail, indent) in [("▌ ", 2), ("  • ", 4), ("  ▏ ", 4)] {
+            let line = Line::from(vec![
+                Span::raw(rail.to_owned()),
+                Span::raw(prose.to_owned()),
+            ]);
+            let rows = split_line_cells(&line, 40);
+            assert!(rows.len() > 1, "{rail:?} did not wrap");
+            let text =
+                |l: &Line| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+
+            // Where the text starts on row 1 is where it starts on every row.
+            let first = text(&rows[0]);
+            let text_starts_at = UnicodeWidthStr::width(
+                &first[..first.len()
+                    - first
+                        .trim_start_matches(|c: char| !c.is_alphanumeric())
+                        .len()],
+            );
+            assert_eq!(text_starts_at, indent, "unexpected rail width for {rail:?}");
+            for row in &rows[1..] {
+                let r = text(row);
+                let lead = UnicodeWidthStr::width(&r[..r.len() - r.trim_start_matches(' ').len()]);
+                assert_eq!(
+                    lead, indent,
+                    "continuation not aligned under the text for {rail:?}: {rows:?}"
+                );
+            }
+            // And no row runs past the viewport now that it starts further in.
+            for row in &rows {
+                let w: usize = row.spans.iter().map(Span::width).sum();
+                assert!(w <= 40, "row overflows after indent for {rail:?}: {row:?}");
+            }
         }
     }
 
