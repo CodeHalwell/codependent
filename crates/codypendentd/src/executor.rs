@@ -517,7 +517,7 @@ impl RuntimeExecutor {
     /// **Two callers fire this for one `codypendent run`** — the server's
     /// `CreateSession` hook (via [`Self::ensure_repository_scanned`]) and
     /// `spawn_run`. Before the async lock, both read the revision map, both saw
-    /// "not folded", and both ran `clear_repository` + a full rebuild against the
+    /// "not folded", and both ran a full `codegraph::rebuild_repository` against the
     /// same database: reproducibly `database is locked`, after which the losing
     /// scan never recorded its revision (so the repository re-scanned on every
     /// later run), and a run could read the repository map between the winner's
@@ -3303,10 +3303,17 @@ mod tests {
         );
 
         // A second run at the SAME revision must not re-scan: clearing the graph
-        // behind the executor's back is only repaired if it re-folds.
-        codypendent_knowledge::codegraph::clear_repository(&pool, repository)
-            .await
-            .expect("clear graph");
+        // behind the executor's back is only repaired if it re-folds. A rebuild
+        // over an empty file list IS the clear — there is no bare public wipe,
+        // because on its own it destroys every agent-asserted edge.
+        codypendent_knowledge::codegraph::rebuild_repository(
+            &pool,
+            repository,
+            &first_revision,
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .await
+        .expect("clear graph");
         executor.ensure_scanned(repository, &repo).await;
         assert!(
             codypendent_knowledge::codegraph::nodes(&pool, repository)

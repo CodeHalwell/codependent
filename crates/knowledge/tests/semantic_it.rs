@@ -13,8 +13,8 @@ use codypendent_knowledge::types::{
     CodeNode, CodeNodeKind, CodeRelation, EvidenceKind, AGENT_ASSERTED_CONFIDENCE,
     COMPILER_RESOLVED_CONFIDENCE, LSP_RESOLVED_CONFIDENCE,
 };
-use codypendent_knowledge::{db, GitRevision};
-use codypendent_protocol::RepositoryId;
+use codypendent_knowledge::{db, EvidenceRef, GitRevision};
+use codypendent_protocol::{RepositoryId, RunId, SessionId};
 
 async fn temp_pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
     let tmp = tempfile::tempdir().unwrap();
@@ -745,4 +745,218 @@ async fn a_reparse_keeps_edges_it_did_not_produce() {
     // And the syntax layer is still replaced wholesale, not accumulated.
     let caller = key_of(&nodes, "caller");
     assert_eq!(edges_between(&pool, repo, caller, handler).await.len(), 1);
+}
+
+/// **The property PR #65 broke.** Assert an edge, run a full rebuild, and the
+/// edge is still there — with its evidence kind, its confidence, and the
+/// rationale and run id the model gave for it.
+///
+/// The rebuild used to open with an unscoped `DELETE FROM code_edges` +
+/// `DELETE FROM code_nodes` for the whole repository, so `codypendent graph
+/// build` (and every revision-triggered rescan, and every branch switch the
+/// watcher collapses into a rebuild) permanently discarded every agent
+/// assertion. The parser cannot reproduce them by construction; that is the
+/// entire point of the feature.
+#[tokio::test]
+async fn a_full_rebuild_keeps_every_agent_assertion() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let rev = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev, "src/api.rs", DISPATCH)
+        .await
+        .unwrap();
+    let before_nodes = codegraph::nodes(&pool, repo).await.unwrap();
+    let handler = key_of(&before_nodes, "handle_create_user").clone();
+    let service = key_of(&before_nodes, "user_service_create").clone();
+
+    let session = SessionId::new();
+    let run = RunId::new();
+    let rationale = "the handler dispatches by name through the service registry";
+    codegraph::assert_agent_edges(
+        &pool,
+        repo,
+        &rev,
+        &[codegraph::AgentEdgeAssertion {
+            from_symbol: "handle_create_user".to_owned(),
+            to_symbol: "user_service_create".to_owned(),
+            relation: CodeRelation::Calls,
+            evidence: Some(EvidenceRef::AgentAssertion {
+                session_id: session,
+                run_id: run,
+                rationale: rationale.to_owned(),
+            }),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        edges_between(&pool, repo, &handler, &service).await.len(),
+        1
+    );
+
+    // The full rebuild — exactly what `codypendent graph build` runs.
+    let rebuild = codegraph::rebuild_repository(&pool, repo, &rev, [("src/api.rs", DISPATCH)])
+        .await
+        .unwrap();
+    assert_eq!(rebuild.retired, codegraph::RetiredFiles::default());
+    assert_eq!(rebuild.edges.before, 1);
+    assert_eq!(rebuild.edges.after, 1, "the rebuild dropped the assertion");
+
+    // Resolved from scratch: the identity of a symbol must survive the rebuild,
+    // or nothing above the parser can.
+    let after_nodes = codegraph::nodes(&pool, repo).await.unwrap();
+    let handler_after = key_of(&after_nodes, "handle_create_user");
+    let service_after = key_of(&after_nodes, "user_service_create");
+    let survived = edges_between(&pool, repo, handler_after, service_after).await;
+    assert_eq!(
+        survived.len(),
+        1,
+        "a full rebuild destroyed the agent assertion"
+    );
+    assert_eq!(survived[0].evidence_kind, EvidenceKind::AgentAsserted);
+    assert_eq!(survived[0].confidence, AGENT_ASSERTED_CONFIDENCE);
+    match survived[0].evidence.as_ref().expect("provenance travels") {
+        EvidenceRef::AgentAssertion {
+            session_id,
+            run_id,
+            rationale: kept,
+        } => {
+            assert_eq!(*session_id, session);
+            assert_eq!(*run_id, run);
+            assert_eq!(kept, rationale);
+        }
+        other => panic!("the rationale was not preserved: {other:?}"),
+    }
+}
+
+/// The one legitimate way to lose an assertion: the file it named is gone. A
+/// rebuild that no longer sees a path retires its symbols (nothing reparses a
+/// missing file), and the edges into them go with it — but only those.
+#[tokio::test]
+async fn a_rebuild_retires_only_the_paths_it_no_longer_sees() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let rev = GitRevision("rev1".into());
+    for (path, source) in [("src/api.rs", DISPATCH), ("src/chain.rs", CHAIN)] {
+        codegraph::upsert_file_graph(&pool, repo, &rev, path, source)
+            .await
+            .unwrap();
+    }
+    codegraph::assert_agent_edges(
+        &pool,
+        repo,
+        &rev,
+        &[assertion("handle_create_user", "compute")],
+    )
+    .await
+    .unwrap();
+    assert!(codegraph::nodes(&pool, repo).await.unwrap().len() > 4);
+
+    // `src/chain.rs` was deleted from the working tree, so the walk no longer
+    // offers it.
+    let rebuild = codegraph::rebuild_repository(&pool, repo, &rev, [("src/api.rs", DISPATCH)])
+        .await
+        .unwrap();
+    assert_eq!(rebuild.retired.files, 1, "{:?}", rebuild.retired);
+    assert!(rebuild.retired.nodes > 0, "{:?}", rebuild.retired);
+    assert_eq!(rebuild.edges.before, 1);
+    assert_eq!(
+        rebuild.edges.after, 0,
+        "the assertion's endpoint really is gone"
+    );
+
+    let after = codegraph::nodes(&pool, repo).await.unwrap();
+    assert!(
+        after
+            .iter()
+            .all(|node| node.key.source_path == "src/api.rs"),
+        "the deleted file's symbols linger: {:?}",
+        after
+            .iter()
+            .map(|n| n.key.source_path.clone())
+            .collect::<Vec<_>>()
+    );
+    // …and the surviving file kept everything the parser gave it.
+    let caller = key_of(&after, "caller");
+    let handler = key_of(&after, "handle_create_user");
+    assert_eq!(edges_between(&pool, repo, caller, handler).await.len(), 1);
+}
+
+/// A rebuild is not allowed to look like a fresh graph to anything holding a
+/// node id: the ids and their creation stamps survive it. That identity is what
+/// carries every layer above the parser across a rebuild, and what stops a
+/// concurrent `graph show --node <id>` from 404ing mid-build.
+#[tokio::test]
+async fn a_rebuild_preserves_node_identity() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let rev = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev, "src/lib.rs", CHAIN)
+        .await
+        .unwrap();
+    let before: Vec<_> = codegraph::nodes(&pool, repo)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|node| (node.key.stable_key(), node.id))
+        .collect();
+    assert!(!before.is_empty());
+
+    codegraph::rebuild_repository(
+        &pool,
+        repo,
+        &GitRevision("rev2".into()),
+        [("src/lib.rs", CHAIN)],
+    )
+    .await
+    .unwrap();
+
+    let after: Vec<_> = codegraph::nodes(&pool, repo)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|node| (node.key.stable_key(), node.id))
+        .collect();
+    assert_eq!(before, after, "the rebuild minted new node ids");
+}
+
+/// Retiring a symbol that still has a NON-syntax edge out of it must not fail.
+///
+/// Scoping the reparse's edge delete to `syntax_inferred` (so an assertion
+/// survives an ordinary save) left an asserted edge pointing OUT of a symbol
+/// whose signature had just changed. `code_edges` has foreign keys on and no
+/// cascade, so deleting the retired node failed the whole transaction — and
+/// every later fold of that repository failed with it.
+#[tokio::test]
+async fn retiring_a_symbol_with_an_asserted_out_edge_succeeds() {
+    let (_tmp, pool) = temp_pool().await;
+    let repo = RepositoryId::new();
+    let rev = GitRevision("rev1".into());
+    codegraph::upsert_file_graph(&pool, repo, &rev, "src/api.rs", DISPATCH)
+        .await
+        .unwrap();
+    codegraph::assert_agent_edges(
+        &pool,
+        repo,
+        &rev,
+        &[assertion("handle_create_user", "user_service_create")],
+    )
+    .await
+    .unwrap();
+
+    // The asserting symbol's SIGNATURE changes, so its `symbol_key` changes and
+    // the old node is retired — while its asserted out-edge still points at it.
+    let edited = DISPATCH.replace(
+        "pub fn handle_create_user() -> u32 { 0 }",
+        "pub fn handle_create_user(tenant: u32) -> u32 { tenant }",
+    );
+    assert_ne!(edited, DISPATCH, "the fixture no longer holds that line");
+    codegraph::upsert_file_graph(&pool, repo, &rev, "src/api.rs", &edited)
+        .await
+        .expect("retiring a symbol with an asserted out-edge must not fail");
+
+    // A full rebuild over the edited file is the same question one level up.
+    codegraph::rebuild_repository(&pool, repo, &rev, [("src/api.rs", edited.as_str())])
+        .await
+        .expect("the rebuild must not fail either");
 }

@@ -78,9 +78,10 @@ pub use adapter::{
     ParseOutput, RustAdapter, ScriptAdapter, SemanticCapability, SymbolIndex, Workspace,
 };
 pub use codegraph::{
-    assert_agent_edges, changed_between, language_for, stable_repository_id, supported_extensions,
-    AgentEdgeAssertion, AssertionResult, CodeGraphError, CodeGraphQueries, GraphAnswer, GraphDelta,
-    GraphHit, GraphQuestion, Language, ParsedSymbol, ScanSummary, SemanticEdge,
+    assert_agent_edges, changed_between, language_for, rebuild_repository, stable_repository_id,
+    supported_extensions, AgentEdgeAssertion, AssertionResult, CarriedEdges, CodeGraphError,
+    CodeGraphQueries, FoldedFile, GraphAnswer, GraphDelta, GraphHit, GraphQuestion, Language,
+    ParsedSymbol, RepositoryRebuild, RetiredFiles, ScanSummary, SemanticEdge,
     SemanticUpsertOutcome, SymbolDelta, SymbolSnapshot, GRAPH_ANSWER_LIMIT, GRAPH_MAX_DEPTH,
 };
 pub use repomap::{

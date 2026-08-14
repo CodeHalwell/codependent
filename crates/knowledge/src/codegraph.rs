@@ -23,7 +23,7 @@
 //! `pool.begin()` transaction that also appends the index-outbox rows so the
 //! authoritative write and its `SymbolChanged` events are atomic.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -178,35 +178,208 @@ pub fn stable_repository_id(canonical_path: &Path) -> RepositoryId {
     RepositoryId(Uuid::from_bytes(bytes))
 }
 
-/// Retire a repository's entire code graph — every edge, then every node.
+// --------------------------------------------------------------------------
+// Full rebuild — refold every file in place, retire only what actually vanished
+// --------------------------------------------------------------------------
+
+/// The per-file counts one rebuild folded, in input order.
 ///
-/// A per-file [`upsert_file_graph`] retires the symbols *its own file* no longer
-/// defines (nodes are keyed by `source_path`), but it never sees a file that was
-/// deleted outright — nothing reparses it, so its nodes would linger. The
-/// Phase-2 pipeline rebuilds the graph with a full working-tree scan on each
-/// startup (there is no live per-file watcher yet), and wiping the repository
-/// first is how a *removed file's* symbols stop lingering in the graph (and in
-/// the repository map, which reads every node for the repository). Code nodes are
-/// a derived, regenerable projection — nothing durable references their ids — so
-/// discarding and rebuilding them is safe.
-pub async fn clear_repository(
+/// Deliberately not the whole [`GraphDelta`]: a 2000-file rebuild would
+/// otherwise hold every node and edge record it wrote in memory purely to count
+/// them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FoldedFile {
+    pub nodes: usize,
+    pub edges: usize,
+}
+
+/// The files a rebuild retired because the scan no longer saw them at all —
+/// deleted, renamed away, newly `.gitignore`d, or past the walk's file cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RetiredFiles {
+    pub files: u64,
+    pub nodes: u64,
+}
+
+/// How many edges the parser cannot reproduce the repository held on either side
+/// of a rebuild.
+///
+/// The whole point of the rebuild's shape. `after < before` means an endpoint
+/// symbol genuinely disappeared with its file or its signature — the one
+/// legitimate way to lose an assertion. It must never mean "a rebuild ran".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CarriedEdges {
+    pub before: u64,
+    pub after: u64,
+}
+
+/// What [`rebuild_repository`] wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepositoryRebuild {
+    /// One entry per input file, in input order.
+    pub folded: Vec<FoldedFile>,
+    /// Paths the scan did not see, and the symbols retired with them.
+    pub retired: RetiredFiles,
+    /// Non-syntax edge counts either side of the rebuild.
+    pub edges: CarriedEdges,
+}
+
+/// Rebuild a repository's whole code graph from `files` — the authoritative fold
+/// a `codypendent graph build`, a startup warm-up, or a branch switch performs.
+///
+/// # Why this does not clear the repository first
+///
+/// It used to. A bare public `clear_repository` deleted every `code_edges` and
+/// `code_nodes` row for the repository with no evidence filter, and the caller
+/// then refolded file by file. Two defects followed from that one line:
+///
+/// * **every agent assertion was destroyed on every build.** An
+///   [`EvidenceKind::AgentAsserted`] edge, its confidence, and the rationale and
+///   run id in its [`EvidenceRef::AgentAssertion`] all went with the wipe — and
+///   the parser cannot reproduce them *by construction*, which is the entire
+///   point of the feature. The incremental reparse in [`upsert_file_graph`] had
+///   already been scoped to `syntax_inferred` for exactly this reason; the
+///   full-rebuild path was the same class one level up.
+/// * **the graph was empty for the length of the scan.** Nothing serializes the
+///   readers against the writer — `graph show`, `graph status` and the agent's
+///   own `graph.*` questions take no lock — so a concurrent reader saw an empty
+///   or half-rebuilt repository and reported it as an answer about the user's
+///   code.
+///
+/// Both go away by not clearing. [`upsert_file_graph`] is already authoritative
+/// for its own file: it upserts by `(repository, symbol_key)` so a re-seen symbol
+/// **keeps its node id**, replaces only that file's syntax edges, and retires the
+/// symbols the file no longer defines. Node identity surviving is what carries
+/// the layers above the parser across a rebuild — no capture-and-restore dance,
+/// and nothing to lose if the scan fails halfway.
+///
+/// What the clear was actually needed for is a file that vanished outright:
+/// nothing reparses a missing path, so its symbols would linger in the graph (and
+/// in the repository map, which reads every node for the repository). That is a
+/// bounded, targeted pass here — [`remove_file_graph`] for each stored
+/// `source_path` this scan did not fold — instead of a repository-wide wipe.
+///
+/// The residual inconsistency is now a reader seeing *some* files at the new
+/// revision and the rest at the previous one, never a truncated graph. Making the
+/// whole rebuild one transaction would remove even that, at the cost of holding
+/// SQLite's single write lock for the length of the scan — past the daemon's
+/// 5-second `busy_timeout`, so every unrelated write in the process (the run
+/// event ledger, the outbox, artifacts) would start failing with `database is
+/// locked`. That trade is not worth it.
+pub async fn rebuild_repository<'a, I>(
     pool: &SqlitePool,
     repository: RepositoryId,
-) -> Result<(), CodeGraphError> {
+    revision: &GitRevision,
+    files: I,
+) -> Result<RepositoryRebuild, CodeGraphError>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let files: Vec<(&str, &str)> = files.into_iter().collect();
+    let before = non_syntax_edge_count(pool, repository).await?;
+
+    // 1. Fold every file in place. Each call is its own transaction and is
+    //    authoritative for its own path, so the graph is complete throughout —
+    //    a mixture of this scan's rows and the previous one's, never a gap.
+    let mut folded = Vec::with_capacity(files.len());
+    let mut scanned: HashSet<&str> = HashSet::with_capacity(files.len());
+    for (path, source) in &files {
+        let delta = upsert_file_graph(pool, repository, revision, path, source).await?;
+        folded.push(FoldedFile {
+            nodes: delta.nodes.len(),
+            edges: delta.edges.len(),
+        });
+        scanned.insert(*path);
+    }
+
+    // 2. Retire the paths the scan did not see. This is the only job the wipe
+    //    was ever doing that a per-file fold cannot: nothing reparses a file that
+    //    is no longer there.
+    let mut retired = RetiredFiles::default();
+    for path in stored_source_paths(pool, repository).await? {
+        match path {
+            Some(path) if scanned.contains(path.as_str()) => {}
+            Some(path) => {
+                let nodes = remove_file_graph(pool, repository, &path).await?;
+                if nodes > 0 {
+                    retired.files += 1;
+                    retired.nodes += nodes;
+                }
+            }
+            // Rows written before `source_path` existed (migration 0004) carry
+            // NULL, and no fold can ever re-see them, so they are retired too —
+            // the wipe used to take them and nothing else would.
+            None => retired.nodes += remove_pathless_nodes(pool, repository).await?,
+        }
+    }
+
+    let after = non_syntax_edge_count(pool, repository).await?;
+    Ok(RepositoryRebuild {
+        folded,
+        retired,
+        edges: CarriedEdges { before, after },
+    })
+}
+
+/// How many edges in `repository` no parser could have produced — everything
+/// whose evidence is not [`EvidenceKind::SyntaxInferred`].
+async fn non_syntax_edge_count(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+) -> Result<u64, CodeGraphError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM code_edges e JOIN code_nodes n ON e.from_node = n.id \
+         WHERE n.repository = ? AND e.evidence_kind <> ?",
+    )
+    .bind(repository.to_string())
+    .bind(scalar(&EvidenceKind::SyntaxInferred))
+    .fetch_one(pool)
+    .await?;
+    Ok(count.max(0) as u64)
+}
+
+/// Every distinct `source_path` the repository currently has nodes under, `None`
+/// for the pre-migration rows that have none.
+async fn stored_source_paths(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+) -> Result<Vec<Option<String>>, CodeGraphError> {
+    Ok(
+        sqlx::query_scalar("SELECT DISTINCT source_path FROM code_nodes WHERE repository = ?")
+            .bind(repository.to_string())
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
+/// Retire the repository's nodes that carry no `source_path` at all, in one
+/// transaction. The [`remove_file_graph`] of the pre-migration rows: `= NULL`
+/// matches nothing in SQL, so they need their own predicate or they linger
+/// forever once the repository-wide wipe is gone.
+async fn remove_pathless_nodes(
+    pool: &SqlitePool,
+    repository: RepositoryId,
+) -> Result<u64, CodeGraphError> {
     let repo = repository.to_string();
+    let mut tx = pool.begin().await?;
     sqlx::query(
-        "DELETE FROM code_edges WHERE from_node IN (SELECT id FROM code_nodes WHERE repository = ?) \
-         OR to_node IN (SELECT id FROM code_nodes WHERE repository = ?)",
+        "DELETE FROM code_edges WHERE from_node IN \
+         (SELECT id FROM code_nodes WHERE repository = ? AND source_path IS NULL) \
+         OR to_node IN \
+         (SELECT id FROM code_nodes WHERE repository = ? AND source_path IS NULL)",
     )
     .bind(&repo)
     .bind(&repo)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    sqlx::query("DELETE FROM code_nodes WHERE repository = ?")
-        .bind(&repo)
-        .execute(pool)
-        .await?;
-    Ok(())
+    let removed =
+        sqlx::query("DELETE FROM code_nodes WHERE repository = ? AND source_path IS NULL")
+            .bind(&repo)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    tx.commit().await?;
+    Ok(removed)
 }
 
 /// Errors from parsing or persisting the code graph.
@@ -294,6 +467,19 @@ pub struct ScanSummary {
     /// Nodes and edges written by this scan.
     pub nodes: usize,
     pub edges: usize,
+    /// The revision every node and edge this scan wrote was **stamped** with.
+    ///
+    /// Reported rather than re-derived by the caller: a scan reads the *working
+    /// tree*, so on a dirty checkout what it folded is not what `HEAD` holds, and
+    /// a report that asked Git a second time could name a different answer than
+    /// the rows carry (2026-08-13 review, codegraph F6).
+    pub revision: String,
+    /// Non-syntax edge counts (agent-, LSP-, compiler-asserted) either side of
+    /// the rebuild. A shortfall means a symbol an assertion named genuinely
+    /// vanished; a rebuild on its own must never move these numbers.
+    pub carried_edges: CarriedEdges,
+    /// Paths the scan no longer saw, and the symbols retired with them.
+    pub retired: RetiredFiles,
     /// The walk stopped at [`Self::file_cap`]: this graph is a *truncation* of
     /// the repository, not the repository.
     pub truncated_by_cap: bool,
@@ -368,6 +554,28 @@ impl ScanSummary {
         }
         if self.files_skipped_ignored > 0 {
             line.push_str(&format!("; {} ignored", self.files_skipped_ignored));
+        }
+        if self.retired.files > 0 {
+            line.push_str(&format!(
+                "; retired {} vanished file(s) ({} symbols)",
+                self.retired.files, self.retired.nodes
+            ));
+        }
+        // The non-syntax layer is the part a rebuild cannot regenerate, so a
+        // rebuild that dropped any of it has to say so where the fold is
+        // reported — silently losing an assertion is the defect, not the number.
+        if self.carried_edges.before > 0 || self.carried_edges.after > 0 {
+            line.push_str(&format!(
+                "; {} asserted edge(s) carried",
+                self.carried_edges.after
+            ));
+            if self.carried_edges.after < self.carried_edges.before {
+                line.push_str(&format!(
+                    " of {} — {} lost to symbols that no longer exist",
+                    self.carried_edges.before,
+                    self.carried_edges.before - self.carried_edges.after
+                ));
+            }
         }
         if self.files_skipped_unreadable > 0 {
             line.push_str(&format!("; {} unreadable", self.files_skipped_unreadable));
@@ -501,27 +709,34 @@ pub async fn upsert_file_graph(
 
     // 2b. Retire any symbol this file no longer defines (issue #6 item 4). Prior
     //     nodes for this `source_path` that this parse did not re-see must first
-    //     have their *incoming* edges removed: step 2 dropped only their outgoing
-    //     edges, and since Phase 4 a semantic (LSP) edge from ANOTHER file can
-    //     point at a symbol here (a cross-file call/test). Foreign keys are ON, so
-    //     deleting a still-referenced node would fail; an incoming edge to a
-    //     symbol that just changed/disappeared is stale anyway, so removing it is
-    //     correct (the next semantic pass re-adds it if still valid).
+    //     have EVERY incident edge removed, in both directions. Foreign keys are
+    //     ON and `code_edges` has no `ON DELETE CASCADE`, so one surviving
+    //     reference makes the node delete fail and the whole reparse error out.
+    //
+    //     Both directions, not just incoming: step 2 above drops only this file's
+    //     *syntax* out-edges, precisely so an agent- or LSP-asserted edge survives
+    //     an ordinary save. That leaves an asserted edge OUT of a symbol whose
+    //     signature just changed still pointing at the node being retired — a
+    //     dangling reference that failed the delete and made every later fold of
+    //     the repository fail with it. An edge whose endpoint no longer exists is
+    //     stale either way, in whichever direction it runs.
     if !ids.is_empty() {
         let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        // Delete edges whose `to_node` is one of the nodes about to be retired.
-        let edges_sql = format!(
-            "DELETE FROM code_edges WHERE to_node IN \
-             (SELECT id FROM code_nodes WHERE repository = ? AND source_path = ? \
+        let retiring = format!(
+            "(SELECT id FROM code_nodes WHERE repository = ? AND source_path = ? \
               AND id NOT IN ({placeholders}))"
         );
-        let mut edges_query = sqlx::query(&edges_sql)
-            .bind(repository.to_string())
-            .bind(path);
-        for id in &ids {
-            edges_query = edges_query.bind(id.to_string());
+        let edges_sql = format!(
+            "DELETE FROM code_edges WHERE from_node IN {retiring} OR to_node IN {retiring}"
+        );
+        let mut edges_query = sqlx::query(&edges_sql);
+        for _ in 0..2 {
+            edges_query = edges_query.bind(repository.to_string()).bind(path);
+            for id in &ids {
+                edges_query = edges_query.bind(id.to_string());
+            }
         }
         edges_query.execute(&mut *tx).await?;
 
@@ -595,8 +810,8 @@ pub async fn upsert_file_graph(
 ///
 /// [`upsert_file_graph`] retires the symbols a file no longer defines, but it
 /// only ever runs on a file that still exists — nothing reparses a path that was
-/// removed, so its nodes would linger until the next full [`clear_repository`]
-/// rebuild. The incremental watcher calls this instead when a watched path
+/// removed, so its nodes would linger until the next [`rebuild_repository`].
+/// The incremental watcher calls this instead when a watched path
 /// disappears (deleted, or renamed away), which is what makes a live per-file
 /// pipeline self-sufficient without a repository-wide wipe.
 ///

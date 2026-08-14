@@ -48,7 +48,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -171,14 +170,14 @@ impl CodeGraphGateway for CodeGraphOps {
                 )
             })?;
 
-            let revision = scan::head_revision(&root);
-            // Record the fold under the SAME map the executor consults, so the
+            // Record the fold under the SAME map the executor consults, and under
+            // the SAME key it compares against (`scan::head_revision`), so the
             // next run for this checkout reuses this graph instead of rebuilding
             // it, and arm the watcher so edits made after the build still land.
             host.scanned
                 .lock()
                 .expect("scanned map lock")
-                .insert(repository, revision.clone());
+                .insert(repository, scan::head_revision(&root));
             host.ensure_watching(repository, &root);
 
             // Per-language files/nodes/edges come from the graph tables rather
@@ -191,7 +190,12 @@ impl CodeGraphGateway for CodeGraphOps {
 
             let report = CodeGraphScanReport {
                 repository_root: root.display().to_string(),
-                revision: revision.0,
+                // The revision the rows actually CARRY, reported by the scan
+                // rather than re-derived here: on a dirty checkout the scan folds
+                // working-tree bytes and stamps `<HEAD>+workdir`, and a second
+                // `git rev-parse` from this handler would print the bare commit
+                // over rows that say otherwise.
+                revision: summary.revision.clone(),
                 files_walked: summary.files_seen as u64,
                 files_supported: summary.files_supported as u64,
                 files_folded: summary.files_folded as u64,
@@ -246,7 +250,7 @@ impl CodeGraphGateway for CodeGraphOps {
             .map_err(store_error)?;
 
             let head = scan::head_revision(&root);
-            let working_tree_dirty = working_tree_dirty(&root);
+            let working_tree_dirty = scan::working_tree_dirty(&root);
             let (stale, stale_reason) = staleness(nodes, &revisions, &head.0, working_tree_dirty);
 
             Ok(CodeGraphStatusView {
@@ -444,21 +448,6 @@ async fn tallies(
             count: count.max(0) as u64,
         })
         .collect())
-}
-
-/// Whether the working tree has changes Git can see (tracked modifications or
-/// untracked, non-ignored files). Best-effort: an unanswerable Git reports
-/// "clean", which only ever makes the staleness verdict more conservative.
-fn working_tree_dirty(root: &Path) -> bool {
-    Command::new("git")
-        .current_dir(root)
-        .args(["status", "--porcelain"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .is_some_and(|output| !output.stdout.is_empty())
 }
 
 /// Decide whether the stored graph still describes the working tree, and say why
@@ -711,6 +700,8 @@ fn push_edge_filters(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::process::Command;
 
     use codypendent_knowledge::codegraph;
 
@@ -1094,6 +1085,110 @@ mod tests {
             report.grammars.iter().any(|g| g.language == "python"),
             "the report must say what WOULD have folded: {report:?}"
         );
+    }
+
+    /// **A build immediately followed by a status must report `current`.**
+    ///
+    /// The full scan reads the WORKING TREE but used to stamp what it folded
+    /// with the bare `HEAD` commit. `graph status` then saw a dirty tree and a
+    /// graph carrying no `+workdir` stamp anywhere, and told the user — and the
+    /// model — that the graph it had just built was stale, with a remedy of
+    /// "run `codypendent graph build`" they had run one second earlier
+    /// (2026-08-13 review, codegraph F6).
+    #[tokio::test]
+    async fn a_build_of_a_dirty_tree_is_not_reported_stale() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_repo(repo.path());
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir");
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn committed() {}\n").expect("write");
+        for args in [vec!["add", "."], vec!["commit", "-qm", "seed"]] {
+            assert!(Command::new("git")
+                .current_dir(repo.path())
+                .args(&args)
+                .status()
+                .expect("run git")
+                .success());
+        }
+        // An uncommitted edit — the state a developer is in essentially always.
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn committed() {}\npub fn uncommitted_symbol() {}\n",
+        )
+        .expect("write");
+
+        let data = tempfile::tempdir().expect("tempdir");
+        let ops = ops(pool(&data).await);
+        let report = ops
+            .build(BuildCodeGraphRequest {
+                repository: repo.path().display().to_string(),
+            })
+            .await
+            .expect("build");
+        assert!(
+            report.revision.ends_with("+workdir"),
+            "a fold of an uncommitted tree must say so: {}",
+            report.revision
+        );
+
+        let status = ops
+            .status(CodeGraphStatusRequest {
+                repository: repo.path().display().to_string(),
+            })
+            .await
+            .expect("status");
+        assert!(status.working_tree_dirty, "{status:?}");
+        assert!(
+            !status.stale,
+            "a graph built one call ago is not stale: {:?}",
+            status.stale_reason
+        );
+        assert_eq!(status.stale_reason, None);
+        // The stamp is the commit plus the marker, not some third thing.
+        assert_eq!(
+            status
+                .revisions
+                .iter()
+                .map(|tally| tally.label.as_str())
+                .collect::<Vec<_>>(),
+            vec![format!("{}+workdir", status.head_revision).as_str()],
+        );
+    }
+
+    /// The other half: a CLEAN tree is stamped with the bare commit, so the
+    /// revision the graph reports is the one a user can `git show`. Stamping
+    /// `+workdir` unconditionally would be the same lie pointing the other way.
+    #[tokio::test]
+    async fn a_build_of_a_clean_tree_is_stamped_with_the_commit() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_repo(repo.path());
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir");
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn committed() {}\n").expect("write");
+        for args in [vec!["add", "."], vec!["commit", "-qm", "seed"]] {
+            assert!(Command::new("git")
+                .current_dir(repo.path())
+                .args(&args)
+                .status()
+                .expect("run git")
+                .success());
+        }
+
+        let data = tempfile::tempdir().expect("tempdir");
+        let ops = ops(pool(&data).await);
+        let report = ops
+            .build(BuildCodeGraphRequest {
+                repository: repo.path().display().to_string(),
+            })
+            .await
+            .expect("build");
+        let status = ops
+            .status(CodeGraphStatusRequest {
+                repository: repo.path().display().to_string(),
+            })
+            .await
+            .expect("status");
+        assert!(!status.working_tree_dirty, "{status:?}");
+        assert_eq!(report.revision, status.head_revision);
+        assert!(!status.stale, "{:?}", status.stale_reason);
     }
 
     /// A repository the extractor does cover folds, and the report attributes

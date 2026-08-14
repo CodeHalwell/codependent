@@ -23,9 +23,10 @@ use tracing::{debug, info, warn};
 /// The upper bound on files folded into the code graph in one scan. The scan is
 /// capped so a very large tree never delays the socket opening (startup) or a
 /// run's first note — but the cap must comfortably cover a real workspace: the
-/// `code_nodes` table is cleared and rebuilt from this scan on every boot, so a
-/// cap smaller than the repository silently truncates the *authoritative* graph
-/// (and, with an unsorted walk, truncates it differently on every boot).
+/// `code_nodes` table is rebuilt from this scan on every boot — and every path
+/// the walk does NOT reach is retired — so a cap smaller than the repository
+/// silently truncates the *authoritative* graph (and, with an unsorted walk,
+/// truncates it differently on every boot).
 pub const SCAN_FILE_CAP: usize = 2000;
 
 /// Serialize every mutation of one repository's code graph.
@@ -33,11 +34,11 @@ pub const SCAN_FILE_CAP: usize = 2000;
 /// Two independent paths trigger a warm-up for the same checkout — the server's
 /// `CreateSession` hook and the executor's `spawn_run` — and `codypendent run`
 /// issues both back to back. Before this lock they both observed "not folded"
-/// and both ran [`clear_repository`](codegraph::clear_repository) + a full
-/// rebuild concurrently, which produced `database is locked` (so the revision
-/// guard was never recorded and the repository re-scanned forever) and let a run
-/// read the repository map *between* another scanner's clear and its rebuild —
-/// a torn graph handed to the model (2026-08-13 review, F6). The live watcher
+/// and both ran a full [`codegraph::rebuild_repository`] concurrently, which
+/// produced `database is locked` (so the revision guard was never recorded and
+/// the repository re-scanned forever) and let a run read the repository map
+/// *between* another scanner's writes — a torn graph handed to the model
+/// (2026-08-13 review, F6). The live watcher
 /// adds a third writer, so the lock is the graph's single writer gate: hold it
 /// across a full scan AND across an incremental batch.
 ///
@@ -65,10 +66,12 @@ pub async fn lock_repository(repository: RepositoryId) -> OwnedMutexGuard<()> {
 /// per-file parse/read failure is logged and skipped, never propagated — a
 /// warm-up must not block or fail its caller.
 ///
-/// The repository's prior graph is cleared first so symbols removed since the
-/// last scan (files deleted outright, which a per-file reparse never revisits)
-/// do not linger. The code graph is derived and regenerable, so wiping and
-/// rebuilding is safe.
+/// Every file is refolded in place by [`codegraph::rebuild_repository`], which
+/// then retires exactly the paths this walk no longer saw — the one job a
+/// per-file reparse can never do, because nothing reparses a file that is gone.
+/// It deliberately does **not** wipe the repository first: that discarded every
+/// agent-asserted edge on every build and left the graph empty for the length of
+/// the scan, in full view of readers that take no lock.
 ///
 /// Returns a [`ScanSummary`] — files seen, folded per language, skipped as
 /// unsupported, and whether the cap truncated the walk. It used to return `()`,
@@ -87,7 +90,14 @@ pub async fn scan_repository(
     let Some(root) = discover_repository_root(root) else {
         anyhow::bail!("cannot scan {}: not a git repository", root.display());
     };
-    let revision = head_revision(&root);
+    // Stamp what this scan actually READS, which is the working tree — not
+    // whatever `HEAD` happens to name. A full rescan of a dirty checkout used to
+    // fold uncommitted bytes and label them with the bare commit, so `graph
+    // status` then compared a dirty tree against a graph carrying no `+workdir`
+    // stamp and called the freshly built graph stale (2026-08-13 review,
+    // codegraph F6). The incremental watcher already stamps this way; this is the
+    // same question, so it is the same function.
+    let revision = working_tree_revision(&root);
 
     // The walk is blocking std::fs work — off the async runtime so a large tree
     // does not stall this worker's other tasks.
@@ -99,19 +109,26 @@ pub async fn scan_repository(
     for (relative, source, _) in &files {
         codegraph::validate_file_graph(repository, relative, source)?;
     }
-    // Destructive replacement begins only after the entire filesystem walk and
-    // parse preflight succeeded. Any later database failure is returned so the
-    // caller removes its in-process success marker and retries.
-    codegraph::clear_repository(pool, repository).await?;
-    for (relative, source, language) in files {
-        match codegraph::upsert_file_graph(pool, repository, &revision, &relative, &source).await {
-            Ok(delta) => {
-                summary.record_folded(language);
-                summary.nodes += delta.nodes.len();
-                summary.edges += delta.edges.len();
-            }
-            Err(error) => return Err(error.into()),
-        }
+    // The fold begins only after the entire filesystem walk and parse preflight
+    // succeeded, so one malformed file cannot leave the graph half-rebuilt. Any
+    // later database failure is returned so the caller removes its in-process
+    // success marker and retries.
+    let rebuild = codegraph::rebuild_repository(
+        pool,
+        repository,
+        &revision,
+        files
+            .iter()
+            .map(|(relative, source, _)| (relative.as_str(), source.as_str())),
+    )
+    .await?;
+    summary.revision = revision.0.clone();
+    summary.carried_edges = rebuild.edges;
+    summary.retired = rebuild.retired;
+    for ((_, _, language), folded) in files.iter().zip(&rebuild.folded) {
+        summary.record_folded(*language);
+        summary.nodes += folded.nodes;
+        summary.edges += folded.edges;
     }
 
     // A scan that folded nothing is the failure this summary exists to expose —
@@ -666,18 +683,29 @@ async fn apply_batch(
     if relative.is_empty() {
         return;
     }
-    // `.gitignore` is asked once per batch, not once per file.
+    // `.gitignore` is asked once per batch, not once per file — and the batch's
+    // revision stamp with it, in the same hop off the runtime. Both shell out to
+    // Git, and `working_tree_revision` now runs `git status`, which stats the
+    // whole worktree; blocking a runtime worker on that once per debounce window
+    // is exactly the stall `spawn_blocking` exists to avoid.
+    //
+    // Every node this batch writes over a dirty tree is stamped
+    // `<head>+workdir`, so the graph says out loud that it is describing an
+    // uncommitted tree rather than claiming the symbol was seen at that commit.
+    // Nothing filters on the revision column; the TUI's edge table and `graph.*`
+    // answers print it.
     let ignore_root = root.to_path_buf();
     let probe = relative.clone();
-    let ignored = tokio::task::spawn_blocking(move || ignored_paths(&ignore_root, &probe))
-        .await
-        .unwrap_or_default();
-
-    // Every node this batch writes is stamped `<head>+workdir`, so the graph
-    // says out loud that it is describing an uncommitted tree rather than
-    // claiming the symbol was seen at that commit. Nothing filters on the
-    // revision column; the TUI's edge table and `graph.*` answers print it.
-    let revision = working_tree_revision(root);
+    let (ignored, revision) = tokio::task::spawn_blocking(move || {
+        (
+            ignored_paths(&ignore_root, &probe),
+            working_tree_revision(&ignore_root),
+        )
+    })
+    .await
+    // A panicked blocking task leaves nothing ignored and the placeholder
+    // revision — the same conservative answers `ignored_paths` degrades to.
+    .unwrap_or_else(|_| (HashSet::new(), GitRevision("workdir".to_string())));
     let mut reparsed = 0usize;
     let mut retired = 0usize;
     for path in relative {
@@ -730,16 +758,45 @@ async fn apply_batch(
     }
 }
 
-/// `<HEAD>+workdir` — the revision an incremental, uncommitted fold is stamped
-/// with. A checkout with no resolvable `HEAD` already reports `"workdir"`, which
-/// is left alone rather than doubled.
-fn working_tree_revision(root: &Path) -> GitRevision {
+/// The revision a fold of the **working tree** is stamped with: `<HEAD>+workdir`
+/// when the tree carries uncommitted changes, the bare commit when it does not.
+///
+/// One function for one question, used by the incremental watcher and by the
+/// full [`scan_repository`] alike. They were two — the watcher stamped
+/// `+workdir` and the full scan stamped bare `HEAD` for the identical bytes — so
+/// the same symbol flipped between the two forms depending only on which path
+/// folded it last, and a full build of a dirty tree was immediately reported
+/// stale by `graph status` (2026-08-13 review, codegraph F6).
+///
+/// A checkout with no resolvable `HEAD` already reports `"workdir"`, which is
+/// left alone rather than doubled.
+pub fn working_tree_revision(root: &Path) -> GitRevision {
     let head = head_revision(root);
-    if head.0 == "workdir" {
+    if head.0 == "workdir" || !working_tree_dirty(root) {
         head
     } else {
         GitRevision(format!("{}+workdir", head.0))
     }
+}
+
+/// Whether the working tree has changes Git can see (tracked modifications or
+/// untracked, non-ignored files). Best-effort: an unanswerable Git reports
+/// "clean", which only ever makes a staleness verdict more conservative.
+///
+/// Lives here, beside [`head_revision`], because the stamp a fold writes and the
+/// staleness verdict `graph status` renders must read dirtiness the same way; a
+/// second copy in the status handler is how the two would drift apart.
+#[must_use]
+pub fn working_tree_dirty(root: &Path) -> bool {
+    Command::new("git")
+        .current_dir(root)
+        .args(["status", "--porcelain"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| !output.stdout.is_empty())
 }
 
 /// The repo-relative form of a watched path, matching exactly what the full scan
