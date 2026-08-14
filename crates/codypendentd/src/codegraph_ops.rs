@@ -280,18 +280,24 @@ impl CodeGraphGateway for CodeGraphOps {
                 query.limit.min(MAX_GRAPH_PAGE)
             };
             // Asking for neither is a client bug, not a legal "select nothing":
-            // answer it as "everything", so an omitted flag never renders as an
-            // empty graph.
+            // answer it as "everything" — BOTH halves, which is what
+            // [`CodeGraphQuery::include_nodes`] documents. Both flags default to
+            // `false`, so a protocol client sending the default `{}` lands here,
+            // and answering it with nodes alone silently deleted every edge from
+            // the reply of the most ordinary request there is.
             let (want_nodes, want_edges) = match (query.include_nodes, query.include_edges) {
-                (false, false) => (true, false),
+                (false, false) => (true, true),
                 pair => pair,
             };
 
+            // The node page is read even when only edges were asked for: this is
+            // where the by-id gate lives, so `--node <id>` naming another
+            // checkout is refused on that path too rather than quietly answered
+            // with an empty edge list.
             let nodes = select_nodes(&host.pool, repository, &query, limit).await?;
             let total_nodes = count_nodes(&host.pool, repository, &query).await?;
             let (edges, total_edges) = if want_edges {
-                let ids: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
-                select_edges(&host.pool, repository, &ids, limit).await?
+                select_edges(&host.pool, repository, &query, limit).await?
             } else {
                 (Vec::new(), 0)
             };
@@ -598,7 +604,16 @@ async fn count_nodes(
     Ok(row.get::<i64, _>(0).max(0) as u64)
 }
 
-/// The edges incident to `node_ids`, with both endpoints named.
+/// The edges incident to the nodes matching `query`, with both endpoints named,
+/// and its own page of at most `limit` rows.
+///
+/// The incident set is the **complete** filtered node set, pushed down as a
+/// subquery over the same [`push_node_filters`] the node page uses — never the
+/// node page itself. Taking the ids from the already-limited page dropped every
+/// edge whose two endpoints both fell past the page boundary, and undercounted
+/// `total_edges` while the client renders that number as a pre-limit total
+/// ("showing N of M"). `limit` is documented as a maximum per row *kind*, so
+/// nodes and edges are paged independently rather than one riding on the other.
 ///
 /// **Both** endpoints are joined back to `code_nodes` and both are constrained
 /// to the repository. Scoping only `from_node` — which is what
@@ -609,23 +624,20 @@ async fn count_nodes(
 async fn select_edges(
     pool: &SqlitePool,
     repository: RepositoryId,
-    node_ids: &[String],
+    query: &CodeGraphQuery,
     limit: u32,
 ) -> Result<(Vec<CodeGraphEdgeView>, u64), CodypendentError> {
-    if node_ids.is_empty() {
-        return Ok((Vec::new(), 0));
-    }
-    // The count runs first, over the SAME predicate builder as the page, so
-    // `total_edges` is the real total rather than "however many the limit let
-    // through". Reporting a clamped page size as the total is the same class of
-    // confidently-wrong number as the bare zero this whole command family
-    // exists to replace.
+    // The count runs first, over the SAME predicate builder as the page and
+    // without its `LIMIT`, so `total_edges` is the real total rather than
+    // "however many the limit let through". Reporting a clamped page size as the
+    // total is the same class of confidently-wrong number as the bare zero this
+    // whole command family exists to replace.
     let mut counter = QueryBuilder::new(
         "SELECT COUNT(*) FROM code_edges e \
          JOIN code_nodes f ON e.from_node = f.id \
          JOIN code_nodes t ON e.to_node = t.id",
     );
-    push_edge_filters(&mut counter, repository, node_ids);
+    push_edge_filters(&mut counter, repository, query);
     let total = counter
         .build()
         .fetch_one(pool)
@@ -641,7 +653,7 @@ async fn select_edges(
          JOIN code_nodes f ON e.from_node = f.id \
          JOIN code_nodes t ON e.to_node = t.id",
     );
-    push_edge_filters(&mut builder, repository, node_ids);
+    push_edge_filters(&mut builder, repository, query);
     builder
         .push(" ORDER BY f.qualified_name ASC, e.relation ASC, t.qualified_name ASC LIMIT ")
         .push_bind(i64::from(limit));
@@ -666,7 +678,9 @@ async fn select_edges(
 /// Bind the repository scope and the incident-node predicate onto an edge query.
 ///
 /// Shared by the page and its count so the two can never be scoped differently —
-/// the same reason [`push_node_filters`] is shared.
+/// the same reason [`push_node_filters`] is shared. The incident set is a
+/// subquery over `code_nodes` carrying the caller's filters, so it is the set the
+/// filter selects rather than the slice of it one page happened to show.
 ///
 /// **Both** endpoints are constrained to the repository. Scoping only
 /// `from_node` — which is what [`codypendent_knowledge::codegraph::edges`] does
@@ -674,26 +688,20 @@ async fn select_edges(
 /// differ — would here let an edge name a node outside the caller's repository
 /// in `to_name`, which is precisely the leak the by-id gate exists to prevent,
 /// arriving through a different door.
-fn push_edge_filters(
-    builder: &mut QueryBuilder<'_, Sqlite>,
+fn push_edge_filters<'q>(
+    builder: &mut QueryBuilder<'q, Sqlite>,
     repository: RepositoryId,
-    node_ids: &[String],
+    query: &'q CodeGraphQuery,
 ) {
     let repo = repository.to_string();
     builder
         .push(" WHERE f.repository = ")
         .push_bind(repo.clone());
     builder.push(" AND t.repository = ").push_bind(repo);
-    builder.push(" AND (e.from_node IN (");
-    let mut separated = builder.separated(", ");
-    for id in node_ids {
-        separated.push_bind(id.clone());
-    }
-    builder.push(") OR e.to_node IN (");
-    let mut separated = builder.separated(", ");
-    for id in node_ids {
-        separated.push_bind(id.clone());
-    }
+    builder.push(" AND (e.from_node IN (SELECT id FROM code_nodes");
+    push_node_filters(builder, repository, query);
+    builder.push(") OR e.to_node IN (SELECT id FROM code_nodes");
+    push_node_filters(builder, repository, query);
     builder.push("))");
 }
 
@@ -965,6 +973,140 @@ mod tests {
         assert!(
             page.total_edges > 1,
             "the total must be the real total, not the page size: {page:?}"
+        );
+    }
+
+    /// **The default request.** Both flags are `#[serde(default)]` bools, so a
+    /// protocol client sending `{}` arrives with `(false, false)` — the "asking
+    /// for neither" case. The contract calls that everything; the handler used
+    /// to answer it with nodes and no edges, so the most ordinary request there
+    /// is silently rendered an edgeless graph.
+    #[tokio::test]
+    async fn a_query_asking_for_neither_half_is_answered_with_both() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let pool = pool(&data).await;
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_repo(repo.path());
+        codegraph::upsert_file_graph(
+            &pool,
+            scan::repository_id_for(repo.path()),
+            &GitRevision("r1".to_string()),
+            "src/lib.rs",
+            "pub fn a() { b(); }\npub fn b() {}\n",
+        )
+        .await
+        .expect("fold");
+
+        let query: CodeGraphQuery = serde_json::from_str("{}").expect("the wire default");
+        assert!(!query.include_nodes && !query.include_edges);
+        let ops = ops(pool);
+        let page = ops
+            .read(CodeGraphReadRequest {
+                repository: repo.path().display().to_string(),
+                query,
+            })
+            .await
+            .expect("read");
+        assert!(!page.nodes.is_empty(), "{page:?}");
+        assert!(
+            !page.edges.is_empty(),
+            "an omitted flag must not delete the edges: {page:?}"
+        );
+        assert!(page.total_edges > 0, "{page:?}");
+
+        // An explicit half is still honoured — "neither" is the only case the
+        // handler reinterprets, so asking for edges alone must not smuggle the
+        // node page back in.
+        let edges_only = ops
+            .read(CodeGraphReadRequest {
+                repository: repo.path().display().to_string(),
+                query: CodeGraphQuery {
+                    include_edges: true,
+                    ..CodeGraphQuery::default()
+                },
+            })
+            .await
+            .expect("read");
+        assert!(edges_only.nodes.is_empty(), "{edges_only:?}");
+        assert_eq!(edges_only.edges.len(), page.edges.len(), "{edges_only:?}");
+        assert_eq!(edges_only.total_nodes, page.total_nodes);
+    }
+
+    /// **Edges are not a rider on the node page.** `limit` is a maximum per row
+    /// KIND, so an edge whose two endpoints both fall past the node page must
+    /// still be returned and still be counted — the CLI renders `total_edges` as
+    /// the `M` in "showing N of M", so a total narrowed to one page's nodes is a
+    /// wrong number printed as a fact.
+    #[tokio::test]
+    async fn edges_span_the_whole_filtered_node_set_not_the_node_page() {
+        let data = tempfile::tempdir().expect("tempdir");
+        let pool = pool(&data).await;
+        let repo = tempfile::tempdir().expect("tempdir");
+        init_repo(repo.path());
+        let repository = scan::repository_id_for(repo.path());
+        let revision = GitRevision("r1".to_string());
+        // Padding that contributes nodes and no edges, sorting before the one
+        // file that holds a call — so with a small limit the calling pair is
+        // entirely past the node page, and every edge in the repository belongs
+        // to nodes the page never shows.
+        for index in 1..=6 {
+            codegraph::upsert_file_graph(
+                &pool,
+                repository,
+                &revision,
+                &format!("src/pad{index:02}.rs"),
+                "// nothing to define\n",
+            )
+            .await
+            .expect("fold the padding");
+        }
+        codegraph::upsert_file_graph(
+            &pool,
+            repository,
+            &revision,
+            "src/zzz.rs",
+            "pub fn zzz_caller() { zzz_callee(); }\npub fn zzz_callee() {}\n",
+        )
+        .await
+        .expect("fold the pair");
+
+        let page = ops(pool.clone())
+            .read(CodeGraphReadRequest {
+                repository: repo.path().display().to_string(),
+                query: CodeGraphQuery {
+                    include_edges: true,
+                    include_nodes: true,
+                    // Five of the six padding nodes, so the calling pair sits
+                    // past the node page — and five edge rows, which is the
+                    // whole repository's edge set.
+                    limit: 5,
+                    ..CodeGraphQuery::default()
+                },
+            })
+            .await
+            .expect("read");
+        assert_eq!(page.nodes.len(), 5, "the node page is clamped: {page:?}");
+        assert!(
+            page.nodes
+                .iter()
+                .all(|node| node.source_path.as_deref() != Some("src/zzz.rs")),
+            "the pair must be past the node page for this to prove anything: {page:?}"
+        );
+
+        // The edges of the whole filtered node set — not of the three nodes that
+        // fitted on the page, which are incident to nothing.
+        let (_, true_edges) = totals(&pool, repository).await.expect("totals");
+        assert_eq!(
+            page.total_edges, true_edges,
+            "total_edges must be the filter's true total: {page:?}"
+        );
+        assert!(page.total_edges > 0, "{page:?}");
+        assert!(
+            page.edges
+                .iter()
+                .any(|edge| edge.from_name.contains("zzz_caller")
+                    && edge.to_name.contains("zzz_callee")),
+            "the call between two off-page nodes must still be returned: {page:?}"
         );
     }
 

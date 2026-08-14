@@ -214,15 +214,22 @@ pub struct CodeGraphQuery {
     /// is not a filter; it is an enumeration oracle with extra steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
-    /// Include the edges incident to the selected nodes.
+    /// Include the edges incident to the selected nodes — **every** node the
+    /// filter selects, not only the ones this page of nodes happens to show.
+    /// The two row kinds are paged independently (see [`limit`](Self::limit)),
+    /// so an edge between two nodes that both fall past the node page is still
+    /// returned and still counted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_edges: bool,
     /// Include the nodes themselves. Both false is treated as both true — a
-    /// query that selects nothing is a client bug, not a legal request.
+    /// query that selects nothing is a client bug, not a legal request. Both
+    /// flags default to `false`, so this is exactly what the default `{}` query
+    /// asks for: everything.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_nodes: bool,
-    /// Maximum rows of each kind. 0 asks for the server default; the server
-    /// clamps any request to its own ceiling.
+    /// Maximum rows of each kind — nodes and edges get a page each, not one
+    /// shared budget. 0 asks for the server default; the server clamps any
+    /// request to its own ceiling.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub limit: u32,
 }
@@ -235,6 +242,10 @@ pub struct CodeGraphPage {
     /// Nodes matching the filter **before** the limit, so a client can say
     /// "showing 50 of 812" rather than implying it showed everything.
     pub total_nodes: u64,
+    /// Edges incident to the filter's nodes, likewise **before** the limit and
+    /// likewise over the whole filtered node set — a client renders it as the
+    /// `M` in "showing N of M", so a total clamped to the page, or narrowed to
+    /// the nodes one page showed, is a wrong number presented as a fact.
     pub total_edges: u64,
     /// The limit actually applied after the server's clamp.
     pub limit: u32,

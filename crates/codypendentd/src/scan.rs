@@ -423,12 +423,15 @@ impl Drop for RepositoryWatcher {
 ///   top-level directory are never WATCHED at all — one `inotify` watch is
 ///   taken per directory, so filtering their events afterwards would still
 ///   register thousands of kernel watches for build output;
-/// * of what is watched, only files [`codegraph::language_for`] recognises reach
-///   the channel (filtered in the notify callback, before the queue);
+/// * of what is watched, only files [`codegraph::language_for`] recognises —
+///   plus a newly created top-level DIRECTORY, which nothing else can report
+///   (see [`is_new_top_level_directory`]) — reach the channel, filtered in the
+///   notify callback, before the queue;
 /// * `.gitignore` is applied per batch, by asking Git (see [`ignored_paths`]);
 /// * events are debounced by [`WATCH_DEBOUNCE`] and capped at [`WATCH_MAX_WINDOW`];
-/// * a batch over [`WATCH_BATCH_CAP`] files (a branch switch) collapses to ONE
-///   full rescan, rate-limited by [`WATCH_FULL_RESCAN_COOLDOWN`];
+/// * a batch over [`WATCH_BATCH_CAP`] files (a branch switch), or one that armed
+///   a new subtree, collapses to ONE full rescan, rate-limited by
+///   [`WATCH_FULL_RESCAN_COOLDOWN`];
 /// * everything else is an incremental per-file reparse — never a
 ///   clear-and-rebuild, which at editor-save frequency would be ruinous.
 pub fn arm_watcher(
@@ -452,12 +455,25 @@ pub fn arm_watcher(
     let dropped_by_notify = Arc::clone(&dropped);
     let mut watcher = codegraph::watcher(move |paths: Vec<PathBuf>| {
         for path in paths {
-            if is_candidate_path(&filter_root, &path) && tx.try_send(path).is_err() {
+            // Two things must reach the debouncer: a file the graph could hold,
+            // and a NEW top-level directory — which holds no extension, so the
+            // language filter discards it, and the debounce loop is the only
+            // caller of `arm_source_subtrees` (2026-08-13 review, codegraph F8).
+            // Everything else is still rejected here, before the bounded queue,
+            // because a full queue drops paths and escalates the batch to a full
+            // rescan.
+            if !is_candidate_path(&filter_root, &path)
+                && !is_new_top_level_directory(&filter_root, &path)
+            {
+                continue;
+            }
+            if tx.try_send(path).is_err() {
                 dropped_by_notify.fetch_add(1, Ordering::Relaxed);
             }
         }
     })?;
-    let watched = arm_source_subtrees(&mut watcher, &root, &mut HashSet::new());
+    let mut watched = HashSet::new();
+    arm_source_subtrees(&mut watcher, &root, &mut watched);
 
     let task = tokio::spawn(async move {
         // The watcher lives exactly as long as this task: aborting the task on
@@ -495,6 +511,37 @@ fn is_candidate_path(root: &Path, path: &Path) -> bool {
     })
 }
 
+/// True for a directory that is an **immediate child of the checkout root** and
+/// could hold source — the one event [`is_candidate_path`] must not swallow even
+/// though the graph will never hold the path itself.
+///
+/// A directory carries no source extension, so the language filter dropped its
+/// creation event before the channel; and because the debounce loop is what calls
+/// [`arm_source_subtrees`], nothing ever armed the new directory. A package added
+/// mid-session then stayed outside every watch until some unrelated accepted
+/// event started a batch — and its already-written files needed a *second* edit
+/// after that before they folded (2026-08-13 review, codegraph F8).
+///
+/// Deliberately only the root's own children. Deeper directories are already
+/// inside a recursive watch, so their appearance needs no re-arming, and the
+/// restriction is what keeps the `is_dir` stat off the hot path: this runs on
+/// notify's thread for every raw event, and the thousands a build or a checkout
+/// produces are all more than one component deep. The name test comes first, so a
+/// dot-directory or `target/` costs no syscall at all.
+fn is_new_top_level_directory(root: &Path, path: &Path) -> bool {
+    if path.parent() != Some(root) {
+        return false;
+    }
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.to_string_lossy();
+    if name == "target" || name.starts_with('.') {
+        return false;
+    }
+    path.is_dir()
+}
+
 /// Watch `root` itself (non-recursively) plus every immediate child directory
 /// that could hold source, recursively — skipping `target/`, `.git/`, any other
 /// dot-directory, and anything `.gitignore` excludes.
@@ -502,14 +549,18 @@ fn is_candidate_path(root: &Path, path: &Path) -> bool {
 /// One `inotify` watch is taken per directory, so a recursive watch on the root
 /// would register thousands for build output that can only ever produce events
 /// [`is_candidate_path`] discards. `already` carries the set arming has covered,
-/// so re-calling this only adds newly appeared directories. Returns the updated
-/// set. Best-effort per directory: one unwatchable path is logged and skipped,
-/// never fatal.
+/// so re-calling this only adds newly appeared directories. Returns the
+/// directories this call newly DISCOVERED — empty on every batch that changed
+/// nothing, which is almost all of them. Best-effort per directory: one
+/// unwatchable path is logged and never fatal, and it is still reported, because
+/// its existing contents went unannounced either way and only the caller's
+/// rescan can fold them.
 fn arm_source_subtrees(
     watcher: &mut codegraph::GraphWatcher,
     root: &Path,
     already: &mut HashSet<PathBuf>,
-) -> HashSet<PathBuf> {
+) -> Vec<PathBuf> {
+    let mut armed = Vec::new();
     // The root is watched non-recursively so a NEW top-level directory (a new
     // crate) is noticed at all; the sweep below then arms it on the next batch.
     if already.insert(root.to_path_buf()) {
@@ -518,7 +569,7 @@ fn arm_source_subtrees(
         }
     }
     let Ok(entries) = std::fs::read_dir(root) else {
-        return std::mem::take(already);
+        return armed;
     };
     let mut candidates = Vec::new();
     for entry in entries.flatten() {
@@ -540,8 +591,9 @@ fn arm_source_subtrees(
         if let Err(error) = watcher.watch_subtree(&path, true) {
             warn!(path = %path.display(), %error, "could not watch a source subtree");
         }
+        armed.push(path);
     }
-    std::mem::take(already)
+    armed
 }
 
 /// Drain events, debounce them into batches, and fold each batch into the graph.
@@ -580,12 +632,23 @@ async fn watch_loop(
             }
         };
 
-        // Two reasons to prefer one full rebuild over per-file folds: a batch
+        // A new top-level directory (a package added mid-session) is covered by
+        // no recursive watch yet — the root's own non-recursive watch is what
+        // reported it, which is why [`is_new_top_level_directory`] lets a
+        // directory event past the filter at all. One `read_dir` of the root per
+        // batch closes that gap, and it runs BEFORE the fold decision below:
+        // every file already inside that directory was written while nothing
+        // watched it, so no event for it exists or ever will, and a rescan is the
+        // only thing that can see them.
+        let armed = arm_source_subtrees(&mut watcher, &root, &mut watched);
+
+        // Three reasons to prefer one full rebuild over per-file folds: a batch
         // this large is a branch switch or a rebase (rebuilding is both cheaper
-        // and retires files the switch deleted), or the notify queue overran and
-        // this batch is missing paths it will never see again.
+        // and retires files the switch deleted); the notify queue overran and
+        // this batch is missing paths it will never see again; or a subtree was
+        // just armed, whose existing contents no event ever announced.
         let lost = dropped.swap(0, Ordering::Relaxed);
-        let wants_rebuild = lost > 0 || pending.len() > WATCH_BATCH_CAP;
+        let wants_rebuild = lost > 0 || pending.len() > WATCH_BATCH_CAP || !armed.is_empty();
 
         // One writer at a time: the same gate a full warm-up holds, so a batch
         // can never interleave with a clear-and-rebuild (F6).
@@ -595,6 +658,7 @@ async fn watch_loop(
                 %repository,
                 changed = pending.len(),
                 dropped_events = lost,
+                newly_watched = armed.len(),
                 "code-graph watcher: bulk change, rebuilding"
             );
             match scan_repository(&pool, repository, &root).await {
@@ -620,6 +684,7 @@ async fn watch_loop(
                     %repository,
                     changed = pending.len(),
                     dropped_events = lost,
+                    newly_watched = armed.len(),
                     "code-graph watcher: rebuild deferred by the cooldown; folding this batch incrementally"
                 );
             }
@@ -627,15 +692,12 @@ async fn watch_loop(
         }
         drop(guard);
 
-        // A new top-level directory (a crate added mid-session) is not covered
-        // by any recursive watch yet — the root's own non-recursive watch is what
-        // reported it. One `read_dir` of the root per batch closes that gap.
-        watched = arm_source_subtrees(&mut watcher, &root, &mut watched);
-
-        // A dropped notify event names no path, so folding the paths that did
-        // arrive cannot repair the graph. Previously a cooldown-deferred rebuild
-        // forgot `lost` here and waited for an unrelated future filesystem event;
-        // if the tree then stayed quiet the graph remained stale forever. Wait
+        // A dropped notify event names no path, and neither does a subtree armed
+        // over files that were written before it existed, so folding the paths
+        // that did arrive cannot repair the graph in either case. Previously a
+        // cooldown-deferred rebuild forgot `lost` here and waited for an
+        // unrelated future filesystem event; if the tree then stayed quiet the
+        // graph remained stale forever. Wait
         // outside the repository lock and perform the promised authoritative
         // rebuild even when no further event arrives. Events accumulated during
         // the wait remain in the bounded channel and are folded afterwards.
@@ -668,6 +730,11 @@ async fn watch_loop(
 }
 
 /// Reparse (or retire) each changed path, incrementally.
+///
+/// A batch can also carry a directory — the new-top-level-directory event
+/// [`is_new_top_level_directory`] admits so the sweep runs. It is not readable as
+/// a file and falls out at the `read_to_string` below, which is why that arm logs
+/// rather than treating an unreadable path as a deletion.
 async fn apply_batch(
     pool: &SqlitePool,
     repository: RepositoryId,
@@ -994,6 +1061,82 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "the watcher never folded the edited Python file"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[test]
+    fn a_new_top_level_directory_is_the_one_non_source_path_the_filter_admits() {
+        // The gate for F8, as a predicate. A directory carries no source
+        // extension, so `is_candidate_path` discards it — and the debounce loop
+        // is the only caller of `arm_source_subtrees`, so discarding it left a
+        // package added mid-session outside every watch.
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        for name in ["newpkg", "target", ".hidden"] {
+            std::fs::create_dir_all(root.join(name).join("src")).unwrap();
+        }
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+
+        assert!(is_new_top_level_directory(&root, &root.join("newpkg")));
+        // Everything else is still rejected before the bounded queue: the filter
+        // exists so a build's event storm cannot fill it.
+        assert!(!is_new_top_level_directory(&root, &root.join("target")));
+        assert!(!is_new_top_level_directory(&root, &root.join(".hidden")));
+        assert!(!is_new_top_level_directory(&root, &root.join("Cargo.toml")));
+        assert!(!is_new_top_level_directory(&root, &root.join("missing")));
+        // Deeper directories are already inside a recursive watch, so they need
+        // no re-arming — and keeping them out is what keeps the stat off the
+        // hot path.
+        assert!(!is_new_top_level_directory(&root, &root.join("newpkg/src")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_top_level_package_added_mid_session_folds_with_no_further_edits() {
+        // F8 end to end. Before this, the directory-creation event was dropped
+        // in the notify callback, so no batch started, so `arm_source_subtrees`
+        // never ran — and the new package's symbols needed TWO further unrelated
+        // edits before they appeared (2026-08-13 review, codegraph F8).
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn existing() {}\n").unwrap();
+        init_repo(&root);
+
+        let data = tempfile::tempdir().unwrap();
+        let pool = codypendent_knowledge::db::open(&data.path().join("graph.db"))
+            .await
+            .unwrap();
+        let repository = repository_id_for(&root);
+        {
+            let _guard = lock_repository(repository).await;
+            scan_repository(&pool, repository, &root).await.unwrap();
+        }
+        let _watcher = arm_watcher(pool.clone(), repository, &root).expect("arm the watcher");
+
+        // The exact move the finding describes: a brand-new top-level package,
+        // written in one go, and then nothing else touched at all.
+        std::fs::create_dir_all(root.join("newpkg/src")).unwrap();
+        std::fs::write(
+            root.join("newpkg/src/lib.rs"),
+            "pub fn brand_new_top_level_symbol() -> u32 { 42 }\n",
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let found =
+                !codegraph::find_symbols(&pool, repository, "brand_new_top_level_symbol", 5)
+                    .await
+                    .unwrap()
+                    .is_empty();
+            if found {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a new top-level package never reached the graph"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
