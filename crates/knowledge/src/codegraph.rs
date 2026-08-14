@@ -20,8 +20,29 @@
 //! Persistence mirrors the house conventions ([`crate::outbox`],
 //! `daemon::artifacts`): a stateless free function takes `pool: &SqlitePool`,
 //! (de)serializes rows by binding columns, and does every write inside a single
-//! `pool.begin()` transaction that also appends the index-outbox rows so the
+//! `BEGIN IMMEDIATE` transaction that also appends the index-outbox rows so the
 //! authoritative write and its `SymbolChanged` events are atomic.
+//!
+//! # Why `BEGIN IMMEDIATE` and never a bare `pool.begin()`
+//!
+//! `pool.begin()` issues a DEFERRED transaction, which takes its WAL read
+//! snapshot at the first *statement* — and every write here reads before it
+//! writes ([`upsert_file_graph`] looks up each symbol's existing id, then
+//! inserts). If any other connection commits between that read and the upgrade
+//! to a write, SQLite refuses the upgrade with `SQLITE_BUSY_SNAPSHOT` (code
+//! 517), because the transaction would otherwise write on top of a snapshot it
+//! can no longer see. `busy_timeout` cannot rescue it: waiting does not make a
+//! stale snapshot current, so SQLite returns immediately rather than blocking,
+//! and the caller must restart the transaction from the beginning.
+//!
+//! That is not theoretical. A full fold of this repository (429 files) writes
+//! over ten thousand `SymbolChanged` outbox rows, and the daemon's retrieval
+//! drainer (`codypendentd::retrieval`, every 60s) then commits one `UPDATE
+//! index_outbox` per row it claims — hundreds of commits, landing in the middle
+//! of a scan that is still folding. `graph build` failed on its own checkout,
+//! every time, at the one-minute mark. `BEGIN IMMEDIATE` takes the write lock
+//! up front, so there is no snapshot to invalidate: contention degrades to a
+//! plain `SQLITE_BUSY` that `busy_timeout` does wait out.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -293,7 +314,11 @@ pub struct RepositoryRebuild {
 /// SQLite's single write lock for the length of the scan — past the daemon's
 /// 5-second `busy_timeout`, so every unrelated write in the process (the run
 /// event ledger, the outbox, artifacts) would start failing with `database is
-/// locked`. That trade is not worth it.
+/// locked`. That trade is not worth it. Each file's fold therefore holds the
+/// write lock for its own transaction and no longer, which is what lets the
+/// daemon keep writing throughout a multi-minute scan (see the module docs on
+/// `BEGIN IMMEDIATE` for why "its own transaction" must take that lock up
+/// front rather than upgrade into it).
 pub async fn rebuild_repository<'a, I>(
     pool: &SqlitePool,
     repository: RepositoryId,
@@ -399,7 +424,7 @@ async fn remove_pathless_nodes(
     repository: RepositoryId,
 ) -> Result<u64, CodeGraphError> {
     let repo = repository.to_string();
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query(
         "DELETE FROM code_edges WHERE from_node IN \
          (SELECT id FROM code_nodes WHERE repository = ? AND source_path IS NULL) \
@@ -679,7 +704,12 @@ pub async fn upsert_file_graph(
     let now = Utc::now();
     let created_at = now.to_rfc3339();
 
-    let mut tx = pool.begin().await?;
+    // `BEGIN IMMEDIATE`, not `pool.begin()`: step 1 below reads every symbol's
+    // existing id before writing any of them, and a DEFERRED transaction that
+    // has taken its read snapshot cannot upgrade to a write once anyone else has
+    // committed — it fails with `SQLITE_BUSY_SNAPSHOT`, which `busy_timeout`
+    // does not and cannot wait out. See the module docs.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     // 1. Upsert every node, preserving ids for re-seen symbols.
     let mut ids: Vec<CodeNodeId> = Vec::with_capacity(built.nodes.len());
@@ -873,7 +903,7 @@ pub async fn remove_file_graph(
     path: &str,
 ) -> Result<u64, CodeGraphError> {
     let repo = repository.to_string();
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query(
         "DELETE FROM code_edges WHERE from_node IN \
          (SELECT id FROM code_nodes WHERE repository = ? AND source_path = ?) \
@@ -1183,7 +1213,10 @@ async fn apply_semantic_edges(
     let created_at = now.to_rfc3339();
     let mut results = Vec::with_capacity(edges.len());
 
-    let mut tx = pool.begin().await?;
+    // Resolves both endpoints by symbol key before writing anything, so it is
+    // the same read-then-write shape as `upsert_file_graph` and takes the write
+    // lock the same way.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     for edge in edges {
         let from = resolve_node_id(&mut *tx, repository, &edge.from_symbol_key).await?;
         let to = resolve_node_id(&mut *tx, repository, &edge.to_symbol_key).await?;

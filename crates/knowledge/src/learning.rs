@@ -409,7 +409,7 @@ impl LearningStore {
             .as_deref()
             .and_then(|value| normalize_conflict_key(Some(value)))
             .or_else(|| inferred_conflict_key(&candidate.content));
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         if let Some(existing_id) = find_duplicate(
             &mut *tx,
@@ -616,7 +616,7 @@ impl LearningStore {
         }
 
         let hash = normalized_hash(&current.content)?;
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(existing_id) = find_duplicate(
             &mut *tx,
             &current.scope,
@@ -676,7 +676,7 @@ impl LearningStore {
                     .to_owned(),
             ));
         }
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let conflicts = find_conflicts(
             &mut *tx,
             &record.scope,

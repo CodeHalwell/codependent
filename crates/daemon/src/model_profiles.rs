@@ -255,7 +255,7 @@ impl ModelProfileStore {
         success: bool,
         run_id: &str,
     ) -> Result<bool, ModelProfileStoreError> {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let Some(existing_json) = sqlx::query(
             "SELECT profile_json FROM model_profiles WHERE model_id = ? AND endpoint = ?",

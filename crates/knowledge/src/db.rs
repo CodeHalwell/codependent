@@ -7,6 +7,7 @@
 
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
@@ -23,7 +24,12 @@ pub async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
         // Match the daemon's pool: foreign keys ON, so referential integrity
         // (code_edges → code_nodes, document_authorship → documents, …) is
         // enforced here and in the `index rebuild` CLI exactly as in production.
-        .foreign_keys(true);
+        .foreign_keys(true)
+        // And its busy timeout. Without one SQLite's default is zero, so the
+        // first `BEGIN IMMEDIATE` that meets a concurrent writer — a daemon
+        // serving the same data directory, or this crate's own tests — fails on
+        // the spot instead of waiting the (millisecond-scale) write out.
+        .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)

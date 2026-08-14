@@ -169,7 +169,7 @@ impl SuggestionStore {
         }
         let id = Uuid::now_v7().to_string();
         let now = Utc::now();
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         // The suggestion is anchored to the revision the *proposer* observed, not
         // whatever is current now: if the document advanced between the client
         // computing the offsets and this write, the offsets are already stale, so
@@ -306,7 +306,7 @@ impl SuggestionStore {
             .ok_or_else(|| DocStoreError::Corrupt("inverted suggestion range".into()))?;
 
         let now = Utc::now();
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         // Atomically claim the pending suggestion. If a concurrent accept already
         // claimed it, this affects 0 rows and we abort before mutating anything.
         let claimed = resolve_pending(
@@ -388,7 +388,7 @@ impl SuggestionStore {
         // Ensure it exists and belongs to the document.
         let _ = self.get(pool, document_id, suggestion_id).await?;
         let now = Utc::now();
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let claimed = resolve_pending(
             &mut *tx,
             suggestion_id,

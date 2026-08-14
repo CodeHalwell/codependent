@@ -225,7 +225,10 @@ impl ArtifactStore {
         let artifact_id = ArtifactId::new();
         let byte_length = u64::try_from(bytes.len()).map_err(anyhow::Error::from)?;
         let created_at = Utc::now().to_rfc3339();
-        let mut tx = pool.begin().await.map_err(anyhow::Error::from)?;
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(anyhow::Error::from)?;
         sqlx::query(
             "INSERT INTO artifacts \
              (id, sha256, media_type, byte_length, classification, created_at, provenance_json) \

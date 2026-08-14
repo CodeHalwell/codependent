@@ -114,7 +114,7 @@ impl DocumentStore {
         let scope_json = serde_json::to_string(&new.scope)?;
         let metadata_json = serde_json::to_string(&new.metadata)?;
 
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO documents \
              (id, title, scope_json, scope_tier, scope_key, status, metadata_json, \
@@ -243,7 +243,7 @@ impl DocumentStore {
         mutation: MutationKind,
         block_id: Option<&str>,
     ) -> Result<u64, DocStoreError> {
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let (revision, status) =
             write_document_tx(&mut tx, doc, author, mutation, block_id, Utc::now()).await?;
         tx.commit().await?;
@@ -270,7 +270,7 @@ impl DocumentStore {
         links: Vec<DocumentLink>,
     ) -> Result<(), DocStoreError> {
         let links_json = serde_json::to_string(&links)?;
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let affected = sqlx::query(
             "UPDATE documents SET links_json = ?, updated_at = ? WHERE id = ? AND revision = ?",
         )

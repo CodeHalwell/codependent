@@ -117,7 +117,7 @@ impl MemoryStore {
         record: &MemoryRecord,
     ) -> Result<(), MemoryError> {
         let now = Utc::now();
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         insert_row(&mut *tx, record, now).await?;
         outbox::enqueue(
             &mut *tx,
@@ -263,7 +263,7 @@ impl MemoryStore {
             new.supersedes.push(old_id);
         }
         let now = Utc::now();
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("UPDATE memories SET valid_until = ? WHERE id = ?")
             .bind(new.valid_from.0.as_str())
             .bind(old_id.to_string())
@@ -288,7 +288,7 @@ impl MemoryStore {
         id: MemoryId,
     ) -> Result<ForgetAudit, MemoryError> {
         let now = Utc::now();
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query("DELETE FROM memories WHERE id = ?")
             .bind(id.to_string())
             .execute(&mut *tx)
@@ -316,7 +316,7 @@ impl MemoryStore {
         scope: &Scope,
     ) -> Result<ForgetAudit, MemoryError> {
         let now = Utc::now();
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         // Collect the in-scope ids first — for the tombstones and the audit — then
         // delete by id. The scope match is the same SQL isolation filter as

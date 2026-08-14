@@ -76,7 +76,7 @@ impl Registry {
         item: &RegistryItem,
     ) -> Result<(), RegistryError> {
         let now = Utc::now();
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT OR REPLACE INTO registry_items \
              (id, kind, name, version, scope_json, scope_tier, scope_key, description, \
@@ -204,7 +204,7 @@ impl Registry {
         id: RegistryItemId,
     ) -> Result<bool, RegistryError> {
         let now = Utc::now();
-        let mut tx = pool.begin().await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query("DELETE FROM registry_items WHERE id = ?")
             .bind(id.to_string())
             .execute(&mut *tx)
