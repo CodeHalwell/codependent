@@ -114,6 +114,9 @@ const GUTTER_WIDTH: usize = 2;
 /// The table budget used when the caller has no measured pane yet.
 const DEFAULT_TABLE_WIDTH: usize = 100;
 
+/// Narrowest a column may be squeezed to: two columns of content plus the "…".
+const MIN_COLUMN_WIDTH: usize = 3;
+
 /// The content columns a table may lay itself out into, given the full row
 /// width. Never below `RULE_WIDTH`: a pane too narrow for any table still has
 /// to produce readable cells rather than a column of ellipses.
@@ -129,6 +132,7 @@ struct Builder {
     lines: Vec<RichLine>,
     cur: Vec<RichSpan>,
     produced_line: bool, // false until the first line is pushed (gutter "▌ " vs "  ")
+    pending_blank: bool, // a block ended; the next line separates itself from it
     heading: Option<u8>,
     strong: usize,
     emphasis: usize,
@@ -189,7 +193,22 @@ impl Builder {
         self.push_line(body);
     }
 
+    /// Separate the next block from the one before it. Consumed by `push_line`
+    /// rather than emitted eagerly, so a message never opens or closes on a
+    /// blank line and consecutive blocks are never double-spaced.
+    fn end_block(&mut self) {
+        self.pending_blank = true;
+    }
+
     fn push_line(&mut self, body: Vec<RichSpan>) {
+        if std::mem::take(&mut self.pending_blank) && self.produced_line {
+            self.lines.push(RichLine {
+                spans: vec![RichSpan {
+                    text: "  ".to_string(),
+                    role: SpanRole::Gutter,
+                }],
+            });
+        }
         let gutter = if self.produced_line { "  " } else { "▌ " };
         self.produced_line = true;
         let mut spans = Vec::with_capacity(body.len() + 2);
@@ -212,10 +231,25 @@ impl Builder {
             return;
         }
         let role = self.inline_role();
-        self.cur.push(RichSpan {
+        self.push_inline(RichSpan {
             text: text.to_string(),
             role,
         });
+    }
+
+    /// The one sink for every inline span, so that "where does this go" is
+    /// answered in a single place. Inside a table it is the current cell;
+    /// otherwise it is the line being accumulated.
+    ///
+    /// `Event::Text` used to carry this routing alone, and `Event::Code` — the
+    /// arm directly below it — did not, so a `` `code` `` span inside a cell
+    /// left the cell empty and was flushed as a paragraph after the table:
+    /// eight file names rendered as `main.pycore/config.pycore/database.py…`.
+    fn push_inline(&mut self, span: RichSpan) {
+        match self.table.as_mut() {
+            Some(t) if t.in_cell => t.cell.push(span),
+            _ => self.cur.push(span),
+        }
     }
 
     fn event(&mut self, ev: Event) {
@@ -225,34 +259,32 @@ impl Builder {
             Event::Text(t) => {
                 if self.code_lang.is_some() {
                     self.code.push_str(&t);
-                } else if self.table.as_ref().is_some_and(|t| t.in_cell) {
-                    let role = if self.table.as_ref().unwrap().head_rows
-                        == self.table.as_ref().unwrap().rows.len()
-                    {
-                        SpanRole::TableHeader
-                    } else {
-                        SpanRole::TableCell
-                    };
-                    self.table.as_mut().unwrap().cell.push(RichSpan {
-                        text: t.to_string(),
-                        role,
-                    });
                 } else {
                     self.push_text(&t);
                 }
             }
-            Event::Code(c) => {
-                self.cur.push(RichSpan {
-                    text: c.to_string(),
-                    role: SpanRole::InlineCode,
-                });
+            Event::Code(c) => self.push_inline(RichSpan {
+                text: c.to_string(),
+                role: SpanRole::InlineCode,
+            }),
+            // A cell is one line by construction, so a break inside one is the
+            // space between its words — flushing there would split the table.
+            Event::SoftBreak | Event::HardBreak => {
+                if self.table.as_ref().is_some_and(|t| t.in_cell) {
+                    self.push_inline(RichSpan {
+                        text: " ".to_string(),
+                        role: SpanRole::Body,
+                    });
+                } else {
+                    self.flush();
+                }
             }
-            Event::SoftBreak | Event::HardBreak => self.flush(),
             Event::Rule => {
                 self.push_line(vec![RichSpan {
                     text: "─".repeat(RULE_WIDTH),
                     role: SpanRole::Rule,
                 }]);
+                self.end_block();
             }
             _ => {} // Html, InlineHtml, FootnoteReference, TaskListMarker: ignored (out of scope)
         }
@@ -322,14 +354,24 @@ impl Builder {
             TagEnd::Heading(_) => {
                 self.flush();
                 self.heading = None;
+                self.end_block();
             }
-            TagEnd::Paragraph => self.flush(),
+            TagEnd::Paragraph => {
+                self.flush();
+                // A loose list emits a paragraph per item; separating those
+                // would space the items apart rather than the list from what
+                // follows it.
+                if self.list_stack.is_empty() {
+                    self.end_block();
+                }
+            }
             TagEnd::Emphasis => self.emphasis = self.emphasis.saturating_sub(1),
             TagEnd::Strong => self.strong = self.strong.saturating_sub(1),
             TagEnd::Strikethrough => {}
             TagEnd::BlockQuote(_) => {
                 self.flush();
                 self.blockquote = self.blockquote.saturating_sub(1);
+                self.end_block();
             }
             TagEnd::Link => {
                 self.cur.push(RichSpan {
@@ -341,11 +383,15 @@ impl Builder {
             TagEnd::Item => self.flush(),
             TagEnd::List(_) => {
                 self.list_stack.pop();
+                if self.list_stack.is_empty() {
+                    self.end_block();
+                }
             }
             TagEnd::CodeBlock => {
                 let lang = self.code_lang.take().unwrap_or_default();
                 let code = std::mem::take(&mut self.code);
                 self.emit_code(&lang, &code);
+                self.end_block();
             }
             TagEnd::TableCell => {
                 if let Some(t) = self.table.as_mut() {
@@ -367,7 +413,10 @@ impl Builder {
                     t.rows.push(row);
                 }
             }
-            TagEnd::Table => self.emit_table(),
+            TagEnd::Table => {
+                self.emit_table();
+                self.end_block();
+            }
             _ => {}
         }
     }
@@ -424,48 +473,138 @@ fn layout_table(t: &TableState, budget: usize) -> Vec<Vec<RichSpan>> {
     let cell_width =
         |cell: &[RichSpan]| -> usize { UnicodeWidthStr::width(cell_text(cell).as_str()) };
 
-    // Column widths, capped so n_cols columns + " │ " joins fit the budget.
+    // What each column would need to show every cell in full.
     let joins = n_cols.saturating_sub(1).saturating_mul(3);
-    let cap = (budget.saturating_sub(joins) / n_cols).max(3);
-    let mut widths = vec![0usize; n_cols];
+    let mut natural = vec![0usize; n_cols];
     for row in &t.rows {
         for (c, cell) in row.iter().enumerate() {
-            widths[c] = widths[c].max(cell_width(cell).min(cap));
+            natural[c] = natural[c].max(cell_width(cell));
         }
     }
 
-    let pad_cell = |cell: &[RichSpan], w: usize, align: Alignment, role: SpanRole| -> RichSpan {
-        let mut text = cell_text(cell);
-        let len = UnicodeWidthStr::width(text.as_str());
-        if len > w {
-            // Drop whole graphemes until the "…" fits: a wide glyph may free
-            // two columns at once, and half a grapheme is not a character.
-            let mut kept = String::new();
-            let mut width = 0;
-            for grapheme in UnicodeSegmentation::graphemes(text.as_str(), true) {
-                let next = UnicodeWidthStr::width(grapheme);
-                if width + next > w.saturating_sub(1) {
-                    break;
+    // Share the budget by need, not equally. An equal cap truncated the wide
+    // column while the narrow one sat half empty — a two-column table on a
+    // 200-column terminal still ellipsised its prose at 45 columns because the
+    // file-name column beside it was allotted the same 45 and used 16.
+    let avail = budget.saturating_sub(joins);
+    let widths = if natural.iter().sum::<usize>() <= avail {
+        natural
+    } else {
+        // Water-fill: settle every column that fits inside an equal share, then
+        // redistribute the slack it did not use among the columns still over.
+        let mut widths = vec![None; n_cols];
+        let mut remaining = avail;
+        let mut unsettled = n_cols;
+        loop {
+            let share = (remaining / unsettled.max(1)).max(MIN_COLUMN_WIDTH);
+            let settling: Vec<usize> = (0..n_cols)
+                .filter(|&c| widths[c].is_none() && natural[c] <= share)
+                .collect();
+            if settling.is_empty() {
+                // Everyone left wants more than its share: split what is left.
+                let over: Vec<usize> = (0..n_cols).filter(|&c| widths[c].is_none()).collect();
+                let mut rest = remaining;
+                for c in over {
+                    let w = share.min(rest);
+                    widths[c] = Some(w.max(MIN_COLUMN_WIDTH));
+                    rest = rest.saturating_sub(w);
                 }
-                kept.push_str(grapheme);
-                width += next;
+                break;
             }
-            // The ellipsis is one column; anything left over is padding, so the
-            // cell still occupies exactly `w` columns.
-            text = kept + "…" + &" ".repeat(w.saturating_sub(width + 1));
-        } else {
-            let fill = w - len;
-            match align {
-                Alignment::Right => text = " ".repeat(fill) + &text,
-                Alignment::Center => {
-                    let l = fill / 2;
-                    text = " ".repeat(l) + &text + &" ".repeat(fill - l);
-                }
-                _ => text = text + &" ".repeat(fill), // None/Left
+            for c in settling {
+                widths[c] = Some(natural[c]);
+                remaining = remaining.saturating_sub(natural[c]);
+                unsettled -= 1;
+            }
+            if unsettled == 0 {
+                break;
             }
         }
-        RichSpan { text, role }
+        widths
+            .into_iter()
+            .map(|w| w.unwrap_or(MIN_COLUMN_WIDTH))
+            .collect()
     };
+
+    // A cell keeps its inline spans rather than collapsing to one string, so
+    // `code`, **bold** and *italic* inside a cell stay styled. Only spans that
+    // carry no styling of their own take the header/body role of the row.
+    let pad_cell =
+        |cell: &[RichSpan], w: usize, align: Alignment, plain: SpanRole| -> Vec<RichSpan> {
+            let role_of = |s: &RichSpan| {
+                if s.role == SpanRole::Body {
+                    plain
+                } else {
+                    s.role
+                }
+            };
+            let mut out: Vec<RichSpan> = Vec::with_capacity(cell.len() + 2);
+            let total = cell_width(cell);
+            let mut width = 0usize;
+
+            if total > w {
+                // Drop whole graphemes until the "…" fits: a wide glyph may free
+                // two columns at once, and half a grapheme is not a character.
+                let limit = w.saturating_sub(1);
+                for s in cell {
+                    let mut kept = String::new();
+                    for grapheme in UnicodeSegmentation::graphemes(s.text.as_str(), true) {
+                        let next = UnicodeWidthStr::width(grapheme);
+                        if width + next > limit {
+                            break;
+                        }
+                        kept.push_str(grapheme);
+                        width += next;
+                    }
+                    if !kept.is_empty() {
+                        out.push(RichSpan {
+                            text: kept,
+                            role: role_of(s),
+                        });
+                    }
+                    if width >= limit {
+                        break;
+                    }
+                }
+                out.push(RichSpan {
+                    text: "…".to_string(),
+                    role: plain,
+                });
+                width += 1;
+            } else {
+                out.extend(
+                    cell.iter()
+                        .filter(|s| !s.text.is_empty())
+                        .map(|s| RichSpan {
+                            text: s.text.clone(),
+                            role: role_of(s),
+                        }),
+                );
+                width = total;
+            }
+
+            // Whatever it holds, the cell occupies exactly `w` columns, or every
+            // column to its right shears out of alignment.
+            let fill = w.saturating_sub(width);
+            if fill > 0 {
+                let pad = |n: usize| RichSpan {
+                    text: " ".repeat(n),
+                    role: plain,
+                };
+                match align {
+                    Alignment::Right => out.insert(0, pad(fill)),
+                    Alignment::Center => {
+                        let left = fill / 2;
+                        if left > 0 {
+                            out.insert(0, pad(left));
+                        }
+                        out.push(pad(fill - left));
+                    }
+                    _ => out.push(pad(fill)), // None/Left
+                }
+            }
+            out
+        };
 
     let align_of = |c: usize| -> Alignment { t.aligns.get(c).copied().unwrap_or(Alignment::None) };
     let empty: Vec<RichSpan> = Vec::new();
@@ -487,7 +626,7 @@ fn layout_table(t: &TableState, budget: usize) -> Vec<Vec<RichSpan>> {
                 });
             }
             let cell = row.get(c).unwrap_or(&empty);
-            spans.push(pad_cell(cell, w, align_of(c), role));
+            spans.extend(pad_cell(cell, w, align_of(c), role));
         }
         out.push(spans);
         // Emit the "─┼─" rule directly after the header block.
@@ -787,6 +926,71 @@ mod tests {
         };
         assert_eq!(widths(&lines[0]), widths(&lines[2]), "columns not aligned");
         assert!(lines[2].spans.iter().any(|s| s.role == SpanRole::TableCell));
+    }
+
+    /// The defect a user reported from a real session: a code-graph summary
+    /// whose first column was every file name in backticks rendered the column
+    /// blank and dumped the names, run together, in a paragraph under the
+    /// table — `main.pycore/config.pycore/database.py…`.
+    #[test]
+    fn inline_code_in_a_cell_stays_in_the_cell() {
+        let md = "| File | Purpose |\n| - | - |\n| `main.py` | App entrypoint |\n\
+                  | `core/config.py` | Settings |";
+        let lines = parse(md, TEST_WIDTH);
+        let text_of =
+            |l: &RichLine| -> String { l.spans.iter().map(|s| s.text.as_str()).collect() };
+
+        let body: Vec<String> = lines.iter().map(text_of).collect();
+        assert!(
+            body.iter().any(|l| l.contains("main.py")),
+            "the cell lost its code span: {body:#?}"
+        );
+        // The run-on paragraph is the signature of the bug: both names on one
+        // line with no cell padding between them.
+        assert!(
+            !body.iter().any(|l| l.contains("main.pycore/config.py")),
+            "code spans were flushed after the table: {body:#?}"
+        );
+        // Every row is still exactly as wide as the header, so the column the
+        // code spans live in did not collapse.
+        let width = |l: &RichLine| -> usize { UnicodeWidthStr::width(text_of(l).as_str()) };
+        assert_eq!(width(&lines[0]), width(&lines[2]), "columns not aligned");
+        assert_eq!(width(&lines[0]), width(&lines[3]), "columns not aligned");
+        // And it is still styled as code rather than flattened into body text.
+        assert!(
+            lines[2]
+                .spans
+                .iter()
+                .any(|s| s.role == SpanRole::InlineCode),
+            "cell code span lost its role: {:#?}",
+            lines[2].spans
+        );
+    }
+
+    #[test]
+    fn blocks_are_separated_by_one_blank_line_and_lists_stay_tight() {
+        let md = "# Title\n\nFirst paragraph.\n\n- one\n- two\n\nAfter the list.";
+        let lines = parse(md, TEST_WIDTH);
+        let text_of =
+            |l: &RichLine| -> String { l.spans.iter().map(|s| s.text.as_str()).collect() };
+        let rendered: Vec<String> = lines.iter().map(text_of).collect();
+        let blank = |s: &String| s.trim().is_empty();
+
+        assert!(!blank(&rendered[0]), "leads with a blank: {rendered:#?}");
+        assert!(
+            !blank(rendered.last().unwrap()),
+            "trails with a blank: {rendered:#?}"
+        );
+        // Heading, paragraph, list and the closing paragraph: three separators.
+        assert_eq!(
+            rendered.iter().filter(|s| blank(s)).count(),
+            3,
+            "expected one blank between each of four blocks: {rendered:#?}"
+        );
+        // The two list items are adjacent — a list is one block, not two.
+        let one = rendered.iter().position(|l| l.contains("one")).unwrap();
+        let two = rendered.iter().position(|l| l.contains("two")).unwrap();
+        assert_eq!(two, one + 1, "list items were spaced apart: {rendered:#?}");
     }
 
     /// Table columns are terminal CELLS. A CJK or emoji cell counted by `char`s
