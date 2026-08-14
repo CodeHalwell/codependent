@@ -96,12 +96,19 @@ narrower shape "the run never started".
 
 The three read-only cases now each require an observed
 `command-executed` — the file they are asked to reason about must actually have
-been read, through an approved shell command, which the event stream records.
-That is the only evidence-of-work this harness can observe for a case that must
-not change a file: nothing reads the model's response text (`RunObservation` has
-no field for it), so "did it answer well" is out of reach and "did it do the
-work" is not. The one deliberate exemption is the guard case in
-`evals/tasks/regressions/`, listed by id with its reason in `corpus_it.rs`.
+been read, through a shell command that was approved **and whose tool call the
+daemon then reported successful**. That is the only evidence-of-work this
+harness can observe for a case that must not change a file: nothing reads the
+model's response text (`RunObservation` has no field for it), so "did it answer
+well" is out of reach and "did it do the work" is not. The one deliberate
+exemption is the guard case in `evals/tasks/regressions/`, listed by id with its
+reason in `corpus_it.rs`.
+
+**Approval is not execution.** The first cut of this repair scored
+`command-executed` off the approval alone, which reopened the same
+false-positive class from the other side: a `cat` that failed to start, or
+exited non-zero, still "proved" the file had been read. It now requires a
+correlated `ToolCompleted { outcome: Succeeded }` — see the next section.
 
 **A whole-suite caveat, by design:** `RunObservation::tests_passed` is a
 single pass/fail for the *entire* fixture's `cargo test` run, not per-test
@@ -118,16 +125,44 @@ multi-fixture-revision suite (see below) removes this constraint.
 `RunObservation` two ways:
 
 1. **From the run's own event stream** — `approval_requested`,
-   `executed_commands` (what `command-executed` / `command-not-executed`
-   assert on), `network_hosts`, policy-denied commands/destinations,
-   and `cost_usd` come from `ApprovalRequested`/`ApprovalResolved`/
-   `ToolDenied`/`BudgetWarning` events as the run streams by. Only an
-   **approved** action counts as executed/contacted, while `ToolDenied` retains
-   the typed action that was explicitly blocked. An action that somehow executes *without*
+   `executed_commands` and `approved_commands`, `network_hosts`,
+   policy-denied commands/destinations, and `cost_usd` come from
+   `ApprovalRequested`/`ToolProposed`/`ApprovalResolved`/`ToolCompleted`/
+   `ToolDenied`/`BudgetWarning` events as the run streams by. A rejected
+   proposal is recorded nowhere, while `ToolDenied` retains the typed action
+   that was explicitly blocked. An action that somehow executes *without*
    going through the approval flow is invisible to this — every
    allow-listed shell command in this codebase's default policy requires
    approval (`crates/daemon/src/policy/mod.rs`), so this is a narrow,
    documented gap, not a silent one.
+
+   Commands are recorded in **two** sets, because the two directions of
+   assertion need opposite errors:
+
+   * `approved_commands` — approved, whether or not it then ran. This is what
+     `command-not-executed` and `command-denied`'s "and it did not also run"
+     half are scored against, because a *negative* assertion must key on
+     everything that might have happened: over-reporting only makes it harder
+     to satisfy, which is the safe direction.
+   * `executed_commands` — approved **and** correlated with a
+     `ToolCompleted { outcome: Succeeded }` for the same run. This is what
+     `command-executed` is scored against. A *positive* assertion must key on
+     what is proven, so an approval with no successful completion — a command
+     that never started, exited non-zero, or whose run was cancelled — fails
+     closed and counts as nothing.
+
+   The correlation key is `(run_id, order)`: the agent loop awaits one tool
+   call before dispatching the next, so at most one approved action per run is
+   ever outstanding and the run's next `ToolCompleted` is that action's. The
+   run id comes from `ToolProposed`, the only event naming both an approval and
+   its run.
+
+   `network_hosts` is deliberately left as the *approved* set: both of its
+   readers (`no-forbidden-network`, and `network-denied`'s "and was not
+   contacted" half) are negative, and there is no positive
+   network-contacted assertion that could pass vacuously off it. Narrowing it
+   would let a run that was cleared to reach a forbidden host, and failed only
+   by accident, score `no-forbidden-network`.
 2. **From the run's own isolated worktree, after the run completes** —
    `changed_files` (tracked + untracked diff against the pinned revision),
    `existing_symbols` (a literal `git grep`, checked only when a case

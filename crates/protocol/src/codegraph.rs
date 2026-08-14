@@ -34,6 +34,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ids::{RunId, SessionId};
+
 /// One language's contribution to the graph, on the scan path and the stored
 /// path alike. `language` is the stored `code_nodes.language` scalar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +170,28 @@ pub struct CodeGraphNodeView {
     pub revision: String,
 }
 
+/// Who asserted an `agent_asserted` edge, and why.
+///
+/// The knowledge layer already records all three of these into
+/// `code_edges.evidence_artifact` (an `EvidenceRef::AgentAssertion`) on every
+/// `graph.assert_edge` call, and the tool *requires* the rationale. Without
+/// them on the wire a client can see only that some edge is agent-asserted —
+/// which is the claim, not the audit trail, and the audit trail is the reason a
+/// model is allowed to write to the graph at all. `evidence_kind` says an
+/// assertion happened; this says who made it and on what grounds, so a reviewer
+/// can go read the turn that said it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeGraphEdgeAssertion {
+    /// The session whose ledger holds the asserting turn.
+    pub session_id: SessionId,
+    /// The run that made the claim.
+    pub run_id: RunId,
+    /// The reason the agent gave, verbatim. Free text, bounded by the tool at
+    /// 400 characters — a renderer must wrap or truncate it rather than assume
+    /// it fits a row.
+    pub rationale: String,
+}
+
 /// One edge, projected for display with both endpoints already named (a client
 /// must not have to issue a second query to render an edge).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,6 +204,12 @@ pub struct CodeGraphEdgeView {
     pub confidence: f32,
     pub evidence_kind: String,
     pub revision: String,
+    /// Present exactly when this edge's stored evidence is an agent assertion —
+    /// i.e. for an `agent_asserted` edge written by `graph.assert_edge`. Absent
+    /// for every mechanically-derived edge (whose evidence points at bytes, not
+    /// a judgement), so the common case stays byte-identical on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asserted_by: Option<CodeGraphEdgeAssertion>,
 }
 
 /// The filter `graph show` applies. Every field narrows; absent fields do not.
@@ -300,6 +330,69 @@ mod tests {
         let back: CodeGraphQuery = serde_json::from_str("{}").expect("deserialize");
         assert_eq!(back, query);
         assert!(back.node_id.is_none());
+    }
+
+    fn edge(asserted_by: Option<CodeGraphEdgeAssertion>) -> CodeGraphEdgeView {
+        CodeGraphEdgeView {
+            from_id: "90000000-0000-0000-0000-000000000001".to_string(),
+            from_name: "routes::get_user".to_string(),
+            to_id: "90000000-0000-0000-0000-000000000002".to_string(),
+            to_name: "services::fetch_user".to_string(),
+            relation: "calls".to_string(),
+            confidence: 0.6,
+            evidence_kind: "agent_asserted".to_string(),
+            revision: "9f1c2ab".to_string(),
+            asserted_by,
+        }
+    }
+
+    /// A mechanically-derived edge carries no assertion, and its absence must
+    /// stay off the wire — so a daemon that never asserts anything serializes
+    /// byte-for-byte as it did before this field existed.
+    #[test]
+    fn an_edge_without_an_assertion_omits_the_field() {
+        let json = serde_json::to_string(&edge(None)).expect("serialize");
+        assert!(!json.contains("asserted_by"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<CodeGraphEdgeView>(&json).expect("deserialize"),
+            edge(None)
+        );
+    }
+
+    /// The provenance an `agent_asserted` edge exists to carry: session, run,
+    /// and the rationale the tool required. Stored on the edge row since
+    /// `graph.assert_edge` shipped; unreadable by any client until it travelled
+    /// here.
+    #[test]
+    fn an_agent_asserted_edge_carries_its_session_run_and_rationale() {
+        let view = edge(Some(CodeGraphEdgeAssertion {
+            session_id: crate::ids::SessionId::new(),
+            run_id: crate::ids::RunId::new(),
+            rationale: "the handler dispatches through the service registry, \
+                        which no parser can follow"
+                .to_string(),
+        }));
+        let json = serde_json::to_string(&view).expect("serialize");
+        assert!(
+            json.contains("dispatches through the service registry"),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<CodeGraphEdgeView>(&json).expect("deserialize"),
+            view
+        );
+    }
+
+    /// An older daemon's payload — no `asserted_by` key at all — must still
+    /// parse, to `None`. The additive-compatibility contract every type in this
+    /// module holds.
+    #[test]
+    fn an_edge_payload_without_the_field_deserializes_to_none() {
+        let json = r#"{"from_id":"a","from_name":"a","to_id":"b","to_name":"b",
+                       "relation":"calls","confidence":0.45,
+                       "evidence_kind":"syntax_inferred","revision":"9f1c2ab"}"#;
+        let back: CodeGraphEdgeView = serde_json::from_str(json).expect("old payload must parse");
+        assert!(back.asserted_by.is_none());
     }
 
     /// A status view keeps its stale reason only when it is stale.

@@ -2276,9 +2276,9 @@ fn memory_vectors() -> Vec<Vector> {
 
 fn codegraph_vectors() -> Vec<Vector> {
     use codypendent_protocol::codegraph::{
-        CodeGraphEdgeView, CodeGraphGrammar, CodeGraphLanguageCount, CodeGraphNodeView,
-        CodeGraphPage, CodeGraphQuery, CodeGraphScanReport, CodeGraphSkippedExtension,
-        CodeGraphStatusView, CodeGraphTally,
+        CodeGraphEdgeAssertion, CodeGraphEdgeView, CodeGraphGrammar, CodeGraphLanguageCount,
+        CodeGraphNodeView, CodeGraphPage, CodeGraphQuery, CodeGraphScanReport,
+        CodeGraphSkippedExtension, CodeGraphStatusView, CodeGraphTally,
     };
 
     // The reported case: a repository walked in full, folded not at all.
@@ -2339,16 +2339,41 @@ fn codegraph_vectors() -> Vec<Vector> {
             kind: "function".to_string(),
             revision: "9f1c2ab".to_string(),
         }],
-        edges: vec![CodeGraphEdgeView {
-            from_id: "90000000-0000-0000-0000-000000000001".to_string(),
-            from_name: "commands::graph_build".to_string(),
-            to_id: "90000000-0000-0000-0000-000000000002".to_string(),
-            to_name: "commands::graph_repository".to_string(),
-            relation: "calls".to_string(),
-            confidence: 0.45,
-            evidence_kind: "syntax_inferred".to_string(),
-            revision: "9f1c2ab".to_string(),
-        }],
+        edges: vec![
+            CodeGraphEdgeView {
+                from_id: "90000000-0000-0000-0000-000000000001".to_string(),
+                from_name: "commands::graph_build".to_string(),
+                to_id: "90000000-0000-0000-0000-000000000002".to_string(),
+                to_name: "commands::graph_repository".to_string(),
+                relation: "calls".to_string(),
+                confidence: 0.45,
+                evidence_kind: "syntax_inferred".to_string(),
+                revision: "9f1c2ab".to_string(),
+                // A mechanically-derived edge asserts nothing, so the field
+                // stays off the wire entirely.
+                asserted_by: None,
+            },
+            // The agent lever's own row: `graph.assert_edge` records session,
+            // run and the required rationale onto the edge, and this is the
+            // projection that lets a client read them back.
+            CodeGraphEdgeView {
+                from_id: "90000000-0000-0000-0000-000000000003".to_string(),
+                from_name: "routes::get_user".to_string(),
+                to_id: "90000000-0000-0000-0000-000000000004".to_string(),
+                to_name: "services::fetch_user".to_string(),
+                relation: "calls".to_string(),
+                confidence: 0.6,
+                evidence_kind: "agent_asserted".to_string(),
+                revision: "9f1c2ab".to_string(),
+                asserted_by: Some(CodeGraphEdgeAssertion {
+                    session_id: session_id(),
+                    run_id: run_id(),
+                    rationale: "the handler dispatches through the service \
+                                registry, which no parser can follow"
+                        .to_string(),
+                }),
+            },
+        ],
         total_nodes: 812,
         total_edges: 1904,
         limit: 50,

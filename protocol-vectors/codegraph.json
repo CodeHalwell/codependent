@@ -72,6 +72,21 @@
           "revision": "9f1c2ab",
           "to_id": "90000000-0000-0000-0000-000000000002",
           "to_name": "commands::graph_repository"
+        },
+        {
+          "asserted_by": {
+            "rationale": "the handler dispatches through the service registry, which no parser can follow",
+            "run_id": "30000000-0000-0000-0000-000000000001",
+            "session_id": "20000000-0000-0000-0000-000000000001"
+          },
+          "confidence": 0.6000000238418579,
+          "evidence_kind": "agent_asserted",
+          "from_id": "90000000-0000-0000-0000-000000000003",
+          "from_name": "routes::get_user",
+          "relation": "calls",
+          "revision": "9f1c2ab",
+          "to_id": "90000000-0000-0000-0000-000000000004",
+          "to_name": "services::fetch_user"
         }
       ],
       "limit": 50,

@@ -3124,10 +3124,71 @@ fn render_page(page: &codypendent_protocol::CodeGraphPage) -> String {
                 "  {:<12} {} -> {}  ({:.2}, {})\n",
                 edge.relation, edge.from_name, edge.to_name, edge.confidence, edge.evidence_kind
             ));
+            if let Some(assertion) = &edge.asserted_by {
+                out.push_str(&render_edge_assertion(assertion));
+            }
         }
     }
     out.push('\n');
     out
+}
+
+/// The indent every edge continuation line hangs under: two leading spaces plus
+/// the 12-column relation field and its separator, so provenance lines up under
+/// the endpoint names rather than under the relation.
+const EDGE_CONTINUATION_INDENT: &str = "               ";
+
+/// A conservative terminal width — the one every wrapped line here fits inside.
+const EDGE_LINE_WIDTH: usize = 80;
+
+/// The columns a rationale may occupy, derived from the width it must fit and
+/// the indent it hangs under (plus the two columns that set it apart from the
+/// run/session lines) rather than restated, so the two cannot drift.
+const RATIONALE_WIDTH: usize = EDGE_LINE_WIDTH - EDGE_CONTINUATION_INDENT.len() - 2;
+
+/// Render an agent-asserted edge's provenance under its row: the run that
+/// claimed it, and the reason it gave.
+///
+/// `evidence_kind` already told the reader THAT a model wrote this edge. That is
+/// the claim; this is the audit trail, and the audit trail is the whole reason a
+/// model is permitted to write to the graph. So the rationale travels in full
+/// rather than being reduced to "asserted by run <uuid>" — the same choice
+/// `crate::tui::evidence_source` makes for a memory's provenance.
+///
+/// A rationale is free text up to 400 characters, which is five terminal rows,
+/// so it is wrapped at [`RATIONALE_WIDTH`] under a fixed indent instead of being
+/// pushed onto the edge row: an edge table whose rows are sometimes 400 columns
+/// wide is not readable, and truncating would throw away the only part a
+/// reviewer actually needs.
+fn render_edge_assertion(assertion: &codypendent_protocol::CodeGraphEdgeAssertion) -> String {
+    // Run and session on separate lines: two full UUIDs plus the indent is 113
+    // columns, which wraps in every terminal and makes both unselectable.
+    let mut out = format!(
+        "{EDGE_CONTINUATION_INDENT}asserted by run {}\n\
+         {EDGE_CONTINUATION_INDENT}in session {}\n",
+        assertion.run_id, assertion.session_id
+    );
+    for line in wrap_words(assertion.rationale.trim(), RATIONALE_WIDTH) {
+        out.push_str(&format!("{EDGE_CONTINUATION_INDENT}  {line}\n"));
+    }
+    out
+}
+
+/// Greedy word wrap to `width` columns. A single word longer than `width` is
+/// left whole on its own line rather than split — breaking mid-identifier makes
+/// a symbol name unsearchable, which is worse than one long line.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    lines
 }
 
 /// The `[mcp]` disposition as the operator wrote it in `policy.toml`
@@ -3347,6 +3408,125 @@ mod graph_tests {
             limit: 50,
         });
         assert!(rendered.contains("showing 1 of 812"), "{rendered}");
+    }
+
+    fn edge_view(
+        evidence_kind: &str,
+        asserted_by: Option<codypendent_protocol::CodeGraphEdgeAssertion>,
+    ) -> codypendent_protocol::CodeGraphEdgeView {
+        codypendent_protocol::CodeGraphEdgeView {
+            from_id: "n1".to_string(),
+            from_name: "routes::handle_charge".to_string(),
+            to_id: "n2".to_string(),
+            to_name: "services::ChargeService::run".to_string(),
+            relation: "calls".to_string(),
+            confidence: 0.6,
+            evidence_kind: evidence_kind.to_string(),
+            revision: "9f1c2ab".to_string(),
+            asserted_by,
+        }
+    }
+
+    fn page_of(edges: Vec<codypendent_protocol::CodeGraphEdgeView>) -> CodeGraphPage {
+        let total_edges = edges.len() as u64;
+        CodeGraphPage {
+            nodes: Vec::new(),
+            edges,
+            total_nodes: 0,
+            total_edges,
+            limit: 50,
+        }
+    }
+
+    /// The audit trail an agent-written edge exists to leave: `graph show
+    /// --edges` must name the run that asserted it and print the reason it
+    /// gave. Before this, the row said `agent_asserted` and stopped — the claim
+    /// without the grounds.
+    #[test]
+    fn an_agent_asserted_edge_prints_its_run_and_rationale() {
+        let session_id = SessionId::new();
+        let run_id = codypendent_protocol::RunId::new();
+        let rendered = render_page(&page_of(vec![edge_view(
+            "agent_asserted",
+            Some(codypendent_protocol::CodeGraphEdgeAssertion {
+                session_id,
+                run_id,
+                rationale: "src/routes.rs dispatches POST /charge to this handler by name"
+                    .to_string(),
+            }),
+        )]));
+        assert!(rendered.contains("agent_asserted"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("asserted by run {run_id}")),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&session_id.to_string()), "{rendered}");
+        assert!(
+            rendered.contains("dispatches POST /charge to this handler by name"),
+            "{rendered}"
+        );
+    }
+
+    /// A parsed edge asserts nothing, so its row must be exactly what it was —
+    /// no blank provenance line, no "asserted by" with nothing after it.
+    #[test]
+    fn a_parsed_edge_gains_no_provenance_line() {
+        let rendered = render_page(&page_of(vec![edge_view("syntax_inferred", None)]));
+        assert!(rendered.contains("syntax_inferred"), "{rendered}");
+        assert!(!rendered.contains("asserted by"), "{rendered}");
+    }
+
+    /// A rationale is free text up to 400 characters. It must wrap under the
+    /// edge row rather than smear one row across 400 columns — the row layout is
+    /// what makes an edge table readable at all.
+    #[test]
+    fn a_long_rationale_wraps_instead_of_running_off_the_row() {
+        let rationale = "the route table maps every path to a handler by name at startup, so \
+                         nothing in the source text links this handler to the service it \
+                         ultimately calls; the link is only visible at runtime, which is exactly \
+                         why a human had to tell the graph about it"
+            .to_string();
+        assert!(rationale.len() > 200, "the fixture must actually be long");
+        let rendered = render_page(&page_of(vec![edge_view(
+            "agent_asserted",
+            Some(codypendent_protocol::CodeGraphEdgeAssertion {
+                session_id: SessionId::new(),
+                run_id: codypendent_protocol::RunId::new(),
+                rationale: rationale.clone(),
+            }),
+        )]));
+
+        // Only the provenance lines are this function's to bound — an edge row
+        // itself is as wide as the two symbol names it must print in full.
+        let provenance: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with(EDGE_CONTINUATION_INDENT))
+            .collect();
+        assert!(
+            provenance.len() > 3,
+            "a 200+ character rationale must occupy several lines: {provenance:?}"
+        );
+        for line in &provenance {
+            assert!(
+                line.chars().count() <= EDGE_LINE_WIDTH,
+                "every provenance line stays inside {EDGE_LINE_WIDTH} columns: {line:?}"
+            );
+        }
+        // Wrapped, not truncated: every word survives.
+        let flattened: String = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+        let wanted: String = rationale.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flattened.contains(&wanted), "{rendered}");
+    }
+
+    #[test]
+    fn wrap_words_never_splits_a_single_long_word() {
+        let long = "a_very_long_identifier_that_exceeds_the_width_on_its_own";
+        assert_eq!(wrap_words(long, 10), vec![long.to_string()]);
+        assert_eq!(
+            wrap_words("one two three", 7),
+            vec!["one two".to_string(), "three".to_string()]
+        );
+        assert!(wrap_words("   ", 10).is_empty());
     }
 }
 

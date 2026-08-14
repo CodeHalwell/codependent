@@ -56,11 +56,11 @@ use codypendent_daemon::codegraph::{
     CodeGraphGateway, CodeGraphReadFuture, CodeGraphReadRequest, CodeGraphStatusFuture,
     CodeGraphStatusRequest,
 };
-use codypendent_knowledge::{GitRevision, Language, ScanSummary};
+use codypendent_knowledge::{EvidenceRef, GitRevision, Language, ScanSummary};
 use codypendent_protocol::{
-    CodeGraphEdgeView, CodeGraphGrammar, CodeGraphLanguageCount, CodeGraphNodeView, CodeGraphPage,
-    CodeGraphQuery, CodeGraphScanReport, CodeGraphSkippedExtension, CodeGraphStatusView,
-    CodeGraphTally, CodypendentError, RepositoryId,
+    CodeGraphEdgeAssertion, CodeGraphEdgeView, CodeGraphGrammar, CodeGraphLanguageCount,
+    CodeGraphNodeView, CodeGraphPage, CodeGraphQuery, CodeGraphScanReport,
+    CodeGraphSkippedExtension, CodeGraphStatusView, CodeGraphTally, CodypendentError, RepositoryId,
 };
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tracing::{info, warn};
@@ -646,9 +646,15 @@ async fn select_edges(
         .get::<i64, _>(0)
         .max(0) as u64;
 
+    // `evidence_artifact` joins the page because `evidence_kind` alone says only
+    // THAT an edge was asserted by an agent, never by whom or why — and
+    // `graph.assert_edge` records exactly that, run and required rationale, into
+    // this column on every write. Selecting the column is what turns the
+    // agent-write audit trail from stored-but-unreadable into something a client
+    // can render (see `agent_assertion`).
     let mut builder = QueryBuilder::new(
         "SELECT e.from_node, f.qualified_name AS from_name, e.to_node, t.qualified_name AS to_name, \
-                e.relation, e.confidence, e.evidence_kind, e.revision \
+                e.relation, e.confidence, e.evidence_kind, e.evidence_artifact, e.revision \
          FROM code_edges e \
          JOIN code_nodes f ON e.from_node = f.id \
          JOIN code_nodes t ON e.to_node = t.id",
@@ -670,9 +676,38 @@ async fn select_edges(
             confidence: row.get::<f64, _>("confidence") as f32,
             evidence_kind: row.get::<String, _>("evidence_kind"),
             revision: row.get::<String, _>("revision"),
+            asserted_by: agent_assertion(
+                row.get::<Option<String>, _>("evidence_artifact").as_deref(),
+            ),
         })
         .collect();
     Ok((edges, total))
+}
+
+/// The agent-assertion provenance stored in one edge's `evidence_artifact`, if
+/// that is what it holds.
+///
+/// `EvidenceRef` has three variants and only [`EvidenceRef::AgentAssertion`]
+/// points at a judgement rather than at bytes; the other two describe a
+/// machine-derived edge and have nothing a reviewer needs to read, so they
+/// project to `None` rather than to an empty assertion. Unparseable or absent
+/// evidence is likewise `None` — a stored row this daemon cannot interpret must
+/// not stop the page being served, and an edge with no readable provenance is
+/// honestly reported as having none.
+fn agent_assertion(evidence_json: Option<&str>) -> Option<CodeGraphEdgeAssertion> {
+    let evidence: EvidenceRef = serde_json::from_str(evidence_json?).ok()?;
+    match evidence {
+        EvidenceRef::AgentAssertion {
+            session_id,
+            run_id,
+            rationale,
+        } => Some(CodeGraphEdgeAssertion {
+            session_id,
+            run_id,
+            rationale,
+        }),
+        EvidenceRef::EventRange { .. } | EvidenceRef::Artifact { .. } => None,
+    }
 }
 
 /// Bind the repository scope and the incident-node predicate onto an edge query.

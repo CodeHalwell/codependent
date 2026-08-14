@@ -307,3 +307,85 @@ async fn an_assertion_never_displaces_a_more_confident_edge() {
         "the resolved edge is still the one the graph holds"
     );
 }
+
+/// The other half of the audit trail: an assertion that is *stored* with its
+/// provenance but cannot be *read back* is not an audit trail at all.
+///
+/// `graph.assert_edge` records session, run and the required rationale into
+/// `code_edges.evidence_artifact`; this drives the SAME `CodeGraphGateway::read`
+/// that answers `codypendent graph show --edges` and asserts all three arrive on
+/// the projection — so a reviewer can see who asserted an edge and why, not just
+/// that a model did. A parsed edge in the same page must stay unannotated, or
+/// "agent-asserted" would stop meaning anything.
+#[tokio::test]
+async fn graph_show_reads_back_who_asserted_an_edge_and_why() {
+    use codypendent_daemon::codegraph::{CodeGraphGateway, CodeGraphReadRequest};
+    use codypendent_protocol::CodeGraphQuery;
+
+    let checkout = tempfile::tempdir().expect("tempdir");
+    seed_repository(checkout.path());
+    let data = tempfile::tempdir().expect("tempdir");
+    let pool = db::open(&data.path().join("codypendent.db"))
+        .await
+        .expect("open database");
+    let root = checkout.path().canonicalize().expect("canonical checkout");
+    let repository = scan::repository_id_for(&root);
+    {
+        let _guard = scan::lock_repository(repository).await;
+        scan::scan_repository(&pool, repository, &root)
+            .await
+            .expect("scan the checkout");
+    }
+
+    let session_id = SessionId::new();
+    let run_id = RunId::new();
+    let rationale = "src/routes.rs dispatches POST /charge to this handler by name";
+    let outcomes = PoolCodeGraphAssertions::new(pool.clone())
+        .assert_edges(EdgeAssertionRequest {
+            repository: &root,
+            session_id,
+            run_id,
+            edges: &[edge("handle_charge", "ChargeService::run", rationale)],
+        })
+        .await
+        .expect("the seam answers");
+    assert!(outcomes[0].recorded(), "sanity: the edge was written");
+
+    let page = codypendent_codypendentd::codegraph_ops::CodeGraphOps::new(
+        pool,
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    )
+    .read(CodeGraphReadRequest {
+        repository: root.display().to_string(),
+        query: CodeGraphQuery {
+            include_edges: true,
+            include_nodes: true,
+            ..CodeGraphQuery::default()
+        },
+    })
+    .await
+    .expect("read the graph the way `graph show` does");
+
+    let asserted = page
+        .edges
+        .iter()
+        .find(|edge| edge.evidence_kind == "agent_asserted")
+        .unwrap_or_else(|| panic!("the asserted edge is in the page: {:?}", page.edges));
+    let provenance = asserted
+        .asserted_by
+        .as_ref()
+        .expect("an agent-asserted edge must carry WHO asserted it and WHY");
+    assert_eq!(provenance.run_id, run_id);
+    assert_eq!(provenance.session_id, session_id);
+    assert_eq!(provenance.rationale, rationale);
+
+    assert!(
+        page.edges
+            .iter()
+            .filter(|edge| edge.evidence_kind != "agent_asserted")
+            .all(|edge| edge.asserted_by.is_none()),
+        "a parsed edge asserts nothing and must carry no assertion: {:?}",
+        page.edges
+    );
+}

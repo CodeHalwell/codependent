@@ -37,9 +37,9 @@ pub use blackboard::{board_scope_id, BlackboardItemDraft, BlackboardItemView, Bl
 pub use capabilities::ClientCapabilities;
 pub use catchup::{Catchup, PendingApprovalProjection, SessionProjection};
 pub use codegraph::{
-    CodeGraphEdgeView, CodeGraphGrammar, CodeGraphLanguageCount, CodeGraphNodeView, CodeGraphPage,
-    CodeGraphQuery, CodeGraphScanReport, CodeGraphSkippedExtension, CodeGraphStatusView,
-    CodeGraphTally,
+    CodeGraphEdgeAssertion, CodeGraphEdgeView, CodeGraphGrammar, CodeGraphLanguageCount,
+    CodeGraphNodeView, CodeGraphPage, CodeGraphQuery, CodeGraphScanReport,
+    CodeGraphSkippedExtension, CodeGraphStatusView, CodeGraphTally,
 };
 pub use command::{
     CanaryMetrics, Command, CommandBody, DaemonStore, NamedResource, PromotionAction,
