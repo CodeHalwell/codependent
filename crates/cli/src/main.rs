@@ -85,9 +85,12 @@ enum TopCommand {
     /// Start a headless run and stream its events — the scriptable twin of
     /// the interactive TUI.
     Run {
-        /// What the agent should do.
+        /// What the agent should do (positional or `--objective`).
+        #[arg(value_name = "PROMPT")]
+        prompt: Option<String>,
+        /// What the agent should do (flag form).
         #[arg(long)]
-        objective: String,
+        objective: Option<String>,
         /// The mode preset the run starts in: how much the agent may change
         /// without asking.
         #[arg(long, value_enum, default_value = "build")]
@@ -107,9 +110,8 @@ enum TopCommand {
         #[arg(long)]
         model: Option<String>,
         /// Stream every session event to stdout as JSONL until the run
-        /// terminates. Currently required: run `codypendent` with no
-        /// subcommand for the interactive view.
-        #[arg(long)]
+        /// terminates. `--json` is accepted as an alias.
+        #[arg(long, visible_alias = "json")]
         jsonl: bool,
     },
     /// Attach to an existing session and stream its events as JSONL.
@@ -1172,6 +1174,7 @@ impl From<ModeArg> for AgentMode {
 /// dedicated enum keeps room for future formats without a breaking CLI change.
 #[derive(Clone, Copy, ValueEnum)]
 enum EventsFormat {
+    #[value(alias = "json")]
     Jsonl,
 }
 
@@ -1251,12 +1254,21 @@ async fn run() -> anyhow::Result<()> {
             DaemonCommand::Restart => commands::restart(&paths).await,
         },
         TopCommand::Run {
+            prompt,
             objective,
             mode,
             repo,
             model,
             jsonl,
         } => {
+            let objective = match (prompt, objective) {
+                (Some(p), _) => p,
+                (None, Some(obj)) => obj,
+                (None, None) => {
+                    eprintln!("error: an objective or positional prompt is required for `codypendent run`");
+                    std::process::exit(2);
+                }
+            };
             let repo = match repo {
                 Some(repo) => repo,
                 None => std::env::current_dir()?,

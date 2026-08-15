@@ -956,6 +956,10 @@ impl RuntimeExecutor {
             .with_questions(Arc::new(PoolQuestionChannel {
                 pool: self.pool.clone(),
                 broker: self.questions.clone(),
+            }))
+            .with_plan_bridge(Arc::new(PoolPlanBridge {
+                pool: self.pool.clone(),
+                subscriptions: self.subscriptions.clone(),
             }));
 
         let hook_engine: Option<Arc<dyn codypendent_daemon::hook_engine::HookDispatch>> =
@@ -1030,6 +1034,12 @@ impl RuntimeExecutor {
             }
         }
 
+        let home = std::env::var("HOME").ok().map(PathBuf::from);
+        let instructions = codypendent_runtime::instructions::discover_instructions(
+            &operating_tree,
+            home.as_deref(),
+        );
+
         let mut ctx = RunContext::new(
             launch.session_id,
             launch.run_id,
@@ -1037,7 +1047,9 @@ impl RuntimeExecutor {
             launch.mode,
             operating_tree.clone(),
             operating_tree.clone(),
-        );
+        )
+        .with_instructions(instructions.clone());
+        let driver = driver.with_instructions(instructions);
         let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
         self.steerings
             .lock()
@@ -3018,6 +3030,47 @@ impl QuestionChannel for PoolQuestionChannel {
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(reply)
+    }
+}
+
+pub(crate) struct PoolPlanBridge {
+    pub(crate) pool: SqlitePool,
+    pub(crate) subscriptions: SubscriptionHub,
+}
+
+#[async_trait]
+impl codypendent_runtime::agent::PlanBridge for PoolPlanBridge {
+    async fn switch_mode(
+        &self,
+        session_id: SessionId,
+        _run_id: RunId,
+        target: AgentMode,
+        text: String,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let views = codypendent_daemon::prompt_queue::enqueue(
+            &mut tx,
+            session_id,
+            &text,
+            target,
+            codypendent_protocol::PromptDelivery::Queue,
+        )
+        .await?;
+        tx.commit().await?;
+
+        let seq = codypendent_daemon::ledger::next_sequence(&self.pool, session_id).await?;
+        let now = chrono::Utc::now();
+        let event = codypendent_protocol::SessionEvent {
+            sequence: seq,
+            occurred_at: now,
+            causation_id: None,
+            correlation_id: None,
+            actor: Actor::System,
+            body: EventBody::PendingPromptsChanged { prompts: views },
+        };
+        codypendent_daemon::ledger::append_event(&self.pool, session_id, &event).await?;
+        self.subscriptions.publish(session_id, event);
+        Ok(())
     }
 }
 

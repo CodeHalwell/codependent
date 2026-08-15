@@ -386,7 +386,6 @@ fn render_run_telemetry(frame: &mut Frame, area: Rect, state: &AppState, theme: 
         AgentMode::Build => "full access",
         _ => "policy",
     };
-    let workspace = status.worktree.as_deref().unwrap_or("—");
     let health = if state.issues.is_empty() {
         if state.daemon_build_id.is_some() {
             "connected".to_owned()
@@ -477,72 +476,77 @@ fn render_run_telemetry(frame: &mut Frame, area: Rect, state: &AppState, theme: 
         },
     ];
     let verbose = area.width >= 160;
-    let optional = [
-        TelemetryItem {
-            text: format!("via {}", truncate_display_width(provider_label, 18)),
-            color: theme.text.secondary,
-        },
-        // What the run actually cost, measured. This used to be `format_cost`
-        // over the budget projection alone — a field whose only writer is a
-        // `BudgetWarning{Cost}` that nothing in the workspace emits, so it read
-        // `—` after every run while the provider's own token counts arrived on
-        // the same connection and were thrown away.
-        TelemetryItem {
-            text: match usage_label(
-                status.prompt_tokens,
-                status.completion_tokens,
-                status.cost_micros,
-            ) {
-                Some(usage) if verbose => format!("usage {usage}"),
-                Some(usage) => usage,
-                None if verbose => format!("cost {}", format_cost(status.cost_minor)),
-                None => format_cost(status.cost_minor),
+    let mut optional: Vec<TelemetryItem> = Vec::new();
+    optional.push(TelemetryItem {
+        text: format!("via {}", truncate_display_width(provider_label, 18)),
+        color: theme.text.secondary,
+    });
+
+    let measured_usage = usage_label(
+        status.prompt_tokens,
+        status.completion_tokens,
+        status.cost_micros,
+    );
+    if let Some(usage) = measured_usage {
+        optional.push(TelemetryItem {
+            text: if verbose {
+                format!("usage {usage}")
+            } else {
+                usage
             },
             color: theme.status.warning,
-        },
-        TelemetryItem {
+        });
+    } else if let Some(cost) = status.cost_minor {
+        optional.push(TelemetryItem {
             text: if verbose {
-                format!("permissions {permission}")
+                format!("cost {}", format_cost(Some(cost)))
             } else {
-                format!("perm:{permission}")
+                format_cost(Some(cost))
+            },
+            color: theme.status.warning,
+        });
+    }
+
+    optional.push(TelemetryItem {
+        text: if verbose {
+            format!("permissions {permission}")
+        } else {
+            format!("perm:{permission}")
+        },
+        color: theme.text.secondary,
+    });
+
+    if let Some(ref wt) = status.worktree {
+        optional.push(TelemetryItem {
+            text: if verbose {
+                format!("branch/worktree {}", truncate_display_width(wt, 18))
+            } else {
+                format!("wt:{}", truncate_display_width(wt, 10))
             },
             color: theme.text.secondary,
+        });
+    }
+
+    optional.push(TelemetryItem {
+        text: if verbose {
+            format!("health {health}")
+        } else if state.issues.is_empty() {
+            "health:ok".to_owned()
+        } else {
+            format!("health:{}!", state.issues.len())
         },
-        TelemetryItem {
-            text: if verbose {
-                format!("branch/worktree {}", truncate_display_width(workspace, 18))
-            } else {
-                format!("wt:{}", truncate_display_width(workspace, 10))
-            },
-            color: theme.text.secondary,
+        color: if state.issues.is_empty() {
+            theme.status.success
+        } else {
+            theme.status.warning
         },
-        TelemetryItem {
-            text: if verbose {
-                format!("health {health}")
-            } else if state.issues.is_empty() {
-                "health:ok".to_owned()
-            } else {
-                format!("health:{}!", state.issues.len())
-            },
-            color: if state.issues.is_empty() {
-                theme.status.success
-            } else {
-                theme.status.warning
-            },
-        },
-        TelemetryItem {
-            text: if verbose {
-                "reasoning —".to_owned()
-            } else {
-                "r:—".to_owned()
-            },
-            color: theme.text.muted,
-        },
-        TelemetryItem {
-            text: "Shift-drag copy".to_owned(),
-            color: theme.text.muted,
-        },
-    ];
+    });
+
+    optional.push(TelemetryItem {
+        text: "Shift-drag copy".to_owned(),
+        color: theme.text.muted,
+    });
+
     let mut used = 2_usize
         + required.iter().map(|item| item.text.width()).sum::<usize>()
         + required.len().saturating_sub(1) * 3;
@@ -791,6 +795,10 @@ pub fn render_splash(
             "Many agents. One shared workspace. You stay in control.",
             Style::default().fg(theme.text.secondary),
         ));
+        lines.push(Line::styled(
+            format!("v{BUILD_ID}"),
+            Style::default().fg(theme.text.muted),
+        ));
         lines.push(Line::raw(""));
     }
     if ready {
@@ -880,11 +888,7 @@ pub fn render_splash(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(theme.surface.panel))
-        .title_bottom(Line::styled(
-            format!(" v{BUILD_ID} "),
-            Style::default().fg(theme.text.muted),
-        ));
+        .style(Style::default().bg(theme.surface.panel));
     let content = block.inner(card);
     frame.render_widget(block, card);
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), content);
@@ -1089,9 +1093,10 @@ fn render_context_pane(frame: &mut Frame, area: Rect, state: &AppState, theme: &
     lines.push(section("Run", theme));
     if let Some(run) = state.selected_run() {
         let field = |k: &str, v: String, color: Color| -> Line {
+            let val_color = if v == "—" { theme.text.muted } else { color };
             Line::from(vec![
                 Span::styled(format!("  {k}: "), Style::default().fg(theme.text.muted)),
-                Span::styled(v, Style::default().fg(color)),
+                Span::styled(v, Style::default().fg(val_color)),
             ])
         };
         lines.push(field(
@@ -1363,6 +1368,18 @@ fn split_line_cells(line: &Line<'_>, width: u16) -> Vec<Line<'static>> {
     out
 }
 
+/// The semantic accent color associated with an agent mode.
+pub fn mode_accent(mode: AgentMode, theme: &Theme) -> Color {
+    match mode {
+        AgentMode::Ask => theme.status.info,
+        AgentMode::Explore => theme.syntax.keyword,
+        AgentMode::Plan => theme.focus.active,
+        AgentMode::Build => theme.agent.tool,
+        AgentMode::Review => theme.status.warning,
+        _ => theme.focus.active,
+    }
+}
+
 /// One transcript fold's full address: the run it belongs to, then its entry
 /// index within that run. The conversation stacks every run, so an entry index
 /// on its own does not identify a card.
@@ -1380,6 +1397,8 @@ struct Row<'a> {
     /// A full-width background for this row (the `You` container). Cosmetic —
     /// `columns()`/`rows()` ignore it; applied only to visible rows at build.
     bg: Option<Color>,
+    /// Continuous assistant rail accent color (Action 1).
+    rail: Option<Color>,
     /// Whether this row belongs to the browsed (`Alt-↑`/`Alt-↓`) transcript
     /// entry. The measure pass sums these rows' offsets so the viewport can
     /// keep the browsed fold in sight.
@@ -1406,6 +1425,7 @@ impl<'a> Row<'a> {
             kind: RowKind::Built(line),
             hit_entry: None,
             bg: None,
+            rail: None,
             selected: false,
         }
     }
@@ -1419,6 +1439,7 @@ impl<'a> Row<'a> {
             },
             hit_entry: None,
             bg: None,
+            rail: None,
             selected: false,
         }
     }
@@ -1427,8 +1448,13 @@ impl<'a> Row<'a> {
             kind: RowKind::Rich(rl),
             hit_entry: None,
             bg: None,
+            rail: None,
             selected: false,
         }
+    }
+    fn with_rail(mut self, color: Color) -> Self {
+        self.rail = Some(color);
+        self
     }
     /// Wrapped visual-row height, allocation-free: drives the same
     /// [`CellWrap`] rule the draw pass splits with, so measure == draw.
@@ -1491,10 +1517,14 @@ fn style_for(role: SpanRole, theme: &Theme) -> Style {
     match role {
         SpanRole::Gutter => base.fg(theme.text.muted),
         SpanRole::Body => base.fg(theme.agent.model_text),
-        SpanRole::Heading(1..=2) => base
+        SpanRole::Heading(1) => base
             .fg(theme.text.heading)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        SpanRole::Heading(_) => base.fg(theme.text.heading).add_modifier(Modifier::BOLD),
+        SpanRole::Heading(2) => base.fg(theme.text.heading).add_modifier(Modifier::BOLD),
+        SpanRole::Heading(3) => base
+            .fg(theme.text.heading)
+            .add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        SpanRole::Heading(_) => base.fg(theme.text.secondary).add_modifier(Modifier::ITALIC),
         SpanRole::Strong => base.fg(theme.text.primary).add_modifier(Modifier::BOLD),
         SpanRole::Emphasis => base
             .fg(theme.agent.model_text)
@@ -1599,12 +1629,17 @@ fn for_each_row<'a>(runs: &'a [RunView], view: TranscriptView<'_>, mut visit: im
                 if produced {
                     visit(Row::built(Line::raw("")));
                 }
+                let accent = mode_accent(run.mode, theme);
                 let mut spans = vec![Span::styled(
                     "⏺ codypendent",
-                    Style::default()
-                        .fg(theme.agent.tool)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 )];
+                if run.mode != AgentMode::Build {
+                    spans.push(Span::styled(
+                        format!(" · {}", mode_label(run.mode).to_ascii_lowercase()),
+                        Style::default().fg(accent),
+                    ));
+                }
                 if let Some(model) = &run.model {
                     spans.push(Span::styled(
                         format!(" · {model}"),
@@ -1617,29 +1652,35 @@ fn for_each_row<'a>(runs: &'a [RunView], view: TranscriptView<'_>, mut visit: im
                 awaiting_header = false;
             }
             match entry {
-                TranscriptEntry::Model { text, rendered } => match rendered {
-                    // RICH: finalized and not the live tail → borrow cached lines.
-                    Some(lines) if !streaming_tail => {
-                        for rl in lines {
-                            visit(Row::rich(rl));
-                            produced = true;
+                TranscriptEntry::Model { text, rendered } => {
+                    let accent = mode_accent(run.mode, theme);
+                    match rendered {
+                        // RICH: finalized and not the live tail → borrow cached lines.
+                        Some(lines) if !streaming_tail => {
+                            for rl in lines {
+                                visit(Row::rich(rl).with_rail(accent));
+                                produced = true;
+                            }
+                        }
+                        // PLAIN: streaming tail, or not yet finalized (belt-and-braces).
+                        _ => {
+                            let mut rows: Vec<&str> = text.lines().collect();
+                            if rows.is_empty() {
+                                rows.push("");
+                            }
+                            let last = rows.len() - 1;
+                            let style = Style::default().fg(theme.agent.model_text);
+                            for (i, l) in rows.into_iter().enumerate() {
+                                let prefix = if i == 0 { "▌ " } else { "  " };
+                                visit(
+                                    Row::model(prefix, l, streaming_tail && i == last, style)
+                                        .with_rail(accent),
+                                );
+                                produced = true;
+                            }
                         }
                     }
-                    // PLAIN: streaming tail, or not yet finalized (belt-and-braces).
-                    _ => {
-                        let mut rows: Vec<&str> = text.lines().collect();
-                        if rows.is_empty() {
-                            rows.push("");
-                        }
-                        let last = rows.len() - 1;
-                        let style = Style::default().fg(theme.agent.model_text);
-                        for (i, l) in rows.into_iter().enumerate() {
-                            let prefix = if i == 0 { "▌ " } else { "  " };
-                            visit(Row::model(prefix, l, streaming_tail && i == last, style));
-                            produced = true;
-                        }
-                    }
-                },
+                }
                 other => {
                     scratch.clear();
                     // Highlighted only while the transcript is being BROWSED
@@ -1678,6 +1719,9 @@ fn for_each_row<'a>(runs: &'a [RunView], view: TranscriptView<'_>, mut visit: im
                         }
                         let mut row = Row::built(line);
                         row.selected = selected;
+                        if is_agent_cell {
+                            row = row.with_rail(mode_accent(run.mode, theme));
+                        }
                         if j == 0 {
                             row.hit_entry = hit;
                         }
@@ -1894,12 +1938,45 @@ fn build_transcript_window<'a>(
             }
             let hit = row.hit_entry;
             let bg = row.bg;
+            let rail = row.rail;
             let index = out.len();
             let line = row.into_line(theme);
             // Pre-split at cell granularity via the SAME rule the measure
             // pass counted with (`CellWrap`), so the Paragraph below renders
             // unwrapped and the drawn geometry equals the measured geometry.
             for mut visual in split_line_cells(&line, inner_width) {
+                if let Some(rail_color) = rail {
+                    if let Some(first_span) = visual.spans.first_mut() {
+                        if first_span.content.starts_with("▌ ") {
+                            // Drop the 3-byte `▌` glyph AND its trailing space
+                            // (`[4..]`), so the replacement `"▎ "` supplies the
+                            // single separating space. Slicing `[3..]` kept the
+                            // old space and produced a DOUBLE space (`▎  x`),
+                            // indenting the streaming first line one column past
+                            // its single-space continuation rows below.
+                            let rest = first_span.content[4..].to_string();
+                            let style = first_span.style;
+                            *first_span = Span::styled("▎ ", Style::default().fg(rail_color));
+                            if !rest.is_empty() {
+                                visual.spans.insert(1, Span::styled(rest, style));
+                            }
+                        } else if first_span.content.starts_with("  ") {
+                            let rest = first_span.content[2..].to_string();
+                            let style = first_span.style;
+                            *first_span = Span::styled("▎ ", Style::default().fg(rail_color));
+                            if !rest.is_empty() {
+                                visual.spans.insert(1, Span::styled(rest, style));
+                            }
+                        } else if first_span.content.starts_with('▌') {
+                            let rest = first_span.content[3..].to_string();
+                            let style = first_span.style;
+                            *first_span = Span::styled("▎", Style::default().fg(rail_color));
+                            if !rest.is_empty() {
+                                visual.spans.insert(1, Span::styled(rest, style));
+                            }
+                        }
+                    }
+                }
                 if let Some(c) = bg {
                     visual.style = visual.style.bg(c);
                     let pad = (inner_width as usize).saturating_sub(visual.width());
@@ -2807,6 +2884,34 @@ fn model_entry_lines<'a>(
     }
 }
 
+const TOOL_OUTPUT_MAX_LINES: usize = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeadTail<'a> {
+    Line(&'a str),
+    Ellipsis(usize),
+}
+
+fn bounded_head_tail(text: &str, max: usize) -> Vec<HeadTail<'_>> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max {
+        lines.into_iter().map(HeadTail::Line).collect()
+    } else {
+        let head_count = 3;
+        let tail_count = 2;
+        let hidden = lines.len().saturating_sub(head_count + tail_count);
+        let mut res = Vec::with_capacity(head_count + 1 + tail_count);
+        for l in &lines[..head_count] {
+            res.push(HeadTail::Line(l));
+        }
+        res.push(HeadTail::Ellipsis(hidden));
+        for l in &lines[lines.len() - tail_count..] {
+            res.push(HeadTail::Line(l));
+        }
+        res
+    }
+}
+
 fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &mut Vec<Line<'a>>) {
     // Task 5 (codex chat shell): the collapsed head is one compact line — a
     // run glyph, the tool's verb/name, and a terse outcome mark — instead of
@@ -2835,17 +2940,6 @@ fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &
     // test` for `shell.run`) renders as `{tool} · {label}` before the outcome
     // mark, dim/muted so the tool name stays the visual anchor — exactly the
     // `⏺ codypendent · <model>` convention the turn header already uses.
-    // `tool_card_lines` has no column-width parameter to fit against (unlike
-    // `desc_w`-style callers elsewhere in this file), so — matching every
-    // other fixed-width `truncate` call in this module (run objectives,
-    // skill/memory names, ...) — the label gets its own fixed cap, well under
-    // a typical card's width even alongside a long tool name. The daemon side
-    // (`codypendent_runtime::tools::tool_label`) already bounds the label to
-    // 80 chars; this is a second, independent, render-layer clamp so a card
-    // never overflows regardless of what produced the event. When there is no
-    // label (an older daemon, or a tool `tool_label` does not recognize) the
-    // head renders exactly as it did before this field existed: `{tool}
-    // {status}`, one line either way.
     const LABEL_RENDER_MAX_CHARS: usize = 48;
     let mut head = vec![Span::styled(format!("{marker} ⏺ {name} "), head_style)];
     if let Some(label) = card.label.as_deref().filter(|l| !l.is_empty()) {
@@ -2882,7 +2976,25 @@ fn tool_card_lines<'a>(card: &'a ToolCard, theme: &Theme, selected: bool, out: &
                 Style::default().fg(theme.status.error),
             ));
         }
-        if let Some(artifact) = &card.artifact {
+        if let Some(preview) = &card.output_preview {
+            let pieces = bounded_head_tail(preview, TOOL_OUTPUT_MAX_LINES);
+            for piece in pieces {
+                match piece {
+                    HeadTail::Line(l) => {
+                        out.push(Line::styled(
+                            format!("    {l}"),
+                            Style::default().fg(theme.text.secondary),
+                        ));
+                    }
+                    HeadTail::Ellipsis(hidden) => {
+                        out.push(Line::styled(
+                            format!("    … ({hidden} lines omitted)"),
+                            Style::default().fg(theme.text.muted),
+                        ));
+                    }
+                }
+            }
+        } else if let Some(artifact) = &card.artifact {
             out.push(Line::styled(
                 format!(
                     "    output: {} ({} bytes)",
@@ -2915,16 +3027,23 @@ fn patch_lines<'a>(
         files if !files.is_empty() => format!("{} files", files.len()),
         _ => format!("change set {}", short_id(&patch.changeset_id)),
     };
-    let stats = if patch.additions > 0 || patch.deletions > 0 {
-        format!("  +{} −{}", patch.additions, patch.deletions)
-    } else {
-        String::new()
-    };
-    out.push(Line::from(vec![
-        Span::styled(format!("{marker} ◆ {target}"), head_style),
-        Span::styled(stats, Style::default().fg(theme.text.muted)),
-        Span::styled("  changes ready", Style::default().fg(theme.status.success)),
-    ]));
+    let mut head = vec![Span::styled(format!("{marker} ◆ {target}"), head_style)];
+    if patch.additions > 0 || patch.deletions > 0 {
+        head.push(Span::styled(
+            format!("  +{}", patch.additions),
+            Style::default().fg(theme.status.success),
+        ));
+        head.push(Span::styled(
+            format!(" −{}", patch.deletions),
+            Style::default().fg(theme.status.error),
+        ));
+    }
+    head.push(Span::styled(
+        "  changes ready",
+        Style::default().fg(theme.status.success),
+    ));
+    out.push(Line::from(head));
+
     if patch.expanded {
         if patch.files.len() > 1 {
             for file in &patch.files {
@@ -2936,19 +3055,20 @@ fn patch_lines<'a>(
             out.push(Line::raw(""));
         }
         for line in patch.preview.lines() {
-            let color = if line.starts_with('+') && !line.starts_with("+++") {
-                theme.diff.added
+            let (color, bg) = if line.starts_with('+') && !line.starts_with("+++") {
+                (theme.diff.added, theme.diff.added_bg)
             } else if line.starts_with('-') && !line.starts_with("---") {
-                theme.diff.removed
+                (theme.diff.removed, theme.diff.removed_bg)
             } else if line.starts_with("@@") || line.starts_with("diff --git") {
-                theme.diff.header
+                (theme.diff.header, Color::Reset)
             } else {
-                theme.diff.context
+                (theme.diff.context, Color::Reset)
             };
-            out.push(Line::styled(
-                format!("    {line}"),
-                Style::default().fg(color),
-            ));
+            let mut style = Style::default().fg(color);
+            if bg != Color::Reset {
+                style = style.bg(bg);
+            }
+            out.push(Line::styled(format!("    {line}"), style));
         }
         if patch.preview_truncated {
             out.push(Line::styled(
@@ -3818,6 +3938,9 @@ fn render_overlays(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         Overlay::Backtrack(bt) => {
             render_backtrack(frame, area, state, theme, bt.selected);
         }
+        Overlay::Context => {
+            render_context_card(frame, area, state, theme);
+        }
         Overlay::None => {}
     }
     if state.show_approval_modal() {
@@ -4330,49 +4453,42 @@ fn issue_guidance(issue: &str) -> &'static str {
 /// approval receipts, enablement scope, and revocation controls cannot be
 /// spoofed by the extension whose authority they govern.
 fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let rect = centered_rect(90, 86, area);
-    shield_modal(state, rect);
-    frame.render_widget(Clear, rect);
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(
-                " Remote UI plugins ({}) · host-owned ",
-                state.ui_plugins.len()
-            ),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
+    let modal_rect = modal(area, ModalSize::Large);
+    let inner = modal_surface(
+        frame,
+        modal_rect,
+        format!(
+            "Remote UI plugins ({}) · host-owned",
+            state.ui_plugins.len()
+        ),
+        state,
+        theme,
+    );
+
+    if state.ui_plugins.is_empty() {
+        render_empty_state(
+            frame,
+            inner,
+            "No installed Remote UI plugins",
+            "Install one with `codypendent plugin install`.",
+            "",
+            "",
+            theme,
         );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
+        return;
+    }
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(2)])
         .split(inner);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(rows[0]);
+    let (list_area, detail_area) = master_detail_split(rows[0], !state.ui_plugins.is_empty());
+    let cols = [list_area, detail_area];
 
     const ROW_LINES: usize = 2;
     let visible = (cols[0].height as usize / ROW_LINES).max(1);
     let first = first_visible_row(state.selected_ui_plugin, state.ui_plugins.len(), visible);
     let mut items = Vec::new();
-    if state.ui_plugins.is_empty() {
-        items.push(empty_state_item(
-            "No installed Remote UI plugins",
-            "Install one with `codypendent plugin install`.",
-            cols[0].width,
-            theme,
-        ));
-    }
     for (index, plugin) in state
         .ui_plugins
         .iter()
@@ -4381,13 +4497,18 @@ fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         .take(visible)
     {
         let selected = index == state.selected_ui_plugin;
+        let marker = selection_marker(selected);
         let head = Line::from(vec![
             Span::styled(
-                if selected { "› " } else { "  " },
+                marker,
                 theme.selection_aware_text_style(selected, theme.focus.active),
             ),
             Span::styled(
-                format!("{} v{}", truncate(&plugin.id, 24), plugin.version),
+                format!(
+                    "{} v{}",
+                    truncate_display_width(&plugin.id, cols[0].width.saturating_sub(10) as usize),
+                    plugin.version
+                ),
                 theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
@@ -4488,36 +4609,21 @@ fn render_ui_plugins(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
 /// metadata, description, risk, and — the exit-criterion payload — its requested
 /// **permissions verbatim**. Colors are Theme tokens only (RULE 7).
 fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let rect = centered_rect(84, 84, area);
-    shield_modal(state, rect);
-    frame.render_widget(Clear, rect);
+    let modal_rect = modal(area, ModalSize::Large);
+    let inner = modal_surface(
+        frame,
+        modal_rect,
+        format!("Skill Studio · read only ({})", state.skills.len()),
+        state,
+        theme,
+    );
 
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" Skill Studio · read only ({}) ", state.skills.len()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
-
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(inner);
+    let (list_area, detail_area) = master_detail_split(inner, !state.skills.is_empty());
+    let cols = [list_area, detail_area];
 
     // Left: the item list (name + scope · trust · status). Each row is 2 lines
     // tall; window the list around the selected skill so a long registry scrolls.
     const ROW_LINES: usize = 2;
-    let list_area = cols[0];
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(state.selected_skill, state.skills.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
@@ -4537,14 +4643,14 @@ fn render_skills(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         .take(visible_rows)
     {
         let selected = idx == state.selected_skill;
-        let marker = if selected { "› " } else { "  " };
+        let marker = selection_marker(selected);
         let head = Line::from(vec![
             Span::styled(
                 marker,
                 theme.selection_aware_text_style(selected, theme.focus.active),
             ),
             Span::styled(
-                truncate(&skill.name, 26),
+                truncate_display_width(&skill.name, list_area.width.saturating_sub(6) as usize),
                 theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
@@ -5744,51 +5850,57 @@ fn provider_listing_label(card: &ProviderCard) -> String {
 /// Governed learning review. Only safe, curated projection fields reach this
 /// renderer; source text and tool material never enter `LearningCard`.
 fn render_journey(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let rect = centered_rect(84, 84, area);
-    shield_modal(state, rect);
-    frame.render_widget(Clear, rect);
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" Learning journey ({}) ", state.learnings.len()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
+    let modal_rect = modal(area, ModalSize::Large);
+    let inner = modal_surface(
+        frame,
+        modal_rect,
+        format!("Learning journey ({})", state.learnings.len()),
+        state,
+        theme,
+    );
+
+    if state.learnings.is_empty() {
+        render_empty_state(
+            frame,
+            inner,
+            "No useful learnings yet",
+            "Explicit preferences and verified outcomes appear here.",
+            "",
+            "",
+            theme,
         );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
+        return;
+    }
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(2)])
         .split(inner);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(rows[0]);
+    let (list_area, detail_area) = master_detail_split(rows[0], !state.learnings.is_empty());
+    let cols = [list_area, detail_area];
     let mut items = Vec::new();
-    if state.learnings.is_empty() {
-        items.push(empty_state_item(
-            "No useful learnings yet",
-            "Explicit preferences and verified outcomes appear here.",
-            cols[0].width,
-            theme,
-        ));
-    }
     for (idx, card) in state.learnings.iter().enumerate() {
         let selected = idx == state.selected_learning;
         let pin = if card.pinned { "◆ " } else { "  " };
+        let marker = selection_marker(selected);
         items.push(
             ListItem::new(vec![
-                Line::styled(
-                    format!("{pin}{}", truncate(&card.statement, 34)),
-                    theme.selection_aware_text_style(selected, theme.text.primary),
-                ),
+                Line::from(vec![
+                    Span::styled(
+                        marker,
+                        theme.selection_aware_text_style(selected, theme.focus.active),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{pin}{}",
+                            truncate_display_width(
+                                &card.statement,
+                                cols[0].width.saturating_sub(6) as usize
+                            )
+                        ),
+                        theme.selection_aware_text_style(selected, theme.text.primary),
+                    ),
+                ]),
                 picker_sub_line(
                     format!("    {} · {} · {}", card.state, card.kind, card.scope),
                     cols[0].width,
@@ -5863,36 +5975,21 @@ fn render_memory(
     theme: &Theme,
     source_open: bool,
 ) {
-    let rect = centered_rect(84, 84, area);
-    shield_modal(state, rect);
-    frame.render_widget(Clear, rect);
+    let modal_rect = modal(area, ModalSize::Large);
+    let inner = modal_surface(
+        frame,
+        modal_rect,
+        format!("Memory ({})", state.memories.len()),
+        state,
+        theme,
+    );
 
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" Memory ({}) ", state.memories.len()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
-
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(inner);
+    let (list_area, detail_area) = master_detail_split(inner, !state.memories.is_empty());
+    let cols = [list_area, detail_area];
 
     // Left: the memory list (statement + class · scope). Each row is 2 lines
     // tall; window the list around the selected memory so a long scope scrolls.
     const ROW_LINES: usize = 2;
-    let list_area = cols[0];
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(state.selected_memory, state.memories.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
@@ -5912,14 +6009,17 @@ fn render_memory(
         .take(visible_rows)
     {
         let selected = idx == state.selected_memory;
-        let marker = if selected { "› " } else { "  " };
+        let marker = selection_marker(selected);
         let head = Line::from(vec![
             Span::styled(
                 marker,
                 theme.selection_aware_text_style(selected, theme.focus.active),
             ),
             Span::styled(
-                truncate(&memory.statement, 26),
+                truncate_display_width(
+                    &memory.statement,
+                    list_area.width.saturating_sub(6) as usize,
+                ),
                 theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
@@ -6048,58 +6148,48 @@ fn render_memory(
 fn render_docs(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let docs_footer_primary = " Tab rail · ↑/↓ · a accept · r reject · Esc";
     let docs_footer_secondary = " n new · e edit · i ins · X del · P publish";
-    let rect = centered_rect(86, 86, area);
-    shield_modal(state, rect);
-    frame.render_widget(Clear, rect);
+    let modal_rect = modal(area, ModalSize::Large);
+    let inner = modal_surface(
+        frame,
+        modal_rect,
+        format!("Docs Studio · existing docs ({})", state.docs.len()),
+        state,
+        theme,
+    );
 
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" Docs Studio · existing docs ({}) ", state.docs.len()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
+    if state.docs.is_empty() {
+        render_empty_state(
+            frame,
+            inner,
+            "No collaborative documents yet",
+            "Press n to create one, or ask an agent to draft it from this session.",
+            "n",
+            "New document",
+            theme,
         );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
+        return;
+    }
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
-        .split(inner);
+    let (list_area, detail_area) = master_detail_split(inner, !state.docs.is_empty());
+    let cols = [list_area, detail_area];
 
     // Left: the document tree (title + scope · status · mode). Each row is 2
     // lines tall; window the tree around the selected document so a large
     // repository scrolls.
     const ROW_LINES: usize = 2;
-    let list_area = cols[0];
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(state.selected_doc, state.docs.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
-    if state.docs.is_empty() {
-        items.push(empty_state_item(
-            "No collaborative documents yet",
-            "Press n to create one, or ask an agent to draft it from this session.",
-            list_area.width,
-            theme,
-        ));
-    }
     for (idx, doc) in state.docs.iter().enumerate().skip(first).take(visible_rows) {
         let selected = idx == state.selected_doc;
-        let marker = if selected { "› " } else { "  " };
+        let marker = selection_marker(selected);
         let head = Line::from(vec![
             Span::styled(
                 marker,
                 theme.selection_aware_text_style(selected, theme.focus.active),
             ),
             Span::styled(
-                truncate(&doc.title, 28),
+                truncate_display_width(&doc.title, list_area.width.saturating_sub(6) as usize),
                 theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
@@ -6389,10 +6479,6 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         return;
     }
 
-    let rect = centered_modal(area, 132, 36);
-    shield_modal(state, rect);
-    frame.render_widget(Clear, rect);
-
     let first_match = if state.edge_total == 0 {
         0
     } else {
@@ -6405,35 +6491,25 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     } else {
         format!(" · filter ‘{}’", truncate(&state.edge_query, 24))
     };
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(
-                " Code graph ({first_match}–{last_match} of {}{query}) ",
-                state.edge_total
-            ),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
-        .split(inner);
+    let modal_rect = modal(area, ModalSize::Large);
+    let inner = modal_surface(
+        frame,
+        modal_rect,
+        format!(
+            "Code graph ({first_match}–{last_match} of {}{query})",
+            state.edge_total
+        ),
+        state,
+        theme,
+    );
+
+    let (list_area, detail_area) = master_detail_split(inner, !state.edges.is_empty());
+    let cols = [list_area, detail_area];
 
     // Left: the edge list (relation, then from → to). Each row is 2 lines tall;
     // window it around the selected edge so a large graph scrolls.
     const ROW_LINES: usize = 2;
-    let list_area = cols[0];
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(state.selected_edge, state.edges.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
@@ -6451,7 +6527,7 @@ fn render_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         .take(visible_rows)
     {
         let selected = idx == state.selected_edge;
-        let marker = if selected { "› " } else { "  " };
+        let marker = selection_marker(selected);
         let head = Line::from(vec![
             Span::styled(
                 marker,
@@ -6685,40 +6761,25 @@ fn render_empty_edges(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
 /// durable run is subscribed while focused and can be started, paused/resumed,
 /// retried from the selected node, or cancelled. Colors are Theme tokens only.
 fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let rect = centered_rect(86, 86, area);
-    shield_modal(state, rect);
-    frame.render_widget(Clear, rect);
+    let modal_rect = modal(area, ModalSize::Large);
+    let inner = modal_surface(
+        frame,
+        modal_rect,
+        format!(
+            "Executable Workflow graph ({} node(s))",
+            state.workflow.len()
+        ),
+        state,
+        theme,
+    );
 
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(
-                " Executable Workflow graph ({} node(s)) ",
-                state.workflow.len()
-            ),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
-
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
-        .split(inner);
+    let (list_area, detail_area) = master_detail_split(inner, !state.workflow.is_empty());
+    let cols = [list_area, detail_area];
 
     // Left: fixed-height node cards in topological order. Repeating the workflow
     // label makes every card self-contained and, importantly, keeps scrolling
     // exact when a window begins in the middle of a multi-workflow list.
     const ROW_LINES: usize = 3;
-    let list_area = cols[0];
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(state.selected_node, state.workflow.len(), visible_rows);
     // Rubric 5: lay the topological list out as layered lanes with box-drawing
@@ -6745,7 +6806,7 @@ fn render_workflow(frame: &mut Frame, area: Rect, state: &AppState, theme: &Them
         .take(visible_rows)
     {
         let selected = idx == state.selected_node;
-        let marker = if selected { "› " } else { "  " };
+        let marker = selection_marker(selected);
         let row = graph.as_ref().and_then(|layout| layout.rows.get(idx));
         // The lane art takes the node's own STATE color, so an edge reads as
         // "this is what `verify` is waiting on" at a glance — the same color key
@@ -7012,26 +7073,28 @@ fn kanban_column_color(status: &str, theme: &Theme) -> Color {
 /// focused card moves between columns with `→`/`←`, which the daemon applies as a
 /// supersession. Colors are Theme tokens only (RULE 7).
 fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let rect = centered_rect(90, 86, area);
-    shield_modal(state, rect);
-    frame.render_widget(Clear, rect);
+    let modal_rect = modal(area, ModalSize::Large);
+    let inner = modal_surface(
+        frame,
+        modal_rect,
+        format!("Kanban task board ({} card(s))", state.kanban.len()),
+        state,
+        theme,
+    );
 
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" Kanban task board ({} card(s)) ", state.kanban.len()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
+    if state.kanban.is_empty() {
+        state.register_hit(inner, Action::NewRun);
+        render_empty_state(
+            frame,
+            inner,
+            "No Kanban tasks yet",
+            "Create and track repository backlog tasks in Kanban columns.",
+            "n",
+            "New card",
+            theme,
         );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
+        return;
+    }
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -7057,27 +7120,25 @@ fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         let lane = lanes[lane_index];
         let column_color = kanban_column_color(status, theme);
         let block = Block::default()
-            .borders(Borders::LEFT)
-            .border_style(Style::default().fg(theme.focus.inactive))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(column_color))
             .title(Span::styled(
                 format!(" {status} ({}) ", cards.len()),
                 Style::default()
                     .fg(column_color)
                     .add_modifier(Modifier::BOLD),
             ))
-            .style(Style::default().bg(theme.surface.overlay));
+            .style(Style::default().bg(theme.surface.panel));
         let body = block.inner(lane);
         frame.render_widget(block, lane);
 
         let capacity = (body.height / CARD_LINES) as usize;
         let mut lines: Vec<Line> = Vec::new();
-        if cards.is_empty() {
-            lines.push(Line::styled("  —", Style::default().fg(theme.text.muted)));
-        }
         for (slot, card) in cards.iter().enumerate().take(capacity) {
             let index = display_index + slot;
             let selected = index == state.selected_card;
-            let marker = if selected { "\u{203a} " } else { "  " };
+            let marker = selection_marker(selected);
             lines.push(Line::from(vec![
                 Span::styled(
                     marker,
@@ -7089,7 +7150,7 @@ fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 ),
             ]));
             lines.push(Line::styled(
-                format!("    {} \u{b7} {}", card.assignee, card.kind),
+                format!("    {} · {}", card.assignee, card.kind),
                 theme.selection_aware_text_style(selected, theme.text.muted),
             ));
             if let Some(hit) = visible_row_hit(body, slot, CARD_LINES) {
@@ -7104,7 +7165,7 @@ fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
             ));
         }
         frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(theme.surface.overlay)),
+            Paragraph::new(lines).style(Style::default().bg(theme.surface.panel)),
             body,
         );
         display_index += cards.len();
@@ -7186,47 +7247,37 @@ fn render_kanban(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
 /// summary on the right. Operators can post an explicit open question; agent
 /// claims still flow through governed tools and evidence rules.
 fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let rect = centered_rect(86, 86, area);
-    shield_modal(state, rect);
-    frame.render_widget(Clear, rect);
+    let modal_rect = modal(area, ModalSize::Large);
+    let inner = modal_surface(
+        frame,
+        modal_rect,
+        format!("Blackboard ({} item(s))", state.blackboard.len()),
+        state,
+        theme,
+    );
 
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" Blackboard ({} item(s)) ", state.blackboard.len()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
+    if state.blackboard.is_empty() {
+        render_empty_state(
+            frame,
+            inner,
+            "No Blackboard evidence, decisions, or artifacts yet",
+            "Start a workflow, then press n to post an open question (example: What should review verify?).",
+            "n",
+            "New item",
+            theme,
         );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
+        return;
+    }
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
-        .split(inner);
+    let (list_area, detail_area) = master_detail_split(inner, !state.blackboard.is_empty());
+    let cols = [list_area, detail_area];
 
     // Left: fixed-height artifact cards. Repeating the owning run keeps every
     // card understandable and makes selection windowing exact at group edges.
     const ROW_LINES: usize = 3;
-    let list_area = cols[0];
     let visible_rows = (list_area.height as usize / ROW_LINES).max(1);
     let first = first_visible_row(state.selected_item, state.blackboard.len(), visible_rows);
     let mut items: Vec<ListItem> = Vec::new();
-    if state.blackboard.is_empty() {
-        items.push(empty_state_item(
-            "No Blackboard evidence, decisions, or artifacts yet",
-            "Start a workflow, then press n to post an open question (example: What should review verify?).",
-            list_area.width,
-            theme,
-        ));
-    }
     for (idx, card) in state
         .blackboard
         .iter()
@@ -7235,9 +7286,9 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         .take(visible_rows)
     {
         let selected = idx == state.selected_item;
-        let marker = if selected { "› " } else { "  " };
+        let marker = selection_marker(selected);
         let mut lines = vec![Line::styled(
-            truncate(&card.run, 36),
+            truncate_display_width(&card.run, list_area.width.saturating_sub(4) as usize),
             theme
                 .selection_aware_text_style(selected, theme.text.heading)
                 .add_modifier(Modifier::BOLD),
@@ -7254,7 +7305,7 @@ fn render_blackboard(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
                 theme.selection_aware_text_style(selected, theme.focus.active),
             ),
             Span::styled(
-                truncate(&card.kind, 16),
+                truncate_display_width(&card.kind, 16),
                 theme.selection_aware_text_style(selected, kind_color),
             ),
             if card.superseded {
@@ -9214,33 +9265,20 @@ fn action_kind(action: &ProposedAction) -> &'static str {
 /// council's chair, rounds, evidence mode, and every member's model/role —
 /// the same list+detail shape as [`render_ui_plugins`]/[`render_skills`].
 fn render_council_browser(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let rect = centered_rect(90, 86, area);
-    shield_modal(state, rect);
-    frame.render_widget(Clear, rect);
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" Agent councils ({}) ", state.councils.len()),
-            Style::default()
-                .fg(theme.text.heading)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(theme.focus.active))
-        .style(
-            Style::default()
-                .bg(theme.surface.overlay)
-                .fg(theme.text.primary),
-        );
-    let inner = outer.inner(rect);
-    frame.render_widget(outer, rect);
+    let modal_rect = modal(area, ModalSize::Large);
+    let inner = modal_surface(
+        frame,
+        modal_rect,
+        format!("Agent councils ({})", state.councils.len()),
+        state,
+        theme,
+    );
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(2)])
         .split(inner);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(rows[0]);
+    let (list_area, detail_area) = master_detail_split(rows[0], !state.councils.is_empty());
+    let cols = [list_area, detail_area];
 
     const ROW_LINES: usize = 2;
     let visible = (cols[0].height as usize / ROW_LINES).max(1);
@@ -9256,13 +9294,14 @@ fn render_council_browser(frame: &mut Frame, area: Rect, state: &AppState, theme
     }
     for (index, council) in state.councils.iter().enumerate().skip(first).take(visible) {
         let selected = index == state.selected_council;
+        let marker = selection_marker(selected);
         let head = Line::from(vec![
             Span::styled(
-                if selected { "› " } else { "  " },
+                marker,
                 theme.selection_aware_text_style(selected, theme.focus.active),
             ),
             Span::styled(
-                truncate(&council.name, 30),
+                truncate_display_width(&council.name, cols[0].width.saturating_sub(6) as usize),
                 theme.selection_aware_text_style(selected, theme.text.primary),
             ),
         ]);
@@ -10183,6 +10222,223 @@ fn render_council_review(
         "  Saved privately to councils.toml. Running it creates durable, attributed sessions.",
         Style::default().fg(theme.text.muted),
     ));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// Selection indicator prefix bar for list rows (Action 12).
+#[must_use]
+pub fn selection_marker(selected: bool) -> &'static str {
+    if selected {
+        "▌ "
+    } else {
+        "  "
+    }
+}
+
+/// Split an overlay inner rect into master list and detail panel with balanced weighting (Action 14).
+pub fn master_detail_split(area: Rect, detail_populated: bool) -> (Rect, Rect) {
+    let (master_pct, detail_pct) = if detail_populated { (40, 60) } else { (55, 45) };
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(master_pct),
+            Constraint::Percentage(detail_pct),
+        ])
+        .split(area);
+    (chunks[0], chunks[1])
+}
+
+/// Standard modal sizes across the application (Action 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalSize {
+    Small,
+    Medium,
+    Large,
+}
+
+/// Computes the centered modal rect for a standard size token.
+pub fn modal(area: Rect, size: ModalSize) -> Rect {
+    match size {
+        ModalSize::Small => {
+            let width = ((area.width as u32 * 60) / 100).clamp(40, 70) as u16;
+            let height = ((area.height as u32 * 40) / 100).clamp(10, 20) as u16;
+            centered_modal(area, width, height)
+        }
+        ModalSize::Medium => {
+            let width = ((area.width as u32 * 75) / 100).clamp(60, 100) as u16;
+            let height = ((area.height as u32 * 70) / 100).clamp(16, 35) as u16;
+            centered_modal(area, width, height)
+        }
+        ModalSize::Large => {
+            let width = ((area.width as u32 * 90) / 100).clamp(80, 160) as u16;
+            let height = ((area.height as u32 * 85) / 100).clamp(24, 55) as u16;
+            centered_modal(area, width, height)
+        }
+    }
+}
+
+/// Centered empty state rendering for overlay panes and views (Action 8).
+pub fn render_empty_state(
+    frame: &mut Frame,
+    area: Rect,
+    headline: &str,
+    hint: &str,
+    cta_key: &str,
+    cta_label: &str,
+    theme: &Theme,
+) {
+    let wrap_width = area.width.saturating_sub(4).max(1);
+    let mut lines = vec![
+        Line::styled(
+            format!("✦  {headline}"),
+            Style::default()
+                .fg(theme.text.heading)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+    ];
+    for row in wrap_display_width(hint, wrap_width as usize) {
+        lines.push(Line::styled(row, Style::default().fg(theme.text.secondary)));
+    }
+    if !cta_key.is_empty() && !cta_label.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {cta_key} "),
+                Style::default()
+                    .fg(theme.surface.background)
+                    .bg(theme.focus.active)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {cta_label}"),
+                Style::default()
+                    .fg(theme.text.primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    let card_height = lines.len() as u16;
+    let card = Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(card_height) / 2,
+        width: area.width,
+        height: card_height.min(area.height),
+    };
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), card);
+}
+
+/// Render the /context token usage breakdown card (Action 19).
+fn render_context_card(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let modal_rect = modal(area, ModalSize::Medium);
+    let inner = modal_surface(
+        frame,
+        modal_rect,
+        "/context  Context breakdown",
+        state,
+        theme,
+    );
+    let run = state.selected_run();
+
+    let mut lines = Vec::new();
+    if let Some(run) = run {
+        let model_name = run.model.as_ref().map_or("—", |m| m.0.as_str());
+        let mode_str = mode_label(run.mode);
+        lines.push(Line::from(vec![
+            Span::styled("Model: ", Style::default().fg(theme.text.muted)),
+            Span::styled(
+                model_name,
+                Style::default()
+                    .fg(theme.text.primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ·  Mode: ", Style::default().fg(theme.text.muted)),
+            Span::styled(mode_str, Style::default().fg(mode_accent(run.mode, theme))),
+        ]));
+        lines.push(Line::raw(""));
+
+        if let Some(b) = run.context_breakdown {
+            let pct = (b.used_tokens * 100)
+                .checked_div(b.window_tokens)
+                .unwrap_or(0);
+            let (meter_filled, meter_empty) = context_meter(Some(pct as u16));
+            let sev_color = context_severity_color(Some(pct as u16), theme);
+            lines.push(Line::from(vec![
+                Span::styled("Usage: ", Style::default().fg(theme.text.muted)),
+                Span::styled(meter_filled, Style::default().fg(sev_color)),
+                Span::styled(meter_empty, Style::default().fg(theme.text.muted)),
+                Span::styled(
+                    format!(
+                        " {pct}% ({}/{} tokens)",
+                        thousands(b.used_tokens),
+                        thousands(b.window_tokens)
+                    ),
+                    Style::default().fg(theme.text.primary),
+                ),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "─── Token Distribution ───",
+                Style::default().fg(theme.text.muted),
+            ));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  • System prompt:     ",
+                    Style::default().fg(theme.text.secondary),
+                ),
+                Span::styled(
+                    format!("{:>8} tokens", thousands(b.system_tokens)),
+                    Style::default().fg(theme.syntax.r#type),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  • Tool declarations: ",
+                    Style::default().fg(theme.text.secondary),
+                ),
+                Span::styled(
+                    format!("{:>8} tokens", thousands(b.tool_tokens)),
+                    Style::default().fg(theme.syntax.function),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  • Conversation hist: ",
+                    Style::default().fg(theme.text.secondary),
+                ),
+                Span::styled(
+                    format!("{:>8} tokens", thousands(b.transcript_tokens)),
+                    Style::default().fg(theme.syntax.string),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("Context tokens: ", Style::default().fg(theme.text.muted)),
+                Span::styled(
+                    run.context_percent
+                        .map_or("—".to_string(), |p| format!("{p}% used")),
+                    Style::default().fg(theme.status.info),
+                ),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "Detailed breakdown not yet available from provider.",
+                Style::default().fg(theme.text.muted),
+            ));
+        }
+    } else {
+        lines.push(Line::styled(
+            "No active run in current session.",
+            Style::default().fg(theme.text.muted),
+        ));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Press Esc to dismiss",
+        Style::default().fg(theme.text.muted),
+    ));
+
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
@@ -13651,12 +13907,15 @@ mod tests {
             "cost $12.34",
             "permissions full access",
             "branch/worktree codex/status-strip",
-            "reasoning —",
             "Shift-drag copy",
             "health connected",
         ] {
             assert!(strip.contains(field), "missing {field:?}: {strip}");
         }
+        assert!(
+            !strip.contains("reasoning —"),
+            "reasoning placeholder must be hidden: {strip}"
+        );
         assert!(strip.contains("42% used/58% left/100k"), "{strip}");
     }
 
@@ -15497,11 +15756,11 @@ mod tests {
         let mut state = running_build_state();
         reduce(&mut state, Action::OpenKanban);
         let text = render_to_string(&state, 140, 32);
+        assert!(text.contains("New card"), "missing primary action:\n{text}");
         assert!(
-            text.contains("n create task"),
-            "missing primary action:\n{text}"
+            text.contains("track repository backlog"),
+            "missing description:\n{text}"
         );
-        assert!(text.contains("regression test"), "missing example:\n{text}");
         assert!(state
             .hit_map
             .borrow()
@@ -15641,6 +15900,54 @@ mod tests {
             lines.len() <= height as usize + 4,
             "the build materializes O(viewport) lines, not O(history): {}",
             lines.len()
+        );
+    }
+
+    #[test]
+    fn streaming_tail_rail_prefix_aligns_first_line_with_continuations() {
+        // Regression (FIX 4): the `"▌ "` first-line branch sliced `[3..]`,
+        // dropping only the 3-byte glyph and KEEPING its trailing space, then
+        // prepended `"▎ "` — producing a DOUBLE space (`▎  Hello`) while
+        // continuation rows (`"  "` → `[2..]`) rendered a single space
+        // (`▎ World`). The first streaming line must line up with the rest.
+        let mut s = AppState::new();
+        let run_id = RunId::new();
+        reduce(
+            &mut s,
+            system_ev(EventBody::RunStarted {
+                run_id,
+                objective: "go".to_owned(),
+                mode: AgentMode::Build,
+            }),
+        );
+        // A streaming (un-finalized) multi-line model reply exercises the plain
+        // streaming-tail path where the `"▌ "` prefix is rewritten to the rail.
+        reduce(
+            &mut s,
+            system_ev(EventBody::ModelStreamDelta {
+                run_id,
+                text: "Hello\nWorld".to_owned(),
+            }),
+        );
+        assert_eq!(s.runs[0].activity, RunActivity::Streaming);
+
+        let theme = Theme::dark();
+        let (lines, _r, _h) = build_transcript_window(&s.runs, test_view(&theme, 78), 0, 40);
+        let joined = |needle: &str| -> String {
+            lines
+                .iter()
+                .find(|l| l.spans.iter().any(|sp| sp.content.contains(needle)))
+                .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+                .unwrap_or_default()
+        };
+        let first = joined("Hello");
+        let cont = joined("World");
+        assert_eq!(first, "▎ Hello", "first streaming line has a double space");
+        // The last streaming line carries a `▋` cursor caret; the rail prefix
+        // before the text must still be the single-space `▎ ` the first line uses.
+        assert!(
+            cont.starts_with("▎ World"),
+            "continuation line rail changed: {cont:?}"
         );
     }
 
@@ -17467,5 +17774,173 @@ mod tests {
                 "every wrapped Help row keeps its indent at {width}x{height},                  these did not: {orphans:?}\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn plan_run_stamps_the_turn_header_with_a_plan_accent() {
+        let mut state = AppState::default();
+        let run_id = RunId::new();
+        reduce(
+            &mut state,
+            Action::daemon_event(SessionEvent {
+                sequence: 1,
+                occurred_at: Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::RunStarted {
+                    run_id,
+                    objective: "design the auth module".to_owned(),
+                    mode: AgentMode::Plan,
+                },
+            }),
+        );
+        reduce(
+            &mut state,
+            Action::daemon_event(SessionEvent {
+                sequence: 2,
+                occurred_at: Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::ModelStreamDelta {
+                    run_id,
+                    text: "I will plan this out.".to_owned(),
+                },
+            }),
+        );
+        let text = render_to_string(&state, 120, 30);
+        assert!(
+            text.contains("⏺ codypendent · plan"),
+            "text must contain stamped plan mode:\n{text}"
+        );
+    }
+
+    #[test]
+    fn build_run_header_is_unstamped_and_uses_the_tool_accent() {
+        let mut state = AppState::default();
+        let run_id = RunId::new();
+        reduce(
+            &mut state,
+            Action::daemon_event(SessionEvent {
+                sequence: 1,
+                occurred_at: Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::RunStarted {
+                    run_id,
+                    objective: "implement feature".to_owned(),
+                    mode: AgentMode::Build,
+                },
+            }),
+        );
+        reduce(
+            &mut state,
+            Action::daemon_event(SessionEvent {
+                sequence: 2,
+                occurred_at: Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::ModelStreamDelta {
+                    run_id,
+                    text: "Building now.".to_owned(),
+                },
+            }),
+        );
+        let text = render_to_string(&state, 120, 30);
+        assert!(
+            text.contains("⏺ codypendent"),
+            "text must contain header:\n{text}"
+        );
+        assert!(
+            !text.contains("⏺ codypendent · build"),
+            "build mode must remain unstamped:\n{text}"
+        );
+    }
+
+    #[test]
+    fn heading_levels_form_a_distinct_ladder() {
+        let theme = Theme::dark();
+        let h1 = style_for(SpanRole::Heading(1), &theme);
+        let h2 = style_for(SpanRole::Heading(2), &theme);
+        let h3 = style_for(SpanRole::Heading(3), &theme);
+        let h4 = style_for(SpanRole::Heading(4), &theme);
+
+        assert!(h1
+            .add_modifier
+            .contains(Modifier::BOLD | Modifier::UNDERLINED));
+        assert!(h2.add_modifier.contains(Modifier::BOLD));
+        assert!(!h2.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(h3.add_modifier.contains(Modifier::BOLD | Modifier::ITALIC));
+        assert_eq!(h4.fg, Some(theme.text.secondary));
+        assert!(h4.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn bounded_head_tail_keeps_head_and_tail_with_a_middle_ellipsis() {
+        let text = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pieces = bounded_head_tail(&text, 5);
+        assert_eq!(pieces.len(), 6);
+        assert_eq!(pieces[0], HeadTail::Line("line 1"));
+        assert_eq!(pieces[1], HeadTail::Line("line 2"));
+        assert_eq!(pieces[2], HeadTail::Line("line 3"));
+        assert_eq!(pieces[3], HeadTail::Ellipsis(5));
+        assert_eq!(pieces[4], HeadTail::Line("line 9"));
+        assert_eq!(pieces[5], HeadTail::Line("line 10"));
+    }
+
+    #[test]
+    fn patch_head_splits_the_diffstat_colours() {
+        let theme = Theme::dark();
+        let patch = PatchSummary {
+            changeset_id: codypendent_protocol::ChangeSetId::new(),
+            files: vec!["src/main.rs".to_owned()],
+            additions: 12,
+            deletions: 4,
+            preview: "+added\n-removed\n context".to_owned(),
+            preview_truncated: false,
+            artifact: codypendent_protocol::ArtifactRef {
+                id: codypendent_protocol::ArtifactId::new(),
+                media_type: "text/x-patch".to_owned(),
+                byte_length: 120,
+                sha256: "abc".to_owned(),
+                sensitivity: codypendent_protocol::DataClassification::Internal,
+            },
+            expanded: false,
+        };
+        let mut out = Vec::new();
+        patch_lines(&patch, &theme, false, &mut out);
+        assert_eq!(out.len(), 1);
+        let spans = &out[0].spans;
+        let add_span = spans.iter().find(|s| s.content.contains("+12")).unwrap();
+        let del_span = spans.iter().find(|s| s.content.contains("−4")).unwrap();
+        assert_eq!(add_span.style.fg, Some(theme.status.success));
+        assert_eq!(del_span.style.fg, Some(theme.status.error));
+    }
+
+    #[test]
+    fn every_list_detail_overlay_uses_the_large_modal_geometry() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let large = modal(area, ModalSize::Large);
+        assert_eq!(large.width, 108);
+        assert_eq!(large.height, 34);
+
+        let small = modal(area, ModalSize::Small);
+        assert_eq!(small.width, 70);
+        assert_eq!(small.height, 16);
+
+        let medium = modal(area, ModalSize::Medium);
+        assert_eq!(medium.width, 90);
+        assert_eq!(medium.height, 28);
     }
 }

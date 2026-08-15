@@ -81,6 +81,8 @@ pub struct DiffTokens {
     pub removed: Color,
     pub context: Color,
     pub header: Color,
+    pub added_bg: Color,
+    pub removed_bg: Color,
 }
 
 /// Agent-activity roles (model text, tool cards, thinking).
@@ -139,7 +141,7 @@ impl Theme {
             text: TextTokens {
                 primary: Color::Rgb(0xe8, 0xec, 0xf4),
                 secondary: Color::Rgb(0xb2, 0xb9, 0xc8),
-                muted: Color::Rgb(0x85, 0x8d, 0x9d),
+                muted: Color::Rgb(0x94, 0x9d, 0xad),
                 heading: Color::Rgb(0xf8, 0xfa, 0xfc),
             },
             status: StatusTokens {
@@ -154,7 +156,7 @@ impl Theme {
                 keyword: Color::Rgb(0xc6, 0x92, 0xff),
                 literal: Color::Rgb(0xe6, 0xb4, 0x50),
                 string: Color::Rgb(0x9c, 0xd6, 0x7a),
-                comment: Color::Rgb(0x85, 0x8d, 0x9d),
+                comment: Color::Rgb(0x94, 0x9d, 0xad),
                 r#type: Color::Rgb(0x5c, 0xc2, 0xc0),
                 function: Color::Rgb(0x6c, 0xb0, 0xf0),
                 operator: Color::Rgb(0xc3, 0xca, 0xd6),
@@ -166,6 +168,8 @@ impl Theme {
                 removed: Color::Rgb(0xef, 0x6d, 0x6d),
                 context: Color::Rgb(0x9a, 0xa2, 0xb1),
                 header: Color::Rgb(0x5c, 0x9d, 0xff),
+                added_bg: Color::Rgb(16, 40, 24),
+                removed_bg: Color::Rgb(48, 16, 20),
             },
             agent: AgentTokens {
                 model_text: Color::Rgb(0xdc, 0xe2, 0xec),
@@ -225,6 +229,8 @@ impl Theme {
                 removed: Color::Rgb(0xc0, 0x2a, 0x2a),
                 context: Color::Rgb(0x4a, 0x52, 0x5e),
                 header: Color::Rgb(0x0a, 0x5a, 0xd0),
+                added_bg: Color::Rgb(220, 245, 225),
+                removed_bg: Color::Rgb(255, 230, 232),
             },
             agent: AgentTokens {
                 model_text: Color::Rgb(0x1f, 0x23, 0x28),
@@ -285,6 +291,8 @@ impl Theme {
                 removed: Color::Rgb(0xff, 0x30, 0x30),
                 context: Color::Rgb(0xe0, 0xe0, 0xe0),
                 header: Color::Rgb(0x00, 0xd7, 0xff),
+                added_bg: Color::Rgb(0, 50, 0),
+                removed_bg: Color::Rgb(60, 0, 0),
             },
             agent: AgentTokens {
                 model_text: Color::Rgb(0xff, 0xff, 0xff),
@@ -321,7 +329,7 @@ impl Theme {
             text: TextTokens {
                 primary: Color::Rgb(0xed, 0xf0, 0xf5),
                 secondary: Color::Rgb(0xbc, 0xc2, 0xce),
-                muted: Color::Rgb(0x86, 0x8e, 0x9d),
+                muted: Color::Rgb(0x94, 0x9c, 0xac),
                 heading: Color::Rgb(0xf5, 0xf7, 0xfb),
             },
             status: StatusTokens {
@@ -336,7 +344,7 @@ impl Theme {
                 keyword: Color::Rgb(0xcc, 0x79, 0xa7), // reddish purple
                 literal: Color::Rgb(0xe6, 0x9f, 0x00),
                 string: Color::Rgb(0x00, 0x9e, 0x73),
-                comment: Color::Rgb(0x86, 0x8e, 0x9d),
+                comment: Color::Rgb(0x94, 0x9c, 0xac),
                 r#type: Color::Rgb(0x56, 0xb4, 0xe9),
                 function: Color::Rgb(0x00, 0x72, 0xb2),
                 operator: Color::Rgb(0xbc, 0xc2, 0xce),
@@ -348,6 +356,8 @@ impl Theme {
                 removed: Color::Rgb(0xd5, 0x5e, 0x00), // vermillion (not pure red)
                 context: Color::Rgb(0xbc, 0xc2, 0xce),
                 header: Color::Rgb(0x56, 0xb4, 0xe9),
+                added_bg: Color::Rgb(16, 35, 48),
+                removed_bg: Color::Rgb(50, 30, 10),
             },
             agent: AgentTokens {
                 model_text: Color::Rgb(0xed, 0xf0, 0xf5),
@@ -407,6 +417,8 @@ impl Theme {
                 removed: Color::Indexed(203),
                 context: Color::Indexed(249),
                 header: Color::Indexed(75),
+                added_bg: Color::Indexed(22),
+                removed_bg: Color::Indexed(52),
             },
             agent: AgentTokens {
                 model_text: Color::Indexed(252),
@@ -467,6 +479,8 @@ impl Theme {
                 removed: Color::LightRed,
                 context: Color::Gray,
                 header: Color::LightBlue,
+                added_bg: Color::Reset,
+                removed_bg: Color::Reset,
             },
             agent: AgentTokens {
                 model_text: Color::White,
@@ -527,6 +541,8 @@ impl Theme {
                 removed: Color::Gray,
                 context: Color::DarkGray,
                 header: Color::White,
+                added_bg: Color::Reset,
+                removed_bg: Color::Reset,
             },
             agent: AgentTokens {
                 model_text: Color::White,
@@ -637,6 +653,16 @@ impl Theme {
                 removed: ansi_red,
                 context: secondary,
                 header: ansi_cyan,
+                added_bg: if is_light {
+                    Color::Rgb(220, 245, 225)
+                } else {
+                    Color::Rgb(16, 40, 24)
+                },
+                removed_bg: if is_light {
+                    Color::Rgb(255, 230, 232)
+                } else {
+                    Color::Rgb(48, 16, 20)
+                },
             },
             agent: AgentTokens {
                 model_text: primary,
@@ -715,7 +741,12 @@ impl Theme {
         Style::default()
             .fg(self.selection.foreground)
             .bg(self.selection.background)
-            .add_modifier(Modifier::BOLD)
+    }
+
+    /// The accent color for the left selection indicator bar.
+    #[must_use]
+    pub fn selection_accent(&self) -> Color {
+        self.focus.active
     }
 
     /// Foreground style for content inside a selectable row. Ratatui merges a
@@ -959,7 +990,11 @@ mod tests {
             ThemeVariant::Monochrome,
         ] {
             let theme = Theme::variant(variant);
-            for background in [theme.surface.panel, theme.surface.overlay] {
+            for background in [
+                theme.surface.background,
+                theme.surface.panel,
+                theme.surface.overlay,
+            ] {
                 let ratio = contrast_ratio(theme.text.muted, background);
                 assert!(
                     ratio >= 4.5,
@@ -974,6 +1009,25 @@ mod tests {
                 "{variant:?}: selected child spans must override their normal token"
             );
         }
+    }
+
+    #[test]
+    fn diff_bg_tints_are_absent_only_on_low_colour_depths() {
+        assert_ne!(Theme::dark().diff.added_bg, Color::Reset);
+        assert_ne!(Theme::dark().diff.removed_bg, Color::Reset);
+        assert_ne!(Theme::light().diff.added_bg, Color::Reset);
+        assert_ne!(Theme::light().diff.removed_bg, Color::Reset);
+        assert_ne!(Theme::high_contrast().diff.added_bg, Color::Reset);
+        assert_ne!(Theme::high_contrast().diff.removed_bg, Color::Reset);
+        assert_ne!(Theme::color_blind_safe().diff.added_bg, Color::Reset);
+        assert_ne!(Theme::color_blind_safe().diff.removed_bg, Color::Reset);
+        assert_ne!(Theme::ansi256().diff.added_bg, Color::Reset);
+        assert_ne!(Theme::ansi256().diff.removed_bg, Color::Reset);
+
+        assert_eq!(Theme::ansi16().diff.added_bg, Color::Reset);
+        assert_eq!(Theme::ansi16().diff.removed_bg, Color::Reset);
+        assert_eq!(Theme::monochrome().diff.added_bg, Color::Reset);
+        assert_eq!(Theme::monochrome().diff.removed_bg, Color::Reset);
     }
 
     #[test]

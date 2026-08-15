@@ -19,6 +19,7 @@
 - [`agent-framework-rs` Integration](12-agent-framework-rs-integration.md)
 - [Observability, Evaluation, and Learning](13-observability-evaluation-learning.md)
 - [Core Data Contracts](14-core-data-contracts.md)
+- [CLI JSON Stream Contract](cli-json-stream.md)
 - [Implementation Roadmap](15-roadmap.md)
 - [Testing and Acceptance Strategy](16-testing-strategy.md)
 - [Architecture Decisions](17-architecture-decisions.md)

@@ -611,6 +611,8 @@ pub enum Overlay {
     },
     /// Backtrack / Session Fork overlay (Adoption 05).
     Backtrack(BacktrackState),
+    /// Detailed token context breakdown card (/context).
+    Context,
 }
 
 /// State of the backtrack / session-fork overlay (Adoption 05).
@@ -657,6 +659,8 @@ pub struct ToolCard {
     pub artifact: Option<ArtifactRef>,
     /// The approval this proposal is gated on, if any.
     pub approval_id: Option<ApprovalId>,
+    /// Inline output preview text for completed tools (Action 3).
+    pub output_preview: Option<String>,
     /// Whether the card is expanded to show detail.
     pub expanded: bool,
 }
@@ -1038,6 +1042,16 @@ pub struct PendingRunStart {
     pub target: RunStartDraftTarget,
 }
 
+/// Detailed token breakdown of context usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextBreakdown {
+    pub used_tokens: u64,
+    pub window_tokens: u64,
+    pub system_tokens: u64,
+    pub tool_tokens: u64,
+    pub transcript_tokens: u64,
+}
+
 /// Everything known about one run, and its transcript.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunView {
@@ -1056,6 +1070,8 @@ pub struct RunView {
     pub worktree: Option<String>,
     /// Context-window usage percent, projected from the token budget.
     pub context_percent: Option<u16>,
+    /// Detailed token breakdown (Action 19).
+    pub context_breakdown: Option<ContextBreakdown>,
     /// Cost so far, in minor currency units, projected from the cost budget.
     pub cost_minor: Option<u64>,
     /// The run's MEASURED usage, from [`EventBody::RunUsage`]
@@ -1104,6 +1120,7 @@ impl RunView {
             model: None,
             worktree: None,
             context_percent: None,
+            context_breakdown: None,
             cost_minor: None,
             prompt_tokens: None,
             completion_tokens: None,
@@ -2893,7 +2910,8 @@ impl AppState {
             | Overlay::CouncilBrowser
             | Overlay::AddModelQuerying { .. }
             | Overlay::UnslothPulling { .. }
-            | Overlay::Backtrack(_) => InputMode::Normal,
+            | Overlay::Backtrack(_)
+            | Overlay::Context => InputMode::Normal,
             Overlay::CouncilResults => InputMode::CouncilResults,
             Overlay::CouncilBuilder(_) => {
                 unreachable!("council builder input mode is resolved above")

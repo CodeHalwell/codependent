@@ -372,6 +372,17 @@ pub enum ProposedAction {
         /// so no echoed secret reaches the ledger).
         byte_len: usize,
     },
+    /// Offer the operator a mode switch and, on their approval, enqueue the
+    /// next turn in `target` (adoption 19: `plan_enter` / `plan_exit`). Targets
+    /// only the session's own human (a yes/no question) and its own prompt
+    /// queue — no filesystem, command, network, or remote effect — so it is
+    /// always policy-`Allow`ed like [`Self::AskUser`] and recorded purely so the
+    /// transition offer is traced. Never serialized into a `ToolProposed`.
+    PlanTransition {
+        /// The mode the accepted continuation runs in (`Plan` from
+        /// `plan_enter`, `Build` from `plan_exit`).
+        target: AgentMode,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -549,6 +560,9 @@ mod tests {
             git_action:
                 "write docs/architecture.md in the working tree (approval-gated change set)"
                     .to_string(),
+        });
+        round_trip(ProposedAction::PlanTransition {
+            target: AgentMode::Build,
         });
         round_trip(Risk {
             level: RiskLevel::High,

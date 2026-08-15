@@ -36,6 +36,7 @@
 //! ([`CommandProcessor::reconcile_pending_effects`]) sweeps any orphaned
 //! `pending_effects`; STEP 1.14 extends that recovery.
 
+use std::path::Path;
 use std::str::FromStr;
 
 use chrono::Utc;
@@ -51,7 +52,25 @@ use crate::approvals::{ApprovalBroker, ApprovalError};
 use crate::principal::PeerPrincipal;
 use crate::projections;
 use crate::questions::{QuestionBroker, QuestionError, QuestionReply};
+use codypendent_sandbox::executor::{
+    enforcing_executor, SandboxCommand, SandboxError, SandboxExecutor, SandboxOutcome,
+};
+use codypendent_sandbox::profile::{SandboxProfile, ENV_ALLOWLIST};
+
+use crate::server::resolve_run_repository;
 use crate::subscriptions::SubscriptionHub;
+
+/// Wall-clock ceiling for a `!` operator shell escape — the sandbox kills the
+/// process group past this. Matches the `shell.run` tool's 30s default so a
+/// `!tail -f` cannot hang the write path.
+const USER_SHELL_WALL_SECONDS: u64 = 30;
+/// CPU-time ceiling for a `!` command (rlimit).
+const USER_SHELL_CPU_SECONDS: u64 = 30;
+/// Memory ceiling for a `!` command (rlimit), in MiB.
+const USER_SHELL_MEMORY_MB: u64 = 512;
+/// Captured-output ceiling for a `!` command, in MiB — the sandbox truncates
+/// beyond this, so a chatty command cannot bloat the ledger note.
+const USER_SHELL_OUTPUT_MB: u64 = 1;
 
 /// A run's resolved model policy is not carried by the Phase 1 `StartRun`
 /// command; the write path records this default (a `models.toml` profile id).
@@ -274,6 +293,17 @@ impl CommandProcessor {
                 prompt_id,
             } => {
                 self.apply_delete_queued_prompt(pool, &ctx, &command, session_id, prompt_id)
+                    .await
+            }
+            CommandBody::RunUserShell {
+                session_id,
+                command: shell_cmd,
+            } => {
+                self.apply_run_user_shell(pool, &ctx, &command, session_id, shell_cmd)
+                    .await
+            }
+            CommandBody::RememberMemory { session_id, text } => {
+                self.apply_remember_memory(pool, &ctx, &command, session_id, text)
                     .await
             }
             // `AttachSession`/`Unknown` are already rejected in `validate`; this
@@ -1362,6 +1392,290 @@ impl CommandProcessor {
         Ok(outcome)
     }
 
+    /// Apply a `!` operator shell escape. This is an operator-initiated shell
+    /// escape that runs CONFINED under the session's sandbox profile in the
+    /// session worktree: `/bin/sh -c <cmd>` still supports pipes and redirects,
+    /// but it executes inside the platform sandbox (Seatbelt on macOS / bwrap on
+    /// Linux) scoped to the worktree (read+write there, no network), bounded
+    /// (memory/CPU/output) and time-limited (wall-clock kill). It FAILS CLOSED:
+    /// when the sandbox cannot be enforced (unsupported platform, missing tool)
+    /// the command is REFUSED with a legible note, never run unconfined.
+    ///
+    /// Crash-consistency: a `!` command is a NON-idempotent external effect, so
+    /// it must never re-execute on resume. The `received` row is committed in
+    /// its OWN transaction BEFORE the subprocess runs and the subprocess runs
+    /// OUTSIDE any write transaction — so a crash mid-exec leaves a durable
+    /// `received` row that [`resume_received`] finalizes applied-without-re-exec
+    /// (the `RunUserShell` body falls through its idempotent-effect arms), never
+    /// a second run. The write lock is NOT held across the subprocess.
+    async fn apply_run_user_shell(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        session_id: SessionId,
+        shell_cmd: String,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
+
+        // --- Claim: commit the `received` row in its OWN transaction, before
+        // the subprocess runs, so a mid-exec crash leaves a durable claim the
+        // resume path finalizes without re-executing.
+        {
+            let mut tx = pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(internal_error)?;
+            if let Err(err) = sqlx::query(
+                "INSERT INTO commands \
+                 (id, idempotency_key, session_id, client_id, body, status, received_at) \
+                 VALUES (?, ?, ?, ?, ?, 'received', ?)",
+            )
+            .bind(command.command_id.to_string())
+            .bind(&command.idempotency_key)
+            .bind(session_id.to_string())
+            .bind(ctx.client_id.to_string())
+            .bind(&body_json)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *tx)
+            .await
+            {
+                let _ = tx.rollback().await;
+                let err = anyhow::Error::from(err);
+                if is_unique_violation(&err) {
+                    if let Some(existing) = lookup_command(pool, &command.idempotency_key)
+                        .await
+                        .map_err(internal_error)?
+                    {
+                        return self.handle_existing(pool, existing).await;
+                    }
+                }
+                return Err(internal_error(err));
+            }
+            tx.commit().await.map_err(internal_error)?;
+        }
+
+        // --- Run OUTSIDE any write transaction, in the session's repository.
+        // The session's originating `StartRun` is authoritative for the repo;
+        // fall back to the daemon cwd only when the session carried none.
+        let provenance = session_run_provenance(pool, session_id)
+            .await
+            .unwrap_or_default();
+        let cwd = resolve_run_repository(provenance.repository.as_deref());
+        // Canonicalize so the confined cwd matches the granted worktree path
+        // exactly (macOS tempdirs are symlinks under /var → /private/var).
+        let cwd = cwd.canonicalize().unwrap_or(cwd);
+        let origin = format!("shell:{session_id}");
+        let output_text = run_user_shell_command(&shell_cmd, &cwd, &origin).await;
+
+        // --- Apply: append the two notes + mark applied in a second tx. The
+        // write lock is taken only now, never across the subprocess above.
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal_error)?;
+
+        // 1. User note: $ <cmd>
+        let seq1 = next_sequence(&mut *tx, session_id)
+            .await
+            .map_err(internal_error)?;
+        let actor1 = Actor::Client {
+            client_id: ctx.client_id,
+        };
+        let body1 = EventBody::NoteAppended {
+            text: format!("$ {shell_cmd}"),
+            run_id: None,
+        };
+        append_event(
+            &mut *tx,
+            session_id,
+            seq1,
+            &actor1,
+            &body1,
+            &now_str,
+            Some(command.command_id),
+        )
+        .await
+        .map_err(internal_error)?;
+
+        // 2. Output note
+        let seq2 = next_sequence(&mut *tx, session_id)
+            .await
+            .map_err(internal_error)?;
+        let actor2 = Actor::System;
+        let body2 = EventBody::NoteAppended {
+            text: output_text,
+            run_id: None,
+        };
+        append_event(
+            &mut *tx,
+            session_id,
+            seq2,
+            &actor2,
+            &body2,
+            &now_str,
+            Some(command.command_id),
+        )
+        .await
+        .map_err(internal_error)?;
+
+        sqlx::query("UPDATE sessions SET revision = revision + 1, updated_at = ? WHERE id = ?")
+            .bind(&now_str)
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+
+        let outcome = CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence: Some(u64::try_from(seq2).map_err(internal_error)?),
+            newly_applied: true,
+        };
+
+        sqlx::query(
+            "UPDATE commands SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",
+        )
+        .bind(serde_json::to_string(&outcome).map_err(internal_error)?)
+        .bind(&now_str)
+        .bind(command.command_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+        tx.commit().await.map_err(internal_error)?;
+
+        let event1 = SessionEvent {
+            sequence: u64::try_from(seq1).map_err(internal_error)?,
+            occurred_at: now,
+            causation_id: Some(command.command_id),
+            correlation_id: None,
+            actor: actor1,
+            body: body1,
+        };
+        self.subscriptions.publish(session_id, event1);
+
+        let event2 = SessionEvent {
+            sequence: u64::try_from(seq2).map_err(internal_error)?,
+            occurred_at: now,
+            causation_id: Some(command.command_id),
+            correlation_id: None,
+            actor: actor2,
+            body: body2,
+        };
+        self.subscriptions.publish(session_id, event2);
+
+        Ok(outcome)
+    }
+
+    async fn apply_remember_memory(
+        &self,
+        pool: &SqlitePool,
+        ctx: &ApplyContext,
+        command: &Command,
+        session_id: SessionId,
+        text: String,
+    ) -> Result<CommandOutcome, CodypendentError> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let body_json = serde_json::to_string(&command.body).map_err(internal_error)?;
+
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(internal_error)?;
+
+        if let Err(err) = sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, ?, ?, ?, ?, 'received', ?)",
+        )
+        .bind(command.command_id.to_string())
+        .bind(&command.idempotency_key)
+        .bind(session_id.to_string())
+        .bind(ctx.client_id.to_string())
+        .bind(&body_json)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await
+        {
+            let _ = tx.rollback().await;
+            let err = anyhow::Error::from(err);
+            if is_unique_violation(&err) {
+                if let Some(existing) = lookup_command(pool, &command.idempotency_key)
+                    .await
+                    .map_err(internal_error)?
+                {
+                    return self.handle_existing(pool, existing).await;
+                }
+            }
+            return Err(internal_error(err));
+        }
+
+        let seq = next_sequence(&mut *tx, session_id)
+            .await
+            .map_err(internal_error)?;
+        let actor = Actor::System;
+        let body = EventBody::NoteAppended {
+            text: format!("remembered: {text}"),
+            run_id: None,
+        };
+
+        append_event(
+            &mut *tx,
+            session_id,
+            seq,
+            &actor,
+            &body,
+            &now_str,
+            Some(command.command_id),
+        )
+        .await
+        .map_err(internal_error)?;
+
+        sqlx::query("UPDATE sessions SET revision = revision + 1, updated_at = ? WHERE id = ?")
+            .bind(&now_str)
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+
+        let outcome = CommandOutcome {
+            command_id: command.command_id,
+            created_session: None,
+            created_run: None,
+            last_sequence: Some(u64::try_from(seq).map_err(internal_error)?),
+            newly_applied: true,
+        };
+
+        sqlx::query(
+            "UPDATE commands SET status = 'applied', result_json = ?, applied_at = ? WHERE id = ?",
+        )
+        .bind(serde_json::to_string(&outcome).map_err(internal_error)?)
+        .bind(&now_str)
+        .bind(command.command_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+        tx.commit().await.map_err(internal_error)?;
+
+        let event = SessionEvent {
+            sequence: u64::try_from(seq).map_err(internal_error)?,
+            occurred_at: now,
+            causation_id: Some(command.command_id),
+            correlation_id: None,
+            actor,
+            body,
+        };
+        self.subscriptions.publish(session_id, event);
+
+        Ok(outcome)
+    }
+
     async fn apply_run_state(
         &self,
         pool: &SqlitePool,
@@ -2084,7 +2398,14 @@ fn role_permits(role: ClientRole, body: &CommandBody) -> bool {
         | CommandBody::QueuePrompt { .. }
         | CommandBody::UpdateQueuedPrompt { .. }
         | CommandBody::PromoteQueuedPrompt { .. }
-        | CommandBody::DeleteQueuedPrompt { .. } => {
+        | CommandBody::DeleteQueuedPrompt { .. }
+        // Operator-initiated composer actions (adoption 20): a `!` shell escape
+        // and a `#` memory quick-add are session mutations the operator drives
+        // from the composer, so they carry the same role floor as submitting
+        // input or queueing a prompt. The `!` escape is separately confined by
+        // the sandbox and its own worktree scope in `apply_run_user_shell`.
+        | CommandBody::RunUserShell { .. }
+        | CommandBody::RememberMemory { .. } => {
             matches!(role, Contributor | Controller | Approver)
         }
         CommandBody::CancelRun { .. }
@@ -2188,6 +2509,120 @@ fn revision_conflict(expected: u64, actual: u64) -> CodypendentError {
         format!("expected session revision {expected} but it is at {actual}"),
         false,
     )
+}
+
+/// Run a `!` operator shell escape CONFINED under the session's sandbox profile,
+/// returning the model-/operator-facing note text.
+///
+/// `!` is an operator-initiated shell escape, but codypendent runs it CONFINED:
+/// `/bin/sh -c <cmd>` still supports pipes/redirects, yet it executes inside the
+/// platform sandbox ([`enforcing_executor`]) scoped to the session worktree
+/// (read+write there, no network), bounded (memory/CPU/output) and time-limited
+/// (wall-clock kill). It FAILS CLOSED: when the sandbox cannot be enforced
+/// ([`SandboxError::UnsupportedPlatform`] / [`SandboxError::ToolUnavailable`],
+/// e.g. Linux without bwrap or Windows) the command is REFUSED with a legible
+/// note — never run unconfined.
+async fn run_user_shell_command(shell_cmd: &str, cwd: &Path, origin: &str) -> String {
+    let executor = match enforcing_executor() {
+        Ok(executor) => executor,
+        // Fail-closed: no OS backend / missing tool ⇒ refuse, never run bare.
+        Err(err) => return shell_escape_refusal(&err),
+    };
+    let shell_cmd = shell_cmd.trim().to_string();
+    let cwd = cwd.to_path_buf();
+    let origin = origin.to_string();
+    // The sandbox executor is blocking (spawns + reaps a child), so offload it
+    // off the async worker rather than stalling the runtime.
+    match tokio::task::spawn_blocking(move || {
+        run_user_shell_confined(executor.as_ref(), &shell_cmd, &cwd, &origin)
+    })
+    .await
+    {
+        Ok(note) => note,
+        Err(join_err) => format!("shell escape failed: {join_err}"),
+    }
+}
+
+/// Build the confined command + profile and run it through `executor`, mapping
+/// the outcome to note text. Split out (and executor-injected) so the mapping is
+/// unit-testable against a mock sandbox.
+fn run_user_shell_confined(
+    executor: &dyn SandboxExecutor,
+    shell_cmd: &str,
+    cwd: &Path,
+    origin: &str,
+) -> String {
+    let profile = user_shell_profile(origin, cwd);
+    let command = SandboxCommand::new(
+        std::path::PathBuf::from("/bin/sh"),
+        vec!["-c".to_string(), shell_cmd.to_string()],
+        cwd.to_path_buf(),
+        origin.to_string(),
+    );
+    user_shell_note(executor.run(&profile, &command))
+}
+
+/// The minimal sandbox profile for an interactive operator shell in the session
+/// worktree: read+write the worktree, NO network (unless a session grants one
+/// elsewhere — this handler does not), subprocess allowed (a shell pipeline
+/// spawns children), a clean env allowlist, and bounded resources. Deliberately
+/// no broader grant than an operator editing files in their own worktree needs.
+fn user_shell_profile(origin: &str, worktree: &Path) -> SandboxProfile {
+    let worktree = worktree.to_string_lossy().to_string();
+    SandboxProfile {
+        plugin: origin.to_string(),
+        env_allowlist: ENV_ALLOWLIST.iter().map(|s| (*s).to_string()).collect(),
+        read_paths: vec![worktree.clone()],
+        write_paths: vec![worktree],
+        network_allowlist: Vec::new(),
+        brokered_secrets: Vec::new(),
+        allow_subprocess: true,
+        memory_mb: USER_SHELL_MEMORY_MB,
+        cpu_seconds: USER_SHELL_CPU_SECONDS,
+        wall_seconds: USER_SHELL_WALL_SECONDS,
+        maximum_output_mb: USER_SHELL_OUTPUT_MB,
+    }
+}
+
+/// Map a confined-run result to the note recorded on the ledger. The executor
+/// already sanitizes and caps output (`maximum_output_mb`), so this just folds
+/// stdout+stderr and annotates a timeout or truncation.
+fn user_shell_note(result: Result<SandboxOutcome, SandboxError>) -> String {
+    match result {
+        Ok(outcome) => {
+            if outcome.timed_out {
+                return format!("(timed out after {USER_SHELL_WALL_SECONDS}s)");
+            }
+            let mut combined = outcome.stdout.text.clone();
+            if !outcome.stderr.text.is_empty() {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&outcome.stderr.text);
+            }
+            let mut text = combined.trim().to_string();
+            if outcome.output_truncated {
+                text.push_str("\n... output truncated (exceeded sandbox cap) ...");
+            }
+            if text.is_empty() {
+                format!(
+                    "(process exited with code {})",
+                    outcome.exit_code.unwrap_or(0)
+                )
+            } else {
+                text
+            }
+        }
+        // Fail-closed: the sandbox refused the run — report it, never re-run bare.
+        Err(err) => shell_escape_refusal(&err),
+    }
+}
+
+/// The fail-closed refusal note: the sandbox could not be enforced (or refused
+/// the run), so the `!` command was NOT executed. The [`SandboxError`] display
+/// carries the operator-legible diagnostic.
+fn shell_escape_refusal(err: &SandboxError) -> String {
+    format!("shell escape refused: sandbox enforcement unavailable — {err}")
 }
 
 /// Whether `err` wraps a SQLite UNIQUE / PRIMARY KEY constraint violation — the
@@ -3128,6 +3563,37 @@ mod tests {
         assert_eq!(provenance.model, None);
     }
 
+    #[test]
+    fn composer_actions_are_role_gated_like_submit_input() {
+        // Adoption 20 regression: `!` shell escape and `#` memory quick-add are
+        // new command bodies. They must be listed in `role_permits` or the
+        // authorization gate rejects them with `protocol.role-denied` before the
+        // handler ever runs — which would silently kill the composer features
+        // even though the handler unit-tests (which bypass the gate) pass.
+        let shell = CommandBody::RunUserShell {
+            session_id: SessionId::new(),
+            command: "ls".to_string(),
+        };
+        let remember = CommandBody::RememberMemory {
+            session_id: SessionId::new(),
+            text: "a fact".to_string(),
+        };
+        for body in [&shell, &remember] {
+            assert!(
+                role_permits(ClientRole::Contributor, body),
+                "contributor must be allowed to issue {body:?}"
+            );
+            assert!(
+                role_permits(ClientRole::Controller, body),
+                "controller must be allowed to issue {body:?}"
+            );
+            assert!(
+                !role_permits(ClientRole::Observer, body),
+                "observer must be denied {body:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn observer_cannot_start_run() {
         let dir = tempdir().unwrap();
@@ -3995,5 +4461,224 @@ mod tests {
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].text, "steer live run");
         assert_eq!(snap[0].delivery, PromptDelivery::Steer);
+    }
+
+    // --- FIX 2: `!` operator shell escape (now SANDBOXED) ---
+
+    /// Whether this host has an enforcing OS sandbox (Seatbelt on macOS, bwrap
+    /// on Linux). Real-confinement assertions gate on this the way the sandbox
+    /// enforcement suite does, so CI on macos-seatbelt and linux-bwrap runs them
+    /// while a host lacking the tool skips them instead of spuriously failing.
+    fn sandbox_available() -> bool {
+        enforcing_executor()
+            .map(|executor| executor.capability_report().available)
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn user_shell_runs_confined_in_the_session_repository() {
+        // (b)+(sandbox) The `!` command runs CONFINED in the session's
+        // repository (its `StartRun.repository`), NOT the daemon's frozen cwd.
+        // A `touch` lands its marker in the repo dir iff the confined cwd was
+        // the granted worktree — proving both the cwd fix and that confinement
+        // permits worktree writes.
+        if !sandbox_available() {
+            eprintln!("skipping: no enforcing OS sandbox on this host");
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "sh-cwd-create").await;
+
+        let repo = tempdir().unwrap();
+        processor
+            .apply(
+                &pool,
+                ctx(ClientRole::Controller),
+                command(
+                    CommandBody::StartRun {
+                        session_id: session,
+                        objective: "go".to_string(),
+                        mode: AgentMode::Build,
+                        repository: Some(repo.path().to_string_lossy().to_string()),
+                        model: None,
+                    },
+                    "sh-cwd-start",
+                ),
+            )
+            .await
+            .expect("start run");
+
+        // Drive the handler directly (mirroring the module's write-path unit
+        // tests): this exercises the restructured claim → confined exec → apply
+        // flow and the session-repository cwd resolution without depending on
+        // the wire role gate.
+        let shell_cmd = command(
+            CommandBody::RunUserShell {
+                session_id: session,
+                command: "touch cwd_marker".to_string(),
+            },
+            "sh-cwd-run",
+        );
+        processor
+            .apply_run_user_shell(
+                &pool,
+                &ctx(ClientRole::Controller),
+                &shell_cmd,
+                session,
+                "touch cwd_marker".to_string(),
+            )
+            .await
+            .expect("run user shell");
+
+        assert!(
+            repo.path().join("cwd_marker").exists(),
+            "the confined `!` command did not run in (or could not write) the session repository"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_flight_user_shell_is_not_re_executed_on_resume() {
+        // (a)+(e) A `!` command is a non-idempotent external effect. A crash
+        // mid-exec leaves a committed `received` row; the resume path must
+        // finalize it applied WITHOUT re-running the command. Simulate the
+        // crash by planting the `received` row, then re-delivering the same
+        // idempotency key: the marker must NOT be created.
+        let dir = tempdir().unwrap();
+        let pool = test_pool(dir.path()).await;
+        let processor = CommandProcessor::default();
+        let session = create_session(&processor, &pool, "sh-resume-create").await;
+        let repo = tempdir().unwrap();
+
+        let marker = repo.path().join("resume_marker");
+        let shell = format!("touch {}", marker.to_string_lossy());
+        let body = CommandBody::RunUserShell {
+            session_id: session,
+            command: shell.clone(),
+        };
+        let key = "sh-resume-run";
+
+        // Plant a `received` row exactly as the claim step would have committed
+        // it before the crash.
+        sqlx::query(
+            "INSERT INTO commands \
+             (id, idempotency_key, session_id, client_id, body, status, received_at) \
+             VALUES (?, ?, ?, ?, ?, 'received', ?)",
+        )
+        .bind(CommandId::new().to_string())
+        .bind(key)
+        .bind(session.to_string())
+        .bind(ClientId::new().to_string())
+        .bind(serde_json::to_string(&body).unwrap())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("plant received row");
+
+        let outcome = processor
+            .apply(&pool, ctx(ClientRole::Contributor), command(body, key))
+            .await
+            .expect("resume applies");
+
+        assert!(
+            !outcome.newly_applied,
+            "a resumed `!` command is a replay, not a fresh application"
+        );
+        assert!(
+            !marker.exists(),
+            "the mid-flight `!` command was wrongly re-executed on resume"
+        );
+    }
+
+    /// Build a synthetic [`SandboxOutcome`], mirroring the hook-exec tests, so
+    /// the note mapping is exercised deterministically on any platform.
+    fn shell_outcome(
+        exit: Option<i32>,
+        timed_out: bool,
+        stdout: &str,
+        stderr: &str,
+        truncated: bool,
+    ) -> SandboxOutcome {
+        SandboxOutcome {
+            backend: codypendent_sandbox::executor::SandboxBackend::None,
+            exit_code: exit,
+            timed_out,
+            duration: std::time::Duration::from_millis(5),
+            stdout: codypendent_sandbox::sanitize::sanitize_untrusted("shell:test", stdout, 4096),
+            stderr: codypendent_sandbox::sanitize::sanitize_untrusted("shell:test", stderr, 4096),
+            output_truncated: truncated,
+        }
+    }
+
+    #[test]
+    fn user_shell_note_reports_a_timeout() {
+        // (c) A hung command hits the sandbox wall-clock cap; the note says so
+        // rather than surfacing partial output as if the command completed.
+        let note = user_shell_note(Ok(shell_outcome(None, true, "partial", "", false)));
+        assert!(
+            note.contains("timed out"),
+            "a timed-out command must report it, got {note:?}"
+        );
+    }
+
+    #[test]
+    fn user_shell_note_marks_truncated_output() {
+        // (d) The sandbox caps output (`maximum_output_mb`); when it truncates,
+        // the note is annotated so the operator knows the tail was dropped.
+        let note = user_shell_note(Ok(shell_outcome(
+            Some(0),
+            false,
+            "lots of output",
+            "",
+            true,
+        )));
+        assert!(
+            note.contains("truncated"),
+            "truncated output must be annotated, got {note:?}"
+        );
+    }
+
+    #[test]
+    fn user_shell_note_combines_stdout_and_stderr() {
+        let note = user_shell_note(Ok(shell_outcome(Some(0), false, "out", "err", false)));
+        assert!(note.contains("out") && note.contains("err"), "got {note:?}");
+    }
+
+    #[tokio::test]
+    async fn user_shell_is_refused_fail_closed_when_sandbox_unavailable() {
+        // Fail-closed identity: a platform with no backend, or a missing tool,
+        // REFUSES the `!` command with a legible note — never runs it unconfined.
+        let unsupported = shell_escape_refusal(&SandboxError::UnsupportedPlatform {
+            platform: "windows",
+        });
+        assert!(unsupported.contains("shell escape refused"));
+        assert!(unsupported.contains("windows"));
+
+        let missing_tool = user_shell_note(Err(SandboxError::ToolUnavailable {
+            tool: "bwrap".to_string(),
+            diagnostic: "not found on PATH".to_string(),
+        }));
+        assert!(missing_tool.contains("shell escape refused"));
+        assert!(missing_tool.contains("bwrap"));
+
+        // On a host that genuinely lacks the sandbox, the end-to-end handler
+        // refuses too (only runs where the tool is actually absent).
+        if !sandbox_available() {
+            let note = run_user_shell_command(
+                "touch should_not_exist",
+                std::path::Path::new("."),
+                "shell:test",
+            )
+            .await;
+            assert!(
+                note.contains("shell escape refused"),
+                "an unavailable sandbox must refuse, got {note:?}"
+            );
+            assert!(
+                !std::path::Path::new("should_not_exist").exists(),
+                "a refused `!` command must not have executed"
+            );
+        }
     }
 }

@@ -332,6 +332,7 @@ pub(crate) fn event_run_id(body: &EventBody) -> Option<RunId> {
         | EventBody::BudgetWarning { run_id, .. }
         | EventBody::RunCompleted { run_id, .. }
         | EventBody::RunUsage { run_id, .. }
+        | EventBody::ContextUsage { run_id, .. }
         | EventBody::LearningsCaptured { run_id, .. } => Some(*run_id),
         _ => None,
     }
@@ -386,6 +387,14 @@ mod tests {
                 prompt_tokens: Some(1),
                 completion_tokens: Some(2),
                 cost_micros: None,
+            },
+            EventBody::ContextUsage {
+                run_id: run,
+                used_tokens: 100,
+                window_tokens: 1000,
+                system_tokens: 10,
+                tool_tokens: 20,
+                transcript_tokens: 70,
             },
             EventBody::LearningsCaptured {
                 run_id: run,

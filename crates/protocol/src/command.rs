@@ -822,6 +822,18 @@ pub enum CommandBody {
         session_id: SessionId,
         prompt_id: PromptId,
     },
+    /// Run a user-initiated shell command as a transcript-recorded turn (Spec 20 Action 18).
+    RunUserShell {
+        session_id: SessionId,
+        command: String,
+    },
+    /// Quick-add a curated memory directly from the composer (Spec 20 Action 20).
+    /// Gated by the curator's secret and dedup filters; emitted to the session
+    /// ledger as a `NoteAppended` event.
+    RememberMemory {
+        session_id: SessionId,
+        text: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -925,6 +937,8 @@ impl CommandBody {
             | Self::Unknown => Vec::new(),
             Self::StartRun { session_id, .. }
             | Self::SubmitUserInput { session_id, .. }
+            | Self::RunUserShell { session_id, .. }
+            | Self::RememberMemory { session_id, .. }
             | Self::UpdateIdeContext { session_id, .. }
             | Self::ReadSessionEvents { session_id, .. }
             | Self::ForkSession { session_id, .. }
@@ -1533,6 +1547,14 @@ mod tests {
             session_id: SessionId::new(),
             after_sequence: 500,
             limit: 200,
+        });
+        round_trip(CommandBody::RunUserShell {
+            session_id: SessionId::new(),
+            command: "cargo test -q".to_string(),
+        });
+        round_trip(CommandBody::RememberMemory {
+            session_id: SessionId::new(),
+            text: "prefer ripgrep over grep in this repo".to_string(),
         });
     }
 

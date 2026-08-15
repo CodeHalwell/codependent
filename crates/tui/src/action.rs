@@ -376,6 +376,8 @@ pub enum Action {
     OpenMemory,
     /// Open the curated learning journey/review surface.
     OpenJourney,
+    /// Open the token context usage card (/context).
+    OpenContext,
     /// Reveal the focused memory's source in full (`o`, or `Enter` in the memory
     /// browser). The TUI does no I/O, so this surfaces the source string rather
     /// than opening a file.
@@ -1082,6 +1084,14 @@ pub enum Intent {
     /// Search workspace files fuzzy-matching query (Adoption 11 M2).
     SearchFiles {
         query: String,
+    },
+    /// Run an operator shell command via `!cmd` prefix (Action 18).
+    RunUserShell {
+        command: String,
+    },
+    /// Curate an operator-authored memory via `#text` prefix (Action 20).
+    RememberMemory {
+        text: String,
     },
 }
 

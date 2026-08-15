@@ -51,6 +51,13 @@ order, but 04 → 05 is a hard dependency.
 | 13 | [13 — Remote UI authoring SDK](13-remote-ui-authoring-sdk.md) | M | ✅ Completed | — | TSX authoring layer compiling to the shipped `UiDocument` protocol; alternatives analysis (React-in-ratatui) recorded |
 | 14 | [14 — Tauri React companion client](14-tauri-react-companion-client.md) | L | ✅ Completed (Arch/Spec) | 12/A6 rec. | Desktop client: real React/shadcn UI as a sibling daemon frontend; shared Remote UI renderer for plugin parity |
 | 15 | [15 — Claude Code comparison](15-claude-code-comparison.md) | ref | ✅ Completed (Ref/Gap) | — | Feature-by-feature comparison against Claude Code; net-new gap guidance (plan mode, instruction files, `!` prefix, prompt-template commands, web tools, …) |
+| 16 | [16 — Master implementation plan](16-master-implementation-plan.md) | plan | 🗺️ Planning | — | Everything-to-1.0: four tracks (UI, parity, graphical client, engine) sequenced into v0.8→v1.0 releases with dependencies + specs-to-write |
+| — | **v0.8 "Feels finished" — 21 actions across specs 17–21** | | | | |
+| 17 | [17 — Transcript & modal redesign](17-transcript-and-modal-redesign.md) | M | ⬜ v0.8 | — | Actions 1–7: turn separation + role accent, heading ladder, tool-call + diff cards, unified modal, scrim, layering/composer-clip fixes |
+| 18 | [18 — TUI polish & empty states](18-tui-polish-and-empty-states.md) | S | ⬜ v0.8 | 17 | Actions 8–14: centered empty states + CTAs, kanban backgrounds, hide empty `—`, splash inset, selection accent, contrast lift, list-width balance |
+| 19 | [19 — Plan mode](19-plan-mode.md) | M | ⬜ v0.8 | — | Actions 15–16: plan profile (writes denied except the plan file) + `plan_enter`/`plan_exit` bridge tools over the shipped question tool + prompt queue |
+| 20 | [20 — Composer parity](20-composer-parity.md) | M | ⬜ v0.8 | — | Actions 17–20: hierarchical `AGENTS.md`/`CLAUDE.md` instruction files, `!` shell prefix, `/context` card + live meter, `#` memory quick-add |
+| 21 | [21 — CLI JSON-stream contract](21-cli-contract.md) | S | ⬜ v0.8 | — | Action 21: pin + document the existing `run --jsonl` / `attach --events jsonl` NDJSON contract with a framing/schema contract test |
 
 Items in 11 and 12 are independent of each other and of the numbered specs; slot
 them opportunistically alongside whichever crate is already open.
