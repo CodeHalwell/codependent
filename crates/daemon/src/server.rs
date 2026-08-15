@@ -6127,6 +6127,7 @@ fn event_run_id(event: &SessionEvent) -> Option<codypendent_protocol::RunId> {
         | BudgetWarning { run_id, .. }
         | RunCompleted { run_id, .. }
         | RunUsage { run_id, .. }
+        | ContextUsage { run_id, .. }
         | LearningsCaptured { run_id, .. } => Some(*run_id),
         _ => None,
     }

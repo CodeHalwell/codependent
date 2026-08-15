@@ -42,6 +42,7 @@ mod github;
 mod graph;
 mod label;
 mod memory;
+mod plan;
 mod question;
 mod read_file;
 mod registry_search;
@@ -99,6 +100,7 @@ pub use graph::{
 };
 pub use label::tool_label;
 pub use memory::{parse_memory_remember, MemoryRemember, MemoryRememberInput};
+pub use plan::{PlanEnter, PlanExit};
 pub use question::{parse_ask_user, render_answers, render_rejection, AskUser};
 pub use read_file::{FileExcerpt, ReadFile, ReadFileInput};
 pub use registry_search::{

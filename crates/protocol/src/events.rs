@@ -202,6 +202,17 @@ pub enum EventBody {
         used: u64,
         limit: u64,
     },
+    /// Live context-window usage, emitted per turn while the model's window is
+    /// known (deduped by percent). Distinct from BudgetWarning (a threshold
+    /// warning) and RunUsage (a terminal measured tally).
+    ContextUsage {
+        run_id: RunId,
+        used_tokens: u64,
+        window_tokens: u64,
+        system_tokens: u64,
+        tool_tokens: u64,
+        transcript_tokens: u64,
+    },
     RunCompleted {
         run_id: RunId,
         disposition: RunDisposition,
@@ -462,6 +473,14 @@ mod tests {
             dimension: BudgetDimension::Tokens,
             used: 90_000,
             limit: 100_000,
+        });
+        round_trip(EventBody::ContextUsage {
+            run_id,
+            used_tokens: 42_000,
+            window_tokens: 200_000,
+            system_tokens: 900,
+            tool_tokens: 3_100,
+            transcript_tokens: 38_000,
         });
         round_trip(EventBody::RunCompleted {
             run_id,

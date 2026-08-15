@@ -926,6 +926,13 @@ pub fn reduce(state: &mut AppState, action: Action) {
                 request_projection(state, ProjectionKind::Journey);
             }
         }
+        Action::OpenContext => {
+            state.overlay = if matches!(state.overlay, Overlay::Context) {
+                Overlay::None
+            } else {
+                Overlay::Context
+            };
+        }
         Action::OpenSource => open_source(state),
 
         Action::OpenDocs => {
@@ -1915,6 +1922,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                         outcome: None,
                         artifact: None,
                         approval_id: Some(approval_id),
+                        output_preview: None,
                         expanded: false,
                     })),
                     at,
@@ -1958,6 +1966,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             outcome: Some(outcome),
                             artifact: None,
                             approval_id: None,
+                            output_preview: None,
                             expanded: false,
                         })),
                         at,
@@ -2000,6 +2009,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             outcome: None,
                             artifact: None,
                             approval_id: None,
+                            output_preview: None,
                             expanded: false,
                         })),
                         at,
@@ -2027,6 +2037,7 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                             outcome: Some(outcome),
                             artifact,
                             approval_id: None,
+                            output_preview: None,
                             expanded: false,
                         })),
                         at,
@@ -2332,6 +2343,36 @@ fn apply_event(state: &mut AppState, event: SessionEvent) {
                 if cost_micros.is_some() {
                     run.cost_micros = cost_micros;
                 }
+            }
+        }
+
+        EventBody::ContextUsage {
+            run_id,
+            used_tokens,
+            window_tokens,
+            system_tokens,
+            tool_tokens,
+            transcript_tokens,
+        } => {
+            let run_opt = state.run_mut(run_id);
+            let run = if run_opt.is_some() {
+                run_opt
+            } else {
+                state.selected_run_mut()
+            };
+            if let Some(run) = run {
+                let percent = (used_tokens * 100)
+                    .checked_div(window_tokens)
+                    .unwrap_or(0)
+                    .min(100) as u16;
+                run.context_percent = Some(percent);
+                run.context_breakdown = Some(crate::state::ContextBreakdown {
+                    used_tokens,
+                    window_tokens,
+                    system_tokens,
+                    tool_tokens,
+                    transcript_tokens,
+                });
             }
         }
 
@@ -6230,6 +6271,48 @@ fn submit_prompt(state: &mut AppState) {
                 open_onboard(state);
                 return;
             }
+            if let Some(cmd_text) = text.strip_prefix('!') {
+                let cmd = cmd_text.trim().to_owned();
+                if !cmd.is_empty() {
+                    if state.composer_history.last().map(String::as_str) != Some(text.as_str()) {
+                        state.composer_history.push(text.clone());
+                    }
+                    if state.prompt_history.last().map(String::as_str) != Some(text.as_str()) {
+                        state.prompt_history.push(text.clone());
+                    }
+                    state.history_cursor = None;
+                    state.composer_stash = None;
+                    state.outbox.push(Intent::RunUserShell { command: cmd });
+                }
+                state.composer.clear();
+                state.composer_cursor = 0;
+                if let Some(run) = state.selected_run_mut() {
+                    run.follow = true;
+                }
+                return;
+            }
+            if !text.contains('\n') && text.starts_with('#') {
+                let memory_text = text.trim_start_matches('#').trim().to_owned();
+                if !memory_text.is_empty() {
+                    if state.composer_history.last().map(String::as_str) != Some(text.as_str()) {
+                        state.composer_history.push(text.clone());
+                    }
+                    if state.prompt_history.last().map(String::as_str) != Some(text.as_str()) {
+                        state.prompt_history.push(text.clone());
+                    }
+                    state.history_cursor = None;
+                    state.composer_stash = None;
+                    state
+                        .outbox
+                        .push(Intent::RememberMemory { text: memory_text });
+                }
+                state.composer.clear();
+                state.composer_cursor = 0;
+                if let Some(run) = state.selected_run_mut() {
+                    run.follow = true;
+                }
+                return;
+            }
             if !text.is_empty() {
                 // An empty session has no durable run id with which to route a
                 // second message. Retain it as a draft until the first
@@ -7069,6 +7152,7 @@ fn run_palette_command(state: &mut AppState, command: crate::palette::PaletteCom
         }
         PaletteCommand::Issues => state.overlay = Overlay::Issues,
         PaletteCommand::NewRun => state.overlay = Overlay::NewRun(String::new()),
+        PaletteCommand::Context => state.overlay = Overlay::Context,
         PaletteCommand::Steer => begin_steering(state),
         PaletteCommand::PauseResume => pause_or_resume(state),
         PaletteCommand::Cancel => request_cancel(state),
@@ -15638,6 +15722,7 @@ mod tests {
             outcome: None,
             artifact: None,
             approval_id: None,
+            output_preview: None,
             expanded: false,
         }));
         assert!(tool.is_foldable(), "tool cards were the dead feature");
@@ -17174,5 +17259,117 @@ mod tests {
 
         reduce(&mut state, Action::Approve(ApprovalScope::Repository));
         assert!(state.outbox.is_empty());
+    }
+
+    #[test]
+    fn submit_prompt_with_bang_emits_run_user_shell() {
+        let mut state = AppState::new();
+        state.composer = "!cargo check".to_string();
+        reduce(&mut state, Action::InputSubmit);
+        assert_eq!(state.outbox.len(), 1);
+        assert_eq!(
+            state.outbox[0],
+            Intent::RunUserShell {
+                command: "cargo check".to_string(),
+            }
+        );
+        assert!(state.composer.is_empty());
+        assert_eq!(
+            state.composer_history.last().map(String::as_str),
+            Some("!cargo check")
+        );
+    }
+
+    #[test]
+    fn submit_prompt_with_bang_alone_is_noop() {
+        let mut state = AppState::new();
+        state.composer = "!   ".to_string();
+        reduce(&mut state, Action::InputSubmit);
+        assert!(state.outbox.is_empty());
+        assert!(state.composer.is_empty());
+    }
+
+    #[test]
+    fn submit_prompt_with_hash_single_line_emits_remember_memory() {
+        let mut state = AppState::new();
+        state.composer = "# remember this critical fact".to_string();
+        reduce(&mut state, Action::InputSubmit);
+        assert_eq!(state.outbox.len(), 1);
+        assert_eq!(
+            state.outbox[0],
+            Intent::RememberMemory {
+                text: "remember this critical fact".to_string(),
+            }
+        );
+        assert!(state.composer.is_empty());
+    }
+
+    #[test]
+    fn submit_prompt_with_hash_multiline_is_not_intercepted_as_memory() {
+        let mut state = AppState::new();
+        state.composer = "# Header\nSome markdown body".to_string();
+        reduce(&mut state, Action::InputSubmit);
+        // It starts a run rather than emitting RememberMemory
+        assert_eq!(state.outbox.len(), 1);
+        assert!(matches!(state.outbox[0], Intent::StartRun { .. }));
+    }
+
+    #[test]
+    fn context_usage_event_updates_run_breakdown_and_percent() {
+        let mut state = AppState::default();
+        let run_id = RunId::new();
+        reduce(
+            &mut state,
+            Action::daemon_event(SessionEvent {
+                sequence: 1,
+                occurred_at: Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::RunStarted {
+                    run_id,
+                    objective: "test".to_owned(),
+                    mode: AgentMode::Build,
+                },
+            }),
+        );
+        reduce(
+            &mut state,
+            Action::daemon_event(SessionEvent {
+                sequence: 2,
+                occurred_at: Utc::now(),
+                causation_id: None,
+                correlation_id: None,
+                actor: Actor::System,
+                body: EventBody::ContextUsage {
+                    run_id,
+                    used_tokens: 50_000,
+                    window_tokens: 200_000,
+                    system_tokens: 10_000,
+                    tool_tokens: 15_000,
+                    transcript_tokens: 25_000,
+                },
+            }),
+        );
+        let run = &state.runs[0];
+        assert_eq!(run.context_percent, Some(25));
+        let breakdown = run.context_breakdown.unwrap();
+        assert_eq!(breakdown.used_tokens, 50_000);
+        assert_eq!(breakdown.window_tokens, 200_000);
+        assert_eq!(breakdown.system_tokens, 10_000);
+        assert_eq!(breakdown.tool_tokens, 15_000);
+        assert_eq!(breakdown.transcript_tokens, 25_000);
+    }
+
+    #[test]
+    fn open_context_action_and_palette_command_toggle_overlay() {
+        let mut state = AppState::default();
+        reduce(&mut state, Action::OpenContext);
+        assert_eq!(state.overlay, Overlay::Context);
+        reduce(&mut state, Action::OpenContext);
+        assert_eq!(state.overlay, Overlay::None);
+
+        run_palette_command(&mut state, crate::palette::PaletteCommand::Context);
+        assert_eq!(state.overlay, Overlay::Context);
     }
 }

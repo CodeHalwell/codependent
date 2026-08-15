@@ -20,6 +20,7 @@ pub mod embedding;
 // `provider-openai` (see Cargo.toml).
 #[cfg(feature = "provider-openai")]
 pub mod extractor;
+pub mod instructions;
 pub mod models;
 pub mod tools;
 pub mod vcr;

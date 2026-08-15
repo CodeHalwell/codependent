@@ -161,6 +161,18 @@ pub struct EvalContext {
     pub repository: PathBuf,
     pub worktree: PathBuf,
     pub mode: ModeOverlay,
+    /// The one directory a `write_allowed == false` mode still permits writes
+    /// under (adoption 19, Plan mode's `<worktree>/.codypendent/plans`).
+    /// `None` for every mode without a plan-file exception. A write is allowed
+    /// by this exception ONLY when [`write_target`](Self::write_target) resolves
+    /// inside this root — deny-wins is untouched: this can never widen a deny
+    /// that the file policy or another overlay imposes.
+    pub plan_write_root: Option<PathBuf>,
+    /// The resolved absolute path of the write under evaluation, when the
+    /// caller knows it (the `workspace.write_file` / `workspace.edit_file`
+    /// target). `None` for non-write actions and for multi-file patches, which
+    /// therefore never qualify for the plan-file exception.
+    pub write_target: Option<PathBuf>,
 }
 
 impl EvalContext {
@@ -170,12 +182,28 @@ impl EvalContext {
             repository: repository.into(),
             worktree: worktree.into(),
             mode: ModeOverlay::permissive(),
+            plan_write_root: None,
+            write_target: None,
         }
     }
 
     /// Set the mode overlay.
     pub fn with_mode(mut self, mode: ModeOverlay) -> Self {
         self.mode = mode;
+        self
+    }
+
+    /// Set the plan-file write root (adoption 19). See [`plan_write_root`].
+    #[must_use]
+    pub fn with_plan_write_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.plan_write_root = Some(root.into());
+        self
+    }
+
+    /// Set the resolved write target for this evaluation (adoption 19).
+    #[must_use]
+    pub fn with_write_target(mut self, target: impl Into<PathBuf>) -> Self {
+        self.write_target = Some(target.into());
         self
     }
 }
@@ -378,6 +406,7 @@ impl PolicyEngine {
             ProposedAction::SearchRegistry => self.eval_search_registry(),
             ProposedAction::DocumentEdit { .. } => self.eval_document_edit(),
             ProposedAction::AskUser { .. } => self.eval_ask_user(),
+            ProposedAction::PlanTransition { .. } => self.eval_plan_transition(),
             ProposedAction::RestoreCheckpoint { .. } => self.eval_restore_checkpoint(),
             _ => self.deny(PolicyReason::new(
                 "policy.unsupported-action",
@@ -487,6 +516,24 @@ impl PolicyEngine {
         }
     }
 
+    /// A `plan_enter`/`plan_exit` call (adoption 19) is always permitted: like
+    /// `user.ask` it targets only the session's own human (a yes/no question)
+    /// and the session's own durable prompt queue — no filesystem, command,
+    /// network, or remote effect — so it grants no capability and never reaches
+    /// the approval gate.
+    fn eval_plan_transition(&self) -> PolicyDecision {
+        PolicyDecision {
+            decision: Decision::Allow,
+            reasons: vec![PolicyReason::new(
+                "policy.plan-transition-allowed",
+                "a plan-mode transition targets only the session's own human and queue",
+            )],
+            capability_grant: None,
+            policy_version: self.version.clone(),
+            approval_reusable: false,
+        }
+    }
+
     /// A checkpoint restore (Adoption 04) is destructive for uncheckpointed
     /// work done after the snapshot, so it ALWAYS requires explicit single-use
     /// human approval (never auto-approvable across runs).
@@ -555,6 +602,27 @@ impl PolicyEngine {
 
     fn eval_write(&self, ctx: &EvalContext) -> PolicyDecision {
         if !ctx.mode.write_allowed {
+            // Adoption 19 — Plan mode's single write exception: a write whose
+            // resolved target is inside the run's plan directory is permitted
+            // even though the mode otherwise forbids all writes. Everything
+            // else stays denied. Deny-wins is preserved: this only ADDS an
+            // allow inside a branch that would otherwise deny, and the grant is
+            // scoped to exactly the plan directory.
+            if let (Some(plan_root), Some(target)) =
+                (ctx.plan_write_root.as_deref(), ctx.write_target.as_deref())
+            {
+                let plan_scope = PathScope::new(vec![plan_root.to_path_buf()], Vec::new());
+                if plan_scope.allows(target) {
+                    return self.allow(
+                        Capability::FileWrite(plan_scope),
+                        PolicyReason::new(
+                            "policy.plan-file-write-allowed",
+                            "Plan mode permits writing the plan file under \
+                             .codypendent/plans/",
+                        ),
+                    );
+                }
+            }
             return self.deny(PolicyReason::new(
                 "policy.write-denied-by-mode",
                 "the active mode forbids filesystem writes",
@@ -2059,5 +2127,118 @@ mod tests {
         );
         assert_eq!(decision.decision, Decision::RequireApproval);
         assert!(decision.approval_reusable);
+    }
+
+    #[test]
+    fn plan_mode_allows_a_write_under_the_plan_root() {
+        let engine = PolicyEngine::with_defaults();
+        let dir = tempdir().unwrap();
+        let worktree = std::fs::canonicalize(dir.path()).unwrap();
+        let plan_root = worktree.join(".codypendent").join("plans");
+        let plan_file = plan_root.join("plan.md");
+
+        let plan_mode = ModeOverlay {
+            write_allowed: false,
+            command_allowed: true,
+            network_allowed: false,
+        };
+        let eval_ctx = ctx(&worktree, &worktree)
+            .with_mode(plan_mode)
+            .with_plan_write_root(&plan_root)
+            .with_write_target(&plan_file);
+
+        let decision = engine.evaluate(
+            &ProposedAction::WritePatch {
+                patch: ArtifactId::new(),
+            },
+            &eval_ctx,
+        );
+
+        assert_eq!(decision.decision, Decision::Allow);
+        assert_eq!(decision.reasons[0].code, "policy.plan-file-write-allowed");
+        let grant = decision.capability_grant.expect("capability grant");
+        match grant.capability {
+            Capability::FileWrite(scope) => {
+                assert!(scope.allows(&plan_file));
+                assert!(!scope.allows(&worktree.join("src/main.rs")));
+            }
+            other => panic!("expected FileWrite capability, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_mode_denies_a_write_outside_the_plan_root() {
+        let engine = PolicyEngine::with_defaults();
+        let dir = tempdir().unwrap();
+        let worktree = std::fs::canonicalize(dir.path()).unwrap();
+        let plan_root = worktree.join(".codypendent").join("plans");
+        let outside_file = worktree.join("src").join("main.rs");
+
+        let plan_mode = ModeOverlay {
+            write_allowed: false,
+            command_allowed: true,
+            network_allowed: false,
+        };
+        let eval_ctx = ctx(&worktree, &worktree)
+            .with_mode(plan_mode)
+            .with_plan_write_root(&plan_root)
+            .with_write_target(&outside_file);
+
+        let decision = engine.evaluate(
+            &ProposedAction::WritePatch {
+                patch: ArtifactId::new(),
+            },
+            &eval_ctx,
+        );
+
+        assert_eq!(decision.decision, Decision::Deny);
+        assert_eq!(decision.reasons[0].code, "policy.write-denied-by-mode");
+    }
+
+    #[test]
+    fn plan_mode_denies_a_write_with_no_target() {
+        let engine = PolicyEngine::with_defaults();
+        let dir = tempdir().unwrap();
+        let worktree = std::fs::canonicalize(dir.path()).unwrap();
+        let plan_root = worktree.join(".codypendent").join("plans");
+
+        let plan_mode = ModeOverlay {
+            write_allowed: false,
+            command_allowed: true,
+            network_allowed: false,
+        };
+        // Multi-file patch case: plan_write_root is set, but write_target is None
+        let eval_ctx = ctx(&worktree, &worktree)
+            .with_mode(plan_mode)
+            .with_plan_write_root(&plan_root);
+
+        let decision = engine.evaluate(
+            &ProposedAction::WritePatch {
+                patch: ArtifactId::new(),
+            },
+            &eval_ctx,
+        );
+
+        assert_eq!(decision.decision, Decision::Deny);
+        assert_eq!(decision.reasons[0].code, "policy.write-denied-by-mode");
+    }
+
+    #[test]
+    fn plan_transition_is_always_allowed_and_not_reusable() {
+        use codypendent_protocol::AgentMode;
+        let engine = PolicyEngine::with_defaults();
+        let dir = tempdir().unwrap();
+        let worktree = std::fs::canonicalize(dir.path()).unwrap();
+
+        for target in [AgentMode::Plan, AgentMode::Build] {
+            let decision = engine.evaluate(
+                &ProposedAction::PlanTransition { target },
+                &ctx(&worktree, &worktree).with_mode(ModeOverlay::read_only()),
+            );
+            assert_eq!(decision.decision, Decision::Allow);
+            assert_eq!(decision.reasons[0].code, "policy.plan-transition-allowed");
+            assert!(!decision.approval_reusable);
+            assert!(decision.capability_grant.is_none());
+        }
     }
 }

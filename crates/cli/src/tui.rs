@@ -4482,6 +4482,14 @@ fn intent_to_command(intent: Intent, session_id: SessionId, repository: &str) ->
         Intent::CancelWorkflow { workflow_run_id } => {
             CommandBody::CancelWorkflow { workflow_run_id }
         }
+        Intent::RunUserShell { command } => CommandBody::RunUserShell {
+            session_id,
+            command,
+        },
+        Intent::RememberMemory { text } => CommandBody::RememberMemory {
+            session_id,
+            text,
+        },
         // `AddModel` and `QueryProviderModels` are CLIENT-ONLY intents applied
         // locally by the harness (see the drain loop's interceptions); neither
         // becomes a daemon command, so these mappings are never reached.

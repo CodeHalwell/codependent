@@ -112,8 +112,8 @@ maintained subset.
 > `claude/roadmap-completion-w20`, PR #19): 19 tasks + the two–project-review defect
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
-> `-D warnings`, `cargo test --workspace` = **≈3133 tests as of 2026-08-15**
-<!-- doc-count:test sources="crates" expect=3133 label="workspace total" -->
+> `-D warnings`, `cargo test --workspace` = **≈3171 tests as of 2026-08-15**
+<!-- doc-count:test sources="crates" expect=3171 label="workspace total" -->
 > (a `#[test]`/`#[tokio::test]` count over every `crates/**/*.rs` file at HEAD —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with
@@ -488,8 +488,8 @@ live client-capture paths (voice/clipboard) are the remaining wiring.
       `Theme::select(depth, prefs)` with a manual override always winning; and a
       **data-only** theme-pack loader that structurally rejects any pack declaring
       capabilities/permissions (README: theme plugins get no execution
-      permissions). 25 tests (legibility invariants per variant; measured 2026-08-15: `crates/tui/src/theme.rs` 15 + `theme_pack.rs` 10).
-<!-- doc-count:test sources="crates/tui/src/theme.rs,crates/tui/src/theme_pack.rs" expect=25 label="theme tests" -->
+      permissions). 26 tests (legibility invariants per variant; measured 2026-08-15: `crates/tui/src/theme.rs` 16 + `theme_pack.rs` 10).
+<!-- doc-count:test sources="crates/tui/src/theme.rs,crates/tui/src/theme_pack.rs" expect=26 label="theme tests" -->
 - [ ] **6.2/6.3/6.4 (enforcement + WASM + executable hooks)** — the native OS
       sandbox (bubblewrap+seccomp / sandbox-exec / AppContainer), the `wasmtime`
       component runtime + WASM SDK, the brokered-secrets host, and executing hooks
@@ -598,8 +598,8 @@ alongside this work.)
       runs; a pending approval owns the input until resolved. **`F2` (or the
       palette) toggles to a workspace layout** — Runs │ conversation │ approvals
       panes for at-a-glance state — sharing the same composer, footer, and input
-      model, so the panes are context, not a separate mode. Pure-reducer; 625 TUI
-<!-- doc-count:test sources="crates/tui/src" expect=625 label="TUI shell tests" -->
+      model, so the panes are context, not a separate mode. Pure-reducer; 639 TUI
+<!-- doc-count:test sources="crates/tui/src" expect=639 label="TUI shell tests" -->
       tests green (whole-crate count, measured 2026-08-14 — grows with every outcome the TUI vertical adds; re-derive rather than trust a fixed number here).
 - [x] **Command palette** (`/`) — one searchable surface for every command, the
       command hub now that typing composes a message rather than firing single-key

@@ -137,13 +137,13 @@ use crate::tools::{
     EdgeAssertionOutcome, EdgeAssertionRequest, EditFile, EditFileInput, EnvironmentBinding,
     GetPullRequest, GetPullRequestInput, GitDiff, GitDiffInput, GraphAssertEdge, GraphBlastRadius,
     GraphCallersOf, GraphTestsCovering, ListCheckRuns, ListCheckRunsInput, MemoryRemember,
-    MemoryRememberInput, ReadFile, ReadFileInput, RegistrySearch, RegistrySearchRequest,
-    RepositoryTest, Search, SearchInput, Shell, ShellExec, ShellWriteStdin, SkillsSearch,
-    SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool, TaskMoveTool,
-    TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput, UpdatePullRequestTool, WebSearch,
-    WebSearchInput, WorkflowCreateInput, WorkflowCreateTool, WorkflowQueryInput, WorkflowQueryTool,
-    WorkflowRunInput, WorkflowRunTool, WriteFile, WriteFileInput, ASSERTABLE_RELATIONS,
-    MAX_ASSERTED_EDGES,
+    MemoryRememberInput, PlanEnter, PlanExit, ReadFile, ReadFileInput, RegistrySearch,
+    RegistrySearchRequest, RepositoryTest, Search, SearchInput, Shell, ShellExec, ShellWriteStdin,
+    SkillsSearch, SkillsSearchInput, TaskCreateInput, TaskCreateTool, TaskListInput, TaskListTool,
+    TaskMoveTool, TaskUpdateInput, TaskUpdateTool, UpdatePullRequestInput, UpdatePullRequestTool,
+    WebSearch, WebSearchInput, WorkflowCreateInput, WorkflowCreateTool, WorkflowQueryInput,
+    WorkflowQueryTool, WorkflowRunInput, WorkflowRunTool, WriteFile, WriteFileInput,
+    ASSERTABLE_RELATIONS, MAX_ASSERTED_EDGES,
 };
 use crate::workflow_control::{
     WorkflowControlChannel, WorkflowCreateRequest, WorkflowRunRequest, WorkflowRunTarget,
@@ -178,11 +178,14 @@ const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 30;
 const PLAN_MODE_INSTRUCTION: &str = "\
 You are running in PLAN MODE. Investigate the request read-only using the \
 available tools (read files, search the workspace, run safe read-only \
-commands); do NOT attempt to write, edit, or patch any files, and do NOT \
-make network calls — such actions are denied in this mode. Then finish with \
-a numbered, concrete implementation plan: the files to change, the ordered \
-steps to change them, and how to verify the result. A human will review \
-your plan and re-submit it in Build mode to execute it.";
+commands). You MUST NOT edit any file in the workspace or run any \
+non-read-only command — those actions are denied in this mode — WITH ONE \
+EXCEPTION: your plan file under `.codypendent/plans/`. Build your plan by \
+writing to or editing a Markdown file there (create it with \
+`workspace.write_file`, refine it with `workspace.edit_file`); it is the only \
+file you may write. Use `user.ask` to clarify requirements. When the plan is \
+complete, call `plan_exit` to ask the operator to switch to Build and execute \
+it. Your turn should end only by asking a question or calling `plan_exit`.";
 
 /// The Review-mode counterpart to [`PLAN_MODE_INSTRUCTION`], seeded by the
 /// same mechanism ([`mode_seed_instruction`]). Review's overlay allows reads
@@ -473,6 +476,41 @@ fn token_budget_event(
             dimension: BudgetDimension::Tokens,
             used,
             limit,
+        },
+        pct,
+    ))
+}
+
+/// Decide whether the plain loop should emit a `ContextUsage` event for this
+/// step (Spec 20 Action 19), and build it when it should. Called ONLY when a
+/// context window is known (`window` came from `driver.context_window()` returning
+/// `Some`).
+///
+/// Dedup: computes the integer percentage `used*100/window` (clamped to
+/// `0..=100`, `window.max(1)` guarding a zero limit) and compares it against
+/// `last_emitted_pct`. Returns `None` when the percentage has not changed.
+#[must_use]
+pub fn context_usage_event(
+    run_id: RunId,
+    used: u64,
+    window: u64,
+    system_tokens: u64,
+    tool_tokens: u64,
+    transcript_tokens: u64,
+    last_emitted_pct: Option<u16>,
+) -> Option<(EventBody, u16)> {
+    let pct = (used.saturating_mul(100) / window.max(1)).min(100) as u16;
+    if last_emitted_pct == Some(pct) {
+        return None;
+    }
+    Some((
+        EventBody::ContextUsage {
+            run_id,
+            used_tokens: used,
+            window_tokens: window,
+            system_tokens,
+            tool_tokens,
+            transcript_tokens,
         },
         pct,
     ))
@@ -1206,6 +1244,9 @@ pub struct RunContext {
     pub turn_ordinal: u32,
     /// Optional turn checkpointer seam (Adoption 04).
     pub checkpointer: Option<Arc<dyn TurnCheckpointer>>,
+    /// Concatenated AGENTS.md/CLAUDE.md/.codypendent instructions, prepended to
+    /// the system prompt. `None` = no instruction files found (unchanged prompt).
+    pub instructions: Option<String>,
 }
 
 /// Seam for per-turn filesystem checkpoints (Adoption 04).
@@ -1241,7 +1282,15 @@ impl RunContext {
             tools_advertised: None,
             turn_ordinal: 1,
             checkpointer: None,
+            instructions: None,
         }
+    }
+
+    /// Attach discovered instruction files to this run context.
+    #[must_use]
+    pub fn with_instructions(mut self, instructions: Option<String>) -> Self {
+        self.instructions = instructions;
+        self
     }
 
     /// Attach a turn checkpointer seam.
@@ -1363,6 +1412,14 @@ pub fn mode_overlay(mode: AgentMode) -> ModeOverlay {
         // An unknown/future mode collapses to the most restrictive overlay.
         _ => ModeOverlay::read_only(),
     }
+}
+
+/// The one directory a Plan run may write (adoption 19). Lives under the run's
+/// worktree so a later Build continuation in the same session reads it back,
+/// and under the established `.codypendent/` convention. Returned only for
+/// `AgentMode::Plan`; `None` disables the policy exception for every other mode.
+pub fn plan_write_root(mode: AgentMode, worktree: &Path) -> Option<PathBuf> {
+    matches!(mode, AgentMode::Plan).then(|| worktree.join(".codypendent").join("plans"))
 }
 
 /// The lowercase mode token the rule classifier reads. Must agree with the
@@ -1583,6 +1640,27 @@ pub trait QuestionChannel: Send + Sync {
     ) -> anyhow::Result<QuestionReply>;
 }
 
+/// Pool-erased mode-switch injection (adoption 19), mirroring the
+/// `QuestionChannel` seam: the daemon implements it over the shipped prompt
+/// queue (adoption 06). `plan_enter`/`plan_exit` call it after the operator
+/// approves the switch; the queued continuation drains into a real
+/// `SubmitUserInput` when the current run terminates, so the switch is recorded
+/// in-band (a `PendingPromptsChanged` event, then a ledgered command) rather
+/// than flipping hidden state.
+#[async_trait]
+pub trait PlanBridge: Send + Sync {
+    /// Enqueue a follow-up turn on `session_id`'s prompt queue with the given
+    /// mode and synthetic user text (`delivery = Queue`). Idempotent on
+    /// `run_id`: a duplicate call for the same transition enqueues once.
+    async fn switch_mode(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        target: AgentMode,
+        text: String,
+    ) -> anyhow::Result<()>;
+}
+
 // ---------------------------------------------------------------------------
 // The runtime
 // ---------------------------------------------------------------------------
@@ -1670,6 +1748,10 @@ pub struct FrameworkAgentRuntime {
     routing_outcomes: Option<Arc<dyn RoutingOutcomeSink>>,
     /// The question channel `user.ask` uses (adoption 03), if wired.
     questions: Option<Arc<dyn QuestionChannel>>,
+    /// The mode-switch channel the plan bridge tools enqueue on (adoption 19),
+    /// if wired. `None` (workflow nodes, webhook runs) leaves `plan_enter` /
+    /// `plan_exit` unoffered — a switch nobody can drive must not be offerable.
+    plan_bridge: Option<Arc<dyn PlanBridge>>,
     /// Optional hook dispatch engine (adoption 08). Present when an enforcing sandbox
     /// is available on interactive session runs; unattended workflow and webhook paths disable hooks.
     hooks: Option<Arc<dyn HookDispatch>>,
@@ -1724,6 +1806,7 @@ impl FrameworkAgentRuntime {
             councils: None,
             routing_outcomes: None,
             questions: None,
+            plan_bridge: None,
             hooks: None,
             unified_exec: None,
             lsp: None,
@@ -1751,6 +1834,13 @@ impl FrameworkAgentRuntime {
     /// Inject the question channel the `user.ask` tool uses (adoption 03).
     pub fn with_questions(mut self, questions: Arc<dyn QuestionChannel>) -> Self {
         self.questions = Some(questions);
+        self
+    }
+
+    /// Inject the plan bridge channel (adoption 19).
+    #[must_use]
+    pub fn with_plan_bridge(mut self, plan_bridge: Arc<dyn PlanBridge>) -> Self {
+        self.plan_bridge = Some(plan_bridge);
         self
     }
 
@@ -2127,6 +2217,13 @@ impl FrameworkAgentRuntime {
         if self.offers_questions() {
             names.push(AskUser::NAME.to_string());
         }
+        if self.plan_bridge.is_some() && self.offers_questions() {
+            if run.mode == AgentMode::Build {
+                names.push(PlanEnter::NAME.to_string());
+            } else if run.mode == AgentMode::Plan {
+                names.push(PlanExit::NAME.to_string());
+            }
+        }
         if self.unified_exec.is_some() {
             names.push(ShellExec::NAME.to_string());
             names.push(ShellWriteStdin::NAME.to_string());
@@ -2155,14 +2252,22 @@ impl FrameworkAgentRuntime {
         // comment above for the invariant). One pass over the assembled set,
         // so the configured/workflow gates above stay the only other filters.
         let overlay = mode_overlay(run.mode);
+        let plan_mode = matches!(run.mode, AgentMode::Plan);
         names.retain(|name| {
-            if !overlay.write_allowed
-                && matches!(
+            if !overlay.write_allowed {
+                let is_write = matches!(
                     name.as_str(),
                     WriteFile::NAME | EditFile::NAME | ApplyPatch::NAME
-                )
-            {
-                return false;
+                );
+                // Plan mode keeps the plan-file writers: the policy engine
+                // allows a write ONLY under `.codypendent/plans/` and denies
+                // everything else, so offering these lets the model author the
+                // plan while a stray write to the worktree is still refused.
+                let plan_writer =
+                    plan_mode && matches!(name.as_str(), WriteFile::NAME | EditFile::NAME);
+                if is_write && !plan_writer {
+                    return false;
+                }
             }
             if !overlay.command_allowed
                 && (matches!(
@@ -2626,6 +2731,14 @@ impl FrameworkAgentRuntime {
         // (never persisted), it is the dedup gate `token_budget_event` checks
         // against so a step whose percentage hasn't moved doesn't re-emit.
         let mut last_token_pct: Option<u16> = None;
+        // Context-usage breakdown (Spec 20 Action 19) has its OWN dedup gate,
+        // independent of the budget-warning threshold above. Both compute the
+        // same `used*100/limit`, so sharing `last_token_pct` made the budget
+        // block set it first and the `ContextUsage` emit always see an
+        // unchanged percentage — suppressing the /context breakdown on every
+        // step. Tracking it separately lets `ContextUsage` emit on a real
+        // change regardless of what the budget warning did.
+        let mut last_context_pct: Option<u16> = None;
         // Resolved once: the model's context window, or `None` when unknown.
         // `None` here means C5's honesty rule applies for the WHOLE run — the
         // loop below never emits a `Tokens` event, so the TUI footer stays `—`.
@@ -2738,6 +2851,29 @@ impl FrameworkAgentRuntime {
                     token_budget_event(run.run_id, used, limit, last_token_pct)
                 {
                     last_token_pct = Some(pct);
+                    self.emit(run.session_id, run_actor.clone(), body).await?;
+                }
+                let system_tokens = ((SYSTEM_PROMPT.chars().count()
+                    + run.instructions.as_deref().map_or(0, |i| i.chars().count()))
+                    / CHARS_PER_TOKEN
+                    + PER_ITEM_TOKEN_OVERHEAD) as u64;
+                let tool_tokens = tool_definitions
+                    .iter()
+                    .map(|def| {
+                        tool_definition_text_len(def) / CHARS_PER_TOKEN + PER_ITEM_TOKEN_OVERHEAD
+                    })
+                    .sum::<usize>() as u64;
+                let transcript_tokens = estimate_context_tokens(&transcript) as u64;
+                if let Some((body, pct)) = context_usage_event(
+                    run.run_id,
+                    used,
+                    limit,
+                    system_tokens,
+                    tool_tokens,
+                    transcript_tokens,
+                    last_context_pct,
+                ) {
+                    last_context_pct = Some(pct);
                     self.emit(run.session_id, run_actor.clone(), body).await?;
                 }
             }
@@ -3775,7 +3911,9 @@ impl FrameworkAgentRuntime {
         }
 
         // (b) evaluate policy under the mode overlay.
-        let decision = self.policy.evaluate(&prepared.action, &self.eval_ctx(run));
+        let mut ctx = self.eval_ctx(run);
+        ctx.write_target = prepared_write_target(&prepared.tool, &run.worktree);
+        let decision = self.policy.evaluate(&prepared.action, &ctx);
         match decision.decision {
             Decision::Deny => {
                 let first_reason = decision.reasons.first();
@@ -4501,6 +4639,34 @@ impl FrameworkAgentRuntime {
                 Ok(Prepared {
                     action,
                     tool: PreparedTool::AskUser(questions),
+                })
+            }
+            PlanEnter::NAME
+                if self.plan_bridge.is_some()
+                    && self.offers_questions()
+                    && run.mode == AgentMode::Build =>
+            {
+                let request = args
+                    .get("request")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                Ok(Prepared {
+                    action: ProposedAction::PlanTransition {
+                        target: AgentMode::Plan,
+                    },
+                    tool: PreparedTool::PlanEnter(request),
+                })
+            }
+            PlanExit::NAME
+                if self.plan_bridge.is_some()
+                    && self.offers_questions()
+                    && run.mode == AgentMode::Plan =>
+            {
+                Ok(Prepared {
+                    action: ProposedAction::PlanTransition {
+                        target: AgentMode::Build,
+                    },
+                    tool: PreparedTool::PlanExit,
                 })
             }
             // MCP client (PR B): an `mcp.<server>.<tool>` call. The match guard
@@ -5252,6 +5418,78 @@ impl FrameworkAgentRuntime {
                             None,
                             ToolOutcome::Failed {
                                 message: "question.failed".to_string(),
+                            },
+                        ),
+                    }
+                }
+            },
+            PreparedTool::PlanEnter(request) => match self.plan_bridge.as_ref() {
+                None => (
+                    "plan bridge is unavailable".to_string(),
+                    None,
+                    ToolOutcome::Failed {
+                        message: "plan.unavailable".to_string(),
+                    },
+                ),
+                Some(bridge) => {
+                    let text = format!(
+                        "switch to Plan mode: {}",
+                        request.as_deref().unwrap_or(
+                            "investigate the workspace and formulate an implementation plan"
+                        )
+                    );
+                    match bridge
+                        .switch_mode(run.session_id, run.run_id, AgentMode::Plan, text)
+                        .await
+                    {
+                        Ok(()) => (
+                            "switched to Plan mode. Work in read-only mode, author your plan in .codypendent/plans/, and call plan_exit when finished.".to_string(),
+                            None,
+                            ToolOutcome::Succeeded,
+                        ),
+                        Err(e) => (
+                            format!("plan_enter failed: {e}"),
+                            None,
+                            ToolOutcome::Failed {
+                                message: "plan.failed".to_string(),
+                            },
+                        ),
+                    }
+                }
+            },
+            PreparedTool::PlanExit => match self.plan_bridge.as_ref() {
+                None => (
+                    "plan bridge is unavailable".to_string(),
+                    None,
+                    ToolOutcome::Failed {
+                        message: "plan.unavailable".to_string(),
+                    },
+                ),
+                Some(bridge) => {
+                    let latest = latest_plan_file(&run.worktree);
+                    let (text, obs) = match latest {
+                        Some(path) => {
+                            let rel = display_relative(&path, &run.worktree);
+                            (
+                                format!("execute plan: {rel}"),
+                                format!("plan complete: {rel}. Switched to Build mode."),
+                            )
+                        }
+                        None => (
+                            "execute plan".to_string(),
+                            "plan complete. Switched to Build mode.".to_string(),
+                        ),
+                    };
+                    match bridge
+                        .switch_mode(run.session_id, run.run_id, AgentMode::Build, text)
+                        .await
+                    {
+                        Ok(()) => (obs, None, ToolOutcome::Succeeded),
+                        Err(e) => (
+                            format!("plan_exit failed: {e}"),
+                            None,
+                            ToolOutcome::Failed {
+                                message: "plan.failed".to_string(),
                             },
                         ),
                     }
@@ -6040,6 +6278,8 @@ impl FrameworkAgentRuntime {
             repository: run.read_root.clone(),
             worktree: run.worktree.clone(),
             mode: mode_overlay(run.mode),
+            plan_write_root: plan_write_root(run.mode, &run.worktree),
+            write_target: None,
         }
     }
 
@@ -6050,6 +6290,58 @@ impl FrameworkAgentRuntime {
     fn write_scope(&self, run: &RunContext) -> PathScope {
         self.policy.file_write_scope(&self.eval_ctx(run))
     }
+}
+
+/// Extract the write target path for single-file write tools so the policy engine
+/// can evaluate whether it falls under the plan root in Plan mode.
+fn prepared_write_target(tool: &PreparedTool, worktree: &Path) -> Option<PathBuf> {
+    match tool {
+        PreparedTool::WriteFile(input) => {
+            let path = Path::new(&input.path);
+            Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                worktree.join(path)
+            })
+        }
+        PreparedTool::EditFile(input) => {
+            let path = Path::new(&input.path);
+            Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                worktree.join(path)
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Find the newest regular `.md` file under `<worktree>/.codypendent/plans/`,
+/// sorting by filesystem modification time (newest first, lexicographic tie-breaker).
+pub fn latest_plan_file(worktree: &Path) -> Option<PathBuf> {
+    let plans_dir = worktree.join(".codypendent").join("plans");
+    let entries = std::fs::read_dir(&plans_dir).ok()?;
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            files.push((mtime, path));
+        }
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    files.into_iter().next().map(|(_, path)| path)
+}
+
+/// Render a path relative to `base` if possible, formatted with forward slashes.
+pub fn display_relative(path: &Path, base: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// The outcome of driving one tool call through the middleware.
@@ -6171,6 +6463,10 @@ enum PreparedTool {
     ArtifactRead(ArtifactReadInput),
     /// A `user.ask` call (adoption 03).
     AskUser(Vec<QuestionPrompt>),
+    /// A `plan_enter` call (adoption 19).
+    PlanEnter(Option<String>),
+    /// A `plan_exit` call (adoption 19).
+    PlanExit,
     /// An MCP tool call (PR B): the dispatch pair `prepare`'s guard verified
     /// against the bridge's offered cache, plus the RAW model-supplied args
     /// (the canonical form lives on the `McpToolCall` action, for the digest).
@@ -6365,6 +6661,8 @@ const ALWAYS_ADVERTISED_TOOLS: &[&str] = &[
     ApplyPatch::NAME,
     SkillsSearch::NAME,
     AskUser::NAME,
+    PlanEnter::NAME,
+    PlanExit::NAME,
 ];
 
 /// Project this run's offered built-in tool names into in-memory registry items
@@ -7123,6 +7421,9 @@ pub struct FrameworkModelDriver {
     /// never a fabricated free zero. Set it with
     /// [`with_price_per_1k_usd`](Self::with_price_per_1k_usd).
     price_per_1k_usd: Option<f64>,
+    /// Concatenated AGENTS.md/CLAUDE.md/.codypendent instructions, appended to
+    /// the system prompt (Spec 20 Action 17).
+    instructions: Option<String>,
 }
 
 #[cfg(feature = "provider-openai")]
@@ -7141,7 +7442,15 @@ impl FrameworkModelDriver {
             context_tokens: None,
             endpoint: None,
             price_per_1k_usd: None,
+            instructions: None,
         }
+    }
+
+    /// Attach discovered instruction files to this model driver.
+    #[must_use]
+    pub fn with_instructions(mut self, instructions: Option<String>) -> Self {
+        self.instructions = instructions;
+        self
     }
 
     /// Give this driver the routed model's MEASURED price per 1K tokens, so the
@@ -7195,6 +7504,7 @@ impl FrameworkModelDriver {
             // provider catalog's cost fields are display-only (T1/T7). A caller
             // holding a routing decision adds it with `with_price_per_1k_usd`.
             price_per_1k_usd: None,
+            instructions: None,
         })
     }
 }
@@ -7986,14 +8296,47 @@ pub(crate) fn static_tool_definitions() -> Vec<ToolDefinition> {
             "Ask the user one or more structured questions with selectable choices or free-text answers. Use this when requirements are ambiguous, to solicit design preferences, or to confirm choices before taking action.",
             AskUser::definition()["parameters"].clone(),
         ),
+        decl(
+            PlanEnter::NAME,
+            "Switch from Build mode into Plan mode to investigate the workspace and design an implementation plan without executing writes or commands. Asks the operator to confirm before switching.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "request": {
+                        "type": "string",
+                        "description": "Optional refined goal or focus area for the planning phase."
+                    }
+                }
+            }),
+        ),
+        decl(
+            PlanExit::NAME,
+            "Exit Plan mode and switch back to Build mode once the plan file under `.codypendent/plans/` is complete. Asks the operator to confirm before switching.",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ),
     ]
 }
 
 #[cfg(feature = "provider-openai")]
 impl FrameworkModelDriver {
-    fn to_messages(transcript: &[TurnItem]) -> Vec<agent_framework_core::types::Message> {
+    fn to_messages(
+        transcript: &[TurnItem],
+        instructions: Option<&str>,
+    ) -> Vec<agent_framework_core::types::Message> {
         use agent_framework_core::types::Message;
-        let mut messages = vec![Message::system(SYSTEM_PROMPT)];
+        let system = match instructions {
+            Some(inst) if !inst.trim().is_empty() => {
+                format!(
+                    "{SYSTEM_PROMPT}\n\n# Workspace Instructions\n\n{}",
+                    inst.trim()
+                )
+            }
+            _ => SYSTEM_PROMPT.to_string(),
+        };
+        let mut messages = vec![Message::system(system)];
         for item in transcript {
             let message = match item {
                 TurnItem::Objective(text) => Message::user(text.clone()),
@@ -8135,7 +8478,10 @@ impl FrameworkModelDriver {
 
         let mut stream = self
             .client
-            .get_streaming_response(Self::to_messages(transcript), options)
+            .get_streaming_response(
+                Self::to_messages(transcript, self.instructions.as_deref()),
+                options,
+            )
             .await
             .map_err(|e| anyhow::anyhow!("model stream failed: {e}"))?;
 
@@ -8815,7 +9161,7 @@ mod tests {
             },
             TurnItem::Steering("also check CI".to_string()),
         ];
-        let messages = FrameworkModelDriver::to_messages(&transcript);
+        let messages = FrameworkModelDriver::to_messages(&transcript, None);
         assert_eq!(messages.len(), 5, "system + four transcript items");
         assert!(
             messages.iter().all(|m| m.role != Role::tool()),
@@ -8846,7 +9192,7 @@ mod tests {
                 artifact: None,
             },
         ];
-        let messages = FrameworkModelDriver::to_messages(&transcript);
+        let messages = FrameworkModelDriver::to_messages(&transcript, None);
         assert_eq!(messages.len(), 4, "system + three transcript items");
 
         let call = &messages[2];
@@ -9953,9 +10299,13 @@ context_tokens = 1000000
         // The floor holds in BOTH, whatever the ranking did.
         for names in [&docs, &backlog] {
             for floor in ALWAYS_ADVERTISED_TOOLS {
-                // `skills.search` and `user.ask` need a wired registry/channel seam,
+                // `skills.search`, `user.ask`, and `plan_*` need a wired registry/channel seam,
                 // which this runtime has not got, so they are not offered here and cannot be floored in.
-                if *floor == SkillsSearch::NAME || *floor == AskUser::NAME {
+                if *floor == SkillsSearch::NAME
+                    || *floor == AskUser::NAME
+                    || *floor == PlanEnter::NAME
+                    || *floor == PlanExit::NAME
+                {
                     continue;
                 }
                 assert!(
@@ -11488,8 +11838,25 @@ context_tokens = 1000000
             "Explore offers the reads only"
         );
 
-        // Plan / Review (commands yes; writes and network no).
-        let probes = set(&[
+        // Plan (commands yes; writes allowed ONLY for plan files via WriteFile/EditFile, ApplyPatch denied; network no).
+        let plan_tools = set(&[
+            Shell::NAME,
+            ReadFile::NAME,
+            Search::NAME,
+            GitDiff::NAME,
+            WriteFile::NAME,
+            EditFile::NAME,
+            MemoryRemember::NAME,
+            RepositoryTest::NAME,
+        ]);
+        assert_eq!(
+            names(AgentMode::Plan),
+            plan_tools,
+            "Plan adds command and plan-writer tools (WriteFile/EditFile), but not ApplyPatch or network tools"
+        );
+
+        // Review (commands yes; writes and network no).
+        let review_tools = set(&[
             Shell::NAME,
             ReadFile::NAME,
             Search::NAME,
@@ -11498,13 +11865,8 @@ context_tokens = 1000000
             RepositoryTest::NAME,
         ]);
         assert_eq!(
-            names(AgentMode::Plan),
-            probes,
-            "Plan adds the command tools, not the write/network tools"
-        );
-        assert_eq!(
             names(AgentMode::Review),
-            probes,
+            review_tools,
             "Review adds the command tools, not the write/network tools"
         );
 
@@ -12576,6 +12938,84 @@ context_tokens = 1000000
             }
         }
         out
+    }
+
+    /// Collect every `ContextUsage` currently buffered on `events` as
+    /// `(used_tokens, window_tokens)` pairs, in publish order — the /context
+    /// breakdown's producer (Spec 20 Action 19), inspected the same way
+    /// [`drain_token_budget_events`] inspects the budget warning.
+    fn drain_context_usage_events(
+        events: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+    ) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let EventBody::ContextUsage {
+                used_tokens,
+                window_tokens,
+                ..
+            } = event.body
+            {
+                out.push((used_tokens, window_tokens));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn context_usage_events_are_emitted_as_the_context_grows() {
+        // Regression (FIX 1): `ContextUsage` had its own dedup state stolen by
+        // the shared `last_token_pct`, so the budget block set the gate first
+        // and the /context breakdown was suppressed on EVERY step — the panel
+        // showed "Detailed breakdown not yet available." forever. With a known
+        // window and a transcript that grows across steps, at least one
+        // `ContextUsage` must now reach the ledger, and its percentage sits far
+        // below the 80% compaction threshold — proving the emit is not gated by
+        // the budget warning.
+        let filler = "context filler line. ".repeat(400);
+        let driver = ScriptedDriver::new(vec![
+            ModelStep::Say(filler.clone()),
+            ModelStep::Say(filler.clone()),
+            ModelStep::Finish {
+                summary: "done".to_string(),
+            },
+        ])
+        .with_context_window(32_768);
+        let (runtime, mut events, session_id) = test_runtime();
+        let repo = tempfile::tempdir().expect("tempdir");
+        let ctx = RunContext::new(
+            session_id,
+            RunId::new(),
+            "grow the context",
+            AgentMode::Build,
+            repo.path(),
+            repo.path(),
+        );
+        runtime
+            .execute_run(&driver, ctx, CancellationToken::never())
+            .await
+            .expect("scripted run completes");
+
+        let usage_events = drain_context_usage_events(&mut events);
+        assert!(
+            !usage_events.is_empty(),
+            "a known window must emit at least one ContextUsage event"
+        );
+        // Every emission is well under the compaction threshold, so it cannot
+        // have been ridden in on the back of an 80% budget warning.
+        for (used, window) in &usage_events {
+            assert!(
+                used.saturating_mul(100) / window.max(&1) < 80,
+                "ContextUsage must emit below the budget threshold, got {used}/{window}"
+            );
+        }
+        // The transcript grows across steps, so the used-token count moves —
+        // and the event tracks it independently of the budget warning.
+        if usage_events.len() >= 2 {
+            assert!(
+                usage_events[1].0 > usage_events[0].0,
+                "ContextUsage used-tokens must rise as the transcript grows, got {usage_events:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -14155,5 +14595,159 @@ context_tokens = 1000000
             }
             other => panic!("expected an ExecuteCommand, got {other:?}"),
         }
+    }
+
+    struct DummyPlanBridge;
+    #[async_trait]
+    impl PlanBridge for DummyPlanBridge {
+        async fn switch_mode(
+            &self,
+            _session_id: SessionId,
+            _run_id: RunId,
+            _target: AgentMode,
+            _text: String,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DummyQuestionChannel;
+    #[async_trait]
+    impl QuestionChannel for DummyQuestionChannel {
+        async fn ask(
+            &self,
+            _session_id: SessionId,
+            _run_id: RunId,
+            _questions: Vec<QuestionPrompt>,
+        ) -> anyhow::Result<QuestionReply> {
+            Ok(QuestionReply::Answered(Vec::new()))
+        }
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[test]
+    fn to_messages_includes_instructions() {
+        let transcript = vec![TurnItem::Objective("test objective".to_string())];
+        let messages = FrameworkModelDriver::to_messages(&transcript, Some("Always write tests."));
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].text().contains("# Workspace Instructions"));
+        assert!(messages[0].text().contains("Always write tests."));
+    }
+
+    #[test]
+    fn plan_mode_retains_write_tools_and_exposes_plan_exit() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_questions(Arc::new(DummyQuestionChannel))
+            .with_plan_bridge(Arc::new(DummyPlanBridge));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "plan test".to_string(),
+            AgentMode::Plan,
+            repo.path().to_path_buf(),
+            repo.path().to_path_buf(),
+        );
+
+        let offered = runtime.offered_tool_names(&run);
+        assert!(
+            offered.contains(&WriteFile::NAME.to_string()),
+            "Plan mode must offer WriteFile"
+        );
+        assert!(
+            offered.contains(&EditFile::NAME.to_string()),
+            "Plan mode must offer EditFile"
+        );
+        assert!(
+            !offered.contains(&ApplyPatch::NAME.to_string()),
+            "Plan mode must NOT offer ApplyPatch"
+        );
+        assert!(
+            offered.contains(&PlanExit::NAME.to_string()),
+            "Plan mode must offer PlanExit"
+        );
+        assert!(
+            !offered.contains(&PlanEnter::NAME.to_string()),
+            "Plan mode must NOT offer PlanEnter"
+        );
+    }
+
+    #[test]
+    fn build_mode_exposes_plan_enter_when_bridge_wired() {
+        let (runtime, _events, session_id) = test_runtime();
+        let runtime = runtime
+            .with_questions(Arc::new(DummyQuestionChannel))
+            .with_plan_bridge(Arc::new(DummyPlanBridge));
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run = RunContext::new(
+            session_id,
+            RunId::new(),
+            "build test".to_string(),
+            AgentMode::Build,
+            repo.path().to_path_buf(),
+            repo.path().to_path_buf(),
+        );
+
+        let offered = runtime.offered_tool_names(&run);
+        assert!(
+            offered.contains(&PlanEnter::NAME.to_string()),
+            "Build mode must offer PlanEnter"
+        );
+        assert!(
+            !offered.contains(&PlanExit::NAME.to_string()),
+            "Build mode must NOT offer PlanExit"
+        );
+    }
+
+    #[test]
+    fn context_usage_event_dedups_and_calculates_correctly() {
+        let run_id = RunId::new();
+        // 5000 / 10000 = 50%
+        let res1 = context_usage_event(run_id, 5000, 10000, 100, 200, 300, None);
+        assert!(res1.is_some());
+        let (body, pct) = res1.unwrap();
+        assert_eq!(pct, 50);
+        match body {
+            EventBody::ContextUsage {
+                used_tokens,
+                window_tokens,
+                system_tokens,
+                tool_tokens,
+                transcript_tokens,
+                ..
+            } => {
+                assert_eq!(used_tokens, 5000);
+                assert_eq!(window_tokens, 10000);
+                assert_eq!(system_tokens, 100);
+                assert_eq!(tool_tokens, 200);
+                assert_eq!(transcript_tokens, 300);
+            }
+            _ => panic!("expected ContextUsage event"),
+        }
+
+        // Same pct (50%) -> None
+        let res2 = context_usage_event(run_id, 5040, 10000, 100, 200, 340, Some(50));
+        assert!(res2.is_none());
+
+        // Changed pct (51%) -> Some
+        let res3 = context_usage_event(run_id, 5100, 10000, 100, 200, 400, Some(50));
+        assert!(res3.is_some());
+    }
+
+    #[test]
+    fn latest_plan_file_picks_newest_md() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plans_dir = dir.path().join(".codypendent").join("plans");
+        std::fs::create_dir_all(&plans_dir).expect("create_dir_all");
+
+        let p1 = plans_dir.join("plan1.md");
+        std::fs::write(&p1, "plan 1").expect("write");
+        std::thread::sleep(Duration::from_millis(15));
+        let p2 = plans_dir.join("plan2.md");
+        std::fs::write(&p2, "plan 2").expect("write");
+
+        let latest = latest_plan_file(dir.path());
+        assert_eq!(latest, Some(p2));
     }
 }

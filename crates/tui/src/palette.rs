@@ -17,6 +17,8 @@ pub enum PaletteCommand {
     Issues,
     /// Open the new-run prompt.
     NewRun,
+    /// View detailed context usage breakdown.
+    Context,
     /// Queue steering text for the selected run.
     Steer,
     /// Pause or resume the selected run.
@@ -114,6 +116,13 @@ pub const COMMANDS: &[PaletteEntry] = &[
         title: "New run",
         description: "start a new run in this session",
         key: "n",
+        group: "Run",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Context,
+        title: "/context  Context usage breakdown",
+        description: "view detailed token usage breakdown for the active run",
+        key: "—",
         group: "Run",
     },
     PaletteEntry {

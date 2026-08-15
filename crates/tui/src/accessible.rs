@@ -874,6 +874,7 @@ fn overlay_name(overlay: &Overlay) -> &'static str {
         Overlay::ConfirmModelRemove { .. } => "remove model confirmation",
         Overlay::ConfirmCommunityAcpInstall { .. } => "Antigravity community bridge confirmation",
         Overlay::Backtrack(_) => "backtrack session fork",
+        Overlay::Context => "context usage breakdown",
         Overlay::AddModelId { .. }
         | Overlay::AddModelKey { .. }
         | Overlay::AddModelProviderKey { .. }
