@@ -3202,6 +3202,54 @@ fn disposition_label(action: ApprovalAction) -> &'static str {
     }
 }
 
+pub async fn approvals_rules_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+    let pool =
+        codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db")).await?;
+    let rules: Vec<(String, String, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, repository, pattern, created_by, created_at, revoked_at \
+         FROM approval_rules ORDER BY created_at ASC",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    if rules.is_empty() {
+        println!("No approval rules found.");
+        return Ok(());
+    }
+
+    for (id, repo, pattern, created_by, created_at, revoked_at) in rules {
+        if let Some(revoked_at) = revoked_at {
+            println!(
+                "{id} · {repo} · {pattern} · {created_by} · {created_at} · (revoked {revoked_at})"
+            );
+        } else {
+            println!("{id} · {repo} · {pattern} · {created_by} · {created_at}");
+        }
+    }
+    Ok(())
+}
+
+pub async fn approvals_rules_revoke(paths: &RuntimePaths, rule_id: &str) -> anyhow::Result<()> {
+    let pool =
+        codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db")).await?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let updated = sqlx::query(
+        "UPDATE approval_rules SET revoked_at = ?, revoked_by = 'cli' \
+         WHERE id = ? AND revoked_at IS NULL",
+    )
+    .bind(&now)
+    .bind(rule_id)
+    .execute(&pool)
+    .await?;
+
+    if updated.rows_affected() == 0 {
+        println!("No active approval rule with id `{rule_id}`.");
+    } else {
+        println!("Revoked approval rule `{rule_id}`.");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod graph_tests {
     use super::*;
@@ -4441,6 +4489,106 @@ pub fn completion_to(
     clap_complete::generate(shell, cmd, name, out);
 }
 
+/// `codypendent hook list` — list all discovered hooks.
+pub async fn hook_list(paths: &RuntimePaths) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = codypendent_daemon::db::open_database(&database_path).await?;
+    let hooks = codypendent_daemon::hooks::list_hooks(&pool).await?;
+    if hooks.is_empty() {
+        println!("(no hooks discovered)");
+        return Ok(());
+    }
+
+    println!(
+        "{:<24} {:<12} {:<14} {:<10} {:<8} {:<10} SOURCE",
+        "ID", "SCOPE", "EVENT", "KIND", "PRIORITY", "APPROVAL"
+    );
+    for h in hooks {
+        println!(
+            "{:<24} {:<12} {:<14} {:<10} {:<8} {:<10} {}",
+            h.hook_id, h.scope_kind, h.event, h.kind, h.priority, h.approval_state, h.source_path,
+        );
+    }
+    Ok(())
+}
+
+/// `codypendent hook show <id>` — print hook specification and hash.
+pub async fn hook_show(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = codypendent_daemon::db::open_database(&database_path).await?;
+    let hook = codypendent_daemon::hooks::get_hook(&pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("hook `{id}` not found"))?;
+
+    println!("Hook: {}", hook.hook_id);
+    println!("Name: {}", hook.name);
+    println!("Scope: {} ({})", hook.scope_kind, hook.scope_key);
+    println!("Event: {}", hook.event);
+    println!("Kind: {}", hook.kind);
+    println!("Priority: {}", hook.priority);
+    println!("Source: {}", hook.source_path);
+    println!("Content Hash: {}", hook.content_hash);
+    println!("Approval State: {}", hook.approval_state);
+    if let Some(approved_hash) = &hook.approved_content_hash {
+        println!("Approved Content Hash: {}", approved_hash);
+    }
+    if let Some(by) = &hook.approved_by {
+        println!("Approved By: {}", by);
+    }
+    if let Some(at) = &hook.approved_at {
+        println!("Approved At: {}", at);
+    }
+    println!("\nSpecification:");
+    if let Ok(raw) = std::fs::read_to_string(&hook.source_path) {
+        println!("{raw}");
+    } else {
+        println!("{}", hook.spec_json);
+    }
+    Ok(())
+}
+
+/// `codypendent hook approve <id>` — approve a hook by content hash.
+pub async fn hook_approve(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = codypendent_daemon::db::open_database(&database_path).await?;
+    let hook = codypendent_daemon::hooks::get_hook(&pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("hook `{id}` not found"))?;
+
+    let user = std::env::var("USER").unwrap_or_else(|_| "operator".to_string());
+    let updated = codypendent_daemon::hooks::approve_hook(&pool, &hook.hook_id, &user).await?;
+    if updated {
+        println!(
+            "approved hook `{}` ({}) with content hash `{}`",
+            hook.hook_id, hook.name, hook.content_hash
+        );
+    } else {
+        println!(
+            "hook `{}` is already approved with current content hash",
+            hook.hook_id
+        );
+    }
+    Ok(())
+}
+
+/// `codypendent hook reject <id>` — reject a hook.
+pub async fn hook_reject(paths: &RuntimePaths, id: &str) -> anyhow::Result<()> {
+    paths.ensure_directories()?;
+    let database_path = paths.data_dir.join("codypendent.db");
+    let pool = codypendent_daemon::db::open_database(&database_path).await?;
+    let hook = codypendent_daemon::hooks::get_hook(&pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("hook `{id}` not found"))?;
+
+    let user = std::env::var("USER").unwrap_or_else(|_| "operator".to_string());
+    codypendent_daemon::hooks::reject_hook(&pool, &hook.hook_id, &user).await?;
+    println!("rejected hook `{}` ({})", hook.hook_id, hook.name);
+    Ok(())
+}
+
 #[cfg(test)]
 mod completion_tests {
     use super::*;
@@ -5298,5 +5446,73 @@ mod docs_publish_outcome_tests {
         );
         // A job row that has not appeared yet is not a verdict either.
         assert_eq!(publish_job_state(&pool, ApprovalId::new()).await, None);
+    }
+}
+
+#[cfg(test)]
+mod hook_command_tests {
+    use super::*;
+    use codypendent_sandbox::hook::HookScope;
+
+    #[tokio::test]
+    async fn hook_cli_commands_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::from_data_dir(dir.path().to_path_buf());
+        paths.ensure_directories().unwrap();
+
+        let hook_dir = dir.path().join("hooks");
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        let hook_file = hook_dir.join("test.toml");
+        std::fs::write(
+            &hook_file,
+            r#"
+schema_version = 1
+id = "test.hook"
+name = "Test Hook"
+scope = "user"
+event = "tool.pre"
+kind = "validate"
+priority = 100
+
+[runtime]
+type = "command"
+program = "/bin/sh"
+args = ["-c", "exit 0"]
+timeout_seconds = 30
+
+[policy]
+failure = "block"
+requires_approval = false
+network = "deny"
+"#,
+        )
+        .unwrap();
+
+        let pool = codypendent_daemon::db::open_database(&paths.data_dir.join("codypendent.db"))
+            .await
+            .unwrap();
+        codypendent_daemon::hooks::scan_hook_root(&pool, &hook_dir, HookScope::User, "").await;
+
+        // List
+        hook_list(&paths).await.unwrap();
+
+        // Show
+        hook_show(&paths, "test.hook").await.unwrap();
+
+        // Approve
+        hook_approve(&paths, "test.hook").await.unwrap();
+        let hook = codypendent_daemon::hooks::get_hook(&pool, "test.hook")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hook.approval_state, "approved");
+
+        // Reject
+        hook_reject(&paths, "test.hook").await.unwrap();
+        let hook_after_reject = codypendent_daemon::hooks::get_hook(&pool, "test.hook")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hook_after_reject.approval_state, "rejected");
     }
 }

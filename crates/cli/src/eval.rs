@@ -1192,6 +1192,7 @@ mod execution_correlation_tests {
                 level: RiskLevel::Medium,
                 reasons: Vec::new(),
             },
+            pattern: None,
         });
         builder.observe(&EventBody::ToolProposed {
             run_id,
@@ -1339,6 +1340,7 @@ mod execution_correlation_tests {
                 level: RiskLevel::High,
                 reasons: Vec::new(),
             },
+            pattern: None,
         });
         builder.observe(&EventBody::ToolProposed {
             run_id,
@@ -1406,6 +1408,7 @@ mod execution_correlation_tests {
                 level: RiskLevel::Low,
                 reasons: Vec::new(),
             },
+            pattern: None,
         });
         builder.observe(&EventBody::ApprovalResolved {
             approval_id,

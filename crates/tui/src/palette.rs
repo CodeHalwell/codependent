@@ -66,6 +66,8 @@ pub enum PaletteCommand {
     Help,
     /// Detach this client (the run keeps going).
     Detach,
+    /// Resume an existing conversation session (Adoption 11 S1).
+    Sessions,
     /// Start a fresh, unseeded conversation in place. The harness creates a new
     /// durable session and atomically hands the running TUI to its own socket;
     /// the previous run remains alive in the daemon without leaking events into
@@ -300,6 +302,13 @@ pub const COMMANDS: &[PaletteEntry] = &[
         title: "Detach",
         description: "leave the TUI; the run keeps going",
         key: "Ctrl-C",
+        group: "Session",
+    },
+    PaletteEntry {
+        command: PaletteCommand::Sessions,
+        title: "/sessions  Resume session",
+        description: "browse and switch to another conversation session",
+        key: "—",
         group: "Session",
     },
     PaletteEntry {

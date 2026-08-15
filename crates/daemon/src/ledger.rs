@@ -5,9 +5,11 @@
 //! subscriptions — the storage shape here is already the durable ordering
 //! authority they build on.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use codypendent_protocol::{Actor, EventBody, RunId, RunState, SessionEvent, SessionId};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 
 /// Insert a session row in state `open`.
 pub async fn create_session(
@@ -408,6 +410,270 @@ pub async fn active_run_count(pool: &SqlitePool) -> anyhow::Result<i64> {
     .fetch_one(pool)
     .await?;
     Ok(count)
+}
+
+/// Copy `events` (already loaded, already ordered) into `target`, remapping
+/// run ids through `id_map` and renumbering sequences from 1. Pure over its
+/// inputs plus the appends; the source session is untouched.
+///
+/// Takes a `&mut SqliteConnection` (not a pool) so a fork can copy the whole
+/// head **inside a single transaction** — the fork's session row, its copied
+/// events, its cloned run rows, and its marker event all commit atomically, so
+/// a crash leaves either no fork or a complete one (never a partial orphan).
+pub async fn copy_events_remapped(
+    conn: &mut SqliteConnection,
+    target: SessionId,
+    events: &[SessionEvent],
+    id_map: &HashMap<RunId, RunId>,
+) -> anyhow::Result<u64> {
+    let mut sequence = 0u64;
+    for event in events {
+        sequence += 1;
+        let copied = SessionEvent {
+            sequence,
+            occurred_at: event.occurred_at,
+            causation_id: None, // command rows are not copied
+            correlation_id: event.correlation_id,
+            actor: remap_actor(&event.actor, id_map),
+            body: remap_body(&event.body, id_map),
+        };
+        append_event_conn(&mut *conn, target, &copied).await?;
+    }
+    Ok(sequence)
+}
+
+/// Append one pre-numbered event within a caller-provided transaction/connection.
+/// The transactional twin of [`append_event`] (which appends against a pool);
+/// used by [`copy_events_remapped`] and session forking so a whole batch of
+/// appends commits atomically.
+pub async fn append_event_conn(
+    conn: &mut SqliteConnection,
+    session_id: SessionId,
+    event: &SessionEvent,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO events \
+         (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+    )
+    .bind(session_id.to_string())
+    .bind(i64::try_from(event.sequence)?)
+    .bind(event.occurred_at.to_rfc3339())
+    .bind(serde_json::to_string(&event.actor)?)
+    .bind(serde_json::to_string(&event.body)?)
+    .bind(event.causation_id.map(|id| id.to_string()))
+    .bind(event.correlation_id.map(|id| id.to_string()))
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+fn remap(id: RunId, map: &HashMap<RunId, RunId>) -> RunId {
+    *map.get(&id).unwrap_or(&id)
+}
+
+fn remap_actor(actor: &Actor, map: &HashMap<RunId, RunId>) -> Actor {
+    match actor {
+        Actor::Agent {
+            agent_id,
+            run_id,
+            model,
+        } => Actor::Agent {
+            agent_id: *agent_id,
+            run_id: remap(*run_id, map),
+            model: model.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
+fn remap_body(body: &EventBody, map: &HashMap<RunId, RunId>) -> EventBody {
+    use EventBody::*;
+    match body {
+        NoteAppended { text, run_id } => NoteAppended {
+            text: text.clone(),
+            run_id: run_id.map(|id| remap(id, map)),
+        },
+        RunStarted {
+            run_id,
+            objective,
+            mode,
+        } => RunStarted {
+            run_id: remap(*run_id, map),
+            objective: objective.clone(),
+            mode: *mode,
+        },
+        RunStateChanged { run_id, state } => RunStateChanged {
+            run_id: remap(*run_id, map),
+            state: *state,
+        },
+        ModelStreamDelta { run_id, text } => ModelStreamDelta {
+            run_id: remap(*run_id, map),
+            text: text.clone(),
+        },
+        ToolProposed {
+            run_id,
+            approval_id,
+            action,
+        } => ToolProposed {
+            run_id: remap(*run_id, map),
+            approval_id: *approval_id,
+            action: action.clone(),
+        },
+        ToolDenied {
+            run_id,
+            action,
+            reasons,
+        } => ToolDenied {
+            run_id: remap(*run_id, map),
+            action: action.clone(),
+            reasons: reasons.clone(),
+        },
+        ToolStarted {
+            run_id,
+            tool,
+            args_digest,
+            label,
+        } => ToolStarted {
+            run_id: remap(*run_id, map),
+            tool: tool.clone(),
+            args_digest: args_digest.clone(),
+            label: label.clone(),
+        },
+        ToolCompleted {
+            run_id,
+            tool,
+            outcome,
+            artifact,
+        } => ToolCompleted {
+            run_id: remap(*run_id, map),
+            tool: tool.clone(),
+            outcome: outcome.clone(),
+            artifact: artifact.clone(),
+        },
+        PatchProposed {
+            run_id,
+            changeset_id,
+            artifact,
+            files,
+            additions,
+            deletions,
+            preview,
+            preview_truncated,
+        } => PatchProposed {
+            run_id: remap(*run_id, map),
+            changeset_id: *changeset_id,
+            artifact: artifact.clone(),
+            files: files.clone(),
+            additions: *additions,
+            deletions: *deletions,
+            preview: preview.clone(),
+            preview_truncated: *preview_truncated,
+        },
+        SteeringQueued { run_id } => SteeringQueued {
+            run_id: remap(*run_id, map),
+        },
+        SteeringApplied { run_id } => SteeringApplied {
+            run_id: remap(*run_id, map),
+        },
+        BudgetWarning {
+            run_id,
+            dimension,
+            used,
+            limit,
+        } => BudgetWarning {
+            run_id: remap(*run_id, map),
+            dimension: *dimension,
+            used: *used,
+            limit: *limit,
+        },
+        RunCompleted {
+            run_id,
+            disposition,
+            chronicle,
+        } => RunCompleted {
+            run_id: remap(*run_id, map),
+            disposition: disposition.clone(),
+            chronicle: chronicle.clone(),
+        },
+        RunUsage {
+            run_id,
+            prompt_tokens,
+            completion_tokens,
+            cost_micros,
+        } => RunUsage {
+            run_id: remap(*run_id, map),
+            prompt_tokens: *prompt_tokens,
+            completion_tokens: *completion_tokens,
+            cost_micros: *cost_micros,
+        },
+        LearningsCaptured {
+            run_id,
+            proposed_count,
+            proposed_ids,
+            activated_count,
+            activated_ids,
+        } => LearningsCaptured {
+            run_id: remap(*run_id, map),
+            proposed_count: *proposed_count,
+            proposed_ids: proposed_ids.clone(),
+            activated_count: *activated_count,
+            activated_ids: activated_ids.clone(),
+        },
+        QuestionAsked {
+            question_id,
+            run_id,
+            questions,
+        } => QuestionAsked {
+            question_id: *question_id,
+            run_id: remap(*run_id, map),
+            questions: questions.clone(),
+        },
+        CheckpointRecorded {
+            run_id,
+            checkpoint_id,
+            ordinal,
+            kind,
+            commit,
+            base_commit,
+        } => CheckpointRecorded {
+            run_id: remap(*run_id, map),
+            checkpoint_id: *checkpoint_id,
+            ordinal: *ordinal,
+            kind: *kind,
+            commit: commit.clone(),
+            base_commit: base_commit.clone(),
+        },
+        CheckpointRestored {
+            run_id,
+            checkpoint_id,
+            restored,
+        } => CheckpointRestored {
+            run_id: remap(*run_id, map),
+            checkpoint_id: *checkpoint_id,
+            restored: *restored,
+        },
+        // Variants carrying no RunId: SessionCreated, SessionClosed, ApprovalRequested,
+        // ApprovalResolved, ClientPresenceChanged, QuestionResolved, SessionForked, Unknown.
+        other => other.clone(),
+    }
+}
+
+/// Find the ledger sequence of the `RunStarted` event for `run_id`.
+pub async fn run_started_sequence(
+    pool: &SqlitePool,
+    session_id: SessionId,
+    run_id: RunId,
+) -> anyhow::Result<Option<u64>> {
+    let events = load_events(pool, session_id).await?;
+    for event in events {
+        if let EventBody::RunStarted { run_id: r_id, .. } = &event.body {
+            if *r_id == run_id {
+                return Ok(Some(event.sequence));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

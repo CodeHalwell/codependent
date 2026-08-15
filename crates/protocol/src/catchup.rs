@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::SessionEvent;
 use crate::ids::{ApprovalId, RunId, SessionId};
-use crate::{ProposedAction, Risk};
+use crate::{PendingPromptView, ProposedAction, Risk};
 
 /// The daemon's answer to an attach: replay or snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,6 +49,10 @@ pub struct SessionProjection {
     /// compacted catch-up must preserve workflow state, not merely run ids.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_approvals: Vec<PendingApprovalProjection>,
+    /// Pending queued prompts at the snapshot watermark, so a >500-event
+    /// catch-up still shows the queue (mirrors `pending_approvals`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_prompts: Vec<PendingPromptView>,
     pub closed: bool,
 }
 
@@ -94,6 +98,9 @@ mod tests {
 
     #[test]
     fn catchup_snapshot_round_trips() {
+        use crate::ids::PromptId;
+        use crate::run::{AgentMode, PromptDelivery};
+
         let original = Catchup::Snapshot {
             through: 512,
             projection: SessionProjection {
@@ -102,12 +109,38 @@ mod tests {
                 last_sequence: 512,
                 active_runs: vec![RunId::new()],
                 pending_approvals: Vec::new(),
+                pending_prompts: vec![PendingPromptView {
+                    id: PromptId::new(),
+                    text: "queued prompt".to_string(),
+                    mode: AgentMode::Build,
+                    delivery: PromptDelivery::Queue,
+                }],
                 closed: false,
             },
         };
         let json = serde_json::to_string(&original).expect("serialize");
+        assert!(json.contains("queued prompt"));
         let parsed: Catchup = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, parsed);
+
+        // Empty pending_prompts is omitted in json and deserializes to empty vec
+        let empty_proj = SessionProjection {
+            session_id: SessionId::new(),
+            title: "empty".to_string(),
+            last_sequence: 1,
+            active_runs: Vec::new(),
+            pending_approvals: Vec::new(),
+            pending_prompts: Vec::new(),
+            closed: false,
+        };
+        let empty_json = serde_json::to_string(&empty_proj).expect("serialize");
+        assert!(!empty_json.contains("pending_prompts"));
+        let parsed_empty: SessionProjection =
+            serde_json::from_str(&empty_json).expect("deserialize");
+        assert_eq!(
+            parsed_empty.pending_prompts,
+            Vec::<PendingPromptView>::new()
+        );
     }
 
     #[test]

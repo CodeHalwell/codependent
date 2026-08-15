@@ -1,0 +1,269 @@
+//! Live LSP diagnostics (Phase 4 follow-up: the "live language-server
+//! spawn" half of Chapter 07's semantic tier). One process-wide manager
+//! lazily spawns servers per (server, workspace-root), caches clients,
+//! marks broken pairs so a failing server is tried once, and exposes the
+//! one question the write tools ask: "fresh diagnostics for this file".
+
+pub mod client;
+pub mod servers;
+pub mod transport;
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+
+use crate::adapter::{on_path, DiagnosticSeverity};
+use client::canonical_or_original;
+pub use client::{LspClient, LspDiagnostic};
+
+/// The seam the runtime's write tools consume (mirrors `CodeGraphQueries`:
+/// a knowledge-owned trait held as `Option<Arc<dyn …>>` on the runtime).
+#[async_trait]
+pub trait LiveDiagnostics: Send + Sync {
+    /// Touch `file` in every live server responsible for it, wait (bounded)
+    /// for fresh diagnostics, and return them. Empty when no server covers
+    /// the file, none is installed, spawn failed, or the wait timed out —
+    /// this method NEVER errors and NEVER blocks beyond its internal bounds.
+    async fn file_diagnostics(&self, file: &Path, worktree: &Path) -> Vec<LspDiagnostic>;
+}
+
+pub struct LspManager {
+    clients: Mutex<HashMap<(String, PathBuf), Arc<LspClient>>>,
+    broken: Mutex<HashSet<(String, PathBuf)>>,
+}
+
+impl std::fmt::Debug for LspManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LspManager").finish_non_exhaustive()
+    }
+}
+
+impl Default for LspManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LspManager {
+    pub fn new() -> Self {
+        Self {
+            clients: Mutex::new(HashMap::new()),
+            broken: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Lazy client for (spec, root): reuse, or spawn+initialize; on failure
+    /// mark broken and answer None forever after (per manager lifetime).
+    pub async fn client_for(
+        &self,
+        spec: &servers::ServerSpec,
+        root: &Path,
+    ) -> Option<Arc<LspClient>> {
+        let canon_root = canonical_or_original(root);
+        let key = (spec.id.to_string(), canon_root.clone());
+
+        {
+            if self.broken.lock().unwrap().contains(&key) {
+                return None;
+            }
+            if let Some(client) = self.clients.lock().unwrap().get(&key) {
+                return Some(client.clone());
+            }
+        }
+
+        if !on_path(spec.binary) {
+            return None;
+        }
+
+        let init = if spec.id == "pyright" {
+            servers::pyright_initialization(&canon_root)
+        } else {
+            serde_json::json!({})
+        };
+
+        let args: Vec<String> = servers::spawn_args(spec)
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        match LspClient::spawn(Path::new(spec.binary), &args, &canon_root, init).await {
+            Ok(client) => {
+                let arc = Arc::new(client);
+                self.clients.lock().unwrap().insert(key, arc.clone());
+                Some(arc)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    server = spec.id,
+                    root = %canon_root.display(),
+                    error = %err,
+                    "failed to spawn LSP server; marking broken for this session"
+                );
+                self.broken.lock().unwrap().insert(key);
+                None
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl LiveDiagnostics for LspManager {
+    async fn file_diagnostics(&self, file: &Path, worktree: &Path) -> Vec<LspDiagnostic> {
+        let file_canon = canonical_or_original(file);
+        let worktree_canon = canonical_or_original(worktree);
+
+        let ext = match file_canon.extension().and_then(|e| e.to_str()) {
+            Some(e) => format!(".{e}"),
+            None => return Vec::new(),
+        };
+
+        let mut all_diags = Vec::new();
+
+        for spec in servers::ROSTER {
+            if spec.extensions.contains(&ext.as_str()) {
+                let root_opt = match spec.id {
+                    "rust-analyzer" => servers::rust_analyzer_root(&file_canon, &worktree_canon),
+                    "pyright" => servers::pyright_root(&file_canon, &worktree_canon),
+                    _ => None,
+                };
+
+                if let Some(root) = root_opt {
+                    if let Some(client) = self.client_for(spec, &root).await {
+                        let after = tokio::time::Instant::now();
+                        if let Ok(version) = client.touch(&file_canon).await {
+                            client
+                                .wait_for_diagnostics(&file_canon, version, after)
+                                .await;
+                            let diags = client.diagnostics_for(&file_canon).await;
+                            all_diags.extend(diags);
+                        }
+                    }
+                }
+            }
+        }
+
+        all_diags
+    }
+}
+
+/// Reference `diagnostic.ts` `report`: severity Error only, cap 20 with
+/// `... and N more`, 1-based positions. `None` when there are no errors.
+pub const MAX_DIAGNOSTICS_PER_FILE: usize = 20;
+
+pub fn report(file: &Path, issues: &[LspDiagnostic]) -> Option<String> {
+    let errors: Vec<&LspDiagnostic> = issues
+        .iter()
+        .filter(|d| d.severity == DiagnosticSeverity::Error)
+        .collect();
+
+    if errors.is_empty() {
+        return None;
+    }
+
+    let mut out = format!("<diagnostics file=\"{}\">\n", file.display());
+    let total = errors.len();
+    let display_count = total.min(MAX_DIAGNOSTICS_PER_FILE);
+
+    for diag in &errors[..display_count] {
+        out.push_str(&format!(
+            "ERROR [{}:{}] {}\n",
+            diag.line + 1,
+            diag.character + 1,
+            diag.message
+        ));
+    }
+
+    if total > MAX_DIAGNOSTICS_PER_FILE {
+        let remaining = total - MAX_DIAGNOSTICS_PER_FILE;
+        out.push_str(&format!("... and {remaining} more\n"));
+    }
+
+    out.push_str("</diagnostics>");
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_matches_reference_format() {
+        let file = Path::new("src/main.rs");
+        let issues = vec![LspDiagnostic {
+            line: 4,
+            character: 10,
+            severity: DiagnosticSeverity::Error,
+            message: "cannot find value `x` in this scope".to_string(),
+            source: Some("rustc".to_string()),
+        }];
+
+        let rendered = report(file, &issues).unwrap();
+        assert_eq!(
+            rendered,
+            "<diagnostics file=\"src/main.rs\">\nERROR [5:11] cannot find value `x` in this scope\n</diagnostics>"
+        );
+    }
+
+    #[test]
+    fn report_caps_at_twenty_with_more_suffix() {
+        let file = Path::new("src/lib.rs");
+        let issues: Vec<LspDiagnostic> = (0..25)
+            .map(|i| LspDiagnostic {
+                line: i,
+                character: 0,
+                severity: DiagnosticSeverity::Error,
+                message: format!("error {i}"),
+                source: None,
+            })
+            .collect();
+
+        let rendered = report(file, &issues).unwrap();
+        assert!(rendered.contains("ERROR [1:1] error 0\n"));
+        assert!(rendered.contains("ERROR [20:1] error 19\n"));
+        assert!(!rendered.contains("ERROR [21:1] error 20\n"));
+        assert!(rendered.contains("... and 5 more\n"));
+    }
+
+    #[test]
+    fn report_is_none_without_errors() {
+        let file = Path::new("src/main.rs");
+        let issues = vec![
+            LspDiagnostic {
+                line: 0,
+                character: 0,
+                severity: DiagnosticSeverity::Warning,
+                message: "unused variable".to_string(),
+                source: None,
+            },
+            LspDiagnostic {
+                line: 1,
+                character: 0,
+                severity: DiagnosticSeverity::Info,
+                message: "hint info".to_string(),
+                source: None,
+            },
+        ];
+
+        assert_eq!(report(file, &issues), None);
+    }
+
+    #[tokio::test]
+    async fn broken_server_is_not_respawned() {
+        let manager = LspManager::new();
+        let fake_spec = servers::ServerSpec {
+            id: "nonexistent-server",
+            extensions: &[".xyz"],
+            binary: "definitely-not-installed-binary-12345",
+        };
+        let tmp = tempfile::tempdir().unwrap();
+
+        let res1 = manager.client_for(&fake_spec, tmp.path()).await;
+        assert!(res1.is_none());
+
+        // Second call should return None immediately via broken set or on_path
+        let res2 = manager.client_for(&fake_spec, tmp.path()).await;
+        assert!(res2.is_none());
+    }
+}

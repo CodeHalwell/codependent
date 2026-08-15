@@ -80,12 +80,28 @@ impl ReadFile {
         // every component. Subsequent reads use this handle, never the pathname.
         let path = input.path.clone();
         let scope_for_open = scope.clone();
-        let scoped =
+        let scoped_res =
             tokio::task::spawn_blocking(move || secure_fs::open_read(&path, &scope_for_open))
                 .await
                 .map_err(|error| {
                     ToolError::Other(anyhow::anyhow!("read worker failed: {error}"))
-                })??;
+                })?;
+
+        let scoped = match scoped_res {
+            Ok(s) => s,
+            Err(ToolError::Io(ref err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                let p = input.path.clone();
+                let s = scope.clone();
+                let suggestions = tokio::task::spawn_blocking(move || did_you_mean(&p, &s))
+                    .await
+                    .unwrap_or_default();
+                return Err(ToolError::FileNotFound {
+                    path: input.path.clone(),
+                    suggestions,
+                });
+            }
+            Err(other) => return Err(other),
+        };
 
         // Validate an explicit range before touching the file (unchanged errors).
         if let Some((start, end)) = input.range {
@@ -168,5 +184,145 @@ impl ReadFile {
             truncated: end < total || start > 1,
             content,
         })
+    }
+}
+
+/// Up to 3 entries of `path`'s parent whose lowercase name contains the
+/// requested leaf's lowercase name or vice versa. The parent is re-checked
+/// against `scope` and read with std::fs::read_dir on the RESOLVED parent;
+/// any error yields no suggestions (the not-found error stands alone).
+fn did_you_mean(path: &std::path::Path, scope: &PathScope) -> Vec<String> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let parent_to_check = if parent.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        parent
+    };
+    let (resolved_parent, verdict) = scope.resolve(parent_to_check);
+    if verdict != codypendent_daemon::policy::ScopeVerdict::Allowed {
+        return Vec::new();
+    }
+    let Some(leaf) = path.file_name().and_then(|f| f.to_str()) else {
+        return Vec::new();
+    };
+    let leaf_lower = leaf.to_lowercase();
+    let Ok(entries) = std::fs::read_dir(&resolved_parent) else {
+        return Vec::new();
+    };
+
+    let mut suggestions = Vec::new();
+    for entry in entries.flatten() {
+        if let Ok(file_name) = entry.file_name().into_string() {
+            let name_lower = file_name.to_lowercase();
+            if name_lower != leaf_lower && is_similar(&name_lower, &leaf_lower) {
+                suggestions.push(file_name);
+            }
+        }
+    }
+    suggestions.sort();
+    suggestions.truncate(3);
+    suggestions
+}
+
+fn is_similar(a: &str, b: &str) -> bool {
+    if a.contains(b) || b.contains(a) {
+        return true;
+    }
+    levenshtein_distance(a, b) <= 2
+}
+
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let m = a_chars.len();
+    let n = b_chars.len();
+    let mut dp = vec![vec![0; n + 1]; m + 1];
+
+    for (i, row) in dp.iter_mut().enumerate().take(m + 1) {
+        row[0] = i;
+    }
+    if let Some(first_row) = dp.first_mut() {
+        for (j, cell) in first_row.iter_mut().enumerate().take(n + 1) {
+            *cell = j;
+        }
+    }
+
+    for i in 1..=m {
+        for j in 1..=n {
+            if a_chars[i - 1] == b_chars[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1];
+            } else {
+                dp[i][j] = 1 + dp[i - 1][j].min(dp[i][j - 1]).min(dp[i - 1][j - 1]);
+            }
+        }
+    }
+    dp[m][n]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codypendent_daemon::policy::PathScope;
+
+    #[tokio::test]
+    async fn not_found_suggests_similar_sibling_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+
+        let scope = PathScope::new(vec![root.clone()], vec![]);
+        let err = ReadFile::execute(
+            &ReadFileInput {
+                path: root.join("src/mian.rs"),
+                range: None,
+            },
+            &scope,
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            ToolError::FileNotFound {
+                ref path,
+                ref suggestions,
+            } => {
+                assert_eq!(path, &root.join("src/mian.rs"));
+                assert_eq!(suggestions, &vec!["main.rs".to_string()]);
+                let msg = err.to_string();
+                assert!(msg.contains("file not found:"));
+                assert!(msg.contains("— did you mean: main.rs?"));
+            }
+            other => panic!("expected FileNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn not_found_out_of_scope_yields_no_suggestions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_root = outside.path().canonicalize().unwrap();
+        std::fs::write(outside_root.join("main.rs"), "fn main() {}").unwrap();
+
+        let scope = PathScope::new(vec![root], vec![]);
+        let err = ReadFile::execute(
+            &ReadFileInput {
+                path: outside_root.join("mian.rs"),
+                range: None,
+            },
+            &scope,
+        )
+        .await
+        .unwrap_err();
+
+        // Either path out of scope or file not found without suggestions
+        match err {
+            ToolError::PathOutOfScope(_) => {}
+            ToolError::FileNotFound { suggestions, .. } => {
+                assert!(suggestions.is_empty());
+            }
+            other => panic!("unexpected error {other:?}"),
+        }
     }
 }

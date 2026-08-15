@@ -122,6 +122,14 @@ pub trait RunExecutor: Send + Sync {
     /// Resume a run previously paused through [`Self::pause_run`].
     fn resume_run(&self, _run_id: RunId) {}
 
+    /// Deliver steering text into a live run's steering channel (Adoption 06).
+    /// Fire-and-forget and idempotent-on-absence: returns `true` if delivered to a live channel,
+    /// `false` if the run is not currently executing in this process (finished, never launched here).
+    /// The runtime applies it at its next safe point and journals `SteeringApplied`.
+    fn steer_run(&self, _run_id: RunId, _text: String) -> bool {
+        false
+    }
+
     /// The shared event fan-out and approval broker this executor publishes a
     /// run's events through and resolves approvals against.
     ///
@@ -143,6 +151,7 @@ pub trait RunExecutor: Send + Sync {
     ) -> Option<(
         crate::subscriptions::SubscriptionHub,
         crate::approvals::ApprovalBroker,
+        crate::questions::QuestionBroker,
     )> {
         None
     }

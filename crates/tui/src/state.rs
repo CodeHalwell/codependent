@@ -12,8 +12,9 @@ use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
 
 use codypendent_protocol::{
-    AgentMode, ApprovalId, ArtifactRef, BudgetDimension, ChangeSetId, DocumentId, DocumentMutation,
-    ModelId, ProposedAction, Risk, RunDisposition, RunId, RunState, ToolOutcome,
+    AgentMode, ApprovalId, ArtifactRef, BudgetDimension, ChangeSetId, CheckpointId, DocumentId,
+    DocumentMutation, ModelId, ProposedAction, QuestionId, QuestionPrompt, Risk, RunDisposition,
+    RunId, RunState, ToolOutcome,
 };
 
 use crate::action::{Action, Intent, KeyTarget, SecretKey};
@@ -93,6 +94,9 @@ pub enum InputMode {
     /// A pending approval owns the screen: only the decision keys (`a`/`A`/`r`)
     /// and selection arrows are live, so an approval is never typed past.
     Approval,
+    /// A pending question prompt owns the screen: decision keys (navigate, select, custom, reject)
+    /// own the input so a mid-run question is never typed past.
+    Question,
     /// Council results combine a selectable result list with a vertically
     /// scrollable long-form synthesis/detail pane.
     CouncilResults,
@@ -232,6 +236,8 @@ pub enum Overlay {
     Issues,
     /// The new-run objective prompt (buffer inline).
     NewRun(String),
+    /// Session/resume picker overlay (Adoption 11 S1).
+    SessionPicker { query: String, selected: usize },
     /// The steering-text prompt (buffer inline).
     Steering(String),
     /// A "cancel this run?" confirmation.
@@ -603,6 +609,15 @@ pub enum Overlay {
         error: Option<String>,
         registered_id: Option<String>,
     },
+    /// Backtrack / Session Fork overlay (Adoption 05).
+    Backtrack(BacktrackState),
+}
+
+/// State of the backtrack / session-fork overlay (Adoption 05).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BacktrackState {
+    /// Index into the forkable run list (0 = oldest run).
+    pub selected: usize,
 }
 
 /// The lifecycle of a single tool card in the transcript.
@@ -935,6 +950,50 @@ pub struct PendingApproval {
     /// `ToolProposed` links an approval to a run; a bare `ApprovalRequested`
     /// does not carry the run id).
     pub run_id: Option<RunId>,
+    /// The arity-learned pattern for ExecuteCommand actions (Adoption 07).
+    pub pattern: Option<String>,
+}
+
+/// A pending question prompt awaiting an answer or rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQuestion {
+    pub question_id: QuestionId,
+    pub run_id: RunId,
+    pub questions: Vec<QuestionPrompt>,
+    pub asked_at: DateTime<Utc>,
+}
+
+/// State for the interactive question card in the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionCardState {
+    /// Index of the active question in `questions` (0..questions.len()).
+    pub index: usize,
+    /// Highlighted option row within the active question.
+    pub selected: usize,
+    /// Selected answers per question: `picked[q_idx]` is a list of selected labels.
+    pub picked: Vec<Vec<String>>,
+    /// Custom text entered per question: `custom_text[q_idx]`.
+    pub custom_text: Vec<String>,
+    /// Whether user is currently editing the custom text field.
+    pub editing_custom: bool,
+    /// Whether the user has moved past the last question to the final confirmation row.
+    pub confirming: bool,
+    /// If Some, the reject-feedback input box is open with the currently typed feedback.
+    pub feedback: Option<String>,
+}
+
+impl QuestionCardState {
+    pub fn new(question_count: usize) -> Self {
+        Self {
+            index: 0,
+            selected: 0,
+            picked: vec![Vec::new(); question_count],
+            custom_text: vec![String::new(); question_count],
+            editing_custom: false,
+            confirming: false,
+            feedback: None,
+        }
+    }
 }
 
 /// A run's current derived activity — never fetched, always folded from the
@@ -955,6 +1014,9 @@ pub enum RunActivity {
     Streaming,
     /// A tool is executing; carries the tool's name.
     RunningTool(String),
+    /// The model request hit a transient failure; the daemon is backing off
+    /// before retry `attempt` of `max_attempts`.
+    Retrying { attempt: u32, max_attempts: u32 },
 }
 
 /// Where an unacknowledged first-run draft came from. A rejected wire command
@@ -1008,6 +1070,8 @@ pub struct RunView {
     /// Measured cost in USD millionths.
     pub cost_micros: Option<u64>,
     pub disposition: Option<RunDisposition>,
+    /// The launch checkpoint recorded for this run (ordinal 1, Adoption 04).
+    pub launch_checkpoint: Option<CheckpointId>,
     /// The ordered transcript.
     pub transcript: Vec<TranscriptEntry>,
     /// When each transcript entry's originating event occurred
@@ -1045,6 +1109,7 @@ impl RunView {
             completion_tokens: None,
             cost_micros: None,
             disposition: None,
+            launch_checkpoint: None,
             transcript: Vec::new(),
             entry_times: Vec::new(),
             transcript_selected: 0,
@@ -2210,11 +2275,61 @@ pub struct StatusProjection {
     pub pending_approvals: usize,
 }
 
+/// One pending prompt as rendered above the composer (Adoption 06).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPromptCard {
+    pub id: codypendent_protocol::PromptId,
+    pub text: String,
+    pub delivery: codypendent_protocol::PromptDelivery,
+}
+
+/// One session row in the session/resume picker (Adoption 11 S1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRow {
+    pub session_id: codypendent_protocol::SessionId,
+    pub workspace_id: Option<codypendent_protocol::WorkspaceId>,
+    pub title: String,
+    pub state: String,
+    pub updated_at: String,
+    pub created_at: String,
+}
+
+/// A large paste held out of the composer text (Adoption 11 M1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasteBlock {
+    pub marker: String,
+    pub text: String,
+}
+
+/// @-file-mentions fuzzy search popup state (Adoption 11 M2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionPopup {
+    pub query: String,
+    pub selected: usize,
+    pub waiting: bool,
+    pub display_query: String,
+    pub matches: Vec<codypendent_protocol::command::FileMatchWire>,
+}
+
+/// Ctrl+R history search popup state (Adoption 11 M2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySearch {
+    pub query: String,
+    pub selected: usize,
+}
+
 /// The whole application state. Read by the renderer, mutated only by `reduce`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppState {
     /// Validated renderer-independent documents and terminal-local view state.
     pub remote_ui: RemoteUiHostState,
+    /// The session's server-side pending-prompt queue (latest
+    /// `PendingPromptsChanged` snapshot). Rendered above the composer.
+    pub pending_prompts: Vec<PendingPromptCard>,
+    /// Selected queue row, when the operator stepped up into the queue.
+    pub queue_selected: Option<usize>,
+    /// In-place edit buffer for the selected row (Tab-edit), if editing.
+    pub queue_editing: Option<String>,
     /// Daemon-owned installed-plugin lifecycle projection. It carries display
     /// metadata only, never executable or trust authority.
     pub ui_plugins: Vec<codypendent_protocol::UiPluginLifecycleStatus>,
@@ -2243,6 +2358,10 @@ pub struct AppState {
     pub pending_approvals: Vec<PendingApproval>,
     /// Index into `pending_approvals` of the focused approval.
     pub selected_approval: usize,
+    /// Pending questions across the session.
+    pub pending_questions: Vec<PendingQuestion>,
+    /// Active interactive question card state.
+    pub question_card_state: Option<QuestionCardState>,
     /// The Skill Studio projection (STEP 2.6): every registered item, mapped to a
     /// self-contained [`SkillCard`] by the CLI. Populated once at attach; the
     /// [`Overlay::Skills`] browser reads it.
@@ -2500,12 +2619,30 @@ pub struct AppState {
     pub tick: u64,
     /// A transient status-line notice and the tick at which it expires.
     pub notice: Option<(String, u64)>,
+    /// Whether an Esc keypress on an empty composer has primed backtrack (Adoption 05).
+    pub backtrack_primed: bool,
+    /// Session ID this session was forked from, if known (Adoption 05).
+    pub forked_from: Option<codypendent_protocol::SessionId>,
     /// Voice input/output state (voice v1, rubric 8). Purely presentational
     /// here: the capture and speech work itself lives in the CLI's voice host
     /// (`codypendent_cli::voice`), which owns the recorder/player subprocesses.
     /// This state is what the status line renders and what the host reads to
     /// decide whether to speak a finalized reply.
     pub voice: VoiceState,
+    /// Known sessions loaded for the session/resume picker (Adoption 11 S1).
+    pub session_list: Vec<SessionRow>,
+    /// Whether the terminal window is focused (Adoption 11 S4).
+    pub terminal_focused: bool,
+    /// Large paste blocks referenced by placeholders (Adoption 11 M1).
+    pub pasted_blocks: Vec<PasteBlock>,
+    /// Active @-mention popup state (Adoption 11 M2).
+    pub mention_popup: Option<MentionPopup>,
+    /// Prompt history for history search / recall.
+    pub prompt_history: Vec<String>,
+    /// Active Ctrl+R history search popup state (Adoption 11 M2).
+    pub history_search: Option<HistorySearch>,
+    /// Hyperlink regions drawn this frame for OSC 8 sidecar (Adoption 11 M5).
+    pub hyperlink_regions: RefCell<Vec<(ratatui::layout::Rect, String)>>,
     /// Semantic commands the CLI must send to the daemon. Drained by the CLI
     /// after every reduce; never touched by the renderer.
     pub outbox: Vec<Intent>,
@@ -2536,6 +2673,9 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             remote_ui: RemoteUiHostState::default(),
+            pending_prompts: Vec::new(),
+            queue_selected: None,
+            queue_editing: None,
             ui_plugins: Vec::new(),
             selected_ui_plugin: 0,
             session_title: None,
@@ -2546,6 +2686,8 @@ impl AppState {
             pending_run_start: None,
             pending_approvals: Vec::new(),
             selected_approval: 0,
+            pending_questions: Vec::new(),
+            question_card_state: None,
             skills: Vec::new(),
             selected_skill: 0,
             memories: Vec::new(),
@@ -2614,9 +2756,27 @@ impl AppState {
             should_detach: false,
             tick: 0,
             notice: None,
+            backtrack_primed: false,
+            forked_from: None,
             voice: VoiceState::default(),
+            session_list: Vec::new(),
+            terminal_focused: true,
+            pasted_blocks: Vec::new(),
+            mention_popup: None,
+            prompt_history: Vec::new(),
+            history_search: None,
+            hyperlink_regions: RefCell::new(Vec::new()),
             outbox: Vec::new(),
         }
+    }
+
+    /// Runs eligible for session fork/backtrack (has an ordinal-1 launch checkpoint recorded).
+    #[must_use]
+    pub fn forkable_runs(&self) -> Vec<&RunView> {
+        self.runs
+            .iter()
+            .filter(|r| r.launch_checkpoint.is_some())
+            .collect()
     }
 
     /// The input mode the next key should be interpreted in.
@@ -2627,6 +2787,9 @@ impl AppState {
         // behind an overlay while its run waits indefinitely.
         if !self.pending_approvals.is_empty() {
             return InputMode::Approval;
+        }
+        if !self.pending_questions.is_empty() {
+            return InputMode::Question;
         }
         if let Overlay::CouncilBuilder(builder) = &self.overlay {
             return match builder.step {
@@ -2694,6 +2857,7 @@ impl AppState {
             // filter on printable keys while staying arrow-navigable, so they
             // share this input mode (see [`crate::input::map_palette_key`]).
             Overlay::Palette { .. }
+            | Overlay::SessionPicker { .. }
             | Overlay::Onboard {
                 step: OnboardStep::Triage { .. } | OnboardStep::SkipConfirm { .. },
             }
@@ -2728,7 +2892,8 @@ impl AppState {
             | Overlay::UiPlugins
             | Overlay::CouncilBrowser
             | Overlay::AddModelQuerying { .. }
-            | Overlay::UnslothPulling { .. } => InputMode::Normal,
+            | Overlay::UnslothPulling { .. }
+            | Overlay::Backtrack(_) => InputMode::Normal,
             Overlay::CouncilResults => InputMode::CouncilResults,
             Overlay::CouncilBuilder(_) => {
                 unreachable!("council builder input mode is resolved above")
@@ -2807,6 +2972,17 @@ impl AppState {
     #[must_use]
     pub fn focused_approval(&self) -> Option<&PendingApproval> {
         self.pending_approvals.get(self.selected_approval)
+    }
+
+    /// Whether the question card should be shown (a pending question exists).
+    pub fn show_question_modal(&self) -> bool {
+        !self.pending_questions.is_empty()
+    }
+
+    /// The focused pending question, if any.
+    #[must_use]
+    pub fn focused_question(&self) -> Option<&PendingQuestion> {
+        self.pending_questions.first()
     }
 
     /// The focused Skill Studio card, if any.

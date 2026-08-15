@@ -72,7 +72,7 @@
     "supported_protocols": [
       {
         "major": 1,
-        "minor": 4
+        "minor": 5
       }
     ],
     "type": "ClientHello"
@@ -125,7 +125,7 @@
     "pid": 4242,
     "protocol_version": {
       "major": 1,
-      "minor": 4
+      "minor": 5
     },
     "session_count": 2,
     "socket_path": "/home/user/.local/share/codypendent/run/daemon.sock",
@@ -228,6 +228,24 @@
     "sequence": 9,
     "type": "Event"
   },
+  "Payload_FileSearchResults": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "matches": [
+      {
+        "indices": [
+          4,
+          5,
+          6,
+          7
+        ],
+        "path": "src/main.rs",
+        "score": 100
+      }
+    ],
+    "query": "main",
+    "truncated": false,
+    "type": "FileSearchResults"
+  },
   "Payload_Ping": {
     "type": "Ping"
   },
@@ -247,9 +265,23 @@
     "resume_token": "opaque",
     "selected_protocol": {
       "major": 1,
-      "minor": 4
+      "minor": 5
     },
     "type": "ServerHello"
+  },
+  "Payload_SessionList": {
+    "command_id": "40000000-0000-0000-0000-000000000001",
+    "sessions": [
+      {
+        "created_at": "2026-01-01T00:00:00Z",
+        "session_id": "20000000-0000-0000-0000-000000000001",
+        "state": "running",
+        "title": "fix the failing test",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "workspace_id": "10000000-0000-0000-0000-000000000001"
+      }
+    ],
+    "type": "SessionList"
   },
   "Payload_Shutdown": {
     "type": "Shutdown"

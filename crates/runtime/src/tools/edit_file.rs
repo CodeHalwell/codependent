@@ -30,6 +30,7 @@ use std::path::PathBuf;
 use codypendent_daemon::policy::PathScope;
 use serde_json::Value;
 
+use super::edit_match::{self, MatchFailure, MatchStage};
 use super::{secure_fs, CapabilityKind, ToolError};
 
 /// Largest file `edit_file` will hold in memory to search. Mirrors
@@ -65,6 +66,10 @@ pub struct EditFileOutcome {
     /// The number of edits applied (== `input.edits.len()` on success, since
     /// the call is all-or-nothing).
     pub edits_applied: usize,
+    /// How many of the applied edits were matched by a fallback stage rather
+    /// than byte-exactly. Disclosed in `observation()` — a fuzzy apply is
+    /// never passed off as exact.
+    pub fuzzy_matches: usize,
 }
 
 impl EditFileOutcome {
@@ -72,11 +77,16 @@ impl EditFileOutcome {
     /// happened, never a fabricated success.
     #[must_use]
     pub fn observation(&self) -> String {
-        format!(
+        let base = format!(
             "applied {} edit(s) to {}",
             self.edits_applied,
             self.path.display()
-        )
+        );
+        if self.fuzzy_matches == 0 {
+            base
+        } else {
+            format!("{base} ({} via fuzzy match)", self.fuzzy_matches)
+        }
     }
 }
 
@@ -93,31 +103,6 @@ impl EditFile {
     }
 
     /// Apply `input.edits` to `input.path` in order, confined to `scope`.
-    ///
-    /// Resolves `input.path` once via [`PathScope::resolve`] and acts only on
-    /// the returned resolved path (mirrors [`WriteFile::execute`](super::WriteFile::execute)).
-    /// A verdict other than `Allowed` refuses without touching the
-    /// filesystem. Before reading, `symlink_metadata` on that same resolved
-    /// path refuses a symlink or directory (the leaf-swap guard). The whole
-    /// file is read into memory, bounded at [`MAX_EDIT_BYTES`] — a larger
-    /// file fails with [`ToolError::FileTooLarge`] rather than being
-    /// silently truncated.
-    ///
-    /// Edits are then applied **sequentially against the evolving buffer**:
-    /// edit `i+1` matches against the buffer *after* edit `i` was applied,
-    /// so a later edit can target text a prior edit just produced. For each
-    /// edit, `search` must appear as an exact, non-overlapping substring
-    /// **exactly once** in the current buffer:
-    /// - empty `search` → [`ToolError::EmptySearch`] (checked before matching);
-    /// - `0` occurrences → [`ToolError::SearchNotFound`];
-    /// - `>1` occurrences → [`ToolError::SearchAmbiguous`];
-    /// - exactly `1` → the occurrence is replaced with `replace`.
-    ///
-    /// The whole sequence is computed **in memory**; the filesystem is
-    /// touched only once, via a single `tokio::fs::write`, and only after
-    /// every edit has matched uniquely. If any edit fails, `execute` returns
-    /// that edit's error (the first/lowest-index failure) and **writes
-    /// nothing** — no partial edit can ever land on disk.
     pub async fn execute(
         input: &EditFileInput,
         scope: &PathScope,
@@ -147,29 +132,37 @@ impl EditFile {
 
             // Compute the full result in memory; nothing is written until every
             // edit has matched uniquely (atomicity).
+            let mut fuzzy_matches = 0usize;
             for (zero_based, edit) in edits.iter().enumerate() {
                 let index = zero_based + 1;
                 if edit.search.is_empty() {
                     return Err(ToolError::EmptySearch { index });
                 }
-                let count = buffer.matches(edit.search.as_str()).count();
-                match count {
-                    0 => {
+                match edit_match::find_unique_span(&buffer, &edit.search) {
+                    Ok(m) => {
+                        if m.stage != MatchStage::Exact {
+                            fuzzy_matches += 1;
+                        }
+                        buffer.replace_range(m.start..m.start + m.len, &edit.replace);
+                    }
+                    Err(MatchFailure::NotFound) => {
                         return Err(ToolError::SearchNotFound {
                             path: scoped.path.clone(),
                             index,
-                        })
+                        });
                     }
-                    1 => {
-                        let pos = buffer.find(edit.search.as_str()).expect("count == 1");
-                        buffer.replace_range(pos..pos + edit.search.len(), &edit.replace);
-                    }
-                    n => {
+                    Err(MatchFailure::Ambiguous { count }) => {
                         return Err(ToolError::SearchAmbiguous {
                             path: scoped.path.clone(),
                             index,
-                            count: n,
-                        })
+                            count,
+                        });
+                    }
+                    Err(MatchFailure::Disproportionate) => {
+                        return Err(ToolError::DisproportionateMatch {
+                            path: scoped.path.clone(),
+                            index,
+                        });
                     }
                 }
             }
@@ -180,6 +173,7 @@ impl EditFile {
             Ok(EditFileOutcome {
                 edits_applied: edits.len(),
                 path: scoped.path,
+                fuzzy_matches,
             })
         })
         .await
@@ -627,5 +621,133 @@ mod tests {
             "edits": [{"search": "a"}]
         });
         assert!(parse_edit_file(&args).is_err());
+    }
+
+    #[tokio::test]
+    async fn fuzzy_line_trimmed_edit_applies_and_is_disclosed() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let scope = scope_for(&root);
+        std::fs::write(
+            root.join("f.txt"),
+            "function test() {\n    let a = 1;\n    let b = 2;\n}\n",
+        )
+        .unwrap();
+
+        let input = EditFileInput {
+            path: root.join("f.txt"),
+            edits: vec![FileEdit {
+                search: "  let a = 1;\n  let b = 2;".to_string(),
+                replace: "    let a = 10;\n    let b = 20;".to_string(),
+            }],
+        };
+        let outcome = EditFile::execute(&input, &scope).await.unwrap();
+
+        assert_eq!(outcome.edits_applied, 1);
+        assert_eq!(outcome.fuzzy_matches, 1);
+        assert!(outcome.observation().ends_with("(1 via fuzzy match)"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "function test() {\n    let a = 10;\n    let b = 20;\n}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn fuzzy_match_that_is_ambiguous_fails_and_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let scope = scope_for(&root);
+        let original = "block\n    line 1\nblock\n    line 1\n";
+        std::fs::write(root.join("f.txt"), original).unwrap();
+
+        let input = EditFileInput {
+            path: root.join("f.txt"),
+            edits: vec![FileEdit {
+                search: "line 1".to_string(),
+                replace: "line 2".to_string(),
+            }],
+        };
+        let err = EditFile::execute(&input, &scope).await.unwrap_err();
+        assert!(matches!(err, ToolError::SearchAmbiguous { count: 2, .. }));
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn disproportionate_match_is_refused_and_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let scope = scope_for(&root);
+        let original = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+        std::fs::write(root.join("f.txt"), original).unwrap();
+
+        // 1-line search with escaped newlines matching 5 lines -> cand_lines (5) >= max(1+3, 2) = 4
+        let input = EditFileInput {
+            path: root.join("f.txt"),
+            edits: vec![FileEdit {
+                search: r"line 1\nline 2\nline 3\nline 4\nline 5".to_string(),
+                replace: "replaced".to_string(),
+            }],
+        };
+        let err = EditFile::execute(&input, &scope).await.unwrap_err();
+        assert_eq!(err.code(), "tool.disproportionate-match");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_ambiguity_still_reports_exact_count() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let scope = scope_for(&root);
+        let original = "aa bb aa";
+        std::fs::write(root.join("f.txt"), original).unwrap();
+
+        let input = EditFileInput {
+            path: root.join("f.txt"),
+            edits: vec![FileEdit {
+                search: "aa".to_string(),
+                replace: "xx".to_string(),
+            }],
+        };
+        let err = EditFile::execute(&input, &scope).await.unwrap_err();
+        assert!(matches!(err, ToolError::SearchAmbiguous { count: 2, .. }));
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_respects_the_evolving_buffer() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let scope = scope_for(&root);
+        std::fs::write(root.join("f.txt"), "hello world").unwrap();
+
+        let input = EditFileInput {
+            path: root.join("f.txt"),
+            edits: vec![
+                FileEdit {
+                    search: "world".to_string(),
+                    replace: "\ntarget\n    indented_code".to_string(),
+                },
+                FileEdit {
+                    search: "  target\n  indented_code".to_string(),
+                    replace: "final_code".to_string(),
+                },
+            ],
+        };
+        let outcome = EditFile::execute(&input, &scope).await.unwrap();
+        assert_eq!(outcome.edits_applied, 2);
+        assert_eq!(outcome.fuzzy_matches, 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "hello \nfinal_code"
+        );
     }
 }

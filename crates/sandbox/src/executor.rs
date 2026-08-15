@@ -150,6 +150,9 @@ impl CapabilityReport {
     }
 }
 
+/// Maximum bytes written to a sandboxed command's stdin (1 MiB — adoption 08).
+pub const MAX_STDIN_BYTES: usize = 1024 * 1024;
+
 /// A command to run confined: a structured request, never an unparsed shell
 /// string.
 #[derive(Debug, Clone)]
@@ -164,6 +167,11 @@ pub struct SandboxCommand {
     /// Origin label the captured output is tagged with (e.g. `skill:rust.fix-ci`,
     /// `plugin:github`) so sanitized output enters context as labeled evidence.
     pub origin: String,
+    /// Bytes written to the child's stdin before it is closed, or `None` for
+    /// the existing null-stdin behaviour (adoption 08 — the hook payload
+    /// protocol). Bounded: larger than [`MAX_STDIN_BYTES`] is refused as
+    /// [`SandboxError::InvalidCommand`], never truncated.
+    pub stdin: Option<Vec<u8>>,
     /// True only when a trusted host runtime independently denies process
     /// creation (for example Node's stable `--permission` model without
     /// `--allow-child-process`). This lets Linux admit that specific runtime
@@ -250,8 +258,16 @@ impl SandboxCommand {
             args,
             cwd: cwd.into(),
             origin: origin.into(),
+            stdin: None,
             runtime_denies_subprocess: false,
         }
+    }
+
+    /// Attach an optional stdin payload to the command.
+    #[must_use]
+    pub fn with_stdin(mut self, stdin: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(stdin.into());
+        self
     }
 
     /// Construct the sealed Node worker form understood by the Linux executor.
@@ -292,6 +308,7 @@ impl SandboxCommand {
             args,
             cwd: cwd.into(),
             origin: origin.into(),
+            stdin: None,
             runtime_denies_subprocess: true,
         })
     }
@@ -695,6 +712,7 @@ const READ_CHUNK: usize = 8 * 1024;
 /// Spawn `argv`, capture (capped) output, enforce the wall-clock kill on the whole
 /// process group, and return the sanitized outcome. The environment is emptied and
 /// only `env_allowlist` vars present in the parent are re-added.
+#[allow(clippy::too_many_arguments)]
 fn spawn_capture_kill(
     argv: &[String],
     cwd: &Path,
@@ -703,9 +721,24 @@ fn spawn_capture_kill(
     output_cap_bytes: usize,
     origin: &str,
     backend: SandboxBackend,
+    stdin: Option<&[u8]>,
 ) -> Result<SandboxOutcome, SandboxError> {
     let Some((program, rest)) = argv.split_first() else {
         return Err(SandboxError::InvalidCommand("empty command".into()));
+    };
+
+    let (stdin_cfg, stdin_bytes) = match stdin {
+        Some(bytes) => {
+            if bytes.len() > MAX_STDIN_BYTES {
+                return Err(SandboxError::InvalidCommand(format!(
+                    "stdin payload is {} bytes, which exceeds the {} byte limit",
+                    bytes.len(),
+                    MAX_STDIN_BYTES
+                )));
+            }
+            (Stdio::piped(), Some(bytes.to_vec()))
+        }
+        None => (Stdio::null(), None),
     };
 
     let mut cmd = Command::new(program);
@@ -713,7 +746,7 @@ fn spawn_capture_kill(
         .current_dir(cwd)
         // Clean environment: nothing inherited except the allowlisted vars.
         .env_clear()
-        .stdin(Stdio::null())
+        .stdin(stdin_cfg)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for name in env_allowlist {
@@ -732,6 +765,17 @@ fn spawn_capture_kill(
     let started = Instant::now();
     let mut child = cmd.spawn().map_err(SandboxError::Spawn)?;
     let pid = child.id();
+
+    // If stdin bytes are provided, write them from a dedicated thread to prevent deadlocks
+    // and close stdin (by dropping the pipe) to signal EOF.
+    if let Some(bytes) = stdin_bytes {
+        if let Some(mut pipe) = child.stdin.take() {
+            thread::spawn(move || {
+                use std::io::Write as _;
+                let _ = pipe.write_all(&bytes);
+            });
+        }
+    }
 
     // Drain both pipes on their own threads so a chatty child never deadlocks on a
     // full pipe buffer, capping what is held in memory.
@@ -1020,6 +1064,7 @@ impl SandboxExecutor for MacosSandbox {
             output_cap_bytes(profile),
             &command.origin,
             SandboxBackend::Seatbelt,
+            command.stdin.as_deref(),
         )
     }
 
@@ -1188,6 +1233,7 @@ impl SandboxExecutor for LinuxSandbox {
             output_cap_bytes(profile),
             &command.origin,
             SandboxBackend::Bubblewrap,
+            command.stdin.as_deref(),
         )
     }
 
@@ -1502,12 +1548,87 @@ maximum_output_mb = 8
     }
 
     #[test]
+    fn stdin_payload_is_delivered_to_the_child() {
+        #[cfg(unix)]
+        {
+            let cat = if Path::new("/bin/cat").exists() {
+                "/bin/cat"
+            } else {
+                "/usr/bin/cat"
+            };
+            let payload = b"hello from stdin\n";
+            let outcome = spawn_capture_kill(
+                &[cat.to_string()],
+                Path::new("/tmp"),
+                &[],
+                Duration::from_secs(5),
+                1024 * 1024,
+                "test:stdin",
+                SandboxBackend::None,
+                Some(payload),
+            )
+            .expect("cat should succeed");
+            assert_eq!(outcome.exit_code, Some(0));
+            assert_eq!(outcome.stdout.text, "hello from stdin\n");
+        }
+    }
+
+    #[test]
+    fn child_that_ignores_stdin_does_not_error() {
+        #[cfg(unix)]
+        {
+            let echo = if Path::new("/bin/echo").exists() {
+                "/bin/echo"
+            } else {
+                "/usr/bin/echo"
+            };
+            let payload = vec![b'a'; 8192];
+            let outcome = spawn_capture_kill(
+                &[echo.to_string(), "done".to_string()],
+                Path::new("/tmp"),
+                &[],
+                Duration::from_secs(5),
+                1024 * 1024,
+                "test:stdin_ignore",
+                SandboxBackend::None,
+                Some(&payload),
+            )
+            .expect("echo should succeed even if stdin is ignored");
+            assert_eq!(outcome.exit_code, Some(0));
+            assert_eq!(outcome.stdout.text.trim(), "done");
+        }
+    }
+
+    #[test]
+    fn oversized_stdin_is_refused_not_truncated() {
+        let oversized = vec![0u8; MAX_STDIN_BYTES + 1];
+        let err = spawn_capture_kill(
+            &["/bin/cat".to_string()],
+            Path::new("/tmp"),
+            &[],
+            Duration::from_secs(5),
+            1024 * 1024,
+            "test:oversized",
+            SandboxBackend::None,
+            Some(&oversized),
+        )
+        .unwrap_err();
+        match err {
+            SandboxError::InvalidCommand(msg) => {
+                assert!(msg.contains("exceeds the"));
+                assert!(msg.contains("byte limit"));
+            }
+            other => panic!("expected InvalidCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn sandbox_command_is_structured() {
         let cmd = SandboxCommand::new("/bin/echo", vec!["hi".into()], "/tmp", "plugin:x");
         assert_eq!(cmd.program, Path::new("/bin/echo"));
         assert_eq!(cmd.args, ["hi"]);
         assert_eq!(cmd.origin, "plugin:x");
-        // A profile with no grants at all still derives (deny-everything).
+        assert!(cmd.stdin.is_none());
         let empty = CapabilitySet::from_spec(&CapabilitiesSpec::default());
         let m = parse_manifest(
             r#"

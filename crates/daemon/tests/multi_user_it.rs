@@ -913,3 +913,229 @@ async fn seed_owned_run_and_approval(
     .expect("seed approval");
     (run_id, approval_id)
 }
+
+/// Seed a session owned by `uid`.
+async fn seed_owned_session(pool: &SqlitePool, uid: u32, title: &str) -> SessionId {
+    let session_id = SessionId::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO sessions (id, title, state, created_at, updated_at, revision, owner_uid) \
+         VALUES (?, ?, 'open', ?, ?, 0, ?)",
+    )
+    .bind(session_id.to_string())
+    .bind(title)
+    .bind(&now)
+    .bind(&now)
+    .bind(i64::from(uid))
+    .execute(pool)
+    .await
+    .expect("seed owned session");
+    session_id
+}
+
+/// A `ListSessions` from this principal must never return another principal's
+/// session. The handler names no resource, so the ownership gate passes
+/// vacuously — the query itself has to carry the owner filter.
+#[tokio::test]
+async fn a_stranger_cannot_list_another_principals_sessions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let uid = our_uid(&tmp);
+    let foreign_uid = uid + 1;
+    let (paths, task, pool) = start_server(&tmp).await;
+
+    let (foreign_session, _, _) = seed_foreign_session(&pool, foreign_uid).await;
+    let own_session = seed_owned_session(&pool, uid, "my work").await;
+
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+    handshake(&mut stream, client_id).await;
+
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ListSessions {
+                    workspace: None,
+                    limit: None,
+                },
+                "list-sessions",
+            )),
+        ),
+    )
+    .await;
+
+    match reply.payload {
+        Payload::SessionList { sessions, .. } => {
+            let ids: Vec<SessionId> = sessions.iter().map(|s| s.session_id).collect();
+            assert!(
+                ids.contains(&own_session),
+                "this principal's own session must be listed"
+            );
+            assert!(
+                !ids.contains(&foreign_session),
+                "another principal's session must NOT be listed"
+            );
+        }
+        other => panic!("expected a SessionList, got {other:?}"),
+    }
+
+    task.abort();
+}
+
+/// `SearchWorkspaceFiles` walks a client-supplied absolute path. A path the
+/// caller has no owned session for must be refused rather than crawled.
+#[tokio::test]
+async fn a_search_outside_the_callers_scope_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (paths, task, _pool) = start_server(&tmp).await;
+
+    // This principal owns no session referencing any repository, so a walk of an
+    // arbitrary absolute path must be refused.
+    let outside = tmp.path().join("some-other-checkout");
+    std::fs::create_dir_all(&outside).expect("create outside dir");
+
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+    handshake(&mut stream, client_id).await;
+
+    let reply = send_recv(
+        &mut stream,
+        &Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::SearchWorkspaceFiles {
+                    repository: outside.to_string_lossy().into_owned(),
+                    query: "anything".to_string(),
+                    limit: None,
+                },
+                "search-outside",
+            )),
+        ),
+    )
+    .await;
+
+    match reply.payload {
+        Payload::CommandRejected(error) => {
+            assert_eq!(error.code, "workspace.repository-not-found");
+        }
+        Payload::FileSearchResults { matches, .. } => panic!(
+            "a search outside the caller's scope returned {} matches",
+            matches.len()
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    task.abort();
+}
+
+/// A duplicate `ForkSession` delivery (same idempotency key) must be idempotent:
+/// return the SAME forked session and create exactly one fork — not a second.
+#[tokio::test]
+async fn a_duplicate_fork_delivery_is_idempotent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let uid = our_uid(&tmp);
+    let (paths, task, pool) = start_server(&tmp).await;
+
+    let source = seed_owned_session(&pool, uid, "source").await;
+
+    // A run + its ordinal-1 launch checkpoint, and the RunStarted event the fork
+    // cuts at.
+    let run_id = RunId::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO runs (id, session_id, objective, state, mode, model_policy, budget_json) \
+         VALUES (?, ?, 'obj', 'Completed', 'Build', 'hosted-default', '{}')",
+    )
+    .bind(run_id.to_string())
+    .bind(source.to_string())
+    .execute(&pool)
+    .await
+    .expect("seed run");
+
+    sqlx::query(
+        "INSERT INTO events \
+         (session_id, sequence, occurred_at, actor, body, causation_id, correlation_id, schema_version) \
+         VALUES (?, 1, ?, ?, ?, NULL, NULL, 1)",
+    )
+    .bind(source.to_string())
+    .bind(&now)
+    .bind(serde_json::to_string(&codypendent_protocol::Actor::System).unwrap())
+    .bind(
+        serde_json::to_string(&EventBody::RunStarted {
+            run_id,
+            objective: "obj".to_string(),
+            mode: codypendent_protocol::AgentMode::Build,
+        })
+        .unwrap(),
+    )
+    .execute(&pool)
+    .await
+    .expect("seed RunStarted");
+
+    let checkpoint_id = codypendent_protocol::CheckpointId::new();
+    sqlx::query(
+        "INSERT INTO run_checkpoints \
+         (id, run_id, ordinal, kind, commit_sha, base_commit, worktree_path, repository_path, created_at) \
+         VALUES (?, ?, 1, 'commit', ?, ?, ?, ?, ?)",
+    )
+    .bind(checkpoint_id.to_string())
+    .bind(run_id.to_string())
+    .bind("c".repeat(40))
+    .bind("b".repeat(40))
+    .bind(tmp.path().join("wt").to_string_lossy().into_owned())
+    .bind(tmp.path().join("repo").to_string_lossy().into_owned())
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .expect("seed checkpoint");
+
+    let mut stream = connect(&paths).await;
+    let client_id = ClientId::new();
+    handshake(&mut stream, client_id).await;
+
+    let fork_cmd = |key: &str| {
+        Envelope::request(
+            client_id,
+            Payload::Command(command(
+                CommandBody::ForkSession {
+                    session_id: source,
+                    checkpoint: checkpoint_id,
+                    name: None,
+                },
+                key,
+            )),
+        )
+    };
+
+    // Two deliveries with the SAME idempotency key.
+    let first = send_recv(&mut stream, &fork_cmd("fork-once")).await;
+    let second = send_recv(&mut stream, &fork_cmd("fork-once")).await;
+
+    let fork_id_1 = match first.payload {
+        Payload::SessionForked { session_id, .. } => session_id,
+        other => panic!("first fork should succeed, got {other:?}"),
+    };
+    let fork_id_2 = match second.payload {
+        Payload::SessionForked { session_id, .. } => session_id,
+        other => panic!("duplicate fork should replay, got {other:?}"),
+    };
+    assert_eq!(
+        fork_id_1, fork_id_2,
+        "a duplicate delivery must return the same forked session"
+    );
+
+    // Exactly one fork exists off the source — the duplicate did not fork again.
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM sessions WHERE forked_from_session_id = ?")
+            .bind(source.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("count forks");
+    assert_eq!(
+        count, 1,
+        "a duplicate delivery must not create a second fork"
+    );
+
+    task.abort();
+}

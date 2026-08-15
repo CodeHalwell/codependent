@@ -248,7 +248,7 @@ impl Shell {
 /// startup files and `CDPATH`, and `PATH` (which redirects the child's own
 /// subprocess lookups even though the top-level program is resolved on the
 /// daemon's PATH).
-fn is_denied_env(name: &str) -> bool {
+pub(crate) fn is_denied_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(
         upper.as_str(),
@@ -444,7 +444,7 @@ impl Drop for ProcessGroupGuard {
 /// Resolve `program` to an absolute path, searching the daemon PATH for a bare
 /// name. Returns `None` when nothing matches. Async so the executable-bit checks
 /// never block the runtime thread.
-async fn resolve_program(program: &Path, cwd: &Path) -> Option<PathBuf> {
+pub(crate) async fn resolve_program(program: &Path, cwd: &Path) -> Option<PathBuf> {
     if program.is_absolute() {
         return is_executable(program).await.then(|| program.to_path_buf());
     }

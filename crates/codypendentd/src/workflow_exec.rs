@@ -492,6 +492,8 @@ pub(crate) fn build_workflow_host(
     workflows: WorkflowHub,
     cancellations: WorkflowRunCancellations,
     routing: RoutingCoordinator,
+    unified_exec: Arc<codypendent_daemon::unified_exec::UnifiedExecManager>,
+    lsp: Option<Arc<codypendent_knowledge::LspManager>>,
 ) -> WorkflowConductorHost<AgentLoopNodeExecutor> {
     let factory: Arc<dyn NodeModelDriverFactory> = Arc::new(ConfiguredModelDriverFactory {
         paths: paths.clone(),
@@ -515,6 +517,8 @@ pub(crate) fn build_workflow_host(
         // The node executor shares the cancellation registry the host's cancel seam
         // fires (T9), so a `CancelWorkflow` interrupts the in-flight node's agent run.
         cancellations.clone(),
+        unified_exec,
+        lsp,
     );
     let host = match drive_locks {
         Some(drive_locks) => {
@@ -720,6 +724,8 @@ pub struct AgentLoopNodeExecutor {
     /// resulting token, so a `CancelWorkflow` interrupts it. Shared with the
     /// [`WorkflowConductorHost`] whose cancel seam fires the handles.
     cancellations: WorkflowRunCancellations,
+    unified_exec: Arc<codypendent_daemon::unified_exec::UnifiedExecManager>,
+    lsp: Option<Arc<codypendent_knowledge::LspManager>>,
 }
 
 impl AgentLoopNodeExecutor {
@@ -736,6 +742,8 @@ impl AgentLoopNodeExecutor {
         startup_repository: PathBuf,
         blackboards: BlackboardHub,
         cancellations: WorkflowRunCancellations,
+        unified_exec: Arc<codypendent_daemon::unified_exec::UnifiedExecManager>,
+        lsp: Option<Arc<codypendent_knowledge::LspManager>>,
     ) -> Self {
         Self {
             pool,
@@ -750,6 +758,8 @@ impl AgentLoopNodeExecutor {
             blackboards,
             tool_runner: Arc::new(ShellRepositoryTestRunner),
             cancellations,
+            unified_exec,
+            lsp,
         }
     }
 
@@ -989,6 +999,7 @@ impl AgentLoopNodeExecutor {
             self.pool.clone(),
             artifact_store(&self.paths),
             manager,
+            self.unified_exec.clone(),
             binding,
         );
         let started = Instant::now();
@@ -1295,6 +1306,9 @@ impl AgentLoopNodeExecutor {
                 self.blackboards.clone(),
             )))
             .with_councils(Arc::new(FileCouncilService::new(self.paths.clone())));
+        if let Some(lsp) = &self.lsp {
+            runtime = runtime.with_lsp(lsp.clone());
+        }
         // The agent operates ENTIRELY within `worktree`: the policy read/search
         // root (`$REPOSITORY`) and the write root (`$WORKTREE`) are BOTH the
         // worktree, so a write and its read-back hit the same tree (read-your-
@@ -1684,6 +1698,7 @@ impl AgentLoopNodeExecutor {
             self.pool.clone(),
             artifact_store(&self.paths),
             manager,
+            self.unified_exec.clone(),
             binding,
         );
 
@@ -1888,6 +1903,7 @@ impl AgentLoopNodeExecutor {
             self.pool.clone(),
             artifact_store(&self.paths),
             manager,
+            self.unified_exec.clone(),
             binding,
         );
 
@@ -2224,6 +2240,7 @@ impl AgentLoopNodeExecutor {
                 &self.pool,
                 session_id,
                 run_id,
+                None,
                 action,
                 risk,
                 capabilities,
@@ -3081,6 +3098,8 @@ steps:
             startup_repository.to_path_buf(),
             BlackboardHub::new(),
             cancellations,
+            Arc::new(codypendent_daemon::unified_exec::UnifiedExecManager::new()),
+            None,
         )
     }
 
@@ -4438,6 +4457,8 @@ steps:
             startup_repository.to_path_buf(),
             BlackboardHub::new(),
             WorkflowRunCancellations::default(),
+            Arc::new(codypendent_daemon::unified_exec::UnifiedExecManager::new()),
+            None,
         )
         .with_test_runner(runner)
     }
@@ -5052,6 +5073,8 @@ steps:
             repo.to_path_buf(),
             BlackboardHub::new(),
             cancellations.clone(),
+            Arc::new(codypendent_daemon::unified_exec::UnifiedExecManager::new()),
+            None,
         )
         .with_test_runner(ScriptedRepositoryTestRunner::new(vec![true]));
         let host = WorkflowConductorHost::new(pool.clone(), Arc::new(executor))

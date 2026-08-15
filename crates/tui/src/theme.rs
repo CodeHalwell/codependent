@@ -7,6 +7,8 @@
 //! `Theme` shape (`surface / text / status / syntax / diff / agent`), extended
 //! here with explicit `focus` and `selection` groups the layout needs.
 
+#![allow(clippy::disallowed_methods)]
+
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 
@@ -556,6 +558,102 @@ impl Theme {
         }
     }
 
+    /// Relative luminance > 0.5 according to ITU-R BT.709 (Adoption 11 M4).
+    #[must_use]
+    pub fn is_light(bg: (u8, u8, u8)) -> bool {
+        let r = bg.0 as f32 / 255.0;
+        let g = bg.1 as f32 / 255.0;
+        let b = bg.2 as f32 / 255.0;
+        (0.2126 * r + 0.7152 * g + 0.0722 * b) > 0.5
+    }
+
+    /// opencode-style synthesized theme. `surface.background` is
+    /// `Color::Reset` (terminal transparency preserved); panel/overlay/user
+    /// are gray-ramp blends off the REAL background; status/diff/syntax
+    /// draw from the user's own ANSI palette; text from real fg (Adoption 11 M4).
+    #[must_use]
+    pub fn system(palette: &TerminalPalette) -> Self {
+        let is_light = Self::is_light(palette.background);
+        let blend = |t: f32| -> (u8, u8, u8) {
+            let (br, bg, bb) = palette.background;
+            let (fr, fg, fb) = palette.foreground;
+            (
+                (br as f32 + (fr as f32 - br as f32) * t).round() as u8,
+                (bg as f32 + (fg as f32 - bg as f32) * t).round() as u8,
+                (bb as f32 + (fb as f32 - bb as f32) * t).round() as u8,
+            )
+        };
+        let to_rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb(r, g, b);
+
+        let step1 = to_rgb(blend(0.05));
+        let step2 = to_rgb(blend(0.10));
+        let step3 = to_rgb(blend(0.18));
+        let muted = to_rgb(blend(0.45));
+        let secondary = to_rgb(blend(0.70));
+        let primary = to_rgb(palette.foreground);
+
+        let ansi_red = to_rgb(palette.ansi[1]);
+        let ansi_green = to_rgb(palette.ansi[2]);
+        let ansi_yellow = to_rgb(palette.ansi[3]);
+        let ansi_blue = to_rgb(palette.ansi[4]);
+        let ansi_magenta = to_rgb(palette.ansi[5]);
+        let ansi_cyan = to_rgb(palette.ansi[6]);
+
+        Self {
+            surface: SurfaceTokens {
+                background: Color::Reset,
+                panel: step1,
+                border: step3,
+                overlay: step2,
+                user: step2,
+            },
+            text: TextTokens {
+                primary,
+                secondary,
+                muted,
+                heading: if is_light { primary } else { ansi_cyan },
+            },
+            status: StatusTokens {
+                info: ansi_cyan,
+                success: ansi_green,
+                warning: ansi_yellow,
+                error: ansi_red,
+                running: ansi_cyan,
+                idle: muted,
+            },
+            syntax: SyntaxTokens {
+                keyword: ansi_magenta,
+                literal: ansi_yellow,
+                string: ansi_green,
+                comment: muted,
+                r#type: ansi_cyan,
+                function: ansi_blue,
+                operator: muted,
+                constant: ansi_yellow,
+                punctuation: muted,
+            },
+            diff: DiffTokens {
+                added: ansi_green,
+                removed: ansi_red,
+                context: secondary,
+                header: ansi_cyan,
+            },
+            agent: AgentTokens {
+                model_text: primary,
+                tool: ansi_cyan,
+                thinking: muted,
+            },
+            focus: FocusTokens {
+                active: ansi_cyan,
+                inactive: step3,
+            },
+            selection: SelectionTokens {
+                foreground: primary,
+                background: step3,
+            },
+        }
+    }
+
     /// Pick the best theme for a terminal's detected [`ColorDepth`] and the user's
     /// [`ThemePreferences`]. A manual override always wins (STEP 6.6: "capability
     /// detection picks the best variant with manual override"); otherwise
@@ -574,10 +672,13 @@ impl Theme {
         if prefs.high_contrast {
             return Self::high_contrast();
         }
+        if prefs.color_blind_safe {
+            return Self::color_blind_safe();
+        }
         match depth {
             ColorDepth::TrueColor => {
-                if prefs.color_blind_safe {
-                    Self::color_blind_safe()
+                if let Some(ref palette) = prefs.system_palette {
+                    Self::system(palette)
                 } else if prefs.prefer_light {
                     Self::light()
                 } else {
@@ -708,6 +809,14 @@ pub enum ThemeVariant {
     Monochrome,
 }
 
+/// The terminal's own colors, queried by the harness before the event loop (Adoption 11 M4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalPalette {
+    pub background: (u8, u8, u8),
+    pub foreground: (u8, u8, u8),
+    pub ansi: [(u8, u8, u8); 16],
+}
+
 /// User theme preferences layered over terminal detection. A manual
 /// `override_variant` wins outright; otherwise accessibility flags steer the
 /// choice within what the terminal can render.
@@ -721,6 +830,40 @@ pub struct ThemePreferences {
     pub prefer_light: bool,
     /// An explicit manual override — always honored.
     pub override_variant: Option<ThemeVariant>,
+    /// Terminal palette queried at startup (synthesizes system theme when TrueColor).
+    pub system_palette: Option<TerminalPalette>,
+}
+
+/// Parse an OSC 10/11/4 color response formatted like `rgb:RRRR/GGGG/BBBB` or `rgb:RR/GG/BB` (Adoption 11 M4).
+#[must_use]
+pub fn parse_osc_color_response(response: &str) -> Option<(u8, u8, u8)> {
+    let rgb_pos = response.find("rgb:")?;
+    let payload = &response[rgb_pos + 4..];
+    let payload = payload.trim_end_matches(['\x07', '\x1b', '\\']);
+    let parts: Vec<&str> = payload.split('/').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let parse_hex = |s: &str| -> Option<u8> {
+        let clean = s.trim();
+        if clean.len() == 4 {
+            let val = u16::from_str_radix(clean, 16).ok()?;
+            Some((val >> 8) as u8)
+        } else if clean.len() == 2 {
+            u8::from_str_radix(clean, 16).ok()
+        } else if clean.len() == 1 {
+            let val = u8::from_str_radix(clean, 16).ok()?;
+            Some(val * 17)
+        } else {
+            None
+        }
+    };
+
+    let r = parse_hex(parts[0])?;
+    let g = parse_hex(parts[1])?;
+    let b = parse_hex(parts[2])?;
+    Some((r, g, b))
 }
 
 #[cfg(test)]
@@ -1112,5 +1255,30 @@ mod tests {
         // Override beats both the high-contrast pref and the true-color depth.
         assert_eq!(Theme::select(ColorDepth::TrueColor, prefs), Theme::light());
         assert_eq!(Theme::select(ColorDepth::Monochrome, prefs), Theme::light());
+    }
+
+    #[test]
+    fn parses_osc_color_responses() {
+        assert_eq!(
+            parse_osc_color_response("\x1b]11;rgb:ffff/0000/8888\x07"),
+            Some((255, 0, 136))
+        );
+        assert_eq!(
+            parse_osc_color_response("\x1b]10;rgb:12/34/56\x1b\\"),
+            Some((0x12, 0x34, 0x56))
+        );
+        assert_eq!(parse_osc_color_response("invalid"), None);
+    }
+
+    #[test]
+    fn synthesizes_system_theme() {
+        let palette = TerminalPalette {
+            background: (20, 20, 20),
+            foreground: (230, 230, 230),
+            ansi: [(0, 0, 0); 16],
+        };
+        assert!(!Theme::is_light(palette.background));
+        let system_theme = Theme::system(&palette);
+        assert_eq!(system_theme.surface.background, Color::Reset);
     }
 }

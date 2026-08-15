@@ -112,8 +112,8 @@ maintained subset.
 > `claude/roadmap-completion-w20`, PR #19): 19 tasks + the two–project-review defect
 > backlog, each implemented → independently reviewed → fixed → re-verified, closed by
 > a multi-agent whole-branch review. Hygiene is green throughout (fmt, clippy
-> `-D warnings`, `cargo test --workspace` = **≈2926 tests as of 2026-08-14**
-<!-- doc-count:test sources="crates" expect=2926 label="workspace total" -->
+> `-D warnings`, `cargo test --workspace` = **≈3133 tests as of 2026-08-15**
+<!-- doc-count:test sources="crates" expect=3133 label="workspace total" -->
 > (a `#[test]`/`#[tokio::test]` count over every `crates/**/*.rs` file at HEAD —
 > a live `cargo test --workspace` run is the authoritative source but is not
 > safe to run in every environment this doc is read in; re-derive with
@@ -215,8 +215,8 @@ New `codypendent-integrations` crate; protocol `ide` module + `ProposedAction::G
 - [x] **3.2** GitHub in the agent loop + `/fix-ci` — five `github.*` tools wired into the runtime (get PR, list check-runs as network reads; create-draft-PR, update-PR, check-run-summary as approval-gated `GitHubMutation`s), the client injected from the personal-mode token at daemon startup, the policy admitting `api.github.com:443` only when configured, `/fix-ci` registered as a built-in `Command` (in the Skill Studio) with a hard-coded objective template. End-to-end tested: the /fix-ci sequence (read check → test → update PR → post summary) with each write parking for a durable approval before it happens; rejected/denied writes never call GitHub. *(The declarative workflow engine that replaces the prompt-encoded sequence is Phase 5.)*
 - [x] **3.3** Webhook ingestion — `X-Hub-Signature-256` HMAC verify **before** parse; normalize → internal events; `X-GitHub-Delivery` GUID replay dedup (migration `0005`); optional loopback listener wired into `codypendentd` (default off); policy-off ⇒ no workflow trigger
 - [x] **3.4** IDE bridge + source-provenance live-path — protocol `IdeContextUpdate`/`DirtyBufferDigest`/edit-request types + `SourceProvenance`; `UpdateIdeContext` command stored as a projection (migration `0006`); the run read path labels an excerpt whose disk bytes diverge from an unsaved editor buffer `unsaved-ide-buffer` in the trace; `IdeBridge` trait; deterministic debounce
-- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery mirroring the Rust protocol, a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 217 vitest tests
-<!-- doc-count:vitest project="extensions/vscode" metric="tests" expect=217 label="VS Code vitest suite" -->
+- [x] **3.5** VS Code / Cursor extension — `extensions/vscode/` (TypeScript, esbuild): frame codec + discovery mirroring the Rust protocol, a `DaemonClient` attaching as `Approver` with reconnect-resume, a side-panel webview, approval notifications → `ResolveApproval`, debounced `IdeContextUpdate` push, `vscode.diff`; 219 vitest tests
+<!-- doc-count:vitest project="extensions/vscode" metric="tests" expect=219 label="VS Code vitest suite" -->
       across 8 files
 <!-- doc-count:vitest project="extensions/vscode" metric="files" expect=8 label="VS Code vitest files" -->
       (re-derived from a real `npm test` run in the `extension` CI job — needs `sdk/ui` built first, which `npm install` now does) + typecheck + lint green; Cursor compat note
@@ -462,8 +462,8 @@ live client-capture paths (voice/clipboard) are the remaining wiring.
       install-disabled → smoke-test → enable → update → revoke lifecycle as a
       guarded state machine carrying each plugin's trust record; and neutralizes
       untrusted plugin/MCP output (origin label, size cap, control-sequence strip)
-      before it enters context. 159 unit tests (measured 2026-08-14 over `crates/sandbox/src`, `#[test]`/`#[tokio::test]`; plus 19 more in `crates/sandbox/tests/`). **Surfaced to users** via
-<!-- doc-count:test sources="crates/sandbox/src" expect=159 label="sandbox unit tests" -->
+      before it enters context. 162 unit tests (measured 2026-08-15 over `crates/sandbox/src`, `#[test]`/`#[tokio::test]`; plus 19 more in `crates/sandbox/tests/`). **Surfaced to users** via
+<!-- doc-count:test sources="crates/sandbox/src" expect=162 label="sandbox unit tests" -->
       <!-- doc-count:test sources="crates/sandbox/tests" expect=19 label="sandbox integration tests" -->
       `codypendent plugin inspect <file>` (renders identity + the requested
       capability list + resource caps + trust posture — the "evaluate permissions"
@@ -488,8 +488,8 @@ live client-capture paths (voice/clipboard) are the remaining wiring.
       `Theme::select(depth, prefs)` with a manual override always winning; and a
       **data-only** theme-pack loader that structurally rejects any pack declaring
       capabilities/permissions (README: theme plugins get no execution
-      permissions). 23 tests (legibility invariants per variant; measured 2026-08-13: `crates/tui/src/theme.rs` 13 + `theme_pack.rs` 10).
-<!-- doc-count:test sources="crates/tui/src/theme.rs,crates/tui/src/theme_pack.rs" expect=23 label="theme tests" -->
+      permissions). 25 tests (legibility invariants per variant; measured 2026-08-15: `crates/tui/src/theme.rs` 15 + `theme_pack.rs` 10).
+<!-- doc-count:test sources="crates/tui/src/theme.rs,crates/tui/src/theme_pack.rs" expect=25 label="theme tests" -->
 - [ ] **6.2/6.3/6.4 (enforcement + WASM + executable hooks)** — the native OS
       sandbox (bubblewrap+seccomp / sandbox-exec / AppContainer), the `wasmtime`
       component runtime + WASM SDK, the brokered-secrets host, and executing hooks
@@ -598,8 +598,8 @@ alongside this work.)
       runs; a pending approval owns the input until resolved. **`F2` (or the
       palette) toggles to a workspace layout** — Runs │ conversation │ approvals
       panes for at-a-glance state — sharing the same composer, footer, and input
-      model, so the panes are context, not a separate mode. Pure-reducer; 600 TUI
-<!-- doc-count:test sources="crates/tui/src" expect=600 label="TUI shell tests" -->
+      model, so the panes are context, not a separate mode. Pure-reducer; 625 TUI
+<!-- doc-count:test sources="crates/tui/src" expect=625 label="TUI shell tests" -->
       tests green (whole-crate count, measured 2026-08-14 — grows with every outcome the TUI vertical adds; re-derive rather than trust a fixed number here).
 - [x] **Command palette** (`/`) — one searchable surface for every command, the
       command hub now that typing composes a message rather than firing single-key

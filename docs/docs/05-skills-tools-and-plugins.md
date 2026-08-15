@@ -246,3 +246,13 @@ Custom commands are named entry points into prompts, workflows or deterministic 
 Development-mode packages may hot reload non-privileged metadata, prompts and themes. Executable code, signatures or permission changes require controlled restart and renewed review.
 
 Compatibility importers normalize `AGENTS.md`, `CLAUDE.md`, selected editor rules and Agent Skills while preserving source path, scope and precedence.
+
+## Remote UI Authoring SDK (TSX -> UiDocument)
+
+Plugin authors can write Remote UI extensions using TSX components, hooks, and composition via `@codypendent/ui`. The SDK compiles components into the deterministic `UiDocument` protocol (`codypendent_protocol::remote_ui::UiDocument`), which executes in a sandboxed UI worker process.
+
+### Boundary Principle
+
+> **TypeScript components describe semantic terminal UI; Rust decides exactly how that UI is laid out, styled, focused, and rendered.**
+
+- See [Adoption 13 Specification](./adoptions/13-remote-ui-authoring-sdk.md) for full architectural guidelines, event flow, and gotchas.

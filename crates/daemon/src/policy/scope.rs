@@ -55,6 +55,9 @@ pub enum Capability {
     /// workflow host enforce the concrete manifest/repository boundaries while
     /// this grant records the fresh human approval.
     WorkflowManage,
+    /// Restore a run's worktree to a recorded filesystem checkpoint (Adoption 04).
+    /// Marker capability: always requires explicit single-use approval.
+    RestoreCheckpoint,
 }
 
 /// The verdict of checking a single path against a [`PathScope`].

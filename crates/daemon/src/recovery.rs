@@ -32,7 +32,7 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use codypendent_protocol::discovery::RuntimePaths;
 use codypendent_protocol::{
-    Actor, ApprovalId, DataClassification, EventBody, RunDisposition, RunId, RunState,
+    Actor, ApprovalId, DataClassification, EventBody, QuestionId, RunDisposition, RunId, RunState,
     SessionEvent, SessionId,
 };
 use serde::Serialize;
@@ -43,6 +43,7 @@ use crate::approvals::ApprovalBroker;
 use crate::artifacts::{ArtifactStore, Provenance};
 use crate::commands::CommandProcessor;
 use crate::projections::{self, run_state_from_db};
+use crate::questions::QuestionBroker;
 use crate::subscriptions::SubscriptionHub;
 use crate::worktrees::WorktreeManager;
 
@@ -65,6 +66,8 @@ pub struct RecoveryReport {
     /// Pending approvals expired because their run is terminal (they could
     /// never be consumed; recovery resolves them as rejected).
     pub expired_approvals: Vec<ApprovalId>,
+    /// Pending questions expired because their run is terminal.
+    pub expired_questions: Vec<QuestionId>,
 }
 
 /// Whether a run state is *live* — in flight when the daemon stopped, and so a
@@ -104,7 +107,11 @@ pub async fn recover_on_startup(
 
     // 3. Reconcile in-flight pending effects (a fresh, throwaway processor: the
     //    real one is built in `server::run`; recovery only needs the sweep).
-    let processor = CommandProcessor::new(SubscriptionHub::new(), ApprovalBroker::new());
+    let processor = CommandProcessor::new(
+        SubscriptionHub::new(),
+        ApprovalBroker::new(),
+        QuestionBroker::new(),
+    );
     let reconciled_effects = processor.reconcile_pending_effects(pool).await?;
 
     // 4. Cleanly fail every live run (no mid-node checkpoint exists in Phase 1).
@@ -120,12 +127,18 @@ pub async fn recover_on_startup(
         .expire_orphaned(pool, Utc::now())
         .await?;
 
+    // 6. Expire pending questions whose run is now terminal.
+    let expired_questions = QuestionBroker::new()
+        .expire_orphaned(pool, Utc::now())
+        .await?;
+
     Ok(RecoveryReport {
         swept_tmp,
         orphaned_leases,
         reconciled_effects,
         failed_runs,
         expired_approvals,
+        expired_questions,
     })
 }
 

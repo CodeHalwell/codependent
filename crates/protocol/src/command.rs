@@ -13,11 +13,13 @@ use crate::document::{DocumentEditLease, DocumentMutation, PublishTarget};
 use crate::handshake::{ClientRole, Subscription};
 use crate::ide::IdeContextUpdate;
 use crate::ids::{
-    ApprovalId, CommandId, DocumentId, MemoryId, ModelId, RunId, SessionId, WorkspaceId,
+    ApprovalId, CheckpointId, CommandId, DocumentId, MemoryId, ModelId, PromptId, QuestionId,
+    RunId, SessionId, WorkspaceId,
 };
 use crate::input::InputEnvelope;
 use crate::memory::MemoryScopeTier;
-use crate::run::{AgentMode, ApprovalDecision, ApprovalScope};
+use crate::question::QuestionOutcome;
+use crate::run::{AgentMode, ApprovalDecision, ApprovalScope, PromptDelivery};
 
 /// An idempotent, optionally revision-guarded request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,6 +99,22 @@ pub enum CommandBody {
     /// all signed Remote UI records from that publisher, and stop their workers.
     RemoveTrustedUiPublisher {
         publisher_id: String,
+    },
+    /// List sessions the daemon knows, newest-updated first (Adoption 11 S1).
+    ListSessions {
+        /// Restrict to one workspace; `None` lists all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<WorkspaceId>,
+        /// Hard cap on returned rows (the daemon also caps at 200).
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    /// Search workspace file paths with fuzzy matching (Adoption 11 M2).
+    SearchWorkspaceFiles {
+        repository: String,
+        query: String,
+        #[serde(default)]
+        limit: Option<u32>,
     },
     CreateSession {
         workspace: WorkspaceId,
@@ -184,6 +202,12 @@ pub enum CommandBody {
         approval_id: ApprovalId,
         decision: ApprovalDecision,
         scope: ApprovalScope,
+    },
+    /// Resolve a parked question (adoption 03). Mirrors `ResolveApproval`:
+    /// session-scoped, idempotent, revision-guarded.
+    ResolveQuestion {
+        question_id: QuestionId,
+        outcome: QuestionOutcome,
     },
     CancelRun {
         run_id: RunId,
@@ -731,6 +755,73 @@ pub enum CommandBody {
         #[serde(default)]
         query: crate::codegraph::CodeGraphQuery,
     },
+    /// Restore a run's operating worktree to a recorded filesystem checkpoint
+    /// (Adoption 04). Controller-only and **approval-gated**: the daemon parks
+    /// a `ProposedAction::RestoreCheckpoint` approval and touches nothing
+    /// until a human approves it; the restore itself is transactional (the
+    /// current state is captured behind a private ref first and re-applied on
+    /// any failure). Refused `checkpoint.run-active` while the run is live,
+    /// `checkpoint.not-found` for an unknown id, and
+    /// `checkpoint.worktree-missing` when the recorded worktree no longer
+    /// exists on disk.
+    RestoreCheckpoint {
+        run_id: RunId,
+        checkpoint: CheckpointId,
+    },
+    /// Fork a session at a recorded run-launch checkpoint (Phase 5 STEP 5.6,
+    /// `ForkSession{checkpoint}` from Chapter 03; Adoption 05). The daemon
+    /// copies the session's ledger up to (excluding) the checkpointed run —
+    /// remapping run ids into a fresh id space — into a NEW session that
+    /// records its fork origin, and replies
+    /// [`SessionForked`](crate::envelope::Payload::SessionForked). The source
+    /// session is never modified. Runs launched in the fork carve their
+    /// worktrees from the checkpointed filesystem state, so the two branches
+    /// are isolated while sharing all immutable pre-fork artifacts.
+    /// Controller-only. `checkpoint` must be an ordinal-1 (run-launch)
+    /// checkpoint of a run in `session_id`; a mid-run steering checkpoint is
+    /// rejected `fork.mid-run-checkpoint`, an absent or foreign checkpoint
+    /// `checkpoint.not-found` (identically — no oracle).
+    ForkSession {
+        session_id: SessionId,
+        checkpoint: CheckpointId,
+        /// The fork's title; absent derives `"<source title> (fork)"` with an
+        /// opencode-style `#N` auto-increment on collision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// Queue a prompt on the session's server-side pending queue
+    /// (Adoption 06). `delivery: Steer` targets the live run's next safe
+    /// point; `Queue` waits for the session to go idle. Re-queuing text that
+    /// is already queued updates the existing entry instead of duplicating
+    /// it. Controller-only; blank text rejected `prompt-queue.empty`.
+    QueuePrompt {
+        session_id: SessionId,
+        text: String,
+        mode: AgentMode,
+        delivery: PromptDelivery,
+    },
+    /// Edit a queued prompt in place (Tab-edit in the queue UI). Absent
+    /// fields keep their values; an emptied `text` is rejected
+    /// `prompt-queue.empty`; an unknown id `prompt-queue.not-found`.
+    UpdateQueuedPrompt {
+        session_id: SessionId,
+        prompt_id: PromptId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery: Option<PromptDelivery>,
+    },
+    /// Promote a queued prompt to steer: delivery becomes `Steer` and the
+    /// entry moves to the front (Enter on a selected queue row).
+    PromoteQueuedPrompt {
+        session_id: SessionId,
+        prompt_id: PromptId,
+    },
+    /// Remove a queued prompt without running it.
+    DeleteQueuedPrompt {
+        session_id: SessionId,
+        prompt_id: PromptId,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -742,6 +833,7 @@ pub enum NamedResource<'a> {
     Session(SessionId),
     Run(RunId),
     Approval(ApprovalId),
+    Question(QuestionId),
     Document(DocumentId),
     /// A document edit lease. A lease owns nothing itself: it is authorized
     /// through the document it is held over.
@@ -824,7 +916,9 @@ impl CommandBody {
             // inside its attach handler with the same ownership check and the
             // same `protocol.session-not-found` answer.
             Self::AttachSession { .. } => Vec::new(),
-            Self::CreateSession { .. }
+            Self::ListSessions { .. }
+            | Self::SearchWorkspaceFiles { .. }
+            | Self::CreateSession { .. }
             | Self::CreateDocument { .. }
             | Self::StartWorkflow { .. }
             | Self::PutArtifact { .. }
@@ -832,7 +926,12 @@ impl CommandBody {
             Self::StartRun { session_id, .. }
             | Self::SubmitUserInput { session_id, .. }
             | Self::UpdateIdeContext { session_id, .. }
-            | Self::ReadSessionEvents { session_id, .. } => {
+            | Self::ReadSessionEvents { session_id, .. }
+            | Self::ForkSession { session_id, .. }
+            | Self::QueuePrompt { session_id, .. }
+            | Self::UpdateQueuedPrompt { session_id, .. }
+            | Self::PromoteQueuedPrompt { session_id, .. }
+            | Self::DeleteQueuedPrompt { session_id, .. } => {
                 vec![NamedResource::Session(*session_id)]
             }
             // The staleness sweep appends a note to whatever session it is
@@ -843,9 +942,13 @@ impl CommandBody {
             Self::CancelRun { run_id }
             | Self::PauseRun { run_id }
             | Self::ResumeRun { run_id }
-            | Self::QueueSteering { run_id, .. } => vec![NamedResource::Run(*run_id)],
+            | Self::QueueSteering { run_id, .. }
+            | Self::RestoreCheckpoint { run_id, .. } => vec![NamedResource::Run(*run_id)],
             Self::ResolveApproval { approval_id, .. } => {
                 vec![NamedResource::Approval(*approval_id)]
+            }
+            Self::ResolveQuestion { question_id, .. } => {
+                vec![NamedResource::Question(*question_id)]
             }
             Self::MutateDocument { document_id, .. }
             | Self::PublishDocument { document_id, .. } => {
@@ -971,6 +1074,26 @@ pub struct CanaryMetrics {
     pub baseline_error_rate_bps: u16,
     pub p95_latency_ms: u64,
     pub baseline_p95_latency_ms: u64,
+}
+
+/// Summary of a session for picker / listing (Adoption 11 S1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session_id: SessionId,
+    pub workspace_id: Option<WorkspaceId>,
+    pub title: String,
+    /// 'open' | 'closed' — the sessions.state column.
+    pub state: String,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Wire match item for workspace file fuzzy search (Adoption 11 M2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMatchWire {
+    pub path: String,
+    pub indices: Vec<u32>,
+    pub score: u32,
 }
 
 #[cfg(test)]
@@ -1216,6 +1339,12 @@ mod tests {
             approval_id: ApprovalId::new(),
             decision: ApprovalDecision::Approve,
             scope: ApprovalScope::Run,
+        });
+        round_trip(CommandBody::ResolveQuestion {
+            question_id: QuestionId::new(),
+            outcome: QuestionOutcome::Answered {
+                answers: vec![vec!["SQLite (Recommended)".to_string()]],
+            },
         });
         round_trip(CommandBody::CancelRun {
             run_id: RunId::new(),
@@ -1602,5 +1731,103 @@ mod tests {
         )
         .expect("unknown tag must parse, not error");
         assert!(matches!(parsed, CommandBody::Unknown));
+    }
+
+    #[test]
+    fn restore_checkpoint_round_trip() {
+        let run_id = RunId::new();
+        let checkpoint = CheckpointId::new();
+        let body = CommandBody::RestoreCheckpoint { run_id, checkpoint };
+        let json = serde_json::to_string(&body).expect("serialize");
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body);
+        assert_eq!(body.named_resources(), vec![NamedResource::Run(run_id)]);
+    }
+
+    #[test]
+    fn fork_session_round_trip() {
+        let session_id = SessionId::new();
+        let checkpoint = CheckpointId::new();
+        let body_no_name = CommandBody::ForkSession {
+            session_id,
+            checkpoint,
+            name: None,
+        };
+        let json = serde_json::to_string(&body_no_name).expect("serialize");
+        assert!(!json.contains("name"));
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body_no_name);
+        assert_eq!(
+            body_no_name.named_resources(),
+            vec![NamedResource::Session(session_id)]
+        );
+
+        let body_with_name = CommandBody::ForkSession {
+            session_id,
+            checkpoint,
+            name: Some("my fork".to_string()),
+        };
+        let json = serde_json::to_string(&body_with_name).expect("serialize");
+        assert!(json.contains("my fork"));
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, body_with_name);
+    }
+
+    #[test]
+    fn prompt_queue_commands_round_trip() {
+        let session_id = SessionId::new();
+        let prompt_id = PromptId::new();
+
+        let queue_cmd = CommandBody::QueuePrompt {
+            session_id,
+            text: "also add tests".to_string(),
+            mode: AgentMode::Build,
+            delivery: PromptDelivery::Queue,
+        };
+        let json = serde_json::to_string(&queue_cmd).expect("serialize");
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, queue_cmd);
+        assert_eq!(
+            queue_cmd.named_resources(),
+            vec![NamedResource::Session(session_id)]
+        );
+
+        let update_cmd = CommandBody::UpdateQueuedPrompt {
+            session_id,
+            prompt_id,
+            text: Some("updated prompt".to_string()),
+            delivery: Some(PromptDelivery::Steer),
+        };
+        let json = serde_json::to_string(&update_cmd).expect("serialize");
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, update_cmd);
+
+        let update_cmd_none = CommandBody::UpdateQueuedPrompt {
+            session_id,
+            prompt_id,
+            text: None,
+            delivery: None,
+        };
+        let json_none = serde_json::to_string(&update_cmd_none).expect("serialize");
+        assert!(!json_none.contains("text"));
+        assert!(!json_none.contains("delivery"));
+        let parsed_none: CommandBody = serde_json::from_str(&json_none).expect("deserialize");
+        assert_eq!(parsed_none, update_cmd_none);
+
+        let promote_cmd = CommandBody::PromoteQueuedPrompt {
+            session_id,
+            prompt_id,
+        };
+        let json = serde_json::to_string(&promote_cmd).expect("serialize");
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, promote_cmd);
+
+        let delete_cmd = CommandBody::DeleteQueuedPrompt {
+            session_id,
+            prompt_id,
+        };
+        let json = serde_json::to_string(&delete_cmd).expect("serialize");
+        let parsed: CommandBody = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, delete_cmd);
     }
 }

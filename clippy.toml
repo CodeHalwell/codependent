@@ -13,3 +13,11 @@
 # rather than box a public protocol field or scatter `#[allow]` across every
 # handler in several crates.
 large-error-threshold = 192
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+
+# Clippy architecture enforcement (Adoption 12 A4)
+disallowed-methods = [
+    { path = "ratatui::style::Color::Rgb", reason = "Use semantic theme tokens (Theme::dark/light/system) instead of hardcoded RGB colors." },
+    { path = "ratatui::style::Color::Indexed", reason = "Use semantic theme tokens instead of raw ANSI 256 indices." },
+]

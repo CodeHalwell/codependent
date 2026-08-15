@@ -321,6 +321,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn unknown_name_falls_back_to_a_theme_pack_on_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_in(tmp.path());

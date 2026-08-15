@@ -7,6 +7,10 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = []
+vt100-tests = ["dep:vt100"]
+
 [dependencies]
 codypendent-protocol = { workspace = true }
 codypendent-ui-host = { workspace = true }
@@ -31,6 +35,11 @@ unicode-width = { workspace = true }
 # the block's id from the client (the CRDT anchors links/citations to it), so
 # the reducer must mint one — the same time-ordered v7 form the fabric uses.
 uuid = { workspace = true }
+vt100 = { workspace = true, optional = true }
+
+[dev-dependencies]
+codypendent-tui = { path = ".", features = ["vt100-tests"] }
+insta = { workspace = true }
 
 [lints]
 workspace = true

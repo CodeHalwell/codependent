@@ -12,3 +12,6 @@ __pycache__/
 # (`.github/scripts/check_doc_test_counts.py --vitest-report`). Ephemeral in
 # CI; running the same two commands locally must not leave a tracked artifact.
 /vitest-extension.json
+
+# Vendored upstream repos kept locally for reference only. Never committed.
+/reference-repos/

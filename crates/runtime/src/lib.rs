@@ -22,9 +22,11 @@ pub mod embedding;
 pub mod extractor;
 pub mod models;
 pub mod tools;
+pub mod vcr;
 pub mod workflow_control;
 
 pub use embedding::HttpEmbedder;
+pub use vcr::{Cassette, CassetteDriver, Interaction, RecordingDriver, VcrError};
 
 #[cfg(feature = "provider-openai")]
 pub use extractor::LlmFactExtractor;
